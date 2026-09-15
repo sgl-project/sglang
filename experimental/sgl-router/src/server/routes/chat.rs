@@ -1307,7 +1307,8 @@ fn build_outgoing_body(
 /// Replicated-and-safe: plain text `messages` with a string `content`.
 /// Not replicated → omit:
 ///   * `tools` / `functions` — the encoder doesn't render tool schemas.
-///   * multimodal (array) `content` — a text tokenizer can't represent images.
+///   * non-string or missing `content` (arrays, `null`): the engine normalizes
+///     these before rendering; the router's encoder renders them verbatim.
 ///   * `chat_template` — an OpenAI-compatible per-request template override
 ///     (e.g. vLLM); the router renders with the model's default template, so a
 ///     custom one would diverge. (SGLang ignores it today, but block it so the
@@ -1331,7 +1332,7 @@ fn build_outgoing_body(
 /// tokenizer that does not would diverge by a leading special, again undetectable
 /// from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_is_multimodal(value) {
+    if request_has_tools(value) || request_has_non_text_content(value) {
         return false;
     }
     // Fields that steer the engine's template tokenization but which the
@@ -1357,22 +1358,11 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     !last_message_is_assistant(value)
 }
 
-/// Whether the ingress tokenization offload was expected to fire but failed —
-/// the condition behind `sgl_router_ingress_tokenize_errors_total`.
+/// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
 ///
-/// True only when ALL of:
-///   * the model has a chat encoder (`has_chat_encoder`), so a chat request
-///     on it SHOULD have produced engine-equivalent ids;
-///   * the request is a chat request (`messages` array present);
-///   * the tokens are absent OR not engine-equivalent — i.e. `encode_chat`
-///     render/encode failed and the request silently fell back to engine-side
-///     tokenization.
-///
-/// Non-chat-encoder / non-`messages` requests never expected the offload, so
-/// they are not failures. A tools / multimodal / thinking request on a
-/// chat-encoder model still gets engine-equivalent ids (`encode_chat`
-/// succeeded; the safe-predicate withholds forwarding for other reasons), so it
-/// is an expected omission, not a failure.
+/// Count chats with a configured encoder that pass the forwarding guard
+/// but lack engine-equivalent tokens. Excluded requests are expected fallbacks,
+/// even when rendering fails.
 fn ingress_tokenize_offload_failed(
     has_chat_encoder: bool,
     request_value: Option<&serde_json::Value>,
@@ -1381,8 +1371,9 @@ fn ingress_tokenize_offload_failed(
     if !has_chat_encoder {
         return false;
     }
-    let chat_request =
-        request_value.is_some_and(|v| v.get("messages").is_some_and(|m| m.is_array()));
+    let chat_request = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array()) && input_ids_safe_to_forward(v)
+    });
     if !chat_request {
         return false;
     }
@@ -1416,16 +1407,15 @@ fn request_has_tools(value: &serde_json::Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
-/// Whether any message carries non-string (array / multimodal) content. A text
-/// tokenizer cannot represent image content, so the router's `input_ids` would
-/// drop it — the caller must let the engine handle these requests.
-fn request_is_multimodal(value: &serde_json::Value) -> bool {
+/// Detect non-string or missing content, which requires engine tokenization:
+/// the engine normalizes arrays and nulls differently from the router's encoder.
+fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
         .and_then(|m| m.as_array())
         .is_some_and(|msgs| {
             msgs.iter()
-                .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
+                .any(|m| !matches!(m.get("content"), Some(serde_json::Value::String(_))))
         })
 }
 
@@ -1692,14 +1682,25 @@ mod tests {
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
     }
 
-    /// Array (multimodal) message content is detected so the caller omits
-    /// `input_ids` (a text tokenizer can't represent image content).
+    /// Arrays, nulls, and missing content block `input_ids` forwarding.
     #[test]
-    fn request_is_multimodal_detects_array_content() {
-        assert!(request_is_multimodal(&serde_json::json!({
-            "messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]
+    fn request_has_non_text_content_detects_non_string_content() {
+        for content in [
+            serde_json::json!([{"type":"image_url","image_url":"x"}]),
+            serde_json::json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                request_has_non_text_content(&serde_json::json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":content}]
+                })),
+                "content {content} must block"
+            );
+        }
+        assert!(request_has_non_text_content(&serde_json::json!({
+            "messages":[{"role":"assistant","tool_calls":[]}]
         })));
-        assert!(!request_is_multimodal(&serde_json::json!({
+        assert!(!request_has_non_text_content(&serde_json::json!({
             "messages":[{"role":"user","content":"hello"}]
         })));
     }
@@ -1785,9 +1786,17 @@ mod tests {
         ));
     }
 
-    /// A chat request on a chat-encoder model whose tokenization yielded NO
-    /// tokens (encode_chat returned None → request_tokens None) IS a failure:
-    /// the encoder should have fired but didn't.
+    /// Excluded requests are expected fallbacks, even without rendered tokens.
+    #[test]
+    fn offload_failed_false_for_unforwardable_request() {
+        let value = serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"f"}}]
+        });
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+    }
+
+    /// Missing tokens count as a failure for an eligible chat with an encoder.
     #[test]
     fn offload_failed_true_when_chat_encoder_request_has_no_tokens() {
         let value = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
