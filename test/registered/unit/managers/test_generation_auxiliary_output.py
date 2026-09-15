@@ -548,19 +548,20 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
         disagg_prefill_inflight_queue=[],
+        cache_unfinished_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
-    with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
-        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
-            scheduler,
-            batch,
-            result,
-        )
+    SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
 
     assert req.output_ids == [7]
+    scheduler.cache_unfinished_disagg_prefill.assert_called_once_with(req)
     snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
         batch,
