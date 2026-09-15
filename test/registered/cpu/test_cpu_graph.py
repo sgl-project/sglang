@@ -45,7 +45,7 @@ class TestCPUGraph(CustomTestCase):
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
-        cpu_ids_by_node = get_cpu_ids_by_node()
+        (mode, cpu_ids_by_node) = get_cpu_ids_by_node()
         n_numa_node = len(cpu_ids_by_node)
         env = copy.deepcopy(os.environ)
         env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
