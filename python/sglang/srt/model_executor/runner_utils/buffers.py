@@ -28,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import dp_capacity_for
 from sglang.srt.model_executor.forward_batch_info import NgramEmbeddingInfo
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 
@@ -178,9 +179,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
-                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                # Pool ceiling, not live width: a captured graph replays against this
+                # exact storage, so a scale must not resize it.
+                dp_capacity = dp_capacity_for(dp_size)
+                global_num_tokens_gpu = torch.zeros((dp_capacity,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (dp_size,), dtype=torch.int32
+                    (dp_capacity,), dtype=torch.int32
                 )
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)

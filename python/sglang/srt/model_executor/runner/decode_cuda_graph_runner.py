@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -900,7 +901,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            # Ceiling, not self.dp_size: see base_runner's capture path.
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.dp_size)
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
         else:
