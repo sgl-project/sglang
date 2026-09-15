@@ -2,8 +2,8 @@
 
 import os
 import types
-from unittest.mock import Mock, patch
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -360,7 +360,9 @@ class TestFusedLowRatioCompress(CustomTestCase):
                     self._check_step(_build(n, ratio, seed=100 + n + ratio), ratio)
 
     def test_static_verify_dispatch_and_real_pool_writes(self):
-        from sglang.kernels.ops.attention.dsv4.c2 import c2_verify_norm_rope_store
+        from sglang.kernels.ops.attention.dsv4.c2 import (
+            c2_decode_or_verify_norm_rope_store,
+        )
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_compression_metadata,
         )
@@ -405,8 +407,8 @@ class TestFusedLowRatioCompress(CustomTestCase):
             with (
                 patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "static"}),
                 patch(
-                    "sglang.kernels.ops.attention.dsv4.c2.c2_verify_norm_rope_store",
-                    wraps=c2_verify_norm_rope_store,
+                    "sglang.kernels.ops.attention.dsv4.c2.c2_decode_or_verify_norm_rope_store",
+                    wraps=c2_decode_or_verify_norm_rope_store,
                 ) as fused,
             ):
                 DeepseekV4AttnBackend._low_ratio_compress(

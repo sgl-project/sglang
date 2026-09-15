@@ -303,19 +303,25 @@ class TestDsaVariantIsDpGlobal(CustomTestCase):
     _LIMITS = [("candidate_all", 2048), ("candidate_unfiltered", 4096)]
 
     def _runner(self, **overrides):
-        attrs = dict(
-            candidate_filter_span=4096,
-            candidate_graph_limits=list(self._LIMITS),
-            dsa_dual_graph=False,
-            dsa_index_topk=2048,
-            require_mlp_tp_gather=True,
+        from sglang.srt.layers.attention.graph_variants import (
+            DsaGraphVariants,
+            Dsv41CandidateGraphVariants,
         )
-        attrs.update(overrides)
-        fake = SimpleNamespace(**attrs)
-        fake._dp_max_seq_len = lambda fb: DecodeCudaGraphRunner._dp_max_seq_len(
-            fake, fb
+
+        variants = (
+            DsaGraphVariants(index_topk=2048)
+            if overrides.get("dsa_dual_graph")
+            else Dsv41CandidateGraphVariants(
+                graph_limits=tuple(self._LIMITS),
+                capture_labels=(
+                    "candidate_all",
+                    "candidate_unfiltered",
+                    "candidate_filtered",
+                ),
+            )
         )
-        return lambda fb: DecodeCudaGraphRunner._resolve_dsa_variant(fake, fb)
+        fake = SimpleNamespace(attention_graph_variants=variants)
+        return lambda fb: DecodeCudaGraphRunner._resolve_attention_variant(fake, fb)
 
     @staticmethod
     def _batch(seq_lens, dp_max_seq_len):

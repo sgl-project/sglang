@@ -334,7 +334,7 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                     else:
                         self.assertTrue(torch.equal(rebound, value))
             for ratio in (1, 2):
-                for name in ("page_table", "c4_seq_lens"):
+                for name in ("page_table", "compressed_seq_lens"):
                     with self.subTest(ratio=ratio, field=name):
                         self.assertTrue(
                             torch.equal(

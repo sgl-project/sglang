@@ -83,7 +83,12 @@ class Dsv41CandidateGraphVariants:
     def select(self, forward_batch: ForwardBatch) -> str:
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
         max_seq_len = getattr(forward_batch, "dp_max_seq_len", None)
-        if max_seq_len is None and lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
+        if (
+            max_seq_len is None
+            and lengths is not None
+            and lengths.device.type == "cpu"
+            and lengths.numel() > 0
+        ):
             max_seq_len = int(lengths.max())
         if max_seq_len is None and self.verify_extra_tokens:
             # Includes acceptance still in flight, without a GPU-to-CPU copy.
