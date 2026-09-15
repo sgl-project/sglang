@@ -1643,6 +1643,7 @@ def w8a8_block_fp8_matmul(
 def _per_tensor_quant_mla_fp8_stage1(
     x_ptr,
     x_s_ptr,
+    num_valid_tokens_ptr,
     head_size,
     x_stride_h,
     x_stride_s,
@@ -1654,6 +1655,8 @@ def _per_tensor_quant_mla_fp8_stage1(
     head_id = tl.program_id(1)
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < head_size
+    if num_valid_tokens_ptr is not None:
+        mask = mask & (seq_id < tl.load(num_valid_tokens_ptr))
 
     x_ptr += head_id * x_stride_h + seq_id * x_stride_s
     x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
@@ -1666,6 +1669,7 @@ def _per_tensor_quant_mla_fp8_stage1(
 def _per_tensor_quant_mla_fp8_stage2(
     x_ptr,
     x_s_ptr,
+    num_valid_tokens_ptr,
     x_q_ptr,
     num_seq,
     head_size,
@@ -1680,6 +1684,8 @@ def _per_tensor_quant_mla_fp8_stage2(
     head_id = tl.program_id(1)
     offset = tl.arange(0, BLOCK_SIZE)
     mask = offset < head_size
+    if num_valid_tokens_ptr is not None:
+        mask = mask & (seq_id < tl.load(num_valid_tokens_ptr))
 
     x_s = tl.load(x_s_ptr)
     x_s_inv = 1.0 / x_s
@@ -1689,15 +1695,23 @@ def _per_tensor_quant_mla_fp8_stage2(
 
     x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
     x_q = tl.clamp(x * x_s_inv, fp8_min, fp8_max).to(FP8_DTYPE)
-    tl.store(x_q_ptr + offset, x_q.to(tl.uint8, bitcast=True), mask=mask)
+    tl.store(x_q_ptr + offset, x_q.to(tl.uint8, bitcast=True), mask=offset < head_size)
 
 
 def per_tensor_quant_mla_fp8(
-    x: torch.Tensor, x_s_out: torch.Tensor, eps: float = 1e-12
+    x: torch.Tensor,
+    x_s_out: torch.Tensor,
+    eps: float = 1e-12,
+    *,
+    num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     This function quantizes input values to float8 values with tensor-wise quantization
     and specialized for mla absorbed case.
+
+    num_valid_tokens is an optional device scalar bounding the valid sequence
+    rows. Padded rows must not affect the shared scale; their output is zero.
+    A device value keeps the boundary live when a CUDA graph bucket is reused.
     """
     assert x.dim() == 3, "`x` is not a 3d-tensor"
     assert (
@@ -1705,6 +1719,11 @@ def per_tensor_quant_mla_fp8(
         and x_s_out.dtype == torch.float32
         and x_s_out.device == x.device
     )
+
+    if num_valid_tokens is not None:
+        assert num_valid_tokens.numel() == 1
+        assert num_valid_tokens.device == x.device
+        assert num_valid_tokens.dtype in (torch.int32, torch.int64)
 
     x_q = x.new_empty(x.size(), dtype=fp8_dtype)
 
@@ -1715,6 +1734,7 @@ def per_tensor_quant_mla_fp8(
     _per_tensor_quant_mla_fp8_stage1[grid](
         x,
         x_s_out,
+        num_valid_tokens,
         head_size,
         x.stride(0),
         x.stride(1),
@@ -1725,6 +1745,7 @@ def per_tensor_quant_mla_fp8(
     _per_tensor_quant_mla_fp8_stage2[grid](
         x,
         x_s_out,
+        num_valid_tokens,
         x_q.view(torch.uint8),
         num_seq,
         head_size,

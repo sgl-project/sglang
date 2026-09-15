@@ -866,6 +866,23 @@ def build_prefill_registry(
     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
         return (bs,)
 
+    def _global_num_token_non_padded_post_fill(buf, fb, ctx):
+        # Attention sees the full token axis even when the MLP uses SP.
+        count = fb.global_num_token_non_padded_cpu
+        buf.fill_(ctx.raw_num_tokens if count is None else count)
+
+    # This scalar is registry-owned; it is not an adopted PrefillInputBuffer.
+    reg.register_slot(
+        GraphSlot(
+            "global_num_token_non_padded",
+            lambda _bs, _mt: (1,),
+            torch.int32,
+            axis="none",
+            copy_from_fb=False,
+            post_fill=_global_num_token_non_padded_post_fill,
+        )
+    )
+
     slots = [
         GraphSlot(
             "input_ids",

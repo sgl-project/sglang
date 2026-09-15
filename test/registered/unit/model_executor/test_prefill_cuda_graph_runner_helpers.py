@@ -63,7 +63,12 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         values = torch.arange(3)
         fill = partial(
             registry.fill_from,
-            SimpleNamespace(input_ids=values, positions=values, out_cache_loc=values),
+            SimpleNamespace(
+                input_ids=values,
+                positions=values,
+                out_cache_loc=values,
+                global_num_token_non_padded_cpu=3,
+            ),
             raw_bs=1,
             padded_bs=1,
             raw_num_tokens=3,

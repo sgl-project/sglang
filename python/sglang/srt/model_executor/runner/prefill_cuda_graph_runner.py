@@ -636,6 +636,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _capture_num_token_non_padded(self, num_tokens: int) -> Optional[torch.Tensor]:
+        self.buffer_registry.get_slot("global_num_token_non_padded").buffer.fill_(
+            num_tokens
+        )
         if not self.buffer_registry.has_slot("num_token_non_padded"):
             return None
 
@@ -1389,6 +1392,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Ported from main #27468.
                 capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
+                global_num_token_non_padded=_slot("global_num_token_non_padded"),
                 global_num_token_non_padded_cpu=num_tokens,
                 attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
                     num_tokens
@@ -1689,6 +1693,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             spec_info=padded_spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
+            global_num_token_non_padded=_slot("global_num_token_non_padded"),
             global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
             attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
                 static_num_tokens

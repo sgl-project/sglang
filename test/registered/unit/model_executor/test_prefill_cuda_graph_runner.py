@@ -78,6 +78,9 @@ class _FakeGraphSlot:
 class _FakeBatchRegistry:
     def __init__(self):
         self.slots = {
+            "global_num_token_non_padded": _FakeGraphSlot(
+                torch.tensor([3], dtype=torch.int32)
+            ),
             "input_ids": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
             "positions": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
             "out_cache_loc": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
