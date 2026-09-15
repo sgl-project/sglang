@@ -146,7 +146,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
             else:
                 # Try to parse as JSON for other types
                 try:
-                    parameters[param_name] = json.loads(param_value.strip())
+                    parameters[param_name] = json.loads(
+                        param_value.strip(), parse_constant=_reject_json_constant
+                    )
                 except (json.JSONDecodeError, ValueError):
                     parameters[param_name] = param_value.strip()
 
