@@ -125,6 +125,28 @@ platform lock and real imports instead of running a global dependency check.
 Extra installed packages are permitted and included in the recorded inventory;
 every applicable locked package must have the required version.
 
+### Why commit dependency locks?
+
+SGLang's existing Python installation flow resolves dependencies from project
+declarations at installation time. Parity adds complete third-party dependency
+locks so that rebuilding on the same supported platform selects the same package
+versions and verifies downloaded distributions against recorded hashes. The
+existing declarations remain the inputs; there is no second hand-maintained
+dependency list.
+
+Both implementations already share one prepared environment, so full locks are
+not required for a fair comparison within a run. They prevent dependency drift
+between fresh environments created by different developers or at different times.
+Source snapshots and import/build verification separately ensure that both
+implementations come from the requested commit.
+
+The cost is larger generated diffs and lock maintenance when dependency inputs
+change. Most lockfile content consists of distribution hashes. We retain the
+resolver's generated output rather than adding custom artifact filtering. Review
+the dependency inputs, selected versions, and platform configuration together;
+ordinary test runs never resolve newer versions. Locks fix Python dependencies,
+but do not guarantee identical generation results across hardware.
+
 ### Updating dependencies
 
 From the desired checkout, with uv 0.11.14 available:
