@@ -68,6 +68,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp4_dense import enable_mxfp4_dense
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -148,6 +149,14 @@ _gdn_decode_fused_proj_conv = (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+
+# An MXFP4 Qwen3.5 checkpoint quantizes only its routed experts, so every
+# attention, GDN and shared-expert projection arrives BF16. The four widest of
+# them carry most of that BF16 work and measure ~2x on aiter's MXFP4 GEMM once a
+# forward pass is wide enough to amortize quantizing the activation; the rest
+# either lose or barely break even, so they stay BF16.
+_qwen3_5_dense_mxfp4 = _is_hip and envs.SGLANG_QWEN3_5_DENSE_MXFP4.get()
+_QWEN3_5_DENSE_MXFP4_MIN_TOKENS = envs.SGLANG_QWEN3_5_DENSE_MXFP4_MIN_TOKENS.get()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -484,6 +493,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        if _qwen3_5_dense_mxfp4:
+            # in_proj_ba is left out on purpose: at 64 output columns it is never
+            # compute-bound, so MXFP4 only adds the activation quantization.
+            for proj in (self.in_proj_qkvz, self.out_proj):
+                enable_mxfp4_dense(proj, _QWEN3_5_DENSE_MXFP4_MIN_TOKENS)
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1177,6 +1192,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
+
+        if _qwen3_5_dense_mxfp4:
+            for proj in (self.qkv_proj, self.o_proj):
+                enable_mxfp4_dense(proj, _QWEN3_5_DENSE_MXFP4_MIN_TOKENS)
 
         self.attn = RadixAttention(
             self.num_heads,

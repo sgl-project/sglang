@@ -1706,6 +1706,12 @@ class Envs:
     # Distinct workspace configurations allowed in one process. Production
     # uses one model/configuration per rank, so fail closed on accidental reuse.
     SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
+    # Spend MXFP4 on the widest projections an MXFP4 Qwen3.5 checkpoint left in
+    # BF16 (gfx950). Off by default: it trades accuracy the checkpoint's own
+    # quantizer chose to keep. Only forward passes at or above the token
+    # threshold use it, so decode is unaffected.
+    SGLANG_QWEN3_5_DENSE_MXFP4 = EnvBool(False)
+    SGLANG_QWEN3_5_DENSE_MXFP4_MIN_TOKENS = EnvInt(1024)
 
     # ===================================================================
     # Plugin system
