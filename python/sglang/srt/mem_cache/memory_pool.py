@@ -4451,7 +4451,7 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
-    # Note(kpham-sgl): Only DSA draft pools opt into replication here;
+    # TODO(kpham-sgl): Only DSA draft pools opt into replication here;
     # generalize this to all draft pools in a follow-up.
     dcp_replicated = False
 
