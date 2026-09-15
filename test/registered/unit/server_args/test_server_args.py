@@ -111,6 +111,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_radix_eviction_policy_explicitness_is_preserved(self):
+        omitted = prepare_server_args(["--model-path", "dummy"])
+        separated = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
+        )
+        joined = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nradix-eviction-policy: lru\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        configured = prepare_server_args(["--config", config_path])
+
+        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
+        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
+        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
+        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -667,14 +686,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
-    def test_cuda_vmm_rejects_rust_server(self):
+    def test_cuda_vmm_allows_rust_server(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with (
+            patch.dict(os.environ, {}, clear=False),
             envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
         ):
             handle_multimodal_feature_transport(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
+        )
 
     @override_platform(is_cuda=True)
     def test_cuda_vmm_rejects_pipeline_parallelism(self):
@@ -2134,11 +2157,22 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
-                with patch(
-                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
-                    return_value=False,
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                        return_value=False,
+                    ),
+                    patch(
+                        # `handle_gpu_memory_settings` computes `gpu_mem` itself
+                        # now (`get_device_memory_capacity(cfg.device)`),
+                        # imported at module scope into `memory_hook` -- patch
+                        # the name where it is looked up, not its origin
+                        # module.
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=None,
+                    ),
                 ):
-                    handle_gpu_memory_settings(args, gpu_mem=None)
+                    handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
