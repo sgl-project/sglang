@@ -158,6 +158,8 @@ class CompressorBackendMixin:
         bf16_store: bool = False,
         kv_scale_cache: Optional[torch.Tensor] = None,
         rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        fp8_2buff: bool = False,
+        kv_cache_rope: Optional[torch.Tensor] = None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -220,6 +222,8 @@ class CompressorBackendMixin:
                 if _is_hip and use_fp4_indexer
                 else None
             ),
+            fp8_2buff=fp8_2buff,
+            kvcache_rope=kv_cache_rope,
         )
 
     def forward_unified(
@@ -238,8 +242,25 @@ class CompressorBackendMixin:
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
+
+        if token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
+            # The fused epilogue writes only the packed FlashMLA layout.
+            from sglang.srt.layers.attention.dsv4.compressor_trtllm import (
+                forward_compress_uniform_fp8,
+            )
+
+            forward_compress_uniform_fp8(
+                self,
+                token_to_kv_pool=token_to_kv_pool,
+                kv_score_input=kv_score_input,
+                state_pool=state_pool,
+                compressor=compressor,
+                layer_id=layer_id,
+            )
+            return
 
         out_loc = self._get_out_loc(compressor.ratio)
         use_fp4_indexer = (
@@ -248,8 +269,10 @@ class CompressorBackendMixin:
         use_hip_fp4 = _is_hip and use_fp4_indexer
         bf16_store = False
         kv_scale_cache = None
+        fp8_2buff = False
+        kv_cache_rope = None
         if compressor.is_in_indexer:
-            page_size = token_to_kv_pool.get_index_k_page_size()
+            page_size = token_to_kv_pool.get_index_k_page_size(compressor.ratio)
             if use_hip_fp4:
                 kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
                 kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)
@@ -276,7 +299,11 @@ class CompressorBackendMixin:
                     self.forward_metadata.core_metadata.unified,
                     f"c{compressor.ratio}_out_loc",
                 )
-            bf16_store = True
+            if is_unified_kv_fp8():
+                fp8_2buff = True
+                kv_cache_rope = token_to_kv_pool.get_unified_kv_rope(layer_id)
+            else:
+                bf16_store = True
         else:
             _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
             assert compress_kv_pool is not None
@@ -302,6 +329,10 @@ class CompressorBackendMixin:
             kv_scale_cache=kv_scale_cache,
             rope_cache=(
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
+            ),
+            fp8_2buff=fp8_2buff,
+            kv_cache_rope=(
+                None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)
             ),
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)

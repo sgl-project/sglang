@@ -62,12 +62,14 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
+        skip_server_warmup=get_serving().skip_server_warmup,
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
+            model_type=getattr(mc.hf_config, "model_type", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
