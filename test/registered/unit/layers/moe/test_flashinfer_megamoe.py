@@ -46,8 +46,8 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
-        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
-            get=lambda: 0
+        SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT=types.SimpleNamespace(
+            get=lambda: True
         ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
@@ -95,45 +95,33 @@ def test_max_tokens_uses_runtime_context_accessor(monkeypatch):
     assert module._resolve_max_tokens_per_rank() == 1024
 
 
-def test_decode_capacity_is_opt_in(monkeypatch):
+def test_make_supported_config_filters_unknown_kwargs(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
-    assert module._resolve_decode_max_tokens_per_rank() == 0
-    envs = sys.modules["sglang.srt.environ"].envs
-    envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get = lambda: 256
-    assert module._resolve_decode_max_tokens_per_rank() == 256
+    class OldConfig:
+        def __init__(self, *, top_k):
+            self.top_k = top_k
+
+    config = module._make_supported_config(
+        OldConfig, top_k=8, topk_reduce_persistent=True
+    )
+    assert config.top_k == 8
+    assert not hasattr(config, "topk_reduce_persistent")
 
 
-def test_selects_decode_profile_for_small_rank_invariant_batch(monkeypatch):
+def test_make_supported_config_passes_persistent_reduce(monkeypatch):
     module = _load_megamoe_module(monkeypatch)
 
-    default_forward = object()
-    decode_forward = object()
-    default_mega = types.SimpleNamespace(
-        _fleet_params=types.SimpleNamespace(max_tokens_per_rank=4096)
-    )
-    decode_mega = types.SimpleNamespace(
-        _fleet_params=types.SimpleNamespace(max_tokens_per_rank=256)
-    )
-    quant_info = module.FlashInferMegaMoeQuantInfo(
-        mega=default_mega,
-        mega_forward=default_forward,
-        decode_mega=decode_mega,
-        decode_mega_forward=decode_forward,
-    )
-    x = torch.empty((32, 8))
+    class NewConfig:
+        def __init__(self, *, top_k, topk_reduce_persistent=False):
+            self.top_k = top_k
+            self.topk_reduce_persistent = topk_reduce_persistent
 
-    monkeypatch.setattr(module, "_runtime_max_tokens_per_rank", lambda _x: 128)
-    assert module._select_megamoe_profile(quant_info, x) == (
-        decode_mega,
-        decode_forward,
+    config = module._make_supported_config(
+        NewConfig, top_k=8, topk_reduce_persistent=True
     )
-
-    monkeypatch.setattr(module, "_runtime_max_tokens_per_rank", lambda _x: 512)
-    assert module._select_megamoe_profile(quant_info, x) == (
-        default_mega,
-        default_forward,
-    )
+    assert config.top_k == 8
+    assert config.topk_reduce_persistent is True
 
 
 def test_adapter_keeps_router_ids_int32(monkeypatch):
@@ -231,6 +219,25 @@ def test_adapter_requests_workspace_output_view(monkeypatch):
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
     assert mega.return_workspace_view is True
+
+
+def test_persistent_topk_reduce_uses_runtime_sized_output(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    output = torch.empty((2, 4), dtype=torch.bfloat16)
+
+    class Mega:
+        _megakernel_config = types.SimpleNamespace(topk_reduce_persistent=True)
+
+        def forward(self, tensors, *, return_workspace_view=False):
+            self.return_workspace_view = return_workspace_view
+            return output
+
+    mega = Mega()
+    forward = module._select_megamoe_forward(mega)
+
+    assert forward(mega, object()) is output
+    assert mega.return_workspace_view is False
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):

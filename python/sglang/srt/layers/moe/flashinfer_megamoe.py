@@ -22,6 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -119,8 +120,6 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
 class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     mega: Any
     mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
-    decode_mega: Any | None = None
-    decode_mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
     fc1_alpha: torch.Tensor | None = None
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
@@ -139,10 +138,24 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
     return mega.forward(tensors)
 
 
-def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
-    import inspect
+def _megamoe_uses_persistent_topk_reduce(mega: Any) -> bool:
+    return bool(
+        getattr(
+            getattr(mega, "_megakernel_config", None),
+            "topk_reduce_persistent",
+            False,
+        )
+    )
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+
+def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
+    # Persistent top-k reduce needs the output extent to be the runtime token
+    # count. The workspace view is capacity-sized, so keep it for the static
+    # reducer only.
+    if (
+        not _megamoe_uses_persistent_topk_reduce(mega)
+        and "return_workspace_view" in inspect.signature(mega.forward).parameters
+    ):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
@@ -162,14 +175,6 @@ def _resolve_max_tokens_per_rank() -> int:
 
     derived = cutedsl_moe_max_num_tokens()
     return derived if derived > 0 else 1024
-
-
-def _resolve_decode_max_tokens_per_rank() -> int:
-    """Return the opt-in capacity for the small decode runtime profile."""
-    configured = (
-        envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
-    )
-    return max(int(configured), 0)
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -205,6 +210,31 @@ def _scalar_float(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().to(torch.float32).max())
     return float(value)
+
+
+def _make_supported_config(config_cls: Any, **kwargs: Any) -> Any:
+    """Instantiate a FlashInfer config while tolerating older wheels.
+
+    The persistent top-k reduce knob is introduced on the FlashInfer side first.
+    Filtering unknown kwargs keeps this adapter importable with older FlashInfer
+    builds while automatically enabling the new scheduler once the config class
+    grows the parameter.
+    """
+    signature = inspect.signature(config_cls)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return config_cls(**kwargs)
+
+    supported = {
+        name: value for name, value in kwargs.items() if name in signature.parameters
+    }
+    return config_cls(**supported)
+
+
+def _topk_reduce_persistent_enabled() -> bool:
+    return bool(envs.SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT.get())
 
 
 def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.Tensor:
@@ -252,8 +282,6 @@ def _bind_transformed_weights(
 def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
     layer._flashinfer_megamoe_forward = None
-    layer._flashinfer_megamoe_decode_layer = None
-    layer._flashinfer_megamoe_decode_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
 
 
@@ -319,49 +347,6 @@ def _ensure_flashinfer_megamoe_layer(
     )
     layer._flashinfer_megamoe_layer = mega
     layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
-
-    decode_capacity = _resolve_decode_max_tokens_per_rank()
-    if decode_capacity > max_tokens_per_rank:
-        raise ValueError(
-            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK "
-            f"({decode_capacity}) must not exceed the default MegaMOE capacity "
-            f"({max_tokens_per_rank})."
-        )
-    if 0 < decode_capacity < max_tokens_per_rank:
-        # A second layer gives the existing reduction kernel a smaller static
-        # max_tokens_per_rank without changing the kernel. Both layers point at
-        # the exact same transformed weight tensors; only their runtime workspace
-        # geometry differs. _ensure_shared_workspace() pools each capacity once
-        # across all model layers.
-        decode_mega = MoEEpMegaLayer(
-            bootstrap=BootstrapConfig(
-                world_size=world_size,
-                rank=rank,
-                device=torch.cuda.current_device(),
-            ),
-            fleet_params=FleetParams(
-                num_experts=layer.num_experts,
-                max_tokens_per_rank=decode_capacity,
-                token_hidden_size=layer.hidden_size,
-            ),
-            weights=None,
-            backend=MegaConfig(
-                megakernel=megakernel_config,
-                preprocess_weights=False,
-                transformed_weights=transformed_weights,
-            ),
-        )
-        layer._flashinfer_megamoe_decode_layer = decode_mega
-        layer._flashinfer_megamoe_decode_forward = _select_megamoe_forward(
-            decode_mega
-        )
-        logger.info(
-            "FlashInfer MegaMOE layer[%s] enabled shared-weight decode profile "
-            "(decode_capacity=%d, default_capacity=%d)",
-            layer.layer_id,
-            decode_capacity,
-            max_tokens_per_rank,
-        )
     return mega
 
 
@@ -374,10 +359,12 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=DeepGemmMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            DeepGemmMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -410,12 +397,14 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            Nvfp4CutedslMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
             combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=input_norm_const,
             fc1_alpha=layer.g1_alphas,
@@ -436,12 +425,14 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Mxfp8CutedslMegaMoeConfig(
+        megakernel_config=_make_supported_config(
+            Mxfp8CutedslMegaMoeConfig,
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            topk_reduce_persistent=_topk_reduce_persistent_enabled(),
         ),
         w13_scale=layer.w13_weight_scale_inv,
         w2_scale=layer.w2_weight_scale_inv,
@@ -622,6 +613,7 @@ def _ensure_shared_workspace(mega: Any) -> None:
         getattr(kc, "kind", None),
         getattr(kc, "in_kernel_fc2_reduce", None),
         getattr(kc, "combine_dtype", None),
+        getattr(kc, "topk_reduce_persistent", None),
         getattr(kc, "token_back_by_dispatch", None),
         getattr(kc, "fast_math", None),
         mc.quantize_input,
@@ -632,30 +624,6 @@ def _ensure_shared_workspace(mega: Any) -> None:
         workspaces[key] = mega._ensure_workspace()
     else:
         mega._workspace = shared
-
-
-def _runtime_max_tokens_per_rank(x: torch.Tensor) -> int:
-    """Return a rank-invariant batch bound when DP token metadata is present."""
-    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-
-    global_num_tokens = get_dp_global_num_tokens()
-    return max(global_num_tokens) if global_num_tokens else x.shape[0]
-
-
-def _select_megamoe_profile(
-    quant_info: FlashInferMegaMoeQuantInfo, x: torch.Tensor
-) -> tuple[Any, Callable[[Any, Any], torch.Tensor]]:
-    mega = quant_info.mega
-    mega_forward = quant_info.mega_forward
-    decode_mega = quant_info.decode_mega
-    if decode_mega is not None:
-        decode_capacity = int(decode_mega._fleet_params.max_tokens_per_rank)
-        if _runtime_max_tokens_per_rank(x) <= decode_capacity:
-            mega = decode_mega
-            mega_forward = quant_info.decode_mega_forward
-
-    assert mega_forward is not None
-    return mega, mega_forward
 
 
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
@@ -677,13 +645,8 @@ def run_flashinfer_megamoe(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
-    # Allocate both capacity profiles before choosing one. The first eager
-    # warmup therefore prepares stable addresses for later CUDA graph capture;
-    # subsequent model layers reuse the two process-local pooled workspaces.
-    _ensure_shared_workspace(quant_info.mega)
-    if quant_info.decode_mega is not None:
-        _ensure_shared_workspace(quant_info.decode_mega)
-    mega, mega_forward = _select_megamoe_profile(quant_info, x)
+    mega = quant_info.mega
+    _ensure_shared_workspace(mega)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
@@ -696,7 +659,8 @@ def run_flashinfer_megamoe(
         fc1_norm_const=quant_info.fc1_norm_const,
     )
     with _capture_safe_ue8m0_pack():
-        y = mega_forward(mega, t)
+        assert quant_info.mega_forward is not None
+        y = quant_info.mega_forward(mega, t)
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor
