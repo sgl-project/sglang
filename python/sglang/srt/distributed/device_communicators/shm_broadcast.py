@@ -15,8 +15,19 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from zmq import IPV6  # type: ignore
-from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
+from zmq import (  # type: ignore
+    CONFLATE,
+    IPV6,
+    NOBLOCK,
+    POLLIN,
+    SNDHWM,
+    SUB,
+    SUBSCRIBE,
+    XPUB,
+    XPUB_VERBOSE,
+    Context,
+    Poller,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
@@ -168,6 +179,7 @@ class Handle:
 
     buffer: Optional[ShmRingBuffer] = None
     local_subscribe_port: Optional[int] = None
+    local_notify_port: Optional[int] = None
     remote_subscribe_port: Optional[int] = None
 
 
@@ -222,12 +234,26 @@ class MessageQueue:
                     "tcp://127.0.0.1"
                 )
             logger.debug("Bound to tcp://127.0.0.1:%d", local_subscribe_port)
+
+            # Wake-up channel for idle readers. Only the fact that a write
+            # happened matters, so a high water mark of 1 keeps the writer
+            # from queueing pings while readers are busy.
+            self.local_notify_socket = context.socket(XPUB)
+            self.local_notify_socket.setsockopt(XPUB_VERBOSE, True)
+            self.local_notify_socket.setsockopt(SNDHWM, 1)
+            # Deliberately outside the [SGLANG_PORT, +8) window used above:
+            # two sockets in an 8-port window risks exhausting it.
+            local_notify_port = self.local_notify_socket.bind_to_random_port(
+                "tcp://127.0.0.1"
+            )
             self.current_idx = 0
 
         else:
             self.buffer = None  # type: ignore
             local_subscribe_port = None
+            local_notify_port = None
             self.local_socket = None
+            self.local_notify_socket = None
             self.current_idx = -1
 
         if n_remote_reader > 0:
@@ -258,6 +284,7 @@ class MessageQueue:
             local_reader_ranks=local_reader_ranks,
             buffer=self.buffer,
             local_subscribe_port=local_subscribe_port,
+            local_notify_port=local_notify_port,
             remote_subscribe_port=remote_subscribe_port,
         )
 
@@ -288,6 +315,18 @@ class MessageQueue:
             logger.debug("Connecting to %s", socket_addr)
             self.local_socket.connect(socket_addr)
 
+            # Keep only the latest ping; a reader that was busy does not need
+            # to drain a backlog of notifications to catch up.
+            self.local_notify_socket = context.socket(SUB)
+            self.local_notify_socket.setsockopt(CONFLATE, 1)
+            self.local_notify_socket.setsockopt_string(SUBSCRIBE, "")
+            self.local_notify_socket.connect(
+                f"tcp://127.0.0.1:{handle.local_notify_port}"
+            )
+            self.notify_poller = Poller()
+            self.notify_poller.register(self.local_notify_socket, POLLIN)
+            self.last_read = time.monotonic()
+
             self.remote_socket = None
         else:
             self.buffer = None  # type: ignore
@@ -297,6 +336,7 @@ class MessageQueue:
             self._is_remote_reader = True
 
             self.local_socket = None
+            self.local_notify_socket = None
 
             self.remote_socket = context.socket(SUB)
             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
@@ -320,6 +360,8 @@ class MessageQueue:
             for i in range(self.n_local_reader):
                 # wait for subscription messages from all local readers
                 self.local_socket.recv()
+            for i in range(self.n_local_reader):
+                self.local_notify_socket.recv()
             if self.n_local_reader > 0:
                 # send a message to all local readers
                 # to make sure the publish channel is working
@@ -395,11 +437,32 @@ class MessageQueue:
                 self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
                 break
 
+    def _notify_readers(self):
+        self.local_notify_socket.send(b"", NOBLOCK)
+
+    def _wait_for_write(self, deadline: float, busy_loop_s: float):
+        """Wait until the writer may have published a new block.
+
+        Spins while reads are frequent so the hot path keeps its latency; once
+        the reader has been idle for `busy_loop_s` it blocks on the notify
+        socket, so an idle reader holds no wall-clock-bounded wait and burns
+        no CPU. Returns at `deadline` at the latest so callers can re-check
+        the ring buffer and emit their warnings.
+        """
+        now = time.monotonic()
+        if now - self.last_read <= busy_loop_s:
+            os.sched_yield()
+            return
+        timeout_ms = max(0, int((deadline - now) * 1000))
+        if self.notify_poller.poll(timeout_ms):
+            self.local_notify_socket.recv(NOBLOCK)
+
     @contextmanager
     def acquire_read(self):
         assert self._is_local_reader, "Only readers can acquire read"
         start_time = time.monotonic()
         n_warning = 1
+        busy_loop_s = envs.SGLANG_RINGBUFFER_BUSY_LOOP_S.get()
         while True:
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
                 read_flag = metadata_buffer[self.local_reader_rank + 1]
@@ -413,8 +476,10 @@ class MessageQueue:
                     # if this block is not ready,
                     # we need to wait until it is written
 
-                    # Release the processor to other threads
-                    os.sched_yield()
+                    self._wait_for_write(
+                        start_time + SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning,
+                        busy_loop_s,
+                    )
 
                     # if we wait for a long time, we should warn the user
                     if (
@@ -437,6 +502,7 @@ class MessageQueue:
                 # set the read flag
                 metadata_buffer[self.local_reader_rank + 1] = 1
                 self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                self.last_read = time.monotonic()
                 break
 
     def enqueue(self, obj):
@@ -451,6 +517,7 @@ class MessageQueue:
                 with self.acquire_write() as buf:
                     buf[0] = 0  # not overflow
                     buf[1 : len(serialized_obj) + 1] = serialized_obj
+            self._notify_readers()
         if self.n_remote_reader > 0:
             self.remote_socket.send(serialized_obj)
 

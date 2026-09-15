@@ -7,8 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 
-from sglang.srt.utils import broadcast_pyobj
-
 from .parallel_state import (
     get_attn_cp_group,
     get_attn_tp_group,
@@ -105,14 +103,10 @@ def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
     # covers both, so broadcast along TP first and then along CP.
     tp_group = get_attn_tp_group()
     if tp_group.world_size > 1:
-        data = broadcast_pyobj(
-            data, tp_group.rank, tp_group.cpu_group, src=tp_group.ranks[0]
-        )
+        data = tp_group.broadcast_object(data, src=0)
     cp_group = get_attn_cp_group()
     if cp_group.world_size > 1:
-        data = broadcast_pyobj(
-            data, cp_group.rank, cp_group.cpu_group, src=cp_group.ranks[0]
-        )
+        data = cp_group.broadcast_object(data, src=0)
     return data
 
 
