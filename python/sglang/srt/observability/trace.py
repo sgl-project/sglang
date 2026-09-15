@@ -284,14 +284,11 @@ def get_otlp_span_exporter(endpoint):
 
 # Should be called by each tracked thread.
 #
-# Decoupled from tracing init (plan.md §5.2): the thread_info table is ALWAYS
-# populated (first-write-wins), even when tracing is disabled. Existing readers
-# -- __create_thread_context and the async exporter -- only run while tracing
-# is enabled, so their behavior is unchanged; the only new benefit is that
-# `get_thread_caller_info()` (caller_id/caller_role attribution forwarded to
-# Mooncake) stays readable regardless of the tracing switch. The exporter
-# callback is still gated on `opentelemetry_initialized` so disabled builds
-# never push thread info to the async trace exporter.
+# The thread_info table is ALWAYS populated (first-write-wins), even when
+# tracing is disabled, so get_thread_caller_info() (caller attribution
+# forwarded to Mooncake) stays readable regardless of the tracing switch. The
+# exporter callback is still gated on `opentelemetry_initialized`, so disabled
+# builds never push thread info.
 def trace_set_thread_info(
     thread_label: str,
     tp_rank: Optional[int] = None,
@@ -321,13 +318,10 @@ def get_thread_caller_info() -> Optional[Tuple[str, str]]:
 
     ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
     ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
-    thread-span name (``[TP x] [PP y] [DP z] (host:.. | pid:..)``) -- note
-    *without* the leading label, so it does not duplicate ``caller_role`` --
-    and is forwarded to Mooncake so per-RPC spans can be attributed to a
-    specific dummy-client / TP rank (plan.md §5.3). Read from
-    ``threads_info`` keyed by the native thread id, so it returns ``None`` on
-    threads that never registered (e.g. a fresh test thread), allowing callers
-    to omit the fields cleanly.
+    thread-span name (without the leading label, so it does not duplicate
+    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
+    a specific dummy-client / TP rank. Returns ``None`` on threads that never
+    registered, so callers can omit the fields cleanly.
     """
     info = threads_info.get(threading.get_native_id())
     if info is None:

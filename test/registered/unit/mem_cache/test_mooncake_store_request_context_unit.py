@@ -157,8 +157,8 @@ class TestRequestContextMechanism(unittest.TestCase):
             _names(binding.event_log),
             ["set_request_context", "clear_request_context"],
         )
-        # caller_id/caller_role are forwarded to the underlying binding (plan.md
-        # §2.8 / plan_trace.md §2.8), alongside the trace fields.
+        # caller_id/caller_role are forwarded to the underlying binding,
+        # alongside the trace fields.
         self.assertEqual(
             binding.event_log[0][1],
             {
@@ -287,7 +287,7 @@ class TestRequestContextFromExtraInfo(unittest.TestCase):
             ),
             {"request_id": "r-1", "caller_id": "sglang-tp0", "caller_role": "backup"},
         )
-        # Backup path: no request_id, only caller attribution (plan.md scenario 1).
+        # Backup path: no request_id, only caller attribution.
         self.assertEqual(
             extract(
                 HiCacheStorageExtraInfo(
@@ -380,10 +380,9 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         )
         self.assertEqual(get_binding.event_log[0][1]["request_id"], "g-9")
 
-        # Write (set) path now ALSO wraps (plan.md §7.3): the backup op's
-        # extra_info reaches the bridge so hop-A/hop-B backup spans correlate to
-        # the (real or virtual) root. exist=0 -> missing -> put RPC issued, all
-        # inside the request_context scope.
+        # Write (set) path also wraps: the backup op's extra_info reaches the
+        # bridge so backup spans correlate to the (real or virtual) root.
+        # exist=0 -> missing -> put RPC issued, all inside request_context.
         set_binding = _SupportedBinding(exist=0)
         set_store = _make_mooncake_store(set_binding)
         set_store.registered_pools = {PoolName.KV: host_pool}
@@ -440,9 +439,9 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
 
 class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
     def test_set_and_batch_set_stay_bare_but_batch_set_v1_now_wraps(self):
-        # `set(...)` and `batch_set(...)` take no extra_info and intentionally stay
-        # unwrapped (plan.md §7.3); `batch_set_v1(...)` receives extra_info and now
-        # wraps its RPC body in request_context so the backup spans correlate.
+        # `set(...)` and `batch_set(...)` take no extra_info and stay unwrapped;
+        # `batch_set_v1(...)` receives extra_info and wraps its RPC body in
+        # request_context so backup spans correlate.
         binding = _SupportedBinding(exist=0)  # missing -> put RPC actually runs
 
         # set(): single key (scalar target_location so the simple

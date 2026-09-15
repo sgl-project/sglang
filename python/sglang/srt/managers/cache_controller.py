@@ -1042,30 +1042,16 @@ class HiCacheController:
         return len(host_indices)
 
     def _init_op_trace(self, operation, rid, role: str) -> None:
-        """Create an opt-in hicache root span for a prefetch/backup operation.
+        """Create an opt-in hicache root span for a prefetch/backup op.
 
-        The root span is only EXPORTED when tracing is enabled AND ``hicache``
-        is in ``--trace-modules`` (the gate is reused from ``TraceReqContext``;
-        otherwise ``module_name='hicache'`` is filtered out -> TraceNullContext).
-        Either way the op carries ``(trace_ctx, trace_id, span_id)``:
-
-        * tracing on + hicache enabled -> ``trace_req_start`` also creates the
-          per-storage-thread child span (``TraceReqContext.thread_context.
-          thread_span``) under the root; we forward THAT thread span's
-          ``trace_id``/``span_id`` to Mooncake, so its hop-A/hop-B link under
-          the rank's thread span instead of directly under the root (plan.md
-          scenario 2). The thread span belongs to the op's owning storage
-          thread (init moved to the storage thread, see commit a0785d3).
-        * otherwise (tracing off / 'hicache' not in modules) -> TraceNullContext.
-          Prefetch keeps None ids: Mooncake derives a per-request trace_id from
-          its request_id. Backup instead synthesizes a per-op trace_id/span_id
-          from the op counter + ns + host/pid, so its Mooncake spans get a
-          distinct trace_id per op instead of one constant per backup thread.
-
-        See plan.md §3-§6. ``parent_span_id`` is intentionally not extracted:
-        the forwarded ``span_id`` (the thread span) is what Mooncake uses as
-        the remote parent; its own parent (the hicache root) is internal and
-        not exposed. ``trace_id`` is identical for the root and thread span.
+        Exported only when tracing is on and ``hicache`` is in
+        ``--trace-modules``; otherwise it collapses to ``TraceNullContext``.
+        When exported, ``trace_req_start`` also creates a per-storage-thread
+        child span under the root, and we forward *its* trace_id/span_id to
+        Mooncake so its hops nest under the rank's thread span. With tracing
+        off, prefetch keeps None ids (Mooncake derives per-request from
+        request_id) and backup synthesizes a per-op id so each backup op gets
+        a distinct Mooncake trace.
         """
         trace_ctx = TraceReqContext(
             rid=str(rid), role=role, module_name="hicache"
@@ -1074,21 +1060,17 @@ class HiCacheController:
         span_id: Optional[str] = None
         if trace_ctx.tracing_enable:
             trace_ctx.trace_req_start()
-            # The per-storage-thread child span (root -> thread span) is created
-            # synchronously inside trace_req_start via __create_thread_context.
-            # Forward its context so Mooncake's hop-A/hop-B nest under the rank's
-            # thread span, not directly under the root (plan.md §10).
+            # Forward the per-storage-thread child span (created in
+            # trace_req_start) so Mooncake's hops nest under the rank's thread
+            # span, not the root.
             span_context = trace_ctx.thread_context.thread_span.get_span_context()
             trace_id = format(span_context.trace_id, "032x")
             span_id = format(span_context.span_id, "016x")
         else:
             trace_ctx = TraceNullContext()
-            # With tracing off, backup ops would otherwise all collapse to one
-            # caller-derived (constant) trace_id per backup thread; synthesize a
-            # per-op trace_id/span_id instead so each backup op gets its own
-            # trace on the Mooncake side. (Prefetch stays None: it carries a
-            # per-request request_id Mooncake already derives a per-request
-            # trace_id from.)
+            # Tracing off: backup would otherwise share one caller-derived
+            # trace_id per thread, so synthesize a per-op id. Prefetch keeps
+            # None (Mooncake derives per-request from request_id).
             if role == "Backup":
                 trace_id = _synth_backup_trace_id(rid)
                 span_id = _synth_backup_span_id(rid)
@@ -1100,10 +1082,9 @@ class HiCacheController:
     def _finish_op_trace(operation) -> None:
         """End the op's hicache root span if one was created.
 
-        Idempotent (``trace_req_finish`` is a no-op once ``root_span`` is
-        cleared, and ``TraceNullContext.trace_req_finish`` is a no-op), so it
-        is safe to call from every retirement path. The ``__del__`` safety net
-        covers any path that bypasses this (revoke/terminate/drain)."""
+        Idempotent (``trace_req_finish`` is a no-op once the span is cleared,
+        and ``TraceNullContext.trace_req_finish`` is a no-op), so it is safe to
+        call from every retirement path."""
         trace_ctx = getattr(operation, "trace_ctx", None)
         if trace_ctx is not None:
             trace_ctx.trace_req_finish()
@@ -1112,18 +1093,11 @@ class HiCacheController:
     def _storage_trace_extra(operation, include_request_id: bool = True) -> dict:
         """Build the per-RPC context dict carried to Mooncake via extra_info.
 
-        Always-on (independent of tracing): ``caller_id``/``caller_role`` from
-        the *running storage thread's* registration (``Prefetch`` on the prefetch
-        threads, ``Backup`` on the backup thread). Prefetch additionally carries
-        ``request_id``. When the hicache root span was exported, also the
-        ``trace_id``/``span_id`` of its per-storage-thread child (root -> thread
-        span -> Mooncake hop-A; see ``_init_op_trace``). ``parent_span_id`` is
-        intentionally empty: the forwarded ``span_id`` (the thread span) is what
-        Mooncake uses as the remote parent, and its own parent (the root) is
-        internal. None/empty fields are omitted so Mooncake keeps the
-        prior per-thread state. The controller fills this from the storage
-        threads, so ``get_thread_caller_info`` reads the storage thread's identity
-        (plan.md §7.4 / §5).
+        Always-on: ``caller_id``/``caller_role`` from the running storage
+        thread's registration (``Prefetch``/``Backup``); prefetch additionally
+        carries ``request_id``. When the hicache span was exported, also the
+        per-storage-thread child's ``trace_id``/``span_id`` (Mooncake uses the
+        span_id as remote parent). None/empty fields are omitted.
         """
         ed: dict = {}
         caller = get_thread_caller_info()
@@ -1139,10 +1113,9 @@ class HiCacheController:
         sid = getattr(operation, "span_id", None)
         if sid:
             ed["span_id"] = sid
-        # Debug: att (caller attribution) is empty -- dump every rc field so
-        # we can see why rc is still non-empty (e.g. request_id carried over
-        # even though this storage thread never registered caller info via
-        # trace_set_thread_info).
+        # Debug: dump the rc fields when caller attribution is empty, to see
+        # why rc is still non-empty (e.g. a stale request_id on a thread that
+        # never registered caller info).
         if caller is None:
             logger.info(
                 "hicache: att (caller attribution) empty; rc fields=%s "
@@ -1337,10 +1310,8 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
 
-                # Retire the op's hicache root span at the completed_req ack
-                # (covers normal completion and terminated ops that flowed through
-                # here; revoke/terminate/drain paths are caught by the
-                # TraceReqContext.__del__ safety net). (plan.md §6/§8.5)
+                # Retire the op's hicache span on completion/termination of a
+                # transferred op.
                 self._finish_op_trace(operation)
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1416,10 +1387,8 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                # Create the opt-in hicache "Prefetch" root span here, off the
-                # scheduler hot path, so trace_id/span_id are ready before
-                # _storage_hit_query forwards them to Mooncake. The span start
-                # reflects dequeue, not enqueue (plan.md §4/§6).
+                # Start the opt-in hicache "Prefetch" span off the scheduler hot
+                # path, before _storage_hit_query forwards ids to Mooncake.
                 self._init_op_trace(operation, rid=operation.request_id, role="Prefetch")
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
@@ -1493,10 +1462,8 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            # Backup carries caller_id/caller_role (caller_role comes out as
-            # "Backup" from this thread's registration) plus the exported root's
-            # trace_id/span_id when present; request_id is intentionally omitted
-            # (backup is per-node, not per-request -- plan.md §8.1).
+            # Backup: caller_id/caller_role (role "Backup" from this thread) plus
+            # the span ids when exported; no request_id (backup is per-node).
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
                 extra_info=self._storage_trace_extra(
@@ -1532,11 +1499,8 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    # Only ranks that actually run the put own a "Backup" root
-                    # span: for MLA models backup_skip drops every non-tp0 rank,
-                    # which issues no storage RPC, so creating a span there
-                    # would be pure noise. The ids are ready before _page_backup
-                    # forwards them to Mooncake (plan.md §6/§8.1).
+                    # Only ranks that run the put own a "Backup" span: backup_skip
+                    # (MLA) drops non-tp0 ranks that issue no storage RPC.
                     self._init_op_trace(operation, rid=operation.id, role="Backup")
                     self._page_backup(operation)
                     self._finish_op_trace(operation)

@@ -606,8 +606,8 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             return hash_value, kv_hit_pages * self.page_size
 
-        # Carry caller_id/caller_role + the exported root's trace_id/span_id (when
-        # present) plus request_id to the storage backend (plan.md §7.5).
+        # Carry caller_id/caller_role + the exported span ids (when present)
+        # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
             extra_info=self._storage_trace_extra(operation, include_request_id=True)
@@ -738,16 +738,13 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers or []
             if self.should_backup(transfer)
         ]
-        # The Backup Req span lifecycle is owned here so the per-storage-thread
-        # thread span is built before any mooncake RPC -- the sidecar batch_set_v2
-        # below and the inherited MLA-KV write via super() -- and ended after
-        # both are done. Only init when this rank has real backup work: sidecar
-        # RPCs (backup_transfers) OR the replicated MLA-KV write (not
-        # self.backup_skip, i.e. tp0). A non-tp0 MLA rank with no rank-sharded
-        # sidecar issues zero RPCs, so it must not create an empty "Backup Req"
-        # (root_span + thread_span only, no hop). base _page_backup keeps its
-        # init/finish in its own backup_thread_func; this override calls super()
-        # only for the KV core loop, so there is no double-init.
+        # Own the Backup Req span lifecycle here so the thread span is built
+        # before any mooncake RPC (sidecar batch_set_v2, or the inherited MLA-KV
+        # write via super()) and ended after both. Init only when this rank has
+        # real backup work (sidecar RPCs OR not backup_skip, i.e. tp0): a non-tp0
+        # MLA rank with no sidecar issues zero RPCs and must not create an empty
+        # Backup span. super() runs only the KV core loop, so no double-init with
+        # base _page_backup.
         needs_backup = bool(backup_transfers) or not self.backup_skip
         if needs_backup:
             self._init_op_trace(operation, rid=operation.id, role="Backup")
@@ -755,9 +752,8 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            # Sidecar backup (rank-sharded pools) also carries caller + trace so
-            # its mooncake spans correlate to the (real or virtual) backup root;
-            # backup carries no request_id (per-node -- plan.md §8.1).
+            # Sidecar backup also carries caller + trace ids so its mooncake
+            # spans correlate to the backup root; no request_id (per-node).
             sidecar_extra = HiCacheStorageExtraInfo(
                 extra_info=self._storage_trace_extra(
                     operation, include_request_id=False

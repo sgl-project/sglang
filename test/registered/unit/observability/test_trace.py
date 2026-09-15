@@ -566,7 +566,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
 class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
     """Caller attribution (caller_id/caller_role) and the 'hicache' trace-module
-    gate introduced for HiCache prefetch/backup root spans (plan.md §5/§4)."""
+    gate introduced for HiCache prefetch/backup root spans."""
 
     def setUp(self):
         self._snap_threads = dict(mod.threads_info)
@@ -580,8 +580,8 @@ class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
         mod.threads_info.update(self._snap_threads)
 
     def test_set_thread_info_registers_even_when_tracing_disabled(self):
-        # Decoupling (plan.md §5.2): the table is populated regardless of tracing,
-        # so caller_id stays readable when tracing is off (just-propagate path).
+        # The table is populated regardless of tracing, so caller_id stays
+        # readable when tracing is off (just-propagate path).
         mod.opentelemetry_initialized = False
         pid = threading.get_native_id()
         self.assertNotIn(pid, mod.threads_info)
