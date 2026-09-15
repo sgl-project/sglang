@@ -856,6 +856,7 @@ class Gemma3ForConditionalGeneration(
 
                 # If loading from Gemma3 checkpoint, it usually has "model.vision_tower.vision_model..."
 
+                local_name = local_name.replace(".mlp.", ".ffn.")
                 if local_name in params_dict:
                     param = params_dict[local_name]
                     weight_loader = getattr(

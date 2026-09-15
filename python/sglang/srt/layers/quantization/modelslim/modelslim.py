@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,12 @@ class ModelSlimConfig(QuantizationConfig):
         }
 
         self.quant_description = quant_config
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        self.quant_description = hf_to_sglang_mapper.apply_dict(self.quant_description)
+        self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+        if "ignore" in self.quant_description:
+            self.quant_description["ignore"] = self.ignore
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)

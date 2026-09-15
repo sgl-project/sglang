@@ -63,6 +63,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
+    WeightsMapper,
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -930,6 +931,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".mlp.": ".ffn."},
+        orig_to_new_suffix={".mlp": ".ffn"},
+    )
 
     # Mapping from fused module names to their component weight names.
     # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify

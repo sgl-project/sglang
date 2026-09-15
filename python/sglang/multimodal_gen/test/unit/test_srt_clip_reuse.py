@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -108,3 +109,76 @@ def test_srt_clip_weight_name_mapping():
         )
         == "text_model.encoder.layers.0.self_attn.proj.weight"
     )
+
+
+def _encoder_loader_fixture(model_cls, root):
+    model = model_cls.__new__(model_cls)
+    nn.Module.__init__(model)
+    parent = model
+    for component in root.split("."):
+        child = nn.Module()
+        parent.add_module(component, child)
+        parent = child
+    layer = nn.Module()
+    layer.ffn = nn.Module()
+    layer.ffn.fc1 = nn.Linear(2, 4)
+    layer.ffn.fc2 = nn.Linear(4, 2)
+    parent.layers = nn.ModuleList([layer])
+    for param in model.parameters():
+        nn.init.zeros_(param)
+    return model
+
+
+@pytest.mark.parametrize("checkpoint_member", ["mlp", "ffn"])
+@pytest.mark.parametrize(
+    "model_cls,root",
+    [
+        (mmgen_clip.CLIPTextModel, "text_model.encoder"),
+        (mmgen_clip.CLIPTextModelWithProjection, "text_model.encoder"),
+        (mmgen_clip.CLIPVisionModel, "vision_model.encoder"),
+    ],
+)
+def test_mmgen_clip_loads_ffn_weights(model_cls, root, checkpoint_member):
+    model = _encoder_loader_fixture(model_cls, root)
+    model.config = SimpleNamespace(
+        arch_config=SimpleNamespace(stacked_params_mapping=[])
+    )
+    expected = {
+        name: torch.full_like(param, index + 1)
+        for index, (name, param) in enumerate(model.named_parameters())
+    }
+    loaded = model.load_weights(
+        (name.replace(".ffn.", f".{checkpoint_member}."), tensor)
+        for name, tensor in expected.items()
+    )
+    assert loaded == set(expected)
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, expected[name])
+
+
+@pytest.mark.parametrize("checkpoint_member", ["mlp", "ffn"])
+@pytest.mark.parametrize(
+    "source_root",
+    ["model.vision_tower.vision_model", "vision_tower", "vision_model"],
+)
+def test_mmgen_gemma3_loads_siglip_ffn_weights(source_root, checkpoint_member):
+    from sglang.multimodal_gen.runtime.models.encoders.gemma_3 import (
+        Gemma3ForConditionalGeneration,
+    )
+
+    root = "vision_tower.vision_model"
+    model = _encoder_loader_fixture(Gemma3ForConditionalGeneration, f"{root}.encoder")
+    expected = {
+        name: torch.full_like(param, index + 1)
+        for index, (name, param) in enumerate(model.named_parameters())
+    }
+    loaded = model.load_weights(
+        (
+            name.replace(root, source_root).replace(".ffn.", f".{checkpoint_member}."),
+            tensor,
+        )
+        for name, tensor in expected.items()
+    )
+    assert loaded == set(expected)
+    for name, param in model.named_parameters():
+        torch.testing.assert_close(param, expected[name])

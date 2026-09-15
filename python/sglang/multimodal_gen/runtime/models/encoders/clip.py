@@ -32,7 +32,7 @@ from sglang.srt.models.clip import (
 
 
 def _srt_clip_param_name(name: str) -> str:
-    return name.replace(".out_proj.", ".proj.")
+    return name.replace(".out_proj.", ".proj.").replace(".mlp.", ".ffn.")
 
 
 class CLIPTextTransformer(nn.Module):
