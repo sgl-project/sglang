@@ -308,7 +308,7 @@ def qsa_sparse_attention(
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Torch reference for sparse GQA over physical token slots."""
+    """Dispatch sparse GQA over physical token slots."""
 
     if _is_npu:
         k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
@@ -324,6 +324,14 @@ def qsa_sparse_attention(
         raise ValueError("Q/K/V head dimensions must match")
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.sparse_attention import (
+            can_run_sparse_attention,
+            sparse_attention,
+        )
+
+        if can_run_sparse_attention(q, k_cache, v_cache, token_slots):
+            return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
     return qsa_sparse_attention_reference(
         q, k_cache, v_cache, token_slots, softmax_scale
     )
