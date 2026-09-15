@@ -20,6 +20,7 @@ from lmcache.integration.sglang.unified_lmcache_mp_connector import (
 )
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     EvictParams,
     InitLoadBackParams,
     InsertParams,
@@ -157,7 +158,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def prefetch_from_storage(
         self,
-        req_id: str,
+        handle: CacheRequestHandle,
         last_host_node_id: NodeId,
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
@@ -167,6 +168,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         cache_salt: Optional[str] = None,
     ) -> None:
         del last_hash, prefix_keys
+        req_id = handle.rid
         if req_id in self._external_flows:
             return
         local_tokens = list(matched_prefix_tokens or [])
@@ -196,7 +198,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             lookup=lookup,
         )
 
-    def check_prefetch_progress(self, req_id: str) -> bool:
+    def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
+        req_id = handle.rid
         flow = self._external_flows.get(req_id)
         if flow is None:
             return True
@@ -229,19 +232,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 )
             if total_hit <= local_hit_tokens:
                 self._external_flows.pop(req_id, None)
-                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
-                self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
+                self.prefetch_loaded_tokens_by_reqid[handle] = 0
+                self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
                 return True
             flow.total_hit = total_hit
             flow.local_hit_tokens = local_hit_tokens
-            self.prefetch_loaded_tokens_by_reqid[req_id] = total_hit - local_hit_tokens
-            self.prefetch_loaded_storage_start_by_reqid[req_id] = local_hit_tokens
+            self.prefetch_loaded_tokens_by_reqid[handle] = total_hit - local_hit_tokens
+            self.prefetch_loaded_storage_start_by_reqid[handle] = local_hit_tokens
 
         return True
-
-    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
-        self.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
-        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=len(req.get_fill_ids()))
@@ -253,7 +252,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
         if not is_insert:
-            self.release_aborted_request(req.rid)
+            self.release_aborted_request(req.cache_request_handle)
         else:
             self._publish_external_loaded_prefix(req, token_ids_len=kv_len_to_handle)
         super().cache_finished_req(
@@ -316,9 +315,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
 
-    def release_aborted_request(self, rid: str) -> None:
-        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        rid = handle.rid
+        self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
+        self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
         flow = self._external_flows.get(rid)
         if flow is None:
             self._request_session_finish(rid)
@@ -366,8 +366,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.host_hit_length = 0
             req.swa_host_hit_length = 0
             req.mamba_host_hit_length = 0
-            self.prefetch_loaded_tokens_by_reqid.pop(req.rid, None)
-            self.prefetch_loaded_storage_start_by_reqid.pop(req.rid, None)
+            self.prefetch_loaded_tokens_by_reqid.pop(req.cache_request_handle, None)
+            self.prefetch_loaded_storage_start_by_reqid.pop(
+                req.cache_request_handle, None
+            )
             # Retire the unloaded flow to release its lookup locks.
             self._retire_loaded_flow(req.rid)
             return (
@@ -659,6 +661,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _finish_failed_load(self, flow: LMCacheExternalFlow) -> None:
         assert flow.load is not None
+        handle = (
+            flow.load_req.cache_request_handle if flow.load_req is not None else None
+        )
         if not flow.prefix_published:
             self.token_to_kv_pool_allocator.free(
                 flow.load.device_indices[flow.released_skip_tokens :]
@@ -689,11 +694,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._release_flow_anchor(flow)
         rid = flow.lookup.request_id
         self._external_flows.pop(rid, None)
-        if flow.cancelled:
-            self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        else:
-            self.prefetch_loaded_tokens_by_reqid[rid] = 0
-        self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
+        if handle is not None:
+            if flow.cancelled:
+                self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
+            else:
+                self.prefetch_loaded_tokens_by_reqid[handle] = 0
+            self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
 
     def _finish_successful_load(self, flow: LMCacheExternalFlow) -> None:
         """Finish local bookkeeping after LMCache has completed the retrieve."""
