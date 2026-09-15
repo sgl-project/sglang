@@ -83,6 +83,7 @@ class SimulationMode(Enum):
 @dataclass(slots=True)
 class RequestStats:
     rid: str = ""
+    session_id: Optional[str] = None
     last_event_time: float = 0.0
     input_length: int = 1
     output_length: int = 1
