@@ -3,12 +3,27 @@ from typing import List, Union
 
 from transformers.processing_utils import ProcessorMixin
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+
+# HuggingFace's microsoft/Phi-4-multimodal-instruct processor returns its
+# image / audio tensors under model-specific names that the sglang base
+# `collect_mm_items_from_processor_output()` doesn't know about. The
+# `__call__`-side `Phi4MMProcessorAdapter` already renames these for the
+# normal path, but the PROCESSOR_OUTPUT input-format path bypasses the
+# adapter (callers hand in the raw HF processor dict). Apply the same
+# rename there so the IMAGE / AUDIO mm_items end up with `feature` set.
+_PHI4MM_HF_TO_SGLANG_KEYS = {
+    "input_image_embeds": "pixel_values",
+    "input_audio_embeds": "audio_features",
+    "audio_embed_sizes": "audio_feature_lens",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +33,13 @@ logger = logging.getLogger(__name__)
 class Phi4MMProcessorAdapter(ProcessorMixin):
     def __init__(self, _processor) -> None:
         self._processor = _processor
+
+    def __getattr__(self, name):
+        # Forward attribute lookups (notably `tokenizer`) to the wrapped HF
+        # processor. Without this, BaseMultimodalProcessor.load_mm_data falls
+        # back to treating the adapter itself as the tokenizer and crashes on
+        # `decode` when prompt is passed as input_ids (the format-tagged path).
+        return getattr(self._processor, name)
 
     def __call__(self, **kwargs):
         result = self._processor(**kwargs)
@@ -65,6 +87,15 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             audio_token=self.AUDIO_TOKEN,
             audio_token_id=self.AUDIO_TOKEN_ID,
         ).build(self.processor)
+
+    def collect_mm_items_from_processor_output(self, data_dict: dict, modality=None):
+        # Normalise HF Phi-4 native keys to sglang-standard names before the
+        # base implementation walks the dict; otherwise keys like
+        # `input_image_embeds` aren't in `ATTR_NAME_TO_MODALITY` and the
+        # IMAGE mm_item ends up without a `feature` set, blowing up at
+        # `phi4mm.get_image_feature` with `expected Tensor ... got NoneType`.
+        renamed = {_PHI4MM_HF_TO_SGLANG_KEYS.get(k, k): v for k, v in data_dict.items()}
+        return super().collect_mm_items_from_processor_output(renamed, modality)
 
     async def process_mm_data_async(
         self,
