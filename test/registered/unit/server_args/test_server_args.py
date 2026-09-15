@@ -65,6 +65,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_server_args,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -109,8 +110,45 @@ _mock_device = patch(
 )
 _mock_device.start()
 
+_QWEN35_MODEL_CONFIG = SimpleNamespace(
+    hf_config=SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+)
+
 
 class TestPrepareServerArgs(CustomTestCase):
+    @patch(
+        "sglang.srt.arg_groups.validation_hook.model_config_of",
+        return_value=_QWEN35_MODEL_CONFIG,
+    )
+    def test_qwen35_pp_mtp_is_allowed_on_disaggregated_prefill(self, _):
+        check_server_args(
+            ServerArgs(
+                model_path="dummy",
+                pp_size=4,
+                disable_overlap_schedule=True,
+                speculative_algorithm="EAGLE",
+                disaggregation_mode="prefill",
+            )
+        )
+
+    @patch(
+        "sglang.srt.arg_groups.validation_hook.model_config_of",
+        return_value=_QWEN35_MODEL_CONFIG,
+    )
+    def test_qwen35_pp_mtp_is_rejected_outside_prefill(self, _):
+        for mode in ("decode", "null"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+                    check_server_args(
+                        ServerArgs(
+                            model_path="dummy",
+                            pp_size=4,
+                            disable_overlap_schedule=True,
+                            speculative_algorithm="EAGLE",
+                            disaggregation_mode=mode,
+                        )
+                    )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
