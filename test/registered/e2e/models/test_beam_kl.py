@@ -5,6 +5,10 @@ from the radix cache and a decode continued on a warm cache must reproduce a
 fresh prefill's logprobs. This is what catches a sliding-window pool that evicted
 something still needed or a cache prefix that does not match a recomputation;
 the fixture's precision tests do not exercise the cache at all.
+
+Both servers prefill in 256-token chunks, so every LongBench prompt crosses the
+512-token window and several chunk boundaries before its prefix is reused, and
+both keep the default breakable prefill CUDA graphs and decode graphs on.
 """
 
 import tempfile
@@ -37,9 +41,10 @@ class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
         "trtllm_mha",
         "--page-size",
         "64",
+        "--chunked-prefill-size",
+        "256",
         "--mem-fraction-static",
         "0.3",
-        "--cuda-graph-backend-prefill=disabled",
     ]
 
     @classmethod
@@ -84,7 +89,6 @@ class TestBeamKLFlashInferChunked(TestBeamKL):
         "256",
         "--mem-fraction-static",
         "0.3",
-        "--cuda-graph-backend-prefill=disabled",
     ]
 
 
