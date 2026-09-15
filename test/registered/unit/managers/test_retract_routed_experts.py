@@ -2,17 +2,22 @@
 
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import schedule_batch
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, release_req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -76,16 +81,18 @@ class TestRetractRoutedExperts(CustomTestCase):
         ).finalize()
         return routes
 
-    def _retract(self, req: Req) -> None:
-        def release(request: Req, *_args, **_kwargs) -> None:
-            # Simulate immediate reuse of every freed slot. The snapshot must
-            # happen before release and own its data, not alias the pool.
-            self.capturer.host_cache.buffer.fill_(-1)
-            self.pool.req_to_token.fill_(999)
-            request.kv = ReqKvInfo()
+    def _release_cache(self, request: Req, *_args, **_kwargs) -> None:
+        # Simulate immediate reuse of every freed slot. The snapshot must
+        # happen before release and own its data, not alias the pool.
+        self.capturer.host_cache.buffer.fill_(-1)
+        self.pool.req_to_token.fill_(999)
+        request.kv = ReqKvInfo()
 
+    def _retract(self, req: Req) -> None:
         with (
-            patch.object(schedule_batch, "release_kv_cache", side_effect=release),
+            patch.object(
+                schedule_batch, "release_kv_cache", side_effect=self._release_cache
+            ),
             patch.object(schedule_batch, "evict_from_tree_cache"),
         ):
             self.assertTrue(
@@ -105,7 +112,7 @@ class TestRetractRoutedExperts(CustomTestCase):
         return req.routed_experts
 
     def test_sampling_routes_survive_reprefill_and_wire_encoding(self) -> None:
-        for start in (0, 3, 4):
+        for start in (0, 3, 4, 5, 10):
             with self.subTest(start=start):
                 req = self._req(start=start)
                 original = self._prefill(req, 0)
@@ -125,6 +132,51 @@ class TestRetractRoutedExperts(CustomTestCase):
                     {"meta_info": {"routed_experts": encoded}}
                 ).reshape(expected.shape)
                 torch.testing.assert_close(torch.from_numpy(decoded), expected)
+
+    def test_pause_retract_preserves_the_drained_overlap_result(self) -> None:
+        req = self._req()
+        self._prefill(req, 0)
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, reqs=[req])
+
+        def finish_pending_result(_batch, _result) -> None:
+            req.output_ids.append(12)
+            req.logprob.output_token_logprobs_val.append(-0.3)
+            self._prefill(req, 0)
+
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            last_batch=batch,
+            running_batch=SimpleNamespace(reqs=[req], batch_is_full=False),
+            result_queue=deque([(batch, None)]),
+            process_batch_result=finish_pending_result,
+            chunked_req=None,
+            disaggregation_mode=DisaggregationMode.NULL,
+            req_to_token_pool=self.pool,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            hisparse_coordinator=None,
+            _add_request_to_queue=Mock(),
+            metrics_reporter=SimpleNamespace(current_scheduler_metrics_enabled=False),
+            kv_events_publisher=Mock(),
+        )
+        with (
+            patch.object(
+                schedule_batch, "release_kv_cache", side_effect=self._release_cache
+            ),
+            patch.object(schedule_batch, "evict_from_tree_cache"),
+        ):
+            Scheduler.pause_generation(
+                scheduler, PauseGenerationReqInput(mode="retract")
+            )
+
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+        self.assertEqual(req.logprob.output_token_logprobs_val, [-0.1, -0.2, -0.3])
+        self.assertEqual(len(scheduler.result_queue), 0)
+        req.output_ids.append(13)
+        recomputed = self._prefill(req, 1)
+        original = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 2, 2)
+        expected = torch.cat((original, recomputed[6:]))
+        torch.testing.assert_close(self._collect(req), expected)
 
     def test_repeated_retracts_keep_each_sampling_version(self) -> None:
         req = self._req()

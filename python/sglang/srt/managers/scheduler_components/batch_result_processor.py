@@ -50,7 +50,6 @@ from sglang.srt.sampling.sampling_params import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -147,17 +146,9 @@ class SchedulerBatchResultProcessor:
         """
         if not req.return_routed_experts:
             return
-        capturer = get_global_experts_capturer()
-        if capturer is None:
-            return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
-        req.routed_experts = capturer.get_topk(
-            req_pool_idx=req.kv.req_pool_idx,
-            seqlen=seqlen,
-            req_to_token_pool=self.req_to_token_pool,
-            start_len=start_len,
-        )
+        req.routed_experts = req.collect_routed_experts(self.req_to_token_pool)
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (
