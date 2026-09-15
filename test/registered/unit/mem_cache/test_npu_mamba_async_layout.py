@@ -18,15 +18,17 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestNPUMambaAsyncConfig(unittest.TestCase):
     def test_accepts_explicit_sync_and_async_modes(self):
         for mode in ("sync", "async"):
-            with self.subTest(mode=mode), patch.dict(
-                os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": mode}
+            with (
+                self.subTest(mode=mode),
+                patch.dict(os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": mode}),
             ):
                 self.assertEqual(_npu_hicache_mamba_io_mode(), mode)
 
     def test_rejects_auto_mode(self):
-        with patch.dict(
-            os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": "auto"}
-        ), self.assertRaisesRegex(ValueError, "must be one of"):
+        with (
+            patch.dict(os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": "auto"}),
+            self.assertRaisesRegex(ValueError, "must be one of"),
+        ):
             _npu_hicache_mamba_io_mode()
 
     @patch.object(mamba_pool_host, "_is_npu", True)
@@ -53,14 +55,17 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         device_indices = torch.tensor([0, 4])
 
         transfer_op = MagicMock()
-        with patch.object(
-            mamba_pool_host,
-            "transfer_state_per_layer_direct_pf_lf",
-            transfer_op,
-        ), patch.object(
-            mamba_pool_host,
-            "_npu_hicache_mamba_io_mode",
-            return_value="async",
+        with (
+            patch.object(
+                mamba_pool_host,
+                "transfer_state_per_layer_direct_pf_lf",
+                transfer_op,
+            ),
+            patch.object(
+                mamba_pool_host,
+                "_npu_hicache_mamba_io_mode",
+                return_value="async",
+            ),
         ):
             pool._copy_tensor_pf_lf(
                 src=host,
@@ -88,14 +93,17 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         host_indices = torch.tensor([1, 3])
 
         transfer_op = MagicMock()
-        with patch.object(
-            mamba_pool_host,
-            "transfer_state_all_layer_direct_lf_pf",
-            transfer_op,
-        ), patch.object(
-            mamba_pool_host,
-            "_npu_hicache_mamba_io_mode",
-            return_value="async",
+        with (
+            patch.object(
+                mamba_pool_host,
+                "transfer_state_all_layer_direct_lf_pf",
+                transfer_op,
+            ),
+            patch.object(
+                mamba_pool_host,
+                "_npu_hicache_mamba_io_mode",
+                return_value="async",
+            ),
         ):
             pool._copy_tensor_all_layers_lf_pf(
                 src_layers=device_layers,

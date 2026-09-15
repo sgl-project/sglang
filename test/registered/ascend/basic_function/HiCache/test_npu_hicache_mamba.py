@@ -131,8 +131,7 @@ class TestNPUMambaHiCache(CustomTestCase):
                     self.assertGreater(
                         int(warm_details.get("device", 0) or 0),
                         0,
-                        "Expected an L1 device hit; "
-                        f"got meta_info={warm['meta_info']}",
+                        f"Expected an L1 device hit; got meta_info={warm['meta_info']}",
                     )
                     self.assertEqual(
                         int(warm_details.get("host", 0) or 0),
@@ -168,7 +167,7 @@ class TestNPUMambaHiCache(CustomTestCase):
                     self.assertGreater(
                         int(details.get("storage", 0) or 0),
                         0,
-                        "Expected an L3 storage hit; " f"got meta_info={restored_meta}",
+                        f"Expected an L3 storage hit; got meta_info={restored_meta}",
                     )
                     self.assertEqual(
                         restored["text"],
