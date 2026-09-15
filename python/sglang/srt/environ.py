@@ -739,6 +739,10 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    # DeepSeek DSML detectors (V3.2, V4): a malformed complete invoke body drops
+    # the call as content instead of parsing as `{}`; streamed names travel with
+    # their first argument delta.
+    SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS = EnvBool(False)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation

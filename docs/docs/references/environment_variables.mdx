@@ -1263,6 +1263,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Strict parsing for the DeepSeek DSML tool-call detectors (V3.2, V4). A complete invoke body must be well-formed (parameter tags with the DSML marker and <code>string</code> attribute, or one JSON object); a malformed body drops the call and returns the text as content with a warning instead of a call with <code>{}</code> arguments. In streaming, the tool name is sent in the same delta as the first argument bytes, the arguments stay incomplete JSON until the invoke closer validates the body, and a malformed invoke turns the rest of its calls block into content.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEFAULT_THINKING</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable model thinking/reasoning output by default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
