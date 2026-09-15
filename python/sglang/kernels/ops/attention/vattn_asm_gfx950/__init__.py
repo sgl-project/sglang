@@ -313,9 +313,14 @@ def _seg_plan_target_wgs() -> int:
     return _SEG_PLAN_TARGET_WGS
 
 
+def _seg_plan_max_segments(num_cus: int, num_seqs: int, num_kv_heads: int) -> int:
+    """Give one sequence up to twice its equal-share CU budget."""
+    uniform_share = max(1, num_cus // max(1, num_seqs * num_kv_heads))
+    return max(16, min(64, 2 * uniform_share))
+
+
 def mtp_verify_attn_seg_max(num_seqs: int, num_kv_heads: int) -> int:
-    """Static grid.x for the planned split: 2x the legacy per-seq count, clamped to 16..64."""
-    return max(16, min(64, 2 * mtp_verify_attn_num_segments(num_seqs, num_kv_heads)))
+    return _seg_plan_max_segments(_seg_plan_target_wgs(), num_seqs, num_kv_heads)
 
 
 def _get_plan_kernel():
