@@ -875,18 +875,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Localize the count when this bucket is attn-TP sharded (SP on).
         attn_tp_sharded = self.model_runner.attn_tp_sequence_sharded(num_tokens)
-        buffers.num_token_non_padded[...] = num_tokens
-        if (
-            enable_num_token_non_padded()
-            and not self.enable_prefill_cp
-            and attn_tp_sharded
-        ):
-            local = compute_local_num_token_non_padded(
-                global_num_token_non_padded=buffers.num_token_non_padded,
-                num_tokens_per_dp=num_tokens,
-                sharded=True,
-            )
-            buffers.num_token_non_padded.copy_(local)
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
+            if not self.enable_prefill_cp and attn_tp_sharded:
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=buffers.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens,
+                    sharded=True,
+                )
+                buffers.num_token_non_padded.copy_(local)
 
         pp_proxy_tensors = None
         # pipeline parallelism
@@ -967,11 +964,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            # Refreshed at replay only under expert parallelism; otherwise None,
-            # like the eager batch, so routing sees no stale count.
-            num_token_non_padded=(
-                buffers.num_token_non_padded if enable_num_token_non_padded() else None
-            ),
+            num_token_non_padded=buffers.num_token_non_padded,
             attn_tp_sequence_sharded=attn_tp_sharded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
