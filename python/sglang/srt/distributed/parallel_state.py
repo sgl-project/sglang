@@ -3104,12 +3104,10 @@ def destroy_distributed_environment():
 
 
 def abort_distributed_environment() -> None:
-    """Drop this rank's communicators without a collective handshake.
+    """Drop this rank's communicators locally.
 
-    ``destroy_process_group`` is effectively collective, so on a shutdown where
-    a peer is already gone -- often the very reason for the shutdown -- it can
-    block until the job times out. Aborting tears the communicators down
-    locally, which is what returns the GPU memory and the file descriptors.
+    ``destroy_process_group`` is collective and blocks when a peer is gone,
+    which on a shutdown path is the common case.
     """
     if envs.SGLANG_DISABLE_SHUTDOWN_NCCL_ABORT.get():
         return
@@ -3117,8 +3115,8 @@ def abort_distributed_environment() -> None:
         return
     abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
     if abort is None:
-        # Older torch exposes no non-collective teardown, and the collective one
-        # is exactly what this function exists to avoid.
+        # Older torch exposes no non-collective teardown,
+        # and the collective one is what this function exists to avoid.
         return
     try:
         # No argument aborts every group, the default one included.

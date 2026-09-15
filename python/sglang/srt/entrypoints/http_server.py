@@ -2681,8 +2681,8 @@ def _setup_and_run_http_server(
 
                 asyncio.run(_run_with_ssl_refresh())
             else:
-                # Default case, one tokenizer process. Built as a Server
-                # rather than uvicorn.run() so shutdown has something to ask.
+                # Default case, one tokenizer process.
+                # A Server rather than uvicorn.run(), so shutdown can ask it to stop.
                 server = uvicorn.Server(
                     uvicorn.Config(
                         app,

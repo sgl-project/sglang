@@ -2170,9 +2170,7 @@ def wait_for_gpu_release(
         while True:
             holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
             if not holders:
-                # A silent wait is indistinguishable from no wait at all, and
-                # this number is the only evidence of how much memory teardown
-                # actually leaves behind.
+                # Without this, a wait is indistinguishable from no wait.
                 waited = time.monotonic() - start
                 if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
                     print(
