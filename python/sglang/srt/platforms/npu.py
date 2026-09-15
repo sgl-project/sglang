@@ -56,9 +56,7 @@ class NPUDeviceMixin(DeviceMixin):
         return torch.npu.mem_get_info(device_id)
 
     def is_pin_memory_available(self, device=None) -> bool:
-        if device is not None and str(device) == "cpu":
-            return False
-        return True
+        return False
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
