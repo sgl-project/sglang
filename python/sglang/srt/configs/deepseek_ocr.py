@@ -23,7 +23,8 @@ from sglang.srt.sampling.custom_logit_processor import (
 DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
-IMAGE_SIZE = 640
+IMAGE_SIZE = 640  # DeepSeek-OCR local crop; OCR-2 uses OCR2_IMAGE_SIZE
+OCR2_IMAGE_SIZE = 768
 CROP_MODE = True
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
@@ -218,7 +219,11 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
+    image,
+    min_num=MIN_CROPS,
+    max_num=MAX_CROPS,
+    image_size=IMAGE_SIZE,
+    use_thumbnail=False,
 ):
     orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
@@ -263,6 +268,28 @@ def dynamic_preprocess(
     return processed_images, target_aspect_ratio
 
 
+def is_ocr2_config(config) -> bool:
+    """Whether a checkpoint is DeepSeek-OCR-2.
+
+    Both checkpoints ship identical processor configs, so OCR-2 is identified
+    from the model config instead: the DeepEncoder V2 vision encoder, or its
+    896-dim projector (OCR-1 pairs ``deeplip_b_l`` with a 2048-dim projector).
+    """
+    return (
+        str(config.vision_config.model_name).lower() == "deepencoderv2"
+        or config.projector_config.input_dim == 896
+    )
+
+
+def local_crop_size(config) -> int:
+    """Local-crop pixel size for a checkpoint.
+
+    Kept next to :func:`is_ocr2_config` so that the crop size and the per-tile
+    token budget it implies stay defined in one place.
+    """
+    return OCR2_IMAGE_SIZE if is_ocr2_config(config) else IMAGE_SIZE
+
+
 class DeepseekOCRProcessor(ProcessorMixin):
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
@@ -287,6 +314,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
 
         self.candidate_resolutions = candidate_resolutions
+        # The checkpoint config carries the *global* base here, not the local
+        # crop; the SGLang processor patches the real crop size per model.
         self.image_size = candidate_resolutions[0][0]
         self.patch_size = patch_size
         self.image_mean = image_mean
@@ -543,18 +572,22 @@ class DeepseekOCRProcessor(ProcessorMixin):
             img_w, img_h = get_image_size(image)
             image_shapes.append((img_w, img_h))
 
-            if img_w <= 640 and img_h <= 640:
+            # Official OCR-1 compares against 640 and OCR-2 against 768, i.e. each
+            # checkpoint's own local-crop size in both cases.
+            if img_w <= self.image_size and img_h <= self.image_size:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=IMAGE_SIZE
+                        image, image_size=self.image_size
                     )
                 else:
                     crop_ratio = [1, 1]
 
             """process the global view"""
-            if self.image_size <= 640 and not cropping:
+            # Official: `self.image_size <= IMAGE_SIZE` against the checkpoint's
+            # own constant (640 / 768), which every matching checkpoint satisfies.
+            if not cropping:
                 image = resize_image(image, (self.image_size, self.image_size))
 
             global_view = pad_image(
@@ -579,6 +612,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 (self.base_size // self.patch_size) / self.downsample_ratio
             )
 
+            # Block order here is cosmetic: image tokens are padded by count
+            # (see MultiModalityDataPaddingPatternMultimodalTokens) and features are
+            # scattered in order, so only the total per image matters.
             if self.ocr2_mode:
                 tokenized_image = []
                 if num_width_tiles > 1 or num_height_tiles > 1:
