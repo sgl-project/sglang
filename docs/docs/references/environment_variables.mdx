@@ -128,6 +128,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Address file of a long-lived forkserver daemon started with `python -m sglang.srt.entrypoints.early_forkserver`. A launcher with `SGLANG_EARLY_FORKSERVER=1` attaches to the daemon named there when it is alive, so the preload cost is paid once per machine.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`/tmp/sglang_forkserver.json`</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PRESPAWN_WORKERS`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Spawn the scheduler (or DP controller) processes right after argument parsing, before the launcher imports the HTTP and tokenizer stack, so worker initialization overlaps that import. Combine with `SGLANG_EARLY_FORKSERVER=1`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
 </tbody>
 </table>
 

@@ -26,6 +26,15 @@ def run_server(server_args):
 
     # The flags dispatched on below are decided by resolution (`--grpc-mode`
     # folds into `smg_grpc_mode`), and `prepare_server_args` returns raw input.
+    cfg = resolving_view(server_args)
+    if not (cfg.encoder_only or cfg.smg_grpc_mode or cfg.grpc_mode or cfg.use_ray):
+        # Default HTTP mode: optionally start the workers before the import of
+        # the HTTP server stack below (SGLANG_PRESPAWN_WORKERS=1). The dispatch
+        # flags read above are plain fields of the raw record.
+        from sglang.srt.entrypoints.prespawn import maybe_prespawn
+
+        maybe_prespawn(server_args)
+
     server_args.resolve_once()
     cfg = resolving_view(server_args)
 

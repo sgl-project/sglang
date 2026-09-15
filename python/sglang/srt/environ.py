@@ -299,6 +299,10 @@ class Envs:
     # multiprocessing start method the launcher applies: spawn | forkserver.
     # Set by start_early(); not meant to be set by hand.
     SGLANG_MP_START_METHOD = EnvStr("spawn")
+    # Spawn the scheduler / DP-controller processes right after argument
+    # parsing, before the launcher imports the HTTP and tokenizer stack
+    # (entrypoints/prespawn.py).
+    SGLANG_PRESPAWN_WORKERS = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

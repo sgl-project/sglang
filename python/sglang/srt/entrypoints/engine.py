@@ -55,6 +55,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
+from sglang.srt.entrypoints import prespawn
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
 )
@@ -1070,81 +1071,96 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         startup_tic = time.perf_counter()
 
-        # Configure global environment
-        configure_logger(server_args)
-        server_args.resolve_once()
-
-        _set_envs_and_config(server_args)
-
-        # Defensive: ensure plugins loaded (may already be loaded by
-        # Engine.__init__ or CLI entry).
-        load_plugins()
-
-        # Not read-only: the LoRA checks normalize adapter paths through late
-        # resolution, which a published config refuses. Hence before publish --
-        # and before the parser detection below, which consumes the "auto"
-        # sentinel: a record rejected here has to stay retryable.
-        server_args.check_server_args()
-
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
-        parsers = resolving_view(server_args)
-        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-            resolve_auto_parsers(server_args)
-
-        # This publish replaces whatever was published before it, so the
-        # rollback below restores that rather than clearing the process: a
-        # caller that catches the launch error still has the context it had.
-        context_before_publish = snapshot_context()
-        publish(server_args, role="tokenizer")
-
-        # Nothing below has spawned yet, so a failure here leaves a record the
-        # caller can hand back -- but only once the publication goes with it:
-        # the validation stage writes through late resolution, which refuses a
-        # record that is already published.
-        try:
-            # Allocate ports for inter-process communications
-            if port_args is None:
-                port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={server_args.resolved_dict()}")
-
-            # Start the engine info bootstrap server if per-rank info is needed.
+        # Workers started by prespawn.maybe_prespawn() (SGLANG_PRESPAWN_WORKERS=1,
+        # right after argument parsing) are adopted here; the preparation in the
+        # else-branch already ran there. Only the default entry point may adopt.
+        pre = prespawn.take(server_args) if port_args is None else None
+        if pre is not None and run_scheduler_process_func is not run_scheduler_process:
+            prespawn.abandon(pre)
+            pre = None
+        if pre is not None:
+            port_args = pre.port_args
             engine_info_bootstrap_server = None
-            if (
-                get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
-                and get_parallel().node_rank == 0
-            ):
-                bootstrap_port = get_model().engine_info_bootstrap_port
-                if not is_port_available(bootstrap_port):
-                    raise RuntimeError(
-                        f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
-                        f"When running multiple instances on the same node, each instance must use a "
-                        f"different --engine-info-bootstrap-port."
+            weight_cache_daemon_procs = []
+            scheduler_init_result, scheduler_procs = pre.result, pre.procs
+        else:
+            # Configure global environment
+            configure_logger(server_args)
+            server_args.resolve_once()
+
+            _set_envs_and_config(server_args)
+
+            # Defensive: ensure plugins loaded (may already be loaded by
+            # Engine.__init__ or CLI entry).
+            load_plugins()
+
+            # Not read-only: the LoRA checks normalize adapter paths through late
+            # resolution, which a published config refuses. Hence before publish --
+            # and before the parser detection below, which consumes the "auto"
+            # sentinel: a record rejected here has to stay retryable.
+            server_args.check_server_args()
+
+            # Needs a tokenizer and a chat template, so it cannot live in the
+            # pipeline; after the plugins, which may register the parser detected.
+            parsers = resolving_view(server_args)
+            if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
+                resolve_auto_parsers(server_args)
+
+            # This publish replaces whatever was published before it, so the
+            # rollback below restores that rather than clearing the process: a
+            # caller that catches the launch error still has the context it had.
+            context_before_publish = snapshot_context()
+            publish(server_args, role="tokenizer")
+
+            # Nothing below has spawned yet, so a failure here leaves a record the
+            # caller can hand back -- but only once the publication goes with it:
+            # the validation stage writes through late resolution, which refuses a
+            # record that is already published.
+            try:
+                # Allocate ports for inter-process communications
+                if port_args is None:
+                    port_args = PortArgs.init_new(server_args)
+                logger.info(f"server_args={server_args.resolved_dict()}")
+
+                # Start the engine info bootstrap server if per-rank info is needed.
+                engine_info_bootstrap_server = None
+                if (
+                    get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+                    and get_parallel().node_rank == 0
+                ):
+                    bootstrap_port = get_model().engine_info_bootstrap_port
+                    if not is_port_available(bootstrap_port):
+                        raise RuntimeError(
+                            f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                            f"When running multiple instances on the same node, each instance must use a "
+                            f"different --engine-info-bootstrap-port."
+                        )
+                    engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                        host=get_serving().host, port=bootstrap_port
                     )
-                engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                    host=get_serving().host, port=bootstrap_port
-                )
 
-            # Launch daemons (daemon mode only). The handles travel back to the
-            # Engine that spawned them; shutdown() reaps from there.
-            weight_cache_daemon_procs: List = []
-            if get_model().weight_cache_mode == "daemon":
-                weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
-                    server_args
-                )
-        except BaseException:
-            restore_context(context_before_publish)
-            raise
+                # Launch daemons (daemon mode only). The handles travel back to the
+                # Engine that spawned them; shutdown() reaps from there.
+                weight_cache_daemon_procs: List = []
+                if get_model().weight_cache_mode == "daemon":
+                    weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
+                        server_args
+                    )
+            except BaseException:
+                restore_context(context_before_publish)
+                raise
 
-        # Launch scheduler processes
-        # Passed only when there is one: this hook is an override point, and a
-        # subclass written against the three-argument signature must keep working.
-        launch_kwargs = (
-            {"placement_group": placement_group} if placement_group is not None else {}
-        )
-        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func, **launch_kwargs
-        )
+            # Launch scheduler processes
+            # Passed only when there is one: this hook is an override point, and a
+            # subclass written against the three-argument signature must keep working.
+            launch_kwargs = (
+                {"placement_group": placement_group}
+                if placement_group is not None
+                else {}
+            )
+            scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
+                server_args, port_args, run_scheduler_process_func, **launch_kwargs
+            )
         scheduler_init_result.engine_info_bootstrap_server = (
             engine_info_bootstrap_server
         )
