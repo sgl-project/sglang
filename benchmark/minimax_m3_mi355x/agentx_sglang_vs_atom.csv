@@ -1,0 +1,17 @@
+series,concurrency,total_tok_s_per_gpu,window_tok_s_per_gpu,interactivity_p90,interactivity_p50
+SGLang · real acceptance,1,3565,3565,131.2,158.7
+SGLang · real acceptance,8,10864,11021,119.8,160.2
+SGLang · real acceptance,24,34720,34785,73.8,129.1
+SGLang · real acceptance,32,35935,39083,47.3,99.5
+SGLang · forced acceptance (ATOM parity),1,4194,4194,244.0,262.8
+SGLang · forced acceptance (ATOM parity),8,11168,11332,178.4,230.3
+SGLang · forced acceptance (ATOM parity),24,38196,38457,99.1,201.7
+SGLang · forced acceptance (ATOM parity),32,40598,43956,66.9,152.9
+ATOM published,1,4845,,256.5,
+ATOM published,2,5050,,257.6,
+ATOM published,8,14047,,198.8,
+ATOM published,10,16756,,188.6,
+ATOM published,15,22025,,163.1,
+ATOM published,20,32870,,121.2,
+ATOM published,24,39680,,106.9,
+ATOM published,32,42476,,58.0,
