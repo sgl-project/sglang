@@ -56,11 +56,22 @@ def _make_req(prompt_len=1500, session=None):
 
 
 def _make_scheduler():
-    return SimpleNamespace(
+    """One stub for both halves.
+
+    `retire_unadmitted_request` is a spy wrapping the real method, so a door
+    test still asserts the call *and* runs the body -- otherwise the doors and
+    the retirement are only ever tested apart, and a step missing from the
+    retirement passes every door test.
+    """
+    sched = SimpleNamespace(
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
-        retire_unadmitted_request=MagicMock(),
+        _release_aborted_request=MagicMock(),
     )
+    sched.retire_unadmitted_request = MagicMock(
+        side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
+    )
+    return sched
 
 
 def _prefill_queue(sched):
@@ -201,6 +212,38 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     else:
                         q._create_receiver_and_enqueue.assert_called_once()
 
+    def test_preempted_reentry_is_not_retired(self):
+        """Preemption requeues through a bare `_add_request_to_queue`.
+
+        The door sees no flag at all, and `release_req` -> `reset_for_retract`
+        is the only thing that marks the request. The resource markers miss
+        this shape on their own: the KV row is already freed and
+        `retraction_backup` is never taken for `seqlen <= 1`.
+        """
+        for door in ("prefill", "decode"):
+            with self.subTest(door=door):
+                req = _make_req(prompt_len=16)
+                req.to_finish = FINISH_ABORT(
+                    "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                req.is_retracted = True
+                # Exactly what a short preemption leaves behind.
+                self.assertFalse(req.kv.holds_kv)
+                self.assertIsNone(req.kv.retraction_backup)
+                self.assertEqual(req.metadata_buffer_index, -1)
+                self.assertFalse(is_unadmitted_reject(req))
+
+                sched = _make_scheduler()
+                if door == "prefill":
+                    q = _prefill_queue(sched)
+                    _admit_prefill(q, req)
+                    self.assertEqual(q.queue, [req])
+                else:
+                    q = _decode_queue(sched)
+                    _admit_decode(q, req)
+                    q._create_receiver_and_enqueue.assert_called_once()
+                sched.retire_unadmitted_request.assert_not_called()
+
     def test_valid_request_still_admitted(self):
         for door in ("prefill", "decode"):
             with self.subTest(door=door):
@@ -250,11 +293,12 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req = _make_req(session=session)
         req.set_finish_with_abort(ERROR_MSG)
 
-        sched = SimpleNamespace(
-            output_streamer=MagicMock(), beam_coordinator=MagicMock()
-        )
+        sched = _make_scheduler()
         Scheduler.retire_unadmitted_request(sched, req)
 
+        # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
+        # before the door, and only this call clears it again.
+        sched._release_aborted_request.assert_called_once_with(req.rid)
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
@@ -271,9 +315,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req = _make_req(session=session)
         req.set_finish_with_abort(ERROR_MSG)
 
-        sched = SimpleNamespace(
-            output_streamer=MagicMock(), beam_coordinator=MagicMock()
-        )
+        sched = _make_scheduler()
         Scheduler.retire_unadmitted_request(sched, req)
 
         session.abort_req.assert_not_called()

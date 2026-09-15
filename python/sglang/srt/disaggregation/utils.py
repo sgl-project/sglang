@@ -1709,18 +1709,24 @@ def is_unadmitted_reject(req: Req) -> bool:
 
     A preempted or resumed request can also carry a pending abort -- "Abort
     method 3" marks a *running* request and `filter_batch` does not drop it,
-    since `finished()` is still False -- but it re-enters owning KV, a metadata
-    buffer or a host retraction backup, whose release its queue owns.
+    since `finished()` is still False -- and its queue owns the release of
+    whatever it still holds.
 
-    This only sniffs state, so it cannot stand alone where the caller already
-    says what it is doing: `DecodePreallocQueue.add` gates on its own
-    `is_retracted` / `is_rebootstrap` flags, because a retracted decode request
-    has none of these markers left -- `release_req` has already freed its KV,
-    its metadata buffer lives on `DecodeRequest`, and `retraction_backup` is
-    unset for a short sequence.
+    `req.is_retracted` catches the two re-entries that declare nothing:
+    priority preemption and the pause/retract-all path both requeue through a
+    bare `_add_request_to_queue`. `release_req` always calls
+    `reset_for_retract`, which sets it, and its clear sites all run downstream
+    of these doors. The resource markers stay as a second line of defence --
+    on their own they miss a `seqlen <= 1` preemption, whose KV is already
+    freed and whose `retraction_backup` was never taken.
+
+    `DecodePreallocQueue.add` still gates on its own `is_retracted` /
+    `is_rebootstrap` parameters as well, since they state the caller's intent
+    rather than inferring it.
     """
     return is_aborted(req) and not (
-        req.kv.holds_kv
+        req.is_retracted
+        or req.kv.holds_kv
         or req.kv.holds_mamba
         or req.metadata_buffer_index >= 0
         or req.kv.retraction_backup is not None

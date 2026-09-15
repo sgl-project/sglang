@@ -3163,7 +3163,15 @@ class Scheduler(
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
         # checks that reject; no-op when the request has no group.
         self.beam_coordinator.retire_group(req)
-        reason = req.to_finish or req.finished_reason
+        # PREFILL runs `_prefetch_kvcache` before its door, so even the
+        # one-token stub is registered with the cache by now:
+        # `prefetch_from_storage` arms the paced-retry set on its too-short
+        # path. Only `release_aborted_request` and a `waiting_queue` sweep
+        # clear that, and a retired request reaches neither.
+        self._release_aborted_request(req.rid)
+        # `update_finish_state` returns early once `finished()`, so an already
+        # set `finished_reason` is what the client receives; report the same.
+        reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
