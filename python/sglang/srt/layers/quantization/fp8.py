@@ -1032,15 +1032,15 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-        if is_cpu:
-            assert _is_cpu_amx_available, (
-                "Fp8LinearMethod on CPU requires that CPU has AMX support"
-            )
-            layer.weight = Parameter(
-                layer.weight.data.t().contiguous(), requires_grad=False
-            )
-            _amx_process_weight_after_loading(layer, ["weight"])
-            return
+            if _is_cpu:
+                assert _is_cpu_amx_available, (
+                    "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                )
+                layer.weight = Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+                return
 
         if self.use_marlin:
             if self.block_quant:
