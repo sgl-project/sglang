@@ -4002,6 +4002,28 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         self.full_kv_pool.set_index_k_buffer(layer_id, loc, index_k)
 
+    @property
+    def index_k_scale_buffer(self):
+        return getattr(self.full_kv_pool, "index_k_scale_buffer", None)
+
+    @property
+    def indexer_hadamard_128(self):
+        return getattr(self.full_kv_pool, "indexer_hadamard_128", None)
+
+    def get_index_k_scale_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_scale_buffer(layer_id)
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+    ):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_index_k_scale_buffer(layer_id, loc, scale)
+
 
 class MLATokenToKVPool(KVCache):
     def __init__(

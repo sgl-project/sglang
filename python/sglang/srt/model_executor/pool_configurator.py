@@ -50,8 +50,11 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -368,6 +371,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.utils.common import is_npu_atlas_a5
+
+            dtype = kvc.kv_cache_dtype
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_atlas_a5():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
