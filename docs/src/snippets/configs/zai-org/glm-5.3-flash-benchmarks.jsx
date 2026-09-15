@@ -1,4 +1,5 @@
 export const benchmarks = [
+  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "low-latency" },
     sglang_version: "d6ab04bdf1",
@@ -35,37 +36,86 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "b3dc0388ed",
     latencyPercentile: "Mean",
     speed: [
       {
         workload: {
           dataset: "random",
-          isl: 1024,
-          osl: 256,
+          isl: 1000,
+          osl: 1000,
           max_concurrency: 1,
-          num_prompts: 8,
+          num_prompts: 80,
         },
-        ttft_ms: 211.25,
-        tpot_ms: 3.65,
-        tokens_per_sec_per_gpu: 279.53,
+        ttft_ms: 204.79,
+        tpot_ms: 2.0,
+        tokens_per_sec_per_gpu: 227.06,
       },
       {
         workload: {
           dataset: "random",
-          isl: 1024,
-          osl: 256,
+          isl: 1000,
+          osl: 1000,
           max_concurrency: 16,
           num_prompts: 80,
         },
-        ttft_ms: 609.9,
-        tpot_ms: 6.25,
-        tokens_per_sec_per_gpu: 2317.35,
+        ttft_ms: 367.48,
+        tpot_ms: 4.8,
+        tokens_per_sec_per_gpu: 1492.93,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1000,
+          osl: 1000,
+          max_concurrency: 80,
+          num_prompts: 80,
+        },
+        ttft_ms: 1243.26,
+        tpot_ms: 6.28,
+        tokens_per_sec_per_gpu: 4487.92,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8000,
+          osl: 1000,
+          max_concurrency: 1,
+          num_prompts: 80,
+        },
+        ttft_ms: 237.02,
+        tpot_ms: 1.95,
+        tokens_per_sec_per_gpu: 1029.64,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8000,
+          osl: 1000,
+          max_concurrency: 16,
+          num_prompts: 80,
+        },
+        ttft_ms: 986.68,
+        tpot_ms: 5.16,
+        tokens_per_sec_per_gpu: 5550.31,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8000,
+          osl: 1000,
+          max_concurrency: 80,
+          num_prompts: 80,
+        },
+        ttft_ms: 7085.4,
+        tpot_ms: 11.65,
+        tokens_per_sec_per_gpu: 8557.31,
       },
     ],
     notes:
-      "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,853.88 aggregate output tok/s — 1.6% above the BF16 + TileLang Low Latency row, with mean TPOT 6.25 ms vs 6.43 ms. Draft and target full-graph capture succeeded for this combination. The speed rows were measured with the NEXTN spelling and --disable-shared-experts-fusion, which resolve to the same runtime path as the published command on this tree. Re-verified on the current release image (tree fe236ea6c3) within 1.5% on 4x GB300; the concurrency-1 entry (8 requests) comes from that re-run.",
+      "The published Low Latency command with FP8 KV + TRT-LLM DSA (TP4, EP1, flashinfer_trtllm MoE, fixed MTP 5/1/6 with natural acceptance) on 4x GB300, zai-org/GLM-5.3-Flash (eb9eb208eb0d) on upstream main b3dc0388ed with FlashInfer 0.6.18, measured in the 2026-09 GLM-5.3-Flash perf campaign (run 20260911_glm53flash_vs_vllm, lane sglang-mtp-trtllm-ep1). Each row is 80 ShareGPT-length random-token requests over streaming /v1/completions with ignore_eos, temperature 0, seed 42, prefix cache disabled, --context-length 16384, --max-running-requests 80, --cuda-graph-max-bs-decode 80 and --mem-fraction-static 0.90; chat is 1,000 input / 1,000 output tokens and summarization 8,000 / 1,000. TTFT and TPOT are per-run means; c16 and c80 are the median of two runs, c1 a single run. Aggregate output tok/s: chat 454.11 / 2,985.85 / 8,975.84 and summarization 457.62 / 2,466.80 / 3,803.25 at concurrency 1 / 16 / 80, at accept lengths of 5.98 / 5.98 / 4.7 (chat) and 6.0 / 6.0 / 4.5 (summarization). In the same campaign, fixed-depth MTP drafting measured 8,490.07 chat c80 tok/s against 3,664.53 for adaptive drafting on the TP4/EP4 deep_gemm command, and EP1 + flashinfer_trtllm then improved every cell over that fixed-depth command by 4.4-13.6%. The campaign's GSM8K natural-stop gate (all 1,319 problems, reasoning effort low, 8,192 max tokens, temperature 1.0 / top_p 0.95) ran these launch flags on eleven source candidates and every run stopped naturally on all 1,319 problems at 90.8-92.7%; that protocol differs from the thinking-mode GSM8K behind the accuracy figures on this page.",
   },
+  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4", quant: "fp8" },
     sglang_version: "d6ab04bdf1",
@@ -87,6 +137,7 @@ export const benchmarks = [
     notes:
       "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,680.61 aggregate output tok/s at a 3.937 accept length — about 10% below the non-DCP FP8 Low Latency row. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch. Re-verified on the current release image (tree fe236ea6c3) within 1.3% on 4x GB300.",
   },
+  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4", quant: "fp8" },
     sglang_version: "d6ab04bdf1",
@@ -108,6 +159,7 @@ export const benchmarks = [
     notes:
       "The Low Latency recipe with BF16 KV + TileLang DSA and DCP4 on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,565.8 aggregate output tok/s at a 3.90 accept length. TileLang DSA DCP decode needs the LSE fix that ships in the current release image. Re-verified on the current release image (tree fe236ea6c3) within 1.3% on 4x GB300.",
   },
+  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "high-throughput" },
     sglang_version: "d6ab04bdf1",
@@ -154,6 +206,7 @@ export const benchmarks = [
     notes:
       "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) on the current release-image tree (d6ab04bdf1), speculative decoding off, after two discarded warmups per row: 1,161.22 / 2,660.24 / 4,828.33 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens). The server ran exactly the published cell command. Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,202.07 / 2,696.20 / 4,634.47 tok/s — within 4% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised. Re-verified on the current release image (tree fe236ea6c3) within 1.5% on 4x GB300.",
   },
+  // TODO: speed measured on the earlier TP4/EP4 deep_gemm command; re-measure on the current recipe.
   {
     match: { hw: "gb300", strategy: "high-throughput", kvDsaPair: "fp8-trtllm", quant: "fp8" },
     sglang_version: "d6ab04bdf1",
@@ -200,6 +253,7 @@ export const benchmarks = [
     notes:
       "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), same protocol as the BF16 rows: 1,227.07 / 2,738.61 / 4,977.02 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.9–5.7% above BF16 + TileLang across the curve, and the FP8 pool holds 12.6M tokens per rank vs 7.0M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,263.85 / 2,763.31 / 4,773.95 tok/s — within 5% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised. Re-verified on the current release image (tree fe236ea6c3) within 1.5% on 4x GB300.",
   },
+  // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
   {
     match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4", kvDsaPair: "bf16-tilelang" },
     sglang_version: "fe236ea6c3",
@@ -280,6 +334,7 @@ export const benchmarks = [
     notes:
       "RadixArk/GLM-5.3-Flash-NVFP4 with speculative decoding off — same checkpoint, image, and 4x GB300 measurement stack as the NVFP4 Low Latency row (ModelOpt 0.46.0 NVFP4 W4A4, abs-max, group size 16; MoE and dense MLPs in FP4, attention/router/MTP/embeddings BF16). Accuracy is a checkpoint-level result carried from that arm: GSM8K 97.14% over the full 1,319-example split x 4 seeds (per-seed range 96.89-97.42%, stop rate 99.85-100%) and AIME 2026 92.45% (30 problems x 16 repeats x 4 seeds, per-seed range 91.67-93.54%). Those runs used the NEXTN spelling of --speculative-algorithm on the adaptive-MTP arm, which resolves to the same runtime path as the published EAGLE command. Speed measured on 4x GB300 with the current release image (tree fe236ea6c3): 80 / 320 / 1,280 random requests at concurrency 16 / 64 / 256 (1,024 input / 256 output tokens) produced 1,352.86 / 3,291.36 / 5,919.49 aggregate output tok/s after two discarded warmups — at or above B300 parity, and above the FP8 gb300 High Throughput row at c256 (5,919.49 vs 4,828.33), as expected for W4A4.",
   },
+  // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
   {
     match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4", kvDsaPair: "fp8-trtllm" },
     sglang_version: "fe236ea6c3",
@@ -358,6 +413,7 @@ export const benchmarks = [
     notes:
       "FP8 KV + TRT-LLM DSA pairing of the NVFP4 recipe with speculative decoding off — same TP4-only flashinfer_cutlass stack as the NVFP4 fp8-trtllm Low Latency row. Speed measured on 4x GB300 with the current release image (tree fe236ea6c3): 80 / 320 / 1,280 random requests at concurrency 16 / 64 / 256 (1,024 input / 256 output tokens) produced 1,439.25 / 3,428.58 / 6,150.46 aggregate output tok/s after two discarded warmups — at or above B300 parity, and above the FP8 gb300 High Throughput row at c256 (6,150.46 vs 4,977.02), as expected for W4A4.",
   },
+  // TODO: speed measured with adaptive MTP; re-measure with fixed MTP 5/1/6.
   {
     match: { hw: "h100", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
@@ -413,6 +469,7 @@ export const benchmarks = [
     notes:
       "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
   },
+  // TODO: speed measured on the earlier TP8/EP8 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "b200", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
@@ -454,6 +511,7 @@ export const benchmarks = [
     notes:
       "Full GSM8K (all 1,319 problems) on 8x B200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27% for the recommended selection; 96.97-97.35% across all 8 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
   },
+  // TODO: speed measured on the earlier TP8/EP8 deep_gemm command with adaptive MTP; re-measure on the current recipe.
   {
     match: { hw: "b300", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
