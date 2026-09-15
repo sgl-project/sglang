@@ -42,8 +42,11 @@ class SWAKVPool(BaseSWAKVPool):
         swa_kv_pool_class: Optional[type] = None,
         full_kv_pool_kwargs: Optional[dict] = None,
         swa_kv_pool_kwargs: Optional[dict] = None,
+        *,
+        dcp_sharded: bool = False,
         **kwargs,
     ):
+        self.dcp_sharded = dcp_sharded
         self.size = size
         self.size_swa = size_swa
         self.dtype = dtype
@@ -93,12 +96,14 @@ class SWAKVPool(BaseSWAKVPool):
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
+            dcp_sharded=dcp_sharded,
             **full_kv_pool_kwargs,
         )
         self.swa_kv_pool = swa_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
+            dcp_sharded=dcp_sharded,
             **swa_kv_pool_kwargs,
         )
         self.dsa_kv_cache_store_fp8 = False
