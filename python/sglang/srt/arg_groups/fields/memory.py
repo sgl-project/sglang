@@ -41,8 +41,12 @@ class Memory(msgspec.Struct):
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            resolvable=True,
         ),
     ] = "lru"
+    # The value alone cannot distinguish the default from an explicit LRU
+    # choice, which model-specific defaults must preserve.
+    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -78,8 +82,10 @@ class Memory(msgspec.Struct):
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends; not yet compatible with PD disaggregation or speculative "
-        "decoding.",
+        "backends. PD disaggregation is supported over mooncake at equal "
+        "attention TP with pp=1; not yet compatible with hierarchical / "
+        "host-tiered KV cache, prefill cuda-graph capture, or speculative "
+        "decoding other than DSPARK.",
     ] = False
     enable_session_radix_cache: A[
         bool,
@@ -139,11 +145,12 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
                 "sim",
                 "mooncake",
+                "npu_memcache",
                 "hf3fs",
                 "nixl",
                 "aibrix",
