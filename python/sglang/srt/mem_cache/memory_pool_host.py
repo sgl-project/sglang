@@ -77,6 +77,8 @@ class LogicalHostPool:
         self.start_layer = 0
         self.end_layer = 0
         self.kv_buffer = None
+        # No backing tensor to pin, but storage backends read this like any host pool.
+        self.pin_memory = False
         self.size_per_token = 0
         self.allocator = None
         self.can_use_write_back_jit = True
