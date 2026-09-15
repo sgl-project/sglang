@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=540, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=369, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
@@ -51,7 +51,7 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "120000",
                 "--chunked-prefill-size",
                 "2048",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",

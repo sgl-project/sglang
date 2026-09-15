@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -40,17 +41,30 @@ struct C1Params {
 /// the fp8 amax reduction requires every lane in its full-warp mask to participate.
 constexpr uint32_t kC1VecSize = 2;
 
-/// \brief RMSNorm + RoPE tail + fp4 fake-quant + the 584-byte FlashMLA store.
+/// \brief RMSNorm + RoPE tail + fp4 fake-quant + the FlashMLA store.
 ///
 /// One CTA per token, `kHeadDim / kC1VecSize` threads over the row.
 ///
 /// The three reductions have three different widths and are not
 /// interchangeable: the RMSNorm statistic spans the row, an fp8 store scale
 /// spans 64 elements, an fp4 block spans 16. All asserted below.
-template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, int32_t kPageBits, typename PosT, typename LocT>
+///
+/// kLayout is the cache's page format. V4 (584 B/token) and V41 (528 B/token,
+/// fp8 with per-32 scales) store the fake-quantized value; V41_FP4 (288 B/token)
+/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding
+/// happens once and no fp8 rounding follows it.
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    int32_t kPageBits,
+    typename PosT,
+    typename LocT,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
 __global__
 __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __grid_constant__ C1Params params) {
   using namespace device;
+  using deepseek_v4::KVLayout;
   using deepseek_v4::fp8::cast_to_ue8m0;
   using deepseek_v4::fp8::inv_scale_ue8m0;
   using deepseek_v4::fp8::pack_fp8;
@@ -63,8 +77,8 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
   constexpr uint32_t kRowWarps = kRowLanes / kWarpThreads;
   constexpr uint32_t kFp8Lanes = 64 / kVecSize;
   constexpr uint32_t kFp4Lanes = deepseek_v4::fp4::kCompressedKVBlockSize / kVecSize;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
-  static_assert(kHeadDim == 512 && kRopeDim == 64, "the 584-byte layout requires (512, 64)");
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  static_assert(kHeadDim == 512 && kRopeDim == 64, "the FlashMLA layouts require (512, 64)");
   static_assert(kHeadDim % kVecSize == 0 && kVecSize % 2 == 0);
   static_assert(kRowLanes % kWarpThreads == 0, "a token owns a whole number of warps");
   static_assert(kNopeLanes % kFp8Lanes == 0, "the nope part must end on an fp8 scale block");
@@ -125,8 +139,6 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
     }
   }
 
-  // Publish the pre-RoPE latent before the PDL trigger for the index-K `wk` GEMM.
-  // Padded rows publish a latent too; the caller discards it.
   latent.store(params.kv_output + row * kHeadDim, tx);
   PDLTriggerSecondary<kUsePDL>();
 
@@ -158,6 +170,14 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
     }
   }
 
+  if constexpr (kLayout == KVLayout::V41_FP4) {
+    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
+    // fake quantization, minus the dequantization.
+    if (out_loc <= 0) return;
+    const auto kv_row = Paged::row(params.kvcache, out_loc);
+    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
+  }
+
   // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
   {
     float amax = fabsf(data[0]);
@@ -179,10 +199,14 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
   // and must publish nothing: at ratio 1 the compressed slot *is* the FULL
   // slot, so there is nothing to divide and no other marker to read.
   if (out_loc <= 0) return;
-  const int32_t page = out_loc >> kPageBits;
-  const int32_t slot = out_loc & ((1 << kPageBits) - 1);
-  const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + slot * 576;
+  const auto kv_row = Paged::row(params.kvcache, out_loc);
+
+  if constexpr (kLayout == KVLayout::V41) {
+    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
+  }
+
+  const auto value_ptr = kv_row.data;
 
   if (tx >= kNopeLanes) {
     bf16_vec_t rope_out;
@@ -207,24 +231,23 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
       nope_out[i] = pack_fp8(data[i * 2 + 0] * inv_scale, data[i * 2 + 1] * inv_scale);
     }
     nope_out.store(value_ptr, tx);
-    if (tx % kFp8Lanes == 0) {
-      (page_ptr + (576 << kPageBits) + slot * 8)[tx / kFp8Lanes] = scale_ue8m0;
-    }
+    kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
   }
 }
 
 /// \brief Host side of `flash_c1_decode_kernel`.
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
 struct FlashC1DecodeKernel {
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
-  static constexpr int64_t kPageBytes = host::div_ceil(584ll * kPageSize, 576) * 576;
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static constexpr uint32_t kBlockSize = kHeadDim / kC1VecSize;
 
   static_assert(std::has_single_bit(kPageSize), "the page/slot split needs a power-of-two page");
   static_assert(kBlockSize % device::kWarpThreads == 0 && kBlockSize <= 1024);
+  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
 
   template <typename PosT, typename LocT>
-  static constexpr auto kernel = flash_c1_decode_kernel<kUsePDL, kHeadDim, kRopeDim, kPageBits, PosT, LocT>;
+  static constexpr auto kernel = flash_c1_decode_kernel<kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
 
   /// \brief The (`positions`, `out_loc`) dtype pair, resolved at run time.
   static auto select(const bool pos_i32, const bool loc_i32) {
@@ -232,7 +255,7 @@ struct FlashC1DecodeKernel {
     return loc_i32 ? kernel<int64_t, int32_t> : kernel<int64_t, int64_t>;
   }
 
-  /// \brief RMSNorm + RoPE + fp4 fake-quant + the 584-byte store, one launch.
+  /// \brief RMSNorm + RoPE + fp4 fake-quant + the FlashMLA store, one launch.
   ///
   /// \param kv_input `[num_tokens, kHeadDim]` bf16, the `wkv` projection.
   /// \param kv_output `[num_tokens, kHeadDim]` bf16, the pre-RoPE latent.
@@ -292,5 +315,8 @@ struct FlashC1DecodeKernel {
         .enable_pdl(kUsePDL)(k, params);
   }
 };
+
+// ensure that C++ wrapper can work
+using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang

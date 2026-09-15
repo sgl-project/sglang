@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=301, stage="base-b", runner_config="2-gpu-large")
 
 SWA_MODEL = "openai/gpt-oss-20b"
 
@@ -35,7 +35,7 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.7",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )

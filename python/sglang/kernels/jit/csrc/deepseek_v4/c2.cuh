@@ -9,6 +9,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -50,19 +51,33 @@ constexpr uint32_t kC2VecSize = 2;
 /// An odd position completes a group with its even predecessor; an even one
 /// parks itself in the state.
 ///
+/// Target-verify runs that same schedule with `draft_len` consecutive positions
+/// per request instead of one, so a row's partner is usually the row before it
+/// in `kv_input` rather than the ring. That is the whole difference, and a 2D
+/// grid answers it without arithmetic: `blockIdx.x` is the position inside the
+/// block, `blockIdx.y` the request.
+///
 /// The three reductions below have three different widths and are not
 /// interchangeable: the RMSNorm statistic spans the row, an fp8 store scale
 /// spans 64 elements, an fp4 block spans 16. All asserted.
+///
+/// kLayout is the cache's page format. V4 (584 B/token) and V41 (528 B/token,
+/// fp8 with per-32 scales) store the fake-quantized value; V41_FP4 (288 B/token)
+/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding
+/// happens once and no fp8 rounding follows it.
 template <
-    bool kUsePDL,
     bool kStore,
+    bool kVerify,
     int64_t kHeadDim,
     int64_t kRopeDim,
     int32_t kPageBits,
     typename PosT,
-    typename LocT>
+    typename LocT,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
 __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const C2Params params) {
   using namespace device;
+  using deepseek_v4::KVLayout;
   using deepseek_v4::fp8::cast_to_ue8m0;
   using deepseek_v4::fp8::inv_scale_ue8m0;
   using deepseek_v4::fp8::pack_fp8;
@@ -74,35 +89,42 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   constexpr uint32_t kNopeThreads = (kHeadDim - kRopeDim) / kVecSize;
   constexpr uint32_t kFp8Lanes = 64 / kVecSize;
   constexpr uint32_t kFp4Lanes = deepseek_v4::fp4::kCompressedKVBlockSize / kVecSize;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
 
   static_assert(kHeadDim == (kVecSize * kCTASize));
   static_assert(kCTASize % kWarpThreads == 0);
   static_assert(kNopeThreads % kFp8Lanes == 0, "the nope part must end on an fp8 scale block");
   static_assert(kWarpThreads % kFp8Lanes == 0 && kWarpThreads % kFp4Lanes == 0);
-  static_assert(kHeadDim == 512 && kRopeDim == 64, "the 584-byte layout requires (512, 64)");
+  static_assert(kHeadDim == 512 && kRopeDim == 64, "the FlashMLA layouts require (512, 64)");
   using fp32_vec_t = AlignedVector<float, kVecSize>;
   using bf16_vec_t = AlignedVector<bf16x2_t, kVecSize / 2>;
 
   const auto tx = threadIdx.x;
-  const auto row = blockIdx.x;
+  // Verify gives each request a CTA column; decode a flat grid of one row each.
+  const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
   // Slots fit in int32 whatever width the scheduler hands them in.
   const auto raw_out_loc = static_cast<int32_t>(static_cast<const LocT*>(params.raw_out_loc)[row]);
   const auto pos = static_cast<const PosT*>(params.positions)[row];
   // A completing row reads the slot left by `pos - 1`;
   // a pending row writes its own slot, so reads and writes stay disjoint.
-  const auto ring = static_cast<int64_t>(params.req[row]) * params.ring_size;
-  const auto read_row = ring + (pos - 1 + params.ring_size) % params.ring_size;
-  const auto write_row = ring + pos % params.ring_size;
+  const auto rid = params.req[row];
   PDLWaitPrimary<kUsePDL>();
 
   fp32_vec_t kv_new, score_new;
   kv_new.load(params.kv_input + row * kStride, tx);
   score_new.load(params.kv_input + row * kStride, tx + kCTASize);
 
+  const auto ring = static_cast<int64_t>(rid) * params.ring_size;
+  const auto read_row = ring + (pos - 1 + params.ring_size) % params.ring_size;
+  const auto write_row = ring + pos % params.ring_size;
+
   fp32_vec_t kv_old, score_old;
-  kv_old.load(params.kv_state + read_row * kStride, tx);
-  score_old.load(params.kv_state + read_row * kStride, tx + kCTASize);
+  const float* partner = params.kv_state + read_row * kStride;
+  if constexpr (kVerify) {
+    if (blockIdx.x != 0) partner = params.kv_input + static_cast<int64_t>(row - 1) * kStride;
+  }
+  kv_old.load(partner, tx);
+  score_old.load(partner, tx + kCTASize);
 
   if ((pos & 1) == 0) {
     // padded case
@@ -195,6 +217,15 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
       }
     }
 
+    if constexpr (kLayout == KVLayout::V41_FP4) {
+      // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
+      // fake quantization, minus the dequantization.
+      if (raw_out_loc == 0) return;
+      const int32_t out_loc = raw_out_loc >> 1;
+      const auto kv_row = Paged::row(params.kvcache, out_loc);
+      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+    }
+
     // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
     {
       float amax = fabsf(staged[0]);
@@ -217,10 +248,14 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
     if (raw_out_loc == 0) return;
     // `raw_out_loc / ratio`; ratio 2 makes it a shift.
     const int32_t out_loc = raw_out_loc >> 1;
-    const int32_t page = out_loc >> kPageBits;
-    const int32_t slot = out_loc & ((1 << kPageBits) - 1);
-    const auto page_ptr = params.kvcache + page * kPageBytes;
-    const auto value_ptr = page_ptr + slot * 576;
+    const auto kv_row = Paged::row(params.kvcache, out_loc);
+
+    if constexpr (kLayout == KVLayout::V41) {
+      // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+    }
+
+    const auto value_ptr = kv_row.data;
 
     if (tx >= kNopeThreads) {
       bf16_vec_t rope_out;
@@ -244,26 +279,26 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
         reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx * (kVecSize / 2) + i] =
             pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
       }
-      if (tx % kFp8Lanes == 0) {
-        (page_ptr + (576 << kPageBits) + slot * 8)[tx / kFp8Lanes] = scale_ue8m0;
-      }
+      kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
     }
   }
 }
 
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
 struct FlashC2DecodeKernel {
   static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
-  static constexpr int64_t kPageBytes = host::div_ceil(584ll * kPageSize, 576) * 576;
-  template <bool kStore, typename PosT, typename LocT>
-  static constexpr auto kernel = flash_c2_decode_kernel<kUsePDL, kStore, kHeadDim, kRopeDim, kPageBits, PosT, LocT>;
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
+  template <bool kStore, bool kVerify, typename PosT, typename LocT>
+  static constexpr auto kernel =
+      flash_c2_decode_kernel<kStore, kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
 
   /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <bool kStore>
+  template <bool kStore, bool kVerify>
   static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kStore, int32_t, int32_t> : kernel<kStore, int32_t, int64_t>;
-    return loc_i32 ? kernel<kStore, int64_t, int32_t> : kernel<kStore, int64_t, int64_t>;
+    if (pos_i32) return loc_i32 ? kernel<kStore, kVerify, int32_t, int32_t> : kernel<kStore, kVerify, int32_t, int64_t>;
+    return loc_i32 ? kernel<kStore, kVerify, int64_t, int32_t> : kernel<kStore, kVerify, int64_t, int64_t>;
   }
 
   // The sum of squares is reduced through a fixed-size shared array, so the CTA
@@ -293,10 +328,14 @@ struct FlashC2DecodeKernel {
         eps,
         ring_size,
         std::nullopt,
-        std::nullopt);
+        std::nullopt,
+        /*draft_len=*/1);
   }
 
-  /// \brief Pool + norm + the RoPE tail, fp4 fake-quant and 584-byte store.
+  /// \brief `run_decode_fusion` for a target-verify block.
+  ///
+  /// `draft_len` consecutive positions per request, request-major, which the
+  /// grid reproduces as `draft_len x batch`.
   static void run_decode_fusion(
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_state,
@@ -308,8 +347,21 @@ struct FlashC2DecodeKernel {
       const float eps,
       const tvm::ffi::TensorView freqs_cis,
       const tvm::ffi::TensorView kvcache,
-      const int64_t ring_size) {
-    launch(kv_input, kv_state, kv_output, norm_weight, positions, req, raw_out_loc, eps, ring_size, freqs_cis, kvcache);
+      const int64_t ring_size,
+      const int64_t draft_len) {
+    launch(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        draft_len);
   }
 
  private:
@@ -326,7 +378,8 @@ struct FlashC2DecodeKernel {
       const float eps,
       const int64_t ring_size,
       const MaybeTensor freqs_cis,
-      const MaybeTensor kvcache) {
+      const MaybeTensor kvcache,
+      const int64_t draft_len) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -357,8 +410,11 @@ struct FlashC2DecodeKernel {
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
-    RuntimeCheck(ring_size > 0, "the pair-state ring must have at least one position");
-
+    const auto is_verify = draft_len > 1;
+    CHECK_HOST(ring_size > 0 && draft_len >= 1);
+    CHECK_HOST(!is_verify || num_tokens % draft_len == 0);
+    CHECK_HOST(!is_verify || ring_size > draft_len)
+        << "the pair-state ring (" << ring_size << ") must be wider than the draft length (" << draft_len << ")";
     const auto params = C2Params{
         .kv_input = static_cast<const float*>(kv_input.data_ptr()),
         .kv_state = static_cast<float*>(kv_state.data_ptr()),
@@ -375,16 +431,24 @@ struct FlashC2DecodeKernel {
     // `LaunchKernel` is move-only, so each arm builds its own.
     const auto pos_i32 = pos_dtype.is_type<int32_t>();
     const auto loc_i32 = loc_dtype.is_type<int32_t>();
-    if (store) {
-      const auto k = select<true>(pos_i32, loc_i32);
+    if (is_verify) {
+      const auto block = static_cast<uint32_t>(draft_len);
+      const auto k = select<true, true>(pos_i32, loc_i32);
+      LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(k, params);
+    } else if (store) {
+      const auto k = select<true, false>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     } else {
-      const auto k = select<false>(pos_i32, loc_i32);
+      const auto k = select<false, false>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }
   }
 };
+
+// ensure that C++ wrapper can work
+using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang

@@ -28,7 +28,7 @@ source.
 | Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                                    |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 16` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 16` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
@@ -215,7 +215,7 @@ do
             --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
             --mem-fraction-static 0.8 \
             --chunked-prefill-size 8192 \
-            --cuda-graph-bs 16 \
+            --cuda-graph-bs-decode 16 \
             --disable-radix-cache \
             --max-running-requests 64 \
             --host 0.0.0.0 \

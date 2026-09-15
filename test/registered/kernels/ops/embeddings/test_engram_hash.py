@@ -7,6 +7,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
     engram_hash_ids,
+    engram_hash_ids_and_commit,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -198,6 +199,98 @@ def test_decode_reads_history_through_req_slots():
         starts=None,
         **_common(),
     )
+
+
+def test_decode_commit_writes_live_rows_only():
+    # Live rows commit (token + n - 2 newest predecessors, oldest first); the
+    # padded row (out_cache_loc 0) does not. Hash ids still read the old history.
+    g = torch.Generator().manual_seed(6)
+    bs, slots_total = 5, 9
+    ids = torch.randint(0, VOCAB, (bs,), generator=g)
+    pos = torch.randint(3, 50, (bs,), generator=g)
+    history = torch.randint(
+        0, VOCAB, (slots_total + 1, N - 1), generator=g, dtype=torch.int32
+    )
+    req_slots = torch.tensor([7, 2, 0, 5, 2])  # the padded row 4 aliases live row 1
+    out_loc = torch.tensor([11, 12, 13, 14, 0])
+    kw = _common()
+    before = history.clone()
+    want_ids, want_toks = naive(
+        ids,
+        pos,
+        mode=MODE_DECODE,
+        history=history,
+        num_real=bs,
+        req_slots=req_slots,
+        block=1,
+        row=None,
+        starts=None,
+        **kw,
+    )
+    dev = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in kw.items()}
+    hist_dev = history.cuda()
+    got_ids = engram_hash_ids_and_commit(
+        ids.cuda(),
+        pos.cuda(),
+        history=hist_dev,
+        req_slots=req_slots.cuda(),
+        out_cache_loc=out_loc.cuda(),
+        mm_pad_shift=MM_PAD_SHIFT,
+        **dev,
+    )
+    assert torch.equal(got_ids.cpu(), want_ids)
+    expect = before.clone()
+    for t in range(bs - 1):  # row 4 is padding
+        expect[req_slots[t]] = want_toks[t, : N - 1].flip(0)
+    assert torch.equal(hist_dev.cpu(), expect)
+
+
+def test_decode_commit_across_programs():
+    # 100 rows span four 32-token programs; live rows hold distinct slots and the
+    # padded rows alias live slots, so cross-program read/write order matters.
+    g = torch.Generator().manual_seed(8)
+    bs, slots_total, live = 100, 160, 90
+    ids = torch.randint(0, VOCAB, (bs,), generator=g)
+    pos = torch.randint(3, 50, (bs,), generator=g)
+    history = torch.randint(
+        0, VOCAB, (slots_total + 1, N - 1), generator=g, dtype=torch.int32
+    )
+    live_slots = torch.randperm(slots_total, generator=g)[:live]
+    req_slots = torch.cat([live_slots, live_slots[: bs - live]])  # padded rows alias
+    out_loc = torch.cat(
+        [torch.arange(1, live + 1), torch.zeros(bs - live, dtype=torch.long)]
+    )
+    kw = _common()
+    before = history.clone()
+    dev = {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in kw.items()}
+    hist_dev = history.cuda()
+    got_ids = engram_hash_ids_and_commit(
+        ids.cuda(),
+        pos.cuda(),
+        history=hist_dev,
+        req_slots=req_slots.cuda(),
+        out_cache_loc=out_loc.cuda(),
+        mm_pad_shift=MM_PAD_SHIFT,
+        **dev,
+    )
+    want_ids, want_toks = naive(
+        ids,
+        pos,
+        mode=MODE_DECODE,
+        history=before,
+        num_real=bs,
+        req_slots=req_slots,
+        block=1,
+        row=None,
+        starts=None,
+        **kw,
+    )
+    # Live rows read the old history and hash identically to the oracle.
+    assert torch.equal(got_ids[:live].cpu(), want_ids[:live])
+    expect = before.clone()
+    for t in range(live):
+        expect[req_slots[t]] = want_toks[t, : N - 1].flip(0)
+    assert torch.equal(hist_dev.cpu(), expect)
 
 
 def _extend_batch(g, lens, padded_to):

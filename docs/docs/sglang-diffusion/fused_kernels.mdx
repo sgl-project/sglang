@@ -4,7 +4,7 @@ description: "The fused CUDA/Triton kernels SGLang Diffusion ships, what each on
 tag: "preserve"
 ---
 
-Diffusion transformers and VAEs spend a large share of their non-GEMM time on short elementwise chains — adaLN modulate, residual gating, QK-norm, RoPE, norm epilogues — each of which is a separate kernel launch and a separate HBM round trip in eager PyTorch. SGLang Diffusion replaces these chains with fused kernels under [`sglang/kernels/ops/diffusion`](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/ops/diffusion).
+Diffusion transformers and VAEs spend a large share of their non-GEMM time on short elementwise and selection chains — adaLN modulate, residual gating, QK-norm, RoPE, norm epilogues, and MoE routing — each of which can require several kernel launches and HBM round trips in eager PyTorch. SGLang Diffusion replaces these chains with fused kernels under [`sglang/kernels/ops/diffusion`](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/ops/diffusion).
 
 This page is an inventory: what each kernel fuses, what its numerical contract is, and which models use it. It is not a lever you tune — most of these kernels are on by default and require no flag. The one switch is `--quality`, described below.
 
@@ -17,6 +17,8 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 **Not bit-exact — request-gated.** These differ from eager only at half-precision rounding-order level, but that is enough to matter, so they are mounted only for `quality="extra-high"` and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. The default `quality="lossless"` runs the unmodified reference chain.
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators, and FP8/NVFP4 producers can be part of a model implementation or a separately selected deployment path. They are documented in the inventory, but `quality` does not select or undo those choices.
+
+**Selection-equivalent routing — enabled unconditionally.** LingBot Video's fused group-limited top-k returns the same selected expert-id set as its guarded CUDA `torch.topk(..., sorted=False)` reference chain. The order of those ids is not part of either path's contract. Because the selected experts are unchanged, this path does not depend on the request `quality` tier.
 
 <Note>
 A plain fp32 single-pass norm fusion looks harmless and is not. On ERNIE-Image it moved the 50-step trajectory to 18.83 dB PSNR, which is what motivated the bit-exact rewrite of that path.
@@ -93,19 +95,19 @@ These fusion families mount under both `quality="extra-high"` and
 
 ## Kernel inventory
 
-43 operators are registered in the kernel registry across 47 implementations (some operators carry several backends). Backends are named by provenance, not device: `JIT` compiles under nvcc *and* hipcc, `TRITON` runs on CUDA and ROCm, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, `AOT` comes from the `sgl_kernel` wheel.
+45 operators are registered in the kernel registry across 51 implementations (some operators carry several backends). Backends are named by provenance, not device: `KDA` identifies Kernel Design Agents implementations, `JIT` compiles under nvcc *and* hipcc, `TRITON` identifies Triton sources, `CUTE_DSL` needs CUTLASS, `FLYDSL` is ROCm gfx950 only, and `AOT` comes from the `sgl_kernel` wheel. Per-operator capability metadata determines which devices can load each implementation.
 
 ### Normalization
 
 | Operator | Backend | Contract | Replaces |
 | --- | --- | --- | --- |
 | `rmsnorm_scale_shift` | Triton | bit-exact | RMSNorm + `* (1 + scale) + shift` (4 kernels) |
-| `scale_residual_norm_scale_shift` | Triton / CuTe-DSL / FlyDSL | bit-exact (Triton) | the above plus the preceding `residual + gate * update` |
+| `scale_residual_norm_scale_shift` | KDA / Triton / CuTe-DSL / FlyDSL | bit-exact (Triton) or backend-specific close contract | the above plus the preceding `residual + gate * update` |
 | `scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `layernorm_modulate` | Triton | bit-exact | affine-free LayerNorm + adaLN modulate |
 | `qk_head_layernorm` | Triton | bit-exact | per-head LayerNorm on q/k |
 | `qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
-| `norm_scale_shift` | CuTe-DSL / FlyDSL | fp32 statistics | LN-or-RMS + scale/shift, many broadcast modes |
+| `norm_scale_shift` | KDA / CuTe-DSL / FlyDSL | backend-specific close contract | LN-or-RMS + scale/shift, many broadcast modes |
 | `rmsnorm_scale`, `rmsnorm_tanh_residual` | Triton | bf16-native statistics | `RMSNorm(x) * scale`, `x + tanh(gate) * RMSNorm(y)` |
 | `apply_group_norm_silu` | Triton | close | `GroupNorm + SiLU`, NCHW-contiguous |
 | `group_norm_silu_4d`, `group_norm_silu_rows` | Triton | close | channels-last GroupNorm(+SiLU); what lets a VAE decoder run channels_last end to end with no `nchwToNhwc` transposes |
@@ -116,7 +118,7 @@ These fusion families mount under both `quality="extra-high"` and
 | Operator | Backend | Contract | Replaces |
 | --- | --- | --- | --- |
 | `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
-| `residual_gate_add` | JIT CUDA | bit-exact | `residual + gate * update` |
+| `residual_gate_add` | KDA (JIT CUDA) | bit-exact | `residual + gate * update` |
 | `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
 | `temb_table_slices` | Triton | bit-exact | see note below |
 | `ltx2_ada_values` | Triton | bit-exact | LTX-2 nine-way adaLN value split, slices come out contiguous |
@@ -130,12 +132,12 @@ These fusion families mount under both `quality="extra-high"` and
 | Operator | Backend | Contract | Replaces |
 | --- | --- | --- | --- |
 | `fused_inplace_qknorm_rope` | JIT CUDA | one bf16 rounding step vs the split baseline; exact with `round_norm_before_rope=True` | separate QK-norm kernel + RoPE |
-| `flux2_qkv_epilogue` | JIT CUDA | bit-exact against its selected BF16 reference chain | FLUX.2 QK RMSNorm + RoPE + joint text/image QKV packing |
+| `flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact against its selected BF16 reference chain | FLUX.2 QK RMSNorm + RoPE + joint text/image QKV packing |
 | `qwen_qkv_epilogue` | JIT CUDA | bit-exact against its selected BF16 reference chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes on SM100+ |
 | `rope_rotate_half` | Triton | bit-exact | `chunk` → `cat(-x2, x1)` → two muls + add → `cat(tail)`, about 7 kernels per projection |
 | `interleaved_rope_fp64` | JIT CUDA | bit-exact | paired SANA-Video Q/K RoPE with fp64 tables, about 14 eager kernels |
 | `helios_qk_rope` | JIT CUDA | bit-exact | paired in-place Helios Q/K RoPE with transposed frequency layout |
-| `ltx2_qknorm_split_rope` | JIT CUDA | close (validated on B200) | LTX-2 QK-norm + split RoPE |
+| `ltx2_qknorm_split_rope` | KDA (JIT CUDA) | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
@@ -154,6 +156,12 @@ These fusion families mount under both `quality="extra-high"` and
 | `sparse_linear_attn_fwd` | Triton | block-map, compression, and forward for sparse linear attention |
 | `bigdn` | Triton | Sana-WM bidirectional gated delta-net; the chunkwise form splits phase A along the KV and Z streams so two blocks stay resident per SM, and stores `(I - P)` so phase B's MMA folds the identity-add in |
 
+### MoE routing
+
+| Operator | Backend | Contract | Replaces |
+| --- | --- | --- | --- |
+| `group_limited_topk` | Triton | selected expert-id set matches the guarded CUDA reference; output order is unspecified | LingBot Video's per-group top-2 reduction, group top-k, mask construction, masked expert scores, and final expert top-k |
+
 ### Data movement
 
 Every kernel here only moves values (plus zero fill, plus at most one same-order add), so each is bitwise identical to the aten chain it replaces.
@@ -164,7 +172,7 @@ Every kernel here only moves values (plus zero fill, plus at most one same-order
 | `pack_qkv_destination_major` | Triton | Ulysses destination-major QKV pack |
 | `varlen_pack_qkv`, `varlen_scatter_to_padded` | Triton | varlen gather/scatter around the masked attention path |
 | `varlen_pack_segmented_qkv` | Triton | varlen gather from a virtual prefix/main Q/K/V sequence |
-| `causal_conv3d_cat_pad` | JIT CUDA / Triton | causal Conv3d `cat` + `pad` |
+| `causal_conv3d_cat_pad` | KDA (JIT CUDA) / Triton | causal Conv3d `cat` + `pad` |
 | `cat_pad_channels_last_3d` | Triton | Wan causal VAE `cat + F.pad + contiguous` (three passes plus cache bookkeeping) in one pass |
 | `dup_up3d_add` | Triton | `repeat_interleave + permute().contiguous() + add` |
 
@@ -174,7 +182,8 @@ These kernels preserve the quantized checkpoint path's selected reference operat
 
 | Operator | Backend | Replaces |
 | --- | --- | --- |
-| `flux2_token_cat_fp8` | Triton | FLUX.2 single-block attention/MLP concatenation plus static FP8 quantization |
+| `flux2_layernorm_modulate_fp8_quant` | KDA (Triton) | FLUX.2 LayerNorm plus adaLN modulation directly into static FP8 output |
+| `flux2_token_cat_fp8` | KDA (Triton) | FLUX.2 single-block attention/MLP concatenation plus static FP8 quantization |
 | `flux2_token_cat_nvfp4` | JIT CUDA | FLUX.2 single-block attention/MLP concatenation plus NVFP4 quantization |
 
 ## Coverage by model
@@ -184,7 +193,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Model | Fused paths |
 | --- | --- |
 | FLUX.1 | LN+modulate, modulate, residual-gate add, linear+GELU |
-| FLUX.2 | LN+modulate, packed SwiGLU, gated residual/norm, residual-gate add, QK RMSNorm+RoPE+joint QKV packing, FP8/NVFP4 token-cat producers |
+| FLUX.2 | LN+modulate, fused LN+modulate-to-FP8, packed SwiGLU, gated residual/norm, residual-gate add, QK RMSNorm+RoPE+joint QKV packing, FP8/NVFP4 token-cat producers |
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
@@ -193,7 +202,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
 | LTX-2.5 decoder | paired 3D RoPE with shared axis-table cache |
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
-| LingBot Video MoE | Fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
+| LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |

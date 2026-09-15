@@ -127,6 +127,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         mut result: MatchResult,
+        _last_device_node_idx: NodeIdx_,
+        best_match_node_idx: NodeIdx_,
         _params: &MatchPrefixParams<'_, K>,
         _value_chunks: &[Tensor],
         _best_value_len: usize,
@@ -143,9 +145,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 
         // HiCache: if mamba was evicted from device but has host backup,
         // ensure mamba_host_hit_length >= 1 so load_back is triggered.
-        let last_node = tree_core
-            .arena
-            .node(tree_core.arena.resolve(result.best_match_node_id));
+        let last_node = tree_core.arena.node(best_match_node_idx);
         if !last_node.has_device_value(MAMBA) && last_node.has_host_value(MAMBA) {
             result.mamba_host_hit_length = result.mamba_host_hit_length.max(1);
         }
@@ -178,16 +178,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
-            // Tombstone refill: the node moves from the host LRU to the device LRU.
-            tree_core
-                .arena
-                .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
-            let host_lru = tree_core.host_lru_list_mut(MAMBA);
-            if host_lru.in_list(Some(node_id)) {
-                host_lru.remove_node(node_id);
-            }
-            tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-            tree_core.inc_evictable_size(MAMBA, slot_len);
+            tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
@@ -417,24 +408,19 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        mut result: IncLockRefResult,
+        result: IncLockRefResult,
         lock_host: bool,
     ) -> IncLockRefResult {
         let node = tree_core.arena.node(node_id);
         if node.is_root() {
             return result;
         }
-        // A node in skip_lock_node_ids was a tombstone when this lock was acquired.
-        if !Self::has_value(node, lock_host) {
-            result
-                .skip_lock_node_ids
-                .entry(MAMBA)
-                .or_default()
-                .insert(node.id);
-            return result;
-        }
+        // Tombstones are counted too; ledger/LRU track only data-bearing
+        // nodes (a value materialized under lock is credited to protected
+        // at the materialization site).
+        let has_value = Self::has_value(node, lock_host);
         if lock_host {
-            if node.host_lock_ref(MAMBA) == 0 {
+            if node.host_lock_ref(MAMBA) == 0 && has_value {
                 let host_lru = tree_core.host_lru_list_mut(MAMBA);
                 if host_lru.in_list(Some(node_id)) {
                     host_lru.remove_node(node_id);
@@ -443,7 +429,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.arena.inc_host_lock_ref(node_id, MAMBA);
         } else {
             let value_len = node.device_value_len(MAMBA);
-            if node.device_lock_ref(MAMBA) == 0 {
+            if node.device_lock_ref(MAMBA) == 0 && has_value {
                 tree_core.dec_evictable_size(MAMBA, value_len);
                 tree_core.inc_protected_size(MAMBA, value_len);
             }
@@ -457,43 +443,44 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        _params: &DecLockRefParams,
         lock_host: bool,
     ) {
         if tree_core.arena.node(node_id).is_root() {
             return;
         }
-        if let Some(params) = params
-            && params
-                .skip_lock_node_ids
-                .get(&MAMBA)
-                .is_some_and(|ids| ids.contains(&tree_core.arena.node(node_id).id))
-        {
-            return;
-        }
         if lock_host {
             let node = tree_core.arena.node_mut(node_id);
+            assert!(
+                node.host_lock_ref(MAMBA) > 0,
+                "Mamba release hit host_lock_ref=0 on node {node_id}"
+            );
             node.dec_host_lock_ref(MAMBA);
-            if node.host_lock_ref(MAMBA) == 0
-                && !node.has_device_value(MAMBA)
-                && node.has_host_value(MAMBA)
-            {
-                let host_lru = tree_core.host_lru_list_mut(MAMBA);
-                if !host_lru.in_list(Some(node_id)) {
-                    host_lru.insert_mru(node_id);
+            if node.host_lock_ref(MAMBA) == 0 {
+                if !node.has_device_value(MAMBA) && node.has_host_value(MAMBA) {
+                    let host_lru = tree_core.host_lru_list_mut(MAMBA);
+                    if !host_lru.in_list(Some(node_id)) {
+                        host_lru.insert_mru(node_id);
+                    }
                 }
+                tree_core.update_evictable_leaf_sets_(node_id);
             }
             return;
         }
         let node = tree_core.arena.node(node_id);
         let device_lock_ref = node.device_lock_ref(MAMBA);
-        if device_lock_ref > 0 {
-            if device_lock_ref == 1 {
-                let value_len = node.device_value_len(MAMBA);
-                tree_core.inc_evictable_size(MAMBA, value_len);
-                tree_core.dec_protected_size(MAMBA, value_len);
-            }
-            tree_core.arena.dec_device_lock_ref(node_id, MAMBA);
+        assert!(
+            device_lock_ref > 0,
+            "Mamba release hit lock_ref=0 on node {node_id}"
+        );
+        if device_lock_ref == 1 && node.has_device_value(MAMBA) {
+            let value_len = node.device_value_len(MAMBA);
+            tree_core.inc_evictable_size(MAMBA, value_len);
+            tree_core.dec_protected_size(MAMBA, value_len);
+        }
+        tree_core.arena.dec_device_lock_ref(node_id, MAMBA);
+        if device_lock_ref == 1 {
+            tree_core.update_evictable_leaf_sets_(node_id);
         }
     }
 
@@ -613,16 +600,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     return;
                 };
                 if let Some(device_indices) = &transfer.device_indices {
-                    let node = tree_core.arena.node_mut(node_id);
-                    node.set_device_value(MAMBA, device_indices.copy());
-                    let count = node.device_value_len(MAMBA);
-                    // Move from host LRU to device LRU
-                    let host_lru = tree_core.host_lru_list_mut(MAMBA);
-                    if host_lru.in_list(Some(node_id)) {
-                        host_lru.remove_node(node_id);
-                    }
-                    tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-                    tree_core.inc_evictable_size(MAMBA, count);
+                    // The materialization primitive owns the ledger/LRU moves,
+                    // including crediting protected when restored under lock.
+                    tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.
@@ -643,7 +623,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 let target_node_id = insert_result
                     .as_deref()
                     .and_then(|result| result.inserted_host_node)
-                    .map(|id| tree_core.arena.resolve(id));
+                    .map(|id| {
+                        tree_core
+                            .arena
+                            .resolve(id)
+                            .expect("prefetch insert results must reference live nodes")
+                    });
                 let attach_target = match (host_indices, target_node_id) {
                     (Some(_), Some(target))
                         if loaded && !tree_core.arena.has_host_value(target, MAMBA) =>

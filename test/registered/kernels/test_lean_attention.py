@@ -197,12 +197,12 @@ def _run_pair_fp8(H_Q, H_KV, D, B, S, fp8_dtype, dev="cuda", seed=0):
 def _run_pair_paged(
     H_Q, H_KV, D, B, S, page_size, dev="cuda", dt=torch.float16, seed=0
 ):
-    """Standard vs Lean on a **paged** 4-D KV buffer ``[num_pages, page_size, head, dim]``.
+    """Standard vs Lean with page-aware addressing over a dense 3-D KV buffer.
 
-    The KV cache is stored in pages and addressed through scattered slot ids in ``kv_indices``
-    (a permutation), so the kernel's page-aware address math (``kv_loc // page_size`` /
-    ``kv_loc % page_size``) is genuinely exercised — not the contiguous fast path. Both arms read
-    the identical buffer + indices, so their outputs must agree. Returns (o_std, o_lean).
+    The dense ``[max_slots, head, dim]`` cache is addressed through scattered slot ids in
+    ``kv_indices`` (a permutation). With ``page_size > 1``, the kernel still exercises its
+    page-aware address math (``kv_loc // page_size`` / ``kv_loc % page_size``). Both arms read the
+    identical buffer + indices, so their outputs must agree. Returns (o_std, o_lean).
     """
     torch.manual_seed(seed)
     D_V = D
@@ -212,11 +212,9 @@ def _run_pair_paged(
     assert tot % page_size == 0, (
         "test setup: total tokens must be a multiple of page_size"
     )
-    num_pages = tot // page_size
-
-    # 4-D paged KV buffers [num_pages, page_size, head, dim] (the shared-pool layout).
-    k = torch.randn(num_pages, page_size, H_KV, D, dtype=dt, device=dev)
-    v = torch.randn(num_pages, page_size, H_KV, D_V, dtype=dt, device=dev)
+    # Unified memory exposes dense 3-D KV views even when the allocator uses pages.
+    k = torch.randn(tot, H_KV, D, dtype=dt, device=dev)
+    v = torch.randn(tot, H_KV, D_V, dtype=dt, device=dev)
 
     kv_indptr = torch.arange(0, (B + 1) * S, step=S, device=dev, dtype=torch.int32)
     # Scatter slots across pages so page_id/tok_in_p vary within every BLOCK_N tile.
@@ -312,9 +310,9 @@ class TestLeanAttentionParity(CustomTestCase):
                         )
 
     def test_paged_kv_parity(self):
-        # Lean must read a paged 4-D KV buffer the same way the standard kernel does. Guards
-        # the page-aware address math (kv_loc // page_size, kv_loc % page_size); a regression
-        # to the contiguous-only form would scramble reads and drop cos well below 1.
+        # Lean must apply page-aware address math to dense KV views the same way the standard
+        # kernel does. A regression in kv_loc // page_size or kv_loc % page_size would scramble
+        # the scattered reads and drop cos well below 1.
         for name, H_Q, H_KV, D in GQA_SHAPES:
             for page_size in (16, 64):
                 with self.subTest(model=name, page_size=page_size):

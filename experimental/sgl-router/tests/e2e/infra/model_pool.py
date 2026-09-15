@@ -34,6 +34,18 @@ from .model_specs import get_model_spec
 logger = logging.getLogger(__name__)
 
 
+def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def _get_open_port() -> int:
     """Allocate an ephemeral TCP port in the range [20000, 55535].
 
@@ -72,6 +84,7 @@ class ModelInstance:
     model_id: str
     gpu_ids: list[int] = field(default_factory=list)
     kv_events_endpoint: str | None = None
+    _shutdown_started: bool = field(default=False, init=False, repr=False)
 
     def __enter__(self) -> "ModelInstance":
         return self
@@ -80,16 +93,31 @@ class ModelInstance:
         self.shutdown()
 
     def shutdown(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            try:
-                self.process.send_signal(signal.SIGTERM)
-                try:
-                    self.process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait()
-            except ProcessLookupError:
-                pass
+        if self.process is None or self._shutdown_started:
+            return
+        self._shutdown_started = True
+        pgid = self.process.pid
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            self.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+
+        if _wait_for_process_group_exit(pgid, timeout=30):
+            return
+
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        self.process.wait()
+        if not _wait_for_process_group_exit(pgid, timeout=5):
+            raise RuntimeError(f"worker process group {pgid} did not exit")
 
 
 def spawn_worker(

@@ -48,7 +48,8 @@ sources = [
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",
-    "csrc/elementwise/topk.cu",
+    # Native HIP implementation of the same three ops exposed by topk.cu.
+    "csrc/elementwise/topk.hip",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",

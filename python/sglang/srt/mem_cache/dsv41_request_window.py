@@ -3,6 +3,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -122,11 +123,16 @@ def window_layout(
     )
 
 
-def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size):
+def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout.V4):
+    """Move tokens between two paged buffers of ``layout``: a token is a data row
+    and a scale row (576 + 8 bytes for V4, 512 + 16 for V41, 256 + 32 for V41_FP4)."""
     if not src_loc.numel():
         return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
-    for width, base in ((576, 0), (8, page_size * 576)):
+    for width, base in (
+        (layout.data_bytes, 0),
+        (layout.scale_bytes, page_size * layout.data_bytes),
+    ):
         cols = torch.arange(width, device=src.device)
         values = src[
             src_loc[:, None] // page_size,
@@ -244,6 +250,7 @@ class RequestWindow:
                 src,
                 layout.history_loc,
                 page_size=self.page_size,
+                layout=self.state.kv_layout,
             )
             self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
@@ -261,5 +268,6 @@ class RequestWindow:
             layout.write_loc,
             dst,
             page_size=self.page_size,
+            layout=self.state.kv_layout,
         )
         self.tags[layer, dst] = layout.pos

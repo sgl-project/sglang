@@ -470,6 +470,17 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _dsv4_page_aligned_only(pool: Any) -> bool:
+    """
+    Whether a DeepSeek V4 paged pool may only move whole pages: the
+    token-granular copy (``transfer_cache_dsv4_mla``) splits a token into the
+    576-byte data row and 8-byte scale row of the V4 layout, so pools in the
+    V4.1 fp8 / fp4 layouts (512 + 16 and 256 + 32 bytes) must stay page aligned.
+    """
+    layout = getattr(pool, "kv_layout", None)
+    return layout is not None and layout.value != "v4"
+
+
 @dataclass(frozen=True)
 class _IndexerRegion:
     """One page-contiguous indexer buffer group to mirror on the host."""
@@ -703,6 +714,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -730,6 +742,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
         entries.append(
             build_pool_entry(
@@ -814,6 +827,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -873,8 +887,11 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
     mtp_draft_device_pools = tuple(
-        pool.full_kv_pool for pool in params.mtp_draft_device_pools
+        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
+        for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
@@ -1000,7 +1017,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
-        allocator_type=get_memory().hicache_storage_backend,
+        allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
     )
     entries = [
@@ -1383,7 +1400,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             _build_deepseek_v4_device_pool_group,
         )
 
-        return _build_deepseek_v4_device_pool_group(kvcache, page_size)
+        return _build_deepseek_v4_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1661,7 +1680,9 @@ class _DsaStrategy(StackStrategy):
             _build_dsa_device_pool_group,
         )
 
-        return _build_dsa_device_pool_group(kvcache, page_size)
+        return _build_dsa_device_pool_group(
+            kvcache, page_size, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
@@ -1985,7 +2006,7 @@ def build_minimax_sparse_hicache_stack(
             index_k_pool,
             kv_host_pool,
             get_memory().hicache_mem_layout,
-            allocator_type=get_memory().hicache_storage_backend,
+            allocator_type=_get_allocator_type(),
         )
         entries.append(
             build_pool_entry(

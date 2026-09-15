@@ -48,6 +48,8 @@ class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
 
 def compute_post_capture_kv_resize(
     model_runner: ModelRunner,
+    *,
+    draft_runners: tuple[ModelRunner, ...] = (),
 ) -> PostCaptureKVResize:
     """Resize the KV pool after capture and return the new sizes for the
     orchestrator to assign. Takes the live ModelRunner because it reads
@@ -97,9 +99,19 @@ def compute_post_capture_kv_resize(
         is_multimodal=model_runner.model_config.is_multimodal,
         mm_feature_transport=get_mm().mm_feature_transport,
     )
+    # Sequential target/draft forwards reuse workspace at unchanged capacities.
+    canary_workspace_bytes = max(
+        (
+            runner.canary_manager.per_forward_workspace_bytes()
+            for runner in (model_runner, *draft_runners)
+            if runner.canary_manager is not None
+        ),
+        default=0,
+    )
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
+        - canary_workspace_bytes
     )
     config = model_runner.kv_cache_configurator.config_from_budget(
         budget_bytes, cap_tokens=model_runner.max_total_num_tokens
@@ -107,6 +119,11 @@ def compute_post_capture_kv_resize(
     pool.finalize_backing(config)
     model_runner.token_to_kv_pool_allocator.resize(config)
     model_runner.req_to_token_pool.reset_aux_cache_allocator()
+    if canary_workspace_bytes:
+        logger.info(
+            "Post-capture KV sizing: KV-canary per-forward workspace %.2f GB",
+            canary_workspace_bytes / (1 << 30),
+        )
 
     capped_max_running_requests = None
     if model_runner.max_running_requests is not None:
