@@ -99,10 +99,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
-from sglang.srt.speculative.pp_draft_embedding import (
-    load_draft_embedding_from_checkpoint,
-    resolve_target_embed_and_head,
-)
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -367,19 +364,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _resolve_shared_embed_and_head(self):
         target_runner = self.target_worker.model_runner
-        embed, head = resolve_target_embed_and_head(
-            target_runner.model, is_first_pp_rank=get_pp_group().is_first_rank
+        return resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            is_first_pp_rank=get_pp_group().is_first_rank,
+            pp_size=get_pp_group().world_size,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
         )
-        if embed is None and get_pp_group().world_size > 1:
-            # This stage does not own the target embedding; the draft loads its own
-            # copy from the checkpoint instead of sharing.
-            embed = load_draft_embedding_from_checkpoint(
-                self.draft_runner.model,
-                target_runner.model_config.model_path,
-                revision=target_runner.model_config.revision,
-                download_dir=self.draft_runner.load_config.download_dir,
-            )
-        return embed, head
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
