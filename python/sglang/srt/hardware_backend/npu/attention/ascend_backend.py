@@ -2273,13 +2273,12 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
-            seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
-            if seq_lens_cpu_int is None:
+            if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            elif seq_lens_cpu_int.device.type == "cpu":
-                actual_seq_lengths_kv = seq_lens_cpu_int.int().tolist()
             else:
-                actual_seq_lengths_kv = seq_lens_cpu_int.int()
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
