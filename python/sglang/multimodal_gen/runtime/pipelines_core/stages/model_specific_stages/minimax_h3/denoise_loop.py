@@ -571,6 +571,9 @@ def minimax_h3_denoise_loop(
                     None if adaln_plan_slots is None else adaln_plan_slots[step]
                 ),
             )
+            arm_pdd_step = getattr(model, "arm_pdd_step", None)
+            if arm_pdd_step is not None:
+                arm_pdd_step(step)
             if attn_metadata is not None:
                 attn_metadata.current_timestep = step
             if model_forward is None and attn_metadata is not None:
