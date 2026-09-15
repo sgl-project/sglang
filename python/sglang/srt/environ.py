@@ -368,6 +368,9 @@ class Envs:
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    # Seconds an idle MessageQueue reader keeps spinning on the ring buffer
+    # after its last read before it blocks on the writer's notify socket.
+    SGLANG_RINGBUFFER_BUSY_LOOP_S = EnvFloat(1.0)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
     # When set, get_open_port() and shm_broadcast search upwards from this

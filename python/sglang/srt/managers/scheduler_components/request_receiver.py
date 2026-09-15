@@ -40,7 +40,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
-    broadcast_pyobj,
     point_to_point_pyobj,
 )
 
@@ -197,23 +196,13 @@ class SchedulerRequestReceiver:
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                control_reqs = self.tp_group.broadcast_object(control_reqs, src=0)
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if self.ps.tp_size != 1:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                recv_reqs = self.tp_group.broadcast_object(recv_reqs, src=0)
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
