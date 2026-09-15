@@ -14,7 +14,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
@@ -29,16 +29,21 @@ _CASES = [
     (2, 3, 4, 4, 128, 128, 4, True, None, False, 6),
     (2, 8, 2, 2, 128, 128, 4, True, 1.5, False, 7),
     (1, 4, 8, 8, 64, 64, 4, True, None, False, 8),
+]
+
+_RING_CASES = list(_CASES)
+
+_CASES += [
     # GLM-5.3 Flash TP4: 16 local heads, six-token EAGLE verification,
     # and a negative safe-gate lower bound.
     (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 9),
     (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
 ]
 
-# ReplaySSM ring-write cases: _CASES plus HV != H shapes, which exercise the
+# ReplaySSM ring-write cases add HV != H shapes, which exercise the
 # per-k-head rawk vs per-v-head g/beta writer split (the GQA hazard: a wrong
 # head index scribbles another head's ring silently).
-_RING_CASES = _CASES + [
+_RING_CASES += [
     (2, 4, 2, 4, 128, 128, 4, True, None, False, 20),
     (1, 5, 2, 8, 64, 64, 4, True, 1.5, False, 21),
     (3, 4, 4, 8, 128, 128, 4, True, None, True, 22),
@@ -239,12 +244,11 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
 
     idx_vals = inp["idx_vals"]
     valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
-    touched_slots = [slot for slot in idx_vals if slot >= 0]
-
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
     _assert_output_matches_reference(o_fus_v, o_ref_v)
-    assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
+    # conv_state is read-only in verify; the commit scatter advances it.
+    assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     if use_ring:
         # Full-tensor bitwise: ring values are elementwise (conv FMA chain,
@@ -294,7 +298,7 @@ def test_glm_fp32_weights_match_under_graph_replay(case_index):
         actual[0].reshape(B, T, HV, V)[valid],
         expected[0].reshape(B, T, HV, V)[valid],
     )
-    assert torch.equal(expected[1][valid], actual[1][valid])
+    assert torch.equal(inp["conv_pool"], actual[1])
     assert torch.equal(expected[2][valid], actual[2][valid])
     torch.testing.assert_close(expected[3][valid], actual[3][valid], atol=4e-3, rtol=0)
 

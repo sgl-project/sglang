@@ -12,9 +12,10 @@ two transpose copies the unfused path needs to feed the conv kernel.
 
 Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
-kernels. Requires ``T >= kernel_width - 1`` (the rolled conv state is then
-exactly the last ``kernel_width - 1`` input tokens, matching the reference
-kernel's store).
+kernels. Requires ``T >= kernel_width - 1``.
+
+State: conv_state and the SSM state are read-only. Verify is speculative, and
+the commit scatter advances them from the selected intermediate window.
 
 ReplaySSM (``cache_ring``): instead of per-step [HV, V, K] fp32 state
 snapshots, stash each step's raw inputs (pre-l2norm k, pre-delta v, gate,
@@ -25,8 +26,9 @@ fused_sigmoid_gating_delta_rule_update, so the two paths fill identical rings.
 Numerics: aligned with the unfused pair. The conv output is rounded to the
 activation dtype (bf16) before entering the recurrence — exactly what the
 unfused path does through its intermediate tensor — and all expressions mirror
-the reference kernels line by line. Reduction order still splits differently
-where many V heads share one Q/K head, worth ~1 ulp on the output.
+the reference kernels line by line. A tuned multi-warp launch can use a
+different reduction order than the one-warp reference, worth about one bf16
+ulp on the output.
 """
 
 from typing import Optional
@@ -41,6 +43,8 @@ from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
 # numerics-safe at num_warps=4 (bit-exact vs the BV=32 original).
 KDA_VERIFY_BLOCK_V = 4
+# gfx950, GLM TP4/T=6 or 8 with fp32 conv weights: larger batches benefit from
+# sharing q/k convolution across more V lanes. B <= 2 still prefers BV=4.
 KDA_VERIFY_BLOCK_V_HIP = 16
 
 
@@ -403,19 +407,8 @@ def fused_kda_conv_gating_verify_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
-    # Rolled conv state after consuming T >= W-1 tokens is exactly the last
-    # W-1 input tokens — which are the current window registers. The verify
-    # pass never writes the ssm state back (rollback happens at commit).
-    if is_qk_owner:
-        tl.store(cs_base + q_ch + 0 * stride_cs_tok, q_c0, mask=mask_k)
-        tl.store(cs_base + q_ch + 1 * stride_cs_tok, q_c1, mask=mask_k)
-        tl.store(cs_base + q_ch + 2 * stride_cs_tok, q_c2, mask=mask_k)
-        tl.store(cs_base + k_ch + 0 * stride_cs_tok, k_c0, mask=mask_k)
-        tl.store(cs_base + k_ch + 1 * stride_cs_tok, k_c1, mask=mask_k)
-        tl.store(cs_base + k_ch + 2 * stride_cs_tok, k_c2, mask=mask_k)
-    tl.store(cs_base + v_ch + 0 * stride_cs_tok, v_c0, mask=mask_v)
-    tl.store(cs_base + v_ch + 1 * stride_cs_tok, v_c1, mask=mask_v)
-    tl.store(cs_base + v_ch + 2 * stride_cs_tok, v_c2, mask=mask_v)
+    # No conv-state writeback: verify is speculative, and every V tile reads
+    # the same Q/K history. The commit scatter advances the selected window.
 
 
 def fused_kda_conv_gating_verify(
@@ -443,9 +436,9 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; conv_state
-    # and the conv-window cache stay bit-identical to the reference, the bf16
-    # output within one ulp (the BV=4 tile reduces K in a different order).
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph on CUDA; the
+    # bf16 output stays within about one ulp (BV=4 reduces K in a different
+    # order). ROCm defaults to one wave for the validated GLM shapes.
     # The fp32 intermediate-ssm rollback cache carries that ~1 ulp/step delta
     # through the delta-rule recurrence — measured ~6e-8 at T=4 standard gate
     # (the production MTP shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe
@@ -629,8 +622,7 @@ def fused_kda_conv_gating_verify(
         MAX_CACHE_LEN=max_cache_len,
         CACHE_RING=cache_ring,
         ROUND_CONV_PRODUCTS=is_hip_runtime() and conv_weight.dtype == torch.float32,
-        # num_warps=1 matches the reference kernels' reduction order exactly;
-        # higher values must be re-validated for bit-exactness before use.
+        # The wrapper selects the validated platform-specific default.
         num_warps=num_warps,
         num_stages=3,
         **pdl_kwargs,
