@@ -168,20 +168,16 @@ class SamplingBatchInfo:
                     processor_dict[processor_str] = []
                 processor_dict[processor_str].append(i)
 
-            merged_custom_logit_processor = {
-                hash(processor_str): CustomLogitProcessor.from_str(processor_str)
-                for processor_str in processor_dict
-            }
-            processor_rows = {
-                hash(processor_str): rows
-                for processor_str, rows in processor_dict.items()
-            }
-            processor_indices = {
-                key: torch.tensor(rows, dtype=torch.long, pin_memory=_pin).to(
-                    device, non_blocking=True
+            merged_custom_logit_processor = {}
+            for processor_str, rows in processor_dict.items():
+                key = hash(processor_str)
+                merged_custom_logit_processor[key] = CustomLogitProcessor.from_str(
+                    processor_str
                 )
-                for key, rows in processor_rows.items()
-            }
+                processor_rows[key] = rows
+                processor_indices[key] = torch.tensor(
+                    rows, dtype=torch.long, pin_memory=_pin
+                ).to(device, non_blocking=True)
             custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
