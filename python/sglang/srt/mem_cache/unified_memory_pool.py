@@ -562,7 +562,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
-        dcp_sharded: bool = False,
     ):
         spec = unified_buffer.mha_spec(sub_pool_name)
         k_views, v_views = unified_buffer.mha_views_for(sub_pool_name)
@@ -591,7 +590,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             enable_alt_stream=enable_alt_stream,
             enable_kv_cache_copy=False,
             kv_cache_layout="page_major",
-            dcp_sharded=dcp_sharded,
         )
         self.kernel_page_blocks = spec.blocks_per_page()
 
@@ -682,7 +680,6 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         sub_pool_name: str,
         kv_cache_dtype: torch.dtype,
         page_size: int = 1,
-        dcp_sharded: bool = False,
     ):
         spec = unified_buffer.mla_spec(sub_pool_name)
         store_dtype = _store_dtype_for(kv_cache_dtype)
@@ -710,7 +707,6 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
             layer_num=spec.layer_num,
             device=unified_buffer.device,
             enable_memory_saver=False,  # buffer owned by UnifiedKVPool
-            dcp_sharded=dcp_sharded,
         )
         self.kernel_page_blocks = spec.blocks_per_page()
 
@@ -1237,7 +1233,6 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
     unified_total_bytes: Optional[int] = None,
-    dcp_sharded: bool = False,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_mamba import (
@@ -1341,7 +1336,6 @@ def init_unified_mamba_pools(
             sub_pool_name="full",
             kv_cache_dtype=kv_cache_dtype,
             page_size=page_size,
-            dcp_sharded=dcp_sharded,
         )
     else:
         unified_full_kv_pool = UnifiedMHATokenToKVPool(
@@ -1350,7 +1344,6 @@ def init_unified_mamba_pools(
             page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
     full_attn_layer_ids_for_pool = (
         [0] if is_draft_worker else list(full_attention_layer_ids)
@@ -1368,7 +1361,6 @@ def init_unified_mamba_pools(
         use_mla=use_mla_backend,
         start_layer=start_layer,
         full_kv_pool=unified_full_kv_pool,
-        dcp_sharded=dcp_sharded,
     )
     allocator = UnifiedMambaTokenToKVPoolAllocator(
         unified_buffer=shared_pool,
@@ -1476,10 +1468,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_memory_saver: bool = False,
-        dcp_sharded: bool = False,
     ):
         # Do NOT call super().__init__ — it would allocate static-partition pools.
-        self.dcp_sharded = dcp_sharded
         self.unified_buffer = unified_buffer
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
@@ -1508,7 +1498,6 @@ class UnifiedSWAKVPool(SWAKVPool):
             page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
         self.swa_kv_pool = UnifiedMHATokenToKVPool(
             unified_buffer=unified_buffer,
@@ -1516,7 +1505,6 @@ class UnifiedSWAKVPool(SWAKVPool):
             page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         # disagg/nvlink disabled; keep attrs present to avoid AttributeError.
@@ -1734,7 +1722,6 @@ def init_unified_swa_pools(
     lazy_compaction: bool = False,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
-    dcp_sharded: bool = False,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
@@ -1820,7 +1807,6 @@ def init_unified_swa_pools(
         start_layer=start_layer,
         end_layer=end_layer,
         enable_memory_saver=enable_memory_saver,
-        dcp_sharded=dcp_sharded,
     )
     allocator = UnifiedSWATokenToKVPoolAllocator(
         unified_buffer=shared_pool,
@@ -1912,7 +1898,6 @@ def init_unified_mamba_swa_pools(
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
     decode_pre_alloc_size: int = 0,
-    dcp_sharded: bool = False,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -2023,7 +2008,6 @@ def init_unified_mamba_swa_pools(
         start_layer=start_layer,
         end_layer=end_layer,
         enable_memory_saver=enable_memory_saver,
-        dcp_sharded=dcp_sharded,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
