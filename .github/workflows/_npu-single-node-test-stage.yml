@@ -54,6 +54,10 @@ on:
         description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
         default: '{"size":1,"arr":[0]}'
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event SHA.'
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -92,6 +96,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Check PR test health
         uses: actions/github-script@v8

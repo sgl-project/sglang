@@ -47,7 +47,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
@@ -525,6 +527,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Copy sglang source to covstub
         run: |
