@@ -179,10 +179,12 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        allow_clean_exit: bool = True,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
+        self._allow_clean_exit = allow_clean_exit
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -210,7 +212,7 @@ class SubprocessWatchdog:
 
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
-            if proc.is_alive() or proc.exitcode == 0:
+            if proc.is_alive() or (self._allow_clean_exit and proc.exitcode == 0):
                 continue
 
             logger.error(

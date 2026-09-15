@@ -10,19 +10,11 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import json
-from typing import (
-    Any,
-    Dict,
-    List,
-    Optional,
-)
+from typing import Any, Dict, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import (
-    A,
-    Arg,
-)
+from sglang.srt.arg_groups.arg_utils import A, Arg
 from sglang.srt.utils.common import json_list_type
 
 
@@ -99,6 +91,19 @@ class Serving(msgspec.Struct):
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
         "or SGLANG_GRPC_PORT.",
     ] = None
+    sidecar_scope: A[
+        str,
+        Arg(
+            help="Where to launch the sidecar. 'leader' keeps the gRPC-only "
+            "contract; 'local-telemetry' also launches headless sidecars on nodes "
+            "with local KV-event publishers and requires provider readiness support.",
+            choices=["leader", "local-telemetry"],
+        ),
+    ] = "leader"
+    sidecar_startup_timeout: A[
+        float,
+        "Seconds to wait for provider readiness in local-telemetry mode.",
+    ] = 60.0
     sidecar_args: A[
         Optional[List[str]],
         Arg(

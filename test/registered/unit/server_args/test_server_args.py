@@ -64,9 +64,7 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import (
-    check_two_batch_overlap,
-)
+from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -1504,7 +1502,6 @@ class TestPortArgs(unittest.TestCase):
             PortArgs.init_new(server_args)
 
     def test_init_new_with_single_node_dp_attention(self):
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -2964,6 +2961,29 @@ class TestGrpcServerArgs(CustomTestCase):
         sa = self._args(sidecar="example.sidecar")
         with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
             handle_deprecated_args(sa)
+
+    def test_local_sidecar_configuration(self):
+        valid = dict(
+            sidecar="provider", sidecar_scope="local-telemetry", grpc_port=50051
+        )
+        handle_deprecated_args(self._args(**valid))
+        for changes, message in (
+            ({"sidecar": None}, "requires --sidecar"),
+            ({"sidecar_scope": "invalid"}, "must be leader or local-telemetry"),
+            ({"sidecar_startup_timeout": 0}, "positive and finite"),
+            ({"sidecar_startup_timeout": float("nan")}, "positive and finite"),
+            ({"sidecar_startup_timeout": float("inf")}, "positive and finite"),
+            ({"nnodes": 2}, "require --dist-init-addr"),
+            ({"max_ep_size": 8}, "static DP topology"),
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                handle_deprecated_args(self._args(**(valid | changes)))
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                handle_deprecated_args(self._args(**valid))
 
     def test_sidecar_rejects_legacy_grpc(self):
         sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)

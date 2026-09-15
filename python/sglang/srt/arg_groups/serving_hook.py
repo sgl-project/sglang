@@ -349,6 +349,24 @@ def handle_deprecated_args(server_args: Any):
     # Native gRPC is incompatible with launch paths it doesn't wire into.
     # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
     native_grpc = cfg.grpc_port is not None and not legacy_grpc
+    if cfg.sidecar_scope not in ("leader", "local-telemetry"):
+        raise ValueError("--sidecar-scope must be leader or local-telemetry.")
+    if cfg.sidecar_scope == "local-telemetry":
+        if cfg.sidecar is None:
+            raise ValueError("--sidecar-scope local-telemetry requires --sidecar.")
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "Local sidecars require the Python server with native gRPC; "
+                "SGLANG_RUST_SERVER is not supported."
+            )
+        if not (0 < cfg.sidecar_startup_timeout < float("inf")):
+            raise ValueError("--sidecar-startup-timeout must be positive and finite.")
+        if cfg.nnodes > 1 and not cfg.dist_init_addr:
+            raise ValueError(
+                "Local sidecars on multiple nodes require --dist-init-addr."
+            )
+        if cfg.max_ep_size is not None or cfg.ep_join_mode == "scale":
+            raise ValueError("Local sidecars currently require a static DP topology.")
     if cfg.sidecar_args is not None:
         if cfg.sidecar is None:
             raise ValueError("--sidecar-args requires --sidecar.")

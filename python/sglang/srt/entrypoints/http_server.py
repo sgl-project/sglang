@@ -200,6 +200,7 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    local_kv_event_sources: List = dataclasses.field(default_factory=list)
 
 
 _global_state: Optional[_GlobalState] = None
@@ -407,9 +408,14 @@ async def lifespan(fast_api_app: FastAPI):
                 grpc_port=get_serving().grpc_port,
             )
             if get_serving().sidecar is not None:
-                from sglang.srt.entrypoints.sidecar import start_sidecar
+                from sglang.srt.entrypoints.sidecar import (
+                    build_sidecar_context,
+                    start_sidecar_async,
+                )
 
-                sidecar = start_sidecar()
+                sidecar = await start_sidecar_async(
+                    build_sidecar_context(_global_state.local_kv_event_sources)
+                )
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -2545,6 +2551,7 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    local_kv_event_sources: Optional[List] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
@@ -2556,6 +2563,7 @@ def _setup_and_run_http_server(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
+            local_kv_event_sources=local_kv_event_sources or [],
         )
     )
 
@@ -2873,4 +2881,5 @@ def launch_server(
             subprocess_watchdog,
             execute_warmup_func=execute_warmup_func,
             launch_callback=launch_callback,
+            local_kv_event_sources=scheduler_init_result.local_kv_event_sources,
         )

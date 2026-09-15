@@ -7,9 +7,11 @@ the router can subscribe per replica (the `dp_size` it reads from
 `/server_info`).
 """
 
+import atexit
 import unittest
 
 import msgspec
+import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -25,6 +27,46 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestLocalKvEventSource(CustomTestCase):
+    def publisher(self, **kwargs):
+        publisher = ZmqEventPublisher(**kwargs)
+        atexit.unregister(publisher.shutdown)
+        self.addCleanup(publisher.shutdown)
+        return publisher
+
+    def test_describes_bound_ports_and_concrete_replay_address(self):
+        publisher = self.publisher(
+            attn_dp_rank=0,
+            endpoint="tcp://*:0",
+            replay_endpoint="tcp://127.0.0.1:0",
+            topic="cache-events",
+        )
+        source = publisher.describe_local_source(block_size=64)
+        self.assertEqual(source.dp_rank, 0)
+        self.assertEqual(source.topic, "cache-events")
+        self.assertEqual(source.block_size, 64)
+        self.assertTrue(source.endpoint.startswith("tcp://127.0.0.1:"))
+        self.assertTrue(source.replay_endpoint.startswith("tcp://127.0.0.1:"))
+        self.assertNotEqual(source.endpoint.rsplit(":", 1)[1], "0")
+        self.assertNotEqual(source.replay_endpoint.rsplit(":", 1)[1], "0")
+
+    def test_global_rank_port_offset_comes_from_created_publisher(self):
+        probe = zmq.Context.instance().socket(zmq.PUB)
+        port = probe.bind_to_random_port("tcp://127.0.0.1")
+        probe.close(linger=0)
+        publisher = self.publisher(attn_dp_rank=4, endpoint=f"tcp://*:{port - 4}")
+        source = publisher.describe_local_source(block_size=16)
+        self.assertEqual(source.dp_rank, 4)
+        self.assertEqual(source.endpoint, f"tcp://127.0.0.1:{port}")
+
+    def test_unusable_transport_fails_only_when_local_source_is_requested(self):
+        for endpoint in ("tcp://127.0.0.1:5557", "inproc://local-sidecar-test"):
+            with self.subTest(endpoint=endpoint):
+                publisher = self.publisher(attn_dp_rank=0, endpoint=endpoint)
+                with self.assertRaisesRegex(ValueError, "local-telemetry"):
+                    publisher.describe_local_source(block_size=64)
 
 
 class TestResolveLoadPubRange(CustomTestCase):

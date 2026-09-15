@@ -60,6 +60,10 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.sidecar_context import (
+    KvEventSource,
+    take_local_kv_event_sources,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -165,6 +169,15 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    local_kv_event_sources: List[KvEventSource] = dataclasses.field(
+        default_factory=list
+    )
+    sidecar: Optional[Any] = None
+
+    def stop_sidecar(self) -> None:
+        if self.sidecar is not None:
+            self.sidecar.stop()
+            self.sidecar = None
 
 
 def init_tokenizer_manager(
@@ -934,9 +947,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
+        local_kv_event_sources = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            local_kv_event_sources.extend(take_local_kv_event_sources(infos))
             scheduler_infos.extend(infos)
             if use_dp_controller:
                 for info in infos:
@@ -954,6 +969,7 @@ class Engine(EngineScoreMixin, EngineBase):
         return (
             SchedulerInitResult(
                 scheduler_infos=scheduler_infos,
+                local_kv_event_sources=local_kv_event_sources,
                 all_child_pids=all_child_pids,
                 wait_for_ready=wait_for_ready,
                 block_until_scheduler_exits=block_until_scheduler_exits,
@@ -1159,6 +1175,33 @@ class Engine(EngineScoreMixin, EngineBase):
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
+            if (
+                get_serving().sidecar_scope == "local-telemetry"
+                and scheduler_init_result.local_kv_event_sources
+            ):
+                from sglang.srt.entrypoints.sidecar import (
+                    build_sidecar_context,
+                    start_sidecar,
+                )
+
+                try:
+                    scheduler_init_result.sidecar = start_sidecar(
+                        build_sidecar_context(
+                            scheduler_init_result.local_kv_event_sources
+                        )
+                    )
+                except BaseException:
+                    # Engine.__init__ has not received these handles yet. An
+                    # embedding caller may catch this exception, so reap only
+                    # the processes owned by this failed launch before returning.
+                    for proc in scheduler_procs or []:
+                        kill_process_tree(proc.pid, wait_timeout=60)
+                    cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                    raise
+                scheduler_init_result.all_child_pids.append(
+                    scheduler_init_result.sidecar.proc.pid
+                )
+
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
@@ -1174,14 +1217,16 @@ class Engine(EngineScoreMixin, EngineBase):
             rust_server_owns_base_port = (
                 envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             )
-            if not rust_server_owns_base_port:
-                launch_dummy_health_check_server(
-                    get_serving().host,
-                    get_serving().port,
-                    get_observability().enable_metrics,
-                )
-
-            scheduler_init_result.block_until_scheduler_exits()
+            try:
+                if not rust_server_owns_base_port:
+                    launch_dummy_health_check_server(
+                        get_serving().host,
+                        get_serving().port,
+                        get_observability().enable_metrics,
+                    )
+                scheduler_init_result.block_until_scheduler_exits()
+            finally:
+                scheduler_init_result.stop_sidecar()
             return (
                 None,
                 None,
@@ -1275,6 +1320,9 @@ class Engine(EngineScoreMixin, EngineBase):
         its GPU context so the caller can immediately reallocate on the same
         device."""
         try:
+            scheduler_init_result = getattr(self, "_scheduler_init_result", None)
+            if scheduler_init_result is not None:
+                scheduler_init_result.stop_sidecar()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
@@ -1665,7 +1713,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
