@@ -209,6 +209,32 @@ def _wait_until(predicate, *, timeout: float, what: str):
     raise AssertionError(f"timed out waiting for {what}; last observed: {last}")
 
 
+def _chat_and_attribute(
+    router_url: str,
+    model_id: str,
+    prompt: str,
+    worker_urls: list[str],
+) -> dict[str, int]:
+    """Send one request and report which worker it landed on, as the
+    per-worker change in successful dispatches.
+
+    The counter is booked as the router finishes the response, which can trail
+    the client's own completion, so wait for the dispatch to be attributed
+    rather than scraping once and reading zeroes everywhere.
+    """
+    before = _success_counts(_scrape(router_url))
+    _chat(router_url, model_id, prompt)
+
+    def _deltas() -> dict[str, int] | None:
+        after = _success_counts(_scrape(router_url))
+        deltas = {url: after.get(url, 0) - before.get(url, 0) for url in worker_urls}
+        return deltas if sum(deltas.values()) >= 1 else None
+
+    return _wait_until(
+        _deltas, timeout=30.0, what="the dispatch to be counted against a worker"
+    )
+
+
 def _drive_until(
     router_url: str,
     model_id: str,
@@ -284,10 +310,6 @@ def test_repeat_returns_to_the_host_tier_owner(
             )
 
             primed = _long_prompt("owner")
-            # The first request lands by min-load (the tree is empty); the
-            # second should hit the prefix and settle a single owner.
-            _chat(router.base_url, spec["model"], primed)
-            _chat(router.base_url, spec["model"], primed)
 
             def _sole_device_owner() -> str | None:
                 text = _scrape(router.base_url)
@@ -298,10 +320,31 @@ def test_repeat_returns_to_the_host_tier_owner(
                 ]
                 return owners[0] if len(owners) == 1 else None
 
+            # The first request lands by min-load (the tree is empty), and its
+            # cache events reach the router only after the response does. Wait
+            # for the prefix to be indexed before repeating it: a repeat sent
+            # inside that gap is still routed by load, so it can land on the
+            # other worker and leave both owning the prefix with no sole owner
+            # to name.
+            _chat(router.base_url, spec["model"], primed)
             owner = _wait_until(
                 _sole_device_owner,
                 timeout=120.0,
                 what="exactly one worker to own the primed prefix on device",
+            )
+
+            # With the prefix indexed and still on device, cache-aware routing
+            # must send the repeat back to its owner. Establishing that here,
+            # before any eviction, separates the two ways the assertion at the
+            # end of the test can fail: routing that never honoured the tree at
+            # all, versus a tree that forgot the owner once its device copy
+            # went.
+            deltas = _chat_and_attribute(
+                router.base_url, spec["model"], primed, worker_urls
+            )
+            assert deltas.get(owner, 0) == 1, (
+                "repeat of a device-resident prefix did not return to its "
+                f"owner {owner}; per-worker deltas={deltas}"
             )
 
             # Turn the device tier over until the owner's copy is demoted:
@@ -339,13 +382,9 @@ def test_repeat_returns_to_the_host_tier_owner(
                 _sum_where(text, "sgl_router_kv_tree_accounting_errors_total") == 0
             ), "tree occupancy accounting contradicted itself"
 
-            before = _success_counts(text)
-            _chat(router.base_url, spec["model"], primed)
-            after = _success_counts(_scrape(router.base_url))
-
-            deltas = {
-                url: after.get(url, 0) - before.get(url, 0) for url in worker_urls
-            }
+            deltas = _chat_and_attribute(
+                router.base_url, spec["model"], primed, worker_urls
+            )
             assert deltas.get(owner, 0) == 1, (
                 "repeat of a host-resident prefix did not return to its owner "
                 f"{owner}; per-worker deltas={deltas}"
