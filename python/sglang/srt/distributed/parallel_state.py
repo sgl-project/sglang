@@ -2124,9 +2124,9 @@ def get_attn_tp_group() -> GroupCoordinator:
 
 
 def get_shared_experts_tp_group() -> GroupCoordinator:
-    assert (
-        _SHARED_EXPERTS_TP is not None
-    ), "shared-expert tensor model parallel group is not initialized"
+    assert _SHARED_EXPERTS_TP is not None, (
+        "shared-expert tensor model parallel group is not initialized"
+    )
     return _SHARED_EXPERTS_TP
 
 

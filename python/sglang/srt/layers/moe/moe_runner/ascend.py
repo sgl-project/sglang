@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,

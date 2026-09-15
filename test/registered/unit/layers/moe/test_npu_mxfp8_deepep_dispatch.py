@@ -44,9 +44,7 @@ class TestNPUMXFP8DeepEPDispatch(CustomTestCase):
 
     def test_mxfp8_config_selects_explicit_deepep_quant_mode(self):
         dispatcher = object.__new__(deepep._DeepEPDispatcherImplLowLatency)
-        dispatcher.quant_config = {
-            "low_latency_dispatcher_output_dtype": "mxfp8"
-        }
+        dispatcher.quant_config = {"low_latency_dispatcher_output_dtype": "mxfp8"}
         with patch.object(
             deepep, "get_deepep_output_dtype", return_value=DispatcherOutputDtype.MXFP8
         ):

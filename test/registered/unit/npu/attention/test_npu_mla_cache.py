@@ -3,6 +3,7 @@
 import unittest
 
 import torch
+
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

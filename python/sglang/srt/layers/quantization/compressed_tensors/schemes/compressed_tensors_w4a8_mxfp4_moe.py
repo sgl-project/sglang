@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
 )

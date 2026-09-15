@@ -71,7 +71,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sm100_supported, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()

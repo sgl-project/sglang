@@ -2,30 +2,11 @@ import math
 from typing import Optional
 
 import torch
-# from sgl_kernel_npu.fla.kda_chunk_delta_h import (
-#     chunk_gated_delta_rule_fwd_h_npu,
-# )
-from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-# from sgl_kernel_npu.fla.kda_prefill import (
-#     chunk_gla_fwd_o_gk_npu,
-#     recompute_w_u_fwd_npu,
-# )
-from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-# from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-# from sgl_kernel_npu.fla.utils import prepare_chunk_indices
-from sgl_kernel_npu.mamba.causal_conv1d import (
-    causal_conv1d_fn_npu,
-    causal_conv1d_update_npu,
-)
-from sgl_kernel_npu.mamba.causal_conv1d_verify import (
-    causal_conv1d_linear_verify_npu,
-)
-from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 
-# from cann_ops_transformer.ops import chunk_kda_fwd
-# from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
-# from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
+
+from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
@@ -33,6 +14,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 
 _LOG2_E = math.log2(math.e)
 
@@ -77,11 +59,7 @@ class _AscendKDAExtendKernel:
             .contiguous()
         )
         scale = k.shape[-1] ** -0.5
-        query_start_loc = (
-            query_start_loc
-            .to(dtype=torch.int64)
-            .contiguous()
-        )
+        query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
 
         outputs = torch.ops.npu.chunk_kda_fwd(
             q,
