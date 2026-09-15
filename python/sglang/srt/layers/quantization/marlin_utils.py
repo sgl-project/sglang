@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
     pack_cols,
@@ -425,16 +426,13 @@ def maybe_warn_marlin_atomic_add(device, dtype):
 def maybe_warn_marlin_atomic_add_env():
     if torch.compiler.is_dynamo_compiling():
         return
-    # TODO(yiyun): Need to add sglang's MARLIN_USE_ATOMIC_ADD: bool = False
-    if True:
+    if envs.SGLANG_MARLIN_USE_ATOMIC_ADD.get():
         return
-    # if envs.VLLM_MARLIN_USE_ATOMIC_ADD:
-    #     return
     logger.info_once(
         "Marlin kernel can achieve better performance for small size_n "
-        "with experimental use_atomic_add feature. "
-        "You can consider set environment variable "
-        "VLLM_MARLIN_USE_ATOMIC_ADD to 1 if possible."
+        "with the experimental use_atomic_add feature. Set the environment "
+        "variable SGLANG_MARLIN_USE_ATOMIC_ADD=1 to enable it; note that the "
+        "atomicAdd reduction is not bitwise reproducible between runs."
     )
 
 
@@ -447,10 +445,15 @@ def should_use_atomic_add_reduce(
     if n >= 2048 or k < 2048 or device.type != "cuda":
         return False
 
+    # The atomicAdd reduce sums the K-slices in CTA scheduling order, so its
+    # output is not bitwise reproducible. Never use it under deterministic
+    # inference, whatever the opt-in below says.
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        return False
+
     # disable atomicAdd reduce by default,
-    # one can enable it with VLLM_MARLIN_USE_ATOMIC_ADD=1
-    # TODO: Need to add sglang's MARLIN_USE_ATOMIC_ADD: bool = False
-    if not True:
+    # one can enable it with SGLANG_MARLIN_USE_ATOMIC_ADD=1
+    if not envs.SGLANG_MARLIN_USE_ATOMIC_ADD.get():
         maybe_warn_marlin_atomic_add_env()
         return False
 
