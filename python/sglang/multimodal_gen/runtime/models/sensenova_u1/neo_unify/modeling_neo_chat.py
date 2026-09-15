@@ -24,6 +24,9 @@ from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -189,8 +192,9 @@ def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
     return abs_x, abs_y
 
 
-class NEOChatModel(PreTrainedModel):
+class NEOChatModel(PreTrainedModel, LayerwiseOffloadableModuleMixin):
     config_class = NEOChatConfig
+    layer_names = ["language_model.model.layers"]
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
@@ -204,6 +208,7 @@ class NEOChatModel(PreTrainedModel):
         "language_model.model.embed_tokens",
         "language_model.lm_head",
     )
+    
 
     # support transformers 4.51.+
     _tp_plan = ""
