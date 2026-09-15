@@ -848,8 +848,8 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace, then wait for the device memory to actually come
-    back: a reaped tree does not mean the driver is done with it.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
     pids = collect_process_tree_pids(process.pid)
     process.terminate()
@@ -2109,11 +2109,9 @@ def _wait_for_gpu_idle_in_ci(
 
 
 def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
-    """Snapshot a process and its descendants so their GPU memory can be waited on.
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
 
-    Call this BEFORE killing the tree: afterwards it can no longer be walked,
-    and these pids are what identifies the dead processes' still-charged device
-    memory in NVML.
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
     """
     try:
         pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
@@ -2131,8 +2129,7 @@ def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         except pynvml.NVMLError:
-            # A container that cannot enumerate compute processes offers no
-            # per-pid signal, so there is nothing to wait on.
+            # No per-pid enumeration in this container; nothing to wait on.
             continue
         reports.extend(
             f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
@@ -2149,14 +2146,11 @@ def wait_for_gpu_release(
 ) -> None:
     """Block until none of ``pids`` is still charged device memory.
 
-    Killing a server only queues the driver-side teardown, so a process can be
-    reaped while its allocations are still charged to it and the next launch
-    OOMs during weight load. Waiting on these exact pids rather than on the GPU
-    being idle keeps this usable while other servers the same test started are
-    deliberately still running.
-
-    Best effort: a timeout warns instead of raising, so teardown never turns a
-    passing test red.
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout warns, never raises.
     """
     if not pids:
         return
