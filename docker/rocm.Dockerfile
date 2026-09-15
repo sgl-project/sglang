@@ -568,8 +568,8 @@ RUN pip uninstall -y aiter
 # block AITER_COMMIT overrides that predate that rule. The working tree was just
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
-# cherry-pick ROCm/aiter#5283 (7b481fb) and #5279 (24a62b1): gfx950 DSV4 a8w8 blockscale bpreshuffle configs; drop at the next aiter bump
-# aiter_flydsl_moe_stage1_lds_dma_drain.patch: stage 1 left LDS-DMA loads in flight across the K-step barrier, so a8w4 was not bitwise repeatable; drop at the aiter bump that carries the fix
+# cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
+# Drain FlyDSL stage-1 LDS-DMA loads before the K-step barrier.
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
@@ -1177,20 +1177,10 @@ ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
-# ROCm 7.0 dp-attention workaround (dp_attention.py _USE_ROCM700A_WA); off for the served ROCm 7.2+ stacks
-ENV SGLANG_USE_ROCM700A=0
-# aiter's bf16-vs-fp8 MoE token bound (default 256); 0 keeps every batch on the quantized expert kernels
-ENV AITER_BF16_FP8_MOE_BOUND=0
-# bf16 GEMMs through hipBLASLt
-ENV TORCH_BLAS_PREFER_HIPBLASLT=1
-# DeepSeek-V4.1 EP4 a8w4 tuned FMoE rows, under model_configs/ so aiter merges them into its table (AITER_CONFIG_FMOE=<file> would replace every other model's rows); drop once they land in aiter
-COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
-# bitwise-repeatable MoE stage 2 (the atomic form differs by an ulp between identical requests)
-ENV AITER_FLYDSL_FORCE_REDUCE=1
+ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
-# Unquantized quick-reduce: INT8/INT4 all-reduce is lossier than the CUDA path.
-ENV ROCM_QUICK_REDUCE_QUANTIZATION=NONE
+ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
 ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
