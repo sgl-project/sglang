@@ -494,6 +494,17 @@ class MoEGate(nn.Module):
         if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
+        # The explicit invariant path must also bypass the token-count-based
+        # small-router specialization so a microbatch cannot switch algorithms.
+        if _is_cuda:
+            from sglang.kernels.ops.attention.dsv4.gemm import (
+                batch_invariant_router_enabled,
+                linear_bf16_fp32,
+            )
+
+            if batch_invariant_router_enabled():
+                return linear_bf16_fp32(hidden_states, self.weight)
+
         if (
             not self.is_deepseek_v4
             and forward_batch is not None

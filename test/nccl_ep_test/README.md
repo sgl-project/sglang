@@ -60,5 +60,24 @@ PYTHONPATH=python:test python -m pytest -q \
 
 These tests use real CUDA streams and Graphs with external EP replaced.
 They detect completion incorrectly waiting for independent compute, but do
-not measure native communication overlap or model speedup. The opt-in
-batch-invariant router and full-model logit diagnostics are separate changes.
+not measure native communication overlap or model speedup.
+
+## Batch-invariant router
+
+The router fix and its direct GPU regressions are included as a separate
+commit. To use the fixed reduction for serial/TBO numerical comparisons,
+select it before starting the server:
+
+```bash
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=batch_invariant
+```
+
+The default remains cuBLAS. Run the direct regression with:
+
+```bash
+PYTHONPATH=python:test python -m pytest -q \
+  test/registered/unit/models/test_batch_invariant_router.py
+```
+
+Full-model logit diagnostics and benchmark drivers remain in the experiment
+branch linked above.

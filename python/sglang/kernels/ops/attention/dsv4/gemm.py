@@ -21,6 +21,11 @@ _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
 _HPC_GEMM_WEIGHT_SCALE = 1.0 / 256.0
 
 
+def batch_invariant_router_enabled() -> bool:
+    """Share the import-time algorithm selection with model router dispatch."""
+    return _linear_bf16_fp32_algo == "batch_invariant"
+
+
 @functools.cache
 def _hpc_gemm_bf16xfp32_available() -> bool:
     """HPC-Ops (https://github.com/Tencent/hpc-ops) ships sm90a kernels."""
@@ -113,7 +118,13 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
-    if _use_aiter and y.dtype == torch.bfloat16:
+    if batch_invariant_router_enabled():
+        from sglang.kernels.ops.gemm.batch_invariant_router import (
+            batch_invariant_router_gemm,
+        )
+
+        return batch_invariant_router_gemm(x, y)
+    elif _use_aiter and y.dtype == torch.bfloat16:
         return tgemm.mm(x, y, otype=x.dtype).float()
     elif hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
