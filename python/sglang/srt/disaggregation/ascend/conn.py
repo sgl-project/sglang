@@ -73,7 +73,7 @@ class AscendKVManager(MooncakeKVManager):
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
             raise RuntimeError(
-                "Ascend DSA PD requires matching prefill/decode DCP sizes, got "
+                "NPU DSA PD requires matching prefill/decode DCP sizes, got "
                 f"prefill={self.dcp_size}, decode={dst_dcp_size}"
             )
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
