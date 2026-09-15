@@ -134,7 +134,7 @@ class TestPureDP(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -177,7 +177,7 @@ class TestMTP(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -229,7 +229,7 @@ class TestNormal(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -277,7 +277,7 @@ class TestLowLatency(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -324,7 +324,7 @@ class TestTBOwithNormal(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -373,7 +373,7 @@ class TestTBOwithLowLatency(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -425,7 +425,7 @@ class TestMTPwithTBONormal(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -486,7 +486,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -548,7 +548,7 @@ class TestEPLBMoriStat(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),

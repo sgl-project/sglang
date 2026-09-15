@@ -115,7 +115,7 @@ class TestDeepseekV4ProFp4CPInterleave(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=1319,
             num_threads=32,
         )

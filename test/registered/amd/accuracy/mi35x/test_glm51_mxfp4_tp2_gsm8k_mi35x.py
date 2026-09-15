@@ -90,7 +90,7 @@ class TestGLM51MXFP4TP2GSM8KMI35x(CustomTestCase):
             eval_name="gsm8k",
             num_examples=GSM8K_NUM_EXAMPLES,
             num_threads=GSM8K_NUM_THREADS,
-            max_tokens=512,
+            max_tokens=2048,
             temperature=0.0,
         )
 

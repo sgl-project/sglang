@@ -135,7 +135,7 @@ class TestKimiK27CodeMXFP4AiterMlaEvalMI35x(unittest.TestCase):
                             eval_name="gsm8k",
                             num_examples=self.num_questions,
                             num_threads=self.num_questions,
-                            max_tokens=512,
+                            max_tokens=2048,
                             host="http://127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )

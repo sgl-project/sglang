@@ -72,7 +72,7 @@ class TestQwen3CoderNext(CustomTestCase):
             eval_name="gsm8k",
             num_examples=200,
             num_threads=128,
-            max_tokens=512,
+            max_tokens=2048,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -136,7 +136,7 @@ class TestQwen3CoderNextMTP(CustomTestCase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),

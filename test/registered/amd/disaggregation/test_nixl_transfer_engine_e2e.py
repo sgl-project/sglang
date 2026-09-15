@@ -195,7 +195,7 @@ class TestNixlTransferEngineAccuracy(NixlTransferEngineBase):
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
-            max_tokens=512,
+            max_tokens=2048,
             num_threads=128,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),

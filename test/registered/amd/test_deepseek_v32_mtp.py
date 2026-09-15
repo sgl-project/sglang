@@ -79,7 +79,7 @@ class TestDeepseekV32DPMTP(CustomTestCase):
             eval_name="gsm8k",
             num_examples=1400,
             num_threads=1400,
-            max_tokens=512,
+            max_tokens=2048,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -170,7 +170,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             eval_name="gsm8k",
             num_examples=1400,
             num_threads=1400,
-            max_tokens=512,
+            max_tokens=2048,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
