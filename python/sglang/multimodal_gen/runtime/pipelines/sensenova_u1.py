@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
+    SenseNovaU1PromptEnhancementStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -61,6 +62,14 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         del server_args
         self.add_stage(InputValidationStage())
+
+        pe_client = self.get_module("pe")
+        if pe_client is not None:
+            self.add_stage(
+                SenseNovaU1PromptEnhancementStage(pe_client=pe_client),
+                "sensenova_u1_prompt_enhancement_stage",
+            )
+
         self.add_stage(
             SenseNovaU1GenerationStage(
                 model=self.get_module("model"),
