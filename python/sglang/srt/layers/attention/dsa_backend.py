@@ -308,6 +308,9 @@ class DeepseekSparseAttnBackend(
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
     needs_cpu_seq_lens: bool = False
+    # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
+    # branch of __init__ allocates one.
+    _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -549,7 +552,6 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
-            self._multi_ctas_kv_counter_buffer = None
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -1303,6 +1305,41 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
         }
+
+        self._ensure_multi_ctas_kv_counter_capacity(max(max_bs, max_num_tokens))
+
+    def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
+        # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
+        # rebinding would free the allocation the decode graphs captured.
+        counter = grow_multi_ctas_kv_counter_buffer_if_needed(
+            buffer=self._multi_ctas_kv_counter_buffer,
+            device=torch.device(self.device),
+            num_q_heads=self.num_q_heads,
+            batch_size=num_query_rows,
+        )
+        # Capacity is established before capture, so a grow here means that
+        # invariant broke rather than a case needing handling.
+        assert (
+            counter is self._multi_ctas_kv_counter_buffer
+            or not torch.cuda.is_current_stream_capturing()
+        ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
+        return counter
+
+    def _ensure_multi_ctas_kv_counter_capacity(self, num_query_rows: int) -> None:
+        # Capture indexes by query rows -- speculative_num_draft_tokens per
+        # request under target verify -- which max_running_requests undercounts.
+        if self._multi_ctas_kv_counter_buffer is None:
+            return
+        # Grow-only, and before any capture: shrinking or growing afterwards
+        # would free the allocation a captured graph replays against.
+        self._multi_ctas_kv_counter_buffer = (
+            grow_multi_ctas_kv_counter_buffer_if_needed(
+                buffer=self._multi_ctas_kv_counter_buffer,
+                device=torch.device(self.device),
+                num_q_heads=self.num_q_heads,
+                batch_size=num_query_rows,
+            )
+        )
 
     def _build_forward_metadata_cuda_graph(
         self,
@@ -3426,14 +3463,7 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
-        )
+        multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
@@ -3455,7 +3485,7 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
         return out
