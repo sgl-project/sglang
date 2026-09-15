@@ -1078,10 +1078,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        # Write path now carries the request context (plan.md §7.3): the
-        # backup op's caller_id/caller_role and -- when the hicache root span was
-        # exported -- its trace_id/span_id reach the dummy->real bridge so the
-        # hop-A/hop-B backup spans correlate to the (real or virtual) root.
+        # Write path carries the request context: the backup op's
+        # caller_id/caller_role and -- when the hicache span was exported -- its
+        # trace_id/span_id reach the bridge so backup spans correlate to the
+        # (real or virtual) root.
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             return self._batch_io_v2(transfers, is_set=True)
 
@@ -1228,10 +1228,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Write path now carries the request context (plan.md §7.3): the
-        # backup op's caller_id/caller_role and -- when the hicache root span
-        # was exported -- its trace_id/span_id reach the bridge so backup
-        # spans correlate to the (real or virtual) root.
+        # Write path carries the request context: the backup op's
+        # caller_id/caller_role and -- when the hicache span was exported --
+        # its trace_id/span_id reach the bridge so backup spans correlate to
+        # the (real or virtual) root.
         with self.request_context(
             **self._request_context_from_extra_info(extra_info)
         ):

@@ -143,11 +143,10 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         self.assertEqual(ack.rid, "r-1")
 
     def test_page_backup_carries_caller_attribution_not_request_id(self):
-        # Flipped from "...carries_no_request_id": the backup write path now
-        # carries caller_id/caller_role (from the registering backup thread) but
-        # still omits request_id (backup is per-node, not per-request -- plan.md
-        # §8.1). When no hicache root span was exported the trace fields are empty
-        # (scenario 1: Mooncake derives a *virtual* backup root from caller).
+        # Backup write path carries caller_id/caller_role (from the registering
+        # backup thread) but omits request_id (per-node, not per-request). With
+        # no exported hicache span the trace fields are empty (Mooncake derives
+        # a *virtual* backup root from caller).
         ctrl = _hicache_ctrl(page_size=2)
         captured = {}
 
