@@ -826,6 +826,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         interleave num_groups per token, peers select via head_group_idx.
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
         """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         decode_tp_size = decode_kv_args.decode_tp_size
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
         prefill_tp_size = self.attn_tp_size
@@ -836,39 +840,30 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
         bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
 
         if prefill_tp_size > decode_tp_size:
             # Multiple prefill ranks feed one decode rank: each prefill rank sends
             # all its src heads to a specific head-range in the decode rank.
-            src_replication = max(1, prefill_tp_size // total_kv_heads)
-            local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
+            _, num_heads_to_send, dst_head_start, _ = compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                decode_kv_args.decode_tp_rank,
+                total_kv_heads,
+            )
             num_groups = 1
-            num_heads_to_send = src_heads_per_rank
             head_group_idx = 0
-            unique_head_idx = local_tp_rank_in_group // src_replication
-            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
             dst_head_offset = dst_head_start * bytes_per_head_slice
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
             #
-            # Under GQA the decode side can have MORE attn-TP ranks than there are
-            # KV heads (decode_tp_size > total_kv_heads). In that case consecutive
-            # decode ranks replicate a shared KV head, so the src dlist must
-            # interleave one group per UNIQUE source head-slice, not one per decode
-            # rank -- otherwise it addresses past the registered KV region and
-            # prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
-            #
-            # Reuse the shared replicated-KV head map (integer division under
-            # replication, not modulo) that the mooncake backend already relies
-            # on, so the two backends stay in sync.
-            from sglang.srt.disaggregation.common.staging_buffer import (
-                compute_head_slice_params,
-            )
-
+            # Under GQA replication the dlist must interleave one group per
+            # UNIQUE source head-slice, not one per decode rank -- otherwise it
+            # addresses past the registered KV region and prep_xfer_dlist raises
+            # NIXL_ERR_NOT_FOUND.
             src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
                 prefill_tp_size,
                 decode_tp_size,
