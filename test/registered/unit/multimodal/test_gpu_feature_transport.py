@@ -1038,6 +1038,7 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
             time_stats=None,
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
+            token_indices_to_pool=None,
             mm_inputs=object(),
         )
 
