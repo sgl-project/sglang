@@ -913,6 +913,10 @@ class Envs:
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
+    # KDA prefill kernel backend: "cann" (default) or "triton".
+    # When "triton", the optimized Triton-Ascend chunk_kda kernel is used
+    # instead of the CANN custom op, with l2norm/gate/sigmoid fused in-kernel.
+    SGLANG_NPU_KDA_PREFILL_BACKEND = EnvStr("cann")
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)

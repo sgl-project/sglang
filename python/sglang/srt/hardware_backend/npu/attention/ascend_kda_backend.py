@@ -2,10 +2,22 @@ import math
 from typing import Optional
 
 import torch
+
+from sglang.srt.environ import envs
+
 # from sgl_kernel_npu.fla.kda_chunk_delta_h import (
 #     chunk_gated_delta_rule_fwd_h_npu,
 # )
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
+
+_USE_TRITON_KDA = (
+    getattr(envs, "SGLANG_NPU_KDA_PREFILL_BACKEND", None) is not None
+    and envs.SGLANG_NPU_KDA_PREFILL_BACKEND.get() == "triton"
+)
+if _USE_TRITON_KDA:
+    from sglang.srt.hardware_backend.npu.attention.triton_kda_prefill import (
+        chunk_kda_fwd_npu,
+    )
 # from sgl_kernel_npu.fla.kda_prefill import (
 #     chunk_gla_fwd_o_gk_npu,
 #     recompute_w_u_fwd_npu,
@@ -61,8 +73,6 @@ class _AscendKDAExtendKernel:
         **kwargs,
     ):
         chunk_size = 64
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
         v = v.contiguous()
         g = g.contiguous()
         beta = beta.contiguous()
@@ -89,24 +99,34 @@ class _AscendKDAExtendKernel:
             .contiguous()
         )
 
-        outputs = torch.ops.npu.chunk_kda_fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=query_start_loc,
-            chunk_size=chunk_size,
-            layout="BSND",
-            safe_gate=False,
-            use_gate_in_kernel=False,
-            state_v_first=True,
-            output_h=return_intermediate_states,
-        )
-        out, final_state, chunk_states = outputs[0], outputs[1], outputs[10]
+        if _USE_TRITON_KDA:
+            out, final_state, chunk_states = self._extend_triton(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                query_start_loc=query_start_loc,
+                chunk_size=chunk_size,
+                return_intermediate_states=return_intermediate_states,
+                **kwargs,
+            )
+        else:
+            out, final_state, chunk_states = self._extend_cann(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                query_start_loc=query_start_loc,
+                chunk_size=chunk_size,
+                return_intermediate_states=return_intermediate_states,
+            )
+
         valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
         ssm_states.index_copy_(
             0,
@@ -117,6 +137,67 @@ class _AscendKDAExtendKernel:
         if return_intermediate_states:
             return out, chunk_states
         return out
+
+    @staticmethod
+    def _extend_cann(
+        *,
+        q, k, v, g, beta,
+        scale, initial_state, query_start_loc, chunk_size,
+        return_intermediate_states,
+    ):
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        outputs = torch.ops.npu.chunk_kda_fwd(
+            q, k, v, g, beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=query_start_loc,
+            chunk_size=chunk_size,
+            layout="BSND",
+            safe_gate=True,
+            use_gate_in_kernel=False,
+            state_v_first=True,
+            output_h=return_intermediate_states,
+        )
+        return outputs[0], outputs[1], outputs[10]
+
+    @staticmethod
+    def _extend_triton(
+        *,
+        q, k, v, g, beta,
+        scale, initial_state, query_start_loc, chunk_size,
+        return_intermediate_states,
+        **kwargs,
+    ):
+        A_log = kwargs.get("A_log")
+        dt_bias = kwargs.get("dt_bias")
+        lower_bound = kwargs.get("lower_bound", -5.0)
+        chunk_indices = kwargs.get("chunk_indices")
+        with torch.inference_mode():
+            o, final_state, h = chunk_kda_fwd_npu(
+                q=q.contiguous(),
+                k=k.contiguous(),
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                chunk_indices=chunk_indices,
+                chunk_size=chunk_size,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                safe_gate=True,
+                lower_bound=lower_bound,
+                state_v_first=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                return_intermediate_states=return_intermediate_states,
+            )
+        return o, final_state, h
 
 
 class AscendKDAAttnBackend(KDAAttnBackend):
@@ -366,6 +447,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            chunk_indices=self.forward_metadata.kda_chunk_indices,
             A_log=extend_A_log,
             dt_bias=extend_dt_bias,
             lower_bound=layer.lower_bound,
@@ -397,10 +479,15 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     ]:
         """Apply the Ascend prefill gate contract.
 
-        The checkpoint was validated with FP32 gate activation before
-        ``chunk_kda``. Keeping this platform override here leaves the shared
-        GPU model/backend paths unchanged.
+        CANN path: the checkpoint was validated with FP32 gate activation
+        before ``chunk_kda``, so the gate is pre-activated here.
+
+        Triton path: the optimized kernel fuses gate activation, l2norm,
+        and beta sigmoid in-kernel, so we pass through the raw gate and
+        hand off ``A_log`` / ``dt_bias`` for in-kernel activation.
         """
+        if _USE_TRITON_KDA:
+            return g, beta, layer.A_log, layer.dt_bias
         preactivated_g = fused_kda_gate_npu(
             g.flatten(-2),
             layer.A_log,

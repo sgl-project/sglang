@@ -2061,7 +2061,16 @@ class KimiK3DeltaAttention(nn.Module):
             if not forward_batch.forward_mode.is_target_verify():
                 # Only chunk_kda (extend) wants pre-activated beta; the verify
                 # kernel sigmoids it in-kernel like decode.
-                beta = beta.float().sigmoid()
+                # When using the Triton KDA prefill kernel, beta sigmoid is
+                # fused in-kernel (use_beta_sigmoid_in_kernel=True), so we
+                # skip the external sigmoid and pass raw beta logits.
+                _triton_kda = (
+                    _is_npu
+                    and getattr(envs, "SGLANG_NPU_KDA_PREFILL_BACKEND", None) is not None
+                    and envs.SGLANG_NPU_KDA_PREFILL_BACKEND.get() == "triton"
+                )
+                if not _triton_kda:
+                    beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

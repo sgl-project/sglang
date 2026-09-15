@@ -528,6 +528,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu:
+            chunk_size = self.mamba_chunk_size
+            chunk_counts = [
+                (l + chunk_size - 1) // chunk_size for l in extend_seq_lens_cpu
+            ]
+            if any(n > 0 for n in chunk_counts):
+                indices = torch.cat(
+                    [torch.arange(n, dtype=torch.int32) for n in chunk_counts]
+                )
+                seq_idx = indices.eq(0).cumsum(0) - 1
+                self.forward_metadata.kda_chunk_indices = torch.stack(
+                    [seq_idx, indices], 1
+                ).to(self.device)
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
