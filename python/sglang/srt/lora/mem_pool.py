@@ -149,9 +149,9 @@ class LoRAMemoryPool:
         enable_lora_overlap_loading: bool = False,
         lora_no_cpu_backup: bool = False,
     ):
-        assert not (
-            lora_no_cpu_backup and enable_lora_overlap_loading
-        ), "--lora-no-cpu-backup drops the staged weights right after install, which overlap loading still reads"
+        assert not (lora_no_cpu_backup and enable_lora_overlap_loading), (
+            "--lora-no-cpu-backup drops the staged weights right after install, which overlap loading still reads"
+        )
         self.lora_no_cpu_backup: bool = lora_no_cpu_backup
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers

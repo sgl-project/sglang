@@ -345,7 +345,9 @@ def _add_lora_gate_up_delta(
             f"gate/up LoRA output {inter_size} is wider than the Marlin intermediate {physical_inter_size}"
         )
         if lora_info.lora_use_virtual_experts and inter_size != physical_inter_size:
-            raise NotImplementedError("virtual-expert MoE LoRA does not support padded Marlin outputs")
+            raise NotImplementedError(
+                "virtual-expert MoE LoRA does not support padded Marlin outputs"
+            )
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
         # B halves are also the tuple form the virtual-experts kernel wants
         # (one shrink at K=2*r, two expands at K=r each).

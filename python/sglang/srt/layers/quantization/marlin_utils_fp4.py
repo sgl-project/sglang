@@ -524,7 +524,9 @@ def prepare_moe_mxfp4_layer_for_marlin(
                 process_scales=_process_scales,
             )[0]
 
-        _transform_parameter_in_place("w13_weight", _repack_expert(w13_size_n, w13_size_k))
+        _transform_parameter_in_place(
+            "w13_weight", _repack_expert(w13_size_n, w13_size_k)
+        )
         _transform_parameter_in_place("w2_weight", _repack_expert(w2_size_n, w2_size_k))
         _transform_parameter_in_place(
             "w13_weight_scale", _permute_expert_scale(w13_size_n, w13_size_k)
@@ -534,7 +536,8 @@ def prepare_moe_mxfp4_layer_for_marlin(
         )
         if w13_bias_data is not None:
             _transform_parameter_in_place(
-                "w13_weight_bias", lambda bias: marlin_permute_bias(bias.to(param_dtype))
+                "w13_weight_bias",
+                lambda bias: marlin_permute_bias(bias.to(param_dtype)),
             )
         if w2_bias_data is not None:
             _transform_parameter_in_place(

@@ -367,7 +367,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-
     _MARLIN_CHECKPOINT_PARAMETER_NAMES = (
         "w13_weight",
         "w13_weight_scale",
