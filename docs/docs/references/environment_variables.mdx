@@ -1998,6 +1998,10 @@ MPS and does not read them.
 
 ## Multimodal (VLM)
 
+Set `SGLANG_ENABLE_MM_SHM_ZERO_COPY=1` to enable CPU shared-memory receiver views on POSIX systems (default: `False`). Each received tensor owns a separate copy-on-write mapping: normal reads avoid the receiver clone, and writes remain private to that receiver. Other platforms keep the copying path.
+
+The scheduler still unlinks names after all TP/CP ranks have opened their mappings. The underlying `/dev/shm` pages and mapping file descriptors remain allocated until the last tensor storage alias is released, including features retained by a session. Size `/dev/shm` for those live features when evaluating this option. Allocation failures retain the existing inline-transport fallback. This option does not remove the sender copy, CUDA transfer, or provide cross-node shared memory.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "33.3%"}} />
