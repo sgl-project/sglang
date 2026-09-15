@@ -123,6 +123,15 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     # Do not recursively include an earlier plan in a frozen recipe.
     args._prepared_pipeline = None
     args._weight_cache_admission = None
+    if (
+        pipeline_cls.component_loaders.get("transformer", TransformerLoader)
+        is not TransformerLoader
+    ):
+        if required:
+            raise ValueError(
+                "Weight cache has no adapter for a custom transformer loader"
+            )
+        return None
     pipeline_cls._validate_direct_gpu_component_selection(model_index, args)
     loader = TransformerLoader()
     loader.component_load_precision(args, "transformer")

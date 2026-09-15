@@ -73,7 +73,7 @@ CUDA handle creation/reconstruction or a second serializer.
 - Each delivery serializes fresh counted sends. Abandoned/fatal consumers may
   retain Torch bookkeeping until owner exit. Non-refundable delivery and storage
   export budgets bound this; restart the owner after draining when exhausted.
-- LoRA, weight-update and sleep/release APIs are rejected for shared weights.
+- LoRA, weight-update and sleep/release/resume APIs are rejected for shared weights.
   `expandable_segments` allocations are unsupported by this transport.
 - Package imports can already initialize CUDA outside planning. Cached workers
   use `spawn`; the new preparation path itself does not construct model tensors.
@@ -82,3 +82,20 @@ CUDA handle creation/reconstruction or a second serializer.
 
 Component import latency is not total service readiness: Python startup,
 distributed setup, uncached text encoder/VAE loading and offload setup remain.
+
+## Verification
+
+The standalone GPU test uses the existing diffusion HTTP server manager and
+video validators, with five ordinary starts and five cached worker restarts for
+each warmup mode. It checks output parity, mutation rejection, owner death,
+graceful drain, stale-file recovery and missing-owner failure:
+
+```bash
+pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_1_gpu.py -v -s
+```
+
+`SGLANG_WEIGHT_CACHE_TEST_MODEL` can point to a local published mirror. The
+default uses a pinned HF revision. Readiness samples and median/p90 for both
+`/liveness` and `/health` are written to the pytest temporary output directory.
+The initial regression threshold is not a speedup claim; speedup must be
+established separately for the target model, storage and host.

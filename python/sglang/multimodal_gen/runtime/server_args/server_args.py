@@ -1923,6 +1923,18 @@ class ServerArgs(DisaggServerArgsMixin):
         # Keep a private, immutable pre-tuning snapshot. Variant resolution never
         # reuses already cache-pinned or memory-tuned options.
         if self.weight_cache_mode != "off":
+            # Direct dataclass callers do not pass CLI provenance. These options
+            # default to None, so a value present before tuning is user input.
+            for name in (
+                "component_residency",
+                "cpu_offload_components",
+                "dit_cpu_offload",
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+                "use_fsdp_inference",
+            ):
+                if getattr(self, name) is not None:
+                    self._explicit_arg_names.add(name)
             self._raw_inputs = pickle.dumps(
                 {
                     f.name: getattr(self, f.name)

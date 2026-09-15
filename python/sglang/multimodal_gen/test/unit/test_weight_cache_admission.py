@@ -211,3 +211,202 @@ def test_explicit_argv_is_not_lost_when_sys_argv_is_empty():
         )
     assert args.model_path == "/fake"
     assert args.weight_cache_mode == "client"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"dit_cpu_offload": True},
+        {"dit_layerwise_offload": True},
+        {"use_fsdp_inference": True},
+        {"cpu_offload_components": ["dit"]},
+        {"layerwise_offload_components": ["dit"]},
+        {"layerwise_offload_components": ["all"]},
+        {"component_residency": {"dit": "resident"}, "dit_cpu_offload": True},
+        {
+            "component_residency": {"dit": "resident"},
+            "layerwise_offload_components": ["dit"],
+        },
+    ],
+)
+def test_direct_dataclass_conflicts_cannot_be_erased_by_cache_pins(overrides):
+    with pytest.raises(ValueError, match="Weight cache"):
+        ServerArgs(
+            model_path="/fake",
+            pipeline_config=WanT2V480PConfig(),
+            weight_cache_mode="client",
+            performance_mode="manual",
+            **overrides,
+        )
+
+
+def test_daemon_stop_interrupts_idle_control_connection():
+    import socket
+
+    from sglang.multimodal_gen.runtime.weight_cache.daemon import (
+        DiffusionWeightCacheDaemon,
+    )
+
+    owner = object.__new__(DiffusionWeightCacheDaemon)
+    left, right = socket.socketpair()
+    try:
+        owner._connection = left
+        owner.stopping = False
+        owner.stop()
+        assert owner.stopping
+        assert right.recv(1) == b""
+    finally:
+        left.close()
+        right.close()
+
+
+def test_explicit_environment_capability_does_not_probe_current_cuda_device():
+    from sglang.srt.platforms import current_platform as srt_platform
+    from sglang.srt.weight_cache.protocol import compute_env_stamp
+
+    with patch.object(srt_platform, "get_device_capability") as capability:
+        assert compute_env_stamp(device_capability="9.0")["device_capability"] == "9.0"
+    capability.assert_not_called()
+
+
+@pytest.fixture
+def prepared_wan(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+    from sglang.multimodal_gen.runtime.pipelines.wan_pipeline import WanPipeline
+    from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
+    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
+        EXPECTED_CONFIG,
+    )
+
+    index = {
+        "_class_name": "WanPipeline",
+        "transformer": ["diffusers", "WanTransformer3DModel"],
+        "text_encoder": ["transformers", "UMT5EncoderModel"],
+        "tokenizer": ["transformers", "T5TokenizerFast"],
+        "vae": ["diffusers", "AutoencoderKLWan"],
+        "scheduler": ["diffusers", "UniPCMultistepScheduler"],
+    }
+    (tmp_path / "model_index.json").write_text(json.dumps(index))
+    component = tmp_path / "transformer"
+    component.mkdir()
+    (component / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel", **EXPECTED_CONFIG})
+    )
+    # Valid metadata but no tensors: preparation may inspect quantization headers,
+    # but cannot construct or populate the model from this checkpoint.
+    save_file({}, component / "diffusion_pytorch_model.safetensors")
+    # Existing lazy kernel imports probe CUDA (e.g. norm_triton autotuning).
+    # This test isolates preparation after imports, not fresh-process purity.
+    ModelRegistry.resolve_model_cls("WanTransformer3DModel")
+    args = make_args(model_path=str(tmp_path))
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.prepare.maybe_download_model",
+            return_value=str(tmp_path),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
+            return_value=True,
+        ),
+    ):
+        yield args, WanPipeline, prepare_pipeline
+
+
+def test_post_import_preparation_constructs_no_modules_or_cuda_state(prepared_wan):
+    import torch
+
+    from sglang.multimodal_gen.runtime.loader.component_loaders import (
+        transformer_loader,
+    )
+
+    args, pipeline, prepare = prepared_wan
+    with (
+        patch.object(torch.nn.Module, "__init__", side_effect=AssertionError("module")),
+        patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("CUDA")),
+        patch.object(
+            transformer_loader,
+            "get_local_torch_device",
+            side_effect=AssertionError("live rank"),
+        ),
+    ):
+        prepared = prepare(pipeline, args, required=True)
+    assert prepared is not None
+    assert len(prepared.specs) == 5
+    assert args.model_paths == {}
+
+
+def test_uncached_placement_changes_execution_not_cache_fingerprint(prepared_wan):
+    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
+        fingerprint_fields,
+    )
+
+    args, pipeline, prepare = prepared_wan
+    a = prepare(pipeline, args, required=True)
+    other = make_args(
+        model_path=args.model_path, component_residency={"vae": "component_offload"}
+    )
+    b = prepare(pipeline, other, required=True)
+    assert a.execution_plan != b.execution_plan
+    assert fingerprint_fields(a.transformer) == fingerprint_fields(b.transformer)
+    ordinary = prepare(pipeline, args.resolve_variant(weight_cache_mode="off"))
+    assert fingerprint_fields(a.transformer) == fingerprint_fields(ordinary.transformer)
+    assert a.specs == ordinary.specs
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "same_named_class",
+        "config",
+        "quant",
+        "dtype",
+        "attention",
+        "attention_config",
+        "fsdp",
+        "tp",
+    ],
+)
+def test_resolved_adapter_rejects_unverified_variants(prepared_wan, variant):
+    import torch
+
+    from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
+        validate_supported,
+    )
+
+    args, pipeline, prepare = prepared_wan
+    recipe = prepare(pipeline, args, required=True).transformer.thaw()
+    attention = "fa"
+    if variant == "same_named_class":
+        recipe.model_cls = type("WanTransformer3DModel", (), {})
+    elif variant == "config":
+        recipe.init_params["hf_config"]["unknown_layout"] = True
+    elif variant == "quant":
+        recipe.quant_spec.post_load_hooks.append(object())
+    elif variant == "dtype":
+        from dataclasses import replace
+
+        recipe.quant_spec = replace(recipe.quant_spec, param_dtype=torch.float16)
+    elif variant == "attention":
+        attention = "torch_sdpa"
+    elif variant == "attention_config":
+        recipe.server_args.attention_backend_config = {"custom": True}
+    elif variant == "fsdp":
+        recipe.component_starts_on_cpu = True
+    elif variant == "tp":
+        recipe.server_args.tp_size = 2
+    frozen = Mock()
+    frozen.thaw.return_value = recipe
+    with pytest.raises(ValueError):
+        validate_supported(frozen, pipeline_name="WanPipeline", attention=attention)
+
+
+def test_custom_loader_is_not_silently_bypassed(prepared_wan):
+    args, pipeline, prepare = prepared_wan
+    with patch.object(pipeline, "component_loaders", {"transformer": object}):
+        with pytest.raises(ValueError, match="custom transformer loader"):
+            prepare(pipeline, args, required=True)
+        assert prepare(pipeline, args.resolve_variant(weight_cache_mode="off")) is None

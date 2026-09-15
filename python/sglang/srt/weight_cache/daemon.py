@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    CLIENT_CONNECTION_TIMEOUT,
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -76,12 +77,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
-
-# Per-connection timeout for the serial serve loop. A client exchange is tiny
-# (a config dict + IPC handle metadata), so this generous bound never trips a
-# healthy client, yet guarantees one hung/dead peer can't stall the other
-# engine ranks indefinitely.
-CLIENT_CONNECTION_TIMEOUT = 30.0
 
 
 @dataclasses.dataclass

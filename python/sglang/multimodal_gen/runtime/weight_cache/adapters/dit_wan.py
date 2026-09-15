@@ -44,12 +44,14 @@ def is_wan_1_3b_config(config):
 
 
 def validate_supported(frozen, *, pipeline_name, attention):
+    from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformer3DModel
+
     recipe = frozen.thaw()
     args = recipe.server_args
     if (
         pipeline_name != "WanPipeline"
         or recipe.component_name != "transformer"
-        or recipe.model_cls.__name__ != "WanTransformer3DModel"
+        or recipe.model_cls is not WanTransformer3DModel
     ):
         raise ValueError(
             "No weight-cache adapter for this pipeline/component/model/loader"
@@ -72,6 +74,10 @@ def validate_supported(frozen, *, pipeline_name, attention):
     if attention != "fa" or args.attention_backend not in (None, "fa"):
         raise ValueError(
             "Weight cache Wan adapter currently supports FA attention only"
+        )
+    if args.attention_backend_config:
+        raise ValueError(
+            "Weight cache has not verified custom attention backend configuration"
         )
     arch = recipe.init_params["config"].arch_config
     if (

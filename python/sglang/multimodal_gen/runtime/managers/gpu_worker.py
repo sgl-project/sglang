@@ -1440,6 +1440,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return self._get_memory_occupation().release_memory_occupation()
 
     def resume_memory_occupation(self) -> dict:
+        from sglang.multimodal_gen.runtime.weight_cache.guards import (
+            reject_cached_weight_mutation,
+        )
+
+        reject_cached_weight_mutation(
+            getattr(self, "pipeline", None), "Wake/resume memory"
+        )
         if self.memory_occupation is None:
             return {
                 "success": True,

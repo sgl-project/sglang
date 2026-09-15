@@ -205,6 +205,9 @@ def check_ipc_quant_support(
 
 
 MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
+# Bound accepted exchanges as well as accept(): a partial/dead peer must not
+# stall every other consumer of a serial owner indefinitely.
+CLIENT_CONNECTION_TIMEOUT = 30.0
 
 
 def send_msg(sock, obj: Any) -> None:

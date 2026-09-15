@@ -16,8 +16,29 @@ def pin_requested_components(args) -> None:
         raise ValueError(
             "Weight cache Phase 1A supports only the transformer (dit) component"
         )
-    if args.use_fsdp_inference and args.is_arg_explicitly_set("use_fsdp_inference"):
+    if args.use_fsdp_inference:
         raise ValueError("Weight cache does not support explicit FSDP inference")
+    if args.dit_cpu_offload or args.dit_layerwise_offload:
+        raise ValueError(
+            "Weight cache conflicts with explicit DiT CPU/layerwise offload"
+        )
+    from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+        cpu_offload_component_matches,
+        layerwise_component_matches_any_selection,
+        normalize_layerwise_offload_components,
+    )
+
+    layerwise = (
+        normalize_layerwise_offload_components(args.layerwise_offload_components) or []
+    )
+    if (
+        cpu_offload_component_matches("transformer", args.cpu_offload_components)
+        or {"all", "dit"}.intersection(layerwise)
+        or layerwise_component_matches_any_selection("transformer", layerwise)
+    ):
+        raise ValueError(
+            "Weight cache conflicts with an explicit transformer offload selector"
+        )
     # This checks original canonical/group and legacy explicit controls before
     # adding an internal requirement. It does not forge user-explicit options.
     args.require_component_resident("transformer", feature_name="Weight cache")

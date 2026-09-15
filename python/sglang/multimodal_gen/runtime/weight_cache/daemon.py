@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_in
 from sglang.multimodal_gen.runtime.weight_cache.plan import plan_diff
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 from sglang.srt.weight_cache.protocol import (
+    CLIENT_CONNECTION_TIMEOUT,
     cleanup_stale_daemon_files,
     recv_msg,
     send_msg,
@@ -74,6 +75,17 @@ class DiffusionWeightCacheDaemon:
         self.stopping = False
         self.consumers = set()
         self.exporter = None
+        self._connection = None
+
+    def stop(self, *_):
+        self.stopping = True
+        # Wake an idle/partial control exchange without waiting for its timeout.
+        # The generation and registered consumers still go through _drain().
+        if self._connection is not None:
+            try:
+                self._connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _request(self, request, peer):
         if self.stopping:
@@ -162,9 +174,7 @@ class DiffusionWeightCacheDaemon:
                 device_uuid, socket_path=str(self.path), ready_path=str(self.ready_path)
             )
             for sig in (signal.SIGTERM, signal.SIGINT):
-                handlers[sig] = signal.signal(
-                    sig, lambda *_: setattr(self, "stopping", True)
-                )
+                handlers[sig] = signal.signal(sig, self.stop)
             bootstrap_diffusion_runtime(
                 self.args,
                 local_rank=local_device_index(self.args),
@@ -218,7 +228,10 @@ class DiffusionWeightCacheDaemon:
                 except TimeoutError:
                     continue
                 with conn:
-                    conn.settimeout(2)
+                    self._connection = conn
+                    conn.settimeout(
+                        min(CLIENT_CONNECTION_TIMEOUT, self.args.weight_cache_timeout)
+                    )
                     try:
                         peer = peer_identity(conn)
                         while not self.stopping:
@@ -236,6 +249,8 @@ class DiffusionWeightCacheDaemon:
                             )
                         except (OSError, EOFError):
                             pass
+                    finally:
+                        self._connection = None
         finally:
             self.stopping = True
             if listener is not None:
