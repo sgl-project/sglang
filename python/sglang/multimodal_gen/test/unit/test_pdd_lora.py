@@ -3,9 +3,9 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
+    LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
-    LoRAFormat,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pdd_lora import (
     apply_pdd_head_bank,
@@ -100,7 +100,9 @@ def test_plain_lora_is_not_pdd():
         "proj_out.lora_A.weight": torch.randn(4, 8),
         "proj_out.lora_B.weight": torch.randn(6, 4),
     }
-    assert extract_pdd_payload(state, video_out_features=6, audio_out_features=3) is None
+    assert (
+        extract_pdd_payload(state, video_out_features=6, audio_out_features=3) is None
+    )
 
 
 def test_sampling_plan_matches_official_mean_velocity():
@@ -167,7 +169,9 @@ def test_h3_nine_sigma_points_land_on_32_grid_blocks():
         )
         plan = pdd_sampling_plan(pdd_time_grid(12.0, n).diff(), start, 4)
         assert int((plan > 0).sum().item()) == 4
-        torch.testing.assert_close(plan[start : start + 4].sum(), torch.tensor(1.0, dtype=plan.dtype))
+        torch.testing.assert_close(
+            plan[start : start + 4].sum(), torch.tensor(1.0, dtype=plan.dtype)
+        )
 
 
 class _Head(nn.Module):
@@ -196,7 +200,9 @@ class _Final(nn.Module):
 def test_apply_and_arm_selects_the_trained_block():
     hidden, video_out, audio_out, n = 8, 6, 3, 4
     layer = _Final(hidden, video_out, audio_out)
-    state = _official_state(n=n, hidden=hidden, video_out=video_out, audio_out=audio_out)
+    state = _official_state(
+        n=n, hidden=hidden, video_out=video_out, audio_out=audio_out
+    )
     _, bank = extract_pdd_payload(
         state,
         metadata={"pdd_block_size": "2"},
