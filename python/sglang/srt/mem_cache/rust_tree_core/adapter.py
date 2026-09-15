@@ -12,8 +12,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -84,19 +82,15 @@ def _kv_event_from_tagged(event: tuple):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
-        event_args = dict(
+        return BlockStored(
             block_hashes=event[1],
             parent_block_hash=event[2],
             token_ids=event[3],
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
-        )
-        if event[6] is None:
-            return BlockStored(**event_args)
-        return BlockStoredWithMetadata(
-            **event_args,
-            metadata=BlockStoredMetadata(cache_salt=event[6]),
+            cache_salt=event[6],
+            session_id=event[7],
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -425,6 +419,26 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node(self) -> UnifiedTreeNode:
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        raise NotImplementedError(
+            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list:
+        raise NotImplementedError(
+            "attach_swa_window: buffer-mode SWA window repair is not yet "
+            "ported to the Rust tree core"
+        )
+
     def inc_lock_ref(
         self,
         node_id: NodeId,
@@ -581,6 +595,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return _match_result_from_binding(result)
 
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        return self._binding.match_full_device_prefix(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            )
+        )
+
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        self._binding.inc_full_pin(node_id)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        self._binding.dec_full_pin(node_id)
+
     @property
     def empty_match_result(self) -> MatchResult:
         return self._empty_match_result
@@ -607,6 +636,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
@@ -790,6 +820,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         transfers = self._binding.build_hicache_transfers(
@@ -800,6 +831,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # TODO: Forward token ids when Rust Mamba prefetch consumes them.
             None,
             prefetch_tokens,
+            staging_tokens,
             last_hash,
         )
         if transfers is None:

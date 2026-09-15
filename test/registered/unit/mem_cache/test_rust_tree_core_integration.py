@@ -20,8 +20,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -971,14 +969,14 @@ def test_salted_events_match_python_hash_and_metadata_contract():
         for value in mem_cache.get_hash_str(array("q", [1, 2, 7, 8]), seed, 2)
     ]
     assert core.take_events() == [
-        BlockStoredWithMetadata(
+        BlockStored(
             block_hashes=hashes,
             parent_block_hash=None,
             token_ids=[1, 2, 7, 8],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
-            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+            cache_salt="tenant-a",
         )
     ]
 
@@ -1012,14 +1010,14 @@ def test_salted_eagle_events_match_the_bigram_hash_contract():
         for value in mem_cache.get_hash_str(raw_tokens, seed, 2, is_bigram=True)
     ]
     assert core.take_events() == [
-        BlockStoredWithMetadata(
+        BlockStored(
             block_hashes=hashes,
             parent_block_hash=None,
             token_ids=[(1, 2), (2, 3), (3, 4), (4, 5)],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
-            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+            cache_salt="tenant-a",
         )
     ]
 
@@ -1906,17 +1904,26 @@ def test_swa_prefetch_commit_end_to_end():
     core.has_swa_host_pool = True
     anchor = core.match_prefix(MatchPrefixParams(key=_key([99]))).best_match_node
 
-    # The build wraps the host buffer with placeholder keys, trailing-pages policy.
+    # Without planned staging the SWA pool takes no part in the fetch.
+    assert (
+        core.build_hicache_transfers(
+            ComponentType.SWA, anchor, CacheTransferPhase.PREFETCH
+        )
+        is None
+    )
+
+    # The build carries the planned staging as placeholder keys, trailing-pages
+    # policy; the host buffer is attached once the hit is known.
     (xfer,) = core.build_hicache_transfers(
         ComponentType.SWA,
         anchor,
         CacheTransferPhase.PREFETCH,
-        host_indices=torch.tensor([30, 31], dtype=torch.int64),
+        staging_tokens=2,
     )
     assert xfer.name == PoolName.SWA
     assert xfer.keys == ["__placeholder__", "__placeholder__"]
     assert xfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
-    assert xfer.host_indices.tolist() == [30, 31]
+    assert xfer.host_indices is None
 
     # The prefetched suffix lands as one host node; its SWA host is a tombstone.
     insert_result = core.insert_host(

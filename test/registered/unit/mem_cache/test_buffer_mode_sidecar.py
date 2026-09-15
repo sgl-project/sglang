@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _UnifiedBackupIntent,
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
+from sglang.srt.mem_cache.unified_radix_cache import _OngoingPrefetch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -246,19 +248,19 @@ class TestBufferModeSidecar(unittest.TestCase):
             storage_start=0,
             buffer_host_occupied_units=len(host_indices),
         )
-        req_id = "sidecar-prefetch"
+        req_id = CacheRequestHandle("sidecar-prefetch", 0)
 
         cache = MagicMock()
         cache.page_size = 2
         cache.cache_controller.prefetch_tokens_occupied = len(host_indices)
         cache.ongoing_prefetch = {
-            req_id: (
-                0,
-                RadixKey(array("q", [1, 2, 3, 4])),
-                host_indices,
-                operation,
-                None,
-                {ComponentType.SWA: [swa]},
+            req_id: _OngoingPrefetch(
+                anchor_node_id=0,
+                prefetch_key=RadixKey(array("q", [1, 2, 3, 4])),
+                host_indices=host_indices,
+                operation=operation,
+                anchor_lock_params=None,
+                comp_xfers={ComponentType.SWA: [swa]},
             )
         }
         cache.prefetch_loaded_tokens_by_reqid = {}
@@ -272,7 +274,7 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         self.assertTrue(
             pipeline.stage_completed_prefetch(
-                req_id=req_id,
+                request=req_id,
                 num_tokens=len(host_indices),
                 hash_value=["page-0", "page-1"],
             )

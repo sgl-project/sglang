@@ -175,17 +175,26 @@ class Memory(msgspec.Struct):
         int,
         Arg(
             help=(
-                "Scheduling passes a queued request waits after a storage "
-                "prefetch miss before the availability check is retried "
-                "(under load the first check can run before the needed "
-                "backup commits). 0 disables retries."
+                "Scheduling passes a queued request waits before its storage "
+                "availability check is re-issued, when the prefetch found "
+                "nothing and a backup may still be committing (under load the "
+                "first check can run before it does). A re-issue that waits on "
+                "staging or a moved match instead goes out on the next pass. "
+                "Only passes that reach prefill scheduling count. 0 disables "
+                "miss retries; known-hit deferrals are always re-issued."
             ),
         ),
-    ] = 0
+    ] = 8
     hicache_storage_prefetch_retry_max_attempts: A[
         int,
-        "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
-    ] = 4
+        Arg(
+            help=(
+                "Storage availability re-issues a queued request may make, paced "
+                "miss polls and immediate re-issues alike; past the cap it is "
+                "admitted with whatever the device holds. 0 disables re-issues."
+            ),
+        ),
+    ] = 8
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache

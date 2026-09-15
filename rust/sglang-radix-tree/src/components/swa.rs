@@ -945,9 +945,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         _mamba_pool_idx: Option<Tensor>,
-        host_indices: Option<Tensor>,
+        _host_indices: Option<Tensor>,
         _token_ids: Option<&[i64]>,
-        prefetch_tokens: usize,
+        _prefetch_tokens: usize,
+        staging_tokens: usize,
         _last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         // unified_kv keeps SWA as a device-only ring.
@@ -1044,18 +1045,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 }])
             }
             CacheTransferPhase::Prefetch => {
-                let sw_pages = host_indices.as_ref().map_or_else(
-                    || {
-                        self.sliding_window_size
-                            .div_ceil(tree_core.page_size)
-                            .min(prefetch_tokens / tree_core.page_size)
-                    },
-                    |indices| indices.numel() / tree_core.page_size,
-                );
+                // Staging is allocated once the hit is known; the placeholders
+                // carry the planned page count and the trailing hashes fill in
+                // at commit.
+                let num_pages = staging_tokens / tree_core.page_size;
+                if num_pages == 0 {
+                    return Ok(None);
+                }
                 Some(vec![PoolTransfer {
                     name: PoolName::Swa,
-                    host_indices,
-                    keys: Some(vec!["__placeholder__".to_string(); sw_pages]),
+                    keys: Some(vec!["__placeholder__".to_string(); num_pages]),
                     hit_policy: PoolHitPolicy::TrailingPages,
                     ..Default::default()
                 }])

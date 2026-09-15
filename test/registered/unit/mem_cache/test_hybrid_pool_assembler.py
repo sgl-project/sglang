@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -199,7 +199,9 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                 cc.storage_backend = FailingStorage()
                 cc.prefetch_sync_queue = Queue()
                 operation = PrefetchOperation(
-                    "r", [1], pool_transfers=[PoolTransfer(name=PoolName.SWA)]
+                    CacheRequestHandle("r", 0),
+                    [1],
+                    pool_transfers=[PoolTransfer(name=PoolName.SWA)],
                 )
                 operation.hash_value = ["h0"]
                 if unified:
@@ -238,7 +240,9 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         operation = PrefetchOperation(
-            "r", list(range(hit_tokens)), pool_transfers=[transfer]
+            CacheRequestHandle("r", 0),
+            list(range(hit_tokens)),
+            pool_transfers=[transfer],
         )
         operation.hash_value = hashes
         self.assertIsNone(cc.alloc_prefetch_host_buffers(operation, hit_tokens))
@@ -258,6 +262,24 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
             transfer.keys, hashes[length // page_size - 2 : length // page_size]
         )
         cc.free_prefetch_host_buffers(operation, host_indices)
+
+        # A hit-time rematch can trim some or all FULL pages while the entire
+        # trailing SWA window still needs staging from the same shared arena.
+        for full_tokens in (page_size, 0):
+            with self.subTest(full_tokens=full_tokens):
+                transfer.keys = hashes[-2:]
+                operation.hash_value = list(hashes)
+                operation.storage_hit_count = hit_tokens
+                operation.sidecar_hash_values = None
+                cc.trim_prefetch_full_head(operation, hit_tokens - full_tokens)
+                self.assertTrue(
+                    cc.can_fit_prefetch_host_buffers(operation, full_tokens)
+                )
+                host_indices = cc.alloc_prefetch_host_buffers(operation, full_tokens)
+                self.assertEqual(host_indices.numel(), full_tokens)
+                self.assertEqual(transfer.host_indices.numel(), 2 * page_size)
+                self.assertEqual(transfer.keys, hashes[-2:])
+                cc.free_prefetch_host_buffers(operation, host_indices)
 
     def test_shared_arena_can_reuse_bytes_across_sides(self):
         page_size = 4

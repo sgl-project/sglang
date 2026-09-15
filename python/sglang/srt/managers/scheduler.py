@@ -98,7 +98,10 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    abort_distributed_environment,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
@@ -279,6 +282,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -3078,7 +3082,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3097,6 +3101,9 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
+            matched_len = len(req.prefix_indices) + req.host_hit_length
+            req.storage_prefetch_last_match_len = matched_len
+
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
@@ -3105,7 +3112,6 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
@@ -3116,7 +3122,7 @@ class Scheduler(
                     else None
                 )
                 tree_cache.prefetch_from_storage(
-                    req.rid,
+                    req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
                     tree_cache.get_last_hash_value(last_host_node),
@@ -3124,41 +3130,78 @@ class Scheduler(
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    storage_hit_end=storage_hit_end,
                 )
 
-    def _retry_missed_storage_prefetches(self):
-        """Re-issue the availability check for queued requests whose prefetch
-        missed. Pacing counts scheduling passes so TP ranks re-issue on the
-        same pass; a sweep (the admission loop stops at the first
-        unschedulable request) covers the whole queue."""
-        interval = get_memory().hicache_storage_prefetch_retry_poll_interval
-        if interval <= 0 or not self.waiting_queue:
+    def _process_storage_prefetch_retries(self):
+        """Issue due L3 attempts in the current waiting-queue order."""
+        retries = self.tree_cache.storage_prefetch_retries
+        if retries is None:
             return
+        memory = get_memory()
+        for req, storage_hit_end in retries.pop_ready(
+            self.waiting_queue,
+            memory.hicache_storage_prefetch_retry_poll_interval,
+            memory.hicache_storage_prefetch_retry_max_attempts,
+        ):
+            self._retry_storage_prefetch(req, storage_hit_end)
+
+    def _retry_storage_prefetch(
+        self, req: Req, storage_hit_end: Optional[int] = None
+    ) -> None:
+        req.storage_prefetch_retry_attempts += 1
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
-        for req in self.waiting_queue:
-            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
-                req.storage_prefetch_retry_pending = True
-                req.storage_prefetch_retry_wait_polls = 0
-            if (
-                not req.storage_prefetch_retry_pending
-                or req.storage_prefetch_retry_attempts >= max_attempts
-            ):
-                continue
-            req.storage_prefetch_retry_wait_polls += 1
-            if req.storage_prefetch_retry_wait_polls <= interval:
-                continue
-            req.storage_prefetch_retry_pending = False
-            req.storage_prefetch_retry_attempts += 1
-            logger.debug(
-                "HiCache storage prefetch retry req=%s attempt=%d",
+        if req.storage_prefetch_retry_attempts >= max_attempts:
+            logger.warning(
+                "HiCache storage prefetch reissue cap reached req=%s attempts=%d; "
+                "the request is admitted without further L3 lookups",
                 req.rid,
                 req.storage_prefetch_retry_attempts,
             )
-            self._prefetch_kvcache(req)
+        else:
+            logger.debug(
+                "HiCache storage prefetch re-issue req=%s attempt=%d",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+        self._prefetch_kvcache(req, storage_hit_end)
+
+    def _prefetch_after_device_hit_loss(self, req: Req) -> bool:
+        """Re-query an L3 range newly exposed by queue-time device eviction."""
+        previous_match_len = req.storage_prefetch_last_match_len
+        buffer_pipeline = self.tree_cache.buffer_pipeline
+        if not previous_match_len or (
+            buffer_pipeline is not None
+            and buffer_pipeline.has_staged(req.cache_request_handle)
+        ):
+            return False
+        current_match_len = len(req.prefix_indices) + req.host_hit_length
+        if current_match_len >= previous_match_len:
+            return False
+        if (
+            req.storage_prefetch_retry_attempts
+            >= get_memory().hicache_storage_prefetch_retry_max_attempts
+        ):
+            # Past the re-issue cap the shorter live match is admitted as is.
+            req.storage_prefetch_last_match_len = current_match_len
+            return False
+        logger.warning(
+            "HiCache device prefix shrank before admission req=%s "
+            "lookup_match=%d current_match=%d; reissuing storage lookup",
+            req.rid,
+            previous_match_len,
+            current_match_len,
+        )
+        self._retry_storage_prefetch(req)
+        return True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if is_retracted:
+            req.storage_prefetch_retry_attempts = 0
+            req.storage_prefetch_last_match_len = None
+            req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -3213,14 +3256,9 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, rid: str) -> None:
+    def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if (
-            self.enable_hierarchical_cache
-            or self.enable_hicache_storage
-            or self.enable_unified_cache_external_linker
-        ):
-            self.tree_cache.release_aborted_request(rid)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3248,7 +3286,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req.rid)
+                self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3462,7 +3500,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req.rid)
+        self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3513,11 +3551,24 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _process_hicache_events(self) -> None:
+        # The HiCache drain is TP-wide consensus; run it before rank-local
+        # decisions (_should_defer_prefill) or ranks enter different collectives.
+        if (
+            self.enable_hierarchical_cache
+            or get_memory().enable_flexkv
+            or self.enable_unified_cache_external_linker
+        ):
+            self.tree_cache.check_hicache_events()
+            if self.enable_hicache_storage:
+                self._process_storage_prefetch_retries()
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self._process_hicache_events()
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3719,15 +3770,6 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if (
-            self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
-        ):
-            self.tree_cache.check_hicache_events()
-            if self.enable_hicache_storage:
-                self._retry_missed_storage_prefetches()
-
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -3832,9 +3874,10 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -3860,14 +3903,16 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(
+                    req.cache_request_handle
+                )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
-                    req.rid
+                    req.cache_request_handle
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
@@ -3877,32 +3922,16 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage and (
+                self._prefetch_after_device_hit_loss(req)
+            ):
+                continue
             if (
                 self.enable_hicache_storage
-                and get_memory().hicache_host_memory_mode == "buffer_only"
+                and buffer_pipeline is not None
+                and not buffer_pipeline.prepare_staged_prefetch(req)
             ):
-                # Buffer mode: surface a staged prefetch as the request's host
-                # hit (consumed through init_load_back) plus its SWA window,
-                # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Planned against the same
-                # live prefix admission uses, so only the splice-able span
-                # tail is charged and unusable holds are freed. Set AFTER
-                # init_next_round_input (which recomputes host_hit). Mamba
-                # (fenced in init_hicache) will need the same charge via
-                # mamba_host_hit_length.
-                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
-                    req.rid, len(req.prefix_indices)
-                )
-                if held_tokens > 0:
-                    req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = held_swa_tokens
-                    req.storage_hit_length = held_tokens
-                    req.storage_hit_start = len(req.prefix_indices)
-                    req.host_hit_is_storage = True
-                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
-                    req.storage_hit_length = 0
-                    req.storage_hit_start = None
-                    req.host_hit_is_storage = False
+                continue
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3950,6 +3979,10 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        retries = self.tree_cache.storage_prefetch_retries
+        if self.enable_hicache_storage and retries is not None:
+            for req in can_run_list:
+                retries.cancel(req.rid)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -4042,7 +4075,7 @@ class Scheduler(
 
         return new_batch, running_batch
 
-    def _can_schedule_lora_req(
+    def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
         """
@@ -5208,7 +5241,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req.rid)
+            self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
@@ -5244,7 +5277,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                self._release_aborted_request(req.rid)
+                self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
@@ -5264,7 +5297,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req.rid)
+                    self._release_aborted_request(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -5848,6 +5881,8 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+                # Last: anything above may still need a working communicator.
+                abort_distributed_environment()
 
 
 def _make_abort_req(
