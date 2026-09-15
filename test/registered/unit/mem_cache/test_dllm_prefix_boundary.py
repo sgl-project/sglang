@@ -47,6 +47,7 @@ class TestDllmPrefixBoundary(unittest.TestCase):
         req.init_next_round_input(cache)
         self.assertEqual(req.prefix_indices.tolist(), [0, 1, 2, 3])
         self.assertEqual(req.dllm_block_offset, 4)
+        self.assertFalse(req.is_dllm_prefill())
         self.assertEqual(list(req.full_untruncated_fill_ids[4:8]), [5, 99, 99, 99])
 
     def test_real_literal_masks_in_complete_blocks_remain_cacheable(self):
@@ -58,6 +59,11 @@ class TestDllmPrefixBoundary(unittest.TestCase):
         req = make_req(prompt)
         req.init_next_round_input(cache)
         self.assertEqual(len(req.prefix_indices), 8)
+
+    def test_literal_mask_in_an_uncached_full_prompt_block_is_prefill(self):
+        req = make_req([1, 99, 2, 99])
+        req.init_next_round_input()
+        self.assertTrue(req.is_dllm_prefill())
 
     def test_real_token_and_logprob_boundaries(self):
         for prompt_len in (1, 3, 4, 5, 7, 8, 9):

@@ -52,8 +52,9 @@ class ReqDllmMixin:
             # still incoming stage
             return
 
-        input_block = self.full_untruncated_fill_ids[prefix_length:min_required_length]
-        is_prefill_phase = self.dllm_config.mask_id not in input_block
+        # A mask ID inside the user's prompt is a real token, not a request to
+        # denoise that position. Only positions beyond the prompt are generated.
+        is_prefill_phase = min_required_length <= len(self.origin_input_ids)
 
         if is_prefill_phase:
             self.dllm_phase = DllmReqPhase.STAGING_PREFILL
@@ -86,8 +87,8 @@ class ReqDllmMixin:
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        assert prefix_len % self.dllm_config.block_size == 0, (
-            f"Unexpected prefix len: {prefix_len}"
-        )
+        assert (
+            prefix_len % self.dllm_config.block_size == 0
+        ), f"Unexpected prefix len: {prefix_len}"
         if prefix_len > self.dllm_block_offset:
             self.dllm_block_offset = prefix_len
