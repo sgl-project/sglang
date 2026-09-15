@@ -519,7 +519,9 @@ def build_low_ratio_decode_workspaces(
     """Capture-safe: everything the schedule kernel touches is pinned in the workspace."""
     return {
         ratio: prepare_fp4_decode_workspace(
-            meta.page_table, meta.c4_seq_lens, bucket=LOW_RATIO_PAGE_TABLE_BUCKET
+            meta.page_table,
+            meta.compressed_seq_lens,
+            bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         )
         for ratio, meta in metadata_by_ratio.items()
     }
@@ -534,7 +536,7 @@ def refresh_low_ratio_prefill_workspaces(
     return {
         ratio: prepare_fp4_prefill_workspace(
             meta.page_table,
-            meta.c4_seq_lens,
+            meta.compressed_seq_lens,
             workspace=previous.get(ratio),
             bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         )
@@ -625,20 +627,28 @@ def low_ratio_decode_rows_fit_candidate_span(backend, forward_batch) -> bool:
     span = backend.low_ratio_candidate_span
     if span is None or forward_batch is None:
         return False
-    if not forward_batch.forward_mode.is_decode():
+    if not (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    ):
         return False
     from sglang.srt.model_executor.runner_utils.capture_mode import (
-        get_capture_dsa_variant,
+        get_capture_attention_variant,
         get_is_capture_mode,
     )
 
     if get_is_capture_mode():
-        return get_capture_dsa_variant() in (
+        return get_capture_attention_variant() in (
             "candidate_all",
             "candidate_c2_all",
             "candidate_unfiltered",
         )
     max_len = _decode_batch_max_seq_len(forward_batch)
+    if forward_batch.forward_mode.is_target_verify():
+        width = getattr(backend, "speculative_num_draft_tokens", None)
+        if width is None or max_len is None:
+            return False
+        max_len += width
     return max_len is not None and max_len <= span
 
 
@@ -665,10 +675,10 @@ def low_ratio_index_topk_hip_decode(
         )
         topk_transform_paged(
             scores,
-            indexer_metadata.c4_seq_lens,
+            indexer_metadata.compressed_seq_lens,
             indexer_metadata.page_table,
             page_indices,
-            indexer_metadata.c4_page_size,
+            indexer_metadata.compressed_page_size,
             raw_indices,
         )
         return
@@ -688,7 +698,7 @@ def low_ratio_index_topk_hip_decode(
         k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
         weights=weights,
         page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.c4_seq_lens,
+        c4_seq_lens=indexer_metadata.compressed_seq_lens,
         weight_scale=1.0,
         page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
         is_decode=True,
@@ -704,10 +714,10 @@ def low_ratio_index_topk_hip_decode(
         ), "candidate blocks missing for decode"
         topk_within_candidate_blocks_hip(
             logits,
-            indexer_metadata.c4_seq_lens,
+            indexer_metadata.compressed_seq_lens,
             candidates,
             page_table=indexer_metadata.page_table,
-            page_size=indexer_metadata.c4_page_size,
+            page_size=indexer_metadata.compressed_page_size,
             page_indices=core.sparse_page_indices(ratio),
             raw_indices=core.sparse_raw_indices(ratio),
             sort_output=True,
@@ -716,16 +726,16 @@ def low_ratio_index_topk_hip_decode(
     if two_level and indexer.is_candidate_source:
         backend.candidate_masks = select_candidate_blocks_hip(
             logits,
-            indexer_metadata.c4_seq_lens,
+            indexer_metadata.compressed_seq_lens,
             topk_blocks=indexer.candidate_topk_blocks,
             block_size=indexer.candidate_block_size,
         )
     topk_transform_paged_sorted(
         logits,
-        indexer_metadata.c4_seq_lens,
+        indexer_metadata.compressed_seq_lens,
         indexer_metadata.page_table,
         page_indices,
-        indexer_metadata.c4_page_size,
+        indexer_metadata.compressed_page_size,
         raw_indices,
     )
 
@@ -866,7 +876,7 @@ def low_ratio_index_topk_hip_extend(
             k_scale=k_scale,
             weights=weights[rows],
             page_table=indexer_metadata.page_table[rows],
-            c4_seq_lens=indexer_metadata.c4_seq_lens[rows],
+            c4_seq_lens=indexer_metadata.compressed_seq_lens[rows],
             weight_scale=1.0,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             is_decode=False,
@@ -886,7 +896,7 @@ def low_ratio_index_topk_hip_extend(
             is_identity=group_is_identity,
             compress_lens=compress_lens[rows],
             page_table=indexer_metadata.page_table[rows],
-            page_size=indexer_metadata.c4_page_size,
+            page_size=indexer_metadata.compressed_page_size,
             page_indices=page_indices[rows],
             raw_indices=raw_indices[rows] if raw_indices is not None else None,
             consume=consume_rows,

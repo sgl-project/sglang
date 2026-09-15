@@ -426,11 +426,13 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
         prefill_form = backend._init_low_ratio_indexer_metadata(core, is_prefill=True)
         self.assertEqual(set(decode_form), {"c2_indexer_metadata"})
         self.assertEqual(
-            decode_form["c2_indexer_metadata"].c4_seq_lens.tolist(), [1, 1, 1, 2, 2, 3]
+            decode_form["c2_indexer_metadata"].compressed_seq_lens.tolist(),
+            [1, 1, 1, 2, 2, 3],
         )
         # Prefill rows keep the raw visible count (a zero row is skipped).
         self.assertEqual(
-            prefill_form["c2_indexer_metadata"].c4_seq_lens.tolist(), [0, 1, 1, 2, 2, 3]
+            prefill_form["c2_indexer_metadata"].compressed_seq_lens.tolist(),
+            [0, 1, 1, 2, 2, 3],
         )
 
     def test_in_graph_hoists_verify_rows_and_builds_decode_workspaces(self):
@@ -509,6 +511,80 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
                 self.assertEqual(seen, {2: c2_meta}, mode)
         finally:
             self.module.build_low_ratio_decode_workspaces = saved
+
+
+@unittest.skipUnless(is_hip(), "HIP multi-stream preparation")
+class TestLowRatioPrepareStreams(CustomTestCase):
+    def test_cp_reference_uses_local_request_row_counts(self):
+        from unittest.mock import Mock
+
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            DeepseekV4HipRadixBackend,
+        )
+
+        backend = SimpleNamespace(_low_ratio_index_topk_torch=Mock())
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([7, 9, 11], device="cuda")
+        )
+        x = torch.empty(5, 16, device="cuda")
+        pos = torch.tensor([2, 4, 6, 8, 10], device="cuda")
+        DeepseekV4HipRadixBackend._low_ratio_index_topk_dense(
+            backend,
+            None,
+            x,
+            x,
+            pos,
+            batch,
+            torch.tensor([2, 0, 3], device="cuda"),
+            [2, 0, 3],
+        )
+        call = backend._low_ratio_index_topk_torch.call_args.args
+        self.assertEqual(call[3].tolist(), [7, 7, 11, 11, 11])
+        self.assertIs(call[4], pos)
+
+    def test_graph_replay_joins_kv_and_source_streams(self):
+        from sglang.srt.models.deepseek_v4 import MQALayer
+
+        x = torch.randn(6, 32, device="cuda")
+        compressed, indexed, kv = (torch.empty_like(x) for _ in range(3))
+
+        def sources(*, x, q_lora, run_compressor=True, run_indexer=True, **kwargs):
+            if run_compressor:
+                compressed.copy_(x * 2)
+            if run_indexer:
+                indexed.copy_(compressed + q_lora)
+
+        layer = SimpleNamespace(
+            alt_streams=[torch.cuda.Stream(), torch.cuda.Stream()],
+            compressor=object(),
+            indexer=object(),
+            fuse_wqa_wkv=True,
+            wqkv_a=lambda x: (x * 4, None),
+            _compute_q_a=lambda x, **kw: (x + 1, x + 1),
+            _compute_q_b=lambda q, positions, q_out: q * 3,
+            _compute_kv_to_cache=lambda x, positions, batch, backend, qkv_a: kv.copy_(
+                qkv_a + 5
+            ),
+        )
+        backend = SimpleNamespace(forward_low_ratio_sources=sources)
+
+        def run():
+            q = MQALayer._forward_prepare_low_ratio_multi_stream(
+                layer, x, None, None, backend
+            )
+            return q + indexed + kv
+
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        for _ in range(3):
+            x.normal_()
+            graph.replay()
+            torch.testing.assert_close(
+                output, (x + 1) * 3 + (x * 2 + x + 1) + (x * 4 + 5)
+            )
 
 
 if __name__ == "__main__":
