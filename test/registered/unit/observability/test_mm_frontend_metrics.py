@@ -22,11 +22,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-def _metrics(registry=None):
+def _metrics(registry=None, labels=None):
     from prometheus_client import Counter, Gauge, Histogram
 
     return MultimodalFrontendMetrics(
-        labels={"model_name": "test"},
+        labels=labels or {"model_name": "test"},
         counter_cls=partial(Counter, registry=registry),
         gauge_cls=partial(Gauge, registry=registry),
         histogram_cls=partial(Histogram, registry=registry),
@@ -96,6 +96,35 @@ class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTest
         self.assertEqual(
             self.sample("stage_seconds_sum", stage="hash", outcome="success"), 3.5
         )
+
+    async def test_configured_labels_cannot_override_frontend_dimensions(self):
+        """Custom labels named stage/outcome/modality must not break requests."""
+        from prometheus_client import CollectorRegistry
+
+        self.registry = CollectorRegistry()
+        metrics = _metrics(
+            self.registry,
+            labels={
+                "model_name": "test",
+                "stage": "custom",
+                "outcome": "custom",
+                "modality": "custom",
+            },
+        )
+        with metrics.record("hash"):
+            metrics.observe_inputs(
+                MultimodalProcessorOutput(
+                    mm_items=[
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE, feature=torch.ones(4)
+                        )
+                    ]
+                )
+            )
+        self.assertEqual(
+            self.sample("stage_seconds_count", stage="hash", outcome="success"), 1
+        )
+        self.assertEqual(self.sample("items_total", modality="image"), 1)
 
     async def test_workload_counts_logical_bytes_without_reading_device_data(self):
         inputs = MultimodalProcessorOutput(
