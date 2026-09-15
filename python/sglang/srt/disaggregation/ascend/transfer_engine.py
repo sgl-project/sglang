@@ -75,9 +75,27 @@ class AscendTransferEngine(MooncakeTransferEngine):
             )
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
+
+        # The NIC endpoint is user-configured and passed verbatim to the engine.
+        # No port rewriting is done here: the multi-rank port layout follows the
+        # transfer engine's contract, and a conflicting endpoint should surface
+        # as an engine error for the user to fix in configuration.
+        nic = os.getenv("ASCEND_MF_NIC")
+        if transfer_protocol == "host_rdma" and nic:
+            logger.info(
+                "HOST_RDMA endpoint: npu_id=%s, nic=%s",
+                self.npu_id,
+                nic,
+            )
+
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            self.store_url,
+            self.session_id,
+            self.role,
+            self.npu_id,
+            trans_op_type,
+            nic=nic,
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
