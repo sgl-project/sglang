@@ -77,9 +77,14 @@ class TestStep3p7Flash(CustomTestCase):
         # and scorer. Sharing this object guarantees identical samples.
         evaluator = MMMUVLMEval(num_examples=100, num_threads=64)
         self.assertEqual(len(evaluator.samples), 100)
-        # Step3.7 is a reasoning model, so use the long generation budget
-        # adopted by the repository's other reasoning-model MMMU tests.
-        args = SimpleNamespace(model=self.model, max_tokens=65536, temperature=0)
+        # Apply the same low reasoning tier and 32k output limit to both modes
+        # to bound outlier generations while preserving a like-for-like comparison.
+        args = SimpleNamespace(
+            model=self.model,
+            max_tokens=32768,
+            reasoning_effort="low",
+            temperature=0,
+        )
         report_dir = Path(tempfile.mkdtemp(prefix="step3p7_mmmu_"))
         print(f"Step3.7 MMMU reports: {report_dir}")
         scores = {}
