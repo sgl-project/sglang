@@ -146,6 +146,9 @@ def test_elastic_backup_targets_current_ffn_storage_from_checkpoint_names():
 
 
 if __name__ == "__main__":
+    import sys
+
     import pytest
 
-    raise SystemExit(pytest.main([__file__]))
+    args = ["-x" if arg == "-f" else arg for arg in sys.argv[1:]]
+    sys.exit(pytest.main([__file__, "-v", *args]))

@@ -640,3 +640,10 @@ def test_mxfp4_humming_passes_input_config_to_weight_preparation():
     assert method.input_quant_config == policy
     assert layer.w13_weight_scale.dtype == torch.float8_e8m0fnu
     assert layer.w2_weight_scale.dtype == torch.float8_e8m0fnu
+
+
+if __name__ == "__main__":
+    import sys
+
+    args = ["-x" if arg == "-f" else arg for arg in sys.argv[1:]]
+    sys.exit(pytest.main([__file__, "-v", *args]))
