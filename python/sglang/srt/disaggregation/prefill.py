@@ -89,8 +89,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
-
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -152,7 +151,7 @@ class PrefillBootstrapQueue:
         tp_size: int,
         gpu_id: int,
         bootstrap_port: int,
-        gloo_group: ProcessGroup,
+        sync_group: GroupCoordinator,
         max_total_num_tokens: int,
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
@@ -172,7 +171,7 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
-        self.gloo_group = gloo_group
+        self.sync_group = sync_group
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = (
@@ -457,8 +456,8 @@ class PrefillBootstrapQueue:
             if uncovered:
                 local_polls = poll_and_all_reduce_attn_cp_tp_group(
                     [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
+                    self.scheduler.attn_cp_group,
+                    self.scheduler.attn_tp_group,
                 )
                 for i, local_poll in zip(uncovered, local_polls):
                     if local_poll == KVPoll.Failed:
@@ -466,8 +465,8 @@ class PrefillBootstrapQueue:
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
-                self.scheduler.attn_cp_cpu_group,
-                self.scheduler.attn_tp_cpu_group,
+                self.scheduler.attn_cp_group,
+                self.scheduler.attn_tp_group,
             )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -557,8 +556,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            self.attn_cp_group,
+            self.attn_tp_group,
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -957,8 +956,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            self.attn_cp_group,
+            self.attn_tp_group,
         )
 
         undone_reqs: List[Req] = []
@@ -1176,8 +1175,8 @@ class SchedulerDisaggregationPrefillMixin:
             return True
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            self.attn_cp_group,
+            self.attn_tp_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
 

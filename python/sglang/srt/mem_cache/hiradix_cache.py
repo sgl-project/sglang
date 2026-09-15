@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -275,6 +276,29 @@ class HiRadixCache(RadixCache):
         5     |                         |                         | _pp_sync(data=1) ends
         """
         if self.pp_size <= 1 or self.pp_group is None:
+            return
+        channel = get_world_group().zmq_p2p
+        if channel is not None:
+            if self.pp_rank > 0:
+                data.copy_(
+                    channel.recv_from(
+                        torch.distributed.get_global_rank(
+                            self.pp_group, self.pp_rank - 1
+                        ),
+                        tag=P2PTag.HIRADIX_PP_SYNC,
+                    )
+                )
+            if self.pp_rank + 1 < self.pp_size:
+                self.work_list.extend(
+                    channel.send_to(
+                        torch.distributed.get_global_rank(
+                            self.pp_group, self.pp_rank + 1
+                        ),
+                        data,
+                        tag=P2PTag.HIRADIX_PP_SYNC,
+                        async_send=True,
+                    )
+                )
             return
         if self.pp_rank > 0:
             torch.distributed.recv(

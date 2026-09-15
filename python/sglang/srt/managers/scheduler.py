@@ -54,7 +54,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-from torch.distributed import barrier
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -98,6 +97,7 @@ from sglang.srt.disaggregation.utils import (
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.device_communicators.zmq_p2p import ZmqP2PChannel
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -1201,6 +1201,18 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
+        # Deadline-free p2p channel for the pipeline-stage edge (request
+        # relay, grammar/HiRadix sync, send_object/recv_object metadata):
+        # the gloo p2p path carries a CLOCK_MONOTONIC deadline a suspended
+        # rank can sleep past. Endpoint exchange is an init-time allgather.
+        self.zmq_p2p_channel = None
+        if self.ps.pp_size > 1:
+            self.zmq_p2p_channel = ZmqP2PChannel.create(
+                self.world_group.cpu_group, self.world_group.rank_in_group
+            )
+            self.pp_group.zmq_p2p = self.zmq_p2p_channel
+            self.world_group.zmq_p2p = self.zmq_p2p_channel
+
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
         # the base TP group. Entry rank is the local rank 0 in that group.
@@ -1523,7 +1535,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                sync_group=self.attn_tp_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.ps.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -1541,7 +1553,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                sync_group=self.attn_tp_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
                 dp_size=get_parallel().dp_size,
@@ -1577,7 +1589,7 @@ class Scheduler(
                 tp_size=self.ps.tp_size,
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
+                sync_group=self.attn_tp_group,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
@@ -2142,14 +2154,7 @@ class Scheduler(
         ):
             return [local_error]
 
-        world_size = torch.distributed.get_world_size(group=self.dp_tp_cpu_group)
-        errors = [None] * world_size
-        torch.distributed.all_gather_object(
-            errors,
-            local_error,
-            group=self.dp_tp_cpu_group,
-        )
-        return errors
+        return self.dp_tp_group.all_gather_object(local_error)
 
     def _materialize_cuda_vmm_inputs(self, recv_req) -> Optional[List[Optional[str]]]:
         """Materialize each request and agree on failures across TP ranks."""
@@ -2205,6 +2210,7 @@ class Scheduler(
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
             ps=self.ps,
+            dp_tp_group=self.dp_tp_group,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
         )
@@ -2604,23 +2610,11 @@ class Scheduler(
 
             # Broadcast either the prepared inputs or the request-local error.
             if group_world_size > 1:
-                obj_list = [result]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                result = obj_list[0]
+                result = self.dp_tp_group.broadcast_object(result, src=0)
         else:
             # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
             if group_world_size > 1:
-                obj_list = [None]
-                torch.distributed.broadcast_object_list(
-                    obj_list,
-                    src=self.dp_tp_group.first_rank,
-                    group=self.dp_tp_cpu_group,
-                )
-                result = obj_list[0]
+                result = self.dp_tp_group.broadcast_object(None, src=0)
             else:
                 result = _MultimodalInputBroadcast(
                     inputs=MultimodalInputs.from_processor_output(raw_mm_inputs)
@@ -5140,7 +5134,7 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier(group=self.tp_group.cpu_group)
+        self.tp_group.barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def handle_update_weight_version(

@@ -20,6 +20,8 @@ from zmq import (  # type: ignore
     IPV6,
     NOBLOCK,
     POLLIN,
+    PULL,
+    PUSH,
     SNDHWM,
     SUB,
     SUBSCRIBE,
@@ -181,6 +183,7 @@ class Handle:
     local_subscribe_port: Optional[int] = None
     local_notify_port: Optional[int] = None
     remote_subscribe_port: Optional[int] = None
+    control_port: Optional[int] = None
 
 
 class MessageQueue:
@@ -197,6 +200,7 @@ class MessageQueue:
             local_reader_ranks = list(range(n_local_reader))
         else:
             assert len(local_reader_ranks) == n_local_reader
+        self.n_reader = n_reader
         self.n_local_reader = n_local_reader
         n_remote_reader = n_reader - n_local_reader
         self.n_remote_reader = n_remote_reader
@@ -273,11 +277,27 @@ class MessageQueue:
             remote_subscribe_port = None
             self.remote_socket = None
 
+        # Reverse control channel (reader -> writer) for barrier() and
+        # all_gather_object(). PUSH sends queue until the connection is up,
+        # so no handshake is needed; neither side of this channel holds a
+        # wall-clock-bounded wait.
+        self.control_socket = context.socket(PULL)
+        if NetworkAddress(connect_ip, 0).is_ipv6:
+            self.control_socket.setsockopt(IPV6, 1)
+            control_port = self.control_socket.bind_to_random_port(
+                f"tcp://[{connect_ip}]"
+            )
+        else:
+            control_port = self.control_socket.bind_to_random_port(
+                f"tcp://{connect_ip}"
+            )
+
         self._is_writer = True
         self._is_local_reader = False
         self.local_reader_rank = -1
         # rank does not matter for remote readers
         self._is_remote_reader = False
+        self.group_rank = 0
 
         self.handle = Handle(
             connect_ip=connect_ip,
@@ -286,6 +306,7 @@ class MessageQueue:
             local_subscribe_port=local_subscribe_port,
             local_notify_port=local_notify_port,
             remote_subscribe_port=remote_subscribe_port,
+            control_port=control_port,
         )
 
         logger.debug("Message queue communication handle: %s", self.handle)
@@ -346,6 +367,15 @@ class MessageQueue:
             socket_addr = na.to_tcp()
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
+
+        # Reverse control channel back to the writer for barrier() and
+        # all_gather_object(); sends queue until the connection is up.
+        self.control_socket = context.socket(PUSH)
+        na = NetworkAddress(handle.connect_ip, handle.control_port)
+        if na.is_ipv6:
+            self.control_socket.setsockopt(IPV6, 1)
+        self.control_socket.connect(na.to_tcp())
+        self.group_rank = rank
 
         return self
 
@@ -547,6 +577,41 @@ class MessageQueue:
         else:
             return self.dequeue()
 
+    def barrier(self):
+        """Rendezvous across the group with no wall-clock-bounded wait.
+
+        Readers push an arrival ack on the control channel and block on the
+        release broadcast; the writer collects one ack per reader before
+        releasing. Neither side holds a deadline, so a suspended rank only
+        delays the barrier instead of failing it on resume.
+        """
+        if self._is_writer:
+            for _ in range(self.n_reader):
+                self.control_socket.recv()
+            self.enqueue(None)
+        else:
+            self.control_socket.send(b"")
+            self.dequeue()
+
+    def all_gather_object(self, obj=None):
+        """Gather one object per rank, returned in group-rank order.
+
+        Same transport as barrier(): readers push (rank, obj) on the
+        control channel and the writer publishes the completed list.
+        """
+        if self._is_writer:
+            gathered = [None] * (self.n_reader + 1)
+            gathered[self.group_rank] = obj
+            for _ in range(self.n_reader):
+                rank, payload = pickle.loads(self.control_socket.recv())
+                gathered[rank] = payload
+            self.enqueue(gathered)
+            return gathered
+        self.control_socket.send(
+            pickle.dumps((self.group_rank, obj), protocol=pickle.HIGHEST_PROTOCOL)
+        )
+        return self.dequeue()
+
     @staticmethod
     def create_from_process_group(
         pg: ProcessGroup, max_chunk_bytes, max_chunks, writer_rank=0
@@ -571,6 +636,7 @@ class MessageQueue:
                 max_chunk_bytes=max_chunk_bytes,
                 max_chunks=max_chunks,
             )
+            buffer_io.group_rank = writer_rank
             handle = buffer_io.export_handle()
             dist.broadcast_object_list(
                 [handle], src=global_ranks[writer_rank], group=pg
