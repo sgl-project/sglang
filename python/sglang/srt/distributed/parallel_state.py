@@ -117,6 +117,21 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+def _pp_output_cpu_bypass_allgather(tensor: torch.Tensor) -> bool:
+    """Whether to bypass the send-allgather scheme for this tensor.
+
+    When SGLANG_PP_OUTPUT_VIA_CPU relays PP output tensors over the CPU
+    (gloo) group, the recv-side all_gather would run on CPU tensors, which
+    device communicators do not support. PP output tensors are replicated
+    across attn-TP ranks (they are produced after the logits/hidden-state
+    gathers), so instead every rank sends the full host tensor and the
+    receiver skips the allgather. This trades N x wire bandwidth for not
+    inserting a device collective into the CPU relay path, which is fine
+    for the small output tensors.
+    """
+    return envs.SGLANG_PP_OUTPUT_VIA_CPU.get() and tensor.is_cpu
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -1736,7 +1751,14 @@ class GroupCoordinator:
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            # CPU-relayed PP outputs bypass the scheme: every rank sends the
+            # full (replicated) host tensor and the receiver skips the
+            # allgather, which could not run on CPU tensors anyway.
+            if (
+                all_gather_group is not None
+                and not _pp_output_cpu_bypass_allgather(tensor)
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1780,8 +1802,11 @@ class GroupCoordinator:
                     continue
 
                 # send-allgather: send only a slice, then do allgather.
+                # CPU-relayed PP outputs arrive as full (replicated) host
+                # tensors, so skip the recv-side allgather.
                 use_all_gather = (
                     all_gather_group is not None
+                    and not _pp_output_cpu_bypass_allgather(tensor)
                     and tensor.numel() % all_gather_size == 0
                 )
 
@@ -1901,6 +1926,7 @@ class GroupCoordinator:
 
                 use_all_gather = (
                     recv_all_gather_group is not None
+                    and not _pp_output_cpu_bypass_allgather(tensor)
                     and tensor.numel() % recv_all_gather_group.world_size == 0
                 )
                 orig_shape = None
@@ -1930,6 +1956,7 @@ class GroupCoordinator:
             send_t = tensor
             if (
                 send_all_gather_group is not None
+                and not _pp_output_cpu_bypass_allgather(send_t)
                 and send_t.numel() % send_all_gather_group.world_size == 0
             ):
                 send_t = send_t.reshape(send_all_gather_group.world_size, -1)[

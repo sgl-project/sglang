@@ -614,6 +614,17 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP: relay output tensors over the CPU (gloo) group instead of the device
+    # group. The last rank D2Hs the (small) output tensors before sending and
+    # receivers H2D them back after recv, while relaying stages forward the
+    # host tensors as-is. gloo's isend does not block at post time, which
+    # removes the all-send-first ring deadlock on backends where isend blocks
+    # until a matching recv is posted (e.g. HCCL) for pp_size > 2 (the paired
+    # batch_isend_irecv path only covers pp_size == 2). With attn_tp_size > 1,
+    # CPU tensors bypass the send-allgather scheme: every TP rank sends the
+    # full replicated host tensor and the receiver skips the allgather.
+    # Incompatible with SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.
+    SGLANG_PP_OUTPUT_VIA_CPU = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_DP_MLP_SYNC_FORCE_CPU_GROUP = EnvBool(False)
 
