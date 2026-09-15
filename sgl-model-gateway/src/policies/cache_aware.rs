@@ -384,6 +384,26 @@ impl CacheAwarePolicy {
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
+
+                // Measure the reuse this branch is giving up, before the insert below
+                // makes the prompt match itself. Without this the match-rate metrics are
+                // conditioned on the balanced path, and a deployment tuned to trip the
+                // balance thresholds often — which is exactly what the KV-cache lab does
+                // on purpose — reports almost no samples at all. One extra traversal on
+                // the imbalanced path only; the insert that follows walks the same nodes.
+                let forgone = tree.prefix_match_with_counts(text);
+                let forgone_rate = if forgone.input_char_count == 0 {
+                    0.0
+                } else {
+                    forgone.matched_char_count as f64 / forgone.input_char_count as f64
+                };
+                Metrics::record_cache_aware_match_rate(Branch::LoadBalance.as_str(), forgone_rate);
+                Metrics::record_cache_aware_prefix_chars(
+                    Branch::LoadBalance.as_str(),
+                    forgone.matched_char_count,
+                    forgone.input_char_count,
+                );
+
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
@@ -524,9 +544,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            Metrics::record_cache_aware_match_rate(match_rate as f64);
-
             let is_cache_hit = match_rate > self.config.cache_threshold;
+            let match_branch = if is_cache_hit {
+                Branch::CacheHit
+            } else {
+                Branch::CacheMissMinLoad
+            };
+
+            Metrics::record_cache_aware_match_rate(match_branch.as_str(), match_rate as f64);
+            Metrics::record_cache_aware_prefix_chars(
+                match_branch.as_str(),
+                result.matched_char_count,
+                result.input_char_count,
+            );
 
             // Select worker without String allocation
             let selected_idx = if is_cache_hit {
@@ -555,11 +585,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
-                let branch = if is_cache_hit {
-                    Branch::CacheHit
-                } else {
-                    Branch::CacheMissMinLoad
-                };
+                let branch = match_branch;
 
                 self.emit_decision_snapshot(
                     workers,

@@ -251,7 +251,15 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_cache_aware_match_rate",
-        "Best-prefix match rate (0..1) observed at cache-aware routing decisions"
+        "Best-prefix match rate (0..1) observed at cache-aware routing decisions, by branch"
+    );
+    describe_counter!(
+        "smg_cache_aware_matched_chars_total",
+        "Characters of the prompt that matched the best worker prefix, by branch"
+    );
+    describe_counter!(
+        "smg_cache_aware_input_chars_total",
+        "Characters of the prompt inspected at a cache-aware decision, by branch"
     );
     describe_gauge!(
         "smg_cache_aware_tree_chars",
@@ -357,6 +365,15 @@ pub fn start_prometheus(config: PrometheusConfig) {
         ]
     });
 
+    // Without explicit buckets, metrics-exporter-prometheus renders a histogram as a
+    // rolling-window summary: you get quantiles but no buckets, so the value cannot be
+    // re-aggregated across scrapes or across routers. A match rate is a 0..1 ratio, so
+    // the duration buckets above are useless for it and it needs its own set.
+    let match_rate_matcher = Matcher::Full(String::from("smg_cache_aware_match_rate"));
+    let match_rate_buckets: Vec<f64> = vec![
+        0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0,
+    ];
+
     let ip_addr: IpAddr = config
         .host
         .parse()
@@ -368,6 +385,8 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(match_rate_matcher, &match_rate_buckets)
+        .expect("failed to set cache-aware match rate buckets")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }
@@ -941,8 +960,36 @@ impl Metrics {
     }
 
     /// Record best-prefix match rate at a cache-aware decision.
-    pub fn record_cache_aware_match_rate(rate: f64) {
-        histogram!("smg_cache_aware_match_rate").record(rate);
+    ///
+    /// The `branch` label separates reuse the router *exploited* (`cache_hit`) from
+    /// reuse it *passed up* (`cache_miss_min_load`, `load_balance`). Summing over the
+    /// label recovers the unlabeled upstream view.
+    pub fn record_cache_aware_match_rate(branch: &'static str, rate: f64) {
+        histogram!(
+            "smg_cache_aware_match_rate",
+            "branch" => branch
+        )
+        .record(rate);
+    }
+
+    /// Record the absolute character counts behind one cache-aware decision.
+    ///
+    /// These two counters exist because a mean of per-request match *rates* is the
+    /// wrong fleet-level number: it weights a 2k-token prompt the same as a 150k-token
+    /// one. The aggregate prefix reuse rate is the ratio of the sums,
+    /// `rate(matched_chars_total[5m]) / rate(input_chars_total[5m])`, which weights each
+    /// request by its size.
+    pub fn record_cache_aware_prefix_chars(branch: &'static str, matched: usize, input: usize) {
+        counter!(
+            "smg_cache_aware_matched_chars_total",
+            "branch" => branch
+        )
+        .increment(matched as u64);
+        counter!(
+            "smg_cache_aware_input_chars_total",
+            "branch" => branch
+        )
+        .increment(input as u64);
     }
 
     /// Set per-worker cache footprint (characters) for a model.
