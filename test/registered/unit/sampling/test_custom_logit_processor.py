@@ -66,7 +66,9 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             vocab_size=4,
             has_custom_logit_processor=True,
             custom_params=params,
-            custom_logit_processor={0: (processor, torch.tensor([True, False, True]))},
+            custom_logit_processor={0: processor},
+            custom_logit_processor_rows={0: [0, 2]},
+            custom_logit_processor_batch_indices={0: torch.tensor([0, 2])},
             device="cpu",
         )
         logits = torch.zeros(batch_size * num_tokens, 4)
