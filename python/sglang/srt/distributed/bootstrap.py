@@ -295,13 +295,8 @@ def _init_parallel_groups(
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
-        # Mooncake owns the dynamically expandable WORLD group. Model-parallel
-        # groups remain fixed within each launch cohort.
-        backend=(
-            get_default_distributed_backend(device)
-            if server_args.elastic_ep_backend == "mooncake"
-            else None
-        ),
+        # Only WORLD is extended during scale-up. The joiner's model-parallel
+        # groups are fixed groups local to its launch cohort.
         recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,

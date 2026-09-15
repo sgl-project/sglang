@@ -313,6 +313,7 @@ class GroupCoordinator:
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
         self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+        # Scale cohorts create these groups without the serving ranks.
         use_local_synchronization = rank_offset > 0 and not recovered_rank
 
         if is_cuda_alike():
@@ -336,7 +337,7 @@ class GroupCoordinator:
                 from mooncake.pg import MooncakeBackendOptions
 
                 pg_active_size = len(ranks)
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     assert max_world_size >= len(ranks), (
                         f"max_world_size ({max_world_size}) must be >= "
                         f"group size ({len(ranks)})"
@@ -350,7 +351,7 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if not recovered_rank and max_world_size is not None:
+                if max_world_size is not None:
                     dev_opts = MooncakeBackendOptions(
                         pg_active_ranks, recovered_rank, max_world_size
                     )
@@ -2033,7 +2034,11 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    recovered_rank: bool = False,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -2048,6 +2053,7 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
+        max_world_size=max_world_size,
     )
 
 
@@ -2446,7 +2452,11 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(
-            ranks, local_rank, backend, recovered_rank=recovered_rank
+            ranks=ranks,
+            local_rank=local_rank,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            max_world_size=max_world_size,
         )
     else:
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
@@ -2619,6 +2629,7 @@ def initialize_model_parallel(
             group_name="dcp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2838,6 +2849,7 @@ def initialize_model_parallel(
             group_name="self_pp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
 
