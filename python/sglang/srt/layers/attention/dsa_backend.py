@@ -2503,8 +2503,7 @@ class DeepseekSparseAttnBackend(
         """
         if self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
-        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        # The born-FP8 Q fast path currently only supports EXTEND.
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
@@ -3555,14 +3554,14 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
-            # disable for MTP
+            # Mixed batches also need ragged offsets for sparse prefill.
             self.dsa_kv_cache_store_fp8
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
             # fp8 KV ("kv must have dtype kBFloat16").
             and self.dsa_prefill_impl in ("flashmla_sparse", "flashmla_sparse_q8")
-            and forward_mode == ForwardMode.EXTEND
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
