@@ -5,10 +5,11 @@ not construct full models or substitute the loaders with mocks.
 """
 
 import importlib
+import sys
 import unittest
 from contextlib import ExitStack
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -93,6 +94,26 @@ class TestFFNModelLoaders(unittest.TestCase):
         ]
         for module, cls in cases:
             with self.subTest(model=module), ExitStack() as stack:
+                if (
+                    module == "bailing_moe_v3"
+                    and importlib.util.find_spec("vllm") is None
+                ):
+                    # CPU CI omits vLLM. This BF16 loading test never calls AWQ.
+                    vllm = ModuleType("vllm")
+                    vllm.__path__ = []
+                    custom_ops = ModuleType("vllm._custom_ops")
+                    custom_ops.awq_dequantize = Mock(
+                        side_effect=AssertionError("BF16 loading must not call AWQ")
+                    )
+                    stack.enter_context(
+                        patch.dict(
+                            sys.modules,
+                            {
+                                "vllm": vllm,
+                                "vllm._custom_ops": custom_ops,
+                            },
+                        )
+                    )
                 model, ffn = _fixture(module, cls)
                 model.num_fused_shared_experts = 1
                 model.enable_shared_expert_fusion = True
