@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -9,7 +10,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import retraction_backup
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -20,6 +25,71 @@ from sglang.srt.speculative.base_spec_worker import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+
+class TestMLADCPRetractionBackup(unittest.TestCase):
+    def _make_pool(self) -> MLATokenToKVPool:
+        return MLATokenToKVPool(
+            size=4,
+            page_size=1,
+            dtype=torch.bfloat16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=4,
+            layer_num=1,
+            device="cuda",
+            enable_memory_saver=False,
+        )
+
+    @staticmethod
+    def _parallel(*, size: int, rank: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            dcp_enabled=size > 1,
+            attn_dcp_size=size,
+            attn_dcp_rank=rank,
+        )
+
+    def test_dcp1_indices_are_unchanged(self):
+        pool = self._make_pool()
+        indices = torch.tensor([0, 2, 3], device="cuda")
+
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=self._parallel(size=1, rank=0),
+        ):
+            actual = pool._localize_dcp_indices(indices)
+
+        torch.testing.assert_close(actual, indices)
+
+    def test_dcp_indices_keep_owned_local_rows(self):
+        pool = self._make_pool()
+        indices = torch.arange(16, device="cuda")
+
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=self._parallel(size=8, rank=3),
+        ):
+            actual = pool._localize_dcp_indices(indices)
+
+        torch.testing.assert_close(actual, torch.tensor([0, 1], device="cuda"))
+
+    def test_dcp_backup_restore_uses_new_local_rows(self):
+        pool = self._make_pool()
+        source = torch.tensor([3, 11], device="cuda")
+        destination = torch.tensor([11, 19], device="cuda")
+        expected = torch.arange(16, device="cuda", dtype=torch.bfloat16).reshape(
+            2, 1, 8
+        )
+        pool.kv_buffer[0][:2] = expected
+
+        with mock.patch(
+            "sglang.srt.mem_cache.memory_pool.get_parallel",
+            return_value=self._parallel(size=8, rank=3),
+        ):
+            backup = pool.get_cpu_copy(source)
+            pool.kv_buffer[0].fill_(-1)
+            pool.load_cpu_copy(backup, destination)
+
+        torch.testing.assert_close(pool.kv_buffer[0][1:3], expected)
 
 
 class TestDecodeRetractionBackup(unittest.TestCase):
