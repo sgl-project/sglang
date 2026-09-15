@@ -1,5 +1,5 @@
 use serde_json::json;
-use sglang_parity::compare::{compare_json, prepare_comparison};
+use sglang_parity::compare::prepare_comparison;
 use sglang_parity::sse::{SseDecoder, SseEvent};
 
 use super::*;
@@ -17,6 +17,18 @@ fn config(incremental: bool) -> RunConfig {
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/unary.json")).unwrap()
+}
+
+fn batch_fixture() -> [Value; 2] {
+    let mut values = [fixture(), fixture()];
+    for (index, value) in values.iter_mut().enumerate() {
+        value["meta_info"]["id"] = json!(format!("batch-{index}"));
+    }
+    values[1]["text"] = json!("Goodbye moon");
+    values[1]["output_ids"] = json!([30, 31]);
+    values[1]["meta_info"]["output_token_logprobs"] = json!([[-0.3, 30, null], [-0.4, 31, null]]);
+    values[1]["meta_info"]["output_top_logprobs"] = json!([[[-0.3, 30, null]], [[-0.4, 31, null]]]);
+    values
 }
 
 fn events(incremental: bool) -> Vec<SseEvent> {
@@ -65,6 +77,14 @@ fn observation(events: Vec<SseEvent>) -> HttpObservation {
     }
 }
 
+fn json_observation(value: Value) -> HttpObservation {
+    HttpObservation {
+        status: Some(200),
+        json: Some(value),
+        ..Default::default()
+    }
+}
+
 fn case(name: &str, incremental: bool) -> (HttpCase, GeneratePolicy) {
     let (suite, policy) = load(DEFAULT_SPEC, &config(incremental)).unwrap();
     (
@@ -88,7 +108,11 @@ fn default_spec_has_five_explicit_stream_pairs() {
     let (suite, _) = load(DEFAULT_SPEC, &config(false)).unwrap();
     assert_eq!(suite.cases.len(), 10);
     assert_eq!(suite.comparison.per_result_value_exceptions.len(), 2);
+    let mut groups = BTreeSet::new();
     for pair in suite.cases.chunks_exact(2) {
+        let group = pair[0].equivalence_group.as_deref().unwrap();
+        assert!(!group.trim().is_empty());
+        assert!(groups.insert(group), "duplicate equivalence group: {group}");
         assert_eq!(pair[0].equivalence_group, pair[1].equivalence_group);
         assert_eq!(pair[0].capture, CaptureMode::Json);
         assert_eq!(pair[1].capture, CaptureMode::Sse);
@@ -164,14 +188,7 @@ fn unary_and_both_stream_modes_preserve_the_complete_fixture() {
     let expected = fixture();
     let (json_case, policy) = case("greedy_json", false);
     let result = policy
-        .prepare(
-            &json_case,
-            &HttpObservation {
-                status: Some(200),
-                json: Some(expected.clone()),
-                ..Default::default()
-            },
-        )
+        .prepare(&json_case, &json_observation(expected.clone()))
         .unwrap();
     assert_eq!(result, expected);
     for incremental in [false, true] {
@@ -193,25 +210,35 @@ fn unary_and_both_stream_modes_preserve_the_complete_fixture() {
 }
 
 #[test]
-fn terminal_unknown_fields_are_not_projected_out() {
-    let (case, policy) = case("greedy_stream", true);
-    let mut stream = events(true);
-    modify_event(&mut stream, 1, |value| {
-        value["new_property"] = json!(["retained", null]);
-        value["meta_info"]["new_counter"] = json!(19);
+fn one_token_without_logprobs_is_valid_in_unary_and_both_stream_modes() {
+    let expected = json!({
+        "text": "Tokyo", "output_ids": [42],
+        "meta_info": {
+            "id": "one-token", "prompt_tokens": 3, "completion_tokens": 1,
+            "finish_reason": {"type": "length", "length": 1}
+        }
     });
-    let result = policy.prepare(&case, &observation(stream)).unwrap();
-    assert_eq!(result["new_property"], json!(["retained", null]));
-    assert_eq!(result["meta_info"]["new_counter"], 19);
-    assert!(
-        compare_json(&fixture(), &result)
-            .iter()
-            .any(|difference| difference.path == "/new_property")
+    let (json_case, policy) = case("one_token_json", false);
+    assert_eq!(
+        policy
+            .prepare(&json_case, &json_observation(expected.clone()))
+            .unwrap(),
+        expected
     );
+    for incremental in [false, true] {
+        let (case, policy) = case("one_token_stream", incremental);
+        assert_eq!(
+            policy
+                .prepare(&case, &observation(vec![event(expected.clone()), done()]))
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
 fn batch_interleaving_restores_input_order_and_removes_only_index() {
+    let expected = batch_fixture();
     for incremental in [false, true] {
         let (case, policy) = case("batch_stream", incremental);
         let original = events(incremental);
@@ -219,18 +246,29 @@ fn batch_interleaving_restores_input_order_and_removes_only_index() {
         for (index, position) in [(1, 0), (0, 0), (1, 1), (0, 1)] {
             let mut value: Value = serde_json::from_str(&original[position].data).unwrap();
             value["index"] = json!(index);
-            value["meta_info"]["id"] = json!(format!("batch-{index}"));
+            value["meta_info"]["id"] = expected[index]["meta_info"]["id"].clone();
+            if index == 1 {
+                value["text"] = json!(match (position, incremental) {
+                    (0, _) => "Goodbye",
+                    (_, true) => " moon",
+                    (_, false) => "Goodbye moon",
+                });
+                let start = if incremental { position } else { 0 };
+                for path in [
+                    "/output_ids",
+                    "/meta_info/output_token_logprobs",
+                    "/meta_info/output_top_logprobs",
+                ] {
+                    *value.pointer_mut(path).unwrap() = json!(
+                        expected[index].pointer(path).unwrap().as_array().unwrap()
+                            [start..=position]
+                    );
+                }
+            }
             stream.push(event(value));
         }
         stream.push(done());
         let actual = policy.prepare(&case, &observation(stream)).unwrap();
-        let expected: Vec<Value> = (0..2)
-            .map(|index| {
-                let mut value = fixture();
-                value["meta_info"]["id"] = json!(format!("batch-{index}"));
-                value
-            })
-            .collect();
         assert_eq!(actual, json!(expected));
     }
 }
@@ -274,6 +312,13 @@ fn incorrect_batch_indices_and_missing_results_fail() {
 #[test]
 fn batch_json_requires_exact_cardinality_and_validates_every_item() {
     let (case, policy) = case("batch_json", false);
+    let expected = json!(batch_fixture());
+    assert_eq!(
+        policy
+            .prepare(&case, &json_observation(expected.clone()))
+            .unwrap(),
+        expected
+    );
     for values in [
         vec![],
         vec![fixture()],
@@ -281,28 +326,14 @@ fn batch_json_requires_exact_cardinality_and_validates_every_item() {
     ] {
         assert!(
             policy
-                .prepare(
-                    &case,
-                    &HttpObservation {
-                        status: Some(200),
-                        json: Some(json!(values)),
-                        ..Default::default()
-                    }
-                )
+                .prepare(&case, &json_observation(json!(values)))
                 .is_err()
         );
     }
     let mut second = fixture();
     second["meta_info"]["finish_reason"] = Value::Null;
     let errors = policy
-        .prepare(
-            &case,
-            &HttpObservation {
-                status: Some(200),
-                json: Some(json!([fixture(), second])),
-                ..Default::default()
-            },
-        )
+        .prepare(&case, &json_observation(json!([fixture(), second])))
         .unwrap_err();
     assert_eq!(errors[0].path, "/1/meta_info/finish_reason");
 }
@@ -341,6 +372,10 @@ fn status_media_type_errors_and_malformed_events_are_failures() {
     for first in [
         event(json!({"error":{"message":"failed"}})),
         SseEvent {
+            event: "error".into(),
+            ..event(fixture())
+        },
+        SseEvent {
             event: "message".into(),
             data: "not json".into(),
             id: None,
@@ -370,7 +405,7 @@ fn one_result_cannot_change_id_prompt_count_or_reverse_completion_count() {
 }
 
 #[test]
-fn cumulative_sequences_must_extend_the_previous_prefix() {
+fn cumulative_sequences_must_remain_and_extend_the_previous_prefix() {
     let (case, policy) = case("greedy_stream", false);
     for path in [
         "/text",
@@ -379,18 +414,35 @@ fn cumulative_sequences_must_extend_the_previous_prefix() {
         "/meta_info/output_top_logprobs",
         "/meta_info/input_token_logprobs",
     ] {
-        let mut stream = events(false);
-        modify_event(&mut stream, 1, |frame| {
-            *frame.pointer_mut(path).unwrap() = match path {
-                "/text" => json!("changed"),
-                "/output_ids" => json!([99, 11]),
-                "/meta_info/output_token_logprobs" => json!([[-0.9, 10, null], [-0.2, 11, null]]),
-                "/meta_info/output_top_logprobs" => json!([[[-9.0, 10, null]], [[-0.2, 11, null]]]),
-                _ => json!([]),
-            };
-        });
-        let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
-        assert_eq!(errors[0].path, path);
+        for disappear in [false, true] {
+            let mut stream = events(false);
+            modify_event(&mut stream, 1, |frame| {
+                if disappear {
+                    let (parent, key) = path.rsplit_once('/').unwrap();
+                    frame
+                        .pointer_mut(parent)
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(key);
+                } else {
+                    *frame.pointer_mut(path).unwrap() = match path {
+                        "/text" => json!("changed"),
+                        "/output_ids" => json!([99, 11]),
+                        "/meta_info/output_token_logprobs" => {
+                            json!([[-0.9, 10, null], [-0.2, 11, null]])
+                        }
+                        "/meta_info/output_top_logprobs" => {
+                            json!([[[-9.0, 10, null]], [[-0.2, 11, null]]])
+                        }
+                        _ => json!([]),
+                    };
+                }
+            });
+            let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
+            assert_eq!(errors[0].path, path, "disappear={disappear}");
+            assert_eq!(errors[0].event, Some(1));
+        }
     }
 }
 
@@ -531,52 +583,69 @@ fn malformed_logprob_tuples_are_rejected_in_unary_and_streams() {
         json!([-0.1, -1, null]),
         json!([-0.1, 10, {}]),
     ] {
-        let (case, policy) = case("greedy_json", false);
-        let mut value = fixture();
-        value["meta_info"]["output_token_logprobs"][0] = malformed.clone();
-        assert!(
-            policy
-                .prepare(
-                    &case,
-                    &HttpObservation {
-                        status: Some(200),
-                        json: Some(value),
-                        ..Default::default()
-                    }
-                )
-                .is_err()
-        );
-        let (case, policy) = self::case("greedy_stream", false);
-        let mut stream = events(false);
-        modify_event(&mut stream, 0, |frame| {
-            frame["meta_info"]["output_token_logprobs"][0] = malformed
-        });
-        assert!(policy.prepare(&case, &observation(stream)).is_err());
+        for key in ["output_token_logprobs", "output_top_logprobs"] {
+            let entry = if key == "output_top_logprobs" {
+                json!([malformed])
+            } else {
+                malformed.clone()
+            };
+            let (json_case, policy) = case("greedy_json", false);
+            let mut value = fixture();
+            value["meta_info"][key][0] = entry.clone();
+            let errors = policy
+                .prepare(&json_case, &json_observation(value))
+                .unwrap_err();
+            assert_eq!(errors[0].path, format!("/meta_info/{key}/0"));
+            for incremental in [false, true] {
+                let (case, policy) = case("greedy_stream", incremental);
+                let mut stream = events(incremental);
+                modify_event(&mut stream, 0, |frame| {
+                    frame["meta_info"][key][0] = entry.clone()
+                });
+                let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
+                assert_eq!(errors[0].path, format!("/meta_info/{key}/0"));
+                assert_eq!(errors[0].event, Some(0));
+            }
+        }
     }
 }
 
 #[test]
 fn requested_logprobs_cannot_be_omitted_by_both_implementations() {
-    let (case, policy) = case("logprobs_json", false);
-    for key in [
-        "input_token_logprobs",
-        "output_token_logprobs",
-        "output_top_logprobs",
+    for (name, incremental) in [
+        ("logprobs_json", false),
+        ("logprobs_stream", false),
+        ("logprobs_stream", true),
     ] {
-        let mut value = fixture();
-        value["meta_info"].as_object_mut().unwrap().remove(key);
-        assert!(
-            policy
-                .prepare(
-                    &case,
-                    &HttpObservation {
-                        status: Some(200),
-                        json: Some(value),
-                        ..Default::default()
-                    }
-                )
-                .is_err()
-        );
+        let (case, policy) = case(name, incremental);
+        for key in [
+            "input_token_logprobs",
+            "output_token_logprobs",
+            "output_top_logprobs",
+        ] {
+            let response = if case.capture == CaptureMode::Json {
+                let mut value = fixture();
+                value["meta_info"].as_object_mut().unwrap().remove(key);
+                json_observation(value)
+            } else {
+                let mut stream = events(incremental);
+                // Omit the field from every data frame so no accumulation check masks
+                // the final response's obligation to include requested logprobs.
+                for index in 0..stream.len() - 1 {
+                    modify_event(&mut stream, index, |frame| {
+                        frame["meta_info"].as_object_mut().unwrap().remove(key);
+                    });
+                }
+                observation(stream)
+            };
+            let errors = policy.prepare(&case, &response).unwrap_err();
+            assert_eq!(
+                errors[0].path,
+                format!("/meta_info/{key}"),
+                "{name}, incremental={incremental}"
+            );
+            assert_eq!(errors[0].event, None);
+        }
     }
 }
 
@@ -591,14 +660,7 @@ fn declared_exceptions_alone_control_latency_validation_and_comparison() {
     let (suite, policy) = load(&spec.to_string(), &config(false)).unwrap();
     let case = &suite.cases[0];
     let prepared = policy
-        .prepare(
-            case,
-            &HttpObservation {
-                status: Some(200),
-                json: Some(value.clone()),
-                ..Default::default()
-            },
-        )
+        .prepare(case, &json_observation(value.clone()))
         .unwrap();
     assert_eq!(prepared, value);
     assert!(prepare_comparison(&prepared, case.comparison_scope, &suite.comparison).is_err());
@@ -627,8 +689,7 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
                 &suite.cases[0],
                 &HttpObservation {
                     status: Some(400),
-                    json: Some(value.clone()),
-                    ..Default::default()
+                    ..json_observation(value.clone())
                 }
             )
             .unwrap(),
@@ -640,8 +701,7 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
                 &suite.cases[0],
                 &HttpObservation {
                     status: Some(400),
-                    json: Some(json!({})),
-                    ..Default::default()
+                    ..json_observation(json!({}))
                 }
             )
             .is_err()
@@ -649,14 +709,7 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
     let (success, success_policy) = case("greedy_json", false);
     assert!(
         success_policy
-            .prepare(
-                &success,
-                &HttpObservation {
-                    status: Some(200),
-                    json: Some(value),
-                    ..Default::default()
-                }
-            )
+            .prepare(&success, &json_observation(value))
             .is_err()
     );
 }

@@ -1,7 +1,6 @@
 //! A real stdlib HTTP subprocess for exercising the public runner without a model.
 
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,8 +36,20 @@ impl Fixture {
         let executable = directory.path().join("fixture-python");
         fs::write(&executable, SERVER).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = socket.local_addr().unwrap().port();
+        // Allocate in a child so concurrent parent forks cannot inherit the socket.
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let port: u16 = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let config = serde_json::from_value(json!({
             "server": {
                 "python": executable,
@@ -123,6 +134,9 @@ impl ResponsePolicy for EchoPolicy {
         case: &HttpCase,
         observation: &HttpObservation,
     ) -> Result<Value, Vec<Violation>> {
+        if case.body["behavior"] == "empty_rejection" {
+            return Err(vec![]);
+        }
         let value = match case.capture {
             CaptureMode::Json => observation
                 .json
@@ -245,6 +259,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if behavior in ('invalid', 'http_error'):
             payload = {'error': 'deliberate fixture failure'}
         encoded = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        if behavior == 'malformed_json':
+            encoded = b'{"value":'
+        if behavior == 'artifact_io_failure':
+            # Block the next atomic artifact replacement before sending a valid response.
+            output = os.path.join(os.path.dirname(trace_path), 'output')
+            run_dir, = os.listdir(output)
+            os.mkdir(os.path.join(output, run_dir, 'python', 'blocked', '1', 'final.json'))
         stream_response = self.path == '/sse' or body.get('stream', False)
         if stream_response:
             encoded = b'event: snapshot\ndata: ' + encoded + b'\n\n'
@@ -252,8 +273,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 encoded += b'data: unfinished'
             elif behavior not in ('truncate', 'timeout'):
                 encoded += b'data: [FIN]\n\n'
-        self.send_response(400 if behavior == 'http_error' else 200)
-        self.send_header('Content-Type', 'text/event-stream; charset=utf-8' if stream_response else 'application/json')
+        self.send_response(400 if behavior in ('http_error', 'wrong_status') else 200)
+        content_type = 'text/event-stream; charset=utf-8' if stream_response else 'application/json'
+        if behavior == 'wrong_type':
+            content_type = 'text/plain'
+        if behavior != 'missing_type':
+            self.send_header('Content-Type', content_type)
         extra = 1000 if behavior in ('truncate', 'timeout') else 0
         self.send_header('Content-Length', str(len(encoded) + extra))
         self.end_headers()

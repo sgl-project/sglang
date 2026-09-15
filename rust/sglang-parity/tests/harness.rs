@@ -7,8 +7,8 @@ use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
-use sglang_parity::runner::Status;
-use sglang_parity::{RunConfig, describe, run};
+use sglang_parity::runner::{RunError, Status};
+use sglang_parity::{RunConfig, Violation, describe, run};
 
 use support::{EchoPolicy, Fixture, assert_process_stopped, case, read_json, suite, wait_until};
 
@@ -130,8 +130,9 @@ async fn precise_differences_invalid_responses_and_instability_remain_distinct()
         case("different", "/json", "different"),
         case("invalid", "/json", "invalid"),
         case("unstable", "/json", "unstable"),
+        case("empty_rejection", "/json", "empty_rejection"),
     ]);
-    let report = run(&fixture.config, &suite, &EchoPolicy).await.unwrap();
+    let mut report = run(&fixture.config, &suite, &EchoPolicy).await.unwrap();
     assert_eq!(
         report.exit_code(),
         2,
@@ -161,9 +162,79 @@ async fn precise_differences_invalid_responses_and_instability_remain_distinct()
         let unstable = &report.cases[2].implementations[side];
         assert_eq!(unstable.repeatability.status, Status::Unstable);
         assert_eq!(unstable.repeatability.differences[0].path, "/value");
+        for attempt in &report.cases[3].implementations[side].attempts {
+            assert!(attempt.final_json.is_none());
+            assert_eq!(
+                attempt.violations,
+                [Violation::new(
+                    "",
+                    "response policy rejected the response without diagnostics"
+                )]
+            );
+        }
     }
     assert_eq!(report.cases[1].parity.status, Status::Skipped);
     assert_eq!(report.cases[2].parity.status, Status::Skipped);
+
+    // Reuse the captured results to check each exit category without masking by others.
+    let cases = std::mem::take(&mut report.cases);
+    for (case, expected) in cases.iter().zip([1, 1, 2, 1]) {
+        report.cases = vec![case.clone()];
+        assert_eq!(report.exit_code(), expected, "isolated {}", case.name);
+    }
+    report.cases = vec![cases[0].clone()];
+    report
+        .runtime_errors
+        .push("deliberate runtime failure".into());
+    assert_eq!(
+        report.exit_code(),
+        2,
+        "runtime errors override parity failure"
+    );
+}
+
+#[tokio::test]
+async fn equivalence_requires_matching_stable_valid_members_even_when_parity_passes() {
+    let fixture = Fixture::new();
+    let mut cases = vec![
+        case("reference", "/json", "normal"),
+        case("different_value", "/sse", "normal"),
+        case("invalid", "/json", "invalid"),
+        case("unstable", "/sse", "unstable"),
+    ];
+    cases[1]["body"]["value"]["items"][1] = json!("changed");
+    for case in &mut cases {
+        case["equivalence_group"] = json!("same_request");
+    }
+    let mut report = run(&fixture.config, &suite(cases), &EchoPolicy)
+        .await
+        .unwrap();
+    for case in &report.cases[..2] {
+        assert_eq!(case.parity.status, Status::Pass);
+        for side in case.implementations.values() {
+            assert_eq!(side.repeatability.status, Status::Pass);
+        }
+    }
+    assert_eq!(report.equivalence.len(), 6);
+    for result in &report.equivalence {
+        assert_eq!(result.group, "same_request");
+        assert_eq!(result.left, "reference");
+        if result.right == "different_value" {
+            assert_eq!(result.check.status, Status::Fail);
+            assert_eq!(result.check.differences.len(), 1);
+            assert_eq!(result.check.differences[0].path, "/value/items/1");
+        } else {
+            assert!(matches!(result.right.as_str(), "invalid" | "unstable"));
+            assert_eq!(result.check.status, Status::Skipped);
+            assert!(result.check.differences.is_empty());
+        }
+    }
+    // The stable members pass individually, but their equivalence failure still exits 1.
+    report.cases.truncate(2);
+    report
+        .equivalence
+        .retain(|result| result.right == "different_value");
+    assert_eq!(report.exit_code(), 1);
 }
 
 #[tokio::test]
@@ -199,6 +270,85 @@ async fn explicitly_expected_errors_use_their_own_strict_contract() {
                 read_json(attempt.final_json.as_ref().unwrap()),
                 json!({"error": "deliberate fixture failure"})
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_http_status_media_type_and_json_keep_complete_raw_artifacts() {
+    let fixture = Fixture::new();
+    let checks = [
+        ("status", "/json", "wrong_status", "/status"),
+        ("json_type", "/json", "wrong_type", "/headers/content-type"),
+        (
+            "json_no_type",
+            "/json",
+            "missing_type",
+            "/headers/content-type",
+        ),
+        ("sse_type", "/sse", "wrong_type", "/headers/content-type"),
+        (
+            "sse_no_type",
+            "/sse",
+            "missing_type",
+            "/headers/content-type",
+        ),
+        ("malformed", "/json", "malformed_json", "/body"),
+    ];
+    let suite = suite(
+        checks
+            .iter()
+            .map(|(name, path, behavior, _)| case(name, path, behavior))
+            .collect(),
+    );
+    let report = run(&fixture.config, &suite, &EchoPolicy).await.unwrap();
+    assert_eq!(report.exit_code(), 1);
+    for (case, (_, path, behavior, violation_path)) in report.cases.iter().zip(checks) {
+        assert_eq!(case.parity.status, Status::Skipped);
+        for side in case.implementations.values() {
+            assert_eq!(side.repeatability.status, Status::Skipped);
+            for attempt in &side.attempts {
+                let observation = attempt.observation.as_ref().unwrap();
+                assert!(observation.transport_error.is_none());
+                assert_eq!(
+                    observation.status,
+                    Some(if behavior == "wrong_status" { 400 } else { 200 })
+                );
+                assert_eq!(
+                    observation.headers.get("content-type").map(String::as_str),
+                    match behavior {
+                        "wrong_type" => Some("text/plain"),
+                        "missing_type" => None,
+                        _ => Some("application/json"),
+                    }
+                );
+                assert_eq!(
+                    observation
+                        .violations
+                        .iter()
+                        .map(|violation| violation.path.as_str())
+                        .collect::<Vec<_>>(),
+                    [violation_path],
+                    "{}",
+                    case.name
+                );
+                assert_eq!(attempt.violations, observation.violations);
+                assert!(attempt.final_json.is_none());
+                let raw = fs::read(&observation.raw_body).unwrap();
+                assert_eq!(raw.len().to_string(), observation.headers["content-length"]);
+                if behavior == "malformed_json" {
+                    assert_eq!(raw, b"{\"value\":");
+                    assert!(observation.json.is_none());
+                } else if path == "/sse" {
+                    assert_eq!(observation.events.len(), 2);
+                    assert!(raw.ends_with(b"data: [FIN]\n\n"));
+                } else {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&raw).unwrap(),
+                        *observation.json.as_ref().unwrap()
+                    );
+                }
+            }
         }
     }
 }
@@ -315,6 +465,55 @@ async fn cancelling_a_library_run_cleans_the_process_tree_and_saves_partial_repo
             .filter(|entry| entry["kind"] == "start")
             .count(),
         1
+    );
+    let socket = TcpListener::bind(("127.0.0.1", fixture.config.server.port)).unwrap();
+    drop(socket);
+}
+
+#[tokio::test]
+async fn artifact_write_failure_after_startup_cleans_process_tree_and_saves_partial_report() {
+    let mut fixture = Fixture::new();
+    fixture
+        .config
+        .server
+        .env
+        .insert("PARITY_FIXTURE_CHILD".into(), "1".into());
+    let suite = suite(vec![case("blocked", "/json", "artifact_io_failure")]);
+    let error = run(&fixture.config, &suite, &EchoPolicy).await.unwrap_err();
+    assert!(matches!(error, RunError::Io(_)), "{error}");
+
+    let lifecycle = fixture.lifecycle();
+    let starts: Vec<_> = lifecycle
+        .iter()
+        .filter(|entry| entry["kind"] == "start")
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "must stop before starting the second implementation"
+    );
+    assert_eq!(
+        lifecycle
+            .iter()
+            .filter(|entry| entry["kind"] == "request")
+            .count(),
+        1
+    );
+    assert_process_stopped(starts[0]["pid"].as_i64().unwrap() as i32).await;
+    assert_process_stopped(starts[0]["worker"].as_i64().unwrap() as i32).await;
+    let directory = fixture.only_run_directory();
+    assert!(
+        read_json(directory.join("python/blocked/1/response.body"))
+            .get("value")
+            .is_some()
+    );
+    assert!(directory.join("python/blocked/1/final.json").is_dir());
+    let partial = read_json(directory.join("report.json"));
+    assert_eq!(partial["state"], "interrupted");
+    assert!(!partial["runtime_errors"].as_array().unwrap().is_empty());
+    assert_eq!(
+        partial["cases"][0]["implementations"]["rust"]["attempts"],
+        json!([])
     );
     let socket = TcpListener::bind(("127.0.0.1", fixture.config.server.port)).unwrap();
     drop(socket);
