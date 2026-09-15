@@ -304,13 +304,20 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                drop_prefill_result = req.to_finish is not None and (
+                    not batch.decoding_reqs or req not in batch.decoding_reqs
+                )
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
                     and req.inflight_middle_chunks <= 0
                 )
                 sampling_mask_finish_reason = None
-                if should_commit_output and req.return_sampling_mask:
+                if (
+                    should_commit_output
+                    and not drop_prefill_result
+                    and req.return_sampling_mask
+                ):
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
@@ -329,7 +336,9 @@ class SchedulerBatchResultProcessor:
                         capture_hidden_mode=prefill_hidden_capture_mode,
                         extend_input_len=extend_input_len_per_req[i],
                         store=(
-                            should_commit_output and sampling_mask_finish_reason is None
+                            should_commit_output
+                            and sampling_mask_finish_reason is None
+                            and not drop_prefill_result
                         ),
                     )
 
@@ -353,6 +362,11 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                    elif drop_prefill_result:
+                        # Abort won the race with this delayed prefill result.
+                        # Finish and clean up without committing the sampled token
+                        # or any metadata derived from it.
+                        req.update_finish_state(new_accepted_len=0)
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
@@ -384,7 +398,7 @@ class SchedulerBatchResultProcessor:
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    if sampling_mask_finish_reason is None:
+                    if sampling_mask_finish_reason is None and not drop_prefill_result:
                         self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
@@ -396,16 +410,17 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
-                            store=sampling_mask_finish_reason is None,
+                            store=sampling_mask_finish_reason is None
+                            and not drop_prefill_result,
                         )
 
                     if sampling_mask_finish_reason is not None:
                         continue
 
-                    if req.return_sampling_mask:
+                    if not drop_prefill_result and req.return_sampling_mask:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
-                    if req.grammar is not None:
+                    if not drop_prefill_result and req.grammar is not None:
                         self._apply_prefill_grammar(
                             req=req,
                             next_token_id=next_token_id,
@@ -875,10 +890,14 @@ class SchedulerBatchResultProcessor:
             # Extend: advance over the single token each completed-prefill req emitted
             # (mirrors process_batch_result_prefill's per-req token indexing).
             for i, req in enumerate(batch.reqs):
+                drop_prefill_result = req.to_finish is not None and (
+                    not batch.decoding_reqs or req not in batch.decoding_reqs
+                )
                 if (
                     req.grammar is None
                     or req.is_retracted
                     or req.finished()
+                    or drop_prefill_result
                     or req.inflight_middle_chunks > 0
                 ):
                     continue
