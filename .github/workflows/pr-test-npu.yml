@@ -621,7 +621,7 @@ jobs:
           import os
           from obs import ObsClient
 
-          # Must match the download URLs in pr-test-npu.yml:
+          # Must match the download URLs in the recommend-tests-from-coverage job:
           # https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/{outputs.tar.gz,test_case_map.json}
           OBS_BUCKET = 'sglang-ascend'
           run_dir = os.environ['RUN_DIR']

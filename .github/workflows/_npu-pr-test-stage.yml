@@ -1,5 +1,7 @@
 name: PR Test Stage for NPU
-# Reusable workflow for one CUDA test stage. Caller pr-test-npu.yml forwards
+# Reusable workflow for one NPU test stage. Caller pr-test-npu.yml forwards
+# job parameters (runner, image, partitions) and optionally delegates test
+# execution to the coverage runner (use_coverage_runner=true).
 
 on:
   workflow_call:

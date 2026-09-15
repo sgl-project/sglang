@@ -9,6 +9,7 @@ Workflow:
 
 import argparse
 import ast
+import base64
 import hashlib
 import json
 import os
@@ -16,8 +17,10 @@ import sqlite3
 import ssl
 import subprocess
 import tempfile
+import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -26,50 +29,18 @@ import regex as re
 
 # ==================== Configuration ====================
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE_PACKAGE_REL = "sglang"
 
 # Repository name: used for filtering and path normalization
-# vllm-ascend: "vllm_ascend"  |  sglang: "sglang"
 REPO_NAME = "sglang"
 
 # Product code path prefix in coverage data / diff paths.
-# - vllm-ascend: coverage path is /__w/vllm_ascend/vllm_ascend/xxx.py, diff path is vllm_ascend/xxx.py
-#   -> PRODUCT_PREFIX = "vllm_ascend/"
-# - sglang: coverage path is /__w/sglang/sglang/python/sglang/xxx.py, diff path is python/sglang/xxx.py
+# sglang: coverage path is /__w/sglang/sglang/python/sglang/xxx.py, diff path is python/sglang/xxx.py
 #   -> PRODUCT_PREFIX = "python/sglang/"
 # After stripping this prefix, both sides produce the same relative path (e.g. srt/models/qwen3_vl.py)
 PRODUCT_PREFIX = "python/sglang/"
 
 
-def resolve_source_path(source_dir: Path, filename: str) -> Path | None:
-    """
-    Resolve a product-code relative path (e.g. 'srt/models/qwen3_vl.py') to an actual source file.
-
-    Fixed structure: <source_dir>/<SOURCE_PACKAGE_REL>/<filename>
-    (e.g. covstub/sglang/srt/models/qwen3_vl.py)
-    Fallback: <source_dir>/<filename> (when source_dir already points at the package root)
-
-    Args:
-        source_dir: Source code directory (e.g. covstub)
-        filename: Product-code relative path (e.g. 'srt/models/qwen3_vl.py')
-
-    Returns:
-        Path object if found, None otherwise
-    """
-    candidates = [
-        source_dir / SOURCE_PACKAGE_REL / filename,
-        source_dir / filename,
-    ]
-    for source_path in candidates:
-        if source_path.exists():
-            return source_path
-    return None
-
-
 # Directory prefix of test case folders under coverage data dir.
-# - vllm-ascend: "tests__" (e.g. tests__e2e__pull_request__...)
-# - sglang: "____w__sglang__sglang__test__..." (GitHub Actions encoded path /__w/sglang/sglang/test/...)
-# Empty string "" means accept any folder that contains coverage files.
 TEST_CASE_DIR_PREFIX = "____w__sglang__sglang__test__"
 
 # Coverage density threshold: proportion of changed lines covered
@@ -102,15 +73,13 @@ def _get_test_files_from_pr_diff(diff_file: str) -> list[str]:
         print(f"  Warning: Failed to read diff file for test file detection: {e}")
         return test_files_found
 
-    # Pattern to match test file paths.
-    # vllm-ascend: tests/e2e/pull_request/ or tests/ut/ directory
-    # sglang: test/registered/ directory
+    # Pattern to match test file paths: test/registered/ directory
     # In diff output:
     #   - +++ b/test/registered/unit/xxx/test_xxx.py (new/modified test file)
     #   - rename to test/registered/unit/xxx/test_xxx.py (renamed test file)
     # Test files must be in test/ directory and start with test_
     test_file_pattern = re.compile(
-        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py|tests/(?:e2e|ut)(?:/.+)?/test_\w+\.py))",
+        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py))",
         re.MULTILINE,
     )
 
@@ -137,7 +106,7 @@ def _get_test_files_from_pr_diff(diff_file: str) -> list[str]:
 def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list[str]:
     """
     Extract deleted test files from PR diff.
-    Test files are in test/registered/ (sglang) or vllm_ascend/tests/ directory with test_*.py pattern.
+    Test files are in test/registered/ directory with test_*.py pattern.
 
     Args:
         diff_file: Path to the PR diff file
@@ -155,10 +124,10 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
         print(f"  Warning: Failed to read diff file for deleted test detection: {e}")
         return deleted_test_files
 
-    # Pattern to match deleted test files (test/registered/ or tests/ directory)
+    # Pattern to match deleted test files (test/registered/ directory)
     # Match --- a/test/... followed by +++ /dev/null (deleted file marker)
     deleted_pattern = re.compile(
-        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py|tests/(?:e2e|ut)(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
+        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
         re.MULTILINE,
     )
 
@@ -193,10 +162,6 @@ class CoverageSelector:
     def scan_test_cases(self) -> list[str]:
         """
         Scan all test case directories.
-
-        Two coverage directory layouts are supported:
-        - vllm-ascend: <test_case>/covdata/coverage.* (covdata subdirectory)
-        - sglang: <test_case>/coverage.* (coverage files directly under test case dir)
         """
         test_cases = []
         if not self.coverage_data_dir or not self.coverage_data_dir.exists():
@@ -208,19 +173,15 @@ class CoverageSelector:
             if not item.is_dir():
                 continue
             name = item.name
-            # vllm-ascend naming: tests__* or cpu-ut
-            is_vllm_layout = name.startswith("tests__") or name == "cpu-ut"
             # sglang naming: ____w__sglang__sglang__test__... (GitHub Actions encoded path)
             is_sglang_layout = TEST_CASE_DIR_PREFIX and name.startswith(
                 TEST_CASE_DIR_PREFIX
             )
-            if not (is_vllm_layout or is_sglang_layout):
+            if not is_sglang_layout:
                 continue
-            # covdata subdirectory (vllm-ascend) OR coverage.* files directly (sglang)
-            covdata = item / "covdata"
-            has_covdata = covdata.exists()
+            # coverage.* files directly under test case dir (sglang)
             has_cov_files = any(item.glob("coverage.*"))
-            if has_covdata or has_cov_files:
+            if has_cov_files:
                 test_cases.append(name)
         return sorted(test_cases)
 
@@ -234,25 +195,16 @@ class CoverageSelector:
         - ...--test_foo -> test/registered/npu/xxx/test_foo.py::test_foo (function-level)
         """
         # sglang layout: strip ____w__sglang__sglang__test__ prefix (encoded /__w/sglang/sglang/test/)
-        if TEST_CASE_DIR_PREFIX and test_name.startswith(TEST_CASE_DIR_PREFIX):
-            # rest: encoded path after /test/ (e.g. registered__npu__xxx__test_foo.py)
-            rest = test_name[len(TEST_CASE_DIR_PREFIX) :]
-            # Restore test/ prefix (TEST_CASE_DIR_PREFIX ends with test__, __ encodes /)
-            result = "test/" + rest.replace("__", "/")
-            # Handle function-level marker: .../test_foo.py--test_bar -> .../test_foo.py::test_bar
-            result = result.replace("--", "::")
-            # File-level tests need .py suffix; avoid double .py when name already ends with .py
-            if "::" not in result and not result.endswith(".py"):
-                result = result + ".py"
-            return result
-
-        # vllm-ascend layout: tests__e2e__... -> tests/e2e/...
-        # First convert -- to :: (function-level test marker)
-        result = test_name.replace("--", "::")
-        # Then convert __ to /
-        result = result.replace("__", "/")
-        # If no :: (file-level test), add .py suffix
-        if "::" not in result:
+        if not TEST_CASE_DIR_PREFIX or not test_name.startswith(TEST_CASE_DIR_PREFIX):
+            return test_name
+        # rest: encoded path after /test/ (e.g. registered__npu__xxx__test_foo.py)
+        rest = test_name[len(TEST_CASE_DIR_PREFIX) :]
+        # Restore test/ prefix (TEST_CASE_DIR_PREFIX ends with test__, __ encodes /)
+        result = "test/" + rest.replace("__", "/")
+        # Handle function-level marker: .../test_foo.py--test_bar -> .../test_foo.py::test_bar
+        result = result.replace("--", "::")
+        # File-level tests need .py suffix; avoid double .py when name already ends with .py
+        if "::" not in result and not result.endswith(".py"):
             result = result + ".py"
         return result
 
@@ -300,10 +252,6 @@ class CoverageSelector:
                 # (e.g. /__w/sglang/sglang/python/sglang/srt/xxx.py -> srt/xxx.py)
                 if PRODUCT_PREFIX in path:
                     rel_path = path.split(PRODUCT_PREFIX)[-1]
-                    files.add(rel_path)
-                # Fallback: vllm-ascend style /__w/vllm_ascend/vllm_ascend/xxx.py -> xxx.py
-                elif REPO_NAME + "/" in path:
-                    rel_path = path.split(f"{REPO_NAME}/")[-1]
                     files.add(rel_path)
             conn.close()
         except Exception as e:
@@ -501,18 +449,17 @@ class CoverageSelector:
         """
         Resolve source file path from relative filename.
 
-        Fixed structure: <source_dir>/<SOURCE_PACKAGE_REL>/<filename>
-        (e.g. covstub/sglang/srt/models/qwen3_vl.py)
-
         Args:
-            filename: Relative file path (e.g., 'srt/models/qwen3_vl.py')
+            filename: Relative file path (e.g., 'covstub/sglang/srt/models/qwen3_vl.py')
 
         Returns:
             Path object if found, None otherwise
         """
         if not self.source_dir:
             return None
-        return resolve_source_path(self.source_dir, filename)
+
+        source_path = self.source_dir / REPO_NAME / filename
+        return source_path if source_path.exists() else None
 
     def build_test_case_map(self) -> dict:
         """Build test case -> covered files mapping (with line numbers)"""
@@ -523,34 +470,32 @@ class CoverageSelector:
         for i, test_case in enumerate(test_cases):
             print(f"  [{i + 1}/{len(test_cases)}] Processing {test_case}...")
             test_case_dir = self.coverage_data_dir / test_case
-
-            # Locate coverage files:
-            # - vllm-ascend: <test_case>/covdata/coverage.*
-            # - sglang: <test_case>/coverage.* (directly under test case dir)
             covdata_dir = test_case_dir / "covdata"
-            if covdata_dir.exists():
-                cov_dir = covdata_dir
-            else:
-                cov_dir = test_case_dir
 
             file_lines_map = defaultdict(set)  # filepath -> set of lines
 
-            for cov_file in cov_dir.glob("coverage.*"):
-                covered_files = self.get_covered_files_from_file(str(cov_file))
+            # Coverage data files (coverage.*) are stored directly under the test case dir
+            cov_dirs = [covdata_dir] if covdata_dir.exists() else [test_case_dir]
 
-                for filename in covered_files:
-                    lines = self.get_covered_lines_from_file(str(cov_file), filename)
-                    if lines:
-                        # Filter noise lines if source_dir is available
-                        if self.source_dir:
-                            source_file = self._resolve_source_file(filename)
-                            if source_file and source_file.exists():
-                                lines = self._filter_noise_lines(
-                                    str(source_file), lines
-                                )
-                        # Skip files with no coverage after filtering
+            for cov_dir in cov_dirs:
+                for cov_file in cov_dir.glob("coverage.*"):
+                    covered_files = self.get_covered_files_from_file(str(cov_file))
+
+                    for filename in covered_files:
+                        lines = self.get_covered_lines_from_file(
+                            str(cov_file), filename
+                        )
                         if lines:
-                            file_lines_map[filename].update(lines)
+                            # Filter noise lines if source_dir is available
+                            if self.source_dir:
+                                source_file = self._resolve_source_file(filename)
+                                if source_file and source_file.exists():
+                                    lines = self._filter_noise_lines(
+                                        str(source_file), lines
+                                    )
+                            # Skip files with no coverage after filtering
+                            if lines:
+                                file_lines_map[filename].update(lines)
 
             normalized_name = self.normalize_test_name(test_case)
             self.test_case_map[normalized_name] = {
@@ -604,12 +549,10 @@ class CodeChangeDetector:
 
     def _product_code_root(self) -> Path:
         """
-        Product code root: <source_dir>/<SOURCE_PACKAGE_REL> (e.g. covstub/sglang).
-
         Hash scanning uses this root so relative paths (e.g. srt/xxx.py) match
         the keys in test_case_map.json (which are relative to python/sglang/).
         """
-        return self.source_dir / SOURCE_PACKAGE_REL
+        return self.source_dir / REPO_NAME
 
     def compute_file_hash(self, filepath: str) -> str:
         """Calculate MD5 hash of file"""
@@ -670,105 +613,89 @@ class CodeChangeDetector:
         return changed_files
 
     def parse_git_diff(
-        self, diff_output: str, filter_prefix: str | None = None
+        self,
+        diff_output: str,
+        base_content_getter=None,
     ) -> dict[str, set[int]]:
         """
-        Parse git diff output, extract changed line numbers
+        Parse git diff output, extract affected base (pre-change) line numbers.
 
-        Supports two diff formats:
-        1. unified diff: @@ -10,3 +10,4 @@ context
-        2. PR diff
+        Rules:
+        - Deleted lines: record the deleted base line itself, nothing more.
+        - Pure comment/docstring changes are excluded (needs base content):
+          a deletion group where every deleted line is a comment/docstring line
+          and the additions are comments or doc prose; an insertion inside a
+          docstring or consisting of comment lines only.
+        - Isolated blank-line deletion (neighbours not deleted): treated as a
+          one-line insertion -> candidate pair (line above, line below).
+        - Pure insertions and blank-deletion pairs are classified via ast of
+          the base file (needs base_content_getter):
+          1. modifies an existing function -> record the line above only;
+          2. sits between two function/class definitions -> excluded;
+          3. inserted text belongs to a newly added def/class -> excluded;
+          4. otherwise (module-level statements) -> record the line above only.
+        - Without base content (or non-parseable Python) pairs fall back to
+          counting both sides, bounded by the hunk's base range.
 
         Args:
             diff_output: diff content
-            filter_prefix: only keep files with this prefix
-                (e.g., '{PRODUCT_PREFIX}' filters product code, defaults to PRODUCT_PREFIX)
+            base_content_getter: optional callable(repo-relative-path -> str | None)
+                returning the base file content for ast classification
 
         Returns:
-            {filepath: {lineno, ...}} - set of changed line numbers in the new file
+            {filepath: {lineno, ...}} - set of affected base line numbers,
+            .py files under '{PRODUCT_PREFIX}' only, with the prefix stripped.
+            Renamed and deleted files are excluded: they are matched at file
+            level via detect_renames() (see parse_pr_diff_file/main).
         """
+        filter_prefix = PRODUCT_PREFIX
+        renamed_files, deleted_files = self.detect_renames(diff_output)
+        renamed_new_paths = set(renamed_files.values())
+        deleted_paths = set(deleted_files)
+
+        files, pending, del_groups = _parse_diff_base_lines(diff_output)
+
         changed_files = {}
-        current_file = None
-
-        # Default to PRODUCT_PREFIX as filter prefix (product code only)
-        if filter_prefix is None:
-            filter_prefix = PRODUCT_PREFIX
-
-        # Parse mode: line by line, precisely calculate each changed line number in the new file
-        for raw_line in diff_output.split("\n"):
-            line = raw_line.rstrip("\r")
-            # New file starts
-            if line.startswith("diff --git"):
+        for path, lines in files.items():
+            # Renamed/deleted files go through file-level matching, skip line-level parsing
+            if path in renamed_new_paths or path in deleted_paths:
                 continue
+            # Filter: only keep product code (exclude test files, etc.)
+            if not path.startswith(filter_prefix):
+                continue
+            if not path.endswith(".py"):
+                continue
+            # Normalize path: remove the '{PRODUCT_PREFIX}' prefix
+            key = path[len(filter_prefix) :]
+            changed_files[key] = lines
+            pairs = pending.get(path) or []
+            groups = del_groups.get(path) or []
+            if pairs or groups:
+                base_text = base_content_getter(path) if base_content_getter else None
+                _classify_candidate_pairs(lines, pairs, groups, base_text, path)
 
-            # File path
-            elif line.startswith("+++ b/") or line.startswith("--- a/"):
-                path = line[6:].strip()
-                # Remove a/ or b/ prefix
-                if path.startswith("a/") or path.startswith("b/"):
-                    path = path[2:]
-                # Filter: only keep paths with specified prefix (exclude test files, etc.)
-                if filter_prefix and not path.startswith(filter_prefix):
-                    current_file = None
-                    continue
-                # Normalize path: remove filter_prefix prefix
-                if filter_prefix and path.startswith(filter_prefix):
-                    path = path[len(filter_prefix) :]
-                if not path.endswith(".py"):
-                    continue
-                current_file = path
-                if current_file not in changed_files:
-                    changed_files[current_file] = set()
+        # Drop files that end up with no affected code lines (e.g. pure comment changes)
+        return {k: v for k, v in changed_files.items() if v}
 
-            # hunk header: @@ -old_start,old_count +new_start,new_count @@
-            elif line.startswith("@@") and current_file:
-                # Parse: @@ -100,10 +100,12 @@
-                match = re.search(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-                if match:
-                    old_start = int(match.group(1))
-                    old_count = int(match.group(2)) if match.group(2) else 1
-                    # Rule: start line = old_start + 2, end line = old_start + old_count - 3
-                    start_line = old_start + 2
-                    end_line = old_start + old_count - 4
-                    if end_line < start_line:
-                        end_line = old_start + old_count
-                    # Collect all lines in hunk, check if there are new lines (starting with +)
-                    hunk_lines = []
-                    for hunk_line in diff_output.split("\n")[
-                        diff_output.split("\n").index(line) + 1 :
-                    ]:
-                        if (
-                            hunk_line.startswith("@@")
-                            or hunk_line.startswith("diff --git")
-                            or hunk_line.startswith("--- a/")
-                            or hunk_line.startswith("+++ b/")
-                        ):
-                            break
-                        hunk_lines.append(hunk_line)
-                    # If no new lines starting with +, changes only include deletions, shrink range by one line
-                    has_addition = any(
-                        hline.lstrip().startswith("+") for hline in hunk_lines
-                    )
-                    if not has_addition:
-                        start_line += 1
-                    for line_no in range(start_line, end_line + 1):
-                        changed_files[current_file].add(line_no)
-
-        return changed_files
-
-    def detect_renames(self, diff_output: str) -> dict[str, str]:
+    def detect_renames(self, diff_output: str) -> tuple[dict[str, str], list[str]]:
         """
-        Detect file renames in git diff output (product code only, under PRODUCT_PREFIX).
+        Detect renamed and deleted files in git diff output (product code only,
+        under PRODUCT_PREFIX). Both are handled the same way: file-level matching
+        with the base path, excluded from line-level parsing.
 
         Args:
             diff_output: diff content
 
         Returns:
-            {old_path: new_path} - mapping from old file path to new file path
+            Tuple of (rename_mapping, deleted_files)
+            - rename_mapping: {old_path: new_path}
+            - deleted_files: [path, ...] (base paths)
         """
         renames = {}
+        deleted = []
         current_old_path = None
         current_new_path = None
+        header_old_path = None
 
         for raw_line in diff_output.split("\n"):
             line = raw_line.rstrip("\r")
@@ -776,7 +703,8 @@ class CodeChangeDetector:
             # Detect rename marker
             if line.startswith("rename from "):
                 current_old_path = line[12:].strip()
-            elif line.startswith("rename to "):
+                continue
+            if line.startswith("rename to "):
                 current_new_path = line[10:].strip()
                 # When we have both old and new path, record the rename
                 if current_old_path and current_new_path:
@@ -796,32 +724,376 @@ class CodeChangeDetector:
                         renames[old_path] = new_path
                     current_old_path = None
                     current_new_path = None
+                continue
 
-        return renames
+            # Detect deleted file via '--- a/path' + '+++ /dev/null'
+            if line.startswith("--- "):
+                header_old_path = line[4:].strip()
+                if header_old_path.startswith("a/"):
+                    header_old_path = header_old_path[2:]
+            elif line.startswith("+++ "):
+                if (
+                    line[4:].strip() == "/dev/null"
+                    and header_old_path
+                    and header_old_path.startswith(PRODUCT_PREFIX)
+                ):
+                    deleted.append(header_old_path)
+                header_old_path = None
+
+        return renames, deleted
 
     def parse_pr_diff_file(
-        self, diff_file_path: str
-    ) -> tuple[dict[str, set[int]], dict[str, str]]:
+        self, diff_file_path: str, base_content_getter=None
+    ) -> tuple[dict[str, set[int]], dict[str, str], list[str]]:
         """
-        Parse changed line numbers and detect renames from PR diff file.
+        Parse changed line numbers, renames and deleted files from PR diff file.
 
         Args:
             diff_file_path: diff file path
+            base_content_getter: optional callable(repo-relative-path -> str | None)
+                returning the base file content for ast classification
 
         Returns:
-            Tuple of (changed_files_with_lines, rename_mapping)
+            Tuple of (changed_files_with_lines, rename_mapping, deleted_files)
             - changed_files_with_lines: {filepath: {lineno, ...}}
             - rename_mapping: {old_path: new_path}
+            - deleted_files: [path, ...]
         """
         try:
             with open(diff_file_path, encoding="utf-8-sig") as f:
                 diff_content = f.read()
-            changed_files = self.parse_git_diff(diff_content)
-            renames = self.detect_renames(diff_content)
-            return changed_files, renames
+            changed_files = self.parse_git_diff(
+                diff_content, base_content_getter=base_content_getter
+            )
+            renames, deleted_files = self.detect_renames(diff_content)
+            return changed_files, renames, deleted_files
         except Exception as e:
             print(f"Warning: Failed to read diff file: {e}")
-            return {}, {}
+            return {}, {}, []
+
+
+_HUNK_RE = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_DEF_RE = re.compile(r"(async\s+def|def|class)\s")
+
+
+def _parse_diff_base_lines(
+    diff_output: str,
+) -> tuple[dict[str, set[int]], dict[str, list[tuple]], dict[str, list[tuple]]]:
+    """Parse unified diff text into affected base (pre-change) line numbers.
+
+    Returns (files, pending, del_groups):
+      files[path]     : set of base line numbers recorded directly
+                        (blank lines inside contiguous deletion blocks)
+      pending[path]   : candidate pairs needing base-content classification;
+                        tuple = (a, b, kind, add_indent, introduces_def,
+                                 adds_all_comment, hunk_base_end)
+                        kind='insert' -> pure insertion between a and b
+                        kind='blank'  -> isolated blank deletion at a+1 (b = a+2)
+      del_groups[path]: deletion groups needing comment/docstring filtering;
+                        tuple = ([(base_line, deleted_text), ...], [added_text, ...])
+    """
+    files, pending, del_groups = {}, {}, {}
+    current = None
+    base_no = None
+    hunk_base_end = 0
+    old_path = None  # path from the last '--- a/...' line (used for deleted files)
+    group_del = []  # (base_line, text) of '-' lines in the current change group
+    group_add = []  # texts of '+' lines in the current change group
+
+    def flush_group():
+        if not group_del and not group_add:
+            return
+        if group_del:
+            del_set = {n for n, _ in group_del}
+            del_lines = []
+            for n, text in group_del:
+                if text.strip():
+                    del_lines.append((n, text))
+                elif (n - 1) in del_set or (n + 1) in del_set:
+                    # blank inside a contiguous deletion block: classify with
+                    # the group (dropped too if the block is pure comment/docstring)
+                    del_lines.append((n, text))
+                else:
+                    pending[current].append(
+                        (n - 1, n + 1, "blank", None, False, False, hunk_base_end)
+                    )
+            if del_lines:
+                del_groups[current].append((del_lines, list(group_add)))
+        else:
+            # base_no is the next unprocessed base line = the line below the insertion
+            if base_no is None or base_no < 1:
+                # New file (hunk '@@ -0,0 ...'): there is no base version at all,
+                # so there is nothing to classify the insertion against. Skip the
+                # pair so callers never attempt to fetch a base file.
+                return
+            a = base_no - 1
+            indent = min(
+                ((len(t) - len(t.lstrip())) for t in group_add if t.strip()), default=0
+            )
+            introduces_def = any(
+                t.strip().startswith("@") or _DEF_RE.match(t.strip())
+                for t in group_add
+                if t.strip()
+            )
+            adds_all_comment = all(
+                t.strip().startswith("#") for t in group_add if t.strip()
+            )
+            pending[current].append(
+                (
+                    a,
+                    a + 1,
+                    "insert",
+                    indent,
+                    introduces_def,
+                    adds_all_comment,
+                    hunk_base_end,
+                )
+            )
+
+    for raw_line in diff_output.split("\n"):
+        line = raw_line.rstrip("\r")
+        if line.startswith("diff --git"):
+            flush_group()
+            group_del, group_add = [], []
+            current, base_no = None, None
+            continue
+        if line.startswith("--- "):
+            old_path = line[4:]
+            if old_path.startswith("a/"):
+                old_path = old_path[2:]
+            continue
+        if line.startswith("+++ "):
+            flush_group()
+            group_del, group_add = [], []
+            path = line[4:]
+            if path == "/dev/null":
+                # deleted file: keep the '--- a/...' path so deletions are recorded
+                path = old_path
+                old_path = None
+                if path is None or path == "/dev/null":
+                    current = None
+                    continue
+            if path.startswith("b/"):
+                path = path[2:]
+            current = path
+            files.setdefault(path, set())
+            pending.setdefault(path, [])
+            del_groups.setdefault(path, [])
+            continue
+        if line.startswith("@@"):
+            flush_group()
+            group_del, group_add = [], []
+            if current is None:
+                continue
+            m = _HUNK_RE.search(line)
+            base_no = int(m.group(1))
+            hunk_base_end = base_no + int(m.group(2) or "1") - 1
+            continue
+        if current is None or base_no is None:
+            continue
+        if line.startswith("-"):
+            group_del.append((base_no, line[1:]))
+            base_no += 1
+        elif line.startswith("+"):
+            group_add.append(line[1:])
+        elif line.startswith("\\"):
+            continue
+        else:
+            flush_group()
+            group_del, group_add = [], []
+            base_no += 1
+    flush_group()
+    return files, pending, del_groups
+
+
+def _collect_defs(source: str) -> tuple[list, set, set, set]:
+    """Parse Python source, return (ranges, end_lines, start_lines, blanks).
+
+    ranges      : [(lineno, end_lineno, col_offset)] of every function/method
+    end_lines   : line numbers where a function/class definition ends
+    start_lines : def/class lines and their decorator lines
+    blanks      : blank line numbers
+    """
+    tree = ast.parse(source)
+    ranges, end_lines, start_lines = [], set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            end_lines.add(node.end_lineno)
+            start_lines.add(node.lineno)
+            for deco in node.decorator_list:
+                start_lines.add(deco.lineno)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                ranges.append((node.lineno, node.end_lineno, node.col_offset))
+    blanks = {i for i, text in enumerate(source.splitlines(), 1) if not text.strip()}
+    return ranges, end_lines, start_lines, blanks
+
+
+def _get_docstring_lines(source: str) -> set[int]:
+    """Line numbers covered by docstrings (module/class/function docstring nodes)."""
+    tree = ast.parse(source)
+    lines = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (
+            isinstance(body, list)
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            lines.update(range(body[0].lineno, body[0].end_lineno + 1))
+    return lines
+
+
+def _looks_like_code(texts: list) -> bool:
+    """True if the added lines are real code: parseable as Python and not
+    solely string-literal expressions (docstring prose)."""
+    block = textwrap.dedent("\n".join(t for t in texts if t.strip()))
+    if not block.strip():
+        return False
+    try:
+        tree = ast.parse(block)
+    except (SyntaxError, ValueError):
+        return False
+    return any(
+        not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+        for stmt in tree.body
+    )
+
+
+def _innermost_func(ranges: list, n: int):
+    """The innermost function whose body contains line n (None if module level)."""
+    best = None
+    for start, end, col in ranges:
+        if start <= n <= end and (best is None or start >= best[0]):
+            best = (start, end, col)
+    return best
+
+
+def _between_definitions(
+    a: int, b: int, end_lines: set, start_lines: set, blanks: set
+) -> bool:
+    """True if the pair (a, b) sits between two definitions: the upper line is
+    the end of a function/class (if a itself is blank, walk up past consecutive
+    blank lines and check the nearest non-blank line instead) and the lower
+    line is the start of a function/class (def/class line or decorator)."""
+    if b not in start_lines:
+        return False
+    upper = a
+    while upper in blanks:
+        upper -= 1
+    return upper in end_lines
+
+
+def _classify_candidate_pairs(
+    affected: set[int],
+    pairs: list[tuple],
+    del_groups: list[tuple],
+    base_text: str | None,
+    path: str,
+) -> None:
+    """Classify deletion groups and candidate pairs of one file using its base
+    content and update the affected line set in place.
+
+    Deletion groups: a group is dropped entirely when every deleted line is a
+    comment/docstring line in the base file AND the added lines are comments or
+    doc prose (not parseable Python), i.e. a pure comment/docstring change.
+    Candidate pairs: without base content (or non-parseable Python) both sides
+    of each pair are counted, bounded by the hunk."""
+    info = None
+    docstr_lines = set()
+    comment_lines = set()
+    if base_text is not None:
+        try:
+            info = _collect_defs(base_text)
+            docstr_lines = _get_docstring_lines(base_text)
+            comment_lines = {
+                i
+                for i, t in enumerate(base_text.splitlines(), 1)
+                if t.strip().startswith("#")
+            }
+        except (SyntaxError, ValueError):
+            info = None
+    if base_text is None:
+        print(
+            f"  Warning: no base content for {path}, counting candidate pairs on both sides"
+        )
+
+    # Deleted non-blank lines: comment/docstring lines are never changes by
+    # themselves; a group made entirely of them is dropped unless its lines are
+    # replaced by real code (then they are kept as the only base anchors).
+    noise_lines = comment_lines | docstr_lines
+    for del_lines, add_texts in del_groups:
+        if info is None:
+            affected.update(n for n, _ in del_lines)
+            continue
+        code_dels = [n for n, _ in del_lines if n not in noise_lines]
+        if code_dels:
+            affected.update(code_dels)
+            dropped = [n for n, _ in del_lines if n in noise_lines]
+            if dropped:
+                print(
+                    f"  Skipped {path}:{dropped} (comment/docstring lines, not counted)"
+                )
+            continue
+        adds = [t for t in add_texts if t.strip()]
+        pure = (
+            not adds
+            or all(t.strip().startswith("#") for t in adds)
+            or not _looks_like_code(adds)
+        )
+        if pure:
+            print(
+                f"  Skipped {path}:{[n for n, _ in del_lines]} (pure comment/docstring change, not counted)"
+            )
+        else:
+            # comment/docstring lines replaced by real code: keep as change anchors
+            affected.update(n for n, _ in del_lines)
+
+    for (
+        a,
+        b,
+        kind,
+        add_indent,
+        introduces_def,
+        adds_all_comment,
+        hunk_base_end,
+    ) in pairs:
+        if info is None:
+            if a >= 1:
+                affected.add(a)
+            if b <= hunk_base_end:
+                affected.add(b)
+            continue
+        ranges, end_lines, start_lines, blanks = info
+        reason = None
+        if kind == "insert":
+            if a in docstr_lines:
+                reason = "inside a docstring"
+            elif adds_all_comment:
+                reason = "pure comment insertion"
+            else:
+                func = _innermost_func(ranges, a)
+                modifies = func is not None and (
+                    b <= func[1] or (add_indent is not None and add_indent > func[2])
+                )
+                if not modifies:
+                    if _between_definitions(a, b, end_lines, start_lines, blanks):
+                        reason = "between function/class definitions"
+                    elif introduces_def:
+                        reason = "belongs to a newly added function/class"
+        # kind == 'blank': isolated blank deletion == one-line insertion
+        elif _between_definitions(a, b, end_lines, start_lines, blanks):
+            reason = "between function/class definitions"
+        if reason is None:  # kept: record the line above only
+            if a >= 1:
+                affected.add(a)
+        else:
+            print(f"  Skipped {path}:{a}-{b} ({reason}, not counted)")
 
 
 class FunctionParser:
@@ -868,7 +1140,10 @@ class FunctionParser:
 
     @staticmethod
     def get_lines_functions(
-        filepath: str, lines: set[int], skip_imports: bool = False
+        filepath: str,
+        lines: set[int],
+        skip_imports: bool = False,
+        function_ranges: dict[str, list[tuple[int, int]]] | None = None,
     ) -> dict[int, str]:
         """
         Get function name for each line
@@ -877,19 +1152,35 @@ class FunctionParser:
             filepath: source file path
             lines: set of line numbers to query
             skip_imports: whether to skip import statement lines
+            function_ranges: pre-parsed function ranges to reuse, avoiding
+                re-parsing the file. When None, the file is parsed internally.
         """
         line_to_function = {}
-        function_ranges = FunctionParser.get_function_ranges(filepath)
+        if not lines:
+            return line_to_function
 
-        func_to_covered_lines = {}
+        if function_ranges is None:
+            function_ranges = FunctionParser.get_function_ranges(filepath)
+        if not function_ranges:
+            return line_to_function
+
+        # Flatten all function ranges into a single interval list sorted by
+        # start line, then match each queried line with one linear scan.
+        # This avoids per-function set expansion and the O(lines x functions)
+        # nested loop. Semantics are preserved: for nested functions the outer
+        # one has the smaller start line and is found first, matching the
+        # original ast.walk (parent-before-child) order.
+        intervals = []
         for func_name, ranges in function_ranges.items():
-            func_to_covered_lines[func_name] = set()
             for start, end in ranges:
-                func_to_covered_lines[func_name].update(range(start, end + 1))
+                intervals.append((start, end, func_name))
+        intervals.sort(key=lambda x: x[0])
 
         for line in lines:
-            for func_name, covered_lines in func_to_covered_lines.items():
-                if line in covered_lines:
+            for start, end, func_name in intervals:
+                if start > line:
+                    break
+                if line <= end:
                     line_to_function[line] = func_name
                     break
 
@@ -1016,16 +1307,25 @@ class TestSelector:
         if enable_function_match and source_dir:
             # Collect functions that changed lines belong to
             changed_functions = {}  # {filepath: {func_name: Set[linenos]}}
+            changed_function_ranges = {}  # {filepath: function_ranges} - parsed once per file
 
             for changed_file, changed_lines in normalized_changed.items():
-                source_path = resolve_source_path(Path(source_dir), changed_file)
-                if not source_path:
-                    continue
-                source_file = str(source_path)
+                source_path = Path(source_dir) / REPO_NAME / changed_file
+                source_file = str(source_path) if source_path.exists() else None
 
-                # Get function mapping for changed lines
+                if not source_file:
+                    continue
+
+                # Parse function ranges ONCE per changed file and reuse the result
+                # for both line-to-function mapping and later range lookups
+                function_ranges = FunctionParser.get_function_ranges(source_file)
+
+                # Get function mapping for changed lines (reuses pre-parsed ranges)
                 line_to_function = FunctionParser.get_lines_functions(
-                    source_file, changed_lines, skip_imports=enable_skip_imports
+                    source_file,
+                    changed_lines,
+                    skip_imports=enable_skip_imports,
+                    function_ranges=function_ranges,
                 )
 
                 # Group by function name
@@ -1035,6 +1335,7 @@ class TestSelector:
 
                 if func_to_lines:
                     changed_functions[changed_file] = func_to_lines
+                    changed_function_ranges[changed_file] = function_ranges
 
             if changed_functions:
                 # Build function -> tests covering that function mapping
@@ -1049,33 +1350,29 @@ class TestSelector:
 
                         covered_lines = covered_files[changed_file]
 
+                        # Resolve source file once per changed file
+                        source_path = Path(source_dir) / REPO_NAME / changed_file
+                        source_file = str(source_path) if source_path.exists() else None
+
+                        if not source_file:
+                            continue
+
+                        # Reuse function ranges parsed in the collection phase
+                        func_ranges = changed_function_ranges.get(changed_file, {})
+
+                        # Filter out import statement lines (for display), computed once
+                        if enable_skip_imports:
+                            import_lines = FunctionParser._get_import_lines(source_file)
+                            display_changed_lines = (
+                                normalized_changed.get(changed_file, set())
+                                - import_lines
+                            )
+                        else:
+                            display_changed_lines = normalized_changed.get(
+                                changed_file, set()
+                            )
+
                         for func_name in func_to_lines:
-                            # Get full line range of this function
-                            source_path = resolve_source_path(
-                                Path(source_dir), changed_file
-                            )
-                            if not source_path:
-                                continue
-                            source_file = str(source_path)
-
-                            # Filter out import statement lines (for display)
-                            if enable_skip_imports:
-                                import_lines = FunctionParser._get_import_lines(
-                                    source_file
-                                )
-                                display_changed_lines = (
-                                    normalized_changed.get(changed_file, set())
-                                    - import_lines
-                                )
-                            else:
-                                display_changed_lines = normalized_changed.get(
-                                    changed_file, set()
-                                )
-
-                            func_ranges = FunctionParser.get_function_ranges(
-                                source_file
-                            )
-
                             if func_name not in func_ranges:
                                 continue
 
@@ -1154,142 +1451,9 @@ class TestSelector:
                 )
                 return selected, "line+function"
 
-            # ===== Stage 3: Function-level matching (only when first two levels are empty) =====
-            print("  Line-level matching empty, trying function-level matching...")
-            expand_reason = "function"
-
-            # Collect functions that changed lines belong to
-            changed_functions = {}  # {filepath: {func_name: Set[linenos]}}
-
-            for changed_file, changed_lines in normalized_changed.items():
-                source_path = resolve_source_path(Path(source_dir), changed_file)
-                if not source_path:
-                    continue
-                source_file = str(source_path)
-
-                # Get function mapping for changed lines
-                line_to_function = FunctionParser.get_lines_functions(
-                    source_file, changed_lines, skip_imports=enable_skip_imports
-                )
-
-                # Group by function name
-                func_to_lines = defaultdict(set)
-                for line, func_name in line_to_function.items():
-                    func_to_lines[func_name].add(line)
-
-                if func_to_lines:
-                    changed_functions[changed_file] = func_to_lines
-
-            if not changed_functions:
-                return selected, expand_reason
-
-            # Build function -> tests covering that function mapping
-            func_to_tests = defaultdict(list)
-
-            for test_case, data in self.test_case_map.items():
-                covered_files = data["files"]
-
-                for changed_file, func_to_lines in changed_functions.items():
-                    if changed_file not in covered_files:
-                        continue
-
-                    covered_lines = covered_files[changed_file]
-
-                    for func_name in func_to_lines:
-                        # Get full line range of this function
-                        possible_paths = [
-                            Path(source_dir) / changed_file,
-                            Path(source_dir) / REPO_NAME / changed_file,
-                            Path(source_dir)
-                            / PRODUCT_PREFIX.rstrip("/")
-                            / changed_file,
-                            Path(source_dir) / "covstub" / REPO_NAME / changed_file,
-                            Path(source_dir) / changed_file.replace("/", os.sep),
-                            Path(source_dir)
-                            / REPO_NAME
-                            / changed_file.replace("/", os.sep),
-                            Path(source_dir)
-                            / "covstub"
-                            / REPO_NAME
-                            / changed_file.replace("/", os.sep),
-                        ]
-
-                        source_file = None
-                        for p in possible_paths:
-                            if p.exists():
-                                source_file = str(p)
-                                break
-
-                        if not source_file:
-                            continue
-
-                        # Filter out import statement lines (for display)
-                        if enable_skip_imports:
-                            import_lines = FunctionParser._get_import_lines(source_file)
-                            display_changed_lines = (
-                                normalized_changed.get(changed_file, set())
-                                - import_lines
-                            )
-                        else:
-                            display_changed_lines = normalized_changed.get(
-                                changed_file, set()
-                            )
-
-                        func_ranges = FunctionParser.get_function_ranges(source_file)
-
-                        if func_name not in func_ranges:
-                            continue
-
-                        # Merge all matched function ranges
-                        func_all_lines = set()
-                        for func_start, func_end in func_ranges[func_name]:
-                            func_all_lines.update(range(func_start, func_end + 1))
-
-                        if not func_all_lines:
-                            continue
-
-                        # Check if this test covers any line of this function
-                        covered_in_func = covered_lines & func_all_lines
-                        if covered_in_func:
-                            # Get intersection of test covered lines and actual changed lines (for display)
-                            covered_changed_lines = (
-                                covered_lines & display_changed_lines
-                            )
-                            func_to_tests[func_name].append(
-                                (test_case, covered_changed_lines)
-                            )
-
-            # Select tests that cover other lines of changed functions (deduplication)
-            for changed_file, func_to_lines in changed_functions.items():
-                for func_name in func_to_lines:
-                    if func_name in func_to_tests:
-                        for test_case, covered_changed_lines in func_to_tests[
-                            func_name
-                        ]:
-                            existing = [s[0] for s in selected]
-                            if test_case not in existing and covered_changed_lines:
-                                # Display actual changed line coverage, not full function coverage
-                                display_lines = (
-                                    covered_changed_lines
-                                    if covered_changed_lines
-                                    else set()
-                                )
-                                selected.append(
-                                    (
-                                        test_case,
-                                        {changed_file: display_lines},
-                                        len(display_lines),
-                                    )
-                                )
-
-            selected.sort(key=lambda x: x[2], reverse=True)
-
-            if selected:
-                return selected, expand_reason
-
-        # ===== Stage 4: File-level matching =====
+        # ===== Stage 3: File-level matching =====
         if not selected and enable_file_match:
-            print("  Function-level matching empty, trying file-level matching...")
+            print("  Using file-level matching (renamed/deleted files)...")
             expand_reason = "file"
 
             # File-level matching: any test covering the changed file is selected
@@ -1380,7 +1544,8 @@ class TestSelector:
                 line_str = self._format_line_range(sorted(lines))
                 print(f"    - {filepath}: {line_str}")
 
-    def _format_line_range(self, lines: list[int]) -> str:
+    @staticmethod
+    def _format_line_range(lines: list[int]) -> str:
         """Compress line number list into range representation"""
         if not lines:
             return ""
@@ -1428,8 +1593,8 @@ def main():
     parser.add_argument(
         "--source-dir",
         "-s",
-        required=True,
-        help="Source code directory (required, passed from outside; relative paths resolve against script dir)",
+        default="covstub",
+        help="Source code directory (default: covstub)",
     )
     parser.add_argument(
         "--map-file",
@@ -1440,11 +1605,8 @@ def main():
     parser.add_argument(
         "--coverage-dir",
         "-c",
-        default=None,
-        help=(
-            "Coverage data directory (only needed when building the map; relative paths "
-            "resolve against script dir)"
-        ),
+        default="coverage",
+        help="Coverage data directory (default: ./coverage)",
     )
     parser.add_argument(
         "--build-map", "-b", action="store_true", help="Rebuild test case mapping"
@@ -1462,46 +1624,12 @@ def main():
         help="Enable deduplication (keep only one test for same covered lines, default off)",
     )
     parser.add_argument(
-        "--enable-line-match",
-        action="store_true",
-        default=False,
-        help="Enable line-level matching (default off)",
-    )
-    parser.add_argument(
-        "--disable-line-match", action="store_true", help="Disable line-level matching"
-    )
-    parser.add_argument(
-        "--enable-function-match",
-        action="store_true",
-        default=True,
-        help="Enable function-level matching (default on)",
-    )
-    parser.add_argument(
-        "--disable-function-match",
-        action="store_true",
-        help="Disable function-level matching",
-    )
-    parser.add_argument(
-        "--enable-file-match",
-        action="store_true",
-        default=True,
-        help="Enable file-level matching (default on)",
-    )
-    parser.add_argument(
-        "--disable-file-match", action="store_true", help="Disable file-level matching"
-    )
-    parser.add_argument(
         "--skip-imports",
         action="store_true",
         help="Skip import statement lines (only effective for function-level matching, default off)",
     )
 
     args = parser.parse_args()
-
-    # Process granularity switches: disable takes precedence over enable
-    args.enable_line_match = not args.disable_line_match
-    args.enable_function_match = not args.disable_function_match
-    args.enable_file_match = not args.disable_file_match
 
     # Resolve relative paths against BASE_DIR (fixed structure), keep absolute paths as-is
     def _resolve_abs(base: Path, p: str) -> Path:
@@ -1597,6 +1725,7 @@ def main():
         # Use cross-platform temp directory
         diff_file = os.path.join(tempfile.gettempdir(), "pr.diff")
         max_retries = 3
+        base_sha = None
 
         for attempt in range(1, max_retries + 1):
             print(f"  Attempt {attempt}/{max_retries} to get PR diff via GitHub API...")
@@ -1608,6 +1737,7 @@ def main():
                 ) as response:
                     pr_data = json.loads(response.read().decode())
                     diff_url = pr_data.get("diff_url")
+                    base_sha = pr_data.get("base", {}).get("sha")
 
                 if not diff_url:
                     raise Exception("Cannot get diff URL")
@@ -1630,6 +1760,24 @@ def main():
                 time.sleep(1)
 
         print(f"  PR diff saved to: {diff_file}")
+
+        def _fetch_base_content(path: str) -> str | None:
+            """Fetch base (pre-change) file content via GitHub contents API"""
+            content_url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={base_sha}"
+            try:
+                req = _github_request(content_url)
+                with urllib.request.urlopen(
+                    req, timeout=30, context=ssl_context
+                ) as response:
+                    data = json.loads(response.read().decode())
+                if data.get("encoding") == "base64":
+                    return base64.b64decode(data["content"]).decode("utf-8")
+            except Exception as e:
+                print(f"  Warning: Failed to fetch base content for {path}: {e}")
+            return None
+
+        # Only usable when the PR base sha was fetched successfully
+        base_content_getter = _fetch_base_content if base_sha else None
     else:
         # Get from file comparison (default)
         change_detector.scan_source_files()
@@ -1651,13 +1799,16 @@ def main():
     changed_files_with_lines: dict[str, set[int]] = {}
 
     renames: dict[str, str] = {}
+    deleted_files: list[str] = []
     if args.github_pr and diff_file:
-        changed_files_with_lines, renames = change_detector.parse_pr_diff_file(
-            diff_file
+        changed_files_with_lines, renames, deleted_files = (
+            change_detector.parse_pr_diff_file(
+                diff_file, base_content_getter=base_content_getter
+            )
         )
         print(f"Parsed {len(changed_files_with_lines)} changed files:")
         for file_path, line_set in changed_files_with_lines.items():
-            print(f"  {file_path}")
+            print(f"  {file_path}: {TestSelector._format_line_range(list(line_set))}")
 
         # detect_renames already filters to PRODUCT_PREFIX only (product code renames)
         if renames:
@@ -1667,22 +1818,21 @@ def main():
             for old_path, new_path in renames.items():
                 print(f"  {old_path} -> {new_path}")
 
-    if changed_files_with_lines:
+        if deleted_files:
+            print(
+                f"\n=== Detected {len(deleted_files)} Product Code Deleted File(s) - Using File-Level Matching ==="
+            )
+            for path in deleted_files:
+                print(f"  {path}")
+
+    if changed_files_with_lines or renames or deleted_files:
         # Select test cases by precision matching
         print("\n=== Selecting Affected Test Cases ===")
         test_selector = TestSelector(selector.test_case_map)
 
-        # For renamed files, we need file-level matching to cover both old and new paths
-        # Filter out renamed new paths from changed files
-        if renames:
-            renamed_new_paths = set(renames.values())
-            normal_files = {
-                k: v
-                for k, v in changed_files_with_lines.items()
-                if k not in renamed_new_paths
-            }
-        else:
-            normal_files = changed_files_with_lines
+        # Renamed/deleted files are already excluded from changed_files by
+        # parse_git_diff; they are matched at file level below
+        normal_files = changed_files_with_lines
 
         # Process normal files with precision matching
         selected: list[tuple[str, dict, int]] = []
@@ -1692,35 +1842,38 @@ def main():
                 normal_files,
                 min_affected_lines=args.min_affected,
                 source_dir=str(source_dir),
-                enable_line_match=args.enable_line_match,
-                enable_function_match=args.enable_function_match,
-                enable_file_match=args.enable_file_match,
+                enable_line_match=True,
+                enable_function_match=True,
+                enable_file_match=False,  # File-level matching reserved for renamed/deleted files only
                 enable_skip_imports=args.skip_imports,
                 enable_dedup=args.dedup,
             )
 
-        # Process renamed files: use OLD path for file-level matching
-        for old_path, new_path in renames.items():
-            rename_files = {old_path: set()}
-            rename_selected, rename_expand = test_selector.select_tests(
-                rename_files,
+        # Process renamed/deleted files: file-level matching with the base path
+        file_level_paths = [(p, f"{p} -> {n}") for p, n in renames.items()]
+        file_level_paths += [(p, p) for p in deleted_files]
+        for path, label in file_level_paths:
+            fl_selected, fl_expand = test_selector.select_tests(
+                {path: set()},
                 min_affected_lines=args.min_affected,
                 source_dir=str(source_dir),
-                enable_line_match=False,  # Disable line match for renames
-                enable_function_match=False,  # Disable function match for renames
-                enable_file_match=True,  # Enable file match for renames
+                enable_line_match=False,  # Disable line match for file-level matching
+                enable_function_match=False,  # Disable function match for file-level matching
+                enable_file_match=True,  # Enable file match for renamed/deleted files
                 enable_skip_imports=args.skip_imports,
                 enable_dedup=args.dedup,
             )
-            selected.extend(rename_selected)
-            expand_reason += rename_expand
-            # Print file-level matched test cases for this rename
-            if rename_selected:
-                print(
-                    f"\n=== File-Level Matched Tests for Renamed File: {old_path} -> {new_path} ==="
-                )
-                for test_name, _, _ in rename_selected:
+            selected.extend(fl_selected)
+            expand_reason += fl_expand
+            # Print file-level matched test cases (even when empty, for diagnosis)
+            print(f"\n=== File-Level Matched Tests for {label} ===")
+            if fl_selected:
+                for test_name, _, _ in fl_selected:
                     print(f"  {test_name}")
+            else:
+                print(
+                    "  (0 tests matched: no coverage data for this path in test_case_map)"
+                )
 
         # Deduplicate
         seen = set()
