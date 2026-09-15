@@ -12,8 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Pure index math for decode context parallel (DCP): per-rank lengths and
-the owner-rule local-index filter."""
+"""Pure index math for decode context parallel (DCP): per-rank lengths,
+the owner-rule local-index filter, and the NPU extend-gather plan."""
+
+from typing import List, NamedTuple, Sequence
 
 import torch
 
@@ -185,3 +187,68 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     if not parallel.dcp_enabled:
         return
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
+
+
+class DcpExtendGatherPlan(NamedTuple):
+    """How one rank gathers a batch's prefix KV at extend.
+
+    ``local_lens[i]`` rows of request i live on this rank; each rank sends them
+    padded to ``padded_lens[i]`` so every rank's send is ``send_rows`` long. The
+    all-gather output is ``gather_rows = send_rows * dcp_size`` rows, rank-major.
+    ``index`` maps each row of the position-ordered buffer -- request 0's prefix
+    then extend, request 1's prefix then extend, ... -- to its row in
+    ``[gathered prefixes | extend_rows of this chunk's own KV]``.
+    """
+
+    local_lens: List[int]
+    padded_lens: List[int]
+    send_rows: int
+    gather_rows: int
+    extend_rows: int
+    index: torch.Tensor
+
+
+def plan_dcp_extend_gather(
+    prefix_lens: Sequence[int],
+    extend_lens: Sequence[int],
+    dcp_size: int,
+    dcp_rank: int,
+) -> DcpExtendGatherPlan:
+    """Plan the extend-time gather of the prefix KV into position order.
+
+    Under the owner rule ``pos % dcp_size == rank`` with each request's prefix
+    starting at position 0, rank r holds positions ``r, r + dcp_size, ...`` of a
+    request in order, so position p sits in rank ``p % dcp_size``'s send at
+    local row ``p // dcp_size``. Local shards are concatenated per request, as
+    the planner's ``dcp_local_prefix_kv_indices`` lists them. The index is the
+    same on every rank; only ``local_lens`` depends on ``dcp_rank``.
+    """
+    prefix_lens = [int(p) for p in prefix_lens]
+    extend_lens = [int(e) for e in extend_lens]
+    local_lens = [p // dcp_size + int(dcp_rank < p % dcp_size) for p in prefix_lens]
+    padded_lens = [-(-p // dcp_size) for p in prefix_lens]
+    send_rows = sum(padded_lens)
+    gather_rows = send_rows * dcp_size
+
+    parts = []
+    send_offset = 0
+    extend_offset = gather_rows
+    for prefix_len, extend_len, padded_len in zip(
+        prefix_lens, extend_lens, padded_lens
+    ):
+        pos = torch.arange(prefix_len, dtype=torch.int64)
+        parts.append((pos % dcp_size) * send_rows + send_offset + pos // dcp_size)
+        parts.append(
+            torch.arange(extend_offset, extend_offset + extend_len, dtype=torch.int64)
+        )
+        send_offset += padded_len
+        extend_offset += extend_len
+    index = torch.cat(parts) if parts else torch.empty(0, dtype=torch.int64)
+    return DcpExtendGatherPlan(
+        local_lens=local_lens,
+        padded_lens=padded_lens,
+        send_rows=send_rows,
+        gather_rows=gather_rows,
+        extend_rows=sum(extend_lens),
+        index=index,
+    )
