@@ -2305,3 +2305,13 @@ class ReasoningParser:
         the stream ends."""
         ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
+
+
+# Keep the dependency-free CLI choices list in sync with the real registry.
+from sglang.srt.parser.reasoning_parser_names import (  # noqa: E402
+    REASONING_PARSER_NAMES,
+)
+
+assert set(REASONING_PARSER_NAMES) == set(ReasoningParser.DetectorMap), (
+    "parser/reasoning_parser_names.py is out of sync with ReasoningParser.DetectorMap"
+)

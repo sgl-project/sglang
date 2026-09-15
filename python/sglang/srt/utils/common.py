@@ -95,7 +95,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -1959,6 +1958,10 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            # Lazy: torchvision (and torch._dynamo behind it) costs ~1.3 s at
+            # import and is only needed for GPU JPEG decode.
+            from torchvision.io import decode_jpeg
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -2489,10 +2492,16 @@ def configure_logger(server_args, prefix: str = ""):
     if parent_process() is not None:
         logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
 
-    if is_flashinfer_available():
-        from flashinfer.jit.core import logger as flashinfer_logger
-
-        flashinfer_logger.setLevel(logging.ERROR)
+    # flashinfer's JIT logger is a Logger built directly (not via getLogger) that
+    # takes its level from FLASHINFER_LOGGING_LEVEL at import. Importing
+    # flashinfer here costs ~1 s (activation -> quantization -> cute_dsl) in
+    # every process that configures logging, so set the level through that
+    # variable unless the module is already imported.
+    flashinfer_jit = sys.modules.get("flashinfer.jit.core")
+    if flashinfer_jit is not None:
+        flashinfer_jit.logger.setLevel(logging.ERROR)
+    else:
+        os.environ.setdefault("FLASHINFER_LOGGING_LEVEL", "error")
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9

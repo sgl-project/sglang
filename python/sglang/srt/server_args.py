@@ -44,7 +44,6 @@ from typing import Any, NoReturn
 
 import msgspec
 
-from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
@@ -60,13 +59,21 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
+
+
+def _real_kv_hash_modes():
+    # Lazy: importing sglang.kernels.ops.kv_canary.consts initializes the whole
+    # sglang.kernels package (fused ops, torch, ...) at server_args import time,
+    # ~2 s in processes that never use it.
+    from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
+    return list(RealKvHashMode)
+
 
 # Re-exported. These were importable from this module while the field
 # declarations that used them lived here; the declarations moved to
@@ -359,7 +366,13 @@ class ServerArgs:
             help="Choose the kernels for sampling layers.",
         )
 
-        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
+        # Names only: importing the parser registries here would pull the OpenAI
+        # protocol models, xgrammar, transformers and torch.distributed (several
+        # seconds) into the launcher before it can spawn anything.
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        reasoning_parser_choices = list(REASONING_PARSER_NAMES)
         parser.add_argument(
             "--reasoning-parser",
             type=str,
@@ -369,7 +382,7 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
+        tool_call_parser_choices = list(TOOL_CALL_PARSER_NAMES)
         parser.add_argument(
             "--tool-call-parser",
             type=str,
@@ -383,7 +396,7 @@ class ServerArgs:
             "--kv-canary-real-data",
             type=str,
             default=_declared_default("kv_canary_real_data"),
-            choices=[m.name.lower() for m in RealKvHashMode],
+            choices=[m.name.lower() for m in _real_kv_hash_modes()],
             help=(
                 "Check the real KV-cache in the canary. "
                 "'none' (default) disables the feature. "
