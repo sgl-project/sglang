@@ -18,6 +18,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 libc = "0.2"
+sha2 = "0.10"
+toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
 [dev-dependencies]

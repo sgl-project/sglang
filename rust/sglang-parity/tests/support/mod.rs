@@ -33,6 +33,28 @@ impl Drop for Fixture {
 impl Fixture {
     pub fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lock = if cfg!(target_os = "macos") {
+            "rust/sglang-parity/environments/mlx.lock"
+        } else {
+            "rust/sglang-parity/environments/cuda.lock"
+        };
+        for relative in [
+            "python/pyproject.toml",
+            "python/pyproject_other.toml",
+            "rust/sglang-parity/environments/profiles.json",
+            "rust/sglang-parity/environments/probe.py",
+            lock,
+        ] {
+            let destination = source.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(repository.join(relative), destination).unwrap();
+        }
+        fs::write(source.join("python/fixture-version.txt"), "initial HEAD").unwrap();
+        git(&source, &["init", "--quiet"]);
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "fixture source"]);
         let executable = directory.path().join("fixture-python");
         fs::write(&executable, SERVER).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
@@ -61,6 +83,11 @@ impl Fixture {
                 },
                 "port": port
             },
+            "environment": {
+                "source_root": source,
+                "cache_dir": directory.path().join("cache"),
+                "setup_timeout_secs": 15
+            },
             "startup_timeout_secs": 15,
             "request_timeout_secs": 5,
             "shutdown_timeout_secs": 1,
@@ -78,6 +105,18 @@ impl Fixture {
             .collect()
     }
 
+    pub fn preparations(&self) -> Vec<Value> {
+        fs::read_to_string(self.directory.path().join("preparation.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    pub fn source(&self) -> PathBuf {
+        self.directory.path().join("source")
+    }
+
     pub fn only_run_directory(&self) -> PathBuf {
         let entries = fs::read_dir(&self.config.output_dir)
             .unwrap()
@@ -86,6 +125,27 @@ impl Fixture {
         assert_eq!(entries.len(), 1);
         entries.into_iter().next().unwrap()
     }
+}
+
+pub fn git(source: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Parity fixture",
+            "-c",
+            "user.email=parity-fixture@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .arg("-C")
+        .arg(source)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 pub fn read_json(path: impl AsRef<Path>) -> Value {
@@ -201,13 +261,41 @@ const SERVER: &str = r#"#!/usr/bin/env python3
 import http.server
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
 
-side = os.environ['SGLANG_RUST_SERVER']
 trace_path = os.environ['PARITY_FIXTURE_LOG']
+if len(sys.argv) > 1 and Path(sys.argv[1]).name == 'probe.py':
+    if '--library-paths' in sys.argv:
+        Path(sys.argv[-1]).write_text('[]')
+        sys.exit(0)
+    arguments = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+    source = Path(arguments['--source'])
+    failed = os.environ.get('PARITY_FIXTURE_PROBE_FAIL') == '1'
+    result = {
+        'status': 'failed' if failed else 'passed',
+        'python_version': arguments['--python-version'],
+        'dependencies_only': False,
+        'lock': str(Path(arguments['--lock']).resolve()),
+        'python_executable': arguments['--python'],
+        'source': str(source.resolve()),
+        'packages': {'fixture': '1.0'},
+        'backend': {'name': arguments['--backend'], 'device': 'fixture'},
+        'rust_extension': {'path': 'fixture', 'fingerprint': 'fixture', 'sha256': 'fixture'},
+    }
+    if failed:
+        result['error'] = 'deliberate fixture probe failure'
+    Path(arguments['--output']).write_text(json.dumps(result))
+    with open(Path(trace_path).with_name('preparation.jsonl'), 'a') as stream:
+        stream.write(json.dumps(result) + '\n')
+    if failed:
+        print(result['error'], flush=True)
+    sys.exit(17 if failed else 0)
+
+side = os.environ['SGLANG_RUST_SERVER']
 worker = None
 
 def record(kind, **fields):
@@ -245,6 +333,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         count = self.server.requests
         record('request', path=self.path, raw=raw.decode('utf-8'), body=body)
         behavior = body['behavior']
+        if behavior == 'wait_for_release':
+            while not os.path.exists(os.environ['PARITY_FIXTURE_RELEASE']):
+                time.sleep(0.01)
         payload = {
             'value': body['value'],
             'trace': side + ':' + str(count),
@@ -298,7 +389,9 @@ server.requests = 0
 if os.environ.get('PARITY_FIXTURE_CHILD') == '1':
     worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
 record('start', argv=sys.argv[1:], deterministic=os.environ.get('SGLANG_ENABLE_DETERMINISTIC_INFERENCE'),
-       shared=os.environ.get('PARITY_FIXTURE_SHARED'), worker=None if worker is None else worker.pid)
+       shared=os.environ.get('PARITY_FIXTURE_SHARED'), worker=None if worker is None else worker.pid,
+       python_path=os.environ['PYTHONPATH'],
+       source_version=Path(os.environ['PYTHONPATH'], 'fixture-version.txt').read_text())
 print('fixture server ready for ' + side, flush=True)
 server.serve_forever()
 "#;

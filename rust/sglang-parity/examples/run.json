@@ -1,6 +1,9 @@
 {
+  "environment": {
+    "backend": "auto",
+    "setup_timeout_secs": 1800
+  },
   "server": {
-    "python": "/path/to/sglang-environment/bin/python",
     "model": "/path/to/model",
     "args": [],
     "env": {},

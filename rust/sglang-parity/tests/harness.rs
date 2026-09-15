@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use sglang_parity::runner::{RunError, Status};
 use sglang_parity::{RunConfig, Violation, describe, run};
 
-use support::{EchoPolicy, Fixture, assert_process_stopped, case, read_json, suite, wait_until};
+use support::{
+    EchoPolicy, Fixture, assert_process_stopped, case, git, read_json, suite, wait_until,
+};
 
 #[tokio::test]
 async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
@@ -27,6 +29,11 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     let report = run(&fixture.config, &suite, &EchoPolicy).await.unwrap();
     assert_eq!(report.exit_code(), 0);
     assert_eq!(report.state, "complete");
+    assert_eq!(fixture.preparations().len(), 1);
+    assert_eq!(
+        read_json(report.directory.join("environment.json")),
+        *report.environment.as_ref().unwrap()
+    );
     assert_eq!(read_json(&report.effective_suite), effective);
     assert_eq!(
         read_json(report.directory.join("report.json")),
@@ -556,12 +563,9 @@ async fn invalid_configuration_and_startup_failures_cannot_be_passing_runs() {
 
 #[test]
 fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
-    let directory = tempfile::tempdir().unwrap();
-    let config: RunConfig = serde_json::from_value(json!({
-        "server": {"python": directory.path().join("does-not-exist"), "model": "fixture"},
-        "output_dir": directory.path().join("output")
-    }))
-    .unwrap();
+    let fixture = Fixture::new();
+    let mut config = fixture.config.clone();
+    config.server.python = Some(fixture.directory.path().join("does-not-exist"));
     let valid = suite(vec![case("valid", "/json", "normal")]);
     describe(&config, &valid).unwrap();
     for name in ["../escape", "nested/path", ""] {
@@ -591,22 +595,16 @@ fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
     unknown["hidden_comparison_override"] = json!(true);
     assert!(serde_json::from_value::<RunConfig>(unknown).is_err());
     assert!(!config.output_dir.exists());
+    assert!(fixture.preparations().is_empty());
 }
 
 #[test]
 fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python() {
-    let directory = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new();
+    fixture.config.server.python = Some(fixture.directory.path().join("missing-python"));
+    let directory = &fixture.directory;
     let config_path = directory.path().join("run.json");
-    let output_dir = directory.path().join("output");
-    fs::write(
-        &config_path,
-        serde_json::to_vec(&json!({
-            "server": {"python": directory.path().join("missing-python"), "model": "fixture"},
-            "output_dir": output_dir
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     let execute = |external: Option<&std::path::Path>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sglang-parity"));
         command.arg("--config").arg(&config_path).arg("--describe");
@@ -642,7 +640,133 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
     let rejected = execute(Some(&external_path));
     assert_eq!(rejected.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown field"));
-    assert!(!output_dir.exists());
+    assert!(!fixture.config.output_dir.exists());
+    assert!(fixture.preparations().is_empty());
+}
+
+#[tokio::test]
+async fn dirty_and_untracked_sources_are_rejected_before_preparation() {
+    for (relative, diagnostic) in [
+        ("python/fixture-version.txt", "uncommitted changes"),
+        ("python/untracked.py", "untracked source files"),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.source().join(relative), "local edit").unwrap();
+        let error = run(
+            &fixture.config,
+            &suite(vec![case("ordinary", "/json", "normal")]),
+            &EchoPolicy,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "{error}");
+        assert!(fixture.preparations().is_empty());
+        assert!(fixture.lifecycle().is_empty());
+        assert!(!fixture.config.output_dir.exists());
+    }
+}
+
+#[tokio::test]
+async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
+    let mut fixture = Fixture::new();
+    let original_commit = git(&fixture.source(), &["rev-parse", "HEAD"]);
+    let release = fixture.directory.path().join("release");
+    fixture.config.server.env.insert(
+        "PARITY_FIXTURE_RELEASE".into(),
+        release.to_string_lossy().into_owned(),
+    );
+    let config = fixture.config.clone();
+    let suite = suite(vec![case("held", "/json", "wait_for_release")]);
+    let task = tokio::spawn(async move { run(&config, &suite, &EchoPolicy).await });
+    assert!(
+        wait_until(|| fixture
+            .lifecycle()
+            .iter()
+            .any(|entry| entry["kind"] == "request"))
+        .await
+    );
+    git(
+        &fixture.source(),
+        &["switch", "--quiet", "-c", "changed-head"],
+    );
+    let marker = fixture.source().join("python/fixture-version.txt");
+    fs::write(&marker, "new HEAD").unwrap();
+    git(
+        &fixture.source(),
+        &["commit", "--quiet", "-am", "advance original"],
+    );
+    assert_ne!(
+        git(&fixture.source(), &["rev-parse", "HEAD"]),
+        original_commit
+    );
+    fs::write(&marker, "uncommitted after switch").unwrap();
+    fs::write(fixture.source().join("python/later.py"), "untracked later").unwrap();
+    fs::write(&release, "resume").unwrap();
+
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.exit_code(), 0, "{report:#?}");
+    let environment = report.environment.as_ref().unwrap();
+    assert_eq!(environment["plan"]["commit"], original_commit);
+    let snapshot = std::path::Path::new(environment["plan"]["source_snapshot"].as_str().unwrap());
+    assert_eq!(git(snapshot, &["rev-parse", "HEAD"]), original_commit);
+    assert!(git(snapshot, &["status", "--porcelain"]).is_empty());
+    let starts: Vec<_> = fixture
+        .lifecycle()
+        .into_iter()
+        .filter(|entry| entry["kind"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 2);
+    for start in starts {
+        assert_eq!(start["python_path"], json!(snapshot.join("python")));
+        assert_eq!(start["source_version"], "initial HEAD");
+    }
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        "uncommitted after switch"
+    );
+}
+
+#[tokio::test]
+async fn failed_environment_probe_retains_evidence_without_starting_servers() {
+    let mut fixture = Fixture::new();
+    fixture
+        .config
+        .server
+        .env
+        .insert("PARITY_FIXTURE_PROBE_FAIL".into(), "1".into());
+    let report = run(
+        &fixture.config,
+        &suite(vec![case("ordinary", "/json", "normal")]),
+        &EchoPolicy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_code(), 2);
+    assert_eq!(report.runtime_errors.len(), 1);
+    assert!(report.runtime_errors[0].contains("environment preparation"));
+    assert!(report.environment.is_none());
+    assert!(fixture.lifecycle().is_empty());
+    assert_eq!(fixture.preparations().len(), 1);
+    assert!(
+        report.cases[0]
+            .implementations
+            .values()
+            .all(|side| side.attempts.is_empty())
+    );
+    assert_eq!(
+        read_json(report.directory.join("environment-probe.json"))["error"],
+        "deliberate fixture probe failure"
+    );
+    assert!(
+        fs::read_to_string(report.directory.join("setup.log"))
+            .unwrap()
+            .contains("deliberate fixture probe failure")
+    );
+    assert!(report.directory.join("environment.lock").is_file());
+    assert_eq!(
+        read_json(report.directory.join("report.json")),
+        serde_json::to_value(report).unwrap()
+    );
 }
 
 #[tokio::test]

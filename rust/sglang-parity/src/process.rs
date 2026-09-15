@@ -1,13 +1,13 @@
-//! Own the complete lifetime of a local SGLang server process group.
+//! Own process groups for environment preparation and local SGLang servers.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,8 @@ use tokio::time::{Instant, sleep};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    pub python: PathBuf,
+    #[serde(default)]
+    pub python: Option<PathBuf>,
     pub model: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -132,7 +133,11 @@ fn configure_environment(
 impl ServerConfig {
     /// Reject ambiguous configurations before starting or downloading a model.
     pub fn validate(&self) -> Result<(), String> {
-        if self.python.as_os_str().is_empty() {
+        if self
+            .python
+            .as_ref()
+            .is_some_and(|python| python.as_os_str().is_empty())
+        {
             return Err("server.python must name a Python executable".into());
         }
         if self.model.trim().is_empty() || self.model.contains('\0') {
@@ -224,15 +229,157 @@ impl Implementation {
     }
 }
 
-/// Owns the server and its process group, including during cancelled futures.
+/// Own a process group across completion, errors, and cancelled futures.
 ///
-/// Explicit shutdown permits graceful termination. Dropping this owner kills
-/// the group immediately and reaps the direct child without requiring an async
-/// runtime. This also protects a cancelled `start` or `shutdown` future.
+/// Keep the direct child until cleanup even after it exits: descendants may
+/// still be running. Drop kills the group and reaps the child synchronously.
 #[derive(Debug)]
-pub struct SglangProcess {
+pub(crate) struct ManagedChild {
     child: Option<Child>,
     process_group: i32,
+}
+
+impl ManagedChild {
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        let child = command.process_group(0).spawn()?;
+        Ok(Self {
+            process_group: child.id() as i32,
+            child: Some(child),
+        })
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("process has already been shut down"))?
+            .try_wait()
+    }
+
+    pub(crate) async fn shutdown(&mut self, grace: Duration) -> Result<(), String> {
+        if self.child.is_none() {
+            return Ok(());
+        }
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or("shutdown timeout is too large")?;
+        signal_group(self.process_group, libc::SIGTERM)
+            .map_err(|e| format!("cannot terminate process group: {e}"))?;
+        loop {
+            let exited = self
+                .try_wait()
+                .map_err(|e| format!("cannot inspect shutting down process: {e}"))?
+                .is_some();
+            if exited && !group_exists(self.process_group) {
+                self.child.take();
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return self.kill_and_reap();
+            }
+            sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let signal = signal_group(self.process_group, libc::SIGKILL);
+        // Also target the direct child if group signaling failed unexpectedly.
+        if signal.is_err() {
+            let _ = child.kill();
+        }
+        let wait = child.wait();
+        signal.map_err(|e| format!("cannot kill process group: {e}"))?;
+        wait.map_err(|e| format!("cannot reap process: {e}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        let _ = self.kill_and_reap();
+    }
+}
+
+/// Remove inherited Python and installer overrides before applying run settings.
+pub(crate) fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| {
+            key.starts_with("GIT_")
+                || key.starts_with("UV_")
+                || key.starts_with("PIP_")
+                || key.starts_with("PYTHON")
+                || matches!(
+                    key,
+                    "VIRTUAL_ENV"
+                        | "CONDA_PREFIX"
+                        | "SGLANG_RUST_BUILD_MODE"
+                        | "PYO3_PYTHON"
+                        | "CARGO_TARGET_DIR"
+                )
+        }) {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
+/// Run a setup command with retained output and cancellation-safe cleanup.
+pub(crate) async fn run_command(
+    command: &mut Command,
+    log: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    if timeout.is_zero() {
+        return Err("command timeout must be positive".into());
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("command timeout is too large")?;
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|e| format!("cannot open command log {}: {e}", log.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|e| format!("cannot duplicate command log: {e}"))?;
+    command.stdin(Stdio::null()).stdout(stdout).stderr(stderr);
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = ManagedChild::spawn(command)
+        .map_err(|e| format!("cannot start {program}: {e}; see {}", log.display()))?;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("cannot inspect {program}: {e}; see {}", log.display()))?
+        {
+            child.shutdown(Duration::ZERO).await?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{program} exited with {status}; see {}",
+                    log.display()
+                ))
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("{program} timed out; see {}", log.display()));
+        }
+        sleep(Duration::from_millis(25).min(remaining)).await;
+    }
+}
+
+/// Owns the server group and waits for its port to be released at shutdown.
+#[derive(Debug)]
+pub struct SglangProcess {
+    child: ManagedChild,
     port: u16,
     shutdown_timeout: Duration,
 }
@@ -247,6 +394,10 @@ impl SglangProcess {
         shutdown_timeout: Duration,
     ) -> Result<Self, String> {
         config.validate()?;
+        let python = config
+            .python
+            .as_ref()
+            .ok_or("server.python must be prepared before starting SGLang")?;
         if startup_timeout.is_zero() {
             return Err("startup timeout must be positive".into());
         }
@@ -273,14 +424,14 @@ impl SglangProcess {
             .map_err(|e| format!("cannot duplicate server log: {e}"))?;
         // Resolve explicit relative paths before changing the child's directory;
         // a bare executable name must still use PATH lookup.
-        let python = if config.python.is_relative() && config.python.components().count() > 1 {
+        let python = if python.is_relative() && python.components().count() > 1 {
             std::env::current_dir()
                 .map_err(|e| format!("cannot resolve Python executable: {e}"))?
-                .join(&config.python)
+                .join(python)
         } else {
-            config.python.clone()
+            python.clone()
         };
-        let mut command = Command::new(python);
+        let mut command = isolated_command(python);
         command
             .args(["-m", "sglang.launch_server", "--model-path", &config.model])
             .args(&config.args)
@@ -296,8 +447,7 @@ impl SglangProcess {
             ])
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(stderr)
-            .process_group(0);
+            .stderr(stderr);
         configure_environment(
             &mut command,
             config,
@@ -308,15 +458,14 @@ impl SglangProcess {
             command.current_dir(directory);
         }
         drop(reservation);
-        let child = command.spawn().map_err(|e| {
+        let child = ManagedChild::spawn(&mut command).map_err(|e| {
             format!(
                 "cannot start {} SGLang server: {e}",
                 implementation.as_str()
             )
         })?;
         let mut process = Self {
-            process_group: child.id() as i32,
-            child: Some(child),
+            child,
             port: config.port,
             shutdown_timeout,
         };
@@ -324,8 +473,6 @@ impl SglangProcess {
         loop {
             if let Some(status) = process
                 .child
-                .as_mut()
-                .unwrap()
                 .try_wait()
                 .map_err(|e| format!("cannot inspect server process: {e}"))?
             {
@@ -352,8 +499,6 @@ impl SglangProcess {
                 // A child can exit while a readiness response is in flight.
                 if process
                     .child
-                    .as_mut()
-                    .unwrap()
                     .try_wait()
                     .map_err(|e| format!("cannot inspect ready server: {e}"))?
                     .is_none()
@@ -383,48 +528,11 @@ impl SglangProcess {
 
     /// Terminate the entire group, escalating after the bounded grace period.
     pub async fn shutdown(&mut self) -> Result<(), String> {
-        if self.child.is_none() {
+        if self.child.child.is_none() {
             return Ok(());
         }
-        signal_group(self.process_group, libc::SIGTERM)
-            .map_err(|e| format!("cannot terminate server process group: {e}"))?;
-        let deadline = Instant::now() + self.shutdown_timeout;
-        loop {
-            let exited = self
-                .child
-                .as_mut()
-                .unwrap()
-                .try_wait()
-                .map_err(|e| format!("cannot inspect shutting down server: {e}"))?
-                .is_some();
-            if exited && !group_exists(self.process_group) {
-                self.child.take();
-                return self.wait_port_release().await;
-            }
-            if Instant::now() >= deadline {
-                self.kill_and_reap()?;
-                return self.wait_port_release().await;
-            }
-            sleep(
-                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
-            )
-            .await;
-        }
-    }
-
-    fn kill_and_reap(&mut self) -> Result<(), String> {
-        let Some(mut child) = self.child.take() else {
-            return Ok(());
-        };
-        let signal = signal_group(self.process_group, libc::SIGKILL);
-        // Also target the direct child if group signaling failed unexpectedly.
-        if signal.is_err() {
-            let _ = child.kill();
-        }
-        let wait = child.wait();
-        signal.map_err(|e| format!("cannot kill server process group: {e}"))?;
-        wait.map_err(|e| format!("cannot reap server process: {e}"))?;
-        Ok(())
+        self.child.shutdown(self.shutdown_timeout).await?;
+        self.wait_port_release().await
     }
 
     async fn wait_port_release(&self) -> Result<(), String> {
@@ -455,12 +563,6 @@ fn reserve_port(port: u16) -> io::Result<TcpListener> {
     let address = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
     socket.bind(&std::net::SocketAddr::V4(address).into())?;
     Ok(socket.into())
-}
-
-impl Drop for SglangProcess {
-    fn drop(&mut self) {
-        let _ = self.kill_and_reap();
-    }
 }
 
 fn signal_group(group: i32, signal: i32) -> io::Result<()> {
@@ -677,6 +779,23 @@ assert inherited.getsockname() != ('127.0.0.1', int(sys.argv[2])), 'port reserva
     }
 
     #[tokio::test]
+    async fn omitted_python_requires_environment_preparation() {
+        let config: ServerConfig =
+            serde_json::from_value(serde_json::json!({"model": "model"})).unwrap();
+        config.validate().unwrap();
+        let error = SglangProcess::start(
+            &config,
+            Implementation::Python,
+            Path::new("unused.log"),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("must be prepared"), "{error}");
+    }
+
+    #[tokio::test]
     async fn python_paths_and_path_lookup_survive_a_different_server_working_dir() {
         let invocation_dir = std::env::current_dir().unwrap();
         let directory = tempfile::tempdir_in(&invocation_dir).unwrap();
@@ -697,7 +816,7 @@ assert inherited.getsockname() != ('127.0.0.1', int(sys.argv[2])), 'port reserva
             PathBuf::from(".").join(relative_dir).join("fake-python"),
             PathBuf::from("fake-python"),
         ] {
-            config.python = python;
+            config.python = Some(python);
             let log = directory.path().join("server.log");
             let error = SglangProcess::start(
                 &config,
@@ -758,7 +877,7 @@ wait "$worker"
             .unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut config = config();
-            config.python = executable;
+            config.python = Some(executable);
             config.port = available_port();
             config.env.insert(
                 "PARITY_PIDS".into(),
@@ -799,17 +918,18 @@ wait "$worker"
             }
         }
 
-        fn owner(&self, grace: Duration) -> SglangProcess {
-            let child = Command::new(&self.config.python)
+        fn command(&self) -> Command {
+            let mut command = Command::new(self.config.python.as_ref().unwrap());
+            command
                 .envs(&self.config.env)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
-                .unwrap();
+                .stderr(Stdio::null());
+            command
+        }
+
+        fn owner(&self, grace: Duration) -> SglangProcess {
             SglangProcess {
-                process_group: child.id() as i32,
-                child: Some(child),
+                child: ManagedChild::spawn(&mut self.command()).unwrap(),
                 port: self.config.port,
                 shutdown_timeout: grace,
             }
@@ -825,6 +945,57 @@ wait "$worker"
             .unwrap();
         let state = String::from_utf8_lossy(&state.stdout);
         !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+
+    #[tokio::test]
+    async fn setup_commands_append_logs_and_report_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("setup.log");
+        for status in [0, 17] {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                &format!("echo output-{status}; echo error-{status} >&2; exit {status}"),
+            ]);
+            let result = run_command(&mut command, &log, Duration::from_secs(5)).await;
+            if status == 0 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("17") && error.contains("setup.log"),
+                    "{error}"
+                );
+            }
+        }
+        let output = std::fs::read_to_string(log).unwrap();
+        assert_eq!(output, "output-0\nerror-0\noutput-17\nerror-17\n");
+    }
+
+    #[tokio::test]
+    async fn setup_exit_timeout_and_cancellation_clean_descendants() {
+        for (mode, timeout, expected) in [
+            ("early", Duration::from_secs(5), "exited with"),
+            ("wait", Duration::from_secs(2), "timed out"),
+        ] {
+            let fixture = Fixture::new(mode);
+            let error = run_command(&mut fixture.command(), &fixture.log(), timeout)
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            fixture.assert_dead().await;
+        }
+        let fixture = Fixture::new("wait");
+        let mut command = fixture.command();
+        let log = fixture.log();
+        let task =
+            tokio::spawn(
+                async move { run_command(&mut command, &log, Duration::from_secs(60)).await },
+            );
+        fixture.await_tree().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        fixture.assert_dead().await;
     }
 
     #[tokio::test]
