@@ -2,13 +2,12 @@
 
 import unittest
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import create_autospec
 
 import torch
 
 from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,7 +26,7 @@ class TestDSparkDisaggDraftInput(CustomTestCase):
             enable_overlap=enable_overlap,
         )
 
-    def _build(self, *, enable_overlap: bool) -> tuple[Any, FutureMap]:
+    def _build(self, *, enable_overlap: bool) -> tuple[SpecInput, FutureMap]:
         future_map = create_autospec(FutureMap, instance=True)
         spec_info = SpeculativeAlgorithm.DSPARK.build_disagg_draft_input(
             batch=self._make_batch(enable_overlap=enable_overlap),
