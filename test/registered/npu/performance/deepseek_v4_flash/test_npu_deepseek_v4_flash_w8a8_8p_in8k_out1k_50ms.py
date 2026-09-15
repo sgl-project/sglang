@@ -45,7 +45,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # to keep the fast sampling path (required for random-dataset perf runs).
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "DEEPEP_HCCL_BUFFSIZE": "2500",
     # Must cover the largest decode bucket (10) x speculative num draft
     # tokens (7) = 70 tokens per rank; 96 leaves headroom for verify.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
@@ -100,15 +100,13 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--speculative-draft-attention-backend",
     "ascend",
     "--speculative-num-draft-tokens",
-    7,
-    "--speculative-dspark-block-size",
     6,
-    "--skip-server-warmup",
+    "--speculative-dspark-block-size",
+    5,
     "--cuda-graph-bs-decode",
     1,
     2,
     4,
-    6,
     8,
     10,
     "--load-balance-method",
