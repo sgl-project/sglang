@@ -1,0 +1,15 @@
+{
+    "_comment": "Floors for the no-reference quality metrics (see test/quality_metrics.py). A metric absent from a case is neither enforced nor computed. One table for all backends: the floors are loose relative to the difference a GPU family makes, unlike latency, which is why perf_baselines/ is per-device and this file is not. Scoring real outputs against a black frame and uniform noise, only image_reward separates a broken image from a healthy one (worst healthy -0.587 vs best broken -2.041, gap 1.45). clip_score OVERLAPS by 0.58 (healthy min 24.70, black max 25.28) and clip_iqa by 0.34 (healthy min 0.430, noise 0.773), so neither can gate a single image at any floor -- they are distribution metrics; compare them with benchmarks/bench_image_quality.py --baseline instead.",
+    "defaults": {},
+    "cases": {
+        "flux2_dev_image_t2i": {
+            "_comment": "Carried over from the previous inline XPU guard, which asserted raw cosine >= 0.20; same gate on the 100*cosine scale, kept so this case is not silently weakened. Read it as a smoke floor on one fixed prompt, not a quality gate: a black frame scores 17.2-25.3, which is inside the range healthy images occupy. clip_iqa/image_reward are unmeasured for FLUX.2-dev, so they stay unenforced.",
+            "min_clip_score": 20.0
+        },
+        "flux_2_klein_image_t2i": {
+            "_comment": "klein-9B BF16, 1024x1024, 4 steps, guidance 1.0. min_image_reward sits between the worst healthy image (-0.717) and the best broken one (-2.041). min_clip_score is a non-image tripwire only: uniform noise scores 13.9-24.1, a black frame 17.2-25.3, so 15.0 catches a decode failure and nothing subtler. min_clip_iqa is deliberately absent -- a 0.45 floor rejects healthy images while uniform noise scores 0.773, inside the healthy bulk.",
+            "min_clip_score": 15.0,
+            "min_image_reward": -1.3
+        }
+    }
+}

@@ -132,6 +132,18 @@ diffusion = [
   "xatlas",
 ]
 
+diffusion-eval = [
+  # CLIP-IQA for multimodal_gen/test/quality_metrics.py; piq holds the canonical
+  # clip_iqa weights, which torchmetrics refuses to load without it. CLIP prompt
+  # adherence is not from here: torchmetrics 1.9's CLIPScore breaks on the pinned
+  # transformers 5.12.1, so quality_metrics.py computes that cosine itself.
+  # image-reward is deliberately absent: it imports ReFL.py, which needs
+  # transformers<5 while this project pins transformers==5.12.1, so it runs in a
+  # separate interpreter named by SGLANG_TEST_IMAGE_REWARD_PYTHON.
+  "piq>=0.8.0",
+  "torchmetrics>=1.9.0",
+]
+
 diffusion-qvg = [
   # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
   # installed separately with --no-deps; this extra provides its missing

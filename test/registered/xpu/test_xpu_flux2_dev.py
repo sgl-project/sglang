@@ -8,13 +8,16 @@ diffusion server harness is device-agnostic; XPU dispatch is picked up by
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.test.quality_metrics import (
+    QualityScores,
+    format_quality_scores,
+)
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
@@ -56,16 +59,14 @@ XPU_FLUX2_CASES = [
             prompt="A curious raccoon in a top hat, oil painting",
             output_size="1024x1024",
         ),
-        # XPU has no perf/consistency baseline in
-        # multimodal_gen/test/server/perf_baselines/. CLIP-score guard below
-        # is the accuracy check; skip the CUDA-only latency/consistency ones.
+        # XPU has no baseline under test/server/perf_baselines/, so the accuracy
+        # check is the quality_thresholds.json floors, not latency/consistency.
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
+        run_quality_check=True,
     ),
 ]
-
-CLIP_SCORE_THRESHOLD = 0.20
 
 ARTIFACT_DIR = os.environ.get(
     "SGLANG_DIFFUSION_ARTIFACT_DIR", "/tmp/diffusion-artifacts"
@@ -73,7 +74,11 @@ ARTIFACT_DIR = os.environ.get(
 
 
 def _save_image_and_write_summary(
-    case_id: str, prompt: str, image_bytes: bytes, clip_score: float | None = None
+    case_id: str,
+    prompt: str,
+    image_bytes: bytes,
+    scores: QualityScores,
+    failures: list[str],
 ):
     ext = "jpg" if image_bytes[:2] == b"\xff\xd8" else "png"
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
@@ -86,49 +91,20 @@ def _save_image_and_write_summary(
     if not summary_file:
         return
 
-    clip_line = ""
-    if clip_score is not None:
-        status = "PASS" if clip_score >= CLIP_SCORE_THRESHOLD else "FAIL"
-        clip_line = (
-            f"| CLIP Score | {clip_score:.4f} "
-            f"({status}, threshold: {CLIP_SCORE_THRESHOLD}) |\n"
-        )
-
+    quality_status = "FAIL" if failures else "PASS"
     md = (
         f"### FLUX.2-dev — `{case_id}`\n\n"
         f"| | |\n|---|---|\n"
         f"| Prompt | {prompt} |\n"
         f"| Size | {len(image_bytes):,} bytes |\n"
-        f"{clip_line}"
+        f"| Quality | {format_quality_scores(scores)} ({quality_status}) |\n"
         f"| Artifact | `{case_id}.{ext}` (download from Artifacts section above) |\n\n"
     )
+    if failures:
+        md += "".join(f"- {failure}\n" for failure in failures) + "\n"
 
     with open(summary_file, "a") as f:
         f.write(md)
-
-
-def _compute_clip_score(image_bytes: bytes, prompt: str) -> float | None:
-    try:
-        from PIL import Image
-        from transformers import CLIPModel, CLIPProcessor
-
-        model_name = "openai/clip-vit-base-patch32"
-        processor = CLIPProcessor.from_pretrained(model_name)
-        model = CLIPModel.from_pretrained(model_name)
-        model.eval()
-
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        inputs = processor(text=[prompt], images=image, return_tensors="pt")
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            score = outputs.logits_per_image.item() / 100.0
-
-        logger.info("CLIP score for '%s': %.4f", prompt, score)
-        return score
-    except Exception as e:
-        logger.warning("CLIP score computation failed: %s", e)
-        return None
 
 
 @pytest.mark.skipif(
@@ -168,18 +144,18 @@ class TestFlux2DevXPU(DiffusionServerBase):
         self._test_v1_models_endpoint(diffusion_server, case)
 
         prompt = case.sampling_params.prompt or ""
-        clip_score = _compute_clip_score(content, prompt)
+        scores = QualityScores()
+        failures: list[str] = []
+        if case.run_quality_check:
+            # Score first, publish the numbers, then fail: a failing run is
+            # exactly the one whose scores need to reach the step summary.
+            scores, failures = self._score_quality(case, content)
+            logger.info("Quality scores: %s", format_quality_scores(scores))
+        _save_image_and_write_summary(case.id, prompt, content, scores, failures)
 
-        if clip_score is not None:
-            logger.info(
-                "CLIP score: %.4f (threshold: %.2f)", clip_score, CLIP_SCORE_THRESHOLD
-            )
-            assert clip_score >= CLIP_SCORE_THRESHOLD, (
-                f"CLIP score {clip_score:.4f} below threshold {CLIP_SCORE_THRESHOLD} "
-                f"for prompt '{prompt}'"
-            )
-
-        _save_image_and_write_summary(case.id, prompt, content, clip_score)
+        assert not failures, (
+            f"Quality check failed for {case.id}: {'; '.join(failures)}"
+        )
 
 
 if __name__ == "__main__":

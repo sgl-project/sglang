@@ -1677,6 +1677,7 @@
                 "pages": [
                   "docs/sglang-diffusion/support_new_models",
                   "docs/sglang-diffusion/ci_perf",
+                  "docs/sglang-diffusion/quality_eval",
                   "docs/sglang-diffusion/contributing"
                 ]
               }
