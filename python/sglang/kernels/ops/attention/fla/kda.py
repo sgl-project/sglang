@@ -12,7 +12,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+    can_use_fused_kda_state_output,
+    chunk_gated_delta_rule_fwd_h,
+    chunk_gated_delta_rule_fwd_o_128,
+)
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
@@ -1160,6 +1164,38 @@ def chunk_kda_fwd(
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
+
+    use_fused_state_output = (
+        not output_intermediate_states
+        and track_state is None
+        and track_chunk_idx is None
+        and can_use_fused_kda_state_output(
+            q=q,
+            k=kg,
+            v=u,
+            w=w,
+            gk=g,
+            A=Aqk,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            num_chunks=_NT_pr,
+        )
+    )
+    if use_fused_state_output:
+        o = chunk_gated_delta_rule_fwd_o_128(
+            q=q,
+            k=kg,
+            v=u,
+            w=w,
+            gk=g,
+            A=Aqk,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        del w, u, kg, Aqk
+        return o
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
