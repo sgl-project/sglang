@@ -241,7 +241,9 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
         out_data = (in_data * a1_scale).to(OutDtype)
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id != num_local_experts:
+            # -1 is the metadata kernel's skip sentinel for any
+            # out-of-range id; only [0, num_local_experts) is real.
+            if 0 <= expert_id < num_local_experts:
                 dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
                 tl.store(dst_ptr_offs + dst_idx * hidden_size, out_data, mask=mask)
 
@@ -855,7 +857,9 @@ def post_reorder_triton_kernel_for_cutlass_moe(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id != num_local_experts:
+            # -1 is the metadata kernel's skip sentinel for any
+            # out-of-range id; only [0, num_local_experts) is real.
+            if 0 <= expert_id < num_local_experts:
                 dst_idx_int32 = tl.load(token_src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx
