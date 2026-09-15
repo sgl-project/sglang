@@ -58,6 +58,7 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
 RUN apt-get update && apt-get install -y \
     python3-dev \
     build-essential \
+    libssl-dev \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
