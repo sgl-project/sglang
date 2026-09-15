@@ -1,10 +1,13 @@
 import unittest
 from array import array
+from unittest import mock
 
 import torch
 
 from sglang.srt.utils.common import (
+    _read_cgroup_memory_max,
     flatten_arrays_to_int64_tensor,
+    get_available_gpu_memory,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
     is_musa,
@@ -159,5 +162,79 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             subprocess.run = original
 
 
-if __name__ == "__main__":
-    unittest.main()
+_COMMON = "sglang.srt.utils.common"
+
+
+class TestReadCgroupMemoryMax(CustomTestCase):
+    """`_read_cgroup_memory_max` returns the container's byte limit, or None
+    when unlimited/unreadable. The None case is load-bearing: get_available_gpu_
+    memory and get_cpu_memory_capacity branch on it to keep bare-metal /
+    full-machine containers on the original host-based estimate. A regression
+    that made "max" or a missing file parse as a real limit reintroduced the
+    over-estimated memory that destabilized the full-machine GNR CI box.
+    """
+
+    def _read(self, content):
+        m = mock.mock_open(read_data=content)
+        with mock.patch("builtins.open", m):
+            return _read_cgroup_memory_max()
+
+    def test_numeric_bytes(self):
+        self.assertEqual(self._read("236223201280\n"), 236223201280)
+
+    def test_unit_suffix_scaled_to_bytes(self):
+        self.assertEqual(self._read("2g\n"), 2 * 1024**3)
+
+    def test_unlimited_returns_none(self):
+        # cgroup-v2 writes the literal "max" when there is no limit.
+        self.assertIsNone(self._read("max\n"))
+
+    def test_unreadable_returns_none(self):
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(_read_cgroup_memory_max())
+
+
+class TestGetAvailableGpuMemoryCpu(CustomTestCase):
+    """The CPU branch of get_available_gpu_memory must use the cgroup limit
+    only when the process is actually capped. Two guarded regressions:
+
+    * capped: free = (cgroup_limit - cgroup_used) / numa. Using a host-wide
+      "used" here drove the estimate negative once a sibling socket-pinned
+      container was resident, so KV-cache sizing failed with "no memory".
+    * uncapped: free = psutil.available / numa (unchanged host behavior). A
+      prior version used cgroup math unconditionally, inflating the estimate on
+      the no-limit GNR box.
+    """
+
+    def test_capped_uses_cgroup_limit_minus_used(self):
+        with (
+            mock.patch(f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)),
+            mock.patch(f"{_COMMON}.get_used_cpu_memory", return_value=50 * (1 << 30)),
+            mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0"]),
+        ):
+            # (200 - 50) GB over 1 numa node.
+            self.assertAlmostEqual(get_available_gpu_memory("cpu", 0), 150.0, places=1)
+
+    def test_uncapped_uses_psutil_available(self):
+        vm = mock.Mock(available=120 * (1 << 30))
+        with (
+            mock.patch(f"{_COMMON}._read_cgroup_memory_max", return_value=None),
+            mock.patch(f"{_COMMON}.psutil.virtual_memory", return_value=vm),
+            mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0", "1"]),
+        ):
+            # 120 GB host-available over 2 numa nodes -> 60 GB.
+            self.assertAlmostEqual(get_available_gpu_memory("cpu", 0), 60.0, places=1)
+
+    def test_capped_not_divided_by_empty_numa_nodes(self):
+        # A socket-pinned container sees one usable node (empty nodes are
+        # dropped upstream in get_cpu_ids_by_node). Dividing the 200 GB limit by
+        # 1, not 2, is what lets the socket use its full budget.
+        with (
+            mock.patch(f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)),
+            mock.patch(f"{_COMMON}.get_used_cpu_memory", return_value=0),
+            mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0"]),
+        ):
+            self.assertAlmostEqual(get_available_gpu_memory("cpu", 0), 200.0, places=1)
+
+
+
