@@ -14,7 +14,9 @@ from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
-HOST_RE = re.compile(r"^(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[1-9][0-9]{0,4})?$")
+HOST_RE = re.compile(
+    r"^(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[1-9][0-9]{0,4})?$"
+)
 REPOSITORY_COMPONENT_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.post(\d+))?([A-Za-z0-9_.-]*)?$")
 VLLM_UBUNTU2404_VERSION_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-ubuntu2404$")
@@ -54,7 +56,9 @@ def docker_hub_repository(image_name: str) -> str:
     if image_name.startswith("docker.io/"):
         image_name = image_name.removeprefix("docker.io/")
     elif "." in image_name.split("/", 1)[0] or ":" in image_name.split("/", 1)[0]:
-        raise SystemExit(f"automatic tag discovery only supports Docker Hub: {image_name}")
+        raise SystemExit(
+            f"automatic tag discovery only supports Docker Hub: {image_name}"
+        )
     parts = image_name.split("/")
     if len(parts) == 1:
         return f"library/{parts[0]}"
@@ -308,7 +312,9 @@ def normalize_repository(value: str, field_name: str) -> str:
 
 
 def normalize_registry(value: str) -> str:
-    if value != value.strip() or any(char in value for char in ("/", "@", "\r", "\n", "\0")):
+    if value != value.strip() or any(
+        char in value for char in ("/", "@", "\r", "\n", "\0")
+    ):
         raise SystemExit(f"invalid registry: {value!r}")
     if not HOST_RE.fullmatch(value) or ".." in value:
         raise SystemExit(f"invalid registry: {value}")
@@ -442,8 +448,14 @@ def main() -> None:
         action="store_true",
         help="Run docker buildx imagetools create. Without this, print a dry run.",
     )
-    parser.add_argument("--write-plan", default="", help="Write the resolved plan as JSON.")
-    parser.add_argument("--plan-file", default="", help="Read and execute an already resolved JSON plan.")
+    parser.add_argument(
+        "--write-plan", default="", help="Write the resolved plan as JSON."
+    )
+    parser.add_argument(
+        "--plan-file",
+        default="",
+        help="Read and execute an already resolved JSON plan.",
+    )
     parser.add_argument(
         "--timezone",
         default="Asia/Shanghai",
@@ -456,7 +468,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.plan_file:
-        sync_images(read_plan(args.plan_file), execute=args.execute, platform=args.platform)
+        sync_images(
+            read_plan(args.plan_file), execute=args.execute, platform=args.platform
+        )
         return
 
     timezone = ZoneInfo(args.timezone)

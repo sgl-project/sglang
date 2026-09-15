@@ -110,6 +110,7 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
 
 | Where | Change | Why | From | Guard |
 |---|---|---|---|---|
+| `docker/Dockerfile` | install the parameterized EIC Python SDK in `framework`; `framework_final` inherits it and `runtime` copies its site-packages | EIC runtime modules and the post-deploy integration check import `eic`; the SDK hunk was lost while resolving #767 onto refreshed `ep_main` | #767 follow-up | `scripts/ci/verify_private_image_runtime.py` imports `eic` in built private images |
 | `hybrid_cache/hybrid_pool_assembler.py` | `device_indexed` clamps DSv4 host pages to device+1 | EIC host pages are device-indexed; `ratio × device` pinned unreachable RSS and OOMed TP8 | #744 | `EICReg.test_device_indexed_host_pages_ignore_hicache_ratio`, `test_eic_calls_the_assembler_with_its_current_signature` |
 | `mem_cache/radix_cache.py` `TreeNode` | `content_hash = None` | Every EIC hash path reads it on nodes `RadixCache` creates | #523 | `EICReg.test_real_tree_node_carries_content_hash` |
 | `storage/eic/eic_storage.py` | v2 multi-pool API (`register_mem_host_pool_v2`, `batch_{exists,get,set}_v2`), pp-scoped key prefix, logical anchor, mexist cardinality guard | Unified radix EIC L3 for DSv4 pools | #637, #660 | `EICReg.test_batch_exists_impl_failed_batch_keeps_cardinality`, `test_unified_tree_node_exposes_storage_hash_helpers` |

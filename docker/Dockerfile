@@ -10,6 +10,8 @@ ARG SGL_DEEP_GEMM_VERSION=0.1.7
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
+ARG EIC_SDK_VERSION=1.5.2
+ARG EIC_SDK_RELEASE_ROOT=https://eic-sdk-release.tos-cn-beijing.volces.com/python
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -434,6 +436,8 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
+ARG EIC_SDK_VERSION
+ARG EIC_SDK_RELEASE_ROOT
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
@@ -575,6 +579,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     tabulate \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+
+# Install the EIC SDK required by the EIC HiCache backend. framework_final
+# inherits it directly, and runtime copies framework_final's site-packages.
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
+    "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
+    --no-cache-dir
 
 # PyTorch 2.13 requires nvidia-nccl-cu13==2.29.7, so keep that version while
 # resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7

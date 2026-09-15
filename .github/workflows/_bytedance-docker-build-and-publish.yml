@@ -315,7 +315,7 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
 
           # When a zstd re-export will follow, export a full (mode=max) registry
-          # build cache so the zstd step can re-use these freshly built layers
+          # build cache so the zstd step can reuse these freshly built layers
           # instead of recompiling from scratch. The heavy intermediate stages
           # (torch_deps/framework/deepep) reach the final image via COPY --from,
           # so mode=max is required to cache them; mode=min/inline would not.

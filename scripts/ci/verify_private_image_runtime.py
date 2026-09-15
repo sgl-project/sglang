@@ -16,3 +16,7 @@ print(f"torch={torch.__version__} cuda={torch.version.cuda}")
 import sglang
 
 print(f"sglang-module={sglang.__file__}")
+
+import eic
+
+print(f"eic-module={eic.__file__}")

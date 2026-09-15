@@ -72,20 +72,21 @@ def select_tag(
             raise ValueError(f"duplicate CUDA entry: {entry_cuda}")
         seen_cuda.add(entry_cuda)
         raw_tags = entry.get("tags")
-        if not isinstance(raw_tags, list) or not raw_tags or not all(
-            isinstance(tag, str) and tag for tag in raw_tags
+        if (
+            not isinstance(raw_tags, list)
+            or not raw_tags
+            or not all(isinstance(tag, str) and tag for tag in raw_tags)
         ):
-            raise ValueError(f"tags for CUDA variant {entry_cuda} must be a non-empty list of strings")
+            raise ValueError(
+                f"tags for CUDA variant {entry_cuda} must be a non-empty list of strings"
+            )
         validated_entries.append((entry_cuda, raw_tags))
 
     for entry_cuda, raw_tags in validated_entries:
         if entry_cuda != cuda:
             continue
 
-        tags = [
-            render_tag_template(tag, version, date, short_sha)
-            for tag in raw_tags
-        ]
+        tags = [render_tag_template(tag, version, date, short_sha) for tag in raw_tags]
         for tag in tags:
             validate_scalar("rendered image tag", tag)
             if not TAG_RE.fullmatch(tag):

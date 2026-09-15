@@ -6,13 +6,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
-HELPER_PATH = REPO_ROOT / "scripts" / "ci" / "utils" / "bytedance_docker_build_metadata_args.py"
+HELPER_PATH = (
+    REPO_ROOT / "scripts" / "ci" / "utils" / "bytedance_docker_build_metadata_args.py"
+)
 DOCKERFILE_PATH = REPO_ROOT / "docker" / "Dockerfile"
 WORKFLOW_PATH = (
-    REPO_ROOT
-    / ".github"
-    / "workflows"
-    / "_bytedance-docker-build-and-publish.yml"
+    REPO_ROOT / ".github" / "workflows" / "_bytedance-docker-build-and-publish.yml"
 )
 
 
@@ -180,16 +179,24 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
     def test_rejects_duplicate_cuda_and_unresolved_placeholder(self):
         with self.assertRaisesRegex(ValueError, "duplicate CUDA"):
             self.helper.select_tag(
-                json.dumps([
-                    {"cuda": "cu130", "tags": ["v{version}"]},
-                    {"cuda": "cu130", "tags": ["latest-cu130"]},
-                ]),
-                "cu130", "0.6.0", "20260429", "abcdef12",
+                json.dumps(
+                    [
+                        {"cuda": "cu130", "tags": ["v{version}"]},
+                        {"cuda": "cu130", "tags": ["latest-cu130"]},
+                    ]
+                ),
+                "cu130",
+                "0.6.0",
+                "20260429",
+                "abcdef12",
             )
         with self.assertRaisesRegex(ValueError, "unresolved placeholder"):
             self.helper.select_tag(
                 json.dumps([{"cuda": "cu130", "tags": ["v{missing}"]}]),
-                "cu130", "0.6.0", "20260429", "abcdef12",
+                "cu130",
+                "0.6.0",
+                "20260429",
+                "abcdef12",
             )
 
     def test_rejects_invalid_top_level_and_repository(self):
@@ -199,11 +206,15 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
             self.helper.build_arg_tokens(
                 cuda="cu130",
                 tag_config=json.dumps([{"cuda": "cu130", "tags": ["v{version}"]}]),
-                image_repo="HTTPS://Example.com/Bad", version="0.6.0",
-                build_commit="abcdef12", build_tree="tree1234",
+                image_repo="HTTPS://Example.com/Bad",
+                version="0.6.0",
+                build_commit="abcdef12",
+                build_tree="tree1234",
                 python_manifest_sha256="digest1234",
                 build_source="https://github.com/bytedance-iaas/sglang",
-                build_url="", date="20260429", short_sha="abcdef12",
+                build_url="",
+                date="20260429",
+                short_sha="abcdef12",
             )
 
     def test_final_dockerfile_stages_embed_metadata_contract(self):
@@ -247,7 +258,9 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         workflow = WORKFLOW_PATH.read_text()
 
         self.assertIn("git rev-parse HEAD", workflow)
-        self.assertIn("scripts/ci/utils/bytedance_docker_build_metadata_args.py", workflow)
+        self.assertIn(
+            "scripts/ci/utils/bytedance_docker_build_metadata_args.py", workflow
+        )
         self.assertIn("mapfile -t METADATA_ARGS", workflow)
         self.assertIn('"${METADATA_ARGS[@]}"', workflow)
 

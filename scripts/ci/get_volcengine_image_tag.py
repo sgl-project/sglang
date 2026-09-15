@@ -38,7 +38,12 @@ def build_tag(
     """
     if not VERSION_RE.fullmatch(version):
         raise SystemExit(f"invalid SGLang version: {version}")
-    for name, value in (("tag-value", tag_value), ("variant-suffix", variant_suffix), ("cuda-suffix", cuda_suffix), ("format-suffix", format_suffix)):
+    for name, value in (
+        ("tag-value", tag_value),
+        ("variant-suffix", variant_suffix),
+        ("cuda-suffix", cuda_suffix),
+        ("format-suffix", format_suffix),
+    ):
         validate_suffix(name, value)
 
     if mode == "manual":
