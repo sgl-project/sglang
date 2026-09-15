@@ -95,6 +95,7 @@ Select with `--dataset-name`:
 - `sharegpt` (default): loads ShareGPT-style pairs; optionally restrict with `--sharegpt-context-len` and override outputs with `--sharegpt-output-len`
 - `random`: random text lengths; sampled from ShareGPT token space
 - `random-ids`: random token ids (can lead to gibberish)
+- `embedding`: reads OpenAI-compatible embedding requests from a JSONL file; each line must contain an `input` string or a non-empty list of strings. Other fields such as `dimensions` and `encoding_format` are passed through to `/v1/embeddings`.
 - `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
 - `generated-shared-prefix`: synthetic dataset with shared long system prompts and short questions
 - `mmmu`: samples from MMMU (Math split) and includes images
@@ -109,6 +110,25 @@ Common dataset flags:
 
 - `--apply-chat-template`: apply tokenizer chat template when constructing prompts
 - `--dataset-path PATH`: file path for ShareGPT json; if blank and missing, it will be downloaded and cached
+
+Embedding dataset JSONL example:
+
+```json
+{"input": "Represent this sentence for retrieval", "encoding_format": "float"}
+{"input": ["query text", "document text"], "dimensions": 256}
+```
+
+Run it with an embedding server:
+
+```bash Command
+python3 -m sglang.benchmark.serving \
+  --backend sglang-embedding \
+  --model Qwen/Qwen3-Embedding-0.6B \
+  --dataset-name embedding \
+  --dataset-path ./embedding_requests.jsonl \
+  --num-prompts 1000 \
+  --max-concurrency 64
+```
 
 Generated Shared Prefix flags (for `generated-shared-prefix`):
 
@@ -478,3 +498,4 @@ The `--fake-prefill` flag automatically injects special sentinel values into eac
 
 - The script raises the file descriptor soft limit (`RLIMIT_NOFILE`) to help with many concurrent connections.
 - For sglang, `/server_info` is queried post-run to report speculative decoding accept length when available.
+
