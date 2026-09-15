@@ -18,6 +18,7 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
+_OUTPUT_RTOL = 2 * torch.finfo(torch.bfloat16).eps
 
 _CASES = [
     (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
@@ -33,6 +34,14 @@ _CASES = [
     (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 9),
     (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
 ]
+
+
+def _assert_output_matches_reference(actual, reference):
+    # The tuned multi-warp fused reduction can cross a BF16 rounding boundary
+    # relative to the one-warp reference. Non-reduction cache checks stay exact.
+    torch.testing.assert_close(
+        actual.float(), reference.float(), rtol=_OUTPUT_RTOL, atol=1e-6
+    )
 
 
 def _make_inputs(
@@ -186,7 +195,7 @@ def _compare_case(case, num_warps=None, weight_dtype=torch.bfloat16):
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    assert torch.equal(o_ref_v, o_fus_v)
+    _assert_output_matches_reference(o_fus_v, o_ref_v)
     # conv_state is read-only in verify; the commit scatter advances it.
     assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
@@ -226,9 +235,9 @@ def test_glm_fp32_weights_match_under_graph_replay(case_index):
 
     valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
     expected, actual = results
-    assert torch.equal(
-        expected[0].reshape(B, T, HV, V)[valid],
+    _assert_output_matches_reference(
         actual[0].reshape(B, T, HV, V)[valid],
+        expected[0].reshape(B, T, HV, V)[valid],
     )
     assert torch.equal(inp["conv_pool"], actual[1])
     assert torch.equal(expected[2][valid], actual[2][valid])

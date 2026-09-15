@@ -21,7 +21,8 @@ Numerics: aligned with the unfused pair. The conv output is rounded to the
 activation dtype (bf16) before entering the recurrence — exactly what the
 unfused path does through its intermediate tensor — and all expressions mirror
 the reference kernels line by line. Reduction order still splits differently
-where many V heads share one Q/K head, worth ~1 ulp on the output.
+when the tuned launch uses multiple warps, worth about one bf16 ulp on the
+output relative to the one-warp reference.
 """
 
 from typing import Optional
