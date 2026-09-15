@@ -989,13 +989,19 @@ def _apply_custom_logit_processor_with_indices(
     sampling_batch_info: SamplingBatchInfo,
     num_tokens_in_batch: int,
 ) -> None:
+    token_offsets = (
+        None
+        if num_tokens_in_batch == 1
+        else torch.arange(num_tokens_in_batch, device=logits.device)
+    )
+    batch_size = len(sampling_batch_info)
     for key, (processor, _) in sampling_batch_info.custom_logit_processor.items():
         rows, indices = sampling_batch_info.custom_logit_processor_row_indices[key]
-        if num_tokens_in_batch != 1:
-            indices = (
-                indices[:, None] * num_tokens_in_batch
-                + torch.arange(num_tokens_in_batch, device=logits.device)
-            ).flatten()
+        assert not rows or rows[-1] < batch_size, (
+            f"Cached processor rows {rows} are stale for a batch of {batch_size}"
+        )
+        if token_offsets is not None:
+            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
         selected = logits.index_select(0, indices)
         custom_params = [
             sampling_batch_info.custom_params[i]
