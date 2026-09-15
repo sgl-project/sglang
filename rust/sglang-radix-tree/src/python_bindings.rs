@@ -417,6 +417,7 @@ fn frees_to_py(py: Python<'_>, frees: HashMap<ComponentType, Vec<Tensor>>) -> Py
 #[derive(Clone)]
 pub struct TreeCoreInitParamsBinding {
     pub eviction_policy: String,
+    pub slru_protected_threshold: i64,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -433,6 +434,7 @@ impl TreeCoreInitParamsBinding {
     fn to_cache_init_params(&self) -> PyResult<CacheInitParams> {
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
+            slru_protected_threshold: self.slru_protected_threshold,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -451,7 +453,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -463,9 +465,11 @@ impl TreeCoreInitParamsBinding {
         enable_kv_cache_events: bool,
         mamba_cache_chunk_size: Option<usize>,
         mamba_max_states_per_path: Option<usize>,
+        slru_protected_threshold: i64,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
+            slru_protected_threshold,
             page_size,
             is_write_back,
             enable_hicache,
@@ -510,6 +514,7 @@ impl MatchParamsBinding {
 /// stays a Python-held reference until the insert call unwraps it.
 #[pyclass(get_all, set_all)]
 pub struct InsertParamsBinding {
+    pub rotation_base: Option<i64>,
     pub key: Vec<i64>,
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
@@ -527,7 +532,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -542,8 +547,10 @@ impl InsertParamsBinding {
         priority: i64,
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
+        rotation_base: Option<i64>,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
+            rotation_base,
             key: py_array_to_vec_i64(py, key)?,
             value,
             extra_key,
@@ -598,6 +605,7 @@ impl MatchResultBinding {
 /// Python-visible insert result; actions are Python-held.
 #[pyclass(get_all)]
 pub struct InsertResultBinding {
+    rotation_tail_declined: bool,
     prefix_len: usize,
     total_len: usize,
     last_device_node: Option<NodeId>,
@@ -638,6 +646,7 @@ impl InsertResultBinding {
     /// Move a core insert result across the boundary.
     fn from_insert_result(py: Python<'_>, result: InsertResult) -> PyResult<Self> {
         Ok(InsertResultBinding {
+            rotation_tail_declined: result.rotation_tail_declined,
             prefix_len: result.prefix_len,
             total_len: result.total_len,
             last_device_node: result.last_device_node_id,
@@ -755,6 +764,7 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
     made_progress: bool,
+    unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -766,6 +776,7 @@ pub struct EvictDeviceNextNodeResultBinding {
 #[pyclass(get_all)]
 pub struct EvictDeviceLeafResultBinding {
     backup_kv: Option<Py<PyAny>>,
+    unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -1021,6 +1032,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
@@ -1058,6 +1070,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             None => None,
         };
         let params = InsertParams {
+            rotation_base: params.rotation_base,
             key,
             namespace: KeyNamespaceRef::new(
                 params.extra_key.as_deref(),
@@ -1232,6 +1245,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
             made_progress,
+            unbacked_tokens: result.unbacked_tokens,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
@@ -1253,6 +1267,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             })
             .map_err(node_access_error)?;
         Ok(EvictDeviceLeafResultBinding {
+            unbacked_tokens: result.unbacked_tokens,
             backup_kv: backup
                 .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
                 .transpose()?,
@@ -1588,6 +1603,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().root_node_handle(extra_key.as_deref()))
     }
 
+    fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+        py.allow_threads(|| self.core().rotation_base_of(node_id))
+            .map_err(node_access_error)
+    }
+
     fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
         py.allow_threads(|| self.core().dfs_weight_order(&node_ids))
             .map_err(node_access_error)
@@ -1719,9 +1739,16 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         component_type: u8,
         num_tokens: usize,
+        skip_full_duplicate_reclaim: bool,
     ) -> PyResult<HostEvictionResultBinding> {
         let ct = parse_component_type(component_type)?;
-        let result = py.allow_threads(move || self.core().drive_host_eviction(ct, num_tokens));
+        let result = py.allow_threads(move || {
+            self.core().drive_host_eviction_with_options(
+                ct,
+                num_tokens,
+                skip_full_duplicate_reclaim,
+            )
+        });
         Ok(HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -2813,6 +2840,10 @@ macro_rules! tree_core_binding {
                 self.inner.root_node_handle(py, extra_key)
             }
 
+            fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                self.inner.rotation_base_of(py, node_id)
+            }
+
             fn dfs_weight_order(
                 &self,
                 py: Python<'_>,
@@ -2884,13 +2915,20 @@ macro_rules! tree_core_binding {
             }
 
             /// Evict up to num_tokens of one component's host resources.
+            #[pyo3(signature = (component_type, num_tokens, skip_full_duplicate_reclaim = false))]
             fn drive_host_eviction(
                 &self,
                 py: Python<'_>,
                 component_type: u8,
                 num_tokens: usize,
+                skip_full_duplicate_reclaim: bool,
             ) -> PyResult<HostEvictionResultBinding> {
-                self.inner.drive_host_eviction(py, component_type, num_tokens)
+                self.inner.drive_host_eviction(
+                    py,
+                    component_type,
+                    num_tokens,
+                    skip_full_duplicate_reclaim,
+                )
             }
 
             /// Evict shallow Mamba device checkpoints beyond the per-path cap

@@ -177,6 +177,8 @@ pub struct Node<K: ChildKeyType> {
     pub hash_value: Option<Vec<String>>,
     /// Whether this node is available through the direct external-cache linker.
     pub external_cache_stored: bool,
+    /// Chain-wide logical-page owner rotation, retained across node splits.
+    pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
     /// Load-back anchor currently reading this node's host slots.
@@ -399,6 +401,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             hash_value: Some(Vec::new()),
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
@@ -422,6 +425,7 @@ impl<K: ChildKeyType> Node<K> {
             swa_host_uuid: None,
             hash_value: None,
             external_cache_stored: false,
+            rotation_base: None,
             write_through_pending_id: None,
             load_back_pending_id: None,
             last_access_counter: 0,
