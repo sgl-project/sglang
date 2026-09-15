@@ -62,6 +62,47 @@ def apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
+def reverse_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    """Reverse RoPE: remove positional embedding from K cache.
+
+    Forward RoPE:
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+
+    Reverse RoPE (inverse):
+        x1 = o1 * cos + o2 * sin
+        x2 = o2 * cos - o1 * sin
+
+    Args:
+        x: [num_tokens, num_heads, head_size] - RoPE-applied K cache
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary.
+
+    Returns:
+        x_orig: [num_tokens, num_heads, head_size] - K with RoPE removed
+    """
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        o1, o2 = torch.chunk(x, 2, dim=-1)
+    else:
+        o1 = x[..., ::2]
+        o2 = x[..., 1::2]
+    # Inverse of forward RoPE
+    x1 = o1 * cos + o2 * sin
+    x2 = o2 * cos - o1 * sin
+    if is_neox_style:
+        return torch.cat((x1, x2), dim=-1)
+    else:
+        return torch.stack((x1, x2), dim=-1).flatten(-2)
+
+
 # Copied from transformers
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""

@@ -161,6 +161,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_fuzzy_match_backend,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_page_major_kv_layout,
@@ -179,6 +180,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
+    run_hook(handle_fuzzy_match_backend, server_args)
     run_hook(handle_decode_context_parallelism, server_args)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph

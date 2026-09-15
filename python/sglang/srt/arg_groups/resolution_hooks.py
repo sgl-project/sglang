@@ -63,6 +63,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_expert_pack",
         "handle_pd_disaggregation",
         "validate_prefill_only_disable_kv_cache_args",
+        "handle_fuzzy_match_backend",
         "handle_decode_context_parallelism",
         "apply_inkling_prefill_cuda_graph_default",
         "apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
