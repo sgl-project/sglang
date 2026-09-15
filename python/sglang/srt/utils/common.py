@@ -781,6 +781,23 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    """Metal's recommended working-set size, in MiB.
+
+    Apple Silicon has no dedicated VRAM: the GPU shares system memory, and
+    Metal reports a soft cap -- about two thirds of physical RAM -- past which
+    command buffers fail with ``kIOGPUCommandBufferCallbackErrorOutOfMemory``.
+    That cap, not total system memory, is what the memory budget must fit
+    inside, so it is the capacity this device reports.
+    """
+    try:
+        if torch.backends.mps.is_available():
+            return torch.mps.recommended_max_memory() // (1 << 20)  # unit: MB
+        return None
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -843,6 +860,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None

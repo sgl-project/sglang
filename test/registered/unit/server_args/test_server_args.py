@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_two_batch_overlap,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -93,6 +94,7 @@ from sglang.srt.runtime_context import (
     override_platform,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.utils.common import get_device_memory_capacity
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -2175,6 +2177,68 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
+class TestMpsMemoryBudget(CustomTestCase):
+    """Apple Metal caps the GPU working set well below system RAM.
+
+    The cap -- not total memory -- is the budget every allocation shares, so
+    the device has to report it like any other. Without a capacity,
+    ``handle_gpu_memory_settings`` falls back to a blanket 0.95 that reserves
+    nothing for activations, and the first real prefill runs the Metal command
+    buffer out of memory.
+    """
+
+    WORKING_SET_BYTES = 16 * (1 << 30)
+    WORKING_SET_MIB = 16 * 1024
+    # The capacity-less fallback in `handle_gpu_memory_settings`.
+    NO_CAPACITY_FRACTION = 0.95
+
+    def test_capacity_reports_the_metal_working_set_in_mib(self):
+        with (
+            patch("torch.backends.mps.is_available", return_value=True),
+            patch(
+                "torch.mps.recommended_max_memory",
+                return_value=self.WORKING_SET_BYTES,
+            ),
+        ):
+            self.assertEqual(get_device_memory_capacity("mps"), self.WORKING_SET_MIB)
+
+    def test_capacity_is_unknown_without_metal(self):
+        with patch("torch.backends.mps.is_available", return_value=False):
+            self.assertIsNone(get_device_memory_capacity("mps"))
+
+    def test_budget_reserves_activation_headroom_on_mps(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="mps",
+            # Metal has no CUDA graphs, so nothing reserves capture memory.
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                prefill=PhaseConfig(backend=Backend.DISABLED),
+            ),
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_multimodal=False,
+            attention_arch=AttentionArch.MHA,
+        )
+        with (
+            patch("torch.backends.mps.is_available", return_value=True),
+            patch(
+                "torch.mps.recommended_max_memory",
+                return_value=self.WORKING_SET_BYTES,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+
+        fraction = resolution_result(args, "mem_fraction_static")
+        self.assertLess(fraction, self.NO_CAPACITY_FRACTION)
+        # What the fraction leaves unclaimed has to cover the activations of a
+        # full chunk, which is the reserve the fallback had no capacity to size.
+        chunk = resolution_result(args, "chunked_prefill_size")
+        headroom_mib = (1 - fraction) * self.WORKING_SET_MIB
+        self.assertGreater(headroom_mib, 1.5 * chunk)
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
