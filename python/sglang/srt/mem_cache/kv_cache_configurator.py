@@ -104,13 +104,25 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
-    )
+    if (
+        memory_config.enable_hisparse
+        or is_draft_worker
+        or memory_config.enable_unified_cache_external_linker
+        or get_disagg().disaggregation_mode != "null"
+    ):
+        return False
+    if memory_config.enable_hierarchical_cache:
+        # The DSA indexer host pool packs only layers that own a device index-K
+        # buffer (pool_host/dsa.py), so HiCache itself never needs the top-k
+        # reuse layers. Upstream still allocates all layers for the non-DCP
+        # path (its L3 storage page format is shared across instances); under
+        # DCP the index-K is virtual-sized (x dcp), where allocating every
+        # layer would cost ~4x the index memory on GLM-5.x, and L3 storage
+        # is rejected at server start.
+        return (
+            get_parallel().dcp_enabled and memory_config.hicache_storage_backend is None
+        )
+    return True
 
 
 _is_hip = is_hip()
@@ -1618,6 +1630,27 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
             ]
+        # WQ Hopper DCP: the target's MLA KV is owner-striped (each rank stores
+        # 1/dcp of the tokens at physical loc // dcp), but the DSA index-K
+        # cache stays REPLICATED and is addressed by the allocator's untranslated
+        # virtual locs, which span [0, (size + page) * dcp). Size it for that
+        # space (same shape of override HiSparse uses for its host ratio). The
+        # draft pool is already virtual-sized via loc_space_scale. The matching
+        # memory budget lives in pool_configurator._compute_dsa_indexer_cell_size.
+        _dcp_size = get_parallel().attn_dcp_size
+        if _dcp_size > 1 and not self.is_draft_worker:
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens + self.pool_page_size
+            ) * _dcp_size
+            logger.info(
+                "DCP (dcp_size=%d): the DSA index-K cache is replicated over the "
+                "virtual loc space and sized for %d slots per rank (dcp_size x the "
+                "%d-token MLA pool); MLA KV itself is striped 1/dcp. Budget this "
+                "when tuning --mem-fraction-static for long contexts.",
+                _dcp_size,
+                pool_kwargs["index_buf_size"],
+                max_total_num_tokens,
+            )
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

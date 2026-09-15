@@ -494,8 +494,15 @@ class HybridCacheController(BaseHiCacheController):
         Sidecar transfers riding another pool's indices are included here but
         excluded from the per-pool token counts.
         """
+        anchor_pool = self.mem_pool_host.anchor_entry.host_pool
         kv_tokens = len(op.device_indices)
-        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        # size_per_token is per PHYSICAL row; under DCP a pool with dcp_size > 1
+        # moves only this rank's 1/dcp of the logical slots.
+        num_bytes = (
+            kv_tokens
+            // getattr(anchor_pool, "dcp_size", 1)
+            * anchor_pool.size_per_token
+        )
         # Slot counts of the pools sidecars can ride on.
         source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
         for t in op.pool_transfers or []:
@@ -509,6 +516,7 @@ class HybridCacheController(BaseHiCacheController):
                 num_slots = source_len.get(t.indices_from_pool, 0)
             else:
                 num_slots = len(t.host_indices) if t.host_indices is not None else 0
+            num_slots //= getattr(entry.host_pool, "dcp_size", 1)
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 

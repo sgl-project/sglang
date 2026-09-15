@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
+    _wq_dsa_dcp_validation,
     attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
@@ -244,10 +245,16 @@ def handle_model_specific_adjustments(server_args: Any):
 
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # WQ Hopper DCP: the DSA+DCP composition guard runs right after
+                # the split backends and kv dtype it validates are resolved.
+                run_post_process_pass(server_args, _wq_dsa_dcp_validation)
 
             elif get_platform().is_xpu:
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # WQ Hopper DCP: the DSA+DCP composition guard runs right after
+                # the split backends and kv dtype it validates are resolved.
+                run_post_process_pass(server_args, _wq_dsa_dcp_validation)
                 # Disable fused topk (requires sgl-kernel ops not available on XPU)
                 if (
                     envs.SGLANG_DSA_FUSE_TOPK.is_set()
