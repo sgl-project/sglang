@@ -859,11 +859,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         else:
             # One prefill rank feeds multiple decode ranks: interleave num_groups
             # head-groups in the src dlist so each decode rank picks its slice.
-            #
-            # Under GQA replication the dlist must interleave one group per
-            # UNIQUE source head-slice, not one per decode rank -- otherwise it
-            # addresses past the registered KV region and prep_xfer_dlist raises
-            # NIXL_ERR_NOT_FOUND.
             src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
                 prefill_tp_size,
                 decode_tp_size,
@@ -871,9 +866,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 decode_kv_args.decode_tp_rank,
                 total_kv_heads,
             )
-            # num_groups (distinct head-groups packed in one prefill rank's src
-            # region) and head_group_idx (this peer's group) are NIXL-specific and
-            # not returned by the shared helper, so derive them here.
+            # num_groups and head_group_idx are NIXL-specific, not returned by the
+            # shared helper. One group per unique head-slice, not per decode rank:
+            # replicating ranks share a slice, and over-counting addresses past the
+            # registered KV region, where prep_xfer_dlist raises NIXL_ERR_NOT_FOUND.
             dst_replication = max(1, decode_tp_size // total_kv_heads)
             num_groups = decode_tp_size // prefill_tp_size // dst_replication
             head_group_idx = src_head_start // dst_heads_per_rank
