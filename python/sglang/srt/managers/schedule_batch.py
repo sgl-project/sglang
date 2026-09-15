@@ -104,6 +104,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
@@ -979,6 +980,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1334,6 +1336,12 @@ class Req(ReqDllmMixin):
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
+
+    def advance_cache_request_handle(self) -> None:
+        self.cache_request_handle = dataclasses.replace(
+            self.cache_request_handle,
+            attempt_id=self.cache_request_handle.attempt_id + 1,
+        )
 
     @property
     def seqlen(self) -> int:
@@ -2016,6 +2024,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
+            "routed_dp_rank": self.disagg_prefill_dp_rank,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
