@@ -22,6 +22,8 @@ from .configuration_neo_chat import NEOMoELLMConfig
 from .modeling_qwen3 import (
     Qwen3Attention,
     Qwen3RMSNorm,
+    cache_dit_attention_type,
+    cache_dit_decoder_layers,
     create_block_causal_mask,
 )
 from .transformers_compat import (
@@ -507,27 +509,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # Match the dense Qwen3 path: Cache-DiT is valid only for pure image
-        # denoising forwards.  Prefix, Think, and text-cache updates must keep
-        # using the native decoder layers.
-        layers = self.layers
-        native_layers = getattr(self, "_sensenova_cache_dit_native_layers", None)
-        if native_layers is not None and (
-            kwargs.get("update_cache", True)
-            or exist_non_image_gen_tokens
-            or not exist_image_gen_tokens
-        ):
-            layers = native_layers
+        layers = cache_dit_decoder_layers(
+            self,
+            update_cache=kwargs.get("update_cache", True),
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+        )
 
         for decoder_layer in layers[: self.config.num_hidden_layers]:
-            attention_type = getattr(decoder_layer, "attention_type", None)
-            if attention_type is None:
-                if native_layers is None:
-                    raise AttributeError(
-                        "Decoder layer does not expose an attention_type."
-                    )
-                attention_type = self._sensenova_cache_dit_attention_type
-
+            attention_type = cache_dit_attention_type(self, decoder_layer)
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,

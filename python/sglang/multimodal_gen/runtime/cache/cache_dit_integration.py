@@ -7,11 +7,12 @@ on transformer modules in SGLang's modular pipeline architecture.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_tp_world_size,
@@ -194,19 +195,23 @@ def get_scm_mask(
     return mask
 
 
-# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
-# DBCache knobs for the second transformer of dual-DiT models.
-CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
+# The DBCache knobs, which are also the subset a request may override on
+# models that do not implement TaylorSeer.
+CACHE_DIT_DBCACHE_KEYS = frozenset(
     {
         "Fn_compute_blocks",
         "Bn_compute_blocks",
         "max_warmup_steps",
         "residual_diff_threshold",
         "max_continuous_cached_steps",
-        "enable_taylorseer",
-        "taylorseer_order",
     }
 )
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
+CACHE_DIT_REQUEST_KNOB_KEYS = CACHE_DIT_DBCACHE_KEYS | {
+    "enable_taylorseer",
+    "taylorseer_order",
+}
 CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
     {
         "scm_preset",
@@ -218,6 +223,17 @@ CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
 CACHE_DIT_REQUEST_PARAM_KEYS = (
     CACHE_DIT_REQUEST_KNOB_KEYS | CACHE_DIT_REQUEST_SCM_KEYS | {"secondary"}
 )
+
+
+def cache_dit_env_defaults() -> dict[str, Any]:
+    """Server-side DBCache knob defaults, keyed by the request knob names."""
+    return {
+        "Fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
+        "Bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
+        "max_warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
+        "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
+        "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
+    }
 
 
 def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
@@ -382,6 +398,8 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 class CustomBlockAdapterSpec:
     blocks_attr: str
     forward_pattern: ForwardPattern
+    # Restricts the spec to classes from this module prefix; a class of the
+    # same name defined elsewhere (e.g. transformers' own Qwen3) is rejected.
     module_prefix: str | None = None
 
 
@@ -406,12 +424,12 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
     "Qwen3Model": CustomBlockAdapterSpec(
         blocks_attr="layers",
         forward_pattern=ForwardPattern.Pattern_3,
-        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+        module_prefix="sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.",
     ),
     "Qwen3MoeModel": CustomBlockAdapterSpec(
         blocks_attr="layers",
         forward_pattern=ForwardPattern.Pattern_3,
-        module_prefix=("sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."),
+        module_prefix="sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.",
     ),
 }
 
@@ -439,10 +457,10 @@ def _build_custom_block_adapter(
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        # Always identify the attribute explicitly.  Some integrations keep an
-        # unregistered alias to the native ModuleList; cache-dit's automatic
-        # identity scan could otherwise select that alias and patch the wrong
-        # attribute during forward.
+        # Name the patched attribute explicitly. SenseNova retains the native
+        # ModuleList under an unregistered alias while mounted; identity-based
+        # discovery could otherwise select that alias. This also preserves the
+        # established behavior of the other custom adapters.
         blocks_name=spec.blocks_attr,
         forward_pattern=spec.forward_pattern,
         has_separate_cfg=has_separate_cfg,
@@ -562,9 +580,9 @@ def enable_cache_on_transformer(
             parallelism_config=None,
         )
     except Exception:
-        # Normalization precedes cache-dit's mutations. If normalization itself
-        # failed, the adapter cannot be passed to disable_cache and owns no
-        # pipeline state that needs releasing.
+        # Normalization precedes cache-dit's mutations, so an unnormalized
+        # adapter owns no pipeline state and cannot be passed to disable_cache.
+        # ``_is_normalized`` is private to cache-dit 1.3.0; a bump can rename it.
         if custom_adapter is not None and not getattr(
             custom_adapter, "_is_normalized", False
         ):

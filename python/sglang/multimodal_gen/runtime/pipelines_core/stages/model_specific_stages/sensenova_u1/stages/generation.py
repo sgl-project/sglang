@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -25,17 +25,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+        CacheDitConfig,
+    )
 
-_SENSENOVA_DBCACHE_KEYS = frozenset(
-    {
-        "Fn_compute_blocks",
-        "Bn_compute_blocks",
-        "max_warmup_steps",
-        "residual_diff_threshold",
-        "max_continuous_cached_steps",
-    }
-)
+logger = init_logger(__name__)
 
 
 def _get_cache_dit_attention_type(transformer: torch.nn.Module) -> str:
@@ -71,7 +66,7 @@ class SenseNovaU1GenerationOptions:
 
     @classmethod
     def from_batch(cls, batch: Req) -> SenseNovaU1GenerationOptions:
-        extra = getattr(batch, "extra", {}).get(SENSENOVA_U1_REQUEST_EXTRA_KEY, {})
+        extra = batch.extra.get(SENSENOVA_U1_REQUEST_EXTRA_KEY, {})
         return cls(
             cfg_norm=extra.get("cfg_norm", DEFAULT_CFG_NORM),
             timestep_shift=float(extra.get("timestep_shift", DEFAULT_TIMESTEP_SHIFT)),
@@ -95,9 +90,11 @@ class SenseNovaU1GenerationStage(PipelineStage):
         self._cache_dit_cleanup_required = False
 
     def _cache_dit_requested(self, batch: Req) -> bool:
-        sampling_params = getattr(batch, "sampling_params", None)
-        enabled = getattr(sampling_params, "enable_cache_dit", None)
-        return envs.SGLANG_CACHE_DIT_ENABLED if enabled is None else enabled
+        """Per-request Cache-DiT switch; the server default applies when unset."""
+        enabled = batch.sampling_params.enable_cache_dit
+        if enabled is None:
+            return envs.SGLANG_CACHE_DIT_ENABLED
+        return enabled
 
     @property
     def _cache_dit_transformer(self) -> torch.nn.Module:
@@ -136,37 +133,47 @@ class SenseNovaU1GenerationStage(PipelineStage):
             # transformer without its native-layers escape hatch.
             self._cache_dit_cleanup_required = not cleanup_succeeded
 
-    def _maybe_enable_cache_dit(self, batch: Req, server_args: ServerArgs) -> None:
-        """Mount or refresh the pure-image Cache-DiT path for one request."""
-        if self._cache_dit_cleanup_required:
-            self._unmount_cache_dit(force=True)
-
-        requested = self._cache_dit_requested(batch)
-        if getattr(server_args, "enable_breakable_cuda_graph", False):
-            if requested:
-                logger.warning_once(
-                    "Cache-DiT was requested but is disabled because breakable "
-                    "CUDA graphs are enabled."
-                )
-            requested = False
-
+    def _cache_dit_blocked_reason(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        cfg_interval: tuple[float, float],
+    ) -> str | None:
+        """Why a request that asked for Cache-DiT cannot mount it; None when it can."""
+        if server_args.enable_breakable_cuda_graph:
+            return "breakable CUDA graphs are enabled"
         # cache-dit's separate-CFG context expects a stable pair of forwards
         # per diffusion step.  SenseNova can gate CFG by timestep, producing
         # a 1 -> 2 -> 1 call rhythm; do not let that rhythm advance a generic
         # cache context incorrectly.  Full-interval CFG has a stable pair and
         # is supported.  A future branch-aware adapter can lift this guard.
-        options = SenseNovaU1GenerationOptions.from_batch(batch)
-        has_separate_cfg = float(batch.guidance_scale) > 1.0
-        has_partial_cfg = has_separate_cfg and tuple(options.cfg_interval) != (
-            0.0,
-            1.0,
-        )
-        if requested and has_partial_cfg:
-            logger.warning_once(
-                "SenseNova-U1 Cache-DiT is disabled for timestep-gated CFG; "
-                "only cfg_interval=(0, 1) is currently safe."
+        if float(batch.guidance_scale) > 1.0 and tuple(cfg_interval) != (0.0, 1.0):
+            return "timestep-gated CFG is not supported; cfg_interval must be (0, 1)"
+        return None
+
+    def _maybe_enable_cache_dit(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        cfg_interval: tuple[float, float],
+    ) -> None:
+        """Mount or refresh the pure-image Cache-DiT path for one request."""
+        if self._cache_dit_cleanup_required:
+            self._unmount_cache_dit(force=True)
+
+        requested = self._cache_dit_requested(batch)
+        if requested:
+            blocked_reason = self._cache_dit_blocked_reason(
+                batch, server_args, cfg_interval=cfg_interval
             )
-            requested = False
+            if blocked_reason is not None:
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because %s.",
+                    blocked_reason,
+                )
+                requested = False
 
         # Disabled requests ignore cache parameters regardless of the previous
         # request. Unmount lazily to keep cache-dit an optional dependency.
@@ -174,32 +181,32 @@ class SenseNovaU1GenerationStage(PipelineStage):
             self._unmount_cache_dit()
             return
 
+        self._mount_or_refresh_cache_dit(batch)
+
+    def _mount_or_refresh_cache_dit(self, batch: Req) -> None:
+        """Reuse the mounted Cache-DiT context, or mount one for this request."""
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+            CACHE_DIT_DBCACHE_KEYS,
             CacheDitConfig,
+            cache_dit_env_defaults,
             cache_dit_overrides_key,
-            enable_cache_on_transformer,
             refresh_context_on_transformer,
             resolve_cache_dit_request_overrides,
         )
 
         overrides = resolve_cache_dit_request_overrides(
-            getattr(batch.sampling_params, "cache_dit_params", None)
+            batch.sampling_params.cache_dit_params
         )
-        unsupported = set(overrides) - _SENSENOVA_DBCACHE_KEYS
+        unsupported = set(overrides) - CACHE_DIT_DBCACHE_KEYS
         if unsupported:
             raise ValueError(
                 "SenseNova-U1 Cache-DiT currently supports DBCache knobs only; "
                 f"unsupported keys: {sorted(unsupported)}."
             )
         # Compare effective settings so omitted and explicit defaults share a mount.
-        effective_config = {
-            "Fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
-            "Bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
-            "max_warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
-            "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
-            "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
-        }
+        effective_config = cache_dit_env_defaults()
         effective_config.update(overrides)
+        has_separate_cfg = float(batch.guidance_scale) > 1.0
         desired_key = (cache_dit_overrides_key(effective_config), has_separate_cfg)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
@@ -218,6 +225,33 @@ class SenseNovaU1GenerationStage(PipelineStage):
             )
             return
 
+        config = CacheDitConfig(
+            enabled=True,
+            num_inference_steps=steps,
+            **effective_config,
+        )
+        self._mount_cache_dit(
+            transformer,
+            config=config,
+            has_separate_cfg=has_separate_cfg,
+        )
+        self._cache_dit_enabled = True
+        self._cache_dit_active_key = desired_key
+        self._cache_dit_active_config = config
+        self._cache_dit_cleanup_required = False
+
+    def _mount_cache_dit(
+        self,
+        transformer: torch.nn.Module,
+        *,
+        config: CacheDitConfig,
+        has_separate_cfg: bool,
+    ) -> None:
+        """Enable Cache-DiT on a transformer, rolling back a partial mount."""
+        from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
+            enable_cache_on_transformer,
+        )
+
         attention_type = _get_cache_dit_attention_type(transformer)
 
         # Cache-DiT's forward wrapper replaces ``transformer.layers`` only
@@ -230,17 +264,12 @@ class SenseNovaU1GenerationStage(PipelineStage):
         )
         transformer._sensenova_cache_dit_attention_type = attention_type
         try:
-            config = CacheDitConfig(
-                enabled=True,
-                num_inference_steps=steps,
-                **effective_config,
-            )
             enable_cache_on_transformer(
                 transformer,
                 config,
                 model_name="sensenova-qwen3-image",
                 # Full-interval CFG issues a stable cond/uncond pair at every
-                # step; timestep-gated CFG was rejected above.
+                # step; timestep-gated CFG was rejected before mounting.
                 has_separate_cfg=has_separate_cfg,
             )
         except Exception:
@@ -255,10 +284,6 @@ class SenseNovaU1GenerationStage(PipelineStage):
                     "Failed to roll back a partial SenseNova-U1 Cache-DiT mount"
                 )
             raise
-        self._cache_dit_enabled = True
-        self._cache_dit_active_key = desired_key
-        self._cache_dit_active_config = config
-        self._cache_dit_cleanup_required = False
 
     @property
     def role_affinity(self) -> RoleType:
@@ -270,8 +295,10 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
-        self._maybe_enable_cache_dit(batch, server_args)
         options = SenseNovaU1GenerationOptions.from_batch(batch)
+        self._maybe_enable_cache_dit(
+            batch, server_args, cfg_interval=options.cfg_interval
+        )
         seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 
         out = self.model.t2i_generate(

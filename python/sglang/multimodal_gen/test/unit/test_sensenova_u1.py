@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -87,6 +88,22 @@ def _install_sensenova_cache_dit_stub(
     module.CacheDitConfig = CacheDitConfig
     module.cache_dit_overrides_key = lambda overrides: tuple(sorted(overrides.items()))
     module.resolve_cache_dit_request_overrides = lambda raw: dict(raw or {})
+    module.CACHE_DIT_DBCACHE_KEYS = frozenset(
+        {
+            "Fn_compute_blocks",
+            "Bn_compute_blocks",
+            "max_warmup_steps",
+            "residual_diff_threshold",
+            "max_continuous_cached_steps",
+        }
+    )
+    module.cache_dit_env_defaults = lambda: {
+        "Fn_compute_blocks": envs.SGLANG_CACHE_DIT_FN,
+        "Bn_compute_blocks": envs.SGLANG_CACHE_DIT_BN,
+        "max_warmup_steps": envs.SGLANG_CACHE_DIT_WARMUP,
+        "residual_diff_threshold": envs.SGLANG_CACHE_DIT_RDT,
+        "max_continuous_cached_steps": envs.SGLANG_CACHE_DIT_MC,
+    }
 
     def enable_cache_on_transformer(transformer, config, **kwargs):
         calls["enable"].append((transformer, config, kwargs))
@@ -114,6 +131,32 @@ def _install_sensenova_cache_dit_stub(
     module.refresh_context_on_transformer = refresh_context_on_transformer
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return calls
+
+
+def _cache_dit_server_args(*, enable_breakable_cuda_graph: bool = False):
+    return SimpleNamespace(
+        enable_breakable_cuda_graph=enable_breakable_cuda_graph,
+    )
+
+
+def _cache_dit_batch(
+    *,
+    num_inference_steps: int = 8,
+    guidance_scale: float = 1.0,
+    enable_cache_dit: bool | None = True,
+    cache_dit_params: dict | None = None,
+    extra: dict | None = None,
+):
+    """Request double carrying the fields the generation stage reads directly."""
+    return SimpleNamespace(
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        sampling_params=SimpleNamespace(
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
+        ),
+        extra={} if extra is None else extra,
+    )
 
 
 class _CacheDitRecordingBlock(torch.nn.Module):
@@ -720,11 +763,12 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         num_outputs_per_prompt=sampling.num_outputs_per_prompt,
         extra=sampling.build_request_extra(),
         metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=False, cache_dit_params=None),
     )
     model = _FakeSenseNovaModel()
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
 
-    output = stage.forward(batch, server_args=SimpleNamespace())
+    output = stage.forward(batch, server_args=_cache_dit_server_args())
 
     assert len(output.output) == 1
     assert torch.allclose(
@@ -756,22 +800,20 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
     )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
-    batch = SimpleNamespace(
-        num_inference_steps=8,
+    batch = _cache_dit_batch(
         guidance_scale=4.0,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params={
-                "Fn_compute_blocks": 3,
-                "Bn_compute_blocks": 1,
-                "max_warmup_steps": 2,
-                "residual_diff_threshold": 0.1,
-                "max_continuous_cached_steps": 4,
-            },
-        ),
+        cache_dit_params={
+            "Fn_compute_blocks": 3,
+            "Bn_compute_blocks": 1,
+            "max_warmup_steps": 2,
+            "residual_diff_threshold": 0.1,
+            "max_continuous_cached_steps": 4,
+        },
     )
 
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
 
     assert len(calls["enable"]) == 1
     assert transformer._sensenova_cache_dit_native_layers is transformer.layers
@@ -787,7 +829,9 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
 
     # A sequential n>1 request enters the generation stage once per output.
     # The second output refreshes the context instead of remounting Cache-DiT.
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     assert len(calls["refresh"]) == 1
     refreshed_transformer, refreshed_steps, refreshed_config = calls["refresh"][0]
     assert refreshed_transformer is transformer
@@ -796,7 +840,9 @@ def test_sensenova_u1_cache_dit_preserves_config_across_sequential_outputs(
     assert refreshed_config.kwargs == config.kwargs
 
     batch.sampling_params.enable_cache_dit = False
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     assert calls["disable"] == [transformer]
     assert stage._cache_dit_active_config is None
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
@@ -817,14 +863,11 @@ def test_sensenova_u1_disabled_cache_ignores_params(
         model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
         tokenizer="tok",
     )
-    batch = SimpleNamespace(
-        num_inference_steps=8,
-        guidance_scale=4.0,
-        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
-    )
-    server_args = SimpleNamespace()
+    batch = _cache_dit_batch(guidance_scale=4.0)
+    server_args = _cache_dit_server_args()
+    cfg_interval = (0.0, 1.0)
     if prior_enabled:
-        stage._maybe_enable_cache_dit(batch, server_args)
+        stage._maybe_enable_cache_dit(batch, server_args, cfg_interval=cfg_interval)
 
     # A shared client config may retain knobs that SenseNova does not support.
     batch.sampling_params.cache_dit_params = {"enable_taylorseer": False}
@@ -833,9 +876,9 @@ def test_sensenova_u1_disabled_cache_ignores_params(
     elif disable_reason == "cuda_graph":
         server_args.enable_breakable_cuda_graph = True
     else:
-        batch.extra = {SENSENOVA_U1_REQUEST_EXTRA_KEY: {"cfg_interval": (0.2, 0.8)}}
+        cfg_interval = (0.2, 0.8)
 
-    stage._maybe_enable_cache_dit(batch, server_args)
+    stage._maybe_enable_cache_dit(batch, server_args, cfg_interval=cfg_interval)
 
     assert len(calls["enable"]) == int(prior_enabled)
     assert calls["disable"] == ([transformer] if prior_enabled else [])
@@ -847,6 +890,35 @@ def test_sensenova_u1_disabled_cache_ignores_params(
     assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
 
 
+def test_sensenova_u1_forward_guards_on_the_request_cfg_interval(monkeypatch):
+    """A timestep-gated CFG interval must reach the guard that vetoes the mount."""
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    model = _FakeSenseNovaModel()
+    model.language_model = SimpleNamespace(model=transformer)
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    batch = SimpleNamespace(
+        prompt="a mountain lake",
+        width=64,
+        height=64,
+        guidance_scale=4.0,
+        num_inference_steps=8,
+        seed=7,
+        num_outputs_per_prompt=1,
+        extra={SENSENOVA_U1_REQUEST_EXTRA_KEY: {"cfg_interval": (0.2, 0.8)}},
+        metrics=None,
+        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
+    )
+
+    stage.forward(batch, server_args=_cache_dit_server_args())
+
+    assert calls == {"enable": [], "disable": [], "refresh": []}
+    assert model.call_kwargs["cfg_interval"] == (0.2, 0.8)
+
+
 def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
     mount_error = RuntimeError("cache-dit mount failed")
     calls = _install_sensenova_cache_dit_stub(monkeypatch, enable_error=mount_error)
@@ -856,17 +928,12 @@ def test_sensenova_u1_cache_dit_rolls_back_partial_mount(monkeypatch):
     )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
-    batch = SimpleNamespace(
-        num_inference_steps=8,
-        guidance_scale=1.0,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params=None,
-        ),
-    )
+    batch = _cache_dit_batch()
 
     with pytest.raises(RuntimeError, match="cache-dit mount failed"):
-        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+        stage._maybe_enable_cache_dit(
+            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        )
 
     assert calls["disable"] == [transformer]
     assert not hasattr(transformer, "_partial_cache_dit_hook")
@@ -889,18 +956,13 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
     )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
-    batch = SimpleNamespace(
-        num_inference_steps=8,
-        guidance_scale=1.0,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params=None,
-        ),
-    )
+    batch = _cache_dit_batch()
 
     # Preserve the original mount error even when its rollback also fails.
     with pytest.raises(RuntimeError, match="cache-dit mount failed"):
-        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+        stage._maybe_enable_cache_dit(
+            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        )
 
     assert stage._cache_dit_enabled is False
     assert stage._cache_dit_active_key is None
@@ -912,7 +974,9 @@ def test_sensenova_u1_cache_dit_failed_rollback_blocks_later_requests(monkeypatc
     # reaching the early return while the transformer may still be wrapped.
     batch.sampling_params.enable_cache_dit = False
     with pytest.raises(RuntimeError, match="cache-dit cleanup failed"):
-        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+        stage._maybe_enable_cache_dit(
+            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        )
 
     assert calls["disable"] == [transformer, transformer]
     assert stage._cache_dit_cleanup_required is True
@@ -932,18 +996,18 @@ def test_sensenova_u1_cache_dit_remounts_when_cfg_mode_changes(
     )
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
-    batch = SimpleNamespace(
-        num_inference_steps=8,
+    batch = _cache_dit_batch(
         guidance_scale=first_guidance_scale,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params={"residual_diff_threshold": 0.1},
-        ),
+        cache_dit_params={"residual_diff_threshold": 0.1},
     )
 
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     batch.guidance_scale = second_guidance_scale
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
 
     assert len(calls["enable"]) == 2
     assert calls["disable"] == [transformer]
@@ -961,21 +1025,19 @@ def test_sensenova_u1_real_cache_dit_wrapper_routes_only_denoising():
     native_layers = transformer.layers
     model = SimpleNamespace(language_model=SimpleNamespace(model=transformer))
     stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
-    batch = SimpleNamespace(
+    batch = _cache_dit_batch(
         num_inference_steps=2,
-        guidance_scale=1.0,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params={
-                "Fn_compute_blocks": 1,
-                "Bn_compute_blocks": 0,
-                "max_warmup_steps": 2,
-                "residual_diff_threshold": 0.1,
-            },
-        ),
+        cache_dit_params={
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 2,
+            "residual_diff_threshold": 0.1,
+        },
     )
 
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     try:
         inputs = torch.zeros(1, 2, 4)
         transformer(
@@ -1030,6 +1092,8 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
         width=2304,
         height=4096,
         num_outputs_per_prompt=2,
+        # Keep the fake model off the Cache-DiT path regardless of SGLANG_* env.
+        enable_cache_dit=False,
     )
     batch = Req(
         request_id="req-0",
@@ -1093,7 +1157,7 @@ def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
     assert batch.metrics.memory_snapshots["after_validation"].peak_reserved_mb == 400.0
 
     for req in expanded:
-        output = stage.forward(req, server_args=SimpleNamespace())
+        output = stage.forward(req, server_args=_cache_dit_server_args())
         assert len(output.output) == 1
 
 
@@ -1363,25 +1427,26 @@ def test_sensenova_cache_dit_effective_defaults_reuse_mount(
     # Pin the environment independently of the developer's cache settings.
     monkeypatch.setenv("SGLANG_CACHE_DIT_RDT", "0.24")
     explicit = {"residual_diff_threshold": 0.24}
-    batch = SimpleNamespace(
-        num_inference_steps=8,
-        guidance_scale=1.0,
-        sampling_params=SimpleNamespace(
-            enable_cache_dit=True,
-            cache_dit_params=explicit if explicit_first else None,
-        ),
+    batch = _cache_dit_batch(
+        cache_dit_params=explicit if explicit_first else None,
     )
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     batch.sampling_params.cache_dit_params = None if explicit_first else explicit
     batch.num_inference_steps = 12
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     assert len(calls["enable"]) == 1
     assert calls["enable"][0][1].kwargs["residual_diff_threshold"] == 0.24
     assert calls["refresh"] == [(transformer, 12, calls["enable"][0][1])]
     assert calls["disable"] == []
 
     batch.sampling_params.cache_dit_params = {"residual_diff_threshold": 0.1}
-    stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+    stage._maybe_enable_cache_dit(
+        batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+    )
     assert len(calls["enable"]) == 2
     assert calls["enable"][1][1].kwargs["residual_diff_threshold"] == 0.1
     assert calls["disable"] == [transformer]
@@ -1402,13 +1467,11 @@ def test_sensenova_cache_dit_rejects_invalid_attention_before_mount(
         model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
         tokenizer="tok",
     )
-    batch = SimpleNamespace(
-        num_inference_steps=8,
-        guidance_scale=1.0,
-        sampling_params=SimpleNamespace(enable_cache_dit=True, cache_dit_params=None),
-    )
+    batch = _cache_dit_batch()
     with pytest.raises(ValueError, match="attention type"):
-        stage._maybe_enable_cache_dit(batch, SimpleNamespace())
+        stage._maybe_enable_cache_dit(
+            batch, _cache_dit_server_args(), cfg_interval=(0.0, 1.0)
+        )
     assert calls == {"enable": [], "disable": [], "refresh": []}
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
     assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")

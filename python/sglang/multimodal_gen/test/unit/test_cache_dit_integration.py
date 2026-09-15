@@ -86,6 +86,7 @@ def _install_cache_dit_stub():
 def _install_sglang_dependency_stubs():
     sglang = types.ModuleType("sglang")
     multimodal_gen = types.ModuleType("sglang.multimodal_gen")
+    envs = types.ModuleType("sglang.multimodal_gen.envs")
     runtime = types.ModuleType("sglang.multimodal_gen.runtime")
     distributed = types.ModuleType("sglang.multimodal_gen.runtime.distributed")
     parallel_state = types.ModuleType(
@@ -101,6 +102,13 @@ def _install_sglang_dependency_stubs():
     parallel_state.get_ulysses_parallel_world_size = lambda: 1
     parallel_state.get_dit_group = lambda: None
 
+    envs.SGLANG_CACHE_DIT_FN = 1
+    envs.SGLANG_CACHE_DIT_BN = 0
+    envs.SGLANG_CACHE_DIT_WARMUP = 4
+    envs.SGLANG_CACHE_DIT_RDT = 0.24
+    envs.SGLANG_CACHE_DIT_MC = 3
+    multimodal_gen.envs = envs
+
     class _FakeLogger:
         def debug(self, *_args, **_kwargs):
             pass
@@ -113,6 +121,7 @@ def _install_sglang_dependency_stubs():
     return {
         "sglang": sglang,
         "sglang.multimodal_gen": multimodal_gen,
+        "sglang.multimodal_gen.envs": envs,
         "sglang.multimodal_gen.runtime": runtime,
         "sglang.multimodal_gen.runtime.distributed": distributed,
         "sglang.multimodal_gen.runtime.distributed.parallel_state": parallel_state,
@@ -169,6 +178,20 @@ def _import_module_with_stub():
 
 
 class TestCacheDitRefreshContext(unittest.TestCase):
+    def test_cache_dit_env_defaults_read_all_dbcache_knobs(self):
+        module = _import_module_with_stub()
+
+        self.assertEqual(
+            module.cache_dit_env_defaults(),
+            {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+            },
+        )
+
     def test_refresh_context_without_scm_preset_skips_steps_mask(self):
         module = _import_module_with_stub()
         module.refresh_context_on_transformer(
