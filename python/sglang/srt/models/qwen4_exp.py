@@ -773,10 +773,8 @@ def _gather_ple_embedding_from_pinned_kernel(
         )
 
 
-def _host_table_device_ptr(
-    host_ptr: int, nbytes: int, *, backend: str
-) -> Optional[int]:
-    """Device address for an offloaded PLE table, or None if none is needed.
+def _host_table_device_mapping(host_ptr: int, nbytes: int, *, backend: str):
+    """Device mapping for an offloaded PLE table, or None if none is needed.
 
     The ``file`` backend hands the kernel a pageable mapping and depends on
     faults paging rows in on demand, plus an ``MADV_DONTNEED`` trimmer that
@@ -874,7 +872,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
-        self._device_table_ptr = _host_table_device_ptr(
+        self._host_table_mapping = _host_table_device_mapping(
             self.weight.data_ptr(),
             self.weight.numel() * self.weight.element_size(),
             backend=backend,
@@ -883,10 +881,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def unregister_host_table(self) -> None:
         """Drop the device mapping. Must run before the host table is freed."""
-        if getattr(self, "_device_table_ptr", None) is None:
+        mapping = getattr(self, "_host_table_mapping", None)
+        if mapping is None:
             return
-        self._device_table_ptr = None
-        current_platform.unregister_host_memory(self.weight.data_ptr())
+        self._host_table_mapping = None
+        current_platform.unregister_host_memory(mapping)
 
     def __del__(self):
         try:
@@ -935,7 +934,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 )
             # Platforms without unified addressing hand the kernel the mapped
             # address; the grid is clamped where the runtime bounds it.
-            weight_ptr = self._device_table_ptr or self.weight.data_ptr()
+            mapping = self._host_table_mapping
+            weight_ptr = (
+                mapping.device_ptr if mapping is not None else self.weight.data_ptr()
+            )
             max_grid = current_platform.get_max_kernel_grid_size()
             grid = n_rows if max_grid is None else min(n_rows, max_grid)
             _gather_ple_embedding_from_pinned_kernel[(grid,)](

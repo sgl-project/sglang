@@ -12,6 +12,7 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
@@ -20,7 +21,22 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["HostMemoryMapping", "SRTPlatform", "PlatformEnum"]
+
+
+@dataclass(frozen=True)
+class HostMemoryMapping:
+    """A device-visible view of a host-memory range.
+
+    ``registered_host_ptr`` is the (possibly page-aligned) address that must be
+    passed back to the runtime. ``owned`` prevents callers from unregistering a
+    mapping that was created by another component, such as torch_npu's pinned
+    allocator.
+    """
+
+    device_ptr: int
+    registered_host_ptr: int
+    owned: bool
 
 
 class SRTPlatform(DeviceMixin):
@@ -122,8 +138,10 @@ class SRTPlatform(DeviceMixin):
     # Host memory visible to device kernels
     # ------------------------------------------------------------------
 
-    def register_host_memory(self, host_ptr: int, nbytes: int) -> Optional[int]:
-        """Return a device address for the page-locked range at ``host_ptr``.
+    def register_host_memory(
+        self, host_ptr: int, nbytes: int
+    ) -> Optional[HostMemoryMapping]:
+        """Return a device-visible mapping for the range at ``host_ptr``.
 
         Some kernels read a table straight out of host memory. On devices with
         unified addressing (CUDA/ROCm UVA, and the pageable-access devices the
@@ -141,8 +159,8 @@ class SRTPlatform(DeviceMixin):
         """
         return None
 
-    def unregister_host_memory(self, host_ptr: int) -> None:
-        """Undo :meth:`register_host_memory`. No-op when none was created."""
+    def unregister_host_memory(self, mapping: HostMemoryMapping) -> None:
+        """Release an owned mapping returned by :meth:`register_host_memory`."""
         pass
 
     def get_max_kernel_grid_size(self) -> Optional[int]:
