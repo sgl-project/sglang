@@ -57,10 +57,16 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            # Exclusions are spelled as extglobs inside the pattern, not as
+            # standalone "!..." entries: paths-filter ORs the entries together,
+            # so a bare negation is a rule that matches every path outside it
+            # and the filter ends up true for the whole repo.
             main_package:
-              - "python/sglang/**/!(*.md)"
-              - "!python/sglang/multimodal_gen/**"
-              - "!python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(ops)/**/!(*.md)"
+              - "python/sglang/kernels/ops/!(*.md)"
+              - "python/sglang/kernels/ops/!(diffusion)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/npu/**"
