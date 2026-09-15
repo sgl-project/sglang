@@ -118,9 +118,8 @@ class PDDisaggregationServerBase(CustomTestCase):
     def rdma_devices_for(cls, gpu_indices) -> list:
         """`--disaggregation-ib-device` args for a server pinned to these GPUs.
 
-        A PD pair puts prefill and decode on different GPUs of one node, so the
-        two sides need different NICs; `cls.rdma_devices` holds a single pair
-        picked without knowing either side's GPUs.
+        `cls.rdma_devices` holds one pair picked without knowing either side's
+        GPUs; a PD pair needs different NICs on each side.
         """
         if not is_in_ci():
             return cls.rdma_devices
@@ -449,11 +448,10 @@ def get_rdma_devices_args():
 def get_rdma_devices_for_gpus(gpu_indices) -> str:
     """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
 
-    `get_rdma_devices_args` reads CUDA_VISIBLE_DEVICES and normalizes the ids
-    to their group base, so a decode server pinned with `--base-gpu-id 4` maps
-    back onto the first NICs and reaches them across the socket boundary. Here
-    the absolute id picks the NIC, keeping each side on the NICs that share its
-    NUMA node.
+    `get_rdma_devices_args` normalizes ids to their group base, so a decode
+    server pinned with `--base-gpu-id 4` maps back onto the first NICs and
+    crosses the socket boundary; the absolute id keeps each side on its own
+    NUMA node's NICs.
     """
     rdma_all_devices = (
         _parse_rdma_device_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
