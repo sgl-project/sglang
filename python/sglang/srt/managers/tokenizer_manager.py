@@ -406,6 +406,11 @@ class InputFormat(Enum):
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
+# How long a scheduler gets to release its resources and exit after a
+# ShutdownReq before it is SIGKILLed.
+_SCHEDULER_EXIT_TIMEOUT_SECS = 15
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -3265,9 +3270,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
+        stragglers = [proc.pid for proc in collect_scheduler_processes()]
+        if stragglers:
+            # SIGKILL lands mid-release, which is how a scheduler's GPU memory
+            # survives its own shutdown. Name the pids; nothing else would.
+            logger.warning(
+                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+                f"ShutdownReq, killing them before they released: {stragglers}"
+            )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         if self._server_stop_hook is not None:
             # sys.exit() from inside a task raises SystemExit into the event
