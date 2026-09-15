@@ -208,7 +208,7 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         )
 
     def test_storage_hit_query_forwards_trace_fields_when_exported(self):
-        # Scenario 2: op carries the exported hicache root span's trace_id/span_id
+        # Scenario 2: op carries the exported hicache thread span's trace_id/span_id
         # -> they are forwarded alongside caller/request attribution.
         ctrl = _hicache_ctrl()
         ctrl.get_hash_str = MagicMock(return_value=["h0", "h1"])
@@ -241,7 +241,7 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         )
 
     def test_page_backup_forwards_trace_fields_when_exported(self):
-        # Scenario 2 backup: the exported root's trace_id/span_id are forwarded
+        # Scenario 2 backup: the exported thread span's trace_id/span_id are forwarded
         # together with caller attribution (still no request_id).
         ctrl = _hicache_ctrl(page_size=2)
         captured = {}
