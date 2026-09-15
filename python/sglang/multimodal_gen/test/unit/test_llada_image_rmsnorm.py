@@ -5,61 +5,39 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.layers import custom_op
 from sglang.multimodal_gen.runtime.layers import layernorm as layernorm_module
 from sglang.multimodal_gen.runtime.models.dits.llada_image import LLaDAImageRMSNorm
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda() or not torch.cuda.is_available(),
-    reason="The HF RMSNorm kernel requires CUDA",
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
 )
-def test_llada_image_rmsnorm_dispatches_to_hf_kernel():
+def test_rmsnorm_cast_order_and_cuda_dispatch(device):
     torch.manual_seed(0)
-    hidden_size = 128
-    norm = LLaDAImageRMSNorm(hidden_size, eps=1e-5).cuda().to(torch.bfloat16)
+    norm = LLaDAImageRMSNorm(128, eps=1e-5).to(device=device, dtype=torch.bfloat16)
     with torch.no_grad():
-        norm.weight.copy_(torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16))
-    hidden_states = torch.randn(
-        2,
-        8,
-        hidden_size,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-
-    with patch.object(
-        layernorm_module,
-        "rmsnorm_hf",
-        wraps=layernorm_module.rmsnorm_hf,
-    ) as rmsnorm_hf:
-        output = norm(hidden_states)
-
-    rmsnorm_hf.assert_called_once()
-    variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
+        norm.weight.copy_(torch.randn(128, device=device, dtype=torch.bfloat16))
+    hidden = torch.randn(2, 8, 128, device=device, dtype=torch.bfloat16)
+    if device == "cuda":
+        with patch.object(
+            layernorm_module, "rmsnorm_hf", wraps=layernorm_module.rmsnorm_hf
+        ) as kernel:
+            actual = norm(hidden)
+        kernel.assert_called_once()
+    else:
+        actual = norm.forward_native(hidden)
+    variance = hidden.float().pow(2).mean(-1, keepdim=True)
     expected = norm.weight * (
-        hidden_states.float() * torch.rsqrt(variance + norm.variance_epsilon)
-    ).to(hidden_states.dtype)
-    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
-
-
-def test_llada_image_rmsnorm_hip_fallback_preserves_cast_order(monkeypatch):
-    monkeypatch.setattr(custom_op, "_is_cuda", False)
-    monkeypatch.setattr(current_platform, "is_hip", lambda: True)
-    monkeypatch.setattr(layernorm_module, "USE_AITER", False)
-    torch.manual_seed(0)
-    norm = LLaDAImageRMSNorm(128, eps=1e-5).to(torch.bfloat16)
-    with torch.no_grad():
-        norm.weight.copy_(torch.randn(128, dtype=torch.bfloat16))
-    hidden_states = torch.randn(2, 8, 128, dtype=torch.bfloat16)
-
-    with patch.object(norm, "forward_native", wraps=norm.forward_native) as native:
-        output = norm(hidden_states)
-
-    native.assert_called_once()
-    variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
-    expected = norm.weight * (
-        hidden_states.float() * torch.rsqrt(variance + norm.variance_epsilon)
-    ).to(hidden_states.dtype)
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        hidden.float() * torch.rsqrt(variance + norm.variance_epsilon)
+    ).to(hidden.dtype)
+    tolerance = 1e-2 if device == "cuda" else 0
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
