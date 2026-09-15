@@ -185,6 +185,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg._swa_full_tokens_ratio_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
