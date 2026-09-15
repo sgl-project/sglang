@@ -103,13 +103,22 @@ def decide_request_auth(
     def _check_bearer_token(
         authorization_header: Optional[str], expected_token: str
     ) -> bool:
-        """Check bearer token with constant-time comparison."""
+        """Check bearer token with constant-time comparison.
+
+        The comparison is done on UTF-8 bytes: ``secrets.compare_digest``
+        rejects ``str`` operands containing non-ASCII characters with
+        ``TypeError``, which would escape the middleware as a 500 instead of
+        a 401 whenever a client sends a non-ASCII token, or the server is
+        started with a non-ASCII key. Bytes keep the constant-time guarantee.
+        """
         if not authorization_header:
             return False
         parts = authorization_header.split(" ", 1)
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return False
-        return secrets.compare_digest(parts[1], expected_token)
+        return secrets.compare_digest(
+            parts[1].encode("utf-8"), expected_token.encode("utf-8")
+        )
 
     # Force-auth endpoints: only admin_api_key can unlock them; if admin_api_key is unset,
     # reject them unconditionally (explicitly "not allowed").
