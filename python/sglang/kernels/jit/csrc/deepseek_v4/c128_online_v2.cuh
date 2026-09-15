@@ -732,6 +732,11 @@ struct OnlinePrefillStage1Params {
   int32_t state_slot_offset;
   uint32_t num_c;
   uint32_t num_w;
+  // Batch size for the bounds guard below: a stale plan entry (produced by
+  // stage 0 from out-of-date metadata under the overlap scheduler) can carry
+  // read_page_0 beyond the current batch, which previously indexed
+  // req_pool_indices out of bounds and faulted the whole scheduler.
+  uint32_t num_batch;
 };
 
 __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params params) {
@@ -744,6 +749,11 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   auto plan = *plan_ptr;
   if (plan.is_invalid()) return;
   const auto batch_id = plan.read_page_0;
+  if (batch_id < 0 || static_cast<uint32_t>(batch_id) >= params.num_batch) {
+    // Do not leave an unfinalized plan for the downstream consumers.
+    *plan_ptr = CompressPlan::invalid();
+    return;
+  }
   const auto rid = params.req_pool_indices[batch_id];
   const int32_t main_slot = static_cast<int32_t>(rid);
   plan.read_page_0 = main_slot + params.state_slot_offset;
@@ -913,6 +923,7 @@ inline OnlinePrefillPlan plan_online_prefill(
         .state_slot_offset = state_slot_offset,
         .num_c = num_c_padded,
         .num_w = num_w_padded,
+        .num_batch = static_cast<uint32_t>(req_pool_indices.size(0)),
     };
     constexpr uint32_t kBlockSize = 128;
     const auto num_blocks = host::div_ceil(total, kBlockSize);
