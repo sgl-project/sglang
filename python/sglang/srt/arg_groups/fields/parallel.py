@@ -222,14 +222,17 @@ class Parallel(msgspec.Struct):
     ] = False
     disable_attn_tp_gather: A[
         bool,
-        "Disable scheduler-side attn_tp_gather (the upstream SP path "
-        "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
-        "buffer). Use for models that manage SP scatter/gather at the "
-        "model level (e.g., perform their own all_gather/reduce_scatter "
-        "inside attention) and do not consume the upstream gathered_buffer. "
-        "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
-        "which can cause kernel autotuners to select wrong-sized variants "
-        "at small batches.",
+        Arg(
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
+            resolvable=True,
+        ),
     ] = False
     enable_p2p_check: A[
         bool,
