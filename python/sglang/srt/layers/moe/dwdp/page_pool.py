@@ -6,11 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-try:
-    from cuda.bindings import driver as cuda
-except ImportError:
-    # For non-cuda platform.
-    cuda = None
+from cuda.bindings import driver as cuda
 
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmReservation,

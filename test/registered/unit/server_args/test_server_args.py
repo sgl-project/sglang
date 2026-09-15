@@ -3481,5 +3481,26 @@ class TestDcpCommBackendDefault(CustomTestCase):
             )
 
 
+class TestDwdpPlatformGate(CustomTestCase):
+    """#31995: --dwdp-size on a non-NVIDIA platform crashed with
+    ModuleNotFoundError('cuda') inside ModelRunner init instead of being rejected."""
+
+    def _args(self, **fields):
+        return ServerArgs(model_path="dummy", tp_size=2, dwdp_size=2, **fields)
+
+    def test_rejects_non_cuda_device(self):
+        with self.assertRaisesRegex(ValueError, "requires an NVIDIA CUDA device"):
+            parallel_hook.handle_dwdp(self._args(device="xpu"))
+
+    @override_platform(is_hip=True)
+    def test_rejects_rocm(self):
+        with self.assertRaisesRegex(ValueError, "requires an NVIDIA CUDA device"):
+            parallel_hook.handle_dwdp(self._args(device="cuda"))
+
+    @override_platform(is_hip=False)
+    def test_allows_cuda(self):
+        parallel_hook.handle_dwdp(self._args(device="cuda"))
+
+
 if __name__ == "__main__":
     unittest.main()
