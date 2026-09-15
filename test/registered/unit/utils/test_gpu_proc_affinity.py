@@ -10,6 +10,7 @@ this path is live for AMD users who never opted into it.
 """
 
 import contextlib
+import os
 import unittest
 from unittest.mock import patch
 
@@ -45,6 +46,21 @@ class FakeProcess:
                 )
         self.bound = sorted(ids)
         return self.bound
+
+
+@contextlib.contextmanager
+def _without_sched_getaffinity():
+    """Present a platform with no CPU affinity API, as macOS and Windows do."""
+    import os as _os
+
+    saved = getattr(_os, "sched_getaffinity", None)
+    if saved is not None:
+        delattr(_os, "sched_getaffinity")
+    try:
+        yield
+    finally:
+        if saved is not None:
+            _os.sched_getaffinity = saved
 
 
 @contextlib.contextmanager
@@ -180,6 +196,31 @@ class TestSetGpuProcAffinity(CustomTestCase):
                            tp_size=tp_size, pp_size=pp_size, nnodes=nnodes)
                 self.assertEqual(len(got), (32 // ranks_per_node) * 2)
                 self.assertTrue(set(got) <= set(UPPER_SOCKET))
+
+    def test_missing_affinity_api_falls_back_to_the_machine(self):
+        """macOS and Windows have no sched_getaffinity, so keep the old pool."""
+        proc = FakeProcess(range(128))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch("psutil.cpu_count", side_effect=lambda logical=True: 128 if logical else 64)
+            )
+            stack.enter_context(patch("psutil.Process", return_value=proc))
+            stack.enter_context(_without_sched_getaffinity())
+            set_gpu_proc_affinity(1, 8, 1, 1)
+        self.assertEqual(proc.bound, list(range(8, 16)) + list(range(72, 80)))
+
+    def test_unreadable_affinity_falls_back_to_the_machine(self):
+        proc = FakeProcess(range(128))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch("os.sched_getaffinity", side_effect=OSError("denied"), create=True)
+            )
+            stack.enter_context(
+                patch("psutil.cpu_count", side_effect=lambda logical=True: 128 if logical else 64)
+            )
+            stack.enter_context(patch("psutil.Process", return_value=proc))
+            set_gpu_proc_affinity(1, 8, 1, 1)
+        self.assertEqual(proc.bound, list(range(8, 16)) + list(range(72, 80)))
 
     def test_data_parallel_gpu_id_wraps_to_the_first_slice(self):
         """More GPUs than TP ranks on a node: rank 5 reuses rank 1's slice."""

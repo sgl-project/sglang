@@ -2939,7 +2939,17 @@ def set_gpu_proc_affinity(
     # Divide up the CPUs this process may actually run on. Slurm and cgroups
     # commonly grant a subset of the machine, so ids derived from the machine's
     # core count name CPUs the process does not own and psutil rejects them.
-    allowed = set(os.sched_getaffinity(0))
+    allowed = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            allowed = set(os.sched_getaffinity(0))
+        except OSError as e:
+            logger.warning("Cannot read CPU affinity, assuming all cores: %s", e)
+    if not allowed:
+        # Platforms without the affinity API, such as macOS and Windows, keep
+        # the whole-machine assumption this function made before it consulted
+        # the cpuset.
+        allowed = set(range(psutil.cpu_count()))
     # The second sibling of core c is c + total_pcores, so allowed ids below
     # that bound are the cores to divide and the rest are their siblings. A
     # cpuset holding only siblings still has to yield a usable pool.
