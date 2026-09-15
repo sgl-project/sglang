@@ -123,10 +123,6 @@ class TestMxfp4TrtllmPadding(CustomTestCase):
                     )
                     self.assertTrue(torch.isfinite(actual).all())
                     self.assertLess(relative_rmse, 0.01)
-                    print(
-                        f"tokens={tokens} TP4 vs unsharded relative_rmse={relative_rmse:.6f}",
-                        flush=True,
-                    )
 
 
 if __name__ == "__main__":

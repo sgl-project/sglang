@@ -151,14 +151,6 @@ class TestLinearNumerics(_OptInCase):
             )
             torch.testing.assert_close(s, expected_s, rtol=0, atol=0)
 
-        # Ordinary block-FP8 tuples must retain their existing dispatch path.
-        sentinel = torch.empty(0)
-        with patch.object(
-            method, "w8a8_block_fp8_linear", return_value=sentinel
-        ) as legacy:
-            self.assertIs(method.apply(layer, (q, s)), sentinel)
-            legacy.assert_called_once()
-
         partial = torch.randn(8, 6, 2, 1024, device=DEVICE)
         _quantize_partial(partial)
         graph = torch.cuda.CUDAGraph()

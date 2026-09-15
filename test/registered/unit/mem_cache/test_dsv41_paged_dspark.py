@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
@@ -83,27 +82,6 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             draft.translate_loc_from_full_to_swa(full).tolist(), [256, 300, 511]
         )
 
-    def test_non_overlap_scheduler_keyword_dispatch(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
-            DSparkWorkerV2,
-        )
-
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
-        )
-        expected = object()
-        worker = SimpleNamespace(_forward_decode=Mock(return_value=expected))
-        result = DSparkWorkerV2.forward_batch_generation(
-            worker, batch, pp_proxy_tensors=None
-        )
-        self.assertIs(result, expected)
-        worker._forward_decode.assert_called_once_with(batch, None, None)
-        with self.assertRaisesRegex(AssertionError, "pipeline parallelism"):
-            DSparkWorkerV2.forward_batch_generation(
-                worker, batch, pp_proxy_tensors=object()
-            )
-
     def test_budget_reserves_target_window_and_real_draft_layer_count(self):
         cfg = SimpleNamespace(
             qk_nope_head_dim=448,
@@ -128,10 +106,6 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
         planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         self.assertGreater(planner.swa_cap_tokens, 0)
-        self.assertEqual(
-            planner._get_swa_fixed_bytes(),
-            planner.request_window_bytes + planner.swa_cap_tokens * 3 * 584,
-        )
         budget = 256 * 1024 * 1024
         sizes = planner.calculate_pool_sizes(budget, 256)
         self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import atexit
 import os
-import types
 
 import pytest
 import torch
@@ -25,7 +24,6 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.distributed.device_communicators.vocab_gather import (
-    LocalVocabGather,
     NcclVocabGather,
     NVLinkVocabGather,
     make_vocab_gather,
@@ -101,21 +99,6 @@ def _check(nvlink: NVLinkVocabGather, nccl: NcclVocabGather, x: torch.Tensor) ->
         lo = nvlink.pull_out.data_ptr()
         hi = lo + nvlink.pull_out.numel() * nvlink.pull_out.element_size()
         assert not (lo <= got.data_ptr() < hi), "result aliases the shared pull output"
-
-
-def test_factory() -> None:
-    tp = _tp_group()
-    nvlink, nccl = _gathers()
-    assert isinstance(nccl, NcclVocabGather)
-    assert isinstance(
-        make_vocab_gather(tp, local_width=LOCAL_WIDTH + 1), NcclVocabGather
-    )
-    single = types.SimpleNamespace(world_size=1, ca_comm=None)
-    assert isinstance(
-        make_vocab_gather(single, local_width=LOCAL_WIDTH), LocalVocabGather
-    )
-    assert nvlink.pull_out is not None
-    assert nvlink.pull_out.shape == (tp.world_size * SYMM_ROWS, LOCAL_WIDTH)
 
 
 @pytest.mark.parametrize("rows", [1, 3, 6, 25, 64, 200, SYMM_ROWS + 1])

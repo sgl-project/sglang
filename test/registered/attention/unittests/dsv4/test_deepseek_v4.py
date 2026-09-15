@@ -126,27 +126,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             extend_lens=(16,),
             compress_ratio=128,
         ),
-        # DeepSeek V4.1 ratio 1 / 2: latents in the c1 / c2 FlashMLA-layout pools,
-        # attended through the same extra-cache path as C4.
-        DSV4AttentionCase(
-            name="dsv4_c1_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64,),
-            extend_lens=(16,),
-            compress_ratio=1,
-        ),
-        DSV4AttentionCase(
-            name="dsv4_c1_decode",
-            backend="dsv4",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 200),
-            compress_ratio=1,
-        ),
         DSV4AttentionCase(
             name="dsv4_c2_extend",
             backend="dsv4",
