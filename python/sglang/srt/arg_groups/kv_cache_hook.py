@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
@@ -162,6 +163,17 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
+    if (
+        cfg.enable_unified_memory
+        and cfg.disaggregation_decode_retraction_backup == "host_pool"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.hicache_write_policy in ("write_through", "write_through_selective")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-retraction-backup=host_pool does not "
+            "support decode radix cache with a write-through HiCache policy. "
+            "Use --hicache-write-policy=write_back or disable decode radix cache."
+        )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
@@ -230,15 +242,38 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-        assert cfg.disaggregation_decode_retraction_backup != "host_pool", (
-            "--enable-unified-memory with PD disaggregation does not support "
-            "--disaggregation-decode-retraction-backup=host_pool; use "
-            "cpu_tensor (the automatic default for unified pools)."
-        )
-        assert not cfg.disaggregation_decode_enable_offload_kvcache, (
-            "--enable-unified-memory with PD disaggregation does not yet support "
-            "--disaggregation-decode-enable-offload-kvcache."
-        )
+        if cfg.disaggregation_decode_enable_offload_kvcache:
+            assert cfg.hicache_storage_backend == "file", (
+                "--enable-unified-memory with decode KV offload currently "
+                "supports --hicache-storage-backend=file only."
+            )
+            model_config = model_config_of(server_args)
+            assert not use_mla_backend(server_args), (
+                "--enable-unified-memory decode KV offload does not support "
+                "MLA models yet."
+            )
+            assert mambaish_config(model_config) is None, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-Mamba models."
+            )
+            assert not model_config.is_hybrid_swa, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-SWA H2D/D2H transfers yet."
+            )
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
+            model_config = model_config_of(server_args)
+            assert not cfg.disaggregation_decode_enable_radix_cache, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support decode radix-cache H2D/D2H transfers yet."
+            )
+            assert mambaish_config(model_config) is None, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support hybrid-Mamba models."
+            )
+            assert not model_config.is_hybrid_swa, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support hybrid-SWA H2D/D2H transfers yet."
+            )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "
