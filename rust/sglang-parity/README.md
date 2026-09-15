@@ -247,6 +247,7 @@ Each run creates a unique directory under `output_dir` (default `target/parity`)
 <run-id>/
   effective_suite.json
   report.json
+  report.html              # standalone human-readable diagnostics
   setup.log                # installation/build/verification output
   environment.lock         # exact dependency lock used
   environment-probe.json   # installed packages, device and Rust artifact evidence
@@ -267,6 +268,39 @@ repeatability, parity and equivalence differences, and artifact paths. Each
 difference has a JSON path, kind, and both values. Runtime failures and unexecuted
 attempts remain visible.
 Interrupted runs preserve a partial report and the bytes received so far.
+
+The terminal summary separates response validation, each implementation's
+repeatability, Python/Rust parity, and declared case equivalence. For example,
+`0 invalid` with `Parity FAIL` means that individual responses satisfy their
+contracts but the two implementations disagree. `Py repeat PASS` only means
+Python returned the same result twice. `Parity diffs` counts differing JSON
+paths for that case; it excludes repeatability and equivalence differences.
+Grouped counts describe difference occurrences, not independent bugs.
+
+Open `report.html` for grouped failure reasons, case links, complete differences,
+requests, original final JSON, saved comparison rules, and raw response/SSE/log
+links. Comparison values are labeled separately from original response values:
+value exceptions may replace timestamps with `0`, but a missing field remains
+`<missing>`, distinct from JSON `null`. A missing artifact is shown as unavailable
+and does not change the recorded test verdict. JSON previews are limited to
+64 KiB, with links to complete artifacts. The HTML has no external dependencies;
+copy the entire run directory to preserve its relative evidence links.
+
+Existing results can be viewed without preparing an environment or starting a
+service, including after moving the run directory:
+
+```sh
+sglang-parity --report target/parity/<run-id>/report.json
+sglang-parity --report target/parity/<run-id>/report.json --case greedy_json
+```
+
+Both commands regenerate the complete `report.html`; `--case` also expands that
+case's comparisons and evidence paths in the terminal. They use saved results
+and rules, not the current suite. They return the recorded test exit code (or `2`
+if reading/writing the report fails). An unknown case is an error. Report options
+cannot be combined with run or environment-maintenance options. Redirected
+output and `NO_COLOR` disable terminal colors. Progress remains on stderr; the
+final summary goes to stdout. `--describe` remains a JSON-only review operation.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -294,7 +328,8 @@ comparison rules, and all artifacts; these do not depend on the CLI.
 | `environments/` | Platform profiles, generated locks and the Python verification probe. |
 | `src/http.rs`, `src/sse.rs` | HTTP capture and generic SSE framing. |
 | `src/compare.rs` | Strict JSON differences and declared scalar-value exceptions. |
-| `src/artifacts.rs` | Artifact storage, without test decisions. |
+| `src/artifacts.rs` | Atomic artifact storage, without test decisions. |
+| `src/report.rs` | Shared diagnostic grouping, terminal summaries, and standalone HTML from recorded results. |
 | `suites/native_generate/` | API cases, native response validation and reconstruction. |
 | `cli/main.rs` | Configuration loading, suite selection, presentation, exit status. |
 

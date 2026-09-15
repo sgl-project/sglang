@@ -7,6 +7,7 @@ use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
+use sglang_parity::report::ReportView;
 use sglang_parity::runner::{RunError, Status};
 use sglang_parity::{RunConfig, Violation, describe, run};
 
@@ -39,6 +40,34 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
         read_json(report.directory.join("report.json")),
         serde_json::to_value(&report).unwrap()
     );
+    let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
+    assert!(html.contains("SGLang Parity — PASS"));
+    // Re-render a moved run with no tools on PATH; the lifecycle must stay unchanged.
+    let moved = fixture.directory.path().join("moved report");
+    fs::rename(&report.directory, &moved).unwrap();
+    let lifecycle_before = fixture.lifecycle();
+    let preparations_before = fixture.preparations();
+    let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
+        .arg("--report")
+        .arg(moved.join("report.json"))
+        .args(["--case", "unary"])
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("8/8 passed"));
+    assert!(text.contains("Parity diffs"));
+    assert!(!text.contains('\x1b'));
+    assert_eq!(fixture.lifecycle(), lifecycle_before);
+    assert_eq!(fixture.preparations(), preparations_before);
+    let html = fs::read_to_string(moved.join("report.html")).unwrap();
+    assert!(html.contains("href=\"python/unary/1/final.json\""));
+    fs::rename(&moved, &report.directory).unwrap();
     assert_eq!(report.equivalence.len(), 2);
     assert!(
         report
@@ -183,6 +212,12 @@ async fn precise_differences_invalid_responses_and_instability_remain_distinct()
     assert_eq!(report.cases[1].parity.status, Status::Skipped);
     assert_eq!(report.cases[2].parity.status, Status::Skipped);
 
+    let summary = ReportView::new(&report, &report.directory)
+        .terminal(None, false)
+        .unwrap();
+    assert!(summary.contains("Python is missing fields present in Rust"));
+    assert!(summary.contains("Field types differ"));
+    assert!(summary.contains("response policy rejected the response without diagnostics"));
     // Reuse the captured results to check each exit category without masking by others.
     let cases = std::mem::take(&mut report.cases);
     for (case, expected) in cases.iter().zip([1, 1, 2, 1]) {
@@ -447,6 +482,11 @@ async fn cancelling_a_library_run_cleans_the_process_tree_and_saves_partial_repo
     let directory = fixture.only_run_directory();
     let partial = read_json(directory.join("report.json"));
     assert_eq!(partial["state"], "interrupted");
+    assert!(
+        fs::read_to_string(directory.join("report.html"))
+            .unwrap()
+            .contains("State: interrupted")
+    );
     assert!(!partial["runtime_errors"].as_array().unwrap().is_empty());
     assert_eq!(
         partial["cases"][0]["implementations"]["python"]["attempts"]
@@ -763,6 +803,11 @@ async fn failed_environment_probe_retains_evidence_without_starting_servers() {
     assert_eq!(report.exit_code(), 2);
     assert_eq!(report.runtime_errors.len(), 1);
     assert!(report.runtime_errors[0].contains("environment preparation"));
+    assert!(
+        fs::read_to_string(report.directory.join("report.html"))
+            .unwrap()
+            .contains("environment preparation")
+    );
     assert!(report.environment.is_none());
     assert!(fixture.lifecycle().is_empty());
     assert_eq!(fixture.preparations().len(), 1);

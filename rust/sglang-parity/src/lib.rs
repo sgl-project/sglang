@@ -21,6 +21,7 @@ pub mod environment;
 pub mod http;
 pub mod process;
 mod progress;
+pub mod report;
 pub mod runner;
 pub mod sse;
 
