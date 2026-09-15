@@ -11,7 +11,6 @@ from typing import (
     List,
     Literal,
     Optional,
-    TypeVar,
     Tuple,
     Union,
 )
@@ -769,8 +768,11 @@ class DeepseekV4HipRadixBackend(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
         # the distinct ratios this pool has, sorted: (4, 128) for V4, (1, 2) for V4.1
+        model_ratios = set(self.token_to_kv_pool.compression_ratios)
         self.present_ratios: Tuple[int, ...] = tuple(
-            sorted(self.token_to_kv_pool.kv_pools)
+            ratio
+            for ratio in sorted(self.token_to_kv_pool.kv_pools)
+            if ratio in model_ratios
         )
         self.low_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in (1, 2) if ratio in self.present_ratios
@@ -796,7 +798,7 @@ class DeepseekV4HipRadixBackend(
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
         self.enable_decoder_swa_bounded_replay: bool = (
-            model_runner.server_args.enable_decoder_swa_bounded_replay
+            get_exec().features.enable_decoder_swa_bounded_replay
         )
         if self.enable_decoder_swa_bounded_replay:
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -889,7 +891,9 @@ class DeepseekV4HipRadixBackend(
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
         return PagedIndexerMetadata(
             page_size=self.page_size,
-            compressed_page_size=self.token_to_kv_pool.get_index_k_page_size(compress_ratio),
+            compressed_page_size=self.token_to_kv_pool.get_index_k_page_size(
+                compress_ratio
+            ),
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
@@ -991,7 +995,7 @@ class DeepseekV4HipRadixBackend(
             )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
-            if need_compress
+            if need_compress and self.has_c4
             else None
         )
         if not need_compress:
@@ -1033,8 +1037,16 @@ class DeepseekV4HipRadixBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c4_compress_metadata=(
+                create(compress_ratio=4)
+                if self.has_c4
+                else _create_dummy_paged_compress_data(compress_ratio=4)
+            ),
+            c128_compress_metadata=(
+                create(compress_ratio=128)
+                if self.has_c128
+                else _create_dummy_paged_compress_data(compress_ratio=128)
+            ),
             **low_ratio_indexer_metadata,
         )
 
@@ -1250,7 +1262,11 @@ class DeepseekV4HipRadixBackend(
         self._attach_unified_kv_decode_streams(
             core_attn_metadata, req_pool_indices_repeated
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if self.has_c4
+            else None
+        )
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=True,
@@ -1267,8 +1283,19 @@ class DeepseekV4HipRadixBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            **self._init_low_ratio_indexer_metadata(
+                core_attn_metadata, is_prefill=False
+            ),
+            c4_compress_metadata=(
+                create(compress_ratio=4)
+                if self.has_c4
+                else _create_dummy_paged_compress_data(compress_ratio=4)
+            ),
+            c128_compress_metadata=(
+                create(compress_ratio=128)
+                if self.has_c128
+                else _create_dummy_paged_compress_data(compress_ratio=128)
+            ),
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -1291,7 +1318,11 @@ class DeepseekV4HipRadixBackend(
             need_compress=True,
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if self.has_c4
+            else None
+        )
         low_ratio_indexer_metadata = self._init_low_ratio_indexer_metadata(
             core_attn_metadata, is_prefill=False
         )
@@ -1308,8 +1339,16 @@ class DeepseekV4HipRadixBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c4_compress_metadata=(
+                create(compress_ratio=4)
+                if self.has_c4
+                else _create_dummy_paged_compress_data(compress_ratio=4)
+            ),
+            c128_compress_metadata=(
+                create(compress_ratio=128)
+                if self.has_c128
+                else _create_dummy_paged_compress_data(compress_ratio=128)
+            ),
             **low_ratio_indexer_metadata,
         )
 
@@ -2578,6 +2617,18 @@ class DeepseekV4HipRadixBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _low_ratio_index_topk_dense(
+        self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+    ) -> None:
+        # The shared CP caller supplies local rows per request. Its CUDA dense
+        # implementation requires DeepGEMM; retain the torch reference on HIP.
+        req = torch.repeat_interleave(
+            forward_batch.req_pool_indices.to(torch.int64),
+            q_lens.to(torch.int64),
+            output_size=x.shape[0],
+        )
+        self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
 
     def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
         """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;

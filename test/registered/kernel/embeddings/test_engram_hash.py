@@ -1,7 +1,5 @@
 """Compare decode and multimodal extend hashes with a per-token reference."""
 
-import sys
-
 import pytest
 import torch
 

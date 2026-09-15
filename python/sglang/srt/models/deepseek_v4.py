@@ -2124,17 +2124,19 @@ class MQALayer(MqaAttentionBase):
         )
 
         low_ratio_multi_stream = (
-            _is_cuda
-            and get_platform().is_blackwell
+            ((_is_cuda and get_platform().is_blackwell) or _is_gfx95_supported)
             and self.compress_ratio in (1, 2)
             and self.alt_streams is not None
             and (
                 forward_batch.forward_mode.is_decode()
                 or (
                     forward_batch.forward_mode.is_target_verify()
-                    # Other MXFP8 backends may share mutable GEMM workspace.
-                    and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
-                    == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                    # CUDA MXFP8 backends other than CuTeDSL may share workspace.
+                    and (
+                        _is_gfx95_supported
+                        or getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                        == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+                    )
                 )
             )
         )
@@ -2748,6 +2750,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_attn_fn.data
                     )
                     self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+
     def _input_norm(
         self,
         hidden_states: torch.Tensor,
