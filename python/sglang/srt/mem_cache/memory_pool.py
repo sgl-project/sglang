@@ -52,7 +52,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp.layout import dcp_local_rows
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -4611,7 +4611,7 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        indices = dcp_local_rows(
+        indices = maybe_dcp_kernel_indices(
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
         current_platform.synchronize()
@@ -4633,7 +4633,7 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        indices = dcp_local_rows(
+        indices = maybe_dcp_kernel_indices(
             indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
         )
         current_platform.synchronize()

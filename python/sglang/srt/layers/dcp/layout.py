@@ -41,11 +41,13 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
-def dcp_local_rows(indices: torch.Tensor, dcp_size: int, dcp_rank: int) -> torch.Tensor:
-    """This rank's physical rows from a positional run of WIDENED slots.
+def maybe_dcp_kernel_indices(
+    indices: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> torch.Tensor:
+    """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
-    Runs start page-aligned, so position i carries residue i % dcp_size and a
-    strided view selects the owned slots without a mask; // dcp_size collapses.
+    Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
+    Runs start page-aligned, so a strided view selects them without a mask.
     """
     if dcp_size == 1:
         return indices

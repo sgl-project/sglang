@@ -10,7 +10,6 @@ import psutil
 import torch
 
 from sglang.srt.distributed.parallel_state import get_world_group
-from sglang.srt.layers.dcp.layout import dcp_local_rows
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -371,19 +370,6 @@ class HostKVCache(abc.ABC):
     def logical_page_size(self) -> int:
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
-
-    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """Transfer kernels index per-rank rows; callers hold widened logical slots.
-
-        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
-        """
-        if self.dcp_size == 1:
-            return indices
-        assert indices.numel() % self.dcp_size == 0, (
-            "HiCache DCP translation expects runs of whole widened pages; got "
-            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
-        )
-        return dcp_local_rows(indices, self.dcp_size, self.dcp_rank)
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
