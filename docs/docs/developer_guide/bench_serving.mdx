@@ -109,6 +109,21 @@ TTFT starts when the HTTP request is submitted. TBT is the observed inter-chunk
 gap divided by the number of newly reported completion tokens in that chunk;
 the first chunk is excluded because its internal token timings are unknown.
 This is client-observed chunk-normalized TBT, not exact individual token latency.
+
+Each request carries a unique native `rid` and records `request_id`, wall-clock
+`request_started_ns`/`request_finished_ns`, `status`, `success`, and structured
+`error` information. Latencies still use the monotonic clock. HTTP status,
+stream completion, partial token counts, and accumulated server metadata are
+retained on failures. A completed stream with a short output is `incomplete`,
+not successful. These checks establish transport and length completion, not
+answer correctness.
+
+Python callers can provide `request_id` and a synchronous `on_result` callback
+to `send_generate`. The callback runs once before return or exception propagation,
+including cancellation, so a caller can write and flush records before later
+profile export. Invalid request IDs are rejected before a request starts.
+The CLI flushes each terminal request record immediately; cancellation remains
+cancellation and persistence errors are not suppressed.
 Failures and incomplete output lengths are recorded separately from successful
 request latency statistics.
 

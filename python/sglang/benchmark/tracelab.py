@@ -43,6 +43,8 @@ import json
 import math
 import random
 import statistics
+import time
+import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -323,11 +325,20 @@ async def iter_sse_data(content):
         yield "\n".join(data)
 
 
-async def send_generate(client, base_url, row, input_ids):
-    """Measure native SGLang /generate streaming without retokenizing prompts."""
-    if len(input_ids) != row.input_tokens:
-        raise ValueError("Prompt token count differs from the selected trace round")
+async def send_generate(
+    client, base_url, row, input_ids, *, request_id=None, on_result=None
+):
+    """Emit one terminal record before returning or propagating a request error.
+
+    on_result is synchronous so callers can write and flush independently of
+    later profiling/export work. Wall clocks attribute requests; latency uses
+    the monotonic clock. Cancellation is recorded and still propagated.
+    """
+    request_id = uuid.uuid4().hex if request_id is None else request_id
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("Request ID must be a nonempty string")
     payload = {
+        "rid": request_id,
         "input_ids": input_ids,
         "sampling_params": {
             "temperature": 0,
@@ -341,46 +352,110 @@ async def send_generate(client, base_url, row, input_ids):
     complete = False
     cached_tokens = None
     output_ids = []
-    async with client.post(
-        base_url.rstrip("/") + "/generate", json=payload
-    ) as response:
-        response.raise_for_status()
-        async for data in iter_sse_data(response.content):
-            if data == "[DONE]":
-                complete = True
-                break
-            event = json.loads(data)
-            if event.get("error"):
-                raise RuntimeError(f"Server stream error: {event['error']}")
-            meta = event.get("meta_info", {})
-            if "output_ids" in event:
-                ids = event["output_ids"]
-                total = meta.get("completion_tokens")
-                if not isinstance(ids, list) or any(
-                    type(token) is not int for token in ids
+    server_metadata = {}
+    http_status = None
+    error = None
+    status = "failed"
+    request_started_ns = time.time_ns()
+    result = {}
+    try:
+        if len(input_ids) != row.input_tokens:
+            raise ValueError("Prompt token count differs from the selected trace round")
+        async with client.post(
+            base_url.rstrip("/") + "/generate", json=payload
+        ) as response:
+            http_status = response.status
+            response.raise_for_status()
+            async for data in iter_sse_data(response.content):
+                if data == "[DONE]":
+                    complete = True
+                    break
+                event = json.loads(data)
+                if not isinstance(event, dict):
+                    raise ValueError("Stream event must be an object")
+                meta = event.get("meta_info", {})
+                if not isinstance(meta, dict):
+                    raise ValueError("Stream metadata must be an object")
+                # Preserve metadata-only and terminal error events, not just tokens.
+                server_metadata.update(meta)
+                if event.get("error"):
+                    raise RuntimeError(f"Server stream error: {event['error']}")
+                finish_reason = meta.get("finish_reason")
+                if (
+                    isinstance(finish_reason, dict)
+                    and finish_reason.get("type") == "abort"
                 ):
-                    raise ValueError("Invalid generated token IDs")
-                if len(ids) == total:
-                    output_ids = ids
-                elif len(output_ids) + len(ids) == total:
-                    output_ids.extend(ids)
+                    raise RuntimeError(f"Server aborted request: {finish_reason}")
+                if "completion_tokens" in meta:
+                    total = meta["completion_tokens"]
+                    if type(total) is not int or total < metrics.output_tokens:
+                        raise ValueError("Invalid cumulative completion count")
                 else:
-                    raise ValueError(
-                        "Generated token IDs disagree with completion count"
-                    )
-            if "completion_tokens" in meta:
-                metrics.observe(meta["completion_tokens"], clock())
-            cached_tokens = meta.get("cached_tokens", cached_tokens)
-    if not complete:
-        raise RuntimeError("SSE stream ended without [DONE]")
-    result = metrics.result()
-    result.update(
-        request_latency_s=clock() - metrics.started,
-        cached_tokens=cached_tokens,
-        requested_output_tokens=row.output_tokens,
-        output_length_matched=metrics.output_tokens == row.output_tokens,
-        output_ids=output_ids,
-    )
+                    total = None
+                if "output_ids" in event:
+                    ids = event["output_ids"]
+                    if not isinstance(ids, list) or any(
+                        type(token) is not int for token in ids
+                    ):
+                        raise ValueError("Invalid generated token IDs")
+                    if len(ids) == total:
+                        output_ids = list(ids)
+                    elif len(output_ids) + len(ids) == total:
+                        output_ids.extend(ids)
+                    else:
+                        raise ValueError(
+                            "Generated token IDs disagree with completion count"
+                        )
+                if total is not None:
+                    metrics.observe(total, clock())
+                cached_tokens = meta.get("cached_tokens", cached_tokens)
+        if not complete:
+            raise RuntimeError("SSE stream ended without [DONE]")
+        result.update(metrics.result())
+        status = (
+            "completed" if metrics.output_tokens == row.output_tokens else "incomplete"
+        )
+        if status == "incomplete":
+            error = {
+                "type": "OutputLengthMismatch",
+                "message": "Response differs from requested output length",
+            }
+    except (Exception, asyncio.CancelledError) as exc:
+        status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+        error = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    finally:
+        if metrics.first_token_at is not None:
+            result.update(metrics.result())
+        else:
+            result.update(
+                output_tokens=0,
+                ttft_s=None,
+                generation_latency_s=None,
+                mean_tbt_s=None,
+                tbt_method="client_chunk_gap_divided_by_new_tokens",
+                chunk_gaps_s=[],
+                chunk_token_counts=[],
+            )
+        result.update(
+            request_id=request_id,
+            request_started_ns=request_started_ns,
+            request_finished_ns=time.time_ns(),
+            request_latency_s=clock() - metrics.started,
+            status=status,
+            success=status == "completed",
+            error=error,
+            http_status=http_status,
+            stream_complete=complete,
+            server_metadata=server_metadata,
+            cached_tokens=cached_tokens,
+            requested_output_tokens=row.output_tokens,
+            output_length_matched=complete
+            and metrics.output_tokens == row.output_tokens,
+            output_ids=output_ids,
+        )
+        if on_result is not None:
+            on_result(result)
     return result
 
 
@@ -545,30 +620,54 @@ async def run_trace(args):
 
             async def send(row):
                 input_ids, reused = prompts.build(row)
-                try:
-                    result = await send_generate(client, args.base_url, row, input_ids)
-                    result["success"] = result["output_length_matched"]
+                result = None
+                persisted = False
+
+                def persist(terminal):
+                    nonlocal result, persisted
+                    result = terminal
                     if result["success"]:
-                        prompts.commit_output(row, input_ids, result.pop("output_ids"))
+                        try:
+                            prompts.commit_output(row, input_ids, result["output_ids"])
+                        except ValueError as error:
+                            result.update(
+                                success=False,
+                                status="failed",
+                                error={
+                                    "type": type(error).__name__,
+                                    "message": str(error),
+                                },
+                            )
+                    output.write(
+                        json.dumps(
+                            {
+                                "type": "request",
+                                **asdict(row),
+                                **{
+                                    key: value
+                                    for key, value in result.items()
+                                    if key != "output_ids"
+                                },
+                                "synthetic_reused_input_tokens": reused,
+                            }
+                        )
+                        + "\n"
+                    )
+                    output.flush()
+                    persisted = True
+
+                try:
+                    await send_generate(
+                        client, args.base_url, row, input_ids, on_result=persist
+                    )
                 except (
                     aiohttp.ClientError,
                     asyncio.TimeoutError,
                     ValueError,
                     RuntimeError,
-                ) as error:
-                    result = {"success": False, "error": str(error)}
-                output.write(
-                    json.dumps(
-                        {
-                            "type": "request",
-                            **asdict(row),
-                            **result,
-                            "synthetic_reused_input_tokens": reused,
-                        }
-                    )
-                    + "\n"
-                )
-                output.flush()
+                ):
+                    if not persisted:
+                        raise
                 return result
 
             started = asyncio.get_running_loop().time()
