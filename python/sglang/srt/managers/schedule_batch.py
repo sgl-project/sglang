@@ -1105,6 +1105,10 @@ class Req(ReqDllmMixin):
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
+        # KV age metrics: set once the first match_prefix for this request has
+        # recorded its hit ages, so per-round re-matches and the post-insert
+        # re-anchor in cache_unfinished_req do not count as reuse.
+        self.kv_age_hit_observed = False
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
