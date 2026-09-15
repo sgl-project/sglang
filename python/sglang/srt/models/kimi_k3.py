@@ -3447,7 +3447,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "language_model.layers.": "language_model.model.layers.",
         },
         orig_to_new_substr={
-            "block_sparse_moe": "mlp",
+            "block_sparse_moe": "ffn",
+            ".mlp.": ".ffn.",
+            r"mlp\.": r"ffn\.",
         },
     )
 

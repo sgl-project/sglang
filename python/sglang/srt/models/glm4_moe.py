@@ -83,7 +83,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
-from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
@@ -1452,7 +1452,7 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
     # _resolve_nextn_quant_config below instead.
-    hf_to_sglang_mapper = WeightsMapper()
+    hf_to_sglang_mapper = DeepseekV2ForCausalLM.hf_to_sglang_mapper
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
 

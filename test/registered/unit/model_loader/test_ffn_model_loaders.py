@@ -194,6 +194,43 @@ class TestFFNModelLoaders(unittest.TestCase):
         torch.testing.assert_close(layer.ffn.experts.w2_weight[1], weights[5][1])
         torch.testing.assert_close(layer.ffn.experts.w2_weight_scale, weights[4][1])
 
+    def test_kimi_wrapper_maps_dense_and_expert_checkpoint_names(self):
+        from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+        for checkpoint_member in ("mlp", "ffn", "block_sparse_moe"):
+            with self.subTest(member=checkpoint_member):
+                model, ffn = _fixture("kimi_k3", "KimiK3LinearForCausalLM")
+                model.config.linear_attn_config = None
+                model.config.is_moe = True
+                model.config.is_linear_attn = False
+                ffn.experts = _experts(2)
+                wrapper = _empty(KimiK3ForConditionalGeneration)
+                wrapper.config = SimpleNamespace(language_only=True)
+                wrapper.language_model = model
+                prefix = f"language_model.layers.0.{checkpoint_member}"
+                gate = torch.arange(24.0).reshape(6, 4)
+                up, down = gate + 30, gate.T.contiguous() + 60
+                with torch.no_grad(), patch.object(model, "post_load_weights"):
+                    wrapper.load_weights(
+                        [
+                            (f"{prefix}.gate_proj.weight", gate),
+                            (f"{prefix}.up_proj.weight", up),
+                            (f"{prefix}.down_proj.weight", down),
+                            (f"{prefix}.experts.1.w1.weight", gate),
+                            (f"{prefix}.experts.1.w3.weight", up),
+                            (f"{prefix}.experts.1.w2.weight", down),
+                        ]
+                    )
+                torch.testing.assert_close(
+                    ffn.gate_up_proj.weight, torch.cat([gate, up])
+                )
+                torch.testing.assert_close(ffn.down_proj.weight, down)
+                torch.testing.assert_close(
+                    ffn.experts.w13_weight[1], torch.cat([gate, up])
+                )
+                torch.testing.assert_close(ffn.experts.w2_weight[1], down)
+                self.assertEqual(ffn.experts.w13_weight[0].count_nonzero(), 0)
+
     def test_gated_dense_family_loaders(self):
         cases = [
             ("llama", "LlamaForCausalLM"),
@@ -633,6 +670,153 @@ class TestMultimodalFFNLoading(unittest.TestCase):
                 )
                 self.assertEqual(param.data_ptr(), pointer)
                 torch.testing.assert_close(param, value + 1)
+
+
+class TestFFNCheckpointQuantization(unittest.TestCase):
+    def _load_config(self, model_class, checkpoint_config, method="modelopt_fp4"):
+        from transformers import PretrainedConfig
+
+        from sglang.srt.configs.load_config import LoadConfig
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_loader import loader
+
+        config = ModelConfig.__new__(ModelConfig)
+        config.hf_config = PretrainedConfig(quantization_config=checkpoint_config)
+        config.quantization = method
+        config.dtype = torch.bfloat16
+        config.is_draft_model = False
+        with (
+            patch.object(
+                loader, "get_model_architecture", return_value=(model_class, "")
+            ),
+            patch.object(loader, "get_device_capability", return_value=(None, None)),
+        ):
+            return loader._get_quantization_config(config, LoadConfig())
+
+    def _assert_unquantized(self, config, prefix):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        layer = LinearBase.__new__(LinearBase)
+        nn.Module.__init__(layer)
+        self.assertIsInstance(
+            config.get_quant_method(layer, prefix), UnquantizedLinearMethod
+        )
+
+    def test_modelopt_checkpoint_exclusions_before_model_construction(self):
+        from sglang.srt.models.glm4_moe import (
+            GlmMoeDsaForCausalLM,
+            GlmMoeDsaForCausalLMNextN,
+        )
+        from sglang.srt.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+            Qwen3_5MoeForConditionalGeneration,
+        )
+        from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+        from sglang.srt.models.qwen3_5_text import (
+            Qwen3_5ForCausalLM,
+            Qwen3_5MoeForCausalLM,
+        )
+
+        for cls in (
+            GlmMoeDsaForCausalLM,
+            GlmMoeDsaForCausalLMNextN,
+            Qwen3_5ForConditionalGeneration,
+            Qwen3_5MoeForConditionalGeneration,
+            Qwen3_5ForCausalLM,
+            Qwen3_5MoeForCausalLM,
+            Qwen3_5ForCausalLMMTP,
+        ):
+            with self.subTest(model=cls.__name__):
+                ignored = [
+                    "model.layers.10.mlp.shared_experts*",
+                    "*.mlp.shared_expert.*",
+                    "lm_head",
+                ]
+                config = self._load_config(
+                    cls,
+                    {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                        "ignore": ignored,
+                    },
+                )
+                self._assert_unquantized(
+                    config, "model.layers.10.ffn.shared_experts.gate_up_proj"
+                )
+                self._assert_unquantized(
+                    config, "model.layers.0.ffn.shared_expert.down_proj"
+                )
+                self.assertFalse(
+                    config.is_layer_excluded(
+                        "model.layers.10.ffn.experts.0.gate_up_proj"
+                    )
+                )
+                self.assertEqual(ignored[0], "model.layers.10.mlp.shared_experts*")
+                self.assertIn("lm_head", config.exclude_modules)
+
+    def test_kimi_checkpoint_regex_keeps_dense_ffn_unquantized(self):
+        from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+
+        ignored = [r"re:.*mlp\.(gate|up|gate_up|down)_proj.*", r"re:.*vision_tower.*"]
+        config = self._load_config(
+            KimiK3ForConditionalGeneration,
+            {
+                "quant_method": "compressed-tensors",
+                "format": "mxfp4-pack-quantized",
+                "config_groups": {},
+                "ignore": ignored,
+            },
+            method="compressed-tensors",
+        )
+        self._assert_unquantized(config, "model.layers.0.ffn.gate_up_proj")
+        self.assertEqual(config.ignore[0], r"re:.*ffn\.(gate|up|gate_up|down)_proj.*")
+        self.assertEqual(config.ignore[1], ignored[1])
+        self.assertEqual(ignored[0], r"re:.*mlp\.(gate|up|gate_up|down)_proj.*")
+
+    def test_inkling_checkpoint_exclusions_keep_bf16_experts(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+        from sglang.srt.models.inkling_common.quantization.config import (
+            InklingModelOptNvfp4Config,
+        )
+
+        ignored = [
+            "model.llm.layers.0.mlp.w13_dn",
+            "model.llm.layers.0.mlp.w2_md",
+            "model.llm.layers.2.mlp.experts",
+            "model.llm.layers.2.mlp_norm",
+            "model.llm.layers.2.mlp_sconv",
+            "model.visual.mlp",
+            "model.unembed",
+        ]
+        config = InklingModelOptNvfp4Config.from_config(
+            {
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                    "exclude_modules": ignored,
+                }
+            }
+        )
+        self._assert_unquantized(config, "llm.layers.0.ffn.gate_up_proj")
+        self._assert_unquantized(config, "llm.layers.0.ffn.down_proj")
+        experts = FusedMoE.__new__(FusedMoE)
+        nn.Module.__init__(experts)
+        experts.is_shared_fused_moe = False
+        self.assertIsInstance(
+            config.get_quant_method(experts, "llm.layers.2.ffn.experts"),
+            UnquantizedFusedMoEMethod,
+        )
+        self.assertFalse(config.exclude_layer("llm.layers.3.ffn.experts"))
+        for name in (
+            "llm.layers.2.ffn_norm",
+            "llm.layers.2.ffn_sconv",
+            "model.visual.mlp",
+            "lm_head",
+        ):
+            self.assertIn(name, config.exclude_modules)
+        self.assertEqual(ignored[2], "model.llm.layers.2.mlp.experts")
 
 
 if __name__ == "__main__":

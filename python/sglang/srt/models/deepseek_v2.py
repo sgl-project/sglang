@@ -184,6 +184,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
@@ -2882,6 +2883,11 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".mlp.": ".ffn."},
+        orig_to_new_suffix={".mlp": ".ffn"},
+    )
+
     # for quark model load
     packed_modules_mapping = {}
 

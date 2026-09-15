@@ -85,6 +85,8 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    hf_to_sglang_mapper = Qwen3_5ForCausalLM.hf_to_sglang_mapper
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(

@@ -255,7 +255,11 @@ def _resolve_explicit_draft_quant_config(
     if model_config.quantization == "modelopt_fp4" and (
         isinstance(quant_config, ModelOptFp4Config)
         and quant_config.is_checkpoint_nvfp4_serialized
-        and quant_config.is_layer_excluded("mtp.layers.0.ffn.experts")
+        # This runs before model-specific checkpoint name mapping.
+        and any(
+            quant_config.is_layer_excluded(f"mtp.layers.0.{name}.experts")
+            for name in ("mlp", "ffn")
+        )
     ):
         return ModelOptFp4Config.for_online_weight_quantization(
             quant_config.packed_modules_mapping
@@ -284,7 +288,10 @@ def _quark_draft_online_quant_config(
     ):
         return None
     excluded = hf_quant_config.get("exclude") or []
-    if not any(str(name).startswith("mtp.layers.0.ffn.experts") for name in excluded):
+    if not any(
+        str(name).startswith(("mtp.layers.0.mlp.experts", "mtp.layers.0.ffn.experts"))
+        for name in excluded
+    ):
         return None
     from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 

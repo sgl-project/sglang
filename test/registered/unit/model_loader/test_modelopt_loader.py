@@ -671,6 +671,8 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
             # Excluded MTP experts are unpacked, so an explicit draft request
             # replaces the serialized config with online weight quantization.
             ("explicit embedded draft", True, ["mtp.layers.0*"], False),
+            ("checkpoint mlp draft", True, ["mtp.layers.0.mlp.experts"], False),
+            ("registered ffn draft", True, ["mtp.layers.0.ffn.experts"], False),
             # MTP experts present in the serialized checkpoint stay serialized.
             ("explicit serialized draft", True, [], True),
             # Inherited target quantization does not override draft exclusions.

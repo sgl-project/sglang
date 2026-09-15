@@ -40,6 +40,7 @@ _MODEL_PREFIX = "model."
 
 class Qwen3_5ForCausalLM(nn.Module):
     body_cls = qwen3_5.Qwen3_5ForCausalLM
+    hf_to_sglang_mapper = qwen3_5.Qwen3_5ForCausalLM.hf_to_sglang_mapper
 
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
     supported_lora_modules = qwen3_5.Qwen3_5ForCausalLM.supported_lora_modules
