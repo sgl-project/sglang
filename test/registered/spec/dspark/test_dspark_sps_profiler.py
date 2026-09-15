@@ -1,15 +1,19 @@
 import unittest
+from unittest import mock
 
 from sglang.benchmark.dspark_sps_profiler import (
     LoadInfo,
+    RoundSettings,
     ServerContext,
     SpsRow,
     build_request_count_sweep,
     build_table_from_summaries,
     count_aligned_steps,
+    fetch_server_context,
     postprocess_round,
     resolve_cuda_graph_max_bs,
     round_summary_dict,
+    run_one_round,
     validate_sweep_against_server,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -46,6 +50,7 @@ def make_rows(
 def make_context(**overrides) -> ServerContext:
     values = dict(
         base_url="http://localhost:30000",
+        control_url="http://localhost:30000",
         tokenizer_path="dummy",
         tp_size=4,
         dp_size=1,
@@ -223,13 +228,157 @@ class TestTableAssembly(CustomTestCase):
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
 
 
-class TestSweepHelpers(CustomTestCase):
+class TestRequestSweepHelpers(CustomTestCase):
     def test_request_count_sweep_tapers_and_hits_the_max(self):
         sweep = build_request_count_sweep(100)
         self.assertEqual(sweep[:4], [1, 2, 4, 8])
         self.assertEqual(sweep[-1], 100)
         self.assertIn(64, sweep)
 
+
+class TestControlUrl(CustomTestCase):
+    @staticmethod
+    def server_info() -> dict:
+        return {
+            "speculative_algorithm": "DSPARK",
+            "tokenizer_path": "dummy",
+            "tp_size": 4,
+            "internal_states": [
+                {
+                    "dp_size": 1,
+                    "effective_max_running_requests_per_dp": 16,
+                    "memory_usage": {"token_capacity": 1024},
+                    "cuda_graph_config": {"decode": {"bs": [1, 2, 4]}},
+                    "dspark_info_record": {
+                        "mode": "static",
+                        "components": ["core", "step_cpu_time"],
+                        "simulate_acc_len": 1.0,
+                        "verify_num_draft_tokens": 8,
+                    },
+                }
+            ],
+        }
+
+    def test_control_url_is_used_for_server_info(self):
+        response = mock.Mock()
+        response.json.return_value = self.server_info()
+        with mock.patch(
+            "sglang.benchmark.dspark_sps_profiler.requests.get",
+            return_value=response,
+        ) as get:
+            context = fetch_server_context(
+                base_url="http://router:8000/",
+                control_url="http://decode:60001/",
+                local_tokenizer_path=None,
+            )
+
+        get.assert_called_once_with(
+            "http://decode:60001/server_info", timeout=mock.ANY
+        )
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(context.base_url, "http://router:8000")
+        self.assertEqual(context.control_url, "http://decode:60001")
+
+    def test_control_url_defaults_to_base_url(self):
+        response = mock.Mock()
+        response.json.return_value = self.server_info()
+        with mock.patch(
+            "sglang.benchmark.dspark_sps_profiler.requests.get",
+            return_value=response,
+        ) as get:
+            context = fetch_server_context(
+                base_url="http://server:30000/",
+                control_url=None,
+                local_tokenizer_path=None,
+            )
+
+        get.assert_called_once_with(
+            "http://server:30000/server_info", timeout=mock.ANY
+        )
+        self.assertEqual(context.base_url, "http://server:30000")
+        self.assertEqual(context.control_url, "http://server:30000")
+
+    def test_profile_round_splits_data_and_control_endpoints(self):
+        context = make_context(
+            base_url="http://router:8000",
+            control_url="http://decode:60001",
+        )
+        settings = RoundSettings(
+            input_len=16,
+            temperature=1.0,
+            min_steady_steps=16,
+            min_steady_seconds=0.0,
+            round_timeout_seconds=30.0,
+        )
+        load_thread = mock.Mock()
+        load_thread.is_alive.return_value = False
+        rows = make_rows(num_running_reqs=4, num_verify_tokens=32)
+
+        patches = (
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler."
+                "should_skip_due_to_max_running_requests",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler."
+                "should_skip_due_to_token_capacity",
+                return_value=False,
+            ),
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler.set_forced_budget_frac"
+            ),
+            mock.patch("sglang.benchmark.dspark_sps_profiler.flush_cache"),
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler.fetch_rank_rows",
+                side_effect=[[[]], [rows]],
+            ),
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler.start_load",
+                return_value=load_thread,
+            ),
+            mock.patch(
+                "sglang.benchmark.dspark_sps_profiler.wait_for_aligned_steps",
+                return_value=True,
+            ),
+            mock.patch("sglang.benchmark.dspark_sps_profiler.abort_all_requests"),
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as set_budget,
+            patches[3] as flush,
+            patches[4] as fetch_rows,
+            patches[5] as start_load,
+            patches[6],
+            patches[7] as abort,
+        ):
+            outcome = run_one_round(
+                context=context,
+                vocab_size=1024,
+                batch_size_per_rank=4,
+                settings=settings,
+                rng=mock.Mock(),
+                frac=0.5,
+            )
+
+        self.assertIsNotNone(outcome)
+        set_budget.assert_called_once_with(
+            base_url="http://decode:60001", frac=0.5
+        )
+        flush.assert_called_once_with(base_url="http://router:8000")
+        self.assertEqual(
+            fetch_rows.call_args_list,
+            [
+                mock.call(base_url="http://decode:60001"),
+                mock.call(base_url="http://decode:60001"),
+            ],
+        )
+        self.assertEqual(start_load.call_args.kwargs["base_url"], "http://router:8000")
+        abort.assert_called_once_with(base_url="http://decode:60001")
+
+
+class TestSweepHelpers(CustomTestCase):
     def test_sweep_beyond_captured_cuda_graphs_raises(self):
         with self.assertRaisesRegex(ValueError, "cuda graphs"):
             validate_sweep_against_server(
