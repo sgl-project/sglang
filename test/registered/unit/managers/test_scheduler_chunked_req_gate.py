@@ -91,6 +91,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
     s.prefill_decode_interval = 0
+    s.dp_phase_lockstep = False
     s._prefill_decode_interval_remaining = 0
     s.get_new_batch_prefill = MagicMock(
         return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
