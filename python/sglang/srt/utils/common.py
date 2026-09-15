@@ -484,7 +484,16 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
+        cgroup_limit = _read_cgroup_memory_max()
+        if cgroup_limit is not None:
+            # Memory-capped container (e.g. one socket-pinned CI container):
+            # size against this cgroup's own limit and usage, so a sibling
+            # container's memory on the same host is not counted here.
+            total_free_memory = cgroup_limit - get_used_cpu_memory()
+        else:
+            # No cgroup limit (bare metal / full-machine container): keep the
+            # original host-wide estimate.
+            total_free_memory = psutil.virtual_memory().available
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -741,6 +750,66 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def _read_cgroup_memory_max():
+    # Return this cgroup's memory limit in bytes, or None when unlimited
+    # (memory.max == "max") or unreadable. Only a real numeric limit means the
+    # process is memory-capped and should size against the cgroup rather than
+    # the host.
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r") as f:
+            content = f.read().strip().lower()
+            # Match a number followed optionally by a unit (e.g., "512m", "2gb", "1024", "512b", "1024bytes")
+            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content)
+            if not match:
+                # "max" (no limit) or an unexpected value.
+                return None
+
+            value_str, unit = match.groups()
+            value = int(value_str)
+
+            # Map units to their respective multiplier (binary/1024-based)
+            # If no unit or unit is 'b'/'bytes', the value is already in bytes (multiplier = 1)
+            if unit and unit not in ("b", "bytes"):
+                multipliers = {
+                    "k": 1024,
+                    "kb": 1024,
+                    "m": 1024**2,
+                    "mb": 1024**2,
+                    "g": 1024**3,
+                    "gb": 1024**3,
+                    "t": 1024**4,
+                    "tb": 1024**4,
+                }
+                value *= multipliers[unit]
+            return value
+    except (PermissionError, FileNotFoundError, ValueError):
+        return None
+
+
+def get_available_cpu_memory():
+    # Total CPU memory capacity in bytes: the cgroup memory limit when the
+    # process is capped (e.g. a container started with docker --memory),
+    # otherwise the host total.
+    limit = _read_cgroup_memory_max()
+    return limit if limit is not None else psutil.virtual_memory().total
+
+
+def get_used_cpu_memory():
+    # Current memory usage of this cgroup (bytes), read from
+    # /sys/fs/cgroup/memory.current. Falls back to the host-wide
+    # psutil.virtual_memory().used so it pairs with the same-scoped fallback in
+    # get_available_cpu_memory(): inside a cgroup-limited container both are
+    # container-scoped, on bare metal both are host-scoped. Using the host-wide
+    # value here while get_available_cpu_memory() returns the per-container
+    # limit would make the "free memory" estimate negative once a sibling
+    # container on the same host is also resident.
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            return int(f.read().strip())
+    except (PermissionError, FileNotFoundError, ValueError):
+        return psutil.virtual_memory().used
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -749,6 +818,16 @@ def get_cpu_memory_capacity():
     if n_numa_node == 0:
         # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
         return float(psutil.virtual_memory().total // (1 << 20))
+
+    cgroup_limit = _read_cgroup_memory_max()
+    if cgroup_limit is not None:
+        # Memory-capped container: divide this cgroup's limit across the usable
+        # NUMA nodes (empty nodes are already dropped by get_cpu_ids_by_node).
+        per_numa_mem = cgroup_limit / n_numa_node
+        return float(per_numa_mem // (1 << 20))
+
+    # No cgroup limit (bare metal / full-machine container): use the smallest
+    # per-node physical MemTotal, matching the original host-based behavior.
     try:
         numa_mem_list = list()
         file_prefix = "/sys/devices/system/node/"
@@ -4258,7 +4337,11 @@ def get_physical_cpus_by_numa():
     for node, core_to_cpu in physical_by_node.items():
         cpus = sorted(core_to_cpu.values())
         allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        node_to_cpus[node] = allowed_cpus
+        # A cpuset-restricted process (e.g. one socket-pinned CI container) sees
+        # NUMA nodes it has no allowed CPUs on; skip them so per-node memory math
+        # divides by the count of usable nodes, not all physical nodes.
+        if allowed_cpus:
+            node_to_cpus[node] = allowed_cpus
 
     return node_to_cpus
 
