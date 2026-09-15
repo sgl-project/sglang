@@ -53,7 +53,7 @@ class TestRetractRoutedExperts(CustomTestCase):
             routed_experts_start_len=start,
         )
         req.output_ids.extend([10, 11])
-        req.output_token_logprobs_val = [-0.1, -0.2]
+        req.logprob.output_token_logprobs_val = [-0.1, -0.2]
         return req
 
     def _prefill(
@@ -65,12 +65,9 @@ class TestRetractRoutedExperts(CustomTestCase):
         indices = torch.arange(version * 16, version * 16 + rows)
         self.pool.req_to_token.fill_(999)
         self.pool.req_to_token[0, :rows] = indices
-        req.kv = ReqKvInfo(
-            req_pool_idx=0, kv_committed_len=rows, kv_allocated_len=rows
-        )
+        req.kv = ReqKvInfo(req_pool_idx=0, kv_committed_len=rows, kv_allocated_len=rows)
         routes = (
-            torch.arange(rows * 4, dtype=torch.int32).reshape(rows, 2, 2)
-            + version * 32
+            torch.arange(rows * 4, dtype=torch.int32).reshape(rows, 2, 2) + version * 32
         )
         TopkCaptureOutput(
             out_cache_loc=indices,
@@ -104,9 +101,7 @@ class TestRetractRoutedExperts(CustomTestCase):
             )
 
     def _collect(self, req: Req) -> torch.Tensor | None:
-        SchedulerBatchResultProcessor._maybe_collect_routed_experts(
-            self.processor, req
-        )
+        SchedulerBatchResultProcessor._maybe_collect_routed_experts(self.processor, req)
         return req.routed_experts
 
     def test_sampling_routes_survive_reprefill_and_wire_encoding(self) -> None:
@@ -117,7 +112,7 @@ class TestRetractRoutedExperts(CustomTestCase):
                 self._retract(req)
                 self.assertIsNone(req.routed_experts)  # No partial stream payload.
                 self.assertEqual(req.output_ids, array("q", [10, 11]))
-                self.assertEqual(req.output_token_logprobs_val, [-0.1, -0.2])
+                self.assertEqual(req.logprob.output_token_logprobs_val, [-0.1, -0.2])
 
                 req.output_ids.append(12)
                 recomputed = self._prefill(req, 1)
@@ -140,9 +135,7 @@ class TestRetractRoutedExperts(CustomTestCase):
         self._retract(req)
         req.output_ids.append(14)
         third = self._prefill(req, 2)
-        expected = torch.cat(
-            (original, second[len(original) :], third[len(second) :])
-        )
+        expected = torch.cat((original, second[len(original) :], third[len(second) :]))
         torch.testing.assert_close(self._collect(req), expected)
 
     def test_retract_during_reprefill_does_not_read_uncomputed_rows(self) -> None:
