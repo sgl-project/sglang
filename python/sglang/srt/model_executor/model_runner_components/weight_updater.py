@@ -340,6 +340,9 @@ class WeightUpdater:
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             prepare_moe_topk,
         )
+        from sglang.srt.model_executor.runner_utils import (
+            set_global_graph_memory_pool,
+        )
         from sglang.srt.utils.offloader import get_offloader
 
         logger.info(f"rebuild_model: before drop. {self._mem_stats()}")
@@ -367,6 +370,10 @@ class WeightUpdater:
         runner.decode_attn_backend = None
         runner.decode_attn_backend_group = None
         runner.graph_shared_output = None
+        # The shared graph pool's use_count drops to zero when the last old
+        # graph is destroyed; re-capture into the same id would trip the
+        # allocator's use_count assert, so the next capture mints a fresh pool.
+        set_global_graph_memory_pool(None)
         old_model = runner.model
         runner.model = None
         # Graph capture caches submodule lists (attention_layers, moe_layers,
