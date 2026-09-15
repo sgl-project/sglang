@@ -44,7 +44,6 @@ class _DummyKVCache(KVCache):
     def __init__(self, size: int, dtype: torch.dtype, device: str):
         # Bypass KVCache.__init__ to avoid custom_mem_pool / memory_saver
         # initialization that may touch CUDA APIs.
-        self.dcp_sharded = False
         self.size = size
         self.page_size = 1
         self.dtype = dtype

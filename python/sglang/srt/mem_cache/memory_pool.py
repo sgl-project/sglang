@@ -1825,10 +1825,7 @@ class KVCache(abc.ABC):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         allocation_label: Optional[str] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
-        self.dcp_sharded = dcp_sharded
         self.size = size
         self.page_size = page_size
         # Row-blocks one page holds in this pool's kernel-facing id space; >1
@@ -1972,8 +1969,6 @@ class MHATokenToKVPool(KVCache):
         quant_method=None,
         post_capture_active: bool = False,
         allocation_label: Optional[str] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         self.k_buffer = None
         self.v_buffer = None
@@ -1991,7 +1986,6 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
             allocation_label,
-            dcp_sharded=dcp_sharded,
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
@@ -3810,10 +3804,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         index_buf_size: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
-        self.dcp_sharded = dcp_sharded
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -3872,7 +3863,6 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
-                dcp_sharded=dcp_sharded,
                 **quant_method_kwarg,
                 **post_capture_kwargs,
             )
@@ -3900,7 +3890,6 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 index_buf_size=index_buf_size,
-                dcp_sharded=dcp_sharded,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3923,7 +3912,6 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
-                dcp_sharded=dcp_sharded,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -4355,8 +4343,6 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -4367,7 +4353,6 @@ class MLATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         self.kv_lora_rank = kv_lora_rank
@@ -4462,14 +4447,17 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
+    # Note(kpham-sgl): Only DSA draft pools opt into replication here;
+    # generalize this to all draft pools in a follow-up.
+    dcp_replicated = False
 
     @property
     def _write_loc_dcp_span(self) -> int:
         """How many logical ids one stored row spans in the write-loc space."""
         return (
-            get_parallel().attn_dcp_size
-            if self.dcp_sharded and not self.write_loc_is_dcp_resolved
-            else 1
+            1
+            if self.write_loc_is_dcp_resolved or self.dcp_replicated
+            else get_parallel().attn_dcp_size
         )
 
     def _scatter_mla_rows(
@@ -4479,12 +4467,12 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.dcp_sharded and not self.write_loc_is_dcp_resolved:
+        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
+            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
             set_mla_kv_buffer_dcp_sharded_triton(
                 dst_buffer, loc, cache_k_nope, cache_k_rope
             )
-        else:
-            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
 
     def set_kv_buffer(
         self,
@@ -4505,7 +4493,7 @@ class MLATokenToKVPool(KVCache):
         assert not self.dsa_kv_cache_store_fp8
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
-        assert self.write_loc_is_dcp_resolved or not self.dcp_sharded, (
+        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
             "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
             "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
             "whose kernel resolves the owner rule; reaching the combined-row "
@@ -4839,8 +4827,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -4859,7 +4845,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_dsa=True,
             override_kv_cache_dim=override_dim,
-            dcp_sharded=dcp_sharded,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -5275,8 +5260,6 @@ class MHATokenToKOnlyPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -5287,7 +5270,6 @@ class MHATokenToKOnlyPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
-            dcp_sharded=dcp_sharded,
         )
         self.head_num = head_num
         self.head_dim = head_dim
@@ -5381,11 +5363,8 @@ class MiniMaxSparseKVPool(KVCache):
         main_pool_cls=MHATokenToKVPool,
         index_kv_pool_cls=MHATokenToKVPool,
         index_k_pool_cls=MHATokenToKOnlyPool,
-        *,
-        dcp_sharded: bool = False,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
-        self.dcp_sharded = dcp_sharded
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
@@ -5436,7 +5415,6 @@ class MiniMaxSparseKVPool(KVCache):
             enable_memory_saver=enable_memory_saver,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (

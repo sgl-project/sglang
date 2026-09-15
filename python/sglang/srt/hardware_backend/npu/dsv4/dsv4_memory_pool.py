@@ -311,7 +311,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device,
             enable_memory_saver,
             kernel_page_size=kernel_page_size,
-            dcp_sharded=self.dcp_sharded,
         )
 
     def _get_state_pool(self, layer_id: int, from_indexer: bool) -> CompressStatePool:

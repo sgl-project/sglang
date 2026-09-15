@@ -80,8 +80,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -92,7 +90,6 @@ class DeepSeekV4SingleKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
-            dcp_sharded=dcp_sharded,
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -258,8 +255,6 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super().__init__(
             size,
@@ -272,7 +267,6 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         self.data_ptrs = torch.tensor(
@@ -610,8 +604,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -622,7 +614,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
-            dcp_sharded=dcp_sharded,
         )
         c4_logical_size = c128_size * 32
 
@@ -1006,7 +997,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
-            dcp_sharded=self.dcp_sharded,
         )
 
     def _make_indexer_pool(

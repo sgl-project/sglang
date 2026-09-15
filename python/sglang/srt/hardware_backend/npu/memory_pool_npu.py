@@ -548,8 +548,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
-        *,
-        dcp_sharded: bool = False,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -560,7 +558,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             enable_memory_saver=enable_memory_saver,
             start_layer=start_layer,
             end_layer=end_layer,
-            dcp_sharded=dcp_sharded,
         )
 
         self.kv_lora_rank = kv_lora_rank

@@ -281,6 +281,9 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     is the contract."""
 
     def setUp(self):
+        # `set_kv_buffer` asks the parallel context whether DCP is in play, and
+        # that is a value the configuration decides at publish -- so a case
+        # here states its topology the way a process does, by publishing one.
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -288,11 +291,10 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="test")
 
-    def _bare_mla_pool(self, *, dcp_sharded=False):
+    def _bare_mla_pool(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         pool = object.__new__(MLATokenToKVPool)
-        pool.dcp_sharded = dcp_sharded
         pool.size = 64
         pool.page_size = 1
         pool.kernel_page_blocks = 1
@@ -306,7 +308,7 @@ class TestMlaWriteDoorsUnderDcp(unittest.TestCase):
     def test_set_kv_buffer_refuses_under_dcp(self):
         from sglang.srt.runtime_context import get_parallel
 
-        pool = self._bare_mla_pool(dcp_sharded=True)
+        pool = self._bare_mla_pool()
         layer = types.SimpleNamespace(layer_id=0)
         loc = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         cache_k = torch.ones((4, 1, 8), dtype=torch.float16)
