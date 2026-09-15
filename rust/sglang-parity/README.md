@@ -21,8 +21,10 @@ cargo run -p sglang-parity -- --config /path/to/run.json --describe
 cargo run -p sglang-parity -- --config /path/to/run.json
 ```
 
-Paths in `run.json` are relative to the invocation directory unless absolute.
-`server.working_dir` optionally selects the servers' working directory. On a Mac,
+Relative `server.python`, `server.working_dir`, and `output_dir` paths resolve from
+the invocation directory; a bare executable name such as `python3` uses `PATH`.
+`server.working_dir` optionally selects the servers' working directory, where the
+server resolves relative model paths and file paths in `server.args`. On a Mac,
 use an environment and model supported by SGLang's MLX backend, set
 `server.env.SGLANG_USE_MLX` to `"1"`, and include `--mlx-enable-sampling` in
 `server.args` for the default sampling and output-logprob cases. Backend support
@@ -51,6 +53,9 @@ The default suite has five scenarios, each with streaming off and on: greedy
 generation, one-token limit, a two-prompt batch, output logprobs, and fixed-seed
 sampling. Ten cases, repeated twice on each side, produce 40 generation requests
 plus readiness probes. This is a finite baseline, not exhaustive API coverage.
+Custom request fields are sent unchanged and their responses are compared in full.
+New API features may also require extending the suite's protocol validation and
+unit tests; matching responses alone do not prove every requested option was honored.
 
 ## Review the test contract
 
