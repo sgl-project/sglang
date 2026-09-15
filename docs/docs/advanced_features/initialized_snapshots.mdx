@@ -1,0 +1,94 @@
+---
+title: "Initialized engine snapshots"
+description: "Checkpoint a TP1 engine before it serves requests and restore it on the same GPU."
+---
+
+`sglang snapshot create` starts an engine, retains its initialization and CUDA Graph state, and checkpoints its process tree before HTTP starts listening. `sglang snapshot restore` brings the process tree back, resumes the released memory, reloads the original model weights, and reopens the HTTP listener. This is not a checkpoint of an active service or a container image.
+
+## How it works
+
+`create` launches the engine as a child process and lets it finish full initialization: loading weights, allocating the KV cache, and capturing CUDA graphs. Two barriers then hold the engine before it can serve requests:
+
+1. The scheduler releases weight and KV memory (this is why `--enable-memory-saver` is required) and records the GPU UUID, then waits.
+2. The HTTP process records the model path and listen address, then waits.
+
+With the engine quiescent and GPU memory released, the CLI exports each GPU-holding process's CUDA context with `cuda-checkpoint` and dumps the whole process tree with CRIU. It also collects the compilation caches, temporary files, and `/dev/shm` files the engine referenced, then writes `manifest.json` last. Model weights are never copied into the artifact, and the captured process tree does not survive the dump: once capture succeeds, the source engine is gone.
+
+`restore` reverses the sequence. After validating the artifact, it puts the saved files back, restores the process tree with CRIU (the processes resume still waiting at their barriers), and restores the CUDA context with `cuda-checkpoint`. It then releases the scheduler, which re-allocates KV memory and re-reads the original weights from the recorded path. The release also brings the HTTP listener back, and that happens before the reload finishes: a request arriving in that window waits in the queue instead of being served. `restore` reports success only once the scheduler has resumed and `/health` answers, so an engine that is not ready yet is never reported as ready.
+
+Before capture, the scheduler also records a canary: one greedy single-token generation from a fixed prompt. Restore re-runs the same generation after the weight reload and fails if the sampled token differs, so a reload that silently produces different logits fails the restore instead of serving traffic.
+
+The two processes coordinate through files in `control/` rather than timing assumptions, so the ordering is deterministic. The controller writes `release.json` (resume, optionally with a listen address) and `abort`; the engine writes `scheduler.json`, `ready.json`, `canary.json`, `resumed` and `error.json`. Every wait has a budget, so a controller that dies cannot leave the engine parked forever, and a parked engine reads the controller's abort instead of waiting to be killed.
+
+## Prerequisites
+
+- Linux with NVIDIA CUDA, `cuda-checkpoint`, and a recent CRIU release. 4.2 is the tested version; older releases are not supported — the CLI uses whichever `criu` it finds on `PATH` (or via `SGLANG_CRIU`), so install the latest available. Create and restore must use the same CRIU version; the artifact records it as part of the identity. The runtime needs permission to checkpoint and restore processes and to lock its network namespace with `iptables`.
+- Exactly one visible CUDA GPU with `--base-gpu-id 0`, tensor/pipeline/data parallel sizes of one, one node, and one tokenizer/detokenizer worker. Use a plain HTTP server and a local, non-quantized model checkpoint with `--load-format auto`, `pt`, or `safetensors`. LoRA, HiCache, disaggregation, weight-cache daemons, Ray, speculative decoding, and TLS are outside this initial scope.
+- The same host, GPU UUID, container image, Python environment, SGLang source, and unchanged model files on restore. Keep model and artifact mount paths identical inside the containers. CRIU recreates the captured processes with their original PIDs and thread IDs, so those numbers must be free in the PID namespace where the restore runs. Run the restore inside the capture's own PID namespace — a reused container started with `--pid=host` — where that range is under your control; the CLI does not create containers. Before entering CRIU it refuses to start while any captured process PID is still in use. Thread IDs are not pre-checked, so a thread-number collision surfaces later as CRIU's `Unable to create a thread: -17`.
+- Enough writable disk or tmpfs space for the process images and compilation caches. The captured processes do not survive the dump, so the source engine cannot keep serving after a capture. Retain the entire artifact, not only `images/`.
+
+Only restore artifacts you trust. CRIU images contain executable process state, memory, and inherited environment values; identity checks are compatibility checks, not authentication. The artifact directory must be owned by the restoring user with mode `0700`; parent directories must not be symlinks or writable by other users, except root-owned sticky directories such as `/tmp`. Manifest and control JSON files are published with mode `0600`.
+
+On kernels without `PTRACE_GET_RSEQ_CONFIGURATION` (before Linux 5.13), disable glibc rseq registration before launching the CLI when your glibc registers rseq:
+
+```bash
+export GLIBC_TUNABLES=glibc.pthread.rseq=0
+```
+
+Install the external tools on `PATH`, or set `SGLANG_CRIU` and `SGLANG_CUDA_CHECKPOINT` to executable wrappers. The CLI sets `USE_LIBUV=0` for the created engine so its TCPStore does not introduce an unsupported io_uring descriptor, and `GLOO_SOCKET_IFNAME=lo` so its TP1 Gloo listener does not retain the source container's IP address. Both are applied to the engine child by the CLI, so no extra server arguments are needed.
+
+## Create
+
+Run inside the source container, with your local model mounted at `/model` and a writable parent directory at `/snapshots`. The output directory must not already exist. Pass ordinary server arguments after `--`:
+
+```bash
+sglang snapshot create --artifact /snapshots/qwen --timeout 600 -- \
+  --model-path /model \
+  --tp-size 1 --enable-memory-saver
+```
+
+`--timeout` is the budget for engine startup and capture (default 600 seconds). The engine inherits this command's standard output and error, so its logs stream to wherever you run `create`. No HTTP request is used to drain or release the engine: the scheduler releases memory before entering its request loop, then waits for the restore controller.
+
+Before dumping, the CLI checks that the engine tree is capture-safe: exactly one GPU holds memory, no process owns io_uring state, and no compilation cache lives outside the artifact. Each failure names the offending process or path, so it can be fixed before a dump is attempted.
+
+The CLI redirects the JIT caches it knows about — Triton, TorchInductor, the CUDA compute cache, FlashInfer, tilelang, humming-kernels, CuTeDSL and the SGLang JIT caches — under the artifact's `runtime/` directory. If you start the engine through another path, set the cache environment variables named in the failure message.
+
+A successful create writes `manifest.json` last. If creation fails, the CLI writes `failure.json` with the error, aborts the engine tree, and keeps the directory (including the CRIU logs under `work/`) for diagnosis; there is no completed manifest, so use a new output directory when retrying.
+
+## Restore
+
+Copy the complete artifact to the target container, which must share the capture's PID namespace as described above, with the same mounts, software, GPU selection, and environment. Mount the artifact at its original absolute path:
+
+```bash
+sglang snapshot restore --artifact /snapshots/qwen --timeout 300
+```
+
+`--timeout` is the budget for the restore and the readiness wait (default 300 seconds). The command returns after the restored process is alive, memory and weights have resumed, and `/health` succeeds. The model path and server settings come from the captured engine, and so does the listen address: the `host` and `port` of the server arguments used at capture, `127.0.0.1:30000` when they were not given. Pass `--host` and/or `--port` to listen somewhere else, for example when the target container has a different address or the captured port is busy:
+
+```bash
+sglang snapshot restore --artifact /snapshots/qwen --host 0.0.0.0 --port 32000
+```
+
+Before entering CRIU, restore checks the runtime identity, model file metadata, the hashes of the files the artifact carries, captured process IDs, and the listen address. Identity mismatches name the fields that changed, for example `snapshot identity mismatch: gpu_uuid, criu`. After the process tree is restored it is pinned with Linux pidfds and verified (session leader, command line, member set) before anything signals it, so cleanup only ever touches the tree this restore created. A failure after the process tree exists — including one after the engine resumed — aborts the handshake and stops that tree. Logs remain under a unique `work/restore-*/` directory, including the restored engine's output.
+
+## Inspect
+
+`sglang snapshot inspect` reads an artifact without touching CRIU and reports what it would restore into:
+
+```bash
+sglang snapshot inspect --artifact /snapshots/qwen
+```
+
+It prints the manifest summary plus three checks: whether this host's identity matches, whether the captured PIDs are free, and whether the listen address is available. `--json` prints the whole report for scripts. The command exits 1 when the identity does not match, so it can gate a deployment.
+
+## Artifact contents and reuse
+
+Copy the artifact whole and mount it at the same absolute path. `manifest.json` is written last and is the completion marker: an artifact without it was never captured successfully, and `failure.json` records why.
+
+The capture carries everything CRIU would otherwise reopen from the host: the process images in `images/`, the compilation caches and temporary files the engine held open in `files/` (restored into `runtime/`, the live tree CRIU reopens), and the `/dev/shm` objects in `dev_shm/`. A restore therefore does not depend on the target host's cache state, although the container image, software, driver and GPU still have to match. Model weights are not copied and must remain available at the recorded path.
+
+`control/` holds the startup and restore handshake; do not touch it while an operation runs. `work/` holds the CRIU work directory and one `restore-<timestamp>/` directory per attempt with that attempt's CRIU logs and PID file. `.lock` serializes create and restore for this host. Keep one artifact to one engine at a time and never share a live `runtime/` directory; restored `/dev/shm` files are written from `dev_shm/`, and an existing file is accepted only when it is byte-identical.
+
+For another restored instance, use its own writable copy of the artifact and a PID namespace where the captured numbers are free. A restored tree that was killed can keep its numbers for a while, so an artifact whose tree has already run may need a later range — start a fresh capture rather than waiting for the old numbers. Preserve modification times when copying model files: the compatibility check compares their relative names, sizes, and modification times, not a hash of every weight byte. It does not replace the requirement to use the same trusted container image and model checkpoint.
+
+The command does not provide cross-host migration, GPU relocation, an active-service drain protocol, or recovery from a node losing its driver state. It also does not remove startup costs that occur after the captured boundary, including weight reload and HTTP warmup.
