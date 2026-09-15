@@ -299,6 +299,54 @@ You can enable it in any of the three supported configuration methods:
 
 > **Note:** `enable_ssd_offload` requires a Mooncake version that supports the `enable_ssd_offload` parameter in `MooncakeDistributedStore.setup()`. If the installed version does not support it, SGLang will automatically fall back to the old behavior and print a warning.
 
+**Mooncake Replica Placement (`replica_num`, `dfs_replica_num`):**
+
+> **Warning:** Descriptor-based DFS is a work-in-progress feature intended only
+> for development and evaluation. It is not covered by Mooncake's production
+> fault-tolerance, HA, durability, or multi-tenant guarantees. In particular,
+> DFS allocator state is not reconstructed after a master restart or HA
+> failover, and DFS writes currently have no DFS-specific timeout,
+> cancellation, or `fsync` durability guarantee. See the
+> [Mooncake descriptor-based DFS documentation](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/mooncake-store-deployment-guide.md#descriptor-based-dfs-storage)
+> for the current limitations.
+
+Use `replica_num` and `dfs_replica_num` in
+`--hicache-storage-backend-extra-config` to control the number of memory and
+descriptor-based DFS replicas created for each HiCache object. The defaults are
+`1` and `0`, respectively. Mooncake currently supports at most one DFS replica,
+and a DFS replica must be accompanied by at least one memory replica. The
+following example uses the default embedded Real Client mode:
+
+```bash
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path] \
+    --hicache-storage-backend-extra-config \
+    '{"master_server_address":"127.0.0.1:50051","replica_num":1,"dfs_replica_num":1,"enable_ssd_offload":true,"ssd_offload_path":"/tmp/mooncake-file-storage"}'
+```
+
+Descriptor-based DFS currently requires the default Mooncake tenant. Start the
+Mooncake master with `MOONCAKE_ENABLE_DFS=1`, and configure the master and every
+Real Client with the same `MOONCAKE_DFS_*` layout. Although DFS data is written
+under `MOONCAKE_DFS_ROOT_DIR`, each Real Client must also initialize FileStorage
+with the distributed backend and an existing absolute file-storage path.
+
+In the default embedded Real Client mode, the Real Client runs inside SGLang.
+Set `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`
+in the SGLang process, and pass `enable_ssd_offload=true` plus an absolute
+`ssd_offload_path` as shown above.
+
+With `standalone_storage=true`, SGLang runs only a Dummy Client. Configure the
+external `mooncake_client` process instead: set the same `MOONCAKE_DFS_*`
+layout,
+`MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`,
+`MOONCAKE_OFFLOAD_ENABLED=true`, and an absolute
+`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. SGLang only needs `replica_num`,
+`dfs_replica_num`, `standalone_storage=true`, and `client_server_address`; the
+Dummy Client forwards the request-level replica configuration to the external
+Real Client.
+
 **Mooncake Group Semantics (`enable_group_semantics`):**
 
 When `enable_group_semantics` is set to `true`, SGLang passes Mooncake `group_ids` for physical objects derived from the same logical HiCache page. This allows Mooncake to apply group-aware metadata routing, lease refresh, and eviction behavior to related KV objects such as MHA K/V pairs, split-head shards, MLA objects, and supported sidecar objects.
