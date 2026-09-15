@@ -1157,16 +1157,24 @@ class SchedulerPPMixin:
     def _pp_spec_chain_topology(
         self: Scheduler, bs: int, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """topk=1 chain constants, the shape a not-yet-drafted row implies.
-        Mirrors _rebuild_topk1_chain_buffers: a single-step chain has no parent
-        entries, and both widths key off num_steps."""
-        num_steps = get_spec().speculative_num_steps
-        parent_width = num_steps if num_steps > 1 else 0
+        """Build valid fallback topology using the tree kernel's row strides.
+
+        A not-yet-drafted row still uses the configured topk and token count.
+        Consecutive selected indices and earlier parents give an acyclic tree;
+        topk=1 reduces to a chain. Single-step drafts need no parent entries.
+        """
+        spec = get_spec()
+        num_steps = spec.speculative_num_steps
+        parent_width = (
+            spec.speculative_eagle_topk * (num_steps - 1) + 1
+            if num_steps > 1
+            else 0
+        )
         parent_list = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=device
         ).repeat(bs, 1)
         top_scores_index = torch.arange(
-            num_steps, dtype=torch.long, device=device
+            spec.speculative_num_draft_tokens - 1, dtype=torch.long, device=device
         ).repeat(bs, 1)
         return parent_list, top_scores_index
 
