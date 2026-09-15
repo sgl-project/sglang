@@ -52,7 +52,9 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
             "--mem-fraction-static",
             "0.85",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.NUM_PREFILL_GPUS)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -79,7 +81,9 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
             "--base-gpu-id",
             str(cls.NUM_PREFILL_GPUS),
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.NUM_PREFILL_GPUS, cls.NUM_PREFILL_GPUS + cls.NUM_DECODE_GPUS)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

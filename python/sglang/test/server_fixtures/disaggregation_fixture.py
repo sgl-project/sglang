@@ -114,6 +114,21 @@ class PDDisaggregationServerBase(CustomTestCase):
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)
 
+    @classmethod
+    def rdma_devices_for(cls, gpu_indices) -> list:
+        """`--disaggregation-ib-device` args for a server pinned to these GPUs.
+
+        A PD pair puts prefill and decode on different GPUs of one node, so the
+        two sides need different NICs; `cls.rdma_devices` holds a single pair
+        picked without knowing either side's GPUs.
+        """
+        if not is_in_ci():
+            return cls.rdma_devices
+        devices = get_rdma_devices_for_gpus(gpu_indices)
+        if not devices:
+            return cls.rdma_devices
+        return ["--disaggregation-ib-device", devices]
+
     # Subclasses can set these to customize server args
     extra_prefill_args = []
     extra_decode_args = []
@@ -131,7 +146,9 @@ class PDDisaggregationServerBase(CustomTestCase):
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.prefill_tp_size)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -160,7 +177,9 @@ class PDDisaggregationServerBase(CustomTestCase):
             "--base-gpu-id",
             str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.decode_base_gpu_id, cls.decode_base_gpu_id + cls.decode_tp_size)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -425,6 +444,58 @@ def get_rdma_devices_args():
 
     # Deduplicate while preserving order
     return ",".join(dict.fromkeys(rdma_devices))
+
+
+def get_rdma_devices_for_gpus(gpu_indices) -> str:
+    """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
+
+    `get_rdma_devices_args` reads CUDA_VISIBLE_DEVICES and normalizes the ids
+    to their group base, so a decode server pinned with `--base-gpu-id 4` maps
+    back onto the first NICs and reaches them across the socket boundary. Here
+    the absolute id picks the NIC, keeping each side on the NICs that share its
+    NUMA node.
+    """
+    rdma_all_devices = (
+        _parse_rdma_device_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
+        or _get_available_ib_devices()
+        or [f"mlx5_roce{i}" for i in range(8)]
+    )
+    gpu_indices = sorted({int(g) for g in gpu_indices})
+    if not gpu_indices or not rdma_all_devices:
+        return ""
+
+    try:
+        import torch
+
+        total_gpus = torch.cuda.device_count()
+    except Exception:
+        total_gpus = 0
+    if total_gpus <= 0:
+        total_gpus = max(8, gpu_indices[-1] + 1)
+
+    n_rdma = len(rdma_all_devices)
+    gpus_per_rdma = max(1, total_gpus // n_rdma)
+    devices = [
+        rdma_all_devices[min(gpu // gpus_per_rdma, n_rdma - 1)] for gpu in gpu_indices
+    ]
+    resolved = ",".join(dict.fromkeys(devices))
+    logger.warning(
+        "RDMA for gpus=%s: total_gpus=%d n_rdma=%d gpus_per_rdma=%d -> %s",
+        gpu_indices,
+        total_gpus,
+        n_rdma,
+        gpus_per_rdma,
+        resolved,
+    )
+    return resolved
+
+
+def _parse_rdma_device_list_env(var_name: str):
+    val = os.getenv(var_name)
+    if not val:
+        return None
+    items = [x.strip() for x in val.split(",") if x.strip()]
+    return items or None
 
 
 _IB_SYSFS = "/sys/class/infiniband"
