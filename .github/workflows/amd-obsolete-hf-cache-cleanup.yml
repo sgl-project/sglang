@@ -1,0 +1,71 @@
+name: AMD obsolete HF cache cleanup
+
+# Deletes the checkpoints listed in cleanup_obsolete_hf_checkpoints.sh from the
+# shared AMD HuggingFace cache PVC, which no per-job script may do (see the
+# rationale in check_hf_cache_space.sh: evicting weights other jobs still need
+# just moves the failure). Retiring a nightly is the case where it is safe, and
+# then only for that nightly's own checkpoints.
+#
+# Dispatch-only: reclaiming space is not a per-PR activity. To reuse this, edit
+# the ALLOWED_DIRS allowlist and dispatch from the branch carrying that edit.
+#
+# The Qwen3-235B Instruct-2507 and DeepSeek-V3.1 weights this PR retires were
+# removed by run 34481735602.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  group: amd-obsolete-hf-cache-cleanup-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      # The runner pools can share one PVC, so a parallel leg would race
+      # another's rm -rf over the same directories.
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: linux-mi300-1gpu-sglang
+            name: mi30x
+          - runner: linux-mi35x-gpu-1
+            name: mi35x
+    name: cleanup-obsolete-hf-cache (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      # The weights are owned by root because the CI container downloads them,
+      # so the unprivileged runner user cannot unlink them. Delete from inside
+      # the same container, which mounts the cache PVC at /sgl-data.
+      - name: Setup docker
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Remove obsolete HF checkpoints
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            -e REQUIRE_HF_CACHE=1 \
+            bash scripts/ci/amd/cleanup_obsolete_hf_checkpoints.sh || TEST_EXIT_CODE=$?
+          cat github_summary.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
