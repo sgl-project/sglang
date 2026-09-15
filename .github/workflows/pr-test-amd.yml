@@ -18,11 +18,12 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: choice
         default: rocm10
         options:
+          - all
           - rocm10
           - rocm724
           - rocm720
@@ -92,7 +93,7 @@ on:
   workflow_call:
     inputs:
       rocm_version:
-        description: 'ROCm image version'
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
         required: false
         type: string
         default: rocm10
@@ -147,8 +148,7 @@ env:
 concurrency:
   # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
   # PR runs share a group per branch so new pushes cancel stale runs.
-  # Include the requested ROCm version so parallel AITER Scout calls do not share a group.
-  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}-${{ inputs.rocm_version || 'default' }}
+  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
   cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -167,9 +167,9 @@ jobs:
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
       # Keep rocm10 on the twice-daily cadence. The 17:30 UTC schedule runs
-      # rocm724 and rocm720 once daily. Dispatch/call inputs select one version,
-      # while a pull_request falls through to the single rocm10 default.
-      rocm_versions: ${{ inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '30 17 * * *' && '["rocm724","rocm720"]' || '["rocm10"]' }}
+      # rocm724 and rocm720 once daily. Dispatch/call inputs select one version
+      # or all three, while a pull_request falls through to the rocm10 default.
+      rocm_versions: ${{ inputs.rocm_version == 'all' && '["rocm10","rocm724","rocm720"]' || inputs.rocm_version && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '30 17 * * *' && '["rocm724","rocm720"]' || '["rocm10"]' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
