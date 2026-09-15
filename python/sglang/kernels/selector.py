@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Callable, Optional
+from weakref import WeakValueDictionary
 
 from sglang.kernels.registry import registry
 from sglang.kernels.spec import KernelBackend, KernelSpec, PlatformInfo
@@ -84,9 +85,34 @@ def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpe
     )
 
 
-@lru_cache(maxsize=None)
-def _resolve(op: str, backend: Optional[KernelBackend]) -> Callable:
-    return select_kernel(op, backend=backend).load()
+class _KernelCache:
+    def __init__(self) -> None:
+        self.generation = id(self)
+        self.kernels: dict[tuple[str, Optional[KernelBackend]], Callable] = {}
+        _cache_generations[self.generation] = self
+
+
+_cache_generations: WeakValueDictionary[int, _KernelCache] = WeakValueDictionary()
+_kernel_cache = _KernelCache()
+
+
+def _resolve(generation: int, op: str, backend: Optional[KernelBackend]) -> None:
+    # Dynamo 2.11 cannot convert arbitrary objects passed to a constant-result
+    # function. Pass a scalar ID and recover the cache outside tracing instead.
+    # get_kernel holds a strong reference throughout resolution and lookup.
+    cache = _cache_generations[generation]
+    key = (op, backend)
+    if key not in cache.kernels:
+        cache.kernels[key] = select_kernel(op, backend=backend).load()
+
+
+# Equivalent to torch.compiler.assume_constant_result(_resolve), without
+# importing torch into this metadata-only namespace. Populate the cache at
+# compile time: op/backend and the registry/platform are fixed for a graph.
+# Return None here, then read the callable from the captured cache in get_kernel
+# so Dynamo can guard and trace it normally (a constant-result callable has no
+# guardable source). Tensor operations are never part of this resolver.
+_resolve._dynamo_marked_constant = True
 
 
 def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
@@ -95,9 +121,19 @@ def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
     This is what the public ``sglang.kernels.ops.*`` wrappers call. The first
     call resolves and imports the backend; later calls hit the cache.
     """
-    return _resolve(op, backend)
+    # Keep one cache generation alive through resolution and lookup, even if
+    # another thread clears the process-wide cache in between.
+    cache = _kernel_cache
+    _resolve(cache.generation, op, backend)
+    return cache.kernels[(op, backend)]
 
 
 def clear_cache() -> None:
-    """Drop the resolved-callable cache (used by tests)."""
-    _resolve.cache_clear()
+    """Drop the resolved-callable cache (used by tests).
+
+    In-flight lookups finish against their captured cache generation. Calls
+    starting after this reset resolve against a fresh cache. Tests changing
+    the registry should also reset Dynamo before recompiling.
+    """
+    global _kernel_cache
+    _kernel_cache = _KernelCache()
