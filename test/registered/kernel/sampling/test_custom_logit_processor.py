@@ -11,14 +11,13 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_cached_decode_does_not_read_row_indices_back_to_cpu(self):
+    def _make_info(self):
         def processor(logits, params):
             for row, param in zip(logits, params, strict=True):
                 row.narrow(0, param["token_id"], 1).fill_(-float("inf"))
             return logits
 
-        info = SamplingBatchInfo(
+        return SamplingBatchInfo(
             temperatures=torch.ones(3, 1, device="cuda"),
             top_ps=torch.ones(3, device="cuda"),
             top_ks=torch.zeros(3, dtype=torch.int32, device="cuda"),
@@ -31,14 +30,16 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
             vocab_size=4,
             has_custom_logit_processor=True,
             custom_params=[{"token_id": 1}, None, {"token_id": 2}],
-            custom_logit_processor={
-                0: (processor, torch.tensor([True, False, True], device="cuda"))
-            },
+            custom_logit_processor={0: processor},
             custom_logit_processor_row_indices={
                 0: ([0, 2], torch.tensor([0, 2], device="cuda"))
             },
             device="cuda",
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cached_decode_does_not_read_row_indices_back_to_cpu(self):
+        info = self._make_info()
         for width in (1, 3):
             with self.subTest(width=width):
                 logits = torch.zeros(3 * width, 4, device="cuda")
@@ -57,6 +58,50 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
                 self.assertTrue(
                     torch.equal(logits.cpu(), expected.repeat_interleave(width, dim=0))
                 )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_casts_processor_result_to_logits_dtype(self):
+        def processor(logits, params):
+            return logits.float() + 0.1
+
+        info = self._make_info()
+        info.custom_logit_processor = {0: processor}
+        for width in (1, 3):
+            with self.subTest(width=width):
+                logits = torch.zeros(3 * width, 4, dtype=torch.bfloat16, device="cuda")
+                apply_custom_logit_processor(logits, info, width)
+                expected = torch.zeros(3, 4, dtype=torch.bfloat16)
+                expected[0] = 0.1
+                expected[2] = 0.1
+                self.assertEqual(logits.dtype, torch.bfloat16)
+                self.assertTrue(
+                    torch.equal(logits.cpu(), expected.repeat_interleave(width, dim=0))
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_filter_does_not_read_processor_membership_back_to_cpu(self):
+        for keep in ([2, 1], [1]):
+            with self.subTest(keep=keep):
+                info = self._make_info()
+                self._make_info()._filter_batch_custom_logit_processor(keep)
+                torch.cuda.synchronize()
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as profile:
+                    info._filter_batch_custom_logit_processor(keep)
+                names = {event.key for event in profile.key_averages()}
+                self.assertNotIn("aten::nonzero", names)
+                self.assertNotIn("aten::_local_scalar_dense", names)
+                if keep == [2, 1]:
+                    rows, indices = info.custom_logit_processor_row_indices[0]
+                    self.assertEqual(rows, [0])
+                    self.assertEqual(indices.tolist(), [0])
+                    self.assertEqual(info.custom_params, [{"token_id": 2}, None])
+                    self.assertEqual(set(info.custom_logit_processor), {0})
+                else:
+                    self.assertEqual(info.custom_logit_processor_row_indices, {})
+                    self.assertIsNone(info.custom_logit_processor)
+                    self.assertFalse(info.has_custom_logit_processor)
 
 
 if __name__ == "__main__":
