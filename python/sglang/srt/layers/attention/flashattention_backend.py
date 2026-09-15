@@ -1255,7 +1255,12 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.kv_cache_is_mxfp8
             and (not is_prefill or self.fa_impl_ver != 4)
         ):
-            if layer.k_scale is not None:
+            # FA4 only accepts descales for FP8 inputs. Quantized model
+            # checkpoints may retain KV scales even with an explicit BF16 cache.
+            if layer.k_scale is not None and (
+                self.fa_impl_ver != 4
+                or self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            ):
                 descale_shape = (logical_batch_size, kv_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
