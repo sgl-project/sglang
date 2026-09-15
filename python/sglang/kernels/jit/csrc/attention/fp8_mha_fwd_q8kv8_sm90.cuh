@@ -18,6 +18,11 @@ constexpr int kBlockSize = 128;
 constexpr int kMmaRows = 64;
 constexpr int kTokenTile = 64;
 constexpr int kNumStages = 2;
+constexpr int kWarpGroupSize = cutlass::NumThreadsPerWarpGroup;
+
+enum NamedBarriers : uint32_t {
+  kWarpGroupSync = 0,
+};
 
 using fp8_t = cutlass::float_e4m3_t;
 using bf16_t = cutlass::bfloat16_t;
@@ -64,6 +69,10 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* barrier) {
 
 __device__ __forceinline__ void fence_mbarrier_init() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+__device__ __forceinline__ void warpgroup_sync() {
+  cutlass::arch::NamedBarrier::arrive_and_wait(kWarpGroupSize, NamedBarriers::kWarpGroupSync);
 }
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* barrier, uint32_t bytes) {
@@ -213,7 +222,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
       copy_q_16B(dst, nullptr, false);
     }
   }
-  __syncthreads();
+  warpgroup_sync();
   if (tid == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tma.k) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tma.v) : "memory");
@@ -238,7 +247,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     const int selected_block = topk_idx[(kv_head * total_q + q_idx) * topk];
     load_kv_tile(storage, tma, req_to_token, 0, selected_block, 0, kv_head, num_kv_heads, max_slots, req_stride, tid);
     mbarrier_wait(&storage.kv_ready[0], 0);
-    __syncthreads();
+    warpgroup_sync();
   }
 
   for (int tile_idx = 0; tile_idx < total_tiles; ++tile_idx) {
@@ -272,7 +281,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
     transpose.transpose_pair(
         flatten(sVSrc(_, 0, 0)), flatten(sVtDst(_, 0, 0)), flatten(sVSrc(_, 0, 1)), flatten(sVtDst(_, 0, 1)));
     fence_view_async_shared();
-    __syncthreads();
+    warpgroup_sync();
 
     sm90::gemm_ss(true, TiledMmaQK{}, sQ, sK, rP, tid);
     warpgroup_commit_batch();
@@ -334,7 +343,7 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
       const int next_stage = next_tile_idx % kNumStages;
       const int next_phase = (next_tile_idx / kNumStages) & 1;
       mbarrier_wait(&storage.kv_ready[next_stage], next_phase);
-      __syncthreads();
+      warpgroup_sync();
     }
   }
 
