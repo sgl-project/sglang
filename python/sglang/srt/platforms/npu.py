@@ -56,13 +56,6 @@ class NPUDeviceMixin(DeviceMixin):
         return torch.npu.mem_get_info(device_id)
 
     def is_pin_memory_available(self, device=None) -> bool:
-        # Keep the pre-#36472 behavior: torch_npu's pinned-memory + non_blocking
-        # H2D path is not verified on this stack (suspected race in xgrammar
-        # bitmask / logits copies under retraction). Re-enable only after the
-        # async-copy semantics are validated against CANN.
-        # TODO: Re-enable pin_memory (return True) only after validating the
-        # pinned-memory async-copy stream semantics on CANN, and making sure
-        # DP attention no longer hangs with pin_memory=True (see #36472).
         return False
 
     @classmethod
