@@ -1471,9 +1471,7 @@ class KimiK3DeltaAttention(nn.Module):
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = (
-            quant_config is None and self.attn_tp_size == self.tp_size
-        )
+        self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
