@@ -10,6 +10,29 @@ from .descriptors import StateManifest, resolve_dtype
 from .traversal import iter_modules, snapshot_module
 
 
+def register_tensor(
+    module: nn.Module,
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    is_param: bool,
+    persistent: bool = True,
+) -> None:
+    """Register an already reconstructed object without breaking exact ties.
+
+    Shared with SRT's setter. Finalized state can change registration kind
+    (e.g. quantization turns an original parameter into a buffer).
+    """
+    if is_param:
+        setattr(module, name, tensor)
+    else:
+        if name in module._parameters:
+            del module._parameters[name]
+        elif hasattr(module, name) and name not in module._buffers:
+            delattr(module, name)
+        module.register_buffer(name, tensor, persistent=persistent)
+
+
 def _supported_metadata(value, visited: set[int]) -> bool:
     if (
         value is None
@@ -119,14 +142,13 @@ def import_state(
     for descriptor in manifest.tensors:
         parent, _, name = descriptor.name.rpartition(".")
         child = modules[parent]
-        if descriptor.kind == "parameter":
-            child._parameters[name] = replacements[descriptor.name]
-        else:
-            child._buffers[name] = replacements[descriptor.name]
-            if descriptor.persistent:
-                child._non_persistent_buffers_set.discard(name)
-            else:
-                child._non_persistent_buffers_set.add(name)
+        register_tensor(
+            child,
+            name,
+            replacements[descriptor.name],
+            is_param=descriptor.kind == "parameter",
+            persistent=descriptor.persistent,
+        )
     # Do not call train()/eval(): recursive calls would overwrite a child's
     # independently recorded mode and may invoke model-specific side effects.
     for name, mode in manifest.training:

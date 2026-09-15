@@ -22,6 +22,7 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -130,6 +131,44 @@ class TestProtocolFraming(CustomTestCase):
 
 
 class TestTransportBackend(CustomTestCase):
+    def test_prepare_is_static_and_every_fetch_serializes_afresh(self):
+        backend = TorchIpcTransportBackend(max_deliveries=2)
+        with patch(
+            "sglang.srt.weight_cache.transport.MultiprocessingSerializer.serialize",
+            side_effect=["first-counted-send", "second-counted-send"],
+        ) as serialize:
+            entries = backend.prepare_export({"x": (torch.zeros(1), True)})
+            serialize.assert_not_called()
+            self.assertNotIn("handle", entries["x"])
+            a, b = socket.socketpair()
+            try:
+                handles = []
+                for _ in range(2):
+                    backend.send_fetch_state_response(
+                        a, config={}, entries=entries, pid=os.getpid()
+                    )
+                    delivered = recv_msg(b)["entries"]["x"]
+                    self.assertNotIn("tensor", delivered)
+                    handles.append(delivered["handle"])
+                self.assertEqual(handles, ["first-counted-send", "second-counted-send"])
+                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                    backend.send_fetch_state_response(
+                        a, config={}, entries=entries, pid=os.getpid()
+                    )
+                self.assertEqual(serialize.call_count, 2)
+            finally:
+                a.close()
+                b.close()
+
+    def test_uuid_patch_also_allows_cpu_serialization(self):
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        monkey_patch_torch_reductions()
+        backend = TorchIpcTransportBackend()
+        entries = backend.prepare_export({"x": (torch.arange(4), False)})
+        tensor = backend.import_tensor(backend.export_entries(entries)["x"])
+        torch.testing.assert_close(tensor, torch.arange(4))
+
     def test_default_backend_is_torch_ipc(self):
         backend = get_client_transport_backend(None)
         self.assertEqual(backend.name, TORCH_IPC_BACKEND)
@@ -459,6 +498,53 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
     """
 
     KEY = "test-daemon-mode-refuses-disk-load"
+
+    def test_shared_watchdog_starts_before_first_import(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        loader = IpcModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+        events = []
+        model = torch.nn.Linear(1, 1)
+        with (
+            patch.object(
+                loader,
+                "_fetch_from_cache",
+                return_value={"entries": {}, "pid": os.getpid()},
+            ),
+            patch(
+                "sglang.srt.model_loader.loader._get_quantization_config",
+                return_value=None,
+            ),
+            patch("sglang.srt.weight_cache.ipc_loader.ProducerWatchdog") as watchdog,
+            patch.object(
+                loader,
+                "_load_zero_copy_mode",
+                side_effect=lambda *args: events.append("import") or model,
+            ),
+            patch.object(loader, "_rebuild_stale_views"),
+        ):
+            watchdog.side_effect = lambda identity: (
+                events.append("watch") or unittest.mock.Mock()
+            )
+            result = loader.load_model(
+                model_config=self._model_config(), device_config=None
+            )
+            self.assertEqual(events, ["watch", "import"])
+            self.assertIs(result, model)
+            self.assertIs(result._weight_cache_watchdog, loader._daemon_watchdog)
+
+    def test_shared_registration_preserves_nonpersistent_buffer(self):
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        model = torch.nn.Linear(1, 1)
+        value = torch.ones(1, 1)
+        IpcModelLoader._set_module_tensor(
+            model, "weight", value, is_param=False, persistent=False
+        )
+        self.assertIs(model.weight, value)
+        self.assertNotIn("weight", model.state_dict())
+        self.assertNotIn("weight", dict(model.named_parameters()))
 
     def _model_config(self):
         from types import SimpleNamespace

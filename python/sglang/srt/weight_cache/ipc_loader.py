@@ -8,9 +8,7 @@ available). Engine depends on daemon staying alive.
 
 import logging
 import os
-import signal
 import stat
-import threading
 import time
 from typing import Optional
 
@@ -24,6 +22,8 @@ from sglang.srt.model_loader.loader import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.weight_cache_common.liveness import ProcessIdentity, ProducerWatchdog
+from sglang.weight_cache_common.mapping import register_tensor
 
 from .protocol import (
     CacheConfig,
@@ -38,9 +38,6 @@ from .protocol import (
 from .transport import TORCH_IPC_BACKEND, get_client_transport_backend
 
 logger = logging.getLogger(__name__)
-
-# How often the client polls the serving daemon's PID for liveness.
-_DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
 
 class IpcModelLoader(BaseModelLoader):
@@ -149,6 +146,9 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
+        # Protect the first mapping and all subsequent initialization, not just
+        # the returned model. Failed partial imports may retain traceback refs.
+        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
         model = self._load_zero_copy_mode(
             model_config,
             device_config,
@@ -171,7 +171,8 @@ class IpcModelLoader(BaseModelLoader):
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
-        self._start_daemon_liveness_watchdog(cache_data.get("pid"))
+        model._weight_cache_watchdog = self._daemon_watchdog
+        self._daemon_watchdog.check_alive()
 
         logger.info(
             f"[IpcModelLoader] Loaded model via IPC (mode={self.weight_cache_mode}), "
@@ -181,48 +182,8 @@ class IpcModelLoader(BaseModelLoader):
         return model.eval()
 
     def _start_daemon_liveness_watchdog(self, daemon_pid: Optional[int]) -> None:
-        """Fail loud if the serving daemon dies while we hold its weights.
-
-        In both client and (engine-spawned) daemon mode, the model's param.data
-        points into the daemon's GPU memory via CUDA IPC, and CUDA graphs may
-        capture those addresses. If the daemon exits, the pointers dangle:
-        forward passes would read freed GPU memory -> illegal-address crashes or
-        silent garbage. There is no safe in-place recovery, so a background
-        thread polls the daemon PID and, on death, SIGKILLs this process with a
-        clear message instead of letting it serve corrupt results.
-        """
-        if not daemon_pid or daemon_pid <= 0:
-            logger.warning(
-                "[IpcModelLoader] Daemon did not report a PID; skipping the "
-                "daemon-liveness watchdog. A daemon crash will not be detected."
-            )
-            return
-
-        def _daemon_alive(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True  # exists but owned by another user
-            return True
-
-        def _watch() -> None:
-            while True:
-                time.sleep(_DAEMON_LIVENESS_POLL_INTERVAL)
-                if not _daemon_alive(daemon_pid):
-                    logger.critical(
-                        f"[IpcModelLoader] Weight cache daemon (pid={daemon_pid}) "
-                        f"died while this engine holds its weights via CUDA IPC. "
-                        f"The mapped weight pointers are now dangling; continuing "
-                        f"would read freed GPU memory. Terminating this process."
-                    )
-                    os.kill(os.getpid(), signal.SIGKILL)
-                    return
-
-        threading.Thread(
-            target=_watch, name="weight-cache-daemon-watchdog", daemon=True
-        ).start()
+        """Use the shared pidfd/PID-start-identity, zombie-aware guard."""
+        self._daemon_watchdog = ProducerWatchdog(ProcessIdentity.read(daemon_pid))
         logger.info(
             f"[IpcModelLoader] Started daemon-liveness watchdog for pid={daemon_pid}"
         )
@@ -272,7 +233,7 @@ class IpcModelLoader(BaseModelLoader):
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
+    def _set_module_tensor(model, name, tensor, is_param=True, persistent=True):
         """Replace or register a parameter/buffer in the model by its full dotted name.
 
         This is necessary because setting param.data on a meta-device tensor
@@ -292,18 +253,10 @@ class IpcModelLoader(BaseModelLoader):
         if is_param:
             # requires_grad=False: the IPC memory is shared/read-only and SGLang
             # is inference-only, so autograd must never write into it.
-            new_param = nn.Parameter(tensor, requires_grad=False)
-            setattr(obj, leaf_name, new_param)
-        else:
-            # register_buffer raises KeyError if the name already exists as a
-            # parameter or plain attribute (not a buffer). This happens when
-            # process_weights_after_loading converts a parameter to a buffer
-            # (e.g. Mamba's A_log). Remove the old attribute first.
-            if leaf_name in obj._parameters:
-                del obj._parameters[leaf_name]
-            elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
-                delattr(obj, leaf_name)
-            obj.register_buffer(leaf_name, tensor)
+            tensor = nn.Parameter(tensor, requires_grad=False)
+        register_tensor(
+            obj, leaf_name, tensor, is_param=is_param, persistent=persistent
+        )
 
     def _load_zero_copy_mode(
         self,
@@ -345,7 +298,9 @@ class IpcModelLoader(BaseModelLoader):
             name: param
             for name, param in model.named_parameters(remove_duplicate=False)
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_buffers = {
+            name: buf for name, buf in model.named_buffers(remove_duplicate=False)
+        }
         existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
@@ -379,7 +334,13 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            self._set_module_tensor(
+                model,
+                name,
+                imported_tensor,
+                is_param=is_param,
+                persistent=entry.get("persistent", True),
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 

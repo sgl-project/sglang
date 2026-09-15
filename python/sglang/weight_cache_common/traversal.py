@@ -32,10 +32,13 @@ class StateSnapshot:
     storages: dict[str, torch.UntypedStorage]
 
 
-def snapshot_module(module: nn.Module) -> StateSnapshot:
-    entries, training = [], []
+def iter_state(module: nn.Module):
+    """Yield every registered path with kind/persistence, preserving exact ties.
+
+    Unlike snapshot_module this does not impose a component adapter's tensor
+    schema restrictions; the SRT exporter also uses it for buffer metadata.
+    """
     for prefix, child in iter_modules(module):
-        training.append((prefix, child.training))
         for kind, iterator in (
             (
                 "parameter",
@@ -48,7 +51,12 @@ def snapshot_module(module: nn.Module) -> StateSnapshot:
                 persistent = (
                     kind == "parameter" or name not in child._non_persistent_buffers_set
                 )
-                entries.append((path, kind, persistent, tensor))
+                yield path, kind, persistent, tensor
+
+
+def snapshot_module(module: nn.Module) -> StateSnapshot:
+    entries = list(iter_state(module))
+    training = [(prefix, child.training) for prefix, child in iter_modules(module)]
 
     tensor_groups, storage_groups = {}, {}
     tensors, storages, descriptions, storage_descriptions = {}, {}, [], []

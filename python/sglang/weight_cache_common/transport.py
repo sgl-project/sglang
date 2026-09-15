@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One-shot, storage-level Torch CUDA IPC deliveries.
+"""Component storage ownership on the shared SRT Torch IPC backend.
 
-This is deliberately separate from SRT's legacy replayable state_entries API.
-Only descriptors are reusable. Every export below creates new counted sends.
+SRT owns tensor serialization, UUID mapping and IPC reconstruction. This layer
+adds component manifests, storage deduplication, generations and lifetime guards.
+Only descriptors are reusable. Every delivery creates new counted sends.
 Abandoned sends and fatal consumers may retain PyTorch bookkeeping until the
 producer exits; a non-refundable generation budget bounds that exposure.
 """
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.multiprocessing.reductions import StorageWeakRef
+
+from sglang.srt.weight_cache.transport import TorchIpcTransportBackend
 
 from .descriptors import StateManifest
 from .liveness import ProcessIdentity, ProducerWatchdog
@@ -40,37 +43,19 @@ class ExportGeneration:
 @dataclass(frozen=True)
 class StorageHandle:
     group: str
-    handle: bytes | None
     nbytes: int
-    allocation_offset: int
-    counter_handle: bytes | None
-    counter_offset: int
-    event_handle: bytes | None
-    event_sync_required: bool
+    entry: dict
 
     def validate(self, nbytes: int) -> None:
         if type(self.nbytes) is not int or self.nbytes != nbytes:
             raise ValueError(f"IPC storage size mismatch: {self.group}")
-        for value in (self.allocation_offset, self.counter_offset):
-            if type(value) is not int or value < 0:
-                raise ValueError(f"Invalid IPC offset: {self.group}")
-        if type(self.event_sync_required) is not bool:
-            raise ValueError("Invalid IPC synchronization flag")
-        if not nbytes:
-            if self.handle is not None or self.counter_handle is not None:
-                raise ValueError("Empty IPC storage must not own a send reference")
-            return
-        # This is a PyTorch allocator handle, NOT a raw cudaIpcMemHandle_t.
-        # Recent Torch versions prefix its 64-byte CUDA payload with a format
-        # tag. Keep it opaque and bounded; Torch validates its private format.
-        if not isinstance(self.handle, bytes) or not 0 < len(self.handle) <= 4096:
-            raise ValueError("Invalid CUDA allocation handle")
-        if not isinstance(self.counter_handle, bytes) or not self.counter_handle:
-            raise ValueError("Missing CUDA IPC send counter")
-        if self.event_sync_required and (
-            not isinstance(self.event_handle, bytes) or len(self.event_handle) != 64
+        if (
+            self.entry.get("shape") != [nbytes]
+            or self.entry.get("dtype") != "uint8"
+            or self.entry.get("device_type") != "cuda"
+            or not isinstance(self.entry.get("handle"), str)
         ):
-            raise ValueError("Missing CUDA IPC synchronization event")
+            raise ValueError(f"Invalid storage tensor entry: {self.group}")
 
 
 @dataclass(frozen=True)
@@ -143,6 +128,10 @@ class CudaIpcExporter:
                 )
         self._module = module
         self._views = storage_byte_views(self._snapshot)
+        self._backend = TorchIpcTransportBackend(max_deliveries=max_deliveries)
+        self._prepared = self._backend.prepare_export(
+            {group: (view, False) for group, view in self._views.items()}
+        )
         # Finalization may have used non-default streams. Publish no generation
         # until every producer-side write on this device has completed.
         torch.cuda.synchronize(self._device)
@@ -158,7 +147,6 @@ class CudaIpcExporter:
         self._requests: set[str] = set()
         self._storage_exports = 0
         self._failed_deliveries = 0
-        self._event_exports = 0
         self._stopped = False
         self._lock = threading.Lock()
 
@@ -190,38 +178,16 @@ class CudaIpcExporter:
                 )
             self._requests.add(request_id)
             self._storage_exports += count
-            handles = []
             try:
-                for group, view in self._views.items():
-                    if not view.numel():
-                        # Torch returns None flags for empty storage. There is
-                        # no send reference or CUDA mapping to transfer.
-                        handles.append(
-                            StorageHandle(group, None, 0, 0, None, 0, None, False)
-                        )
-                        continue
-                    # This API creates a new send reference even when the
-                    # allocation handle itself is unchanged. Do not memoize it.
-                    _, handle, size, offset, counter, counter_offset, event, sync = (
-                        view.untyped_storage()._share_cuda_()
-                    )
-                    self._event_exports += int(bool(sync))
-                    entry = StorageHandle(
-                        group,
-                        handle,
-                        size,
-                        offset,
-                        counter,
-                        counter_offset,
-                        event,
-                        sync,
-                    )
-                    entry.validate(view.numel())
-                    handles.append(entry)
+                entries = self._backend.export_entries(self._prepared)
+                handles = tuple(
+                    StorageHandle(group, self._views[group].numel(), entry)
+                    for group, entry in entries.items()
+                )
             except Exception:
                 self._failed_deliveries += 1
                 raise
-            return IpcDelivery(self.generation, request_id, tuple(handles))
+            return IpcDelivery(self.generation, request_id, handles)
 
     def stop_admission(self) -> None:
         with self._lock:
@@ -234,7 +200,6 @@ class CudaIpcExporter:
                 "deliveries_reserved": len(self._requests),
                 "storage_exports_reserved": self._storage_exports,
                 "failed_deliveries": self._failed_deliveries,
-                "event_exports": self._event_exports,
                 "max_deliveries": self._max_deliveries,
                 "max_storage_exports": self._max_storage_exports,
                 "admission_stopped": self._stopped,
@@ -253,19 +218,6 @@ _received_lock = threading.Lock()
 _MAX_RECEIVED_DELIVERIES = 4096
 
 
-def _open_storage(handle: StorageHandle, device: int) -> torch.UntypedStorage:
-    return torch.UntypedStorage._new_shared_cuda(
-        device,
-        handle.handle,
-        handle.nbytes,
-        handle.allocation_offset,
-        handle.counter_handle,
-        handle.counter_offset,
-        handle.event_handle,
-        handle.event_sync_required,
-    )
-
-
 class CudaIpcImporter:
     """Generation-bound imports with liveness active before the first mapping."""
 
@@ -281,6 +233,7 @@ class CudaIpcImporter:
         self.manifest = manifest
         self._live_storages: list[StorageWeakRef] = []
         self._closed = False
+        self._backend = TorchIpcTransportBackend()
         self._guard = ProducerWatchdog(generation.producer)
         try:
             matches = [
@@ -319,13 +272,6 @@ class CudaIpcImporter:
             raise ValueError("IPC delivery storage groups differ")
         for handle in delivery.storages:
             handle.validate(expected[handle.group])
-        allocation_views = [
-            (handle.handle, handle.allocation_offset)
-            for handle in delivery.storages
-            if handle.nbytes
-        ]
-        if len(set(allocation_views)) != len(allocation_views):
-            raise ValueError("Distinct storage groups repeat the same IPC storage")
         self._guard.check_alive()
         key = (os.getpid(), self.generation.nonce, request_id)
         with _received_lock:
@@ -339,19 +285,12 @@ class CudaIpcImporter:
         views = {}
         for handle in delivery.storages:
             self._guard.check_alive()
-            if handle.nbytes:
-                # A separate storage wrapper per counted send owns its one
-                # release. Torch internally shares the CUDA allocation mapping.
-                storage = _open_storage(handle, self._device)
-                # Track immediately: a later import failure's traceback may
-                # itself retain this mapping after receive() raises.
-                self._live_storages.append(StorageWeakRef(storage))
-                view = torch.empty(0, dtype=torch.uint8, device=self._device).set_(
-                    storage, 0, (handle.nbytes,), (1,)
-                )
-            else:
-                view = torch.empty(0, dtype=torch.uint8, device=self._device)
-                self._live_storages.append(StorageWeakRef(view.untyped_storage()))
+            view = self._backend.import_tensor(handle.entry)
+            # Track immediately, including references held by error tracebacks.
+            # Torch's shared storage cache releases duplicate sends itself.
+            self._live_storages.append(StorageWeakRef(view.untyped_storage()))
+            if view.device != torch.device("cuda", self._device):
+                raise ValueError("Imported storage is on the wrong physical GPU")
             views[handle.group] = view
         self._guard.check_alive()
         import_state(module, self.manifest, views)

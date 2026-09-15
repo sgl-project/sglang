@@ -6,10 +6,13 @@ the bounded generation policy retains those until the producer exits. No test
 repairs counters. CPU manifest/mapping tests live in test_weight_cache_common.py.
 """
 
+import base64
 import gc
+import io
 import json
 import multiprocessing as mp
 import os
+import pickle
 import signal
 import statistics
 import struct
@@ -25,7 +28,6 @@ import torch
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.weight_cache_common import transport
 from sglang.weight_cache_common.transport import (
     CudaIpcExporter,
     CudaIpcImporter,
@@ -100,19 +102,21 @@ def _consumer(conn, action):
             conn.recv()  # producer-death test: watcher must kill us here
             raise AssertionError("Lost producer was not detected before import")
         if action == "partial":
-            original = transport._open_storage
+            original = importer._backend.import_tensor
             calls = 0
 
-            def fail_second(handle, device):
+            def fail_second(entry):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise RuntimeError("injected partial import")
-                return original(handle, device)
+                return original(entry)
 
             module = _model("meta")
             retained_error = None
-            with patch.object(transport, "_open_storage", side_effect=fail_second):
+            with patch.object(
+                importer._backend, "import_tensor", side_effect=fail_second
+            ):
                 try:
                     importer.receive(
                         deliveries[0], module, request_id=deliveries[0].request_id
@@ -210,12 +214,30 @@ def _producer(conn):
         conn.close()
 
 
+def _reduction_args(handle):
+    # Inspect our own trusted test payload WITHOUT importing/consuming its send.
+    # Production keeps the serializer payload opaque and uses the SRT backend.
+    class InspectReduction(pickle.Unpickler):
+        def find_class(self, module, name):
+            if name in ("_rebuild_cuda_tensor_modified", "rebuild_cuda_tensor"):
+                return lambda *args: args
+            return super().find_class(module, name)
+
+    return InspectReduction(io.BytesIO(base64.b64decode(handle.entry["handle"]))).load()
+
+
+def _counter_token(handle):
+    args = _reduction_args(handle)
+    return args[11], args[12]
+
+
 def _counter(handle):
     # Review-only Linux diagnostic for RefcountedMapAllocator's 64-byte prefix.
     # Each test verifies the initial count is 1 before relying on this layout.
-    path = Path("/dev/shm") / os.fsdecode(handle.counter_handle).lstrip("/")
+    counter_handle, counter_offset = _counter_token(handle)
+    path = Path("/dev/shm") / os.fsdecode(counter_handle).lstrip("/")
     with path.open("rb") as stream:
-        stream.seek(64 + handle.counter_offset * 8)
+        stream.seek(64 + counter_offset * 8)
         return struct.unpack("<q", stream.read(8))[0]
 
 
@@ -280,11 +302,7 @@ class TestWeightCacheCommonIpc(unittest.TestCase):
         seen = set()
         for _ in range(3):
             delivery = self._delivery(exporter)
-            tokens = {
-                (h.counter_handle, h.counter_offset)
-                for h in delivery.storages
-                if h.nbytes
-            }
+            tokens = {_counter_token(h) for h in delivery.storages if h.nbytes}
             self.assertTrue(seen.isdisjoint(tokens))
             seen.update(tokens)
             process, connection = self._start(

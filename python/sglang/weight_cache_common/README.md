@@ -1,9 +1,11 @@
 # Weight-cache correctness foundations (Phase 0A)
 
-This opt-in package is the first diffusion fast-recovery implementation stage.
-It does **not** enable a diffusion cache CLI, start a daemon, change existing
-loaders, or modify SRT's legacy weight-cache transport. Those integrations follow
-only after the preparation/admission and model-parity gates pass.
+This package contains shared correctness primitives for SRT and diffusion.
+Component export/import delegates to SRT's `TorchIpcTransportBackend`, including
+`MultiprocessingSerializer` and its physical-device UUID reduction patch. SRT's
+daemon now retains prepared tensors and serializes afresh on each fetch; SRT also
+uses the shared state traversal and producer watchdog. Diffusion CLI/model
+integration follows the preparation/admission and model-parity gates.
 
 ## State model
 
@@ -55,10 +57,11 @@ tests use PyTorch 2.13.0+cu130; private Torch IPC compatibility is version-check
    have stopped using them. Disconnecting a socket does not release ownership.
    `stop_admission()` rejects new fetches but frees no weights.
 
-The allocation handle is opaque PyTorch metadata, not necessarily a raw 64-byte
-CUDA handle. Its counted-send metadata is never cached as a reusable payload.
-There is one import/release owner per storage send; tensor views do not create
-extra sends. `expandable_segments` is rejected, including runtime configuration.
+The serializer payload stays opaque; there is no parallel private-Torch wire
+format. It is never cached as a reusable payload. Torch's rebuild routine owns
+release accounting, including consuming a fresh send when a storage mapping is
+already cached in that process. Tensor views/ties do not create extra sends.
+`expandable_segments` is rejected, including runtime configuration.
 
 `CudaIpcImporter.close()` refuses while any imported C++ storage is still live,
 including detached views or a partial-import exception traceback. Process-local
@@ -77,7 +80,9 @@ uses a non-refundable per-generation budget, by default **128 delivery attempts*
 and **65,536 storage-export reservations**. Empty storage reservations are counted
 conservatively too. Rejections happen before another export; partial failures do
 not refund reservations. `stats()` reports reservations, limits, failed exports,
-cumulative event-bearing exports, unique weight bytes and admission state.
+unique weight bytes and admission state. The shared SRT backend additionally
+bounds deliveries (128 by default); component callers supply the same configured
+limit. Event/refcounter internals are inspected only in diagnostics/tests.
 
 When exhausted, coordinate a consumer drain and producer restart. The defaults
 are safety bounds, not tuned production lifetime promises. A future control

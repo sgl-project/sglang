@@ -443,28 +443,25 @@ class WeightCacheDaemon:
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
-            if name not in state_dict_names:
+        from sglang.weight_cache_common.traversal import iter_state
+
+        state_metadata = list(iter_state(self.model))
+        for name, kind, persistent, buf in state_metadata:
+            if kind == "buffer" and name not in state_dict_names:
                 state_tensors[name] = (buf.data, False)
                 non_persistent_count += 1
 
         self.transport_backend = choose_daemon_transport_backend(state_tensors)
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name, kind, persistent, _ in state_metadata:
+            if name in self.state_entries:
+                self.state_entries[name]["persistent"] = persistent
 
-        # Log approximate serialized metadata size (not payload-backed bytes).
-        # Only the handle blob carries real weight, so measure it directly:
-        # stringifying every entry would allocate a copy of all handles.
-        total_bytes = sum(
-            len(handle)
-            for handle in (entry.get("handle") for entry in self.state_entries.values())
-            if isinstance(handle, (str, bytes, bytearray))
-        )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} tensors "
+            f"Prepared {len(self.state_entries)} tensors "
             f"({non_persistent_count} non-persistent buffers), "
-            f"transport={self.transport_backend.name}, "
-            f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+            f"transport={self.transport_backend.name}; fresh IPC reductions per fetch"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
@@ -607,15 +604,15 @@ class WeightCacheDaemon:
             )
 
     def shutdown(self):
-        """Release GPU memory and clean up."""
+        """Stop serving; retain exported allocations until process exit.
+
+        A client watches our process identity, not Python object lifetimes.
+        Clearing model/state while this process is still alive would leave a
+        window where its live-producer check succeeds on freed allocations.
+        """
+        self._running = False
         if dist.is_initialized():
             dist.destroy_process_group()
-        if self.model is not None:
-            del self.model
-            self.model = None
-        self.state_entries.clear()
-        current_platform.empty_cache()
-        self._running = False
 
 
 def run_weight_cache_daemon(
