@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionPatchMerger, Qwen2_5_VLMLP
+from sglang.srt.models.utils import permute_inv
 from sglang.srt.runtime_context import get_mm, get_server_args
 from sglang.srt.utils import add_prefix
 
@@ -410,9 +411,7 @@ class MiMoVisionTransformer(nn.Module):
         window_index_1d_col = self.get_window_index_1d(grid_thw, col=True).to(
             device=x.device
         )
-        reverse_window_index_1d_col = torch.argsort(window_index_1d_col).to(
-            device=x.device
-        )
+        reverse_window_index_1d_col = permute_inv(window_index_1d_col)
 
         rotary_pos_emb = rotary_pos_emb.to(device=x.device)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
