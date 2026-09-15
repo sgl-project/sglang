@@ -10,7 +10,70 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.runtime.pipelines_core.candidates import (
+    CandidateTrajectorySpec,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+def _runtime_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = value.lower()
+        if value == "auto":
+            return default
+        if value in ("true", "1", "yes"):
+            return True
+        if value in ("false", "0", "no"):
+            return False
+    return bool(value)
+
+
+def _build_candidate_spec(
+    options: dict[str, Any], batch_size: int
+) -> CandidateTrajectorySpec | None:
+    """Build the opt-in candidate-trajectory spec (see #35331 and
+    ``runtime.pipelines_core.candidates``) from request options, or None to
+    keep today's single-output behavior unchanged.
+
+    ``candidate_count`` is the only required knob: a client asking for more
+    than one candidate gets a "mean" reduction by default (Cosmos3's action
+    output is a continuous action-chunk tensor, so a per-channel mean is the
+    framework-registered reducer that applies without a model-specific rule).
+
+    Restricted to ``batch_size == 1``: candidates are trajectories for *one*
+    logical observation (the RFC's "one logical request" framing), which is
+    a different batch axis than this endpoint's multi-image batching above
+    -- combining them would leave it ambiguous whether each candidate group
+    is per-image or shared, so a multi-image request with candidate_count
+    set is rejected rather than guessed at.
+
+    Not wired to ``--batching-max-size``: that governs the multi-image batch
+    axis above (merging different observations into one physical batch),
+    not a single request's own candidate count, which today's scheduler
+    always executes in full (as one physical batch, or sequentially per
+    ``supports_sequential_multi_output_inference()`` -- never truncated). A
+    real execution-batch ceiling for candidate groups is scheduler-internal
+    state and belongs in the phase-3 scheduling work the RFC's rollout plan
+    defers until after this adapter is benchmarked.
+    """
+    candidate_count = options.get("candidate_count")
+    if candidate_count is None:
+        return None
+    candidate_count = int(candidate_count)
+    if candidate_count == 1:
+        return None
+    if batch_size != 1:
+        raise ValueError(
+            "candidate_count > 1 requires exactly one observation image "
+            f"(one candidate group per logical request), got {batch_size}"
+        )
+    return CandidateTrajectorySpec(
+        count=candidate_count,
+        reducer=str(options.get("candidate_reducer", "mean")),
+        return_candidates=_runtime_bool(options.get("return_candidates"), False),
+    )
 
 
 def cosmos3_action_metadata(server_args: ServerArgs) -> dict[str, Any]:
@@ -60,7 +123,7 @@ def cosmos3_action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "batch_inputs": max_batch_size > 1,
             "max_batch_size": max_batch_size,
             "batched_action_modes": ["policy"],
-            "multiple_candidates": False,
+            "multiple_candidates": True,
         },
     }
 
@@ -199,8 +262,25 @@ def build_cosmos3_action_sampling_params(
     if action_mode != "policy" and not isinstance(prompt, str):
         raise ValueError("Cosmos3 inverse_dynamics prompt must be a string")
     prompt = _action_prompt(prompt, batch_size)
+    candidate_spec = _build_candidate_spec(options, batch_size)
+    if candidate_spec is not None:
+        # Fan out the single image/prompt into candidate_spec.count physical
+        # copies (see #35331's "Expand/fan out conditioning and build
+        # candidate batch" step) by reusing this endpoint's existing
+        # multi-image batch-axis machinery: the pipeline stages downstream
+        # already turn a same-length image/prompt list into a batch of that
+        # size, and derive_candidate_generators (wired into
+        # InputValidationStage._generate_seeds) gives each physical batch
+        # item its own independent, stably-derived RNG stream rather than
+        # sharing one draw across the batch.
+        image_path = [images[0]] * candidate_spec.count
+        prompt = _action_prompt(prompt if isinstance(prompt, str) else prompt[0], candidate_spec.count)
     sampling_kwargs = {
         "request_id": payload.get("request_id") or payload.get("id"),
+        "candidate_spec": candidate_spec,
+        "num_outputs_per_prompt": (
+            candidate_spec.count if candidate_spec is not None else None
+        ),
         "prompt": prompt,
         "image_path": image_path,
         "video_path": video_path,
