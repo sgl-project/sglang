@@ -539,8 +539,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     (``force_reasoning=True`` covers this).
 
     Post-reasoning content is unwrapped from the XTML ``response`` /
-    ``message`` markers; a ``tools`` channel is passed through raw for the
-    kimi_k3 tool-call detector.
+    ``message`` markers; a ``tools`` channel is passed through raw only when
+    the kimi_k3 tool-call detector is active.
 
     The model does not always honour the pre-filled think channel: on very long
     prompts (~1M tokens) it sometimes emits a zero-length think section and
@@ -559,6 +559,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tool_call_parser_active: bool = False,
     ):
         # strict-thinking flattens these to single token ids, so the full marker
         # "<|open|>response<|sep|>" is inexpressible. The bare name works: it
@@ -587,6 +588,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         # Unlike the base class, K3 cannot use `normal_text == ""` alone:
         # skipped-think and truncated marker-free reasoning end up identical.
         self._force_nonempty_content = force_nonempty_content
+        self._tool_call_parser_active = tool_call_parser_active
         self._reasoning_done = False
         self._tools_passthrough = False
         self._stream_text = ""
@@ -596,7 +598,10 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
         if tools_idx != -1:
-            return strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
+            content = strip_response_wrappers(text[:tools_idx])
+            if self._tool_call_parser_active:
+                return content + text[tools_idx:]
+            return content
         return strip_response_wrappers(text)
 
     def _next_channel_idx(self, text: str, start: int = 0) -> int:
@@ -759,7 +764,19 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def finish(self) -> StreamingParseResult:
         self._streamed_reasoning.clear()
         if not self._force_nonempty_content:
-            return super().finish()
+            result = super().finish()
+            if not self._tool_call_parser_active:
+                normal_suffix_len = partial_suffix_len(result.normal_text, [TOOLS_OPEN])
+                reasoning_suffix_len = partial_suffix_len(
+                    result.reasoning_text, [TOOLS_OPEN]
+                )
+                if normal_suffix_len:
+                    result.normal_text = result.normal_text[:-normal_suffix_len]
+                if reasoning_suffix_len:
+                    result.reasoning_text = result.reasoning_text[
+                        :-reasoning_suffix_len
+                    ]
+            return result
         text, self._stream_text = self._stream_text, ""
         if self._in_reasoning and self._is_skipped_think_answer(text):
             # _in_reasoning means no channel decision happened mid-stream, so the
@@ -788,7 +805,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             self._buffer = buf[len(emit) :]
             if self._discard_delayed_think_close:
                 emit = emit.replace(self.think_end_token, "")
-            return emit
+            return emit if self._tool_call_parser_active else ""
 
         tools_idx = buf.find(TOOLS_OPEN)
         if tools_idx != -1:
@@ -807,7 +824,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 head = head.replace(self.think_end_token, "")
                 tail = tail.replace(self.think_end_token, "")
             self._tools_passthrough = True
-            return head + tail
+            return head + tail if self._tool_call_parser_active else head
 
         markers = [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
         if self._discard_delayed_think_close:
