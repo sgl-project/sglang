@@ -53,6 +53,14 @@ ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
+# Optional device-resident ordering-edge runtime (ROCm/rocm-systems#11212).
+# Selects which stage supplies the patched ROCr/CLR libs swapped into the final
+# image. Default = the empty no-op stage, so the daily image builds nothing extra.
+# To build the ordering-edge variant (rocm1000 flavors only):
+#   docker build --build-arg GPU_ARCH=gfx950-rocm1000 \
+#     --build-arg ORDERING_EDGE_SRC=ordering_edge_build -f rocm.Dockerfile .
+ARG ORDERING_EDGE_SRC=ordering_edge_none
+
 # ===============================
 # Base image 942 with rocm700 and args
 FROM $BASE_IMAGE_942 AS gfx942
@@ -331,6 +339,114 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
 FROM scratch AS local_src
 COPY . /src
+
+# ===============================
+# Optional device-resident ordering-edge runtime (ROCm/rocm-systems#11212)
+#
+# Mirrors the standalone docker/rocm-ordering-edge.Dockerfile recipe, folded in
+# here so the daily image can build the ordering-edge variant directly. The heavy
+# ROCr + CLR rebuild lives in the ordering_edge_build stage; ORDERING_EDGE_SRC
+# selects whether the final stage pulls patched libs from it or from the empty
+# ordering_edge_none stage (default). Only meaningful for *-rocm1000 flavors: it
+# rebuilds from the exact rocm-systems commit the ROCm-10.0 base was built from,
+# so ROCr stays 1.21.0 (ABI-compatible) while gaining the #11212 series.
+FROM ${GPU_ARCH} AS ordering_edge_build
+ARG ROCM_SYSTEMS_REPO=https://github.com/ROCm/rocm-systems.git
+# Exact rocm-systems source the ROCm-10.0 base (_rocm_sdk 10.0.0) was built from
+# (ROCr 1.21.0 / HIP 7.15). Retarget together with the base for other ROCm SDKs.
+ARG ROCM_RUNTIME_COMMIT=6b0e43f341195e203754e08f850e437ff2fc09f9
+# Cumulative patch: #11212 (72ee0a5a..25e14349) cherry-picked onto ROCM_RUNTIME_COMMIT.
+ARG ORDERING_EDGE_PATCH=docker/ordering_edge_11212_on_rocm10.patch
+
+# Build deps for rocr-runtime + clr (the rocm1000 base ships clang under
+# $ROCM_HOME/llvm/bin, but not these -dev libs / cmake / ninja / xxd).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       g++ cmake ninja-build git \
+       libelf-dev libdrm-dev libnuma-dev libdw-dev xxd \
+       libglvnd-dev libgl1-mesa-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir CppHeaderParser
+
+# Bring the prebuilt cumulative patch into the image (build context is repo root).
+COPY ${ORDERING_EDGE_PATCH} /tmp/ordering_edge.patch
+
+# Sparse, blobless, shallow checkout of just the pieces the patch touches / we build.
+# rocprofiler-sdk is included ONLY so the patch applies cleanly; it is not compiled below.
+RUN git init -q /src-rocm && cd /src-rocm \
+    && git remote add origin ${ROCM_SYSTEMS_REPO} \
+    && git config core.sparseCheckout true \
+    && git config remote.origin.promisor true \
+    && git config remote.origin.partialclonefilter blob:none \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set projects/rocr-runtime projects/clr projects/hip projects/rocprofiler-sdk shared cmake \
+    && git fetch --filter=blob:none --depth 1 origin ${ROCM_RUNTIME_COMMIT} \
+    && git checkout -q FETCH_HEAD
+
+# Apply the cherry-picked #11212 series. --check first so a bad patch fails loudly and
+# early, before the (long) compile, rather than half-applying.
+RUN cd /src-rocm \
+    && git apply --check --verbose /tmp/ordering_edge.patch \
+    && git apply --whitespace=nowarn /tmp/ordering_edge.patch \
+    && echo "ordering-edge patch applied" \
+    && grep -q 'get_version("1.21.0")' projects/rocr-runtime/CMakeLists.txt \
+    && grep -q 'hsa_amd_signal_create_v2' projects/rocr-runtime/runtime/hsa-runtime/inc/hsa_ext_amd.h
+
+# ROCr's trap_handler/blit_shaders call find_package(Clang/LLVM REQUIRED) only to
+# get IMPORTED executables. The ROCm image ships the binaries but no CMake package
+# config, so supply a shim pointing at them.
+RUN mkdir -p /opt/rocm-cmake-shim \
+    && printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake \
+    && printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake
+
+# ROCr first, installed into /opt/rocm because the clr build below needs its headers.
+RUN cd /src-rocm/projects/rocr-runtime \
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DClang_DIR=/opt/rocm-cmake-shim \
+        -DLLVM_DIR=/opt/rocm-cmake-shim \
+    && cmake --build build --parallel "$(nproc)" \
+    && cmake --install build \
+    && cmake --install build --prefix /rocr-install --strip
+
+# CRITICAL: ROCM_KPACK_ENABLED=ON. The stock image libamdhip64 links librocm_kpack.so.0 and
+# parses fat binaries / registered kernels through it; the image's device code is a kpack archive
+# (_rocm_sdk_*/.kpack/rand_lib_gfx950.kpack). Building CLR with the default ROCM_KPACK_ENABLED=OFF
+# produces a libamdhip64 whose getDeviceKernel() map lookup is incompatible with that device code,
+# which SIGSEGVs on the very first kernel launch (independent of the ordering-edge patch). Enabling
+# kpack + pointing find_package(rocm-kpack) at the SDK cmake config is what makes the rebuild run.
+RUN KPACK_CMAKE=${ROCM_HOME}/lib/cmake/rocm-kpack \
+    && cd /src-rocm/projects/clr \
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCLR_BUILD_HIP=ON \
+        -DCLR_BUILD_OCL=OFF \
+        -DHIP_COMMON_DIR=/src-rocm/projects/hip \
+        -DROCM_PATH=/opt/rocm \
+        -DCMAKE_PREFIX_PATH="/opt/rocm;$KPACK_CMAKE" \
+        -Drocm-kpack_DIR="$KPACK_CMAKE" \
+        -DROCM_KPACK_ENABLED=ON \
+        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
+        -DLLVM_DIR=/opt/rocm-cmake-shim \
+        -DHIP_LLVM_ROOT=/opt/rocm/llvm \
+    && cmake --build build --parallel "$(nproc)" \
+    && cmake --install build --prefix /clr-install --strip \
+    && readelf -d /clr-install/lib/libamdhip64.so.7.* | grep -q librocm_kpack
+
+RUN mkdir -p /staging/lib \
+    && cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ \
+    && cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ \
+    && ls -l /staging/lib
+
+# No-op source: empty /staging so the default final image swaps nothing.
+FROM ${GPU_ARCH} AS ordering_edge_none
+RUN mkdir -p /staging/lib
+
+# ORDERING_EDGE_SRC (default ordering_edge_none) selects which of the two above
+# provides the libs the final stage copies in.
+FROM ${ORDERING_EDGE_SRC} AS ordering_edge_selected
 
 # ===============================
 # Chosen arch and args
@@ -1159,6 +1275,45 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 
 # torch 2.11 still Requires-Dist: triton-rocm after the swap above.
 RUN case "${GPU_ARCH}" in *-rocm724) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^ ;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+
+# -----------------------
+# Optional device-resident ordering-edge runtime swap (ROCm/rocm-systems#11212).
+#
+# Pull the (possibly empty) staged libs from the ORDERING_EDGE_SRC-selected stage
+# and overwrite the real files behind every libhsa-runtime64.so.1* / libamdhip64.so.7*
+# under the venv and /opt/rocm so the SONAME lookup resolves to the rebuilt library
+# everywhere (both _rocm_sdk_devel, which rocminfo loads, and _rocm_sdk_core, which
+# torch/HIP load via RPATH -- the actual inference path). When ORDERING_EDGE_SRC is
+# the default ordering_edge_none, /staging/lib is empty and this is a no-op, leaving
+# the daily image unchanged.
+COPY --from=ordering_edge_selected /staging/ /staging/
+RUN set -eux; \
+    if ls /staging/lib/libhsa-runtime64.so.1* >/dev/null 2>&1 \
+       && ls /staging/lib/libamdhip64.so.7* >/dev/null 2>&1; then \
+        hsa_src="$(readlink -f /staging/lib/libhsa-runtime64.so.1)"; \
+        hip_src="$(readlink -f /staging/lib/libamdhip64.so.7)"; \
+        test -s "$hsa_src"; test -s "$hip_src"; \
+        found_hsa=0; found_hip=0; \
+        for d in $(find /opt/venv /opt/rocm/lib -xdev -type f \
+                     \( -name 'libhsa-runtime64.so.1' -o -name 'libhsa-runtime64.so.1.*' \
+                        -o -name 'libamdhip64.so.7' -o -name 'libamdhip64.so.7.*' \) 2>/dev/null); do \
+            case "$(basename "$d")" in \
+                libhsa*)      cp -f --remove-destination "$hsa_src" "$d"; found_hsa=$((found_hsa+1));; \
+                libamdhip64*) cp -f --remove-destination "$hip_src" "$d"; found_hip=$((found_hip+1));; \
+            esac; \
+            echo "patched $d"; \
+        done; \
+        echo "ordering-edge: swapped libhsa=$found_hsa libamdhip64=$found_hip"; \
+        [ "$found_hsa" -ge 2 ] && [ "$found_hip" -ge 2 ]; \
+        ldconfig; \
+        echo 'export ROCPROFILER_QUEUE_INTERPOSITION=0' >> /etc/bash.bashrc; \
+        echo 'ROCPROFILER_QUEUE_INTERPOSITION=0' >> /etc/environment; \
+        mkdir -p /app; \
+        printf 'ORDERING_EDGE_PATCH: ROCm/rocm-systems#11212 (device-resident ordering edges)\n' > /app/ordering_edge_patch.txt; \
+    else \
+        echo "ordering-edge: disabled (ORDERING_EDGE_SRC=ordering_edge_none); no runtime swap"; \
+    fi; \
+    rm -rf /staging
 
 # -----------------------
 # Performance environment variable.
