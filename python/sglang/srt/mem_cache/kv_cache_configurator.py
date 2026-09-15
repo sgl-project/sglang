@@ -1621,6 +1621,8 @@ class KVCacheConfigurator:
         from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 
         index_buf_size = self._replicated_dsa_indexer_size(max_total_num_tokens)
+        pool_page_size = get_schedule().page_size
+        max_total_num_tokens += self.pool_page_size - pool_page_size
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
@@ -1655,8 +1657,7 @@ class KVCacheConfigurator:
             ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
-            page_size=self.pool_page_size,
-            index_page_size=get_schedule().page_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1886,7 +1887,6 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
-                    index_page_size=get_schedule().page_size,
                     index_buf_size=self._replicated_dsa_indexer_size(
                         max_total_num_tokens
                     ),
@@ -1943,8 +1943,12 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        pool_page_size = self.pool_page_size
+        if extra_args.get("use_dsa"):
+            pool_page_size = get_schedule().page_size
+            max_total_num_tokens += self.pool_page_size - pool_page_size
         token_to_kv_pool = pool_class(
-            page_size=self.pool_page_size,
+            page_size=pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(

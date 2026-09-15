@@ -124,11 +124,6 @@ class SWAKVPool(BaseSWAKVPool):
         )
 
     @property
-    def index_page_size(self) -> int:
-        assert isinstance(self.full_kv_pool, DSATokenToKVPool)
-        return self.full_kv_pool.index_page_size
-
-    @property
     def post_capture_active(self) -> bool:
         """True iff the sub-pools took the post-capture VA-backed path (both share the flag)."""
         return self.full_kv_pool.post_capture_active

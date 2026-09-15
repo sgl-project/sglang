@@ -30,7 +30,7 @@ class TestDsaKpoolMultiPool(CustomTestCase):
 
     def _pool(self) -> SimpleNamespace:
         return SimpleNamespace(
-            index_page_size=self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
             index_head_dim=INDEX_HEAD_DIM,
             slots_per_page=self.SLOTS_PER_PAGE,
             index_kpool=self.POOL_SIZE,
