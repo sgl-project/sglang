@@ -203,7 +203,7 @@ specification permits only these per-result scalar values to vary:
 | --- | --- | --- | --- |
 | `/meta_info/id` | Required | Nonempty string | Each request has its own identifier. |
 | `/meta_info/e2e_latency` | Required | Finite, nonnegative number | Elapsed time varies. |
-| `/meta_info/response_sent_to_client_ts` | Optional | Finite, nonnegative number | Send times vary; final streaming responses may omit this field. |
+| `/meta_info/response_sent_to_client_ts` | Optional | Finite, nonnegative number | Send times vary; streaming results retain this field from the first data event when provided. |
 
 Exception rules default to `"presence": "required"`: missing paths fail validation.
 With `"presence": "optional"`, absent fields remain absent; present values still
@@ -218,14 +218,43 @@ exception reasons are configuration errors. The supported comparison vocabulary 
 `exact_json`, `non_empty_string`, and `non_negative_number`; pointers are literal
 JSON Pointers, with no wildcards, scripts, or expressions.
 
-The suite's Rust response policy validates the native protocol and reconstructs
-full final JSON. It cannot add comparison exceptions. Cumulative streams use final
-snapshots; incremental streams accumulate text, output tokens, and output
-logprobs. Batch results return to input order. The policy checks indices, per-result
-IDs, sequence progression, terminal results, and the final `[DONE]`. It rejects
-in-band errors and truncated streams. Legitimate event coalescing and interleaving
-across batch results do not need to match between implementations. Raw events are
-retained for diagnosis.
+The suite's `streaming.fields` declaration assigns a lifecycle to each complete
+response field, using per-result JSON Pointers. The native suite interprets these
+rules; the core stores the effective configuration without interpreting it.
+
+| Rule | Native fields / behavior |
+| --- | --- |
+| `first` | Retain the first-event timestamp; reject late or repeated occurrences. |
+| `terminal` | Latency and weight-version spans appear only when the result finishes. |
+| `constant` | Request ID and prompt count stay identical within the result. |
+| `counter` | Completion, reasoning, cache, retraction and output-logprob counts are nonnegative integers that cannot decrease. |
+| `snapshot` | Cache details, DP rank and current weight version are validated per event; retain the terminal snapshot. |
+| `text`, `tokens`, `output_logprobs` | Validate cumulative prefix extension or concatenate incremental content. |
+| `input_logprobs` | Reconstruct input data without appending repeated prompt logprobs. |
+| `finish_reason`, `index` | Validate termination and batch routing. |
+
+Constant, counter and snapshot fields must retain their presence throughout a
+result. A field absent from the entire result stays absent, so a Python/Rust
+presence mismatch remains a parity difference. Required fields and value
+exceptions keep their existing requirements. Unknown streaming fields produce
+`streaming rule not covered` with the field path and event index; parity is
+`SKIPPED` until the suite declares the lifecycle. This is a missing test rule,
+not evidence of a server bug. Members inside declared objects remain intact and
+are compared strictly. Custom streaming suites must supply `streaming.fields`;
+unknown rule names and invalid pointers fail before services start.
+
+Each batch result has its own first and terminal events. A single data event can
+be both. The suite validates all events and the final `[DONE]`, rejects in-band
+errors and truncated streams, and checks token/logprob consistency and contiguous
+weight-version spans. These rules apply to the current metrics-disabled native
+configuration; other APIs need their own response policies.
+
+`final.json` is the complete reconstructed result before value exceptions, not a
+copy of the last SSE event. It includes declared first-event fields and accumulated
+content. Legitimate event coalescing and interleaving across batch results do not
+need to match between implementations. Intermediate snapshots are validated but
+are not matched by event ordinal; their terminal values are compared. The raw
+body and events remain unchanged as evidence.
 
 First, each side must produce valid responses and repeat its own final result.
 Unstable results are marked `UNSTABLE` and skip a definite parity conclusion.
@@ -264,9 +293,15 @@ Each run creates a unique directory under `output_dir` (default `target/parity`)
 ```
 
 `report.json` records environment evidence, attempts, validation errors,
-repeatability, parity and equivalence differences, and artifact paths. Each
+repeatability, parity and equivalence differences, field origins, and artifact paths. Each
 difference has a JSON path, kind, and both values. Runtime failures and unexecuted
 attempts remain visible.
+Streaming field origins map reconstructed JSON Pointers to zero-based indices in
+`events.json`; nested differences inherit the nearest ancestor's source. Reports
+show reconstructed values separately from comparison values and can expand the
+source events. Source records contain indices, not copies of events. Old reports
+without these records remain readable and keep their saved verdicts.
+
 Interrupted runs preserve a partial report and the bytes received so far.
 
 The terminal summary separates response validation, each implementation's

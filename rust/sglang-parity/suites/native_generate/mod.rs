@@ -2,15 +2,16 @@
 //!
 //! The specification owns comparison exceptions. This module only interprets
 //! generation frames, checks their lifecycle, and reconstructs the complete
-//! final response. Unknown terminal fields survive for the core comparator.
+//! response. Streaming fields require an explicit lifecycle; their complete
+//! values survive reconstruction for the core comparator.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sglang_parity::compare::{ComparisonRules, ComparisonScope, Violation};
 use sglang_parity::http::{CaptureMode, HttpCase, HttpObservation};
-use sglang_parity::runner::{HttpSuite, ResponsePolicy, RunConfig};
+use sglang_parity::runner::{HttpSuite, PreparedResponse, ResponsePolicy, RunConfig};
 
 pub const DEFAULT_SPEC: &str = include_str!("suite.json");
 
@@ -20,6 +21,8 @@ struct SuiteSpec {
     name: String,
     http: HttpSpec,
     comparison: ComparisonRules,
+    #[serde(default)]
+    streaming: Option<StreamingRules>,
     cases: Vec<CaseSpec>,
 }
 
@@ -43,6 +46,87 @@ struct CaseSpec {
 /// One interpretation of streaming output, shared by both implementations.
 pub struct GeneratePolicy {
     incremental: bool,
+    streaming: StreamingRules,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StreamingRules {
+    fields: BTreeMap<String, FieldRule>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FieldRule {
+    First,
+    Terminal,
+    Constant,
+    Counter,
+    Snapshot,
+    Text,
+    Tokens,
+    InputLogprobs,
+    OutputLogprobs,
+    FinishReason,
+    Index,
+}
+
+fn pointer_key(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+impl StreamingRules {
+    fn validate(&self) -> Result<(), String> {
+        for (path, rule) in &self.fields {
+            // Rules address complete top-level fields or metadata fields, not
+            // projections that could silently omit unknown object members.
+            let parts: Vec<_> = path.split('/').collect();
+            if !matches!(parts.as_slice(), ["", key] if !key.is_empty() && *key != "meta_info")
+                && !matches!(parts.as_slice(), ["", "meta_info", key] if !key.is_empty())
+            {
+                return Err(format!("invalid streaming field pointer {path:?}"));
+            }
+            let key = parts.last().unwrap();
+            let decoded = key.replace("~1", "/").replace("~0", "~");
+            if pointer_key(&decoded) != *key || *key == "*" {
+                return Err(format!("invalid streaming field pointer {path:?}"));
+            }
+            let special = match path.as_str() {
+                "/text" => Some(FieldRule::Text),
+                "/output_ids" => Some(FieldRule::Tokens),
+                "/index" => Some(FieldRule::Index),
+                "/meta_info/finish_reason" => Some(FieldRule::FinishReason),
+                _ if INPUT_LOGPROBS
+                    .iter()
+                    .any(|key| path == &format!("/meta_info/{key}")) =>
+                {
+                    Some(FieldRule::InputLogprobs)
+                }
+                _ if OUTPUT_LOGPROBS
+                    .iter()
+                    .any(|key| path == &format!("/meta_info/{key}")) =>
+                {
+                    Some(FieldRule::OutputLogprobs)
+                }
+                _ => None,
+            };
+            let specialized = matches!(
+                rule,
+                FieldRule::Text
+                    | FieldRule::Tokens
+                    | FieldRule::Index
+                    | FieldRule::FinishReason
+                    | FieldRule::InputLogprobs
+                    | FieldRule::OutputLogprobs
+            );
+            if special.is_some_and(|expected| expected != *rule)
+                || (specialized && special.is_none())
+            {
+                return Err(format!("streaming rule {rule:?} does not match {path}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -58,11 +142,12 @@ struct ResultState {
     ids: Option<Vec<Value>>,
     output: BTreeMap<&'static str, Vec<Value>>,
     input: BTreeMap<&'static str, Vec<Value>>,
+    first: BTreeMap<String, Value>,
+    origins: BTreeMap<String, Vec<usize>>,
     finished: bool,
 }
 
-// These are protocol accumulation rules, not comparison exceptions. Every
-// other terminal field remains untouched, including newly introduced fields.
+// These families have protocol-specific accumulation and tuple validation.
 const OUTPUT_LOGPROBS: [&str; 3] = [
     "output_token_logprobs",
     "output_top_logprobs",
@@ -87,6 +172,9 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
         return Err("native_generate requires POST /generate".into());
     }
     spec.comparison.validate()?;
+    if let Some(rules) = &spec.streaming {
+        rules.validate()?;
+    }
     if spec.cases.is_empty() {
         return Err("a suite must contain at least one case".into());
     }
@@ -134,6 +222,9 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
                 Some(Value::Bool(value)) => *value,
                 _ => return Err(format!("{}: stream must be a boolean", case.name)),
             };
+            if stream && spec.streaming.is_none() {
+                return Err("streaming cases require streaming.fields lifecycle rules".into());
+            }
             (
                 if stream {
                     CaptureMode::Sse
@@ -169,10 +260,17 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
                 "cumulative"
             }
             .into(),
+            response_policy: spec
+                .streaming
+                .as_ref()
+                .map(|rules| serde_json::json!({"streaming": rules})),
             comparison: spec.comparison,
             cases,
         },
-        GeneratePolicy { incremental },
+        GeneratePolicy {
+            incremental,
+            streaming: spec.streaming.unwrap_or_default(),
+        },
     ))
 }
 
@@ -245,7 +343,7 @@ impl ResponsePolicy for GeneratePolicy {
         &self,
         case: &HttpCase,
         observation: &HttpObservation,
-    ) -> Result<Value, Vec<Violation>> {
+    ) -> Result<PreparedResponse, Vec<Violation>> {
         let mut violations = observation.violations.clone();
         if let Some(error) = &observation.transport_error {
             violations.push(Violation::new("", format!("transport failed: {error}")));
@@ -275,11 +373,11 @@ impl ResponsePolicy for GeneratePolicy {
                     "expected a native error object",
                 )]);
             }
-            return Ok(value.clone());
+            return Ok(value.clone().into());
         }
         let shape = request_shape(&case.body).map_err(|error| vec![Violation::new("", error)])?;
         match case.capture {
-            CaptureMode::Json => prepare_json(case, observation, shape),
+            CaptureMode::Json => prepare_json(case, observation, shape).map(Into::into),
             CaptureMode::Sse => self.prepare_stream(case, observation, shape),
         }
     }
@@ -344,7 +442,7 @@ impl GeneratePolicy {
         case: &HttpCase,
         observation: &HttpObservation,
         shape: Shape,
-    ) -> Result<Value, Vec<Violation>> {
+    ) -> Result<PreparedResponse, Vec<Violation>> {
         let content_type = observation
             .headers
             .iter()
@@ -414,6 +512,13 @@ impl GeneratePolicy {
                     ));
                 }
                 validate_frame(&value, &path, false)?;
+                state.accept_fields(
+                    &value,
+                    &self.streaming,
+                    self.incremental,
+                    event_index,
+                    &path,
+                )?;
                 state.accept(&value, self.incremental, &path)?;
                 Ok(())
             })();
@@ -441,21 +546,30 @@ impl GeneratePolicy {
             return Err(violations);
         }
         let mut values = Vec::with_capacity(shape.count);
+        let mut origins = BTreeMap::new();
         for (index, state) in states.into_iter().enumerate() {
-            let value = state.finish(self.incremental, shape.batch);
             let path = if shape.batch {
                 format!("/{index}")
             } else {
                 String::new()
             };
+            let prepared = state.finish(self.incremental, shape.batch);
+            let value = prepared.value;
+            origins.extend(
+                prepared
+                    .origins
+                    .into_iter()
+                    .map(|(field, events)| (format!("{path}{field}"), events)),
+            );
             validate_requested_logprobs(case, index, &value, &path).map_err(|error| vec![error])?;
             values.push(value);
         }
-        Ok(if shape.batch {
+        let value = if shape.batch {
             Value::Array(values)
         } else {
             values.remove(0)
-        })
+        };
+        Ok(PreparedResponse { value, origins })
     }
 }
 
@@ -532,10 +646,163 @@ fn validate_frame<'a>(
             "output_ids must contain non-negative integers",
         ));
     }
+    validate_metadata(meta, path)?;
     Ok(meta)
 }
 
+fn validate_metadata(meta: &Map<String, Value>, path: &str) -> Result<(), Violation> {
+    for (key, value) in meta {
+        let valid = match key.as_str() {
+            "response_sent_to_client_ts" | "e2e_latency" => {
+                value.as_f64().is_some_and(|v| v.is_finite() && v >= 0.0)
+            }
+            "reasoning_tokens"
+            | "cached_tokens"
+            | "num_retractions"
+            | "output_token_logprobs_length" => value.as_u64().is_some(),
+            "dp_rank" => value.is_null() || value.as_u64().is_some(),
+            "weight_version" => value.as_str().is_some_and(|v| !v.is_empty()),
+            "cached_tokens_details" => {
+                value.is_null()
+                    || value.as_object().is_some_and(|details| {
+                        ["device", "host", "storage"]
+                            .iter()
+                            .all(|key| details.get(*key).is_none_or(|v| v.as_u64().is_some()))
+                            && details.get("storage_backend").is_none_or(Value::is_string)
+                    })
+            }
+            _ => true,
+        };
+        if !valid {
+            return Err(Violation::new(
+                format!("{path}/meta_info/{key}"),
+                "invalid native metadata value",
+            ));
+        }
+    }
+    if let Some(spans) = meta.get("weight_versions") {
+        let invalid = || {
+            Violation::new(
+                format!("{path}/meta_info/weight_versions"),
+                "weight version spans must be contiguous from zero to completion_tokens, with the final version matching weight_version",
+            )
+        };
+        let spans = spans
+            .as_array()
+            .filter(|spans| !spans.is_empty())
+            .ok_or_else(invalid)?;
+        let mut end = 0;
+        for span in spans {
+            let next = span["end"].as_u64().ok_or_else(invalid)?;
+            if span["start"].as_u64() != Some(end)
+                || next < end
+                || span["version"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(invalid());
+            }
+            end = next;
+        }
+        if Some(end) != meta["completion_tokens"].as_u64()
+            || meta
+                .get("weight_version")
+                .is_some_and(|v| v != &spans.last().unwrap()["version"])
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 impl ResultState {
+    fn accept_fields(
+        &mut self,
+        value: &Value,
+        rules: &StreamingRules,
+        incremental: bool,
+        event: usize,
+        path: &str,
+    ) -> Result<(), Violation> {
+        let object = value.as_object().expect("validated result");
+        let meta = value["meta_info"].as_object().expect("validated metadata");
+        for field in object
+            .keys()
+            .filter(|key| *key != "meta_info")
+            .map(|key| format!("/{}", pointer_key(key)))
+            .chain(
+                meta.keys()
+                    .map(|key| format!("/meta_info/{}", pointer_key(key))),
+            )
+        {
+            if !rules.fields.contains_key(&field) {
+                return Err(Violation::new(
+                    format!("{path}{field}"),
+                    "streaming rule not covered: declare this field's lifecycle before evaluating parity",
+                ));
+            }
+        }
+        let terminal = !meta["finish_reason"].is_null();
+        for (field, rule) in &rules.fields {
+            let current = value.pointer(field);
+            let previous = self.last.as_ref().and_then(|last| last.pointer(field));
+            let error = match rule {
+                FieldRule::First if current.is_some() && self.last.is_some() => {
+                    Some("field must occur only in the first event of its result")
+                }
+                FieldRule::Terminal if current.is_some() && !terminal => {
+                    Some("field must occur only in the terminal event of its result")
+                }
+                FieldRule::Constant | FieldRule::Counter | FieldRule::Snapshot
+                    if self.last.is_some() && current.is_some() != previous.is_some() =>
+                {
+                    Some("per-event field presence changed within one result")
+                }
+                FieldRule::Constant if self.last.is_some() && current != previous => {
+                    Some("value changed within one result")
+                }
+                FieldRule::Counter if current.is_some_and(|v| v.as_u64().is_none()) => {
+                    Some("counter must be a non-negative integer")
+                }
+                FieldRule::Counter
+                    if previous.and_then(Value::as_u64) > current.and_then(Value::as_u64) =>
+                {
+                    Some("counter moved backwards")
+                }
+                _ => None,
+            };
+            if let Some(error) = error {
+                return Err(Violation::new(format!("{path}{field}"), error));
+            }
+            let Some(current) = current else { continue };
+            if *rule == FieldRule::First {
+                self.first.insert(field.clone(), current.clone());
+            }
+            // Routing is not part of the reconstructed result. Input arrays
+            // may repeat or carry empty placeholders; retain the source that
+            // supplied the reconstructed value, not a later empty placeholder.
+            if *rule == FieldRule::Index {
+                continue;
+            }
+            if *rule == FieldRule::InputLogprobs
+                && incremental
+                && current.as_array().is_some_and(Vec::is_empty)
+                && self.origins.contains_key(field)
+            {
+                continue;
+            }
+            if incremental
+                && matches!(
+                    rule,
+                    FieldRule::Text | FieldRule::Tokens | FieldRule::OutputLogprobs
+                )
+            {
+                self.origins.entry(field.clone()).or_default().push(event);
+            } else {
+                self.origins.insert(field.clone(), vec![event]);
+            }
+        }
+        Ok(())
+    }
+
     fn accept(&mut self, value: &Value, incremental: bool, path: &str) -> Result<(), Violation> {
         let meta = value["meta_info"].as_object().expect("validated metadata");
         // Existing delta positions already agreed on a previous frame. If either
@@ -657,6 +924,15 @@ impl ResultState {
                 ));
             }
         }
+        if let Some(length) = meta.get("output_token_logprobs_length")
+            && length.as_u64()
+                != Some(self.output.get("output_token_logprobs").map_or(0, Vec::len) as u64)
+        {
+            return Err(Violation::new(
+                format!("{path}/meta_info/output_token_logprobs_length"),
+                "logprob length does not match the reconstructed output logprobs",
+            ));
+        }
         let prompt_count = meta["prompt_tokens"].as_u64().expect("validated count");
         for (key, values) in &self.input {
             if values.len() as u64 > prompt_count {
@@ -682,8 +958,17 @@ impl ResultState {
         Ok(())
     }
 
-    fn finish(self, incremental: bool, batch: bool) -> Value {
+    fn finish(self, incremental: bool, batch: bool) -> PreparedResponse {
         let mut value = self.last.expect("every result terminated");
+        for (field, first) in self.first {
+            let (parent, key) = field.rsplit_once('/').expect("validated field pointer");
+            value
+                .pointer_mut(parent)
+                .expect("validated field parent")
+                .as_object_mut()
+                .expect("object field parent")
+                .insert(key.replace("~1", "/").replace("~0", "~"), first);
+        }
         if incremental {
             if let Some(text) = self.text {
                 value["text"] = Value::String(text);
@@ -701,7 +986,10 @@ impl ResultState {
                 .expect("validated object")
                 .remove("index");
         }
-        value
+        PreparedResponse {
+            value,
+            origins: self.origins,
+        }
     }
 }
 

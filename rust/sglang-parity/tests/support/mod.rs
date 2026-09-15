@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sglang_parity::runner::PreparedResponse;
 use sglang_parity::{
     CaptureMode, HttpCase, HttpObservation, HttpSuite, ResponsePolicy, RunConfig, Violation,
 };
@@ -193,7 +194,7 @@ impl ResponsePolicy for EchoPolicy {
         &self,
         case: &HttpCase,
         observation: &HttpObservation,
-    ) -> Result<Value, Vec<Violation>> {
+    ) -> Result<PreparedResponse, Vec<Violation>> {
         if case.body["behavior"] == "empty_rejection" {
             return Err(vec![]);
         }
@@ -228,7 +229,14 @@ impl ResponsePolicy for EchoPolicy {
                 format!("expected an object containing {required_key}"),
             )]);
         }
-        Ok(value)
+        Ok(PreparedResponse {
+            value,
+            origins: if case.capture == CaptureMode::Sse {
+                [(String::new(), vec![0])].into()
+            } else {
+                Default::default()
+            },
+        })
     }
 }
 

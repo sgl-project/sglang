@@ -86,7 +86,10 @@ fn json_observation(value: Value) -> HttpObservation {
 }
 
 fn case(name: &str, incremental: bool) -> (HttpCase, GeneratePolicy) {
-    let (suite, policy) = load(DEFAULT_SPEC, &config(incremental)).unwrap();
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    spec["streaming"]["fields"]["/future_field"] = json!("terminal");
+    spec["streaming"]["fields"]["/meta_info/unknown_metadata"] = json!("terminal");
+    let (suite, policy) = load(&spec.to_string(), &config(incremental)).unwrap();
     (
         suite
             .cases
@@ -189,21 +192,24 @@ fn unary_and_both_stream_modes_preserve_the_complete_fixture() {
     let (json_case, policy) = case("greedy_json", false);
     let result = policy
         .prepare(&json_case, &json_observation(expected.clone()))
-        .unwrap();
+        .unwrap()
+        .value;
     assert_eq!(result, expected);
     for incremental in [false, true] {
         let (case, policy) = case("greedy_stream", incremental);
         assert_eq!(
             policy
                 .prepare(&case, &observation(events(incremental)))
-                .unwrap(),
+                .unwrap()
+                .value,
             expected
         );
         // A transport backlog may coalesce all data into one event.
         assert_eq!(
             policy
                 .prepare(&case, &observation(vec![event(expected.clone()), done()]))
-                .unwrap(),
+                .unwrap()
+                .value,
             expected
         );
     }
@@ -222,7 +228,8 @@ fn one_token_without_logprobs_is_valid_in_unary_and_both_stream_modes() {
     assert_eq!(
         policy
             .prepare(&json_case, &json_observation(expected.clone()))
-            .unwrap(),
+            .unwrap()
+            .value,
         expected
     );
     for incremental in [false, true] {
@@ -230,7 +237,8 @@ fn one_token_without_logprobs_is_valid_in_unary_and_both_stream_modes() {
         assert_eq!(
             policy
                 .prepare(&case, &observation(vec![event(expected.clone()), done()]))
-                .unwrap(),
+                .unwrap()
+                .value,
             expected
         );
     }
@@ -238,7 +246,10 @@ fn one_token_without_logprobs_is_valid_in_unary_and_both_stream_modes() {
 
 #[test]
 fn batch_interleaving_restores_input_order_and_removes_only_index() {
-    let expected = batch_fixture();
+    let mut expected = batch_fixture();
+    for (index, value) in expected.iter_mut().enumerate() {
+        value["meta_info"]["response_sent_to_client_ts"] = json!(100 + index);
+    }
     for incremental in [false, true] {
         let (case, policy) = case("batch_stream", incremental);
         let original = events(incremental);
@@ -247,6 +258,10 @@ fn batch_interleaving_restores_input_order_and_removes_only_index() {
             let mut value: Value = serde_json::from_str(&original[position].data).unwrap();
             value["index"] = json!(index);
             value["meta_info"]["id"] = expected[index]["meta_info"]["id"].clone();
+            if position == 0 {
+                value["meta_info"]["response_sent_to_client_ts"] =
+                    expected[index]["meta_info"]["response_sent_to_client_ts"].clone();
+            }
             if index == 1 {
                 value["text"] = json!(match (position, incremental) {
                     (0, _) => "Goodbye",
@@ -269,7 +284,15 @@ fn batch_interleaving_restores_input_order_and_removes_only_index() {
         }
         stream.push(done());
         let actual = policy.prepare(&case, &observation(stream)).unwrap();
-        assert_eq!(actual, json!(expected));
+        assert_eq!(actual.value, json!(expected));
+        assert_eq!(
+            actual.origins["/0/meta_info/response_sent_to_client_ts"],
+            [1]
+        );
+        assert_eq!(
+            actual.origins["/1/meta_info/response_sent_to_client_ts"],
+            [0]
+        );
     }
 }
 
@@ -316,7 +339,8 @@ fn batch_json_requires_exact_cardinality_and_validates_every_item() {
     assert_eq!(
         policy
             .prepare(&case, &json_observation(expected.clone()))
-            .unwrap(),
+            .unwrap()
+            .value,
         expected
     );
     for values in [
@@ -457,7 +481,10 @@ fn incremental_input_logprobs_are_set_once_or_repeated_not_concatenated() {
             fixture()["meta_info"]["input_top_logprobs"].clone();
     });
     assert_eq!(
-        policy.prepare(&case, &observation(stream.clone())).unwrap(),
+        policy
+            .prepare(&case, &observation(stream.clone()))
+            .unwrap()
+            .value,
         fixture()
     );
     modify_event(&mut stream, 1, |frame| {
@@ -484,7 +511,7 @@ fn input_logprobs_may_arrive_after_an_empty_placeholder() {
             fixture()["meta_info"]["input_top_logprobs"].clone();
     });
     assert_eq!(
-        policy.prepare(&case, &observation(stream)).unwrap(),
+        policy.prepare(&case, &observation(stream)).unwrap().value,
         fixture()
     );
 }
@@ -534,7 +561,10 @@ fn incremental_late_token_ids_or_logprobs_validate_the_entire_new_overlap() {
             }
         });
         assert_eq!(
-            policy.prepare(&case, &observation(stream.clone())).unwrap(),
+            policy
+                .prepare(&case, &observation(stream.clone()))
+                .unwrap()
+                .value,
             fixture()
         );
         modify_event(&mut stream, 1, |frame| {
@@ -559,7 +589,7 @@ fn trimmed_stop_tokens_still_count_as_generated_tokens() {
         frame.as_object_mut().unwrap().remove("output_ids");
         frame["meta_info"]["finish_reason"] = json!({"type":"stop","matched":11});
     });
-    let value = policy.prepare(&case, &observation(stream)).unwrap();
+    let value = policy.prepare(&case, &observation(stream)).unwrap().value;
     assert_eq!(value["output_ids"], json!([10]));
     assert_eq!(value["meta_info"]["completion_tokens"], 2);
 }
@@ -661,7 +691,8 @@ fn declared_exceptions_alone_control_latency_validation_and_comparison() {
     let case = &suite.cases[0];
     let prepared = policy
         .prepare(case, &json_observation(value.clone()))
-        .unwrap();
+        .unwrap()
+        .value;
     assert_eq!(prepared, value);
     assert!(prepare_comparison(&prepared, case.comparison_scope, &suite.comparison).is_err());
     spec["comparison"]["per_result_value_exceptions"]
@@ -692,7 +723,8 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
                     ..json_observation(value.clone())
                 }
             )
-            .unwrap(),
+            .unwrap()
+            .value,
         value
     );
     assert!(
@@ -712,4 +744,158 @@ fn explicit_http_error_suite_uses_json_root_without_success_exceptions() {
             .prepare(&success, &json_observation(value))
             .is_err()
     );
+}
+
+#[test]
+fn lifecycle_reconstruction_survives_coalescing_and_preserves_sources() {
+    for incremental in [false, true] {
+        let (stream_case, policy) = case("greedy_stream", incremental);
+        let mut stream = events(incremental);
+        for position in 0..2 {
+            modify_event(&mut stream, position, |frame| {
+                let meta = &mut frame["meta_info"];
+                meta["cached_tokens"] = json!(position);
+                meta["dp_rank"] = json!(position);
+                meta["output_token_logprobs_length"] = json!(position + 1);
+                if position == 0 {
+                    meta["response_sent_to_client_ts"] = json!(123.5);
+                } else {
+                    meta["weight_version"] = json!("v1");
+                    meta["weight_versions"] = json!([{"start":0,"end":2,"version":"v1"}]);
+                }
+            });
+        }
+        // Snapshot fields are per-event; their values need not be constant.
+        modify_event(&mut stream, 0, |v| {
+            v["meta_info"]["weight_version"] = json!("v0")
+        });
+        let prepared = policy.prepare(&stream_case, &observation(stream)).unwrap();
+        assert_eq!(
+            prepared.value["meta_info"]["response_sent_to_client_ts"],
+            123.5
+        );
+        assert_eq!(
+            prepared.origins["/meta_info/response_sent_to_client_ts"],
+            [0]
+        );
+        assert_eq!(prepared.origins["/meta_info/weight_versions"], [1]);
+        assert_eq!(
+            prepared.origins["/output_ids"],
+            if incremental { vec![0, 1] } else { vec![1] }
+        );
+        let coalesced = policy
+            .prepare(
+                &stream_case,
+                &observation(vec![event(prepared.value.clone()), done()]),
+            )
+            .unwrap();
+        assert_eq!(coalesced.value, prepared.value);
+        let (json_case, _) = case("greedy_json", incremental);
+        let unary = policy
+            .prepare(&json_case, &json_observation(prepared.value.clone()))
+            .unwrap();
+        assert_eq!(unary.value, prepared.value);
+        assert!(unary.origins.is_empty());
+    }
+}
+
+#[test]
+fn lifecycle_violations_identify_the_field_and_event() {
+    for (field, first, last, event_index) in [
+        ("response_sent_to_client_ts", None, Some(json!(1)), 1),
+        (
+            "response_sent_to_client_ts",
+            Some(json!(1)),
+            Some(json!(1)),
+            1,
+        ),
+        ("response_sent_to_client_ts", Some(Value::Null), None, 0),
+        ("e2e_latency", Some(json!(0.1)), Some(json!(0.2)), 0),
+        (
+            "weight_versions",
+            Some(json!([{"start":0,"end":1,"version":"v1"}])),
+            None,
+            0,
+        ),
+        (
+            "weight_versions",
+            None,
+            Some(json!([{"start":1,"end":2,"version":"v1"}])),
+            1,
+        ),
+        ("cached_tokens", Some(json!(2)), Some(json!(1)), 1),
+        ("cached_tokens", Some(json!(0)), None, 1),
+        ("cached_tokens", None, Some(json!(0)), 1),
+        ("cached_tokens", Some(json!(-1)), Some(json!(0)), 0),
+        ("dp_rank", Some(json!("invalid")), None, 0),
+        (
+            "output_token_logprobs_length",
+            Some(json!(2)),
+            Some(json!(2)),
+            0,
+        ),
+        ("unclassified", Some(json!(true)), None, 0),
+    ] {
+        for incremental in [false, true] {
+            let (case, policy) = case("greedy_stream", incremental);
+            let mut stream = events(incremental);
+            for (position, value) in [first.clone(), last.clone()].into_iter().enumerate() {
+                modify_event(&mut stream, position, |frame| {
+                    let meta = frame["meta_info"].as_object_mut().unwrap();
+                    if let Some(value) = value {
+                        meta.insert(field.into(), value);
+                    } else {
+                        meta.remove(field);
+                    }
+                });
+            }
+            let errors = policy.prepare(&case, &observation(stream)).unwrap_err();
+            assert_eq!(errors[0].path, format!("/meta_info/{field}"));
+            assert_eq!(errors[0].event, Some(event_index), "{field}");
+        }
+    }
+}
+
+#[test]
+fn streaming_rules_are_explicit_and_extension_values_remain_complete() {
+    for (pointer, rule) in [
+        ("/meta_info", "snapshot"),
+        ("/meta_info/a/b", "first"),
+        ("/bad~2key", "terminal"),
+        ("/*", "terminal"),
+        ("/text", "counter"),
+        ("/extension", "text"),
+        ("/extension", "unknown_rule"),
+    ] {
+        let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+        spec["streaming"]["fields"][pointer] = json!(rule);
+        assert!(
+            load(&spec.to_string(), &config(false)).is_err(),
+            "{pointer}: {rule}"
+        );
+    }
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    spec.as_object_mut().unwrap().remove("streaming");
+    assert!(load(&spec.to_string(), &config(false)).is_err());
+
+    let (case, mut policy) = case("greedy_stream", false);
+    let mut stream = events(false);
+    modify_event(&mut stream, 0, |v| {
+        v["new/field~"] = json!({"nested":[null, {"keep":true}]})
+    });
+    let errors = policy
+        .prepare(&case, &observation(stream.clone()))
+        .unwrap_err();
+    assert_eq!(errors[0].path, "/new~1field~0");
+    assert!(errors[0].message.contains("rule not covered"));
+    policy
+        .streaming
+        .fields
+        .insert("/new~1field~0".into(), FieldRule::First);
+    let prepared = policy.prepare(&case, &observation(stream)).unwrap();
+    assert_eq!(
+        prepared.value["new/field~"],
+        json!({"nested":[null, {"keep":true}]})
+    );
+    assert_eq!(prepared.origins["/new~1field~0"], [0]);
 }

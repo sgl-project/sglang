@@ -305,7 +305,7 @@ impl<'a> ReportView<'a> {
         if let Some(name) = case {
             let files = self.final_files(Some(name));
             out.push_str(
-                "\nCASE DETAILS — values below are comparison values unless marked original\n",
+                "\nCASE DETAILS — values below are comparison values unless marked reconstructed\n",
             );
             for comparison in self
                 .comparisons
@@ -335,11 +335,19 @@ impl<'a> ReportView<'a> {
                     for side in [comparison.left, comparison.right] {
                         writeln!(
                             out,
-                            "    {} original: {}",
+                            "    {} reconstructed: {}",
                             plain(side.implementation),
                             clipped(&self.original(side, &difference.path, &files), 120)
                         )
                         .unwrap();
+                        if let Some(indices) = Self::sources(side, &difference.path) {
+                            writeln!(
+                                out,
+                                "    source event indices (zero-based): {}",
+                                clipped(&format!("{indices:?}"), 120)
+                            )
+                            .unwrap();
+                        }
                         if let Some(rule) = self.exception(side.case, &difference.path) {
                             writeln!(out, "    value exception: {}", plain(rule)).unwrap();
                         }
@@ -607,13 +615,36 @@ impl<'a> ReportView<'a> {
             .map(|rule| rule.reason.as_str())
     }
 
+    fn sources<'b>(side: Evidence<'b>, mut pointer: &str) -> Option<&'b [usize]> {
+        let origins = &side.attempt?.origins;
+        loop {
+            if let Some(indices) = origins.get(pointer) {
+                return Some(indices);
+            }
+            pointer = pointer.rsplit_once('/')?.0;
+        }
+    }
+
+    fn source_events(side: Evidence<'_>, indices: &[usize]) -> Result<Value, String> {
+        let observation = side
+            .attempt
+            .and_then(|a| a.observation.as_ref())
+            .ok_or("Source events unavailable")?;
+        let events: Result<Vec<_>, _> = indices.iter().map(|index| {
+            let event = observation.events.get(*index).ok_or_else(|| format!("Source event {index} unavailable"))?;
+            let data = serde_json::from_str::<Value>(&event.data).unwrap_or_else(|_| Value::String(event.data.clone()));
+            Ok(serde_json::json!({"index": index, "event": event.event, "id": event.id, "data": data}))
+        }).collect();
+        events.map(Value::Array)
+    }
+
     fn evidence_paths(&self, side: Evidence<'_>) -> Vec<(&'static str, PathBuf)> {
         let Some(attempt) = side.attempt else {
             return Vec::new();
         };
         let mut paths = vec![("request", attempt.directory.join("request.json"))];
         if let Some(path) = &attempt.final_json {
-            paths.push(("final response", path.clone()));
+            paths.push(("reconstructed response", path.clone()));
         }
         if let Some(observation) = &attempt.observation {
             paths.push(("raw response", observation.raw_body.clone()));
@@ -818,7 +849,11 @@ impl<'a> ReportView<'a> {
                     if let Some(path) = &attempt.final_json
                         && let Some(value) = files.get(path)
                     {
-                        self.html_preview(&mut out, "Original final JSON", value);
+                        self.html_preview(
+                            &mut out,
+                            "Reconstructed JSON (before value exceptions)",
+                            value,
+                        );
                     }
                 }
             }
@@ -834,6 +869,9 @@ impl<'a> ReportView<'a> {
         }
         out.push_str("<h2>Recorded comparison rules</h2>");
         if let Ok(suite) = &self.suite {
+            if let Some(policy) = &suite.response_policy {
+                self.html_preview(&mut out, "Recorded response policy", &Ok(policy.clone()));
+            }
             write!(
                 out,
                 "<pre>{}</pre>",
@@ -869,13 +907,13 @@ impl<'a> ReportView<'a> {
                 write!(
                     out,
                     "<p>{}</p>",
-                    self.link(&format!("{} — original final response", side.label()), path)
+                    self.link(&format!("{} — reconstructed response", side.label()), path)
                 )
                 .unwrap();
             }
         }
         if !comparison.check.differences.is_empty() {
-            out.push_str("<p class=\"muted\">Comparison values may contain declared replacements. &lt;missing&gt; means absent; null is a present JSON value. Original values come from final.json.</p><div class=\"scroll\"><table><thead><tr><th>Path / reason</th><th>Left</th><th>Right</th></tr></thead><tbody>");
+            out.push_str("<p class=\"muted\">Comparison values may contain declared replacements. &lt;missing&gt; means absent; null is a present JSON value. Reconstructed values come from final.json before value exceptions and may combine several events.</p><div class=\"scroll\"><table><thead><tr><th>Path / reason</th><th>Left</th><th>Right</th></tr></thead><tbody>");
             for difference in &comparison.check.differences {
                 write!(
                     out,
@@ -888,7 +926,7 @@ impl<'a> ReportView<'a> {
                     (comparison.left, difference.left.as_ref()),
                     (comparison.right, difference.right.as_ref()),
                 ] {
-                    write!(out, "<td><small>Comparison value</small><pre>{}</pre><details><summary>Original value</summary><pre>{}</pre></details>", escape(&value_text(value)), escape(&self.original(side, &difference.path, files))).unwrap();
+                    write!(out, "<td><small>Comparison value</small><pre>{}</pre><details><summary>Reconstructed value</summary><pre>{}</pre></details>", escape(&value_text(value)), escape(&self.original(side, &difference.path, files))).unwrap();
                     if let Some(reason) = self.exception(side.case, &difference.path) {
                         write!(
                             out,
@@ -896,6 +934,13 @@ impl<'a> ReportView<'a> {
                             escape(reason)
                         )
                         .unwrap();
+                    }
+                    if let Some(indices) = Self::sources(side, &difference.path) {
+                        self.html_preview(
+                            out,
+                            "Source events (zero-based indices)",
+                            &Self::source_events(side, indices),
+                        );
                     }
                     out.push_str("</td>");
                 }
@@ -1100,7 +1145,7 @@ mod tests {
         assert!(expanded.contains("left: python / json / attempt 1"));
         assert!(expanded.contains("right: python / stream / attempt 1"));
         assert!(expanded.contains("right: rust / stream / attempt 2"));
-        assert!(expanded.contains("original: <unavailable>"));
+        assert!(expanded.contains("reconstructed: <unavailable>"));
         for (kind, message) in [
             (DifferenceKind::ValueMismatch, "Field values differ"),
             (DifferenceKind::TypeMismatch, "Field types differ"),
@@ -1122,7 +1167,23 @@ mod tests {
 
     #[test]
     fn moved_evidence_distinguishes_original_values_exceptions_and_unavailable_files() {
-        let report = recorded();
+        let mut report = recorded();
+        let attempt = &mut report.cases[0]
+            .implementations
+            .get_mut("python")
+            .unwrap()
+            .attempts[0];
+        attempt.origins = [("/time".into(), vec![0]), ("/nullable".into(), vec![99])].into();
+        attempt
+            .observation
+            .as_mut()
+            .unwrap()
+            .events
+            .push(crate::sse::SseEvent {
+                event: "message".into(),
+                id: None,
+                data: r#"{"time":123.25,"unsafe":"<script>"}"#.into(),
+            });
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let attempt = root.join("python/json/1");
@@ -1141,6 +1202,14 @@ mod tests {
         let specification = json!({"suite": {"name": "example", "response_implementation": "example", "output_mode": "example", "cases": cases, "comparison": {"base": "exact_json", "per_result_value_exceptions": [{"path": "/time", "presence": "optional", "require": "non_negative_number", "reason": "Clock value varies"}]}}});
         std::fs::write(root.join("effective_suite.json"), specification.to_string()).unwrap();
         let mut view = ReportView::new(&report, root);
+        let side = view.comparisons[0].left;
+        assert_eq!(
+            ReportView::sources(side, "/time/nested/0"),
+            Some([0].as_slice())
+        );
+        assert_eq!(ReportView::sources(side, "/timestamp"), None);
+        let expanded = view.terminal(Some("json"), false).unwrap();
+        assert!(expanded.contains("source event indices (zero-based): [0]"));
         let html = view.html();
         for expected in [
             "123.25",
@@ -1151,6 +1220,8 @@ mod tests {
             "Preview truncated at 64 KiB",
             "href=\"python/json/1/final.json\"",
             "id=\"equivalence-0\"",
+            "Source events (zero-based indices)",
+            "Source event 99 unavailable",
         ] {
             assert!(html.contains(expected), "missing {expected}");
         }
@@ -1170,7 +1241,7 @@ mod tests {
         assert!(!root.join("report.html.pending").exists());
         std::fs::remove_file(attempt.join("final.json")).unwrap();
         let html = view.html();
-        assert!(html.contains("final response (unavailable)"));
+        assert!(html.contains("reconstructed response (unavailable)"));
         assert_eq!(report.exit_code(), 1);
     }
 
