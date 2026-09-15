@@ -33,6 +33,7 @@ from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
+    resolve_runtime_aux_hidden_states,
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -461,6 +462,13 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        hidden_states, aux_hidden_states = resolve_runtime_aux_hidden_states(
+            self,
+            hidden_states,
+            logits_metadata,
+            aux_hidden_states,
+        )
+
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):

@@ -58,6 +58,14 @@ def configure_aux_hidden_state_capture(
             model.set_dspark_layers_to_capture(dflash_target_layer_ids)
         elif hasattr(model, "set_dflash_layers_to_capture"):
             model.set_dflash_layers_to_capture(dflash_target_layer_ids)
+        elif is_dspark:
+            from sglang.srt.model_executor.dspark_aux_hidden_state import (
+                attach_runtime_dspark_aux_hidden_state_capture,
+            )
+
+            attach_runtime_dspark_aux_hidden_state_capture(
+                model, dflash_target_layer_ids
+            )
         else:
             raise ValueError(
                 f"Model {model.__class__.__name__} implements neither "

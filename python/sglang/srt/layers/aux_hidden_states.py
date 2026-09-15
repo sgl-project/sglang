@@ -53,6 +53,46 @@ class AuxHiddenStatePacker:
 AuxHiddenStateAccumulator = Union[List[torch.Tensor], AuxHiddenStatePacker]
 
 
+# Runtime-attached capture is used by models whose decoder stack follows the
+# standard SGLang residual-stream contract but does not implement a model-local
+# DFlash/DSpark capture hook. The attributes are deliberately private: they
+# are an executor/model boundary, not checkpoint configuration.
+RUNTIME_AUX_HIDDEN_STATES_ATTR = "_sglang_runtime_aux_hidden_states"
+RUNTIME_AUX_CAPTURE_LOGITS_ATTR = "_sglang_use_runtime_aux_hidden_states"
+
+
+def resolve_runtime_aux_hidden_states(
+    logits_processor,
+    hidden_states,
+    logits_metadata,
+    aux_hidden_states: Optional[AuxHiddenStates],
+):
+    """Unpack aux states produced by a runtime-attached decoder stack.
+
+    Body-only prefill graphs return ``(hidden_states, aux_hidden_states)`` so
+    every captured tensor remains a graph output. Ordinary and split-prefill
+    forwards can instead carry the same list on ``ForwardBatch``.
+    """
+    if not getattr(logits_processor, RUNTIME_AUX_CAPTURE_LOGITS_ATTR, False):
+        return hidden_states, aux_hidden_states
+
+    if isinstance(hidden_states, tuple):
+        if len(hidden_states) != 2:
+            raise RuntimeError(
+                "Runtime auxiliary hidden-state capture expected a two-item "
+                "transformer output."
+            )
+        hidden_states, runtime_aux_hidden_states = hidden_states
+        if aux_hidden_states is None:
+            aux_hidden_states = runtime_aux_hidden_states
+    elif aux_hidden_states is None:
+        aux_hidden_states = getattr(
+            logits_metadata, RUNTIME_AUX_HIDDEN_STATES_ATTR, None
+        )
+
+    return hidden_states, aux_hidden_states
+
+
 def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     if isinstance(aux_hidden_states, torch.Tensor):
         return aux_hidden_states

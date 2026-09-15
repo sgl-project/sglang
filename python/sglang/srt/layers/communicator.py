@@ -614,20 +614,31 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._communicate_simple_fn(
-                hidden_states=residual,
-                forward_batch=forward_batch,
-                context=self._context,
+            self.capture_last_layer_output(
+                residual, forward_batch, captured_last_layer_outputs
             )
-            if (
-                gathered_last_layer_output is residual
-                # An accumulator that copies on append already holds a snapshot.
-                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual)
-            ):
-                gathered_last_layer_output = residual.clone()
-            captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
+
+    def capture_last_layer_output(
+        self,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: AuxHiddenStateAccumulator,
+    ) -> None:
+        """Materialize and save the completed preceding residual stream."""
+        gathered_last_layer_output = self._communicate_simple_fn(
+            hidden_states=residual,
+            forward_batch=forward_batch,
+            context=self._context,
+        )
+        if (
+            gathered_last_layer_output is residual
+            # An accumulator that copies on append already holds a snapshot.
+            and not getattr(captured_last_layer_outputs, "copies_on_append", False)
+            and not self._post_attn_residual_is_read_only(residual)
+        ):
+            gathered_last_layer_output = residual.clone()
+        captured_last_layer_outputs.append(gathered_last_layer_output)
 
     def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
         """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``

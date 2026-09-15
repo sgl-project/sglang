@@ -302,11 +302,20 @@ def execute_prefill_cp_bcg(
                 else hidden_states
             )
 
+        stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(
-            hidden_states,
-            static_forward_batch,
-            torch.cuda.current_stream(),
+            hidden_states, static_forward_batch, stream
         )
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, static_forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, static_forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
