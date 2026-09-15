@@ -219,6 +219,20 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA (Qwen4-Exp sparse attention) "
+                "indexer key cache and of the index query the block-selection "
+                'kernels score it with. "auto" keeps bf16. "fp8_e4m3" stores the '
+                "compressed indexer keys as plain e4m3 (no scale) and scores "
+                "blocks with fp8 GEMMs; it halves the indexer scoring bandwidth "
+                "and needs CUDA SM90+. The main KV cache dtype is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
+        ),
+    ] = "auto"
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (

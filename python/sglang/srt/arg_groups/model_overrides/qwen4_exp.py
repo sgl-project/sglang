@@ -78,6 +78,18 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     )
 
     profile = parse_qsa_profile(hf_config)
+    if cfg.qsa_indexer_dtype == "fp8_e4m3":
+        # The fp8 indexer scores blocks with fp8 GEMMs (TileLang / tensor
+        # cores); Hopper and datacenter Blackwell are the validated targets.
+        platform = get_platform()
+        if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100_or_sm110)):
+            raise ValueError(
+                "--qsa-indexer-dtype fp8_e4m3 requires a CUDA SM90/SM100 GPU"
+            )
+        if profile is None:
+            raise ValueError(
+                "--qsa-indexer-dtype fp8_e4m3 requires the compressed QSA indexer"
+            )
     if profile is not None:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
