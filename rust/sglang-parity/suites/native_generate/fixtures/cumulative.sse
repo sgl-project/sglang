@@ -1,0 +1,7 @@
+data: {"text":"Hello","output_ids":[10],"meta_info":{"id":"fixture-id","prompt_tokens":3,"completion_tokens":1,"finish_reason":null,"input_token_logprobs":[[null,1,null],[-0.5,2,null]],"output_token_logprobs":[[-0.1,10,null]],"input_top_logprobs":[null,[[-0.5,2,null]]],"output_top_logprobs":[[[-0.1,10,null],[-1.0,20,null]]]}}
+
+data: {"text":"Hello world","output_ids":[10,11],"future_field":{"keep":[null,"value"]},"meta_info":{"id":"fixture-id","prompt_tokens":3,"completion_tokens":2,"finish_reason":{"type":"length","length":2},"e2e_latency":0.01,"input_token_logprobs":[[null,1,null],[-0.5,2,null]],"output_token_logprobs":[[-0.1,10,null],[-0.2,11,null]],"input_top_logprobs":[null,[[-0.5,2,null]]],"output_top_logprobs":[[[-0.1,10,null],[-1.0,20,null]],[[-0.2,11,null],[-2.0,21,null]]],"unknown_metadata":{"complete":true}}}
+
+data: [DONE]
+
+: fixture end
