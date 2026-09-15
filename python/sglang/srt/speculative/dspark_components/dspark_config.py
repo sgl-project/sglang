@@ -67,6 +67,8 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    enable_confidence_head: bool
+    confidence_head_with_markov: bool
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -220,6 +222,13 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     prefixed_target_layer_ids = _cfg_get(
         draft_hf_config, "dspark_target_layer_ids", None
     )
+    prefixed_enable_confidence_head = _cfg_get(
+        draft_hf_config, "dspark_enable_confidence_head", None
+    )
+    prefixed_confidence_head_with_markov = _cfg_get(
+        draft_hf_config, "dspark_confidence_head_with_markov", None
+    )
+
     uses_prefixed = any(
         value is not None
         for value in (
@@ -304,6 +313,33 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     else:
         target_layer_ids = base.target_layer_ids
 
+    enable_confidence_head = bool(
+        prefixed_enable_confidence_head
+        if prefixed_enable_confidence_head is not None
+        else dspark_cfg.get(
+            "enable_confidence_head",
+            _cfg_get(
+                text_config,
+                "enable_confidence_head",
+                _cfg_get(draft_hf_config, "enable_confidence_head", True),
+            ),
+        )
+    )
+    confidence_head_with_markov = bool(
+        prefixed_confidence_head_with_markov
+        if prefixed_confidence_head_with_markov is not None
+        else dspark_cfg.get(
+            "confidence_head_with_markov",
+            _cfg_get(
+                text_config,
+                "confidence_head_with_markov",
+                _cfg_get(
+                    draft_hf_config, "confidence_head_with_markov", markov_rank > 0
+                ),
+            ),
+        )
+    )
+
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
         num_target_layers=base.num_target_layers,
@@ -313,4 +349,6 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        enable_confidence_head=enable_confidence_head,
+        confidence_head_with_markov=confidence_head_with_markov,
     )
