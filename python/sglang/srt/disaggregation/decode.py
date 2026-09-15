@@ -74,6 +74,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -82,6 +83,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    evict_from_tree_cache,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -1362,15 +1364,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            # Prefetch before allocation: a declined prefetch degrades the
+            # promised L3 range, which the alloc and metadata must reflect.
+            decode_req.prefix_match = prefix_match
+            if self.scheduler.enable_decode_hicache and prefix_match is not None:
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                total_prefix_len = min(total_prefix_len, prefix_match.decode_prefix_len)
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
-            decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1828,10 +1833,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
-
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
+        # Same admission path as the colocated scheduler: on hybrid SSM pools
+        # this evicts cached mamba checkpoints before taking a fresh slot.
+        req_pool_indices = alloc_req_slots(
+            self.req_to_token_pool, [req], self.tree_cache
         )
 
         fill_len = self._pre_alloc_fill_len(req)
@@ -1850,20 +1855,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len=fill_len, prefix_len=prefix_len
         )
 
-        # Evict cached entries if the pool doesn't have enough free pages.
-        if (
-            get_disagg().disaggregation_decode_enable_radix_cache
-            and self._radix_full_available() < required_alloc_tokens
-        ):
-            num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_to_evict)
-            )
+        # Evict per component pool (full + SWA), matching the colocated path:
+        # a full-attention-only shortfall leaves the SWA pool with pages that
+        # are counted evictable but never reclaimed, wedging the alloc below.
+        if get_disagg().disaggregation_decode_enable_radix_cache:
+            evict_from_tree_cache(self.tree_cache, required_alloc_tokens)
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self._radix_full_available()} "
-                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
+                    f"available {self._radix_full_available()}. "
                     f"evictable_size={self._radix_full_evictable()}, "
                     f"protected_size={self._radix_full_protected()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "
