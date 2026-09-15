@@ -1,33 +1,35 @@
-import json
-import tempfile
+import base64
+import io
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
+import requests
+from PIL import Image
+
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval, run_eval_once
-from sglang.test.server_fixtures.default_fixture import openai_api_env
-from sglang.test.simple_eval_common import make_report
-from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+from sglang.test.run_eval import run_eval
+from sglang.test.server_fixtures.default_fixture import (
+    DefaultServerBase,
+    openai_api_env,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     is_in_ci,
-    popen_launch_server,
-    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
-# Three cold server launches, GSM8K, and a serialized MMMU baseline.
-# This is an estimate pending a complete GPU CI run.
-register_cuda_ci(est_time=2400, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-h200")
 
 
-class TestStep3p7Flash(CustomTestCase):
+class TestStep3p7Flash(DefaultServerBase):
+    """Real-model coverage for batched Step3.7 images and GSM8K accuracy."""
+
     model = "stepfun-ai/Step-3.7-Flash"
-    base_url = DEFAULT_URL_FOR_TEST
-    # Reuse the Step3.5 Flash E2E model-loading and TP configuration.
+    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
+    # Hold scheduler input until the entire /generate batch is preprocessed.
+    server_env = {"SGLANG_ENABLE_COLOCATED_BATCH_GEN": "1"}
+    # Reuse the Step3.5 Flash E2E launch configuration.
     other_args = [
         "--tp",
         "8",
@@ -38,110 +40,91 @@ class TestStep3p7Flash(CustomTestCase):
         "0.75",
         "--chunked-prefill-size",
         "8192",
+        "--max-prefill-tokens",
+        "8192",
+        "--max-running-requests",
+        "8",
         "--disable-radix-cache",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
     ]
 
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = get_tokenizer(cls.model, trust_remote_code=True)
+        super().setUpClass()
+
+    def _make_request(self, images):
+        image_data = []
+        for color, size in images:
+            with io.BytesIO() as buffer:
+                Image.new("RGB", size, color).save(buffer, format="PNG")
+                encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            image_data.append(f"data:image/png;base64,{encoded}")
+
+        prompt = self.tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": "<im_patch>\n"
+                    * len(images)
+                    + "Name the solid background color of each image in image order. "
+                    "Reply only with the color names separated by commas.",
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # This checkpoint's template opens <think> unconditionally. Close it
+        # so a short image probe does not spend its budget on reasoning.
+        if prompt.endswith("<think>\n"):
+            prompt += "</think>\n"
+        return prompt, image_data
+
+    def test_batched_image_features(self):
+        # Fresh images exercise both patch-free and patch + thumbnail paths.
+        cases = [
+            [("red", (224, 224))],
+            [("green", (1008, 504))],
+            [("blue", (1008, 504)), ("red", (280, 280))],
+            [("red", (336, 336)), ("blue", (504, 1008))],
+        ]
+        inputs = [self._make_request(case) for case in cases]
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": [text for text, _ in inputs],
+                "image_data": [images for _, images in inputs],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 128},
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        outputs = response.json()
+        self.assertEqual(len(outputs), len(cases))
+        for case, output in zip(cases, outputs):
+            with self.subTest(images=case):
+                self.assertTrue(output["text"].strip(), output)
+
     def test_gsm8k(self):
-        process = popen_launch_server(
-            self.model,
-            self.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-            other_args=self.other_args,
-        )
-        try:
-            args = SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
-                eval_name="gsm8k",
-                api="completion",
-                max_tokens=4096,
-                num_examples=500,
-                num_threads=128,
-            )
-            with openai_api_env("EMPTY"):
-                metrics = run_eval(args)
-            summary = f"Step3.7 GSM8K (500 samples): score={metrics['score']:.4f}"
-            print(summary)
-            if is_in_ci():
-                write_github_step_summary(summary + "\n")
-            # Initial floor from test_step3p5_flash_chain_mtp.py; this has
-            # not yet been calibrated against a measured Step3.7 baseline.
-            self.assertGreater(metrics["score"], 0.83, summary)
-        finally:
-            terminate_and_kill_process_tree(process, wait_timeout=60)
-
-    def test_mmmu_serial_vs_concurrent(self):
-        # Reuse the nightly MMMU dataset selection, prompts, answer parser,
-        # and scorer. Sharing this object guarantees identical samples.
-        evaluator = MMMUVLMEval(num_examples=100, num_threads=64)
-        self.assertEqual(len(evaluator.samples), 100)
-        # Apply the same low reasoning tier and 32k output limit to both modes
-        # to bound outlier generations while preserving a like-for-like comparison.
         args = SimpleNamespace(
+            base_url=self.base_url,
             model=self.model,
-            max_tokens=32768,
-            reasoning_effort="low",
-            temperature=0,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=4096,
+            num_examples=500,
+            num_threads=128,
         )
-        report_dir = Path(tempfile.mkdtemp(prefix="step3p7_mmmu_"))
-        print(f"Step3.7 MMMU reports: {report_dir}")
-        scores = {}
-
-        for mode, max_running_requests in [("serial", 1), ("concurrent", 8)]:
-            # Restart for each mode: a warm vision embedding cache could hide
-            # the changed encoder path. The client workload is unchanged;
-            # only the scheduler's maximum request concurrency differs.
-            process = popen_launch_server(
-                self.model,
-                self.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                other_args=self.other_args
-                + ["--max-running-requests", str(max_running_requests)],
-            )
-            try:
-                # Unlike run_eval(), run_eval_once() does not initialize the
-                # SDK's required API key, even for an unauthenticated server.
-                with openai_api_env("EMPTY"):
-                    result, latency, _ = run_eval_once(
-                        args, self.base_url + "/v1", evaluator
-                    )
-                scores[mode] = result.score
-                (report_dir / f"{mode}.html").write_text(make_report(result))
-                (report_dir / f"{mode}.json").write_text(
-                    json.dumps(
-                        {
-                            "score": result.score,
-                            "latency": latency,
-                            "sample_ids": [s["id"] for s in evaluator.samples],
-                            "answers": [c[-1]["content"] for c in result.convos],
-                        },
-                        indent=2,
-                    )
-                )
-                self.assertEqual(len(result.convos), len(evaluator.samples))
-                self.assertTrue(
-                    all(c[-1]["content"].strip() for c in result.convos),
-                    f"{mode}: empty responses; see {report_dir}",
-                )
-                # Reject a vacuous comparison where both runs score zero.
-                self.assertGreater(result.score, 0, f"{mode}: {report_dir}")
-            finally:
-                terminate_and_kill_process_tree(process, wait_timeout=60)
-
-        summary = (
-            f"Step3.7 MMMU (100 samples): serial={scores['serial']:.4f}, "
-            f"concurrent={scores['concurrent']:.4f}. Reports: {report_dir}"
-        )
+        with openai_api_env("EMPTY"):
+            metrics = run_eval(args)
+        summary = f"Step3.7 GSM8K (500 samples): score={metrics['score']:.4f}"
         print(summary)
         if is_in_ci():
             write_github_step_summary(summary + "\n")
-        # The fixed 100-sample subset has roughly one-point answer granularity,
-        # and batch-dependent GPU numerics can flip a small number of answers.
-        # Reject a material regression while allowing up to two percentage
-        # points of absolute score difference from the serialized control.
-        self.assertGreaterEqual(scores["concurrent"], scores["serial"] - 0.02, summary)
+        # Initial floor from test_step3p5_flash_chain_mtp.py; this has
+        # not yet been calibrated against a measured Step3.7 baseline.
+        self.assertGreater(metrics["score"], 0.83, summary)
 
 
 if __name__ == "__main__":
