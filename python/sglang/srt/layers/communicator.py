@@ -843,6 +843,11 @@ class LayerCommunicator:
                             hidden_states,
                             residual,
                             use_attn_tp_group=False,
+                            # emit_bf16 is only True for a qwen3.5 GDN layer whose
+                            # bf16 in_proj_ba shares this norm with an FP8
+                            # in_proj_qkvz; keep the bf16 sidecar so in_proj_ba
+                            # gets an unquantized input. False (no-op) elsewhere.
+                            keep_bf16=emit_bf16,
                         )
                     elif (
                         quant_result is None
@@ -960,10 +965,12 @@ class LayerCommunicator:
                         and not _disable_fused_ar_fp8_quant
                     ):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
-                        # When DSA is active, also preserve the unquantized bf16
-                        # output as a 3-tuple (fp8, scale, bf16) so the DSA
-                        # indexer can skip redundant FP8 dequantization.
+                        # The kernel can also emit the unquantized bf16 normed
+                        # output. Two consumers need it: the DSA indexer, and a
+                        # qwen3.5 GDN layer whose bf16 in_proj_ba shares this norm
+                        # with the FP8 in_proj_qkvz (signalled by emit_bf16).
                         _dsa_needs_bf16 = get_attn_tp_context().is_dsa
+                        _need_bf16 = _dsa_needs_bf16 or emit_bf16
                         hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             getattr(
@@ -978,14 +985,25 @@ class LayerCommunicator:
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
-                            output_unquantized_inp1=_dsa_needs_bf16,
+                            output_unquantized_inp1=_need_bf16,
                             transpose_scale=False,
                         )
                         if _use_aiter_bpreshuffle_gfx95:
                             hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
                                 hidden_states
                             )
-                        if _dsa_needs_bf16:
+                        # The two consumers expect different 3-tuple layouts:
+                        # qwen3.5's _select_fused_ar_input_for_linear expects
+                        # (bf16, fp8, scale); the DSA indexer expects
+                        # (fp8, scale, bf16). emit_bf16 is qwen3.5-GDN-only, so
+                        # the arms are mutually exclusive.
+                        if emit_bf16:
+                            hidden_states = (
+                                _unq_bf16,
+                                hidden_states[0],
+                                hidden_states[1],
+                            )
+                        elif _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
@@ -1041,9 +1059,11 @@ class LayerCommunicator:
                         and not _disable_fused_ar_fp8_quant
                     ):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
-                        # with residual addition. When DSA is active, pack
-                        # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
+                        # with residual addition. The kernel can also emit the
+                        # unquantized bf16 normed output for the DSA indexer or a
+                        # qwen3.5 GDN bf16 in_proj_ba (signalled by emit_bf16).
                         _dsa_needs_bf16 = get_attn_tp_context().is_dsa
+                        _need_bf16 = _dsa_needs_bf16 or emit_bf16
                         hidden_states, _unq_bf16, _, residual = (
                             fused_rms_fp8_group_quant(
                                 hidden_states,
@@ -1059,7 +1079,7 @@ class LayerCommunicator:
                                 group_size=128,
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
-                                output_unquantized_inp1=_dsa_needs_bf16,
+                                output_unquantized_inp1=_need_bf16,
                                 transpose_scale=False,
                             )
                         )
@@ -1067,7 +1087,15 @@ class LayerCommunicator:
                             hidden_states = materialize_bpreshuffle_fp8_scale_tuple(
                                 hidden_states
                             )
-                        if _dsa_needs_bf16:
+                        # qwen3.5 expects (bf16, fp8, scale); DSA expects
+                        # (fp8, scale, bf16). emit_bf16 is qwen3.5-GDN-only.
+                        if emit_bf16:
+                            hidden_states = (
+                                _unq_bf16,
+                                hidden_states[0],
+                                hidden_states[1],
+                            )
+                        elif _dsa_needs_bf16:
                             hidden_states = (
                                 hidden_states[0],
                                 hidden_states[1],
