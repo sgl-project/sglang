@@ -1,4 +1,4 @@
-"""Production loader regressions using real parameter storage."""
+"""Regression coverage for LongCat NextN weight requantization."""
 
 import unittest
 from types import SimpleNamespace
@@ -9,17 +9,17 @@ from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _empty(cls):
-    module = cls.__new__(cls)
-    nn.Module.__init__(module)
-    return module
+    obj = cls.__new__(cls)
+    nn.Module.__init__(obj)
+    return obj
 
 
-class TestFFNModelLoaders(unittest.TestCase):
-    def test_longcat_nextn_requantizes_both_mlp_projections(self):
+class TestLongcatNextNRequantization(unittest.TestCase):
+    def test_longcat_nextn_requantizes_both_dense_projections(self):
         from sglang.srt.models import longcat_flash_nextn as longcat
 
         model = _empty(longcat.LongcatFlashForCausalLMNextN)

@@ -35,10 +35,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -257,7 +254,6 @@ class GPT2LMHeadModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
@@ -271,8 +267,7 @@ class GPT2LMHeadModel(nn.Module):
             if not name.startswith("transformer."):
                 name = "transformer." + name
 
-            registered_name = map_weight_name(name)
-            param = params_dict[registered_name]
+            param = params_dict[name]
             # The HF's GPT-2 implementation uses Conv1D instead of Linear.
             # Because of this, we need to transpose the weights.
             # Note(zhuohan): the logic below might break quantized models.

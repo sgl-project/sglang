@@ -71,10 +71,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -1036,7 +1033,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         is_nextn=False,
         params_dict=None,
     ):
-        map_weight_name = get_checkpoint_name_mapper(self)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1159,13 +1155,12 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
 
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1182,12 +1177,11 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         # Expert weight not on this rank, will be skipped below
                         continue
 
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1203,10 +1197,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                         continue
 
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
 
                     # GLM NOTE: for MLA
@@ -1242,10 +1233,9 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                                     "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
                                 )
                             )
-                            registered_param_name = map_weight_name(param_name)
-                            if registered_param_name not in params_dict:
+                            if param_name not in params_dict:
                                 continue
-                            param = params_dict[registered_param_name]
+                            param = params_dict[param_name]
 
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
@@ -1254,9 +1244,9 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-                        if ("k_scale" in name or "v_scale" in name) and map_weight_name(
-                            name
-                        ) not in params_dict:
+                        if (
+                            "k_scale" in name or "v_scale" in name
+                        ) and name not in params_dict:
                             # modelopt attn kv scale is named differently
                             if any(scale in name for scale in ["k_scale", "v_scale"]):
                                 name = name.replace("_proj", "attn_mqa")
@@ -1265,12 +1255,11 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                                     f"Unknown scale found in checkpoint: {name}"
                                 )
 
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
 
-                    if registered_name in params_dict.keys():
-                        param = params_dict[registered_name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

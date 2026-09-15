@@ -82,7 +82,6 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
@@ -1691,7 +1690,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
-        map_weight_name = get_checkpoint_name_mapper(self)
 
         stacked_params_mapping = [
             # Leading "." on ".qkv_proj" prevents it from falsely matching the sparse
@@ -1753,13 +1751,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 if "mlp.experts." in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
 
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1774,11 +1771,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
 
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1792,19 +1788,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     if is_expert_weight:
                         continue
 
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
 
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
 
-                    registered_name = map_weight_name(name)
-                    if registered_name in params_dict:
-                        param = params_dict[registered_name]
+                    if name in params_dict:
+                        param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -1815,8 +1807,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                             continue
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
 
         # Run before the loader's process pass: the raw fp8 weight + uint8 scale are
         # final here (mxfp8 post-process only derives the packed scale, not these).

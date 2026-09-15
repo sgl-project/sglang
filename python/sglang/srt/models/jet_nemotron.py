@@ -29,10 +29,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
 
@@ -551,7 +548,6 @@ class JetNemotronForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping: list[tuple[str, str, str | int]] = [
             # (param_name, shard_weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -582,12 +578,11 @@ class JetNemotronForCausalLM(nn.Module):
                     shard_weight_name_part, param_name_part
                 )
 
-                registered_param_name = map_weight_name(param_name)
-                if registered_param_name not in params_dict:
+                if param_name not in params_dict:
                     # Fall back to direct match if no such stacked parameter.
                     continue
 
-                param = params_dict[registered_param_name]
+                param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -595,8 +590,7 @@ class JetNemotronForCausalLM(nn.Module):
             else:
                 param_name = weight_name
 
-                registered_param_name = map_weight_name(param_name)
-                param = params_dict[registered_param_name]
+                param = params_dict[param_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

@@ -32,10 +32,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 
 
@@ -384,7 +381,6 @@ class VoxtralForConditionalGeneration(nn.Module):
         return self.language_model
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         encoder_stacked = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -415,15 +411,13 @@ class VoxtralForConditionalGeneration(nn.Module):
                     for param_name, weight_name, shard_id in encoder_stacked:
                         if f".{weight_name}." in trimmed:
                             stacked_name = trimmed.replace(weight_name, param_name)
-                            registered_stacked_name = map_weight_name(stacked_name)
-                            if registered_stacked_name in encoder_dict:
-                                param = encoder_dict[registered_stacked_name]
+                            if stacked_name in encoder_dict:
+                                param = encoder_dict[stacked_name]
                                 param.weight_loader(param, w, shard_id)
                                 loaded = True
                                 break
-                    if not loaded and map_weight_name(trimmed) in encoder_dict:
-                        registered_trimmed = map_weight_name(trimmed)
-                        param = encoder_dict[registered_trimmed]
+                    if not loaded and trimmed in encoder_dict:
+                        param = encoder_dict[trimmed]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -436,9 +430,8 @@ class VoxtralForConditionalGeneration(nn.Module):
                     trimmed = trimmed.replace("linear_1.", "w_in.").replace(
                         "linear_2.", "w_out."
                     )
-                    registered_trimmed = map_weight_name(trimmed)
-                    if registered_trimmed in projector_dict:
-                        param = projector_dict[registered_trimmed]
+                    if trimmed in projector_dict:
+                        param = projector_dict[trimmed]
                         default_weight_loader(param, w)
                     continue
 

@@ -55,10 +55,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -592,7 +589,6 @@ class AfmoeForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -623,12 +619,11 @@ class AfmoeForCausalLM(nn.Module):
 
                 new_name = name.replace(weight_name, param_name)
                 # Skip if parameter doesn't exist (e.g., bias for layers without bias)
-                registered_new_name = map_weight_name(new_name)
-                if registered_new_name not in params_dict:
+                if new_name not in params_dict:
                     handled = True
                     break
 
-                param = params_dict[registered_new_name]
+                param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 handled = True
@@ -638,9 +633,8 @@ class AfmoeForCausalLM(nn.Module):
                 continue
 
             # Load remaining weights directly
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                param = params_dict[registered_name]
+            if name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

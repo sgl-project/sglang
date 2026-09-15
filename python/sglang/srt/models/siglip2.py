@@ -40,10 +40,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 
@@ -553,7 +550,6 @@ class Siglip2Model(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # VisionAttention uses attn.qkv_proj for fused Q/K/V
@@ -588,11 +584,10 @@ class Siglip2Model(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
 
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
 
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -603,12 +598,10 @@ class Siglip2Model(nn.Module):
                         name = name.replace(old_name, new_name)
                         break
 
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
         return loaded_params

@@ -52,7 +52,6 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbedding
@@ -1194,7 +1193,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1304,10 +1302,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 if weight_name not in orig_name:
                     continue
                 name = orig_name.replace(weight_name, param_name)
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(
                     param,
@@ -1316,7 +1313,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     shard_id=shard_id,
                     expert_id=expert_id,
                 )
-                loaded_params.add(registered_name)
+                loaded_params.add(name)
                 break
             else:
                 # 2) BF16 fused checkpoint layout: experts.gate_up_proj is a
@@ -1327,16 +1324,15 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     for i in range(num_experts):
                         chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
                         for chunk, sid in zip(chunks, shard_ids):
                             weight_loader(param, chunk, name, sid, i)
-                    loaded_params.add(registered_name)
+                    loaded_params.add(name)
                     break
                 else:
                     for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1344,49 +1340,41 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        registered_name = map_weight_name(name)
-                        if registered_name not in params_dict:
+                        if name not in params_dict:
                             continue
-                        param = params_dict[registered_name]
+                        param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight, shard_id)
                         if should_dup_k_to_v:
                             weight_loader(param, loaded_weight, "v")
-                        loaded_params.add(registered_name)
+                        loaded_params.add(name)
                         break
                     else:
                         name = orig_name
-                        if (
-                            name.endswith(".bias")
-                            and map_weight_name(name) not in params_dict
-                        ):
+                        if name.endswith(".bias") and name not in params_dict:
                             continue
                         name = maybe_remap_kv_scale_name(name, params_dict)
                         if name is None:
                             continue
-                        registered_name = map_weight_name(name)
-                        if registered_name not in params_dict:
+                        if name not in params_dict:
                             continue
-                        param = params_dict[registered_name]
+                        param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-                        loaded_params.add(registered_name)
+                        loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
             buckets = {
                 logging.WARNING: (
                     "Some weights are not initialized from checkpoints",
-                    lambda p: map_weight_name(p) in param_names,
+                    lambda p: p in param_names,
                 ),
                 logging.INFO: (
                     "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: (
-                        map_weight_name(p) not in param_names
-                        and p not in non_persistent_buffers
-                    ),
+                    lambda p: p not in param_names and p not in non_persistent_buffers,
                 ),
                 logging.DEBUG: (
                     "Non-persistent buffers not in checkpoint (expected)",

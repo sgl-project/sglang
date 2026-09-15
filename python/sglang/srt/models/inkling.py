@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from typing import Callable, Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -45,10 +45,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.attn import (
     InklingAttention,
     compute_log_scaling_tau,
@@ -1215,13 +1212,10 @@ class InklingForConditionalGeneration(nn.Module):
         name: str,
         loaded_weight: torch.Tensor,
         shard_id: Optional[int] = None,
-        *,
-        map_weight_name: Callable[[str], str],
     ) -> bool:
-        registered_name = map_weight_name(name)
-        if registered_name not in params_dict:
+        if name not in params_dict:
             return False
-        param = params_dict[registered_name]
+        param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         if shard_id is None:
             if param.data.shape == loaded_weight.shape:
@@ -1230,7 +1224,7 @@ class InklingForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight)
         else:
             weight_loader(param, loaded_weight, shard_id)
-        loaded_params.add(registered_name)
+        loaded_params.add(name)
         return True
 
     def _load_nvfp4_scale_param(
@@ -1239,16 +1233,13 @@ class InklingForConditionalGeneration(nn.Module):
         loaded_params: Set[str],
         name: str,
         loaded_weight: torch.Tensor,
-        *,
-        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Load an NVFP4 auxiliary tensor (block scale / scale2 / input_amax /
         original_shape); shard appropriately.
         """
-        registered_name = map_weight_name(name)
-        if registered_name not in params_dict:
+        if name not in params_dict:
             return False
-        param = params_dict[registered_name]
+        param = params_dict[name]
         if loaded_weight.shape != param.shape:
             # shared experts shard over the full tp group; routed over moe_tp
             tp_rank = (
@@ -1269,7 +1260,7 @@ class InklingForConditionalGeneration(nn.Module):
                     dim, tp_rank * param.shape[dim], param.shape[dim]
                 )
         default_weight_loader(param, loaded_weight)
-        loaded_params.add(registered_name)
+        loaded_params.add(name)
         return True
 
     def _ckpt_scale_to_modelopt(
@@ -1332,13 +1323,10 @@ class InklingForConditionalGeneration(nn.Module):
         name: str,
         loaded_weight: torch.Tensor,
         shard_id: str,
-        *,
-        map_weight_name: Callable[[str], str],
     ) -> bool:
-        registered_name = map_weight_name(name)
-        if registered_name not in params_dict:
+        if name not in params_dict:
             return False
-        param = params_dict[registered_name]
+        param = params_dict[name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         if (
             shard_id == "w13"
@@ -1363,7 +1351,7 @@ class InklingForConditionalGeneration(nn.Module):
             default_weight_loader(param, loaded_weight)
         else:
             weight_loader(param, loaded_weight, name, shard_id)
-        loaded_params.add(registered_name)
+        loaded_params.add(name)
         return True
 
     def _load_per_expert_param(
@@ -1372,8 +1360,6 @@ class InklingForConditionalGeneration(nn.Module):
         loaded_params: Set[str],
         name: str,
         loaded_weight: torch.Tensor,
-        *,
-        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Load ONE routed expert shipped by the online RL weight-sync.
 
@@ -1403,13 +1389,13 @@ class InklingForConditionalGeneration(nn.Module):
             (
                 t
                 for t in (f"{pfx}.{leaf}", f"{pfx}.base_layer.{leaf}")
-                if map_weight_name(t) in params_dict
+                if t in params_dict
             ),
             None,
         )
         if target is None:
             return False
-        moe = self.get_submodule(map_weight_name(target.rsplit(".", 1)[0]))
+        moe = self.get_submodule(target.rsplit(".", 1)[0])
         if getattr(moe, "use_flashinfer_trtllm_moe", False) or getattr(
             getattr(moe, "quant_method", None), "use_flashinfer_trtllm_moe", False
         ):
@@ -1425,19 +1411,16 @@ class InklingForConditionalGeneration(nn.Module):
             local = self.text_config.n_routed_experts // ep_size
             first = get_parallel().moe_ep_rank * local
             if not (first <= eid < first + local):
-                registered_target = map_weight_name(target)
-                loaded_params.add(registered_target)  # another rank owns this expert
+                loaded_params.add(target)  # another rank owns this expert
                 return True
             eid -= first
         if proj == "down_proj":
-            registered_target = map_weight_name(target)
-            dst = params_dict[registered_target].data[
+            dst = params_dict[target].data[
                 eid
             ]  # [H, I_local]; shard intermediate (dim 1)
             dst.copy_(_shard_full_to_local(loaded_weight, dst, dim=1))
         else:
-            registered_target = map_weight_name(target)
-            w13 = params_dict[registered_target].data[
+            w13 = params_dict[target].data[
                 eid
             ]  # [2*I_local, H]; shard intermediate (dim 0)
             idx = 0 if proj == "gate_proj" else 1
@@ -1450,12 +1433,10 @@ class InklingForConditionalGeneration(nn.Module):
             else:
                 dst = w13[idx::2]  # Inkling-interleaved rows
             dst.copy_(_shard_full_to_local(loaded_weight, dst, dim=0))
-        registered_target = map_weight_name(target)
-        loaded_params.add(registered_target)
+        loaded_params.add(target)
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         embed_tokens_weight: Optional[torch.Tensor] = None
@@ -1528,12 +1509,7 @@ class InklingForConditionalGeneration(nn.Module):
                     continue
                 sgl_name = name.replace(f".{weight_name}.", f".{param_name}.")
                 matched = self._load_regular_param(
-                    params_dict,
-                    loaded_params,
-                    sgl_name,
-                    loaded_weight,
-                    shard_id,
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, sgl_name, loaded_weight, shard_id
                 )
                 break
             if matched:
@@ -1541,9 +1517,8 @@ class InklingForConditionalGeneration(nn.Module):
 
             if ".mlp.w13_dn.weight" in name:
                 sgl_name = name.replace(".w13_dn.", ".gate_up_proj.")
-                registered_sgl_name = map_weight_name(sgl_name)
-                if registered_sgl_name in params_dict:
-                    param = params_dict[registered_sgl_name]
+                if sgl_name in params_dict:
+                    param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
                         start = get_parallel().attn_tp_rank * shard_size
@@ -1553,17 +1528,13 @@ class InklingForConditionalGeneration(nn.Module):
                         # stock LoRA gate_up slicing line up (see InklingDenseMLP.__init__).
                         loaded_weight = deinterleave_gate_up(loaded_weight, dim=0)
                     default_weight_loader(param, loaded_weight)
-                    loaded_params.add(registered_sgl_name)
+                    loaded_params.add(sgl_name)
                     continue
 
             if ".mlp.w2_md.weight" in name:
                 sgl_name = name.replace(".w2_md.", ".down_proj.")
                 if self._load_regular_param(
-                    params_dict,
-                    loaded_params,
-                    sgl_name,
-                    loaded_weight,
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, sgl_name, loaded_weight
                 ):
                     continue
 
@@ -1571,12 +1542,7 @@ class InklingForConditionalGeneration(nn.Module):
                 if f".mlp.{weight_name}." in name:
                     sgl_name = name.replace(f".{weight_name}.", f".{param_name}.")
                     matched = self._load_regular_param(
-                        params_dict,
-                        loaded_params,
-                        sgl_name,
-                        loaded_weight,
-                        shard_id,
-                        map_weight_name=map_weight_name,
+                        params_dict, loaded_params, sgl_name, loaded_weight, shard_id
                     )
                     break
             if matched:
@@ -1606,25 +1572,16 @@ class InklingForConditionalGeneration(nn.Module):
                     }.get(_suf)
                     mo_name = f"{prefix}_{mo_suf}" if mo_suf else None
                     inkling_name = f"{prefix}_{_suf}"
-                    if mo_name is not None and map_weight_name(mo_name) in params_dict:
-                        registered_mo_name = map_weight_name(mo_name)
+                    if mo_name is not None and mo_name in params_dict:
                         conv = self._ckpt_scale_to_modelopt(
-                            _suf, loaded_weight, params_dict[registered_mo_name]
+                            _suf, loaded_weight, params_dict[mo_name]
                         )
                         self._load_nvfp4_scale_param(
-                            params_dict,
-                            loaded_params,
-                            mo_name,
-                            conv,
-                            map_weight_name=map_weight_name,
+                            params_dict, loaded_params, mo_name, conv
                         )
-                    elif map_weight_name(inkling_name) in params_dict:
+                    elif inkling_name in params_dict:
                         self._load_nvfp4_scale_param(
-                            params_dict,
-                            loaded_params,
-                            inkling_name,
-                            loaded_weight,
-                            map_weight_name=map_weight_name,
+                            params_dict, loaded_params, inkling_name, loaded_weight
                         )
                     elif _suf != "original_shape":
                         # ModelOpt path has no original_shape param, so dropping that one
@@ -1664,22 +1621,12 @@ class InklingForConditionalGeneration(nn.Module):
                         )
                     loaded_weight = loaded_weight.view(n_e, two_f, hid)
                 if self._load_fused_moe_param(
-                    params_dict,
-                    loaded_params,
-                    name,
-                    loaded_weight,
-                    "w13",
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, name, loaded_weight, "w13"
                 ):
                     continue
             if ".experts.w2_weight" in name:
                 if self._load_fused_moe_param(
-                    params_dict,
-                    loaded_params,
-                    name,
-                    loaded_weight,
-                    "w2",
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, name, loaded_weight, "w2"
                 ):
                     continue
             if ".shared_experts.shared_w13_weight" in name:
@@ -1712,42 +1659,24 @@ class InklingForConditionalGeneration(nn.Module):
                     loaded_weight = loaded_weight.view(n_e, two_f, hid)
                 sgl_name = name.replace("shared_w13_weight", "w13_weight")
                 if self._load_fused_moe_param(
-                    params_dict,
-                    loaded_params,
-                    sgl_name,
-                    loaded_weight,
-                    "w13",
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, sgl_name, loaded_weight, "w13"
                 ):
                     continue
             if ".shared_experts.shared_w2_weight" in name:
                 sgl_name = name.replace("shared_w2_weight", "w2_weight")
                 if self._load_fused_moe_param(
-                    params_dict,
-                    loaded_params,
-                    sgl_name,
-                    loaded_weight,
-                    "w2",
-                    map_weight_name=map_weight_name,
+                    params_dict, loaded_params, sgl_name, loaded_weight, "w2"
                 ):
                     continue
             if self._load_per_expert_param(
-                params_dict,
-                loaded_params,
-                name,
-                loaded_weight,
-                map_weight_name=map_weight_name,
+                params_dict, loaded_params, name, loaded_weight
             ):
                 continue
 
-            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+            if name.endswith(".bias") and name not in params_dict:
                 continue
             if self._load_regular_param(
-                params_dict,
-                loaded_params,
-                name,
-                loaded_weight,
-                map_weight_name=map_weight_name,
+                params_dict, loaded_params, name, loaded_weight
             ):
                 continue
 
@@ -1761,7 +1690,6 @@ class InklingForConditionalGeneration(nn.Module):
                     loaded_params,
                     "llm.lm_head.weight",
                     embed_tokens_weight,
-                    map_weight_name=map_weight_name,
                 )
         return loaded_params
 
@@ -1982,7 +1910,6 @@ class InklingForConditionalGenerationMTP(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -2012,14 +1939,13 @@ class InklingForConditionalGenerationMTP(nn.Module):
                 if f".attn.{weight_name}." not in name:
                     continue
                 sgl_name = name.replace(f".{weight_name}.", f".{param_name}.")
-                registered_sgl_name = map_weight_name(sgl_name)
-                if registered_sgl_name in params_dict:
-                    param = params_dict[registered_sgl_name]
+                if sgl_name in params_dict:
+                    param = params_dict[sgl_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(registered_sgl_name)
+                    loaded_params.add(sgl_name)
                 matched = True
                 break
             if matched:
@@ -2027,15 +1953,14 @@ class InklingForConditionalGenerationMTP(nn.Module):
 
             if ".mlp.w13_dn.weight" in name:
                 sgl_name = name.replace(".w13_dn.", ".gate_up_proj.")
-                registered_sgl_name = map_weight_name(sgl_name)
-                if registered_sgl_name in params_dict:
-                    param = params_dict[registered_sgl_name]
+                if sgl_name in params_dict:
+                    param = params_dict[sgl_name]
                     if loaded_weight.shape != param.data.shape:
                         shard_size = param.data.shape[0]
                         start = get_parallel().attn_tp_rank * shard_size
                         loaded_weight = loaded_weight.narrow(0, start, shard_size)
                     default_weight_loader(param, loaded_weight)
-                    loaded_params.add(registered_sgl_name)
+                    loaded_params.add(sgl_name)
                 continue
             if ".mlp.w2_md.weight" in name:
                 name = name.replace(".w2_md.", ".down_proj.")
@@ -2043,9 +1968,8 @@ class InklingForConditionalGenerationMTP(nn.Module):
                 for param_name, weight_name, shard_id in STACKED_DENSE_PARAMS_MAPPING:
                     if f".mlp.{weight_name}." in name:
                         sgl_name = name.replace(f".{weight_name}.", f".{param_name}.")
-                        registered_sgl_name = map_weight_name(sgl_name)
-                        if registered_sgl_name in params_dict:
-                            param = params_dict[registered_sgl_name]
+                        if sgl_name in params_dict:
+                            param = params_dict[sgl_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -2053,7 +1977,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
                                 weight_loader(param, loaded_weight)
                             else:
                                 weight_loader(param, loaded_weight, shard_id)
-                            loaded_params.add(registered_sgl_name)
+                            loaded_params.add(sgl_name)
                         matched = True
                         break
                 if matched:
@@ -2067,9 +1991,8 @@ class InklingForConditionalGenerationMTP(nn.Module):
                 (".experts.w13_weight", "w13"),
                 (".experts.w2_weight", "w2"),
             ):
-                if needle in name and map_weight_name(name) in params_dict:
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                if needle in name and name in params_dict:
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -2077,20 +2000,19 @@ class InklingForConditionalGenerationMTP(nn.Module):
                         default_weight_loader(param, loaded_weight)
                     else:
                         weight_loader(param, loaded_weight, name, shard)
-                    loaded_params.add(registered_name)
+                    loaded_params.add(name)
                     matched = True
                     break
             if matched:
                 continue
 
-            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+            if name.endswith(".bias") and name not in params_dict:
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                param = params_dict[registered_name]
+            if name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(registered_name)
+                loaded_params.add(name)
 
         unloaded = sorted(set(params_dict) - loaded_params)
         if unloaded:

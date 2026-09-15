@@ -50,7 +50,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.utils import (
@@ -596,7 +595,6 @@ class SDARMoeForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -663,16 +661,12 @@ class SDARMoeForCausalLM(nn.Module):
                     continue
 
                 name2 = name.replace(weight_name, param_name)
-                if (
-                    name2.endswith(".bias")
-                    and map_weight_name(name2) not in params_dict
-                ):
+                if name2.endswith(".bias") and name2 not in params_dict:
                     continue
-                registered_name2 = map_weight_name(name2)
-                if registered_name2 not in params_dict:
+                if name2 not in params_dict:
                     continue
 
-                param = params_dict[registered_name2]
+                param = params_dict[name2]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -685,11 +679,10 @@ class SDARMoeForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name2 = name.replace(weight_name, param_name)
-                    registered_name2 = map_weight_name(name2)
-                    if registered_name2 not in params_dict:
+                    if name2 not in params_dict:
                         continue
 
-                    param = params_dict[registered_name2]
+                    param = params_dict[name2]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -706,16 +699,12 @@ class SDARMoeForCausalLM(nn.Module):
                         continue
 
                     # 3) regular params
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
 
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

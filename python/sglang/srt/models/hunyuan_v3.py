@@ -44,10 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -567,7 +564,6 @@ class HYV3ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -609,10 +605,9 @@ class HYV3ForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 is_found = True
@@ -628,10 +623,9 @@ class HYV3ForCausalLM(nn.Module):
                     continue
                 is_expert_weight = True
                 name_mapped = name.replace(weight_name, param_name)
-                registered_name_mapped = map_weight_name(name_mapped)
-                if registered_name_mapped not in params_dict:
+                if name_mapped not in params_dict:
                     continue
-                param = params_dict[registered_name_mapped]
+                param = params_dict[name_mapped]
                 weight_loader = param.weight_loader
                 weight_loader(
                     param,
@@ -646,10 +640,9 @@ class HYV3ForCausalLM(nn.Module):
 
             if "router.gate." in name:
                 name = name.replace("router.", "")
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 continue
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

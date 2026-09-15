@@ -77,7 +77,9 @@ class TestPerExpertSync(unittest.TestCase):
         self._saved = {
             n: getattr(inkling_mod, n)
             for n in (
-                "get_parallel",
+                "get_moe_expert_parallel_world_size",
+                "get_moe_expert_parallel_rank",
+                "get_moe_tensor_parallel_rank",
                 "lora_compatible_layout_enabled",
             )
         }
@@ -87,9 +89,9 @@ class TestPerExpertSync(unittest.TestCase):
             setattr(inkling_mod, n, f)
 
     def _patch(self, ep_size, ep_rank, tp_rank, lora_layout=False):
-        inkling_mod.get_parallel = lambda: types.SimpleNamespace(
-            moe_ep_size=ep_size, moe_ep_rank=ep_rank, moe_tp_rank=tp_rank
-        )
+        inkling_mod.get_moe_expert_parallel_world_size = lambda: ep_size
+        inkling_mod.get_moe_expert_parallel_rank = lambda: ep_rank
+        inkling_mod.get_moe_tensor_parallel_rank = lambda: tp_rank
         inkling_mod.lora_compatible_layout_enabled = lambda: lora_layout
 
     def _run_rank(
@@ -109,11 +111,7 @@ class TestPerExpertSync(unittest.TestCase):
         loaded = set()
         for (e, proj), w in full.items():
             name = f"model.layers.0.mlp.experts.{e}.{proj}.weight"
-            self.assertTrue(
-                model._load_per_expert_param(
-                    params_dict, loaded, name, w, map_weight_name=lambda name: name
-                )
-            )
+            self.assertTrue(model._load_per_expert_param(params_dict, loaded, name, w))
         contiguous = lora_layout or not interleaved
         exp_w13, exp_w2 = _expected_stacks(
             full, ep_size, ep_rank, tp_size, tp_rank, contiguous
@@ -168,7 +166,6 @@ class TestPerExpertSync(unittest.TestCase):
                 set(),
                 "model.layers.0.mlp.experts.0.gate_proj.weight",
                 torch.zeros(I_FULL, H),
-                map_weight_name=lambda name: name,
             )
 
 

@@ -71,7 +71,7 @@ class W8A8Int8Config(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
-        self.quant_description = self.checkpoint_metadata(quant_config)
+        self.quant_description = quant_config
         self.is_dynamic = quant_config.get("is_dynamic", False)
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
@@ -109,11 +109,8 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if self.match_layer(
-            prefix,
-            should_ignore_layer,
-            ignore=self.ignore,
-            fused_mapping=self.packed_modules_mapping,
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):

@@ -52,7 +52,6 @@ class TestNemotronHWeightLoading(CustomTestCase):
         self, named_parameters=(), model_class=NemotronHForCausalLM
     ):
         model = object.__new__(model_class)
-        torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(n_routed_experts=2, max_n_routed_experts=2)
         model.model = SimpleNamespace()
         model.pp_group = _FakePPGroup()

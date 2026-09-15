@@ -446,8 +446,6 @@ def _build_checkpoint_weight_schema(layer_config: dict[str, Any]):
 
 class HummingConfig(QuantizationConfig):
     packed_modules_mapping = {}
-    humming_input_quant_config: dict | None = None
-    humming_online_quant_config: dict | None = None
 
     def __init__(self, full_config: dict[str, Any] | None = None):
         _lazy_import_humming()
@@ -513,9 +511,6 @@ class HummingConfig(QuantizationConfig):
         self.hf_to_sglang_mapper = hf_to_sglang_mapper
 
     def is_layer_skipped(self, config: dict[str, Any], prefix: str):
-        return self.match_layer(prefix, self._is_layer_skipped, config)
-
-    def _is_layer_skipped(self, prefix: str, config: dict[str, Any]):
         keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
         ignored_layers = self.get_from_keys_or(config, keys, []) or []
         if hasattr(self, "hf_to_sglang_mapper"):
@@ -540,10 +535,7 @@ class HummingConfig(QuantizationConfig):
         return False
 
     def get_layer_weight_schema(self, config: dict[str, Any], prefix: str):
-        return self.match_layer(prefix, self._get_layer_weight_schema, config)
-
-    def _get_layer_weight_schema(self, prefix: str, config: dict[str, Any]):
-        if self._is_layer_skipped(prefix, config):
+        if self.is_layer_skipped(config, prefix):
             return None
 
         if config["quant_method"] in ["compressed-tensors", "modelopt"]:
@@ -567,10 +559,7 @@ class HummingConfig(QuantizationConfig):
         return _build_checkpoint_weight_schema(layer_config)
 
     def get_layer_input_schema(self, config: dict[str, Any], prefix: str):
-        return self.match_layer(prefix, self._get_layer_input_schema, config)
-
-    def _get_layer_input_schema(self, prefix: str, config: dict[str, Any]):
-        if self._is_layer_skipped(prefix, config):
+        if self.is_layer_skipped(config, prefix):
             return None
         if config["quant_method"] in ["compressed-tensors", "modelopt"]:
             group_config = compressed_tensors_get_config(config, "input_activations")
@@ -624,9 +613,7 @@ class HummingConfig(QuantizationConfig):
             )
 
         is_online_quant = False
-        online_quant_config = self.humming_online_quant_config
-        if online_quant_config is None:
-            online_quant_config = envs.SGLANG_HUMMING_ONLINE_QUANT_CONFIG.get() or {}
+        online_quant_config = envs.SGLANG_HUMMING_ONLINE_QUANT_CONFIG.get() or {}
         if online_quant_config and (
             not self.full_config or online_quant_config.get("force_requant", False)
         ):
@@ -647,11 +634,8 @@ class HummingConfig(QuantizationConfig):
                     checkpoint_input_config, prefix
                 )
 
-            input_quant_config = self.humming_input_quant_config
-            if input_quant_config is None:
-                input_quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get()
-            if input_quant_config:
-                quant_config = input_quant_config.copy()
+            if envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get():
+                quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get().copy()
                 quant_config["quant_method"] = "humming"
                 force_input_schema = self.get_layer_input_schema(quant_config, prefix)
                 if input_schema is None:
@@ -689,7 +673,7 @@ class HummingConfig(QuantizationConfig):
 
             fp8_config = Fp8Config.from_config(self.full_config)
             fp8_config.is_fp4_experts = True
-            return self.delegate(fp8_config, layer, prefix)
+            return fp8_config.get_quant_method(layer, prefix)
 
         quant_config = self.get_quant_config_for_layer(prefix, layer_type)
         if quant_config is None:

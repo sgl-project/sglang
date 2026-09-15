@@ -55,10 +55,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
@@ -1328,7 +1325,6 @@ class SarvamMLAForCausalLM(nn.Module):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ) -> None:
-        map_weight_name = get_checkpoint_name_mapper(self)
         del is_nextn
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
@@ -1362,15 +1358,11 @@ class SarvamMLAForCausalLM(nn.Module):
                 if weight_name not in name or "mlp.experts" in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                if (
-                    mapped_name.endswith(".bias")
-                    and map_weight_name(mapped_name) not in params_dict
-                ):
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
-                registered_mapped_name = map_weight_name(mapped_name)
-                if registered_mapped_name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[registered_mapped_name]
+                param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 is_stacked = True
@@ -1383,10 +1375,9 @@ class SarvamMLAForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                registered_mapped_name = map_weight_name(mapped_name)
-                if registered_mapped_name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[registered_mapped_name]
+                param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1400,12 +1391,11 @@ class SarvamMLAForCausalLM(nn.Module):
             if is_expert:
                 continue
 
-            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+            if name.endswith(".bias") and name not in params_dict:
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 continue
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

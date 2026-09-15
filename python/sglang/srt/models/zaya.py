@@ -75,10 +75,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
@@ -1558,7 +1555,6 @@ class ZayaForCausalLM(nn.Module):
            to FusedMoE shards ``w1`` (first half) and ``w3`` (second half);
            ``linear_fc2.weight`` becomes the FusedMoE ``w2`` shard.
         """
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         # ``balancing_biases`` is a persistent buffer; FusedMoE may also expose
@@ -1599,8 +1595,7 @@ class ZayaForCausalLM(nn.Module):
                 weight_loader = moe_module.weight_loader
                 if kind == "linear_fc1":
                     param_name = f"{experts_prefix}.w13_weight"
-                    registered_param_name = map_weight_name(param_name)
-                    param = params_dict.get(registered_param_name)
+                    param = params_dict.get(param_name)
                     if param is None:
                         logger.warning("No param %s for %s", param_name, ckpt_name)
                         continue
@@ -1619,11 +1614,10 @@ class ZayaForCausalLM(nn.Module):
                         shard_id="w3",
                         expert_id=expert_id,
                     )
-                    loaded_params.add(registered_param_name)
+                    loaded_params.add(param_name)
                 else:  # linear_fc2
                     param_name = f"{experts_prefix}.w2_weight"
-                    registered_param_name = map_weight_name(param_name)
-                    param = params_dict.get(registered_param_name)
+                    param = params_dict.get(param_name)
                     if param is None:
                         logger.warning("No param %s for %s", param_name, ckpt_name)
                         continue
@@ -1634,13 +1628,12 @@ class ZayaForCausalLM(nn.Module):
                         shard_id="w2",
                         expert_id=expert_id,
                     )
-                    loaded_params.add(registered_param_name)
+                    loaded_params.add(param_name)
                 continue
 
             # HF stores CCA tensors under ``self_attn.qkv.*``, which already
             # matches our submodule registration, so no rename is needed.
-            registered_ckpt_name = map_weight_name(ckpt_name)
-            if registered_ckpt_name not in params_dict:
+            if ckpt_name not in params_dict:
                 # ``conv_qk`` is an ``nn.Sequential`` of two ``nn.Conv1d``,
                 # whose keys end in ``.0.{weight,bias}`` / ``.1.{weight,bias}``
                 # and are exposed through ``named_parameters()`` automatically.
@@ -1651,10 +1644,10 @@ class ZayaForCausalLM(nn.Module):
                 )
                 continue
 
-            param = params_dict[registered_ckpt_name]
+            param = params_dict[ckpt_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(registered_ckpt_name)
+            loaded_params.add(ckpt_name)
 
         return loaded_params
 

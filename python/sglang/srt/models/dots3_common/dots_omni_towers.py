@@ -11,10 +11,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.model_loader.weight_utils import (
-    get_checkpoint_name_mapper,
-    map_state_dict_names,
-)
 from sglang.srt.models.dots3_common.dots_omni_audio import (
     OmniAudioConfig,
     OmniAudioModel,
@@ -50,9 +46,7 @@ class DotsNoteOmniVisionEncoder(DotsMoEVitModel):
         self.to(torch.bfloat16)
 
     def load_converted_state(self, state: dict[str, torch.Tensor]):
-        missing, unexpected = self.load_state_dict(
-            map_state_dict_names(state, get_checkpoint_name_mapper(self)), strict=False
-        )
+        missing, unexpected = self.load_state_dict(state, strict=False)
         if missing:
             raise RuntimeError(f"Dots vision tower missing weights: {missing[:8]}")
         if unexpected:

@@ -6,10 +6,7 @@ from transformers import LlamaConfig
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.model_executor.model_runner import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
 from sglang.srt.utils import add_prefix
 
@@ -43,7 +40,6 @@ class LlamaEmbeddingModel(nn.Module):
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -61,10 +57,7 @@ class LlamaEmbeddingModel(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 return
-            if (
-                name.startswith("model.vision_tower")
-                and map_weight_name(name) not in params_dict
-            ):
+            if name.startswith("model.vision_tower") and name not in params_dict:
                 return
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -72,19 +65,17 @@ class LlamaEmbeddingModel(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     return
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

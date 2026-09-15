@@ -33,10 +33,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 from sglang.srt.models.qwen3_5 import (
     QWEN3_5_KV_SCALE_MAPPER,
@@ -224,15 +221,13 @@ def _load_mobius_weights_strict(
     config: InternS2MobiusTextConfig,
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> set[str]:
-    map_weight_name = get_checkpoint_name_mapper(owner)
     params_dict = dict(owner.named_parameters(remove_duplicate=False))
     expected_slots = _expected_mobius_load_slots(params_dict, config.num_experts)
     loaded_slots: set[tuple[str, object, int | None]] = set()
     loaded_sources: set[str] = set()
 
     def record_slot(name, shard_id=None, expert_id=None):
-        registered_name = map_weight_name(name)
-        slot = (registered_name, shard_id, expert_id)
+        slot = (name, shard_id, expert_id)
         if slot in loaded_slots:
             raise ValueError(f"Mobius destination load is duplicated: {slot}")
         loaded_slots.add(slot)
@@ -253,9 +248,8 @@ def _load_mobius_weights_strict(
                 "experts.down_proj_scale_inv",
             )
         ):
-            registered_name = map_weight_name(name)
             _load_fused_mobius_expert_weight(
-                name=registered_name,
+                name=name,
                 loaded_weight=loaded_weight,
                 params_dict=params_dict,
                 num_experts=config.num_experts,
@@ -270,27 +264,25 @@ def _load_mobius_weights_strict(
             if name.startswith("visual."):
                 continue
             destination = name.replace(weight_name, parameter_name)
-            registered_destination = map_weight_name(destination)
-            if registered_destination not in params_dict:
+            if destination not in params_dict:
                 raise KeyError(
                     f"Mobius packed destination is missing: {destination} "
                     f"(from {source_name})"
                 )
-            parameter = params_dict[registered_destination]
+            parameter = params_dict[destination]
             loader = parameter.weight_loader
             record_slot(destination, shard_id)
             loader(parameter, loaded_weight, shard_id)
             break
         else:
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 raise KeyError(
                     f"Mobius destination is missing: {name} (from {source_name})"
                 )
-            parameter = params_dict[registered_name]
+            parameter = params_dict[name]
             loader = getattr(parameter, "weight_loader", default_weight_loader)
             if _is_optional_mobius_parameter(name):
-                expected_slots.add((registered_name, None, None))
+                expected_slots.add((name, None, None))
             record_slot(name)
             loader(parameter, loaded_weight)
 

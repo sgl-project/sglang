@@ -48,7 +48,6 @@ from sglang.srt.model_loader.utils import (
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
-    get_checkpoint_name_mapper,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -223,7 +222,6 @@ class DeepseekV2WeightLoaderMixin:
             weights: Iterable of (weight_name, weight_tensor) pairs
             is_nextn: Whether loading NextN speculative decoding weights
         """
-        map_weight_name = get_checkpoint_name_mapper(self)
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
@@ -321,10 +319,7 @@ class DeepseekV2WeightLoaderMixin:
                                 ):
                                     continue
 
-                registered_name = map_weight_name(name)
-                if _load_fused_expert_tensor(
-                    registered_name, loaded_weight, params_dict
-                ):
+                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
                     continue
 
                 if "rotary_emb.inv_freq" in name:
@@ -360,19 +355,13 @@ class DeepseekV2WeightLoaderMixin:
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and map_weight_name(
-                        name
-                    ) not in params_dict:
+                    if ("mlp.experts." in name) and name not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
                         executor=executor,
@@ -390,10 +379,9 @@ class DeepseekV2WeightLoaderMixin:
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
-                        registered_name = map_weight_name(name)
-                        if registered_name not in params_dict:
+                        if name not in params_dict:
                             continue
-                        param = params_dict[registered_name]
+                        param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -413,10 +401,7 @@ class DeepseekV2WeightLoaderMixin:
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
-                        if (
-                            name.endswith(".bias")
-                            and map_weight_name(name) not in params_dict
-                        ):
+                        if name.endswith(".bias") and name not in params_dict:
                             continue
                         # Skip loading embed_tokens if not first rank in pipeline parallelism
                         if ".embed_tokens." in name and not self.pp_group.is_first_rank:
@@ -476,8 +461,7 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
-                                registered_param_name = map_weight_name(param_name)
-                                param = params_dict[registered_param_name]
+                                param = params_dict[param_name]
 
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
@@ -494,7 +478,7 @@ class DeepseekV2WeightLoaderMixin:
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
-                            ) and map_weight_name(name) not in params_dict:
+                            ) and name not in params_dict:
                                 # modelopt attn kv scale is named differently
                                 for scale in ["k_scale", "v_scale"]:
                                     if scale in name:
@@ -502,14 +486,13 @@ class DeepseekV2WeightLoaderMixin:
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            registered_name = map_weight_name(name)
-                            if registered_name not in params_dict:
+                            if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[registered_name]
+                            param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )

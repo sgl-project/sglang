@@ -110,9 +110,6 @@ class PetitNvFp4Config(QuantizationConfig):
         return _is_hip and quant_method == "modelopt"
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
-        return self.match_layer(prefix, self._is_layer_excluded, exclude_modules)
-
-    def _is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:
             regex_str = pattern.replace(".", r"\.").replace("*", r".*")
             if re.fullmatch(regex_str, prefix):
@@ -123,9 +120,9 @@ class PetitNvFp4Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         if isinstance(layer, LinearBase):
-            if self.match_layer(
-                prefix, is_layer_skipped, self.exclude_modules
-            ) or self.is_layer_excluded(prefix, self.exclude_modules):
+            if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
+                prefix, self.exclude_modules
+            ):
                 return UnquantizedLinearMethod()
             return PetitNvFp4LinearMethod(self)
         return None

@@ -63,10 +63,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
@@ -426,7 +423,6 @@ class TransformersFusedMoE(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         loaded: set[str] = set()
         param_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -435,8 +431,7 @@ class TransformersFusedMoE(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                registered_mapped_name = map_weight_name(mapped_name)
-                param = param_dict.get(registered_mapped_name)
+                param = param_dict.get(mapped_name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -454,12 +449,9 @@ class TransformersFusedMoE(nn.Module):
                 matched = True
                 break
             if not matched:
-                direct_name = (
-                    name if map_weight_name(name) in param_dict else f"experts.{name}"
-                )
-                registered_direct_name = map_weight_name(direct_name)
-                if registered_direct_name in param_dict:
-                    param = param_dict[registered_direct_name]
+                direct_name = name if name in param_dict else f"experts.{name}"
+                if direct_name in param_dict:
+                    param = param_dict[direct_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

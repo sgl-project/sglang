@@ -31,7 +31,6 @@ from transformers.modeling_outputs import BaseModelOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     replace_prefix,
     replace_substrings,
 )
@@ -606,7 +605,6 @@ class RadioModel(nn.Module):
         return features[:, num_skip:]
 
     def load_weights(self, weights) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         remap_substrings = {
             "attn": "attn.attn",
             "qkv": "qkv_proj",
@@ -639,15 +637,14 @@ class RadioModel(nn.Module):
                     continue
                 name = replace_substrings(name, remap_substrings)
                 name = replace_prefix(name, remap_prefixes)
-            if name and map_weight_name(name) in params_dict:
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+            if name and name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if loaded_shard_id is None:
                     weight_loader(param, weight)
                 else:
                     weight_loader(param, weight, loaded_shard_id)
-                loaded_params.add(registered_name)
+                loaded_params.add(name)
                 if "video_embedder" in name:
                     self.model.patch_generator._video_embedder_loaded = True
             elif is_hf_export:

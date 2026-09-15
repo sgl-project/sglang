@@ -23,10 +23,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -610,7 +607,6 @@ class MiDashengLMModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         buffers_dict = dict(self.named_buffers())
         audio_encoder_loaded = []
@@ -640,18 +636,17 @@ class MiDashengLMModel(nn.Module):
                 name = name.replace(".net.2.", ".fc2.")
             if (
                 name.endswith(".bias")
-                and map_weight_name(name) not in params_dict
-                and map_weight_name(name) not in buffers_dict
+                and name not in params_dict
+                and name not in buffers_dict
             ):
                 skipped_weights.append(f"{original_name} (bias not in params/buffers)")
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                param = params_dict[registered_name]
+            if name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            elif map_weight_name(name) in buffers_dict:
-                buffers_dict[registered_name].copy_(loaded_weight)
+            elif name in buffers_dict:
+                buffers_dict[name].copy_(loaded_weight)
             else:
                 if "audio_projector" in original_name:
                     skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL)")

@@ -78,7 +78,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     kv_cache_scales_loader,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
@@ -1445,7 +1444,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1501,23 +1499,21 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     ]:
                         if weight_name in name:
                             name = name.replace(weight_name, param_name)
-                            registered_name = map_weight_name(name)
-                            if registered_name not in params_dict:
+                            if name not in params_dict:
                                 break
-                            param = params_dict[registered_name]
+                            param = params_dict[name]
                             weight_loader = param.weight_loader
                             weight_loader(param, loaded_weight, shard_id)
                             audio_stacked = True
                             break
                     if audio_stacked:
                         continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     logger.warning(
                         f"Audio param {name} not found in params_dict, skipping"
                     )
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if self._AUDIO_WEIGHT_SUBSTRING in name:
                     weight_loader(param, loaded_weight[: param.shape[0], :])
@@ -1534,14 +1530,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         match_stacked_vit = True
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
                     match_stacked_vit = True
@@ -1549,10 +1541,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 if match_stacked_vit:
                     continue
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
@@ -1603,9 +1594,8 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
-                registered_name = map_weight_name(name)
-                if registered_name in params_dict:
-                    param = params_dict[registered_name]
+                if name in params_dict:
+                    param = params_dict[name]
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
@@ -1627,18 +1617,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     continue
                 if weight_name not in name:
                     continue
-                if ("mlp.experts." in name) and map_weight_name(
-                    name
-                ) not in params_dict:
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1650,12 +1637,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     name = name.replace(weight_name, param_name)
                     # mxfp4 ckpts store expert scales without the `_inv` suffix,
                     # while Fp8MoEMethod registers them as *_weight_scale_inv.
-                    if name.endswith("weight_scale") and (
-                        map_weight_name(name + "_inv") in params_dict
-                    ):
+                    if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1667,15 +1651,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    registered_name = map_weight_name(name)
-                    if registered_name in params_dict.keys():
-                        param = params_dict[registered_name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
                         if "attention_sink_bias" in name:
                             start = get_parallel().attn_tp_rank * param.numel()
                             param.data.copy_(

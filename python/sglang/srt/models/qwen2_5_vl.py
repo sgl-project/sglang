@@ -69,10 +69,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
@@ -917,7 +914,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -966,15 +962,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     continue
 
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip loading visual/language model weights
                 if (
                     self.config.encoder_only or self.config.language_only
-                ) and map_weight_name(name) not in params_dict:
+                ) and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -985,14 +980,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 try:
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    if registered_name in params_dict.keys():
-                        param = params_dict[registered_name]
+                    if name in params_dict.keys():
+                        param = params_dict[name]
                     else:
                         continue
 

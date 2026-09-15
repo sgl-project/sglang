@@ -39,10 +39,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm2 import Lfm2ForCausalLM
 from sglang.srt.models.siglip2 import Siglip2Model
 from sglang.srt.utils import add_prefix
@@ -294,7 +291,6 @@ class Lfm2VlForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from HuggingFace format."""
-        map_weight_name = get_checkpoint_name_mapper(self)
         # Collect weights by destination
         vision_weights = []
         projector_weights = []
@@ -332,10 +328,9 @@ class Lfm2VlForConditionalGeneration(nn.Module):
         # Load projector weights
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in projector_weights:
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 continue
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

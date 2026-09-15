@@ -99,7 +99,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
@@ -3124,7 +3123,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
@@ -3210,9 +3208,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     ".kv_a_proj_with_mqa.", ".fused_qkv_a_proj_with_mqa."
                 )
                 fused_name = _maybe_map_fp8_pb_scale_name(fused_name, params_dict)
-                registered_fused_name = map_weight_name(fused_name)
-                if registered_fused_name in params_dict:
-                    param = params_dict[registered_fused_name]
+                if fused_name in params_dict:
+                    param = params_dict[fused_name]
                     if fused_name.endswith(".weight_scale_inv"):
                         offset = 0 if is_q_a else _cdiv(self.config.q_lora_rank, 128)
                         param.data[offset : offset + loaded_weight.shape[0]].copy_(
@@ -3223,7 +3220,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     else:
                         q_lora_rank = self.config.q_lora_rank or 0
                         param.data[q_lora_rank:].copy_(loaded_weight)
-                    loaded_params.add(registered_fused_name)
+                    loaded_params.add(fused_name)
                     continue
 
             if "rotary_emb.inv_freq" in name:
@@ -3234,9 +3231,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if ("mlp.experts." in name) and map_weight_name(
-                    name
-                ) not in params_dict:
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 # Fused projections only apply to KDA layers
                 if param_name in {
@@ -3255,11 +3250,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
                 name = _maybe_map_fp8_pb_scale_name(name, params_dict)
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -3273,10 +3267,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # Skip experts of layers outside a truncated config (e.g.
                     # num_hidden_layers override), mirroring the non-expert
                     # `name not in params_dict` guard below.
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         break
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -3289,7 +3282,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 else:
                     if (
                         name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
+                        and name not in params_dict
                         and not self.config.is_linear_attn
                     ):
                         continue
@@ -3297,10 +3290,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name is None:
                         continue
                     name = _maybe_map_fp8_pb_scale_name(name, params_dict)
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     if name.endswith(".b_proj.weight_scale_inv"):
                         # All TP ranks share K3's single beta output-scale block.
                         param.data.copy_(loaded_weight)
@@ -3309,8 +3301,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight, **kwargs)
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
 
         self.post_load_weights()
         return loaded_params
@@ -3792,7 +3783,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
@@ -3808,11 +3798,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 if "vision_tower" in name or "mm_projector" in name:
                     if vision_params is None:
                         continue
-                    registered_name = map_weight_name(name)
-                    if registered_name not in vision_params:
+                    if name not in vision_params:
                         logger.warning("Unmapped vision weight: %s", name)
                         continue
-                    param = vision_params[registered_name]
+                    param = vision_params[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

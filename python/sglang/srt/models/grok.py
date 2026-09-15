@@ -57,10 +57,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -782,7 +779,6 @@ class Grok1ForCausalLM(nn.Module):
         check_hit_names: bool = True,
         model_config: PretrainedConfig | None = None,
     ) -> dict[str, torch.Tensor]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         if model_config is None:
             model_config = self.config
 
@@ -827,17 +823,15 @@ class Grok1ForCausalLM(nn.Module):
             if ignore_parent_name:
                 name = name.split(".")[-1]
 
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 logger.info(f"Skipping {name=} in load_weights_wrapper")
                 return
 
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight, *args, **kwargs)
-            hit_names.add(registered_name)
-            registered_original_name = map_weight_name(original_name)
-            self.loaded_param_names.add(registered_original_name)
+            hit_names.add(name)
+            self.loaded_param_names.add(original_name)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -848,7 +842,7 @@ class Grok1ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
                 load_weight_wrapper(name, loaded_weight, shard_id)
                 break
@@ -869,10 +863,7 @@ class Grok1ForCausalLM(nn.Module):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
                     if name is None:
                         continue

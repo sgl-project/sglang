@@ -108,7 +108,7 @@ class BlockInt8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if self.match_layer(prefix, is_layer_skipped, self.ignored_layers):
+            if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return BlockInt8LinearMethod(self)
         elif isinstance(layer, FusedMoE):

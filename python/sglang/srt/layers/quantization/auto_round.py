@@ -188,11 +188,6 @@ class AutoRoundConfig(QuantizationConfig):
         raise NotImplementedError
 
     def get_layer_config(self, layer, layer_name: str):
-        return self.match_layer(
-            layer_name, lambda name: self._get_layer_config(layer, name)
-        )
-
-    def _get_layer_config(self, layer, layer_name: str):
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         def get_config(name: str, quantized: bool = True):
@@ -428,7 +423,7 @@ class AutoRoundConfig(QuantizationConfig):
                 "zero_point": not sym,
                 "lm_head": False,
             }
-            return self.delegate(MoeWNA16Config.from_config(config), layer, prefix)
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
@@ -563,7 +558,7 @@ class AutoRoundConfig(QuantizationConfig):
                 "sym": sym,
                 "lm_head": False,
             }
-            return self.delegate(MoeWNA16Config.from_config(config), layer, prefix)
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if is_linear:
             if use_marlin:

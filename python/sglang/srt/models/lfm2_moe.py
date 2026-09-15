@@ -50,7 +50,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     sharded_weight_loader,
 )
 from sglang.srt.models.lfm2 import (
@@ -662,7 +661,6 @@ class Lfm2MoeForCausalLM(nn.Module):
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
         """Load weights with FusedMoE expert format."""
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -722,14 +720,13 @@ class Lfm2MoeForCausalLM(nn.Module):
                     "feed_forward.experts.gate_up_proj",
                     "feed_forward.experts.w13_weight",
                 )
-                registered_fused_name = map_weight_name(fused_name)
-                if registered_fused_name in params_dict:
+                if fused_name in params_dict:
                     if loaded_weight.dim() != 3:
                         raise ValueError(
                             f"Expected a 3D packed tensor for {name}, got "
                             f"{loaded_weight.dim()}D {tuple(loaded_weight.shape)}"
                         )
-                    param = params_dict[registered_fused_name]
+                    param = params_dict[fused_name]
                     weight_loader = param.weight_loader
                     if loaded_weight.shape[1] % 2 != 0:
                         raise ValueError(
@@ -752,7 +749,7 @@ class Lfm2MoeForCausalLM(nn.Module):
                             shard_id="w3",
                             expert_id=expert_id,
                         )
-                    loaded_params.add(registered_fused_name)
+                    loaded_params.add(fused_name)
                     continue
 
             if "feed_forward.experts.down_proj" in name:
@@ -763,14 +760,13 @@ class Lfm2MoeForCausalLM(nn.Module):
                     "feed_forward.experts.down_proj",
                     "feed_forward.experts.w2_weight",
                 )
-                registered_fused_name = map_weight_name(fused_name)
-                if registered_fused_name in params_dict:
+                if fused_name in params_dict:
                     if loaded_weight.dim() != 3:
                         raise ValueError(
                             f"Expected a 3D packed tensor for {name}, got "
                             f"{loaded_weight.dim()}D {tuple(loaded_weight.shape)}"
                         )
-                    param = params_dict[registered_fused_name]
+                    param = params_dict[fused_name]
                     weight_loader = param.weight_loader
                     for expert_id in range(loaded_weight.shape[0]):
                         weight_loader(
@@ -780,7 +776,7 @@ class Lfm2MoeForCausalLM(nn.Module):
                             shard_id="w2",
                             expert_id=expert_id,
                         )
-                    loaded_params.add(registered_fused_name)
+                    loaded_params.add(fused_name)
                     continue
 
             # Handle stacked params (QKV, dense MLP gate_up)
@@ -791,15 +787,14 @@ class Lfm2MoeForCausalLM(nn.Module):
                 if "experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     break
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     break
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(registered_name)
+                loaded_params.add(name)
                 break
             else:
                 # Handle MoE expert weights using FusedMoE format
@@ -815,10 +810,9 @@ class Lfm2MoeForCausalLM(nn.Module):
                         continue
                     # Build our parameter name
                     name = name.replace(weight_name, param_name)
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -827,24 +821,20 @@ class Lfm2MoeForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
-                    loaded_params.add(registered_name)
+                    loaded_params.add(name)
                     break
                 else:
                     # Handle regular weights
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    if registered_name not in params_dict:
+                    if name not in params_dict:
                         continue
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(registered_name)
+                    loaded_params.add(name)
 
         # Handle tied lm_head weight
         if "lm_head.weight" not in loaded_params and "lm_head.weight" in params_dict:

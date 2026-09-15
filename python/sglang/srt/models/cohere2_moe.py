@@ -30,10 +30,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
 
@@ -548,7 +545,6 @@ class Cohere2MoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -574,11 +570,9 @@ class Cohere2MoeForCausalLM(nn.Module):
             # bias-free Cohere layers (input_layernorm.bias, norm.bias,
             # o_proj.bias, mlp.gate.bias, experts.*.[gate|up|down]_proj.bias).
             if (name.endswith(".bias") or name.endswith("_bias")) and (
-                map_weight_name(name) not in params_dict
-                and map_weight_name(name.replace("q_proj", "qkv_proj"))
-                not in params_dict
-                and map_weight_name(name.replace("gate_proj", "gate_up_proj"))
-                not in params_dict
+                name not in params_dict
+                and name.replace("q_proj", "qkv_proj") not in params_dict
+                and name.replace("gate_proj", "gate_up_proj") not in params_dict
             ):
                 continue
 
@@ -590,20 +584,16 @@ class Cohere2MoeForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 new_name = name.replace(shard_name, param_name)
-                if (
-                    new_name.endswith(".bias")
-                    and map_weight_name(new_name) not in params_dict
-                ):
+                if new_name.endswith(".bias") and new_name not in params_dict:
                     matched = True
                     break
-                registered_new_name = map_weight_name(new_name)
-                if registered_new_name not in params_dict:
+                if new_name not in params_dict:
                     matched = True
                     break
-                param = params_dict[registered_new_name]
+                param = params_dict[new_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(registered_new_name)
+                loaded_params.add(new_name)
                 matched = True
                 break
             if matched:
@@ -615,10 +605,9 @@ class Cohere2MoeForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 new_name = name.replace(weight_name, param_name)
-                registered_new_name = map_weight_name(new_name)
-                if registered_new_name not in params_dict:
+                if new_name not in params_dict:
                     continue
-                param = params_dict[registered_new_name]
+                param = params_dict[new_name]
                 weight_loader = param.weight_loader
                 weight_loader(
                     param,
@@ -627,7 +616,7 @@ class Cohere2MoeForCausalLM(nn.Module):
                     shard_id=shard_id,
                     expert_id=expert_id,
                 )
-                loaded_params.add(registered_new_name)
+                loaded_params.add(new_name)
                 matched = True
                 break
             if matched:
@@ -636,13 +625,12 @@ class Cohere2MoeForCausalLM(nn.Module):
             # lm_head is tied with embed_tokens; skip if missing.
             if "lm_head.weight" in name:
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 continue
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
 
         return loaded_params
 

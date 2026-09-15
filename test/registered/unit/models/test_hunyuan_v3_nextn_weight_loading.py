@@ -30,7 +30,6 @@ class _FakeParam:
 class TestHunyuanV3NextNWeightLoading(unittest.TestCase):
     def _make_minimal_model(self, named_parameters=()):
         model = object.__new__(HYV3ForCausalLMNextN)
-        torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(num_hidden_layers=80, num_experts=2)
         model.named_parameters = lambda: iter(named_parameters)
         return model

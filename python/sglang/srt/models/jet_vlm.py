@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import get_checkpoint_name_mapper
 from sglang.srt.models.jet_nemotron import JetNemotronForCausalLM
 
 MM_HIDDEN_SIZE = 1152
@@ -122,15 +121,13 @@ class JetVLMForConditionalGeneration(nn.Module):
         return vision_features
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> None:
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader
                 )

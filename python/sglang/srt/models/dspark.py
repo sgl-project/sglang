@@ -14,10 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -551,7 +548,6 @@ class DSparkDraftMixin:
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
@@ -578,13 +574,12 @@ class DSparkDraftMixin:
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 raise ValueError(
                     f"DSpark unexpected markov weight {name!r} not found in model "
                     f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
                 )
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
@@ -598,21 +593,19 @@ class DSparkDraftMixin:
         confidence_weights: list,
         params_dict: dict,
     ) -> None:
-        map_weight_name = get_checkpoint_name_mapper(self)
         if self.confidence_head is None:
             return
         loaded_names = set()
         for name, loaded_weight in confidence_weights:
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 raise ValueError(
                     f"DSpark unexpected confidence weight {name!r} not found in "
                     "model parameters."
                 )
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_names.add(registered_name)
+            loaded_names.add(name)
 
         confidence_param_names = {
             name for name in params_dict if name.startswith("confidence_head.")

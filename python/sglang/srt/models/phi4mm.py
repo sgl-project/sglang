@@ -39,10 +39,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.phi4mm_audio import AudioEmbedding
@@ -486,7 +483,6 @@ class Phi4MMForCausalLM(nn.Module):
         return bool(self.lora_pattern.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -529,14 +525,12 @@ class Phi4MMForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                registered_name = map_weight_name(name)
-                param = params_dict.get(registered_name)
+                param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
                         logger.warning(f"Warning: {name} not found in model parameters")

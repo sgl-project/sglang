@@ -26,7 +26,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -490,7 +489,6 @@ class Spark2_5ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -529,10 +527,9 @@ class Spark2_5ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
-                registered_mapped_name = map_weight_name(mapped_name)
-                if registered_mapped_name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
-                param = params_dict[registered_mapped_name]
+                param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded = True
@@ -540,9 +537,8 @@ class Spark2_5ForCausalLM(nn.Module):
             if loaded:
                 continue
 
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                param = params_dict[registered_name]
+            if name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             elif original_name in ("model.embedding.weight",):

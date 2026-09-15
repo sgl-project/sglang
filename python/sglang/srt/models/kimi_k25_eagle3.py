@@ -37,10 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.utils import BumpAllocator, add_prefix
 
@@ -426,7 +423,6 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         return self.hot_token_id
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
@@ -455,10 +451,9 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                 if weight_name not in mapped_name:
                     continue
                 target_name = mapped_name.replace(weight_name, param_name)
-                registered_target_name = map_weight_name(target_name)
-                if registered_target_name not in params_dict:
+                if target_name not in params_dict:
                     continue
-                param = params_dict[registered_target_name]
+                param = params_dict[target_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 handled = True
@@ -483,9 +478,8 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                         [cached_a_proj[q_name], cached_a_proj[kv_name]], dim=0
                     )
                     fused_name = q_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                    registered_fused_name = map_weight_name(fused_name)
-                    if registered_fused_name in params_dict:
-                        param = params_dict[registered_fused_name]
+                    if fused_name in params_dict:
+                        param = params_dict[fused_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -494,11 +488,10 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                     cached_a_proj.pop(kv_name)
                 continue
 
-            registered_mapped_name = map_weight_name(mapped_name)
-            if registered_mapped_name not in params_dict:
+            if mapped_name not in params_dict:
                 logger.warning("Eagle3 MLA: skipping unexpected weight %s", name)
                 continue
-            param = params_dict[registered_mapped_name]
+            param = params_dict[mapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

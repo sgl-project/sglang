@@ -26,10 +26,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.platforms import current_platform
@@ -193,7 +190,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -216,12 +212,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     loaded_params.add("lm_head.weight")
 
         body_loaded = self.model.load_weights(body_weights())
-        loaded_params.update(
-            {
-                map_weight_name(name)
-                for name in ((f"{_MODEL_PREFIX}{n}" for n in body_loaded))
-            }
-        )
+        loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
 
         if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
             loaded_params.add("lm_head.weight")

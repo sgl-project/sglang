@@ -19,10 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.utils import add_prefix
@@ -130,7 +127,6 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         llm_stacked_params = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -182,25 +178,20 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 name_tmp = name.replace(weight_name, param_name)
-                if (
-                    name_tmp.endswith(".bias")
-                    and map_weight_name(name_tmp) not in params_dict
-                ):
+                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
                     continue
-                registered_name_tmp = map_weight_name(name_tmp)
-                if registered_name_tmp not in params_dict:
+                if name_tmp not in params_dict:
                     continue
-                param = params_dict[registered_name_tmp]
+                param = params_dict[name_tmp]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

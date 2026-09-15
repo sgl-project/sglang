@@ -46,7 +46,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
@@ -1112,7 +1111,6 @@ class Qwen3NextForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self attention
@@ -1191,20 +1189,15 @@ class Qwen3NextForCausalLM(nn.Module):
 
                 replaced_name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if (
-                    replaced_name.endswith(".bias")
-                    and map_weight_name(replaced_name) not in params_dict
-                ):
+                if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                registered_replaced_name = map_weight_name(replaced_name)
-                if registered_replaced_name not in params_dict:
+                if replaced_name not in params_dict:
                     continue
                 name = replaced_name
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1221,11 +1214,10 @@ class Qwen3NextForCausalLM(nn.Module):
                     if (
                         replaced_name.endswith(".bias")
                         or replaced_name.endswith("_bias")
-                    ) and map_weight_name(replaced_name) not in params_dict:
+                    ) and replaced_name not in params_dict:
                         continue
                     name = replaced_name
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
 
                     weight_loader = getattr(param, "weight_loader")
                     weight_loader(
@@ -1238,30 +1230,22 @@ class Qwen3NextForCausalLM(nn.Module):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
                     # if is_pp_missing_parameter(name, self):
                     #     continue
 
-                    if (
-                        name.endswith("_scale")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith("_scale") and name not in params_dict:
                         assert abs(loaded_weight.item() - 1.0) < 1e-6, (
                             f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         )
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
         return loaded_params
 
     @classmethod

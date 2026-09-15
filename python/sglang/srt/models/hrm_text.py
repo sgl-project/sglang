@@ -55,10 +55,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -466,15 +463,13 @@ class HrmTextForCausalLM(nn.Module):
         # Disk keys use `.attn.`; rename to our `.self_attn.`. The per-step
         # RadixAttention modules hold no params, and disk tensors are already
         # fused so no stacked_params_mapping is needed.
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if ".attn." in name:
                 name = name.replace(".attn.", ".self_attn.", 1)
-            registered_name = map_weight_name(name)
-            if registered_name not in params_dict:
+            if name not in params_dict:
                 continue
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

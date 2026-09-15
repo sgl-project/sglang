@@ -44,10 +44,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
@@ -145,8 +142,6 @@ class PixtralForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
-
         def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
             return weight[0].startswith("vision_encoder")
 
@@ -184,29 +179,25 @@ class PixtralForConditionalGeneration(nn.Module):
                     # TODO: Remove this if condition once the model is fixed
                     if "fake_quantizer.qscale_act" in trimmed_name:
                         continue
-                    registered_trimmed_name = map_weight_name(trimmed_name)
-                    param = vision_encoder_dict[registered_trimmed_name]
+                    param = vision_encoder_dict[trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_patch_merger((name, w)):
                     # Load vision patch merger weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    registered_trimmed_name = map_weight_name(trimmed_name)
-                    param = patch_merger_dict[registered_trimmed_name]
+                    param = patch_merger_dict[trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_pre_mm_projector_norm((name, w)):
                     # Load vision pre_mm_projector_norm weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    registered_trimmed_name = map_weight_name(trimmed_name)
-                    param = pre_mm_projector_norm_dict[registered_trimmed_name]
+                    param = pre_mm_projector_norm_dict[trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_vision_lang_adapter_weights((name, w)):
                     # Load vision-language adapter weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    registered_trimmed_name = map_weight_name(trimmed_name)
-                    param = vision_lang_adapter_dict[registered_trimmed_name]
+                    param = vision_lang_adapter_dict[trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 else:
@@ -1017,7 +1008,6 @@ class PixtralHFVisionModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         """Load weights from a HuggingFace checkpoint with proper parameter mapping."""
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
 
         # for (param, weight, shard_id): load weight into param as param's shard_id part
@@ -1035,9 +1025,8 @@ class PixtralHFVisionModel(nn.Module):
                 if weight_name in name:
                     # Replace the weight name part with the combined parameter name
                     transformed_name = name.replace(weight_name, param_name)
-                    registered_transformed_name = map_weight_name(transformed_name)
-                    if registered_transformed_name in params_dict:
-                        param = params_dict[registered_transformed_name]
+                    if transformed_name in params_dict:
+                        param = params_dict[transformed_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -1046,12 +1035,10 @@ class PixtralHFVisionModel(nn.Module):
             else:
                 if ".attention.o_proj" in name:
                     alt_name = name.replace(".attention.o_proj", ".attention.proj")
-                    registered_alt_name = map_weight_name(alt_name)
-                    if registered_alt_name in params_dict:
+                    if alt_name in params_dict:
                         name = alt_name
-                registered_name = map_weight_name(name)
-                if registered_name in params_dict:
-                    param = params_dict[registered_name]
+                if name in params_dict:
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

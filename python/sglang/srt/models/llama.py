@@ -49,7 +49,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
@@ -119,7 +118,6 @@ class LlamaMLP(nn.Module):
         return x
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         from sglang.srt.model_loader.auto_loader import STANDARD_GATE_UP_MAPPING
 
         loaded: set[str] = set()
@@ -127,18 +125,12 @@ class LlamaMLP(nn.Module):
         for name, tensor in weights:
             target = STANDARD_GATE_UP_MAPPING.try_load(name, tensor, params_dict)
             if target is not None:
-                registered_target = map_weight_name(target)
-                loaded.add(registered_target)
+                loaded.add(target)
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                wl = getattr(
-                    params_dict[registered_name],
-                    "weight_loader",
-                    default_weight_loader,
-                )
-                wl(params_dict[registered_name], tensor)
-                loaded.add(registered_name)
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
         return loaded
 
 
@@ -271,7 +263,6 @@ class LlamaAttention(nn.Module):
         return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
 
         loaded: set[str] = set()
@@ -279,18 +270,12 @@ class LlamaAttention(nn.Module):
         for name, tensor in weights:
             target = STANDARD_QKV_MAPPING.try_load(name, tensor, params_dict)
             if target is not None:
-                registered_target = map_weight_name(target)
-                loaded.add(registered_target)
+                loaded.add(target)
                 continue
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                wl = getattr(
-                    params_dict[registered_name],
-                    "weight_loader",
-                    default_weight_loader,
-                )
-                wl(params_dict[registered_name], tensor)
-                loaded.add(registered_name)
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
         return loaded
 
 
@@ -682,7 +667,6 @@ class LlamaForCausalLM(nn.Module):
         return self._legacy_load_weights(weights)
 
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -716,10 +700,7 @@ class LlamaForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if (
-                name.startswith("model.vision_tower")
-                and map_weight_name(name) not in params_dict
-            ):
+            if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
@@ -734,28 +715,23 @@ class LlamaForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip loading kv_scale from ckpts towards new design.
-                if (
-                    name.endswith(".kv_scale")
-                    and map_weight_name(name) not in params_dict
-                ):
+                if name.endswith(".kv_scale") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name in params_dict.keys():
-                    param = params_dict[registered_name]
+                if name in params_dict.keys():
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -809,7 +785,6 @@ class LlamaForCausalLM(nn.Module):
         Only used for unit test with an unoptimized performance.
         For optimized performance, please use torch.save and torch.load.
         """
-        map_weight_name = get_checkpoint_name_mapper(self)
         try:
             if name == "lm_head.weight" and self.config.tie_word_embeddings:
                 logger.info(
@@ -830,8 +805,7 @@ class LlamaForCausalLM(nn.Module):
                     mapped_shard_id = shard_id
                     break
             params_dict = dict(self.named_parameters())
-            registered_mapped_name = map_weight_name(mapped_name)
-            param = params_dict[registered_mapped_name]
+            param = params_dict[mapped_name]
             if mapped_shard_id is not None:
                 if mapped_shard_id in ["q", "k", "v"]:
                     num_heads = self.config.num_attention_heads // tp_size

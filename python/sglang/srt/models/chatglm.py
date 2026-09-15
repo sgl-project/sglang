@@ -39,10 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -409,7 +406,6 @@ class ChatGLMForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_pos_emb.inv_freq" in name:
@@ -417,10 +413,9 @@ class ChatGLMForCausalLM(nn.Module):
             if "word_embeddings" in name:
                 name = name.replace(".word_embeddings", "")
             # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+            if name.endswith(".bias") and name not in params_dict:
                 continue
-            registered_name = map_weight_name(name)
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

@@ -29,7 +29,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     kv_cache_scales_loader,
 )
 
@@ -468,7 +467,6 @@ class SolarForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
 
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             is_packed = False
@@ -477,9 +475,8 @@ class SolarForCausalLM(nn.Module):
                     if src_name in name:
                         model_param_name = name.replace(src_name, packed_name)
 
-                        registered_model_param_name = map_weight_name(model_param_name)
-                        if registered_model_param_name in params_dict:
-                            param = params_dict[registered_model_param_name]
+                        if model_param_name in params_dict:
+                            param = params_dict[model_param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -492,9 +489,8 @@ class SolarForCausalLM(nn.Module):
             if is_packed:
                 continue
 
-            registered_name = map_weight_name(name)
-            if registered_name in params_dict:
-                param = params_dict[registered_name]
+            if name in params_dict:
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

@@ -198,25 +198,23 @@ class MoeWNA16Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        if self.match_layer(
-            prefix, is_layer_skipped_quant, self.modules_to_not_convert
-        ):
+        if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
             if isinstance(layer, FusedMoE):
                 return UnquantizedFusedMoEMethod()
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             if self.linear_quant_method == "gptq":
                 if self.use_marlin:
-                    return self.delegate(
-                        GPTQMarlinConfig.from_config(self.full_config), layer, prefix
-                    )
+                    return GPTQMarlinConfig.from_config(
+                        self.full_config
+                    ).get_quant_method(layer, prefix)
                 else:
-                    return self.delegate(
-                        GPTQConfig.from_config(self.full_config), layer, prefix
+                    return GPTQConfig.from_config(self.full_config).get_quant_method(
+                        layer, prefix
                     )
             elif self.linear_quant_method == "awq":
-                return self.delegate(
-                    AWQConfig.from_config(self.full_config), layer, prefix
+                return AWQConfig.from_config(self.full_config).get_quant_method(
+                    layer, prefix
                 )
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")

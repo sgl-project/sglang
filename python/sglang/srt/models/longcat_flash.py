@@ -86,10 +86,7 @@ from sglang.srt.model_loader.utils import (
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.runtime_context import get_parallel as _gp
@@ -964,7 +961,6 @@ class LongcatFlashForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
 
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1012,19 +1008,13 @@ class LongcatFlashForCausalLM(nn.Module):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and map_weight_name(
-                        name
-                    ) not in params_dict:
+                    if ("mlp.experts." in name) and name not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(".bias") and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
                         executor=executor,
@@ -1040,8 +1030,7 @@ class LongcatFlashForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        registered_name = map_weight_name(name)
-                        param = params_dict[registered_name]
+                        param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -1057,10 +1046,7 @@ class LongcatFlashForCausalLM(nn.Module):
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
-                        if (
-                            name.endswith(".bias")
-                            and map_weight_name(name) not in params_dict
-                        ):
+                        if name.endswith(".bias") and name not in params_dict:
                             continue
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
@@ -1104,8 +1090,7 @@ class LongcatFlashForCausalLM(nn.Module):
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
-                                registered_param_name = map_weight_name(param_name)
-                                param = params_dict[registered_param_name]
+                                param = params_dict[param_name]
 
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
@@ -1122,7 +1107,7 @@ class LongcatFlashForCausalLM(nn.Module):
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
-                            ) and map_weight_name(name) not in params_dict:
+                            ) and name not in params_dict:
                                 # modelopt attn kv scale is named differently
                                 for scale in ["k_scale", "v_scale"]:
                                     if scale in name:
@@ -1130,14 +1115,13 @@ class LongcatFlashForCausalLM(nn.Module):
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            registered_name = map_weight_name(name)
-                            if registered_name not in params_dict:
+                            if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[registered_name]
+                            param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )

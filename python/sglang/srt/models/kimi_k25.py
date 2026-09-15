@@ -36,10 +36,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2, tpool_patch_merger
 from sglang.srt.models.utils import WeightsMapper
@@ -858,7 +855,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         iterator reuses backing buffers — collecting tensors before consuming them
         would clobber prior tensors.
         """
-        map_weight_name = get_checkpoint_name_mapper(self)
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
@@ -880,10 +876,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
                         .replace("mm_projector.proj.0", "mm_projector.linear_1")
                         .replace("mm_projector.proj.2", "mm_projector.linear_2")
                     )
-                    registered_vname = map_weight_name(vname)
-                    if registered_vname not in vision_params:
+                    if vname not in vision_params:
                         raise ValueError(f"Weight {vname} not found in params_dict")
-                    param = vision_params[registered_vname]
+                    param = vision_params[vname]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

@@ -50,10 +50,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     flatten_nested_list,
 )
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.utils import add_prefix
@@ -341,7 +338,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
     # Weight loading
     # ------------------------------------------------------------------
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         params_dict = dict(self.named_parameters())
@@ -397,25 +393,23 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 if weight_name not in name:
                     continue
                 mapped = name.replace(weight_name, param_name)
-                registered_mapped = map_weight_name(mapped)
-                if registered_mapped not in params_dict:
+                if mapped not in params_dict:
                     continue
-                param = params_dict[registered_mapped]
+                param = params_dict[mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
                 if should_dup_k_to_v:
                     param.weight_loader(param, loaded_weight, "v")
-                loaded_params.add(registered_mapped)
+                loaded_params.add(mapped)
                 break
             else:
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name not in params_dict:
+                if name not in params_dict:
                     continue
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(registered_name)
+                loaded_params.add(name)
 
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
@@ -423,14 +417,11 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             buckets = {
                 logging.WARNING: (
                     "Some weights are not initialized from checkpoints",
-                    lambda p: map_weight_name(p) in param_names,
+                    lambda p: p in param_names,
                 ),
                 logging.INFO: (
                     "Persistent buffers not in checkpoint (using default init)",
-                    lambda p: (
-                        map_weight_name(p) not in param_names
-                        and p not in non_persistent_buffers
-                    ),
+                    lambda p: p not in param_names and p not in non_persistent_buffers,
                 ),
                 logging.DEBUG: (
                     "Non-persistent buffers not in checkpoint (expected)",

@@ -159,9 +159,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if self.match_layer(
-                prefix, is_layer_skipped_bnb, self.llm_int8_skip_modules
-            ):
+            if is_layer_skipped_bnb(prefix, self.llm_int8_skip_modules):
                 return UnquantizedLinearMethod()
             return BitsAndBytesLinearMethod(self)
         elif isinstance(layer, FusedMoE):

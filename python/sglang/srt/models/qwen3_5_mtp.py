@@ -32,10 +32,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -252,7 +249,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        map_weight_name = get_checkpoint_name_mapper(self)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -311,8 +307,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             shard_id: str,
             num_experts: int,
         ):
-            registered_name = map_weight_name(name)
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = param.weight_loader
             # Let EP MoE layer handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
@@ -338,14 +333,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 "model.language_model.embed_tokens.weight",
             ):
                 param_name = "model.embed_tokens.weight"
-                registered_param_name = map_weight_name(param_name)
-                if registered_param_name in params_dict:
-                    param = params_dict[registered_param_name]
+                if param_name in params_dict:
+                    param = params_dict[param_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(registered_param_name)
+                    loaded_params.add(param_name)
                 continue
 
             if "rotary_emb.inv_freq" in name:
@@ -396,15 +390,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if (
                     name_mapped.endswith(ignore_suffixes)
-                    and map_weight_name(name_mapped) not in params_dict
+                    and name_mapped not in params_dict
                 ):
                     continue
 
-                registered_name_mapped = map_weight_name(name_mapped)
-                if registered_name_mapped not in params_dict:
+                if name_mapped not in params_dict:
                     continue
 
-                param = params_dict[registered_name_mapped]
+                param = params_dict[name_mapped]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 name = name_mapped
@@ -453,13 +446,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                         # Non-fused expert, load by expert_id/shard
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and map_weight_name(name_mapped) not in params_dict
+                            and name_mapped not in params_dict
                         ):
                             continue
-                        registered_name_mapped = map_weight_name(name_mapped)
-                        if registered_name_mapped not in params_dict:
+                        if name_mapped not in params_dict:
                             break
-                        param = params_dict[registered_name_mapped]
+                        param = params_dict[name_mapped]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -476,15 +468,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                         continue
 
                     # 3) Regular non-stacked / non-expert parameters, use default loader
-                    if (
-                        name.endswith(ignore_suffixes)
-                        and map_weight_name(name) not in params_dict
-                    ):
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
-                    registered_name = map_weight_name(name)
-                    if registered_name in params_dict:
-                        param = params_dict[registered_name]
+                    if name in params_dict:
+                        param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -494,8 +482,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                             f"Parameter {name} not found in params_dict, skip loading"
                         )
 
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
         return loaded_params
 
 

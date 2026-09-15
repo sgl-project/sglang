@@ -44,10 +44,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.pixtral import (
     PATCH_MERGE,
     PatchMerger,
@@ -210,7 +207,6 @@ class LightOnOCRForConditionalGeneration(nn.Module):
         - ``vision_projection.linear_2.*`` -> self.vision_language_adapter.w_out
         - ``language_model.*`` -> self.language_model (Qwen3ForCausalLM)
         """
-        map_weight_name = get_checkpoint_name_mapper(self)
         vision_encoder_dict = dict(self.vision_encoder.named_parameters())
         patch_merger_dict = dict(self.patch_merger.named_parameters())
         norm_dict = dict(self.vision_projection_norm.named_parameters())
@@ -239,9 +235,8 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name in trimmed:
                             transformed = trimmed.replace(weight_name, param_name)
-                            registered_transformed = map_weight_name(transformed)
-                            if registered_transformed in vision_encoder_dict:
-                                param = vision_encoder_dict[registered_transformed]
+                            if transformed in vision_encoder_dict:
+                                param = vision_encoder_dict[transformed]
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
@@ -256,9 +251,8 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                             trimmed = trimmed.replace(
                                 ".attention.o_proj", ".attention.proj"
                             )
-                        registered_trimmed = map_weight_name(trimmed)
-                        if registered_trimmed in vision_encoder_dict:
-                            param = vision_encoder_dict[registered_trimmed]
+                        if trimmed in vision_encoder_dict:
+                            param = vision_encoder_dict[trimmed]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -270,17 +264,15 @@ class LightOnOCRForConditionalGeneration(nn.Module):
 
                     if remaining.startswith("patch_merger."):
                         trimmed = remaining[len("patch_merger.") :]
-                        registered_trimmed = map_weight_name(trimmed)
-                        if registered_trimmed in patch_merger_dict:
-                            param = patch_merger_dict[registered_trimmed]
+                        if trimmed in patch_merger_dict:
+                            param = patch_merger_dict[trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 
                     elif remaining.startswith("norm."):
                         trimmed = remaining[len("norm.") :]
-                        registered_trimmed = map_weight_name(trimmed)
-                        if registered_trimmed in norm_dict:
-                            param = norm_dict[registered_trimmed]
+                        if trimmed in norm_dict:
+                            param = norm_dict[trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 
@@ -289,9 +281,8 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                         trimmed = remaining.replace("linear_1.", "w_in.").replace(
                             "linear_2.", "w_out."
                         )
-                        registered_trimmed = map_weight_name(trimmed)
-                        if registered_trimmed in adapter_dict:
-                            param = adapter_dict[registered_trimmed]
+                        if trimmed in adapter_dict:
+                            param = adapter_dict[trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 

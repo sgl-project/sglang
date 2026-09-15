@@ -53,11 +53,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-    map_state_dict_names,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.utils import logger
 
@@ -1087,10 +1083,7 @@ def create_siglip_vit(
     if ckpt_path:
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
-        incompatible_keys = model.load_state_dict(
-            map_state_dict_names(state_dict, get_checkpoint_name_mapper(model)),
-            strict=False,
-        )
+        incompatible_keys = model.load_state_dict(state_dict, strict=False)
         print(
             f"SigLIP-ViT restores from {ckpt_path},\n"
             f"\tincompatible_keys:', {incompatible_keys}."
@@ -2012,7 +2005,6 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return helper.pad_input_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -2030,10 +2022,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if (
-                name.startswith("model.vision_tower")
-                and map_weight_name(name) not in params_dict
-            ):
+            if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 
             # skip generation sub model
@@ -2052,20 +2041,18 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 name = name.replace(weight_name, param_name)
 
                 # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", None)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

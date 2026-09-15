@@ -945,9 +945,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         sparsity_scheme: Optional[SparsityCompressionConfig] = None
         with suppress(ValueError):
-            matched_target = self.match_layer(
-                layer_name,
-                find_matched_target,
+            matched_target = find_matched_target(
+                layer_name=layer_name,
                 module=layer,
                 targets=sparsity_targets,
                 fused_mapping=self.packed_modules_mapping,
@@ -1006,11 +1005,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         """
         if layer_name is None or not self.target_scheme_map:
             return None
-        if self.match_layer(
-            layer_name,
-            should_ignore_layer,
-            ignore=self.ignore,
-            fused_mapping=self.packed_modules_mapping,
+        if should_ignore_layer(
+            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return None
         # check_equal_or_regex_match also accepts dotted-suffix targets
@@ -1024,9 +1020,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             (
                 target
                 for target in self.target_scheme_map
-                if self.match_layer(
-                    layer_name, check_equal_or_regex_match, targets=[target]
-                )
+                if check_equal_or_regex_match(layer_name=layer_name, targets=[target])
             ),
             None,
         )
@@ -1065,20 +1059,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "format": str | None
             } | None
         """
-        if self.match_layer(
-            layer_name,
-            should_ignore_layer,
-            ignore=self.ignore,
-            fused_mapping=self.packed_modules_mapping,
+        if should_ignore_layer(
+            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return None
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = self.match_layer(
-                    layer_name,
-                    find_matched_target,
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
                     module=layer,
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,

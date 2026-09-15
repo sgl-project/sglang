@@ -14,10 +14,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3p5 import Step3p5DecoderLayer, Step3p5ForCausalLM
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -187,7 +184,6 @@ class Step3p5MTP(Step3p5ForCausalLM):
         return
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -226,19 +222,16 @@ class Step3p5MTP(Step3p5ForCausalLM):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and map_weight_name(
-                    name
-                ) not in params_dict:
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 if "experts" in name or "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -251,10 +244,9 @@ class Step3p5MTP(Step3p5ForCausalLM):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and map_weight_name(name) not in params_dict:
+                    ) and name not in params_dict:
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     for expert_id in range(loaded_weight.shape[0]):
                         loaded_weight_expert = loaded_weight[expert_id]
@@ -265,13 +257,13 @@ class Step3p5MTP(Step3p5ForCausalLM):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                    loaded_params.add(registered_name)
+                    loaded_params.add(name)
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
+                        and name not in params_dict
                         or "tok_embeddings" in name
                     ):
                         continue
@@ -284,14 +276,12 @@ class Step3p5MTP(Step3p5ForCausalLM):
                             and self.config.num_nextn_predict_layers > 0
                         )
                         name = "model.embed_tokens.weight"
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
         params_need_to_load = set(params_dict.keys())
         if params_need_to_load != loaded_params:
             missing_params = list(params_need_to_load - loaded_params)

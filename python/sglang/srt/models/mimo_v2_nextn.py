@@ -37,10 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
@@ -284,7 +281,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -304,18 +300,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if (
-                name.startswith("model.vision_tower")
-                and map_weight_name(name) not in params_dict
-            ):
+            if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             name = self.map_model_name_to_mtp_param_name(name)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
-                registered_name = map_weight_name(name)
-                if registered_name in params_dict:
-                    param = params_dict[registered_name]
+                if name in params_dict:
+                    param = params_dict[name]
                     load_mimo_v2_qkv_proj_weight(
                         name,
                         param,
@@ -333,16 +325,15 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     break
                 name = name.replace(f".{weight_name}.", f".{param_name}.")
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
 
                 if "mtp_block" not in name and (
@@ -354,9 +345,8 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     and "final_layernorm" not in name
                 ):
                     continue
-                registered_name = map_weight_name(name)
-                if registered_name in params_dict.keys():
-                    param = params_dict[registered_name]
+                if name in params_dict.keys():
+                    param = params_dict[name]
                     if "attention_sink_bias" in name:
                         start = get_parallel().attn_tp_rank * param.numel()
                         param.data.copy_(loaded_weight[start : start + param.numel()])

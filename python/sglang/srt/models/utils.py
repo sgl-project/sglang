@@ -36,10 +36,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -192,18 +189,13 @@ class AutoWeightsLoader:
         base_prefix: str,
         param: torch.nn.Parameter,
         weights: Iterable[tuple[str, torch.Tensor]],
-        *,
-        checkpoint_prefix: str | None = None,
     ) -> Iterable[str]:
-        if checkpoint_prefix is None:
-            checkpoint_prefix = base_prefix
         for weight_name, weight_data in weights:
             weight_qualname = self._get_qualname(base_prefix, weight_name)
-            checkpoint_name = self._get_qualname(checkpoint_prefix, weight_name)
-            if self._can_skip(checkpoint_name):
+            if self._can_skip(weight_qualname):
                 continue
             if weight_name != "":
-                if self._can_ignore_unexpected(checkpoint_name):
+                if self._can_ignore_unexpected(weight_qualname):
                     continue
                 raise ValueError(
                     f"Attempted to load nested weight {weight_qualname!r} "
@@ -219,11 +211,7 @@ class AutoWeightsLoader:
         base_prefix: str,
         module: torch.nn.Module,
         weights: Iterable[tuple[str, torch.Tensor]],
-        *,
-        checkpoint_prefix: str | None = None,
     ) -> Iterable[str]:
-        if checkpoint_prefix is None:
-            checkpoint_prefix = base_prefix
         if module.__class__.__name__ == "PPMissingLayer":
             return
 
@@ -238,52 +226,42 @@ class AutoWeightsLoader:
                     )
                 return
 
-        map_name = get_checkpoint_name_mapper(module, recurse=False)
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
         child_buffers = dict(module.named_buffers(recurse=False))
         for child_prefix, child_weights in self._groupby_prefix(weights):
-            checkpoint_name = self._get_qualname(checkpoint_prefix, child_prefix)
-            child_prefix = map_name(child_prefix)
             prefix = self._get_qualname(base_prefix, child_prefix)
             if child_prefix in child_modules:
-                if self._can_skip(checkpoint_name + "."):
+                if self._can_skip(prefix + "."):
                     continue
                 yield from self._load_module(
                     prefix,
                     child_modules[child_prefix],
                     child_weights,
-                    checkpoint_prefix=checkpoint_name,
                 )
                 continue
 
             if child_prefix in child_params:
-                if self._can_skip(checkpoint_name):
+                if self._can_skip(prefix):
                     continue
                 yield from self._load_param(
-                    prefix,
-                    child_params[child_prefix],
-                    child_weights,
-                    checkpoint_prefix=checkpoint_name,
+                    prefix, child_params[child_prefix], child_weights
                 )
                 continue
 
             if child_prefix in child_buffers:
-                if self._can_skip(checkpoint_name):
+                if self._can_skip(prefix):
                     continue
                 yield from self._load_param(
-                    prefix,
-                    child_buffers[child_prefix],
-                    child_weights,
-                    checkpoint_prefix=checkpoint_name,
+                    prefix, child_buffers[child_prefix], child_weights
                 )
                 continue
 
-            if self._can_skip(checkpoint_name) or self._can_skip(checkpoint_name + "."):
+            if self._can_skip(prefix) or self._can_skip(prefix + "."):
                 continue
-            if self._can_ignore_unexpected(
-                checkpoint_name
-            ) or self._can_ignore_unexpected(checkpoint_name + "."):
+            if self._can_ignore_unexpected(prefix) or self._can_ignore_unexpected(
+                prefix + "."
+            ):
                 continue
             raise ValueError(
                 f"No module or parameter named {prefix!r} in {self.module._get_name()}."
@@ -300,8 +278,7 @@ class AutoWeightsLoader:
         weights = (
             (name, weight) for name, weight in weights if not self._can_skip(name)
         )
-        loaded = set(self._load_module("", self.module, weights))
-        return loaded
+        return set(self._load_module("", self.module, weights))
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):

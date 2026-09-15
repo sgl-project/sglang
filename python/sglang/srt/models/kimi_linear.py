@@ -42,7 +42,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
@@ -873,7 +872,6 @@ class KimiLinearForCausalLM(nn.Module):
         return False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
@@ -930,9 +928,7 @@ class KimiLinearForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and map_weight_name(
-                    name
-                ) not in params_dict:
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 # Check if this mapping targets a fused projection (only apply fusion check to fused params)
                 if param_name in {".fused_qkvbfg_a_proj", ".fused_fg_b_proj"}:
@@ -949,10 +945,9 @@ class KimiLinearForCausalLM(nn.Module):
                         continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -963,8 +958,7 @@ class KimiLinearForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -978,7 +972,7 @@ class KimiLinearForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias")
-                        and map_weight_name(name) not in params_dict
+                        and name not in params_dict
                         and not self.config.is_linear_attn
                     ):  # noqa: E501
                         continue
@@ -986,14 +980,12 @@ class KimiLinearForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
-                    registered_name = map_weight_name(name)
-                    param = params_dict[registered_name]
+                    param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, **kwargs)
-            registered_name = map_weight_name(name)
-            loaded_params.add(registered_name)
+            loaded_params.add(name)
 
         self.post_load_weights()
 

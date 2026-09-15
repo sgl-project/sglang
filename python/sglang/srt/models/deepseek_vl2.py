@@ -17,10 +17,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
@@ -246,7 +243,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return hs
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -262,8 +258,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 name = name.replace("language.", "")
                 self.language_model.load_weights([(name, loaded_weight)])
             else:
-                registered_name = map_weight_name(name)
-                param = params_dict[registered_name]
+                param = params_dict[name]
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 

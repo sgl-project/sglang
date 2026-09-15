@@ -120,7 +120,7 @@ class ModelSlimConfig(QuantizationConfig):
                     )
                 ] = quant_config[k]
 
-        self.quant_description = self.checkpoint_metadata(quant_config)
+        self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -199,7 +199,7 @@ class ModelSlimConfig(QuantizationConfig):
             **quant_config,
         }
 
-        self.quant_description = self.checkpoint_metadata(quant_config)
+        self.quant_description = quant_config
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)

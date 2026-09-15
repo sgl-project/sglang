@@ -36,10 +36,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    get_checkpoint_name_mapper,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -284,7 +281,6 @@ class GPTBigCodeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
@@ -293,8 +289,7 @@ class GPTBigCodeForCausalLM(nn.Module):
                 # Skip attention mask.
                 # NOTE: "c_attn.bias" should not be skipped.
                 continue
-            registered_name = map_weight_name(name)
-            param = params_dict[registered_name]
+            param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             # TODO (@robertgshaw2-neuralmagic): move to fp8 linear method
             if "c_attn.input_scale" in name or "c_attn.weight_scale" in name:
