@@ -600,6 +600,24 @@ class MoriKVManager(CommonKVManager):
                         current,
                     )
                     return
+                if not self.is_room_scheduled(transfer_info.room):
+                    logger.warning(
+                        "Rejecting un-scheduled bootstrap room %s to prevent memory leak / DoS",
+                        transfer_info.room,
+                    )
+                    return
+                if (
+                    transfer_info.room not in self.transfer_infos
+                    and len(self.transfer_infos) >= self.max_pending_rooms
+                ):
+                    logger.warning(
+                        "Rejecting bootstrap room %s: max pending rooms limit (%s) reached",
+                        transfer_info.room,
+                        self.max_pending_rooms,
+                    )
+                    return
+                if transfer_info.room not in self.transfer_infos:
+                    self.record_room_active(transfer_info.room)
                 infos = self.transfer_infos.setdefault(transfer_info.room, {})
                 infos[transfer_info.engine_key] = transfer_info
 
@@ -679,6 +697,7 @@ class MoriKVManager(CommonKVManager):
                 return
 
             self.update_status(bootstrap_room, KVPoll.Failed)
+            self._purge_room_state(bootstrap_room, terminal_status=KVPoll.Failed)
 
         logger.debug("Room %s marked Failed via ABORT from decode", bootstrap_room)
 
@@ -687,6 +706,7 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    self.sweep_stale_rooms()
                     if not msg:
                         continue
 
@@ -973,9 +993,11 @@ class MoriKVManager(CommonKVManager):
         kv_item_len = self.kv_args.kv_item_lens[0]
 
         if self.is_mla_backend or self.is_hybrid_mla_backend:
-            src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
-            )
+            (
+                src_descs,
+                dst_descs,
+                layers_current_pp_stage,
+            ) = self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             for layer_id in range(layers_current_pp_stage):
                 layer_plan = self._build_contiguous_transfer_plan(
                     grouped_plan, self.kv_args.kv_item_lens[layer_id]
@@ -1521,9 +1543,12 @@ class MoriKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
-        )
+        (
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            should_skip,
+        ) = self._prepare_send_indices(kv_indices, state_indices)
         if should_skip:
             return
 

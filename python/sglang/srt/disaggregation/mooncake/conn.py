@@ -253,9 +253,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
-            self.enable_custom_mem_pool, self.custom_mem_pool_type = (
-                check_mooncake_custom_mem_pool_enabled()
-            )
+            (
+                self.enable_custom_mem_pool,
+                self.custom_mem_pool_type,
+            ) = check_mooncake_custom_mem_pool_enabled()
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -678,10 +679,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         device_prefill_kv_blocks = device_dst_kv_blocks = None
         if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
+            (
+                device_prefill_kv_blocks,
+                device_dst_kv_blocks,
+            ) = group_concurrent_contiguous(
+                prefill_data_indices, dst_device_data_indices
             )
 
         layers_params = None
@@ -710,10 +712,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
             else:
-                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(
-                        src_data_ptrs, dst_data_ptrs, state_type
-                    )
+                (
+                    src_kv_ptrs,
+                    dst_kv_ptrs,
+                    layers_current_pp_stage,
+                ) = self.get_mla_kv_ptrs_with_pp(
+                    src_data_ptrs, dst_data_ptrs, state_type
                 )
                 layers_params = [
                     (
@@ -724,9 +728,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     for layer_id in range(layers_current_pp_stage)
                 ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
+            (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
             if layers_current_pp_stage > len(dst_k_ptrs):
@@ -842,11 +850,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 batch_device_prefill_blocks = batch_device_dst_blocks = None
                 if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
+                    (
+                        batch_device_prefill_blocks,
+                        batch_device_dst_blocks,
+                    ) = group_concurrent_contiguous(
+                        prefill_data_indices[start : start + max_batch_indices],
+                        dst_device_data_indices[start : start + max_batch_indices],
                     )
                 ret = process_index_batch(
                     batch_prefill_blocks,
@@ -1167,7 +1176,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if src_layer_ids or dst_layer_ids:
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+            if any(
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+            ):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "
                     f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
@@ -1184,9 +1195,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             ]
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
-            )
+            (
+                src_k_ptrs,
+                src_v_ptrs,
+                dst_k_ptrs,
+                dst_v_ptrs,
+                layers_current_pp_stage,
+            ) = self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
             ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
@@ -2156,9 +2171,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(kv_chunk.room, None)
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
-                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    self._purge_room_state(
+                        kv_chunk.room,
+                        terminal_status=self.request_status.get(kv_chunk.room),
+                    )
                     if self.enable_staging:
                         # Purge prefetch bookkeeping for the finished room.
                         # Snapshot first: the scheduler thread adds concurrently.
@@ -2179,6 +2195,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                self.sweep_stale_rooms()
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2224,6 +2241,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )
+                            self._purge_room_state(
+                                room_to_be_aborted, terminal_status=KVPoll.Failed
+                            )
                         continue
                     # No need to abort the room if it has already succeeded
                     if room_active:
@@ -2255,6 +2275,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     except Exception as e:
                         logger.debug(
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        )
+                    if self._staging_outstanding.get(room_to_be_aborted, 0) <= 0:
+                        self._purge_room_state(
+                            room_to_be_aborted, terminal_status=KVPoll.Failed
                         )
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
@@ -2290,8 +2314,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    if not self.is_room_scheduled(room):
+                        logger.warning(
+                            f"Rejecting un-scheduled bootstrap room {room} to prevent memory leak / DoS"
+                        )
+                        continue
+                    if (
+                        room not in self.transfer_infos
+                        and len(self.transfer_infos) >= self.max_pending_rooms
+                    ):
+                        logger.warning(
+                            f"Rejecting bootstrap room {room}: max pending rooms limit ({self.max_pending_rooms}) reached"
+                        )
+                        continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
+                        self.record_room_active(room)
 
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
@@ -2519,9 +2557,12 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
-        kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
-        )
+        (
+            kv_indices,
+            index_slice,
+            is_last_chunk,
+            should_skip,
+        ) = self._prepare_send_indices(kv_indices, state_indices)
         if should_skip:
             return
 
