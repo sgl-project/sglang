@@ -244,9 +244,9 @@ if _is_hip:
     ) -> torch.Tensor:
         return _gemm_a4w4_orig(
             x,
-            w,
+            w.view(x.dtype),
             x_scales,
-            w_scales,
+            w_scales.view(x_scales.dtype),
             dtype=output_dtype_ref.dtype,
             bpreshuffle=True,
         )
