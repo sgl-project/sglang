@@ -74,6 +74,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -434,6 +435,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     def __init__(
         self,
@@ -1512,6 +1514,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             # The decode requests polling kv cache
@@ -1559,6 +1562,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

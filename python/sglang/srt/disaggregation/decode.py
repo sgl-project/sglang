@@ -37,6 +37,12 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.checksum import (
+    KvChecksumComputer,
+    is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
+)
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -111,6 +117,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +426,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+        if get_disagg().disaggregation_enable_kv_checksum:
+            kv_args = self.kv_manager.kv_args
+            self.scheduler.kv_checksum_computer = KvChecksumComputer(
+                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                kv_data_ptrs=kv_args.kv_data_ptrs,
+                kv_item_lens=kv_args.kv_item_lens,
+                state_data_ptrs=kv_args.state_data_ptrs,
+                state_item_lens=kv_args.state_item_lens,
+            )
+        else:
+            self.scheduler.kv_checksum_computer = None
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -2092,7 +2111,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        # Preserve the checksum before the metadata slot is freed so it can be
+        # re-verified when the request enters a batch, including after retraction.
         idx = decode_req.metadata_buffer_index
+        if self.scheduler.kv_checksum_computer is not None:
+            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
+                idx
+            )
         (
             output_id,
             cached_tokens,
@@ -2640,6 +2665,57 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        if computer is None:
+            return self._get_new_prebuilt_batch(running_batch)
+
+        verified: List[Req] = []
+        for req in self.waiting_queue:
+            if is_health_check_req(req):
+                verified.append(req)
+                continue
+            expected = req.expected_kv_checksum
+            if expected == 0:
+                verified.append(req)
+                continue
+            seq_len = len(req.origin_input_ids)
+            page_indices_gpu = page_indices_for_request(self, req, seq_len)
+            state_indices = state_indices_for_request(self, req, seq_len)
+            actual = computer.compute(page_indices_gpu, state_indices)
+            if actual == expected:
+                verified.append(req)
+                continue
+            msg = (
+                f"KV checksum mismatch req={req.rid} "
+                f"bootstrap_room={req.bootstrap_room} "
+                f"expected={expected:#x} got={actual:#x}"
+            )
+            logger.error(msg)
+            self._handle_kv_checksum_mismatch(req, msg)
+        self.waiting_queue = verified
+
+        return self._get_new_prebuilt_batch(running_batch)
+
+    def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
+        # A mismatch means the KV this worker received is not what prefill sent,
+        # so the cause is hardware or transport rather than the request. Serving
+        # keeps going and drops just this request; CI fails instead, because a
+        # single aborted request is easy to miss in a passing run.
+        if is_in_ci():
+            raise RuntimeError(msg)
+        prepare_abort(
+            req,
+            "KV checksum mismatch",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        self.output_streamer.stream_output([req], req.return_logprob)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_transfer_failed_reqs()
+
+    def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""

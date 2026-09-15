@@ -1306,6 +1306,7 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        self.expected_kv_checksum: int = 0
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
