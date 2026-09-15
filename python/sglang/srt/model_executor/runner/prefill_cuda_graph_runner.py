@@ -1781,26 +1781,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         return static_forward_batch
 
-    def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
-        ie_idx = self._input_embeds_arg_idx
-        ie = layer_kwargs.get("input_embeds")
-        if ie is None and ie_idx is not None and len(args) > ie_idx:
-            ie = args[ie_idx]
-        if ie is None:
-            # Otherwise the graph replays the previous batch's embeddings.
-            input_ids = layer_kwargs.get("input_ids")
-            if input_ids is None and len(args) > 0:
-                input_ids = args[0]
-            embed = getattr(self.model_runner.model, "get_input_embeddings", None)
-            assert input_ids is not None and embed is not None, (
-                "prefill CUDA graph replay needs input_embeds for the static "
-                "slot, and the model exposes no get_input_embeddings()"
-            )
-            ie = embed()(input_ids)
-        self.buffer_registry.get_slot("input_embeds").slice_for(1, static_num_tokens)[
-            : ie.shape[0]
-        ].copy_(ie)
-
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -1813,6 +1793,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG / Full: replay the captured body, run the LM head +
         # logits_processor eagerly.
         full_path = self._is_full_backend
+        ie_idx = self._input_embeds_arg_idx
 
         def replay_layer_forward(*args, **layer_kwargs):
             # The captured body graph reads activations from the static
@@ -1824,7 +1805,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Copy them into the slot before replay so the graph sees the
             # current request's embeddings (mirrors main's BCG closure).
             if self.buffer_registry.has_slot("input_embeds"):
-                self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
+                ie = layer_kwargs.get("input_embeds")
+                if ie is None and ie_idx is not None and len(args) > ie_idx:
+                    ie = args[ie_idx]
+                if ie is None:
+                    # Otherwise the graph replays the previous batch's embeddings.
+                    input_ids = args[0] if args else layer_kwargs["input_ids"]
+                    ie = self.model_runner.model.get_input_embeddings()(input_ids)
+                self.buffer_registry.get_slot("input_embeds").slice_for(
+                    1, static_num_tokens
+                )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
