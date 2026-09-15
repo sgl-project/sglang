@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=100, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=140, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
