@@ -786,7 +786,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        if self.enable_custom_mem_pool:
+        if (
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+        ):
             futures = [
                 executor.submit(
                     process_layer,
