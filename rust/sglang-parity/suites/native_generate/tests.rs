@@ -107,7 +107,7 @@ fn modify_event(events: &mut [SseEvent], index: usize, edit: impl FnOnce(&mut Va
 fn default_spec_has_five_explicit_stream_pairs() {
     let (suite, _) = load(DEFAULT_SPEC, &config(false)).unwrap();
     assert_eq!(suite.cases.len(), 10);
-    assert_eq!(suite.comparison.per_result_value_exceptions.len(), 2);
+    assert_eq!(suite.comparison.per_result_value_exceptions.len(), 3);
     let mut groups = BTreeSet::new();
     for pair in suite.cases.chunks_exact(2) {
         let group = pair[0].equivalence_group.as_deref().unwrap();
@@ -667,7 +667,7 @@ fn declared_exceptions_alone_control_latency_validation_and_comparison() {
     spec["comparison"]["per_result_value_exceptions"]
         .as_array_mut()
         .unwrap()
-        .pop();
+        .retain(|rule| rule["path"] != "/meta_info/e2e_latency");
     let (suite, _) = load(&spec.to_string(), &config(false)).unwrap();
     assert!(prepare_comparison(&prepared, case.comparison_scope, &suite.comparison).is_ok());
 }

@@ -199,15 +199,22 @@ keys, array order and length, all values, and missing versus `null` matter. Ther
 are no tolerances, text normalization, or implicit field exclusions. The default
 specification permits only these per-result scalar values to vary:
 
-| Pointer | Requirement | Reason |
-| --- | --- | --- |
-| `/meta_info/id` | Nonempty string | Each request has its own identifier. |
-| `/meta_info/e2e_latency` | Finite, nonnegative number | Elapsed time varies. |
+| Pointer | Presence | Requirement | Reason |
+| --- | --- | --- | --- |
+| `/meta_info/id` | Required | Nonempty string | Each request has its own identifier. |
+| `/meta_info/e2e_latency` | Required | Finite, nonnegative number | Elapsed time varies. |
+| `/meta_info/response_sent_to_client_ts` | Optional | Finite, nonnegative number | Send times vary; final streaming responses may omit this field. |
 
-Every declared path must exist on every result, even if both implementations omit
-it. The core validates values before replacing them in comparison copies. Original
-responses retain every field. Unknown rules, invalid/duplicate pointers, and empty
-exception reasons are configuration errors. The supported rule vocabulary is
+Exception rules default to `"presence": "required"`: missing paths fail validation.
+With `"presence": "optional"`, absent fields remain absent; present values still
+must satisfy `require`. The core replaces validated values only in comparison
+copies. Two absent fields compare equally; presence on only one side remains a
+structural difference. `null` is a present value and must pass the declared type
+check. Original responses retain every field. `--describe` and the saved effective
+suite include the resolved presence policy.
+
+Unknown rules or presence policies, invalid/duplicate pointers, and empty
+exception reasons are configuration errors. The supported comparison vocabulary is
 `exact_json`, `non_empty_string`, and `non_negative_number`; pointers are literal
 JSON Pointers, with no wildcards, scripts, or expressions.
 
