@@ -441,9 +441,15 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                should_output = (
+                # Send the first output through detokenization immediately so
+                # non-streaming TTFT includes detok without waiting for a batch.
+                # Speculative decoding may produce several first tokens at once.
+                first_output = req.send_token_offset == 0 and bool(req.output_ids)
+                should_output = first_output or (
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
+                if first_output:
+                    should_output &= not req.check_match_stop_str_prefix()
 
         if not should_output:
             return
