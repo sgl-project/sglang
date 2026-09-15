@@ -69,7 +69,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
     bind_or_assign,
-    cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
     is_cpu,
@@ -87,7 +86,6 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
@@ -96,17 +94,6 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
     pass
-
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-else:
-    from vllm._custom_ops import awq_dequantize
 
 if _is_hip:
     pass
@@ -1133,6 +1120,18 @@ class BailingMoELinearForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                # AWQ backends are only required for quantized KV weights.
+                if _is_cuda:
+                    from sglang.kernels.ops.quantization.awq_dequantize import (
+                        awq_dequantize,
+                    )
+                elif _is_hip:
+                    from sglang.kernels.ops.quantization.awq_triton import (
+                        awq_dequantize_triton as awq_dequantize,
+                    )
+                else:
+                    from vllm._custom_ops import awq_dequantize
+
                 # AWQ compatible
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(

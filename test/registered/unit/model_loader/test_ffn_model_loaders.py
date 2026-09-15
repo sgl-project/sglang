@@ -5,11 +5,10 @@ not construct full models or substitute the loaders with mocks.
 """
 
 import importlib
-import sys
 import unittest
 from contextlib import ExitStack
-from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -79,6 +78,39 @@ def _fixture(module_name, class_name, member="ffn"):
 
 
 class TestFFNModelLoaders(unittest.TestCase):
+    def test_bailing_bf16_attention_post_load_weights(self):
+        for module, cls in (
+            ("bailing_moe_v3", "BailingMoeV3ForCausalLM"),
+            ("bailing_moe_linear", "BailingMoELinearForCausalLM"),
+        ):
+            for is_nextn in (False, True):
+                with self.subTest(model=module, is_nextn=is_nextn):
+                    model, _ = _fixture(module, cls)
+                    weight = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
+                    attention = SimpleNamespace(
+                        kv_b_proj=SimpleNamespace(weight=weight),
+                        qk_nope_head_dim=3,
+                        v_head_dim=2,
+                        w_kc=None,
+                        w_vc=None,
+                        w_scale=None,
+                    )
+                    layer = model.model.layers[0]
+                    layer.attention = attention
+                    if is_nextn:
+                        model.model.decoder = layer
+
+                    model.post_load_weights(is_nextn=is_nextn)
+
+                    torch.testing.assert_close(
+                        attention.w_kc, torch.stack([weight[:3], weight[5:8]])
+                    )
+                    torch.testing.assert_close(
+                        attention.w_vc,
+                        torch.stack([weight[3:5], weight[8:]]).transpose(1, 2),
+                    )
+                    self.assertIsNone(attention.w_scale)
+
     def test_shared_experts_load_into_fused_expert_slot(self):
         from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
             DeepseekV2WeightLoaderMixin,
@@ -94,26 +126,6 @@ class TestFFNModelLoaders(unittest.TestCase):
         ]
         for module, cls in cases:
             with self.subTest(model=module), ExitStack() as stack:
-                if (
-                    module == "bailing_moe_v3"
-                    and importlib.util.find_spec("vllm") is None
-                ):
-                    # CPU CI omits vLLM. This BF16 loading test never calls AWQ.
-                    vllm = ModuleType("vllm")
-                    vllm.__path__ = []
-                    custom_ops = ModuleType("vllm._custom_ops")
-                    custom_ops.awq_dequantize = Mock(
-                        side_effect=AssertionError("BF16 loading must not call AWQ")
-                    )
-                    stack.enter_context(
-                        patch.dict(
-                            sys.modules,
-                            {
-                                "vllm": vllm,
-                                "vllm._custom_ops": custom_ops,
-                            },
-                        )
-                    )
                 model, ffn = _fixture(module, cls)
                 model.num_fused_shared_experts = 1
                 model.enable_shared_expert_fusion = True

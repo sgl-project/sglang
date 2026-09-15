@@ -14,11 +14,10 @@ through `get_parallel().override(...)`; the ones that are pure config /
 quantization are exercised directly.
 """
 
-import importlib.util
 import sys
 import unittest
 import unittest.mock
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,25 +30,6 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 def _quant(name: str):
     return SimpleNamespace(get_name=lambda: name)
-
-
-def _import_bailing_modules():
-    if importlib.util.find_spec("vllm") is not None:
-        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
-
-        return bailing_moe_v3, bailing_moe_nextn
-
-    # CPU CI omits vLLM; these fusion gates never execute the imported AWQ kernel.
-    vllm = ModuleType("vllm")
-    vllm.__path__ = []
-    custom_ops = ModuleType("vllm._custom_ops")
-    custom_ops.awq_dequantize = unittest.mock.Mock()
-    with unittest.mock.patch.dict(
-        sys.modules, {"vllm": vllm, "vllm._custom_ops": custom_ops}
-    ):
-        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
-
-    return bailing_moe_v3, bailing_moe_nextn
 
 
 class _FusionGateCase(CustomTestCase):
@@ -316,7 +296,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         )
 
     def _reason_on_cuda(self, quant_config):
-        bailing_moe_v3, _ = _import_bailing_modules()
+        from sglang.srt.models import bailing_moe_v3
 
         self._seed()
         with (
@@ -345,7 +325,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
 
     def test_nextn_uses_its_rewritten_architecture(self):
-        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
 
         config = self._config()
         config.architectures = ["BailingMoeForCausalLMNextN"]
@@ -371,7 +351,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         self.assertIn("different quant methods", reason)
 
     def test_nextn_constructor_calls_v3_fusion_setup(self):
-        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
 
         config = SimpleNamespace(
             architectures=["BailingMoeForCausalLMNextN"],
