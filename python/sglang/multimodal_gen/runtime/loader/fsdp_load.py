@@ -232,6 +232,45 @@ def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
 
 
 # TODO(PY): add compile option
+def initialize_model_for_inference(
+    model_cls: type[nn.Module],
+    init_params: dict[str, Any],
+    *,
+    param_dtype: torch.dtype | None,
+    reduce_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
+    fsdp_inference: bool = False,
+) -> tuple[nn.Module, MixedPrecisionPolicy]:
+    """Shared construction prologue for ordinary loading and cache meta import.
+
+    Models read the thread-local mixed-precision policy during construction,
+    including on the non-FSDP path. Merely setting torch's default dtype is not
+    an equivalent construction context. This function reads no weight files.
+    """
+    default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
+    fsdp_param_dtype = (
+        None
+        if fsdp_inference and getattr(model_cls, "_fsdp_mixed_dtype_params", False)
+        else default_torch_dtype
+    )
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=fsdp_param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        cast_forward_inputs=False,
+    )
+    set_mixed_precision_policy(
+        param_dtype=default_torch_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=output_dtype,
+        mp_policy=mp_policy,
+    )
+    model = initialize_model(
+        model_cls, init_params, default_torch_dtype, torch.device("meta")
+    )
+    return model, mp_policy
+
+
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
     init_params: dict[str, Any],
@@ -270,35 +309,13 @@ def maybe_load_fsdp_model(
             instead of reading ``weight_dir_list`` as safetensors. Set by callers
             whose checkpoint is not safetensors at all, such as GGUF.
     """
-    # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
-    # manually casting the inputs to the model
-
-    # 1. prepare for loading
-    default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
-    # Some native models deliberately mix FP32 projections with lower-precision
-    # blocks.  FSDP must all-gather those parameters in their original dtypes;
-    # the thread-local compute dtype below remains the requested default.
-    fsdp_param_dtype = (
-        None
-        if fsdp_inference and getattr(model_cls, "_fsdp_mixed_dtype_params", False)
-        else default_torch_dtype
-    )
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=fsdp_param_dtype,
+    model, mp_policy = initialize_model_for_inference(
+        model_cls,
+        init_params,
+        param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         output_dtype=output_dtype,
-        cast_forward_inputs=False,
-    )
-
-    set_mixed_precision_policy(
-        param_dtype=default_torch_dtype,
-        reduce_dtype=reduce_dtype,
-        output_dtype=output_dtype,
-        mp_policy=mp_policy,
-    )
-
-    model = initialize_model(
-        model_cls, init_params, default_torch_dtype, torch.device("meta")
+        fsdp_inference=fsdp_inference,
     )
 
     # Check if we should use FSDP

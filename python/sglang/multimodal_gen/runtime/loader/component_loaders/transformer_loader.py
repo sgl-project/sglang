@@ -1,7 +1,9 @@
 import copy
 import logging
+import pickle
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -47,6 +49,48 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+@dataclass
+class ResolvedTransformerLoad:
+    """The existing loader's resolved decisions, before any model is built."""
+
+    model_cls: type[torch.nn.Module]
+    init_params: dict[str, Any]
+    weight_files: tuple[str, ...]
+    server_args: ServerArgs
+    component_name: str
+    component_starts_on_cpu: bool
+    quant_spec: TransformerQuantLoadSpec
+    weight_load_plan: WeightLoadPlan
+    checkpoint_key_filter: Callable[[str], bool] | None
+    quantized_attn_backend: AttentionBackendEnum | None
+
+    def freeze(self) -> "FrozenTransformerLoad":
+        """Snapshot a prepared recipe, independent of later argument mutation.
+
+        Only explicitly migrated pipelines opt in. Unmigrated/quantized loaders
+        need not support serializing every custom post-load hook to use the
+        ordinary path. This is process-local state, never a network payload.
+        """
+        return FrozenTransformerLoad(
+            pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+
+
+@dataclass(frozen=True)
+class FrozenTransformerLoad:
+    """Immutable local recipe; every consumer receives a fresh working copy.
+
+    Constructed by this process's resolver (or inherited by its spawned worker),
+    NOT decoded from a daemon response. Wire identity uses canonical plan fields,
+    not Python pickle bytes. Never accept this payload from an external peer.
+    """
+
+    _payload: bytes
+
+    def thaw(self) -> ResolvedTransformerLoad:
+        return pickle.loads(self._payload)
+
+
 def _resolve_checkpoint_load_device(
     runtime_device: torch.device,
     *,
@@ -69,7 +113,7 @@ def _default_quantized_attention_backend(
     quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
 ) -> AttentionBackendEnum | None:
     """Preserve stable NVFP4 numerics unless the user selected a backend."""
-    if not current_platform.is_blackwell() or not quant_spec.is_modelopt_fp4:
+    if not quant_spec.is_modelopt_fp4 or not current_platform.is_blackwell():
         return None
     if (
         get_global_forced_attn_backend() is not None
@@ -251,6 +295,26 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         cpu_offload_flag: bool = False,
     ):
         """Load the transformer based on the model path, and inference args."""
+        recipe = self.prepare_customized(
+            component_model_path, server_args, component_name, cpu_offload_flag
+        )
+        return self.materialize_customized(recipe)
+
+    def prepare_customized(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
+        *,
+        planned_device: torch.device | None = None,
+    ) -> ResolvedTransformerLoad:
+        """Resolve the ordinary loader's recipe without constructing a module.
+
+        A launcher passes planned_device so it does not consult live distributed
+        state. Existing ordinary loads retain their legacy argument updates;
+        pipeline preparation supplies its own working copy and freezes the result.
+        """
         component_server_args = _server_args_for_transformer_component(
             server_args,
             component_name,
@@ -466,7 +530,9 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 component_server_args.transformer_weights_path,
             )
 
-        local_torch_device = get_local_torch_device()
+        local_torch_device = (
+            planned_device if planned_device is not None else get_local_torch_device()
+        )
         checkpoint_load_device = (
             torch.device("cpu")
             if cpu_offload_flag
@@ -513,11 +579,31 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 "Using %s attention for ModelOpt NVFP4 to preserve output precision",
                 quantized_attn_backend.name.lower(),
             )
+        return ResolvedTransformerLoad(
+            model_cls=model_cls,
+            init_params=init_params,
+            weight_files=tuple(safetensors_list),
+            server_args=component_server_args,
+            component_name=component_name,
+            component_starts_on_cpu=component_starts_on_cpu,
+            quant_spec=quant_spec,
+            weight_load_plan=weight_load_plan,
+            checkpoint_key_filter=checkpoint_key_filter,
+            quantized_attn_backend=quantized_attn_backend,
+        )
+
+    def materialize_customized(
+        self, recipe: ResolvedTransformerLoad | FrozenTransformerLoad
+    ) -> torch.nn.Module:
+        """Consume resolved decisions; do not reopen configs or rediscover files."""
+        if isinstance(recipe, FrozenTransformerLoad):
+            recipe = recipe.thaw()
+        quant_spec = recipe.quant_spec
         attn_backend_context = (
             component_attn_backend_context_manager(
-                quantized_attn_backend, component_name=component_name
+                recipe.quantized_attn_backend, component_name=recipe.component_name
             )
-            if quantized_attn_backend is not None
+            if recipe.quantized_attn_backend is not None
             else nullcontext()
         )
 
@@ -525,20 +611,20 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         # quantization-specific default around FSDP initialization and loading.
         with attn_backend_context:
             model = self.load_state_dict_model(
-                model_cls=model_cls,
-                init_params=init_params,
-                weight_files=safetensors_list,
-                server_args=component_server_args,
-                component_name=component_name,
-                component_starts_on_cpu=component_starts_on_cpu,
+                model_cls=recipe.model_cls,
+                init_params=recipe.init_params,
+                weight_files=list(recipe.weight_files),
+                server_args=recipe.server_args,
+                component_name=recipe.component_name,
+                component_starts_on_cpu=recipe.component_starts_on_cpu,
                 dtype=quant_spec.param_dtype,
-                weight_load_plan=weight_load_plan,
-                checkpoint_key_filter=checkpoint_key_filter,
+                weight_load_plan=recipe.weight_load_plan,
+                checkpoint_key_filter=recipe.checkpoint_key_filter,
                 weights_iterator=(
                     gguf_weights_iterator(
                         quant_spec.gguf_file,
                         quant_spec.quant_config.tensor_meta,
-                        key_filter=checkpoint_key_filter,
+                        key_filter=recipe.checkpoint_key_filter,
                     )
                     if quant_spec.gguf_file is not None
                     else None
