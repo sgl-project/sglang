@@ -452,7 +452,6 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
         ({"text_encoder_cpu_offload": True}, "text encoder CPU offload"),
         ({"image_encoder_cpu_offload": True}, "image encoder CPU offload"),
         ({"vae_cpu_offload": True}, "VAE CPU offload"),
-        ({"dit_layerwise_offload": True}, "DiT layerwise offload"),
         ({"layerwise_offload_components": ["transformer"]}, "layerwise offload"),
         ({"quantization": "fp8"}, "quantization"),
         ({"quantization_ignored_layers": ["foo"]}, "quantization ignored layers"),

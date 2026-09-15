@@ -121,7 +121,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             "text_encoder_cpu_offload": "text encoder CPU offload",
             "image_encoder_cpu_offload": "image encoder CPU offload",
             "vae_cpu_offload": "VAE CPU offload",
-            "dit_layerwise_offload": "DiT layerwise offload",
             "layerwise_offload_components": "layerwise offload",
             "quantization": "quantization",
             "quantization_ignored_layers": "quantization ignored layers",
