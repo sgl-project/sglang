@@ -2516,9 +2516,8 @@ def _run_granian_server(
 
     if tokenizer_worker_num == 1:
         if tokenizer_manager is not None:
-            # Same handoff as the uvicorn path: the signal handler wired below
-            # is replaced once auto_create_handle_loop runs, so shutdown has to
-            # reach the server through the hook instead.
+            # auto_create_handle_loop replaces the signal handler wired below,
+            # so shutdown can only reach this server through the hook.
             tokenizer_manager.set_server_stop_hook(server.stop)
 
         async def serve():
@@ -2711,9 +2710,8 @@ def _setup_and_run_http_server(
                 )
                 server.run()
         else:
-            # Multiple tokenizer and http processes. No stop hook here: the app
-            # is re-imported in child processes, so this manager is not the one
-            # serving and has nothing to ask.
+            # Multiple tokenizer and http processes.
+            # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
