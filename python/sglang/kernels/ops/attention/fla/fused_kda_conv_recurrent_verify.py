@@ -12,17 +12,21 @@ two transpose copies the unfused path needs to feed the conv kernel.
 
 Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
-kernels. Requires ``T >= kernel_width - 1``.
+kernels. Requires ``T >= kernel_width - 1`` (the rolled conv state is then
+exactly the last ``kernel_width - 1`` input tokens, matching the reference
+kernel's store).
 
-State: conv_state and the SSM state are read-only. Verify is speculative, and
-the commit scatter advances them from the selected intermediate window.
+ReplaySSM (``cache_ring``): instead of per-step [HV, V, K] fp32 state
+snapshots, stash each step's raw inputs (pre-l2norm k, pre-delta v, gate,
+beta) into the per-slot rings the commit-time exact fold replays
+(kda_replayssm_spec_decode.py) -- same CACHE_RING contract as the unfused
+fused_sigmoid_gating_delta_rule_update, so the two paths fill identical rings.
 
 Numerics: aligned with the unfused pair. The conv output is rounded to the
 activation dtype (bf16) before entering the recurrence — exactly what the
 unfused path does through its intermediate tensor — and all expressions mirror
 the reference kernels line by line. Reduction order still splits differently
-when the tuned launch uses multiple warps, worth about one bf16 ulp on the
-output relative to the one-warp reference.
+where many V heads share one Q/K head, worth ~1 ulp on the output.
 """
 
 from typing import Optional
@@ -37,8 +41,6 @@ from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
 # numerics-safe at num_warps=4 (bit-exact vs the BV=32 original).
 KDA_VERIFY_BLOCK_V = 4
-# gfx950, GLM TP4/T=6 or 8 with fp32 conv weights: larger batches benefit from
-# sharing q/k convolution across more V lanes. B <= 2 still prefers BV=4.
 KDA_VERIFY_BLOCK_V_HIP = 16
 
 
@@ -105,8 +107,20 @@ def fused_kda_conv_gating_verify_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     SAVE_INTERMEDIATE_WINDOW: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
-    ROUND_CONV_PRODUCTS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    ROUND_CONV_PRODUCTS: tl.constexpr = False,
+    # ReplaySSM fused ring-write (spec verify): per-slot rings consumed by the
+    # commit-time exact fold (kda_replayssm_spec_decode.py). Off -> dead code.
+    replayssm_rawv=None,  # [slots, HV, L, V] activation dtype
+    replayssm_rawk=None,  # [slots, H,  L, K] activation dtype
+    replayssm_g=None,  # [slots, HV, L, K] fp32
+    replayssm_beta=None,  # [slots, HV, L]    fp32
+    stride_rawv_slot: tl.constexpr = 0,
+    stride_rawk_slot: tl.constexpr = 0,
+    stride_g_slot: tl.constexpr = 0,
+    stride_beta_slot: tl.constexpr = 0,
+    MAX_CACHE_LEN: tl.constexpr = 0,
+    CACHE_RING: tl.constexpr = False,
 ):
     # PDL: overlap prologue with the tail of the producer qkv-projection GEMM;
     # every global load (conv_state_indices, mixed_qkv, weights) happens after
@@ -313,6 +327,53 @@ def fused_kda_conv_gating_verify_kernel(
 
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
+        # ReplaySSM ring-write. Must sit here: b_k still pre-l2norm, b_v still
+        # pre-delta, b_g/b_beta formed -- so the commit fold's replay is
+        # bit-identical to the update below (mirrors the CACHE_RING block in
+        # fused_sigmoid_gating_recurrent.py). rawk dedups via is_qk_owner
+        # (per k-head); g/beta write once per v-head at i_v == 0. The
+        # t < MAX_CACHE_LEN guard drops absorb-overflow steps instead of
+        # smashing the next slot's ring.
+        if CACHE_RING:
+            if h0_idx >= 0 and t < MAX_CACHE_LEN:
+                ring_slot = h0_idx.to(tl.int64)
+                tl.store(
+                    replayssm_rawv
+                    + ring_slot * stride_rawv_slot
+                    + i_hv * MAX_CACHE_LEN * V
+                    + t * V
+                    + o_v,
+                    b_v.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if is_qk_owner:
+                    tl.store(
+                        replayssm_rawk
+                        + ring_slot * stride_rawk_slot
+                        + i_h * MAX_CACHE_LEN * K
+                        + t * K
+                        + o_k,
+                        b_k.to(replayssm_rawk.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                if i_v == 0:
+                    tl.store(
+                        replayssm_g
+                        + ring_slot * stride_g_slot
+                        + i_hv * MAX_CACHE_LEN * K
+                        + t * K
+                        + o_k,
+                        b_g,
+                        mask=mask_k,
+                    )
+                    tl.store(
+                        replayssm_beta
+                        + ring_slot * stride_beta_slot
+                        + i_hv * MAX_CACHE_LEN
+                        + t,
+                        b_beta,
+                    )
+
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
             b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
@@ -342,8 +403,19 @@ def fused_kda_conv_gating_verify_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
-    # No conv-state writeback: every V tile reads the same Q/K history, so a
-    # tile in a later wave would read what i_v == 0 had overwritten.
+    # Rolled conv state after consuming T >= W-1 tokens is exactly the last
+    # W-1 input tokens — which are the current window registers. The verify
+    # pass never writes the ssm state back (rollback happens at commit).
+    if is_qk_owner:
+        tl.store(cs_base + q_ch + 0 * stride_cs_tok, q_c0, mask=mask_k)
+        tl.store(cs_base + q_ch + 1 * stride_cs_tok, q_c1, mask=mask_k)
+        tl.store(cs_base + q_ch + 2 * stride_cs_tok, q_c2, mask=mask_k)
+        tl.store(cs_base + k_ch + 0 * stride_cs_tok, k_c0, mask=mask_k)
+        tl.store(cs_base + k_ch + 1 * stride_cs_tok, k_c1, mask=mask_k)
+        tl.store(cs_base + k_ch + 2 * stride_cs_tok, k_c2, mask=mask_k)
+    tl.store(cs_base + v_ch + 0 * stride_cs_tok, v_c0, mask=mask_v)
+    tl.store(cs_base + v_ch + 1 * stride_cs_tok, v_c1, mask=mask_v)
+    tl.store(cs_base + v_ch + 2 * stride_cs_tok, v_c2, mask=mask_v)
 
 
 def fused_kda_conv_gating_verify(
@@ -371,9 +443,23 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # CUDA retains the B200-tuned four-warp default. ROCm uses one wave to
-    # preserve the reference reduction order at the GLM verification shapes.
+    # num_warps=4 is ~1.3x faster than the unfused pair in-graph; conv_state
+    # and the conv-window cache stay bit-identical to the reference, the bf16
+    # output within one ulp (the BV=4 tile reduces K in a different order).
+    # The fp32 intermediate-ssm rollback cache carries that ~1 ulp/step delta
+    # through the delta-rule recurrence — measured ~6e-8 at T=4 standard gate
+    # (the production MTP shape), ~1.5e-5 at T=4 safe gate, ~2e-3 at T=8 safe
+    # gate. num_warps=1 is ~2.4x slower in-graph — numerics debugging only.
+    # The ReplaySSM ring values are bit-exact at any num_warps: they are
+    # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
     num_warps: Optional[int] = None,
+    # ReplaySSM fused ring-write; same parameter names as the unfused
+    # fused_sigmoid_gating_delta_rule_update so ring_kwargs pass through both.
+    cache_ring: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Chain-verify fast path. Returns ``o`` of shape [1, seq_len, HV, V],
     matching the unfused ``target_verify`` output layout."""
@@ -441,6 +527,37 @@ def fused_kda_conv_gating_verify(
     if intermediate_states_buffer is not None:
         assert intermediate_states_buffer.is_contiguous()
 
+    if cache_ring:
+        # Per-layer ring views (memory_pool.py KDA spec rings). The kernel uses
+        # stride(0) as the slot pitch and packs within a slot from
+        # MAX_CACHE_LEN and the head/dim extents, so inner dims must be packed.
+        assert (
+            replayssm_rawv is not None
+            and replayssm_rawk is not None
+            and replayssm_g is not None
+            and replayssm_beta is not None
+        ), "cache_ring requires all four replayssm_* rings"
+        max_cache_len = replayssm_rawv.shape[-2]
+        assert tuple(replayssm_rawv.shape[1:]) == (HV, max_cache_len, V)
+        assert tuple(replayssm_rawk.shape[1:]) == (H, max_cache_len, K)
+        assert tuple(replayssm_g.shape[1:]) == (HV, max_cache_len, K)
+        assert tuple(replayssm_beta.shape[1:]) == (HV, max_cache_len)
+        assert replayssm_rawv.stride()[1:] == (max_cache_len * V, V, 1)
+        assert replayssm_rawk.stride()[1:] == (max_cache_len * K, K, 1)
+        assert replayssm_g.stride()[1:] == (max_cache_len * K, K, 1)
+        assert replayssm_beta.stride()[1:] == (max_cache_len, 1)
+        assert replayssm_rawv.dtype == mixed_qkv.dtype
+        assert replayssm_rawk.dtype == mixed_qkv.dtype
+        assert replayssm_g.dtype == torch.float32
+        assert replayssm_beta.dtype == torch.float32
+        stride_rawv_slot = replayssm_rawv.stride(0)
+        stride_rawk_slot = replayssm_rawk.stride(0)
+        stride_g_slot = replayssm_g.stride(0)
+        stride_beta_slot = replayssm_beta.stride(0)
+    else:
+        max_cache_len = 0
+        stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
+
     grid = (NV, B * HV)
     # PDL (sm90+): chain behind the producer qkv-projection GEMM and signal the
     # downstream o_norm / o_proj. Scheduling only — bit-exactness unaffected.
@@ -501,6 +618,16 @@ def fused_kda_conv_gating_verify(
         USE_LOWER_BOUND=lower_bound is not None,
         SAVE_INTERMEDIATE_WINDOW=intermediate_conv_window is not None,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        MAX_CACHE_LEN=max_cache_len,
+        CACHE_RING=cache_ring,
         ROUND_CONV_PRODUCTS=is_hip_runtime() and conv_weight.dtype == torch.float32,
         # num_warps=1 matches the reference kernels' reduction order exactly;
         # higher values must be re-validated for bit-exactness before use.

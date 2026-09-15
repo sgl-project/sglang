@@ -1672,10 +1672,12 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(len(m.device_indices), prompt_aligned)
         if self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer:
-            node = cache.resolve_node_handle(m.last_device_node)
+            node_value = cache.tree_core.get_component_device_value(
+                m.last_device_node, ComponentType.MAMBA
+            )
             self.assertTrue(
                 torch.equal(
-                    node.component_data[ComponentType.MAMBA].value.reshape(-1),
+                    node_value.reshape(-1),
                     prompt_slot.reshape(-1),
                 )
             )
@@ -7863,10 +7865,12 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                 )
                 self.assertEqual(len(match.device_indices), expected_len)
                 if expected_len:
-                    node = cache.resolve_node_handle(match.last_device_node)
+                    node_value = cache.tree_core.get_component_device_value(
+                        match.last_device_node, ComponentType.MAMBA
+                    )
                     self.assertTrue(
                         torch.equal(
-                            node.component_data[ComponentType.MAMBA].value.reshape(-1),
+                            node_value.reshape(-1),
                             previous_slot.reshape(-1),
                         )
                     )

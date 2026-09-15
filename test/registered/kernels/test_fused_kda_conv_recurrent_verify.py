@@ -35,6 +35,35 @@ _CASES = [
     (16, 8, 16, 16, 128, 128, 4, False, -5.0, True, 10),
 ]
 
+# ReplaySSM ring-write cases: _CASES plus HV != H shapes, which exercise the
+# per-k-head rawk vs per-v-head g/beta writer split (the GQA hazard: a wrong
+# head index scribbles another head's ring silently).
+_RING_CASES = _CASES + [
+    (2, 4, 2, 4, 128, 128, 4, True, None, False, 20),
+    (1, 5, 2, 8, 64, 64, 4, True, 1.5, False, 21),
+    (3, 4, 4, 8, 128, 128, 4, True, None, True, 22),
+]
+
+# Power of two >= 2 * max draft T in _RING_CASES, matching the pool invariant
+# (memory_pool.py: ring length must be a power of two >= 2 * draft tokens).
+_RING_LEN = 16
+
+
+def _make_ring_buffers(H, HV, K, V):
+    # Garbage-filled so a full-tensor bitwise compare proves both that written
+    # positions match and that neither kernel scribbles outside them.
+    slots = 8
+    return {
+        "rawv": torch.randn(
+            slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
+        ),
+        "rawk": torch.randn(
+            slots, H, _RING_LEN, K, device=_DEVICE, dtype=torch.bfloat16
+        ),
+        "g": torch.randn(slots, HV, _RING_LEN, K, device=_DEVICE, dtype=torch.float32),
+        "beta": torch.randn(slots, HV, _RING_LEN, device=_DEVICE, dtype=torch.float32),
+    }
+
 
 def _assert_output_matches_reference(actual, reference):
     # The tuned multi-warp fused reduction can cross a BF16 rounding boundary
@@ -97,13 +126,13 @@ def _make_inputs(
     return inputs
 
 
-def _run_reference(inp, B, T, H, HV, K, V, lower_bound):
+def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
     dim = 2 * H * K + HV * V
     seq_len = B * T
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
-    ic = inp["inter_ssm"].clone()
+    ic = inp["inter_ssm"].clone() if rings is None else None
 
     x3 = inp["mixed"].reshape(B, T, dim).transpose(1, 2)
     out3 = causal_conv1d_update(
@@ -138,20 +167,27 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound):
         cu_seqlens=cu,
         is_kda=True,
         disable_state_update=True,
+        # ReplaySSM mode (rings set) drops the per-step snapshots, exactly as
+        # the production GDN/KDA backends pass None + cache_ring.
         intermediate_states_buffer=ic,
-        intermediate_state_indices=inp["inter_indices"],
+        intermediate_state_indices=inp["inter_indices"] if rings is None else None,
         cache_steps=T,
         retrieve_parent_token=None,
         lower_bound=lower_bound,
+        cache_ring=rings is not None,
+        replayssm_rawv=rings["rawv"] if rings is not None else None,
+        replayssm_rawk=rings["rawk"] if rings is not None else None,
+        replayssm_g=rings["g"] if rings is not None else None,
+        replayssm_beta=rings["beta"] if rings is not None else None,
     )
     return o, conv, win, ic
 
 
-def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps):
+def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
-    ic = inp["inter_ssm"].clone()
+    ic = inp["inter_ssm"].clone() if rings is None else None
 
     o = fused_kda_conv_gating_verify(
         mixed_qkv=inp["mixed"],
@@ -176,37 +212,56 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps):
         head_v_dim=V,
         lower_bound=lower_bound,
         **({"num_warps": num_warps} if num_warps is not None else {}),
+        cache_ring=rings is not None,
+        replayssm_rawv=rings["rawv"] if rings is not None else None,
+        replayssm_rawk=rings["rawk"] if rings is not None else None,
+        replayssm_g=rings["g"] if rings is not None else None,
+        replayssm_beta=rings["beta"] if rings is not None else None,
     )
     return o, conv, win, ic
 
 
-def _compare_case(case, num_warps=None, weight_dtype=torch.bfloat16):
+def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloat16):
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
     inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
+    if use_ring:
+        template = _make_ring_buffers(H, HV, K, V)
+        rings_ref = {name: buf.clone() for name, buf in template.items()}
+        rings_fus = {name: buf.clone() for name, buf in template.items()}
+    else:
+        rings_ref = rings_fus = None
     o_ref, conv_ref, win_ref, ic_ref = _run_reference(
-        inp, B, T, H, HV, K, V, lower_bound
+        inp, B, T, H, HV, K, V, lower_bound, rings=rings_ref
     )
     o_fus, conv_fus, win_fus, ic_fus = _run_fused(
-        inp, B, T, H, HV, K, V, lower_bound, num_warps
+        inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=rings_fus
     )
 
     idx_vals = inp["idx_vals"]
     valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
+    touched_slots = [slot for slot in idx_vals if slot >= 0]
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
     _assert_output_matches_reference(o_fus_v, o_ref_v)
-    # conv_state is read-only in verify; the commit scatter advances it.
-    assert torch.equal(inp["conv_pool"], conv_fus)
+    assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
-    torch.testing.assert_close(
-        ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
-    )
+    if use_ring:
+        # Full-tensor bitwise: ring values are elementwise (conv FMA chain,
+        # gate, sigmoid), upstream of every tl.sum, so they are exact at any
+        # num_warps; the shared garbage init makes any out-of-slot or
+        # negative-slot scribble a mismatch.
+        for name in ("rawv", "rawk", "g", "beta"):
+            assert torch.equal(rings_ref[name], rings_fus[name]), name
+    else:
+        torch.testing.assert_close(
+            ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
+        )
 
 
 @pytest.mark.parametrize("case", _CASES)
 def test_matches_unfused_reference(case):
-    _compare_case(case)
+    _compare_case(case, num_warps=4)
 
 
 @pytest.mark.parametrize("case_index", [8, 9])
@@ -239,7 +294,7 @@ def test_glm_fp32_weights_match_under_graph_replay(case_index):
         actual[0].reshape(B, T, HV, V)[valid],
         expected[0].reshape(B, T, HV, V)[valid],
     )
-    assert torch.equal(inp["conv_pool"], actual[1])
+    assert torch.equal(expected[1][valid], actual[1][valid])
     assert torch.equal(expected[2][valid], actual[2][valid])
     torch.testing.assert_close(expected[3][valid], actual[3][valid], atol=4e-3, rtol=0)
 
@@ -264,6 +319,11 @@ def test_output_does_not_depend_on_cta_scheduling():
         squeezed = _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps=4)[0]
     streams[0].synchronize()
     assert torch.equal(full, squeezed)
+
+
+@pytest.mark.parametrize("case", _RING_CASES)
+def test_replayssm_ring_matches_unfused(case):
+    _compare_case(case, num_warps=4, use_ring=True)
 
 
 if __name__ == "__main__":
