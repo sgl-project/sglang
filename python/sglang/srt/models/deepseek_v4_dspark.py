@@ -665,12 +665,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hf_config, quant_config
         )
 
-    @classmethod
-    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config, quant_config
-        )
-
     def __init__(
         self,
         config: DeepSeekV4Config,
