@@ -218,6 +218,35 @@ def test_ue8m0_row_packed_bitexact(hidden):
 
 
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("num_tokens,hidden", [(1, 128), (7, 384), (33, 4096)])
+def test_ue8m0_fp32_scale(dtype, num_tokens, hidden):
+    """FP8 einsum's UE8M0 conversion needs power-of-two values in FP32 storage."""
+    x = torch.linspace(-1, 1, hidden, device="cuda").repeat(num_tokens, 1).to(dtype)
+    if num_tokens > 1:
+        x[0].zero_()
+    raw_scale = _group_amax(x, G) / FMAX
+    assert (raw_scale.view(torch.int32) & 0x7FFFFF).ne(0).any()
+
+    x_q = torch.empty_like(x, dtype=fp8_dtype)
+    x_s = torch.empty(num_tokens, hidden // G, device=x.device, dtype=torch.float32)
+    per_token_group_quant(x, x_q, x_s, G, scale_ue8m0=True)
+
+    assert x_s.dtype == torch.float32
+    assert x_s.shape == (num_tokens, hidden // G)
+    assert x_s.stride() == (hidden // G, 1)
+    assert torch.isfinite(x_s).all() and (x_s > 0).all()
+    # The amax floor makes these positive NORMAL FP32 values, so zero
+    # mantissa bits are equivalent to exact powers of two (exclude 0/inf/NaN).
+    assert (x_s >= torch.finfo(torch.float32).tiny).all()
+    assert (x_s.view(torch.int32) & 0x7FFFFF).eq(0).all()
+    expected_scale = torch.exp2(torch.ceil(torch.log2(raw_scale)))
+    torch.testing.assert_close(x_s, expected_scale, rtol=0, atol=0)
+    q_ref, _ = ref_fp8_ue8m0(x, G)
+    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8))
+    assert _dequant_rel_err(x_q, x_s, x, G) < 0.04
+
+
 # fp32 / int8 scale paths: exact stored scale + dequant round-trip (the codes
 # are not bit-reproducible under fast-math division).
 # --------------------------------------------------------------------------- #
