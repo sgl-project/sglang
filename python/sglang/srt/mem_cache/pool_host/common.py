@@ -265,8 +265,7 @@ def _resolve_device_accessible_ptr_fn():
             get_device_accessible_ptr = None
 
     if get_device_accessible_ptr is None:
-        # HIP maps registered host memory at a device address distinct from the
-        # host one, so there is no valid fallback; CUDA's UVA makes the two equal.
+        # CUDA's UVA makes host and device addresses equal; on HIP they differ.
         if _is_hip:
             raise ImportError(
                 "sgl_kernel.kvcacheio.get_device_accessible_ptr is missing from the "

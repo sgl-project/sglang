@@ -280,8 +280,8 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
 def test_registered_mmap_kernel_ptr_table_fallback_matches_device_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``make_kernel_ptr_table``'s raw-host-address fallback is sound only while
-    CUDA maps registered host memory at the host address itself."""
+    """CUDA maps registered host memory at the host address itself;
+    ``make_kernel_ptr_table``'s raw-host-address fallback depends on it."""
     if _resolve_device_accessible_ptr_fn() is None:
         pytest.skip(
             "installed sglang-kernel has no get_device_accessible_ptr; "
