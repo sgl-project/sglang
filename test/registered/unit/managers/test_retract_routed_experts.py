@@ -131,7 +131,7 @@ class TestRetractRoutedExperts(CustomTestCase):
                 decoded = extract_routed_experts_from_meta_info(
                     {"meta_info": {"routed_experts": encoded}}
                 ).reshape(expected.shape)
-                torch.testing.assert_close(torch.from_numpy(decoded), expected)
+                torch.testing.assert_close(torch.from_numpy(decoded.copy()), expected)
 
     def test_pause_retract_preserves_the_drained_overlap_result(self) -> None:
         req = self._req()
