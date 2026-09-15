@@ -228,25 +228,6 @@ def _update_gather_batch(
     require_mlp_tp_gather: bool,
     skip_global_metadata=False,
 ):
-    # TODO: handle the case when moe_dense_tp_size != 1
-    batch.mega_moe_global_num_tokens = list(
-        mlp_sync_info.global_num_tokens
-        if mlp_sync_info.global_num_tokens is not None
-        else [mlp_sync_info.num_tokens]
-    )
-    if mlp_sync_info.tp0_info_cpu is not None:
-        global_modes = mlp_sync_info.tp0_info_cpu[:, 5].tolist()
-        if mlp_sync_info.is_extend_in_batch:
-            sync_candidates = [
-                tokens
-                for tokens, mode in zip(batch.mega_moe_global_num_tokens, global_modes)
-                if ForwardMode(mode).is_extend()
-            ]
-        else:
-            sync_candidates = batch.mega_moe_global_num_tokens
-        batch.mega_moe_sync_tokens = max(sync_candidates, default=0)
-    else:
-        batch.mega_moe_sync_tokens = mlp_sync_info.num_tokens
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]

@@ -25,7 +25,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
-    get_server_args,
 )
 
 if TYPE_CHECKING:
@@ -50,7 +49,6 @@ class EPLBManager:
         # constructed (model load, expert_backup_client, weight_updater), so
         # they are read through getters at rebalance time, not captured here.
         self._model_config = model_config
-        self._server_args = get_server_args()
         self._ps = ps
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
@@ -83,7 +81,7 @@ class EPLBManager:
     def on_forward_pass_end(self, forward_batch=None):
         if (
             forward_batch is not None
-            and megamoe_prefill_only_recorder_enabled(self._server_args)
+            and megamoe_prefill_only_recorder_enabled()
             and not forward_batch.is_extend_in_batch
         ):
             return

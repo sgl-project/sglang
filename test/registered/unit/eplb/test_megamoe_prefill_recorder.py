@@ -28,8 +28,11 @@ def _batch(mode: ForwardMode, *, extend_tokens: int = 0, any_prefill: bool = Fal
 
 class TestMegaMoEPrefillRecorder(unittest.TestCase):
     def setUp(self):
-        self.server_args = SimpleNamespace(moe_a2a_backend="megamoe")
         self.env_patches = (
+            patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_megamoe=lambda: True),
+            ),
             patch(
                 "sglang.srt.eplb.expert_distribution.envs."
                 "SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get",
@@ -64,7 +67,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         for batch, expected in cases:
             with self.subTest(mode=batch.forward_mode, extend=batch.extend_num_tokens):
                 self.assertEqual(
-                    should_record_megamoe_prefill_pass(batch, self.server_args),
+                    should_record_megamoe_prefill_pass(batch),
                     expected,
                 )
 
@@ -74,9 +77,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             "sglang.srt.eplb.expert_distribution._is_model_capture_mode",
             return_value=True,
         ):
-            self.assertFalse(
-                should_record_megamoe_prefill_pass(batch, self.server_args)
-            )
+            self.assertFalse(should_record_megamoe_prefill_pass(batch))
 
     def test_gate_off_preserves_legacy_decode_recording(self):
         with patch(
@@ -85,9 +86,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             return_value=False,
         ):
             self.assertTrue(
-                should_record_megamoe_prefill_pass(
-                    _batch(ForwardMode.DECODE), self.server_args
-                )
+                should_record_megamoe_prefill_pass(_batch(ForwardMode.DECODE))
             )
 
     def test_recorder_skips_decode_and_commits_prefill(self):
@@ -103,7 +102,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
 
     def test_eplb_counter_advances_only_on_global_prefill(self):
         manager = EPLBManager.__new__(EPLBManager)
-        manager._server_args = self.server_args
         advances = []
 
         def generator():
@@ -155,7 +153,6 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         gatherer.collect.return_value = {"global_physical_count": torch.zeros(1)}
         accumulator = Mock()
         accumulator.get_single_pass_gatherer_key.return_value = "primary"
-        recorder._server_args = self.server_args
         recorder._recording = True
         recorder._disable_all = False
         recorder._record_current_pass = False

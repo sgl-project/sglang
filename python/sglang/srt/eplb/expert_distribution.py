@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
-    get_server_args,
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
@@ -57,23 +56,26 @@ from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
-def megamoe_prefill_only_recorder_enabled(server_args: ServerArgs) -> bool:
+def megamoe_prefill_only_recorder_enabled() -> bool:
+    # Read the backend through the resolved accessor, not off a supplied
+    # ServerArgs: test_supplied_instance_exposure_ratchet pins (file, field)
+    # pairs where a `server_args` parameter is read for a field that resolution
+    # fills in, and that surface may only shrink.
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
     return (
         envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
         and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
-        and server_args.moe_a2a_backend == "megamoe"
+        and get_moe_a2a_backend().is_megamoe()
     )
 
 
-def should_record_megamoe_prefill_pass(
-    forward_batch: ForwardBatch, server_args: ServerArgs
-) -> bool:
-    if not megamoe_prefill_only_recorder_enabled(server_args):
+def should_record_megamoe_prefill_pass(forward_batch: ForwardBatch) -> bool:
+    if not megamoe_prefill_only_recorder_enabled():
         return True
     if _is_model_capture_mode():
         return False
@@ -203,7 +205,6 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._server_args = get_server_args()
         self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
@@ -247,9 +248,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._recording:
             self._record_current_pass = False
             return
-        self._record_current_pass = should_record_megamoe_prefill_pass(
-            forward_batch, self._server_args
-        )
+        self._record_current_pass = should_record_megamoe_prefill_pass(forward_batch)
         if not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
@@ -302,10 +301,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if (
-            megamoe_prefill_only_recorder_enabled(self._server_args)
-            and not self._record_current_pass
-        ):
+        if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
             return
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
