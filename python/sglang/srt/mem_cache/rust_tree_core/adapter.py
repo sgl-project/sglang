@@ -12,8 +12,6 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -84,19 +82,15 @@ def _kv_event_from_tagged(event: tuple):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
-        event_args = dict(
+        return BlockStored(
             block_hashes=event[1],
             parent_block_hash=event[2],
             token_ids=event[3],
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
-        )
-        if event[6] is None:
-            return BlockStored(**event_args)
-        return BlockStoredWithMetadata(
-            **event_args,
-            metadata=BlockStoredMetadata(cache_salt=event[6]),
+            cache_salt=event[6],
+            session_id=event[7],
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -228,6 +222,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             prefix_len=step.result.prefix_len,
             last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
+            swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
             adopted_ranges=(
                 {
@@ -252,6 +247,7 @@ def _match_result_from_binding(result) -> MatchResult:
         best_match_node=result.best_match_node_id,
         host_hit_length=result.host_hit_length,
         swa_host_hit_length=result.swa_host_hit_length,
+        swa_branching_seqlen=result.swa_branching_seqlen,
         mamba_host_hit_length=result.mamba_host_hit_length,
         mamba_branching_seqlen=result.mamba_branching_seqlen,
         full_kv_hit_length=result.full_kv_hit_length,
@@ -586,9 +582,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
+                swa_branching_seqlen=params.swa_branching_seqlen,
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
@@ -629,6 +627,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
+
+    def set_host_memory_buffer_only(self) -> None:
+        self._binding.set_host_memory_buffer_only()
+
+    @property
+    def is_host_memory_buffer_only(self) -> bool:
+        return self._binding.is_host_memory_buffer_only()
 
     @property
     def page_size(self) -> int:
