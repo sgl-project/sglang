@@ -7,7 +7,7 @@ so each variant carries only the fields it actually uses.
 """
 
 import uuid
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Annotated, Any, List, Literal, Optional, Union
 
 from pydantic import (
     BaseModel,
@@ -377,6 +377,13 @@ class AnthropicMessagesRequest(BaseModel):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+
+    # SGLang internal fields for PD disaggregation.
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
 
     @field_validator("model")
     @classmethod
