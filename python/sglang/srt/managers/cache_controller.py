@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
+    _get_host_id,
     get_thread_caller_info,
     trace_set_thread_info,
 )
@@ -53,6 +55,51 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+# --- per-op synthetic trace ids for backup when hicache tracing is off --------
+# With hicache tracing off, a backup op carries no request_id (backup is
+# per-node), so Mooncake would otherwise derive every op's trace_id from the
+# same caller_id/caller_role -- one constant trace_id per backup thread. We
+# instead synthesize a per-op 32-hex TraceId / 16-hex SpanId from the op counter
+# + current ns + host/pid salt, so each backup op gets its own trace on the
+# Mooncake side (rc.batch_put). counter alone is unsafe (resets per process),
+# so we mix in time_ns + host + pid. Prefetch is unchanged: it carries a
+# per-request request_id, which Mooncake already derives a per-request trace_id
+# from.
+_HOST_SALT: Optional[int] = None
+
+
+def _host_salt() -> int:
+    """Low-16-bit stable per-host salt (from _get_host_id) for cross-host
+    uniqueness of synthesized backup trace ids."""
+    global _HOST_SALT
+    if _HOST_SALT is None:
+        host_id = _get_host_id()
+        _HOST_SALT = abs(hash(host_id)) & 0xFFFF if host_id else 0
+    return _HOST_SALT
+
+
+def _synth_backup_trace_id(op_id: int) -> str:
+    """Synthesize a per-backup-op OTel TraceId: 32 lowercase hex (16 bytes),
+    non-zero. high 8 bytes = ns timestamp (time-of-op); low 8 bytes =
+    host/pid/op-id mix so concurrent ops and cross-process/cross-host backups
+    never collide."""
+    ts = time.time_ns()
+    low = (_host_salt() << 48) ^ (os.getpid() << 16) ^ (int(op_id) & 0xFFFF)
+    raw = ts.to_bytes(8, "big") + (low & (2**64 - 1)).to_bytes(8, "big")
+    # time.time_ns() is non-zero in practice -> raw is never all-zero.
+    return raw.hex()
+
+
+def _synth_backup_span_id(op_id: int) -> str:
+    """Synthesize a per-backup-op OTel SpanId: 16 lowercase hex (8 bytes),
+    non-zero, using a different mixing seed than the trace id."""
+    h = (
+        (int(op_id) * 0x9E3779B97F4A7C15) ^ (os.getpid() << 8) ^ _host_salt()
+    ) & (2**64 - 1)
+    if h == 0:
+        h = 1
+    return h.to_bytes(8, "big").hex()
 
 device_module = get_device_module()
 
@@ -1009,10 +1056,11 @@ class HiCacheController:
           the rank's thread span instead of directly under the root (plan.md
           scenario 2). The thread span belongs to the op's owning storage
           thread (init moved to the storage thread, see commit a0785d3).
-        * otherwise (tracing off / 'hicache' not in modules) -> TraceNullContext +
-          None ids; Mooncake still correlates by deriving a stable *virtual*
-          root from the per-thread caller_id/caller_role it receives via
-          request_context (plan.md scenario 1).
+        * otherwise (tracing off / 'hicache' not in modules) -> TraceNullContext.
+          Prefetch keeps None ids: Mooncake derives a per-request trace_id from
+          its request_id. Backup instead synthesizes a per-op trace_id/span_id
+          from the op counter + ns + host/pid, so its Mooncake spans get a
+          distinct trace_id per op instead of one constant per backup thread.
 
         See plan.md §3-§6. ``parent_span_id`` is intentionally not extracted:
         the forwarded ``span_id`` (the thread span) is what Mooncake uses as
@@ -1035,6 +1083,15 @@ class HiCacheController:
             span_id = format(span_context.span_id, "016x")
         else:
             trace_ctx = TraceNullContext()
+            # With tracing off, backup ops would otherwise all collapse to one
+            # caller-derived (constant) trace_id per backup thread; synthesize a
+            # per-op trace_id/span_id instead so each backup op gets its own
+            # trace on the Mooncake side. (Prefetch stays None: it carries a
+            # per-request request_id Mooncake already derives a per-request
+            # trace_id from.)
+            if role == "Backup":
+                trace_id = _synth_backup_trace_id(rid)
+                span_id = _synth_backup_span_id(rid)
         operation.trace_ctx = trace_ctx
         operation.trace_id = trace_id
         operation.span_id = span_id
