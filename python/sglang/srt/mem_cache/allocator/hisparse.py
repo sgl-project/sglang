@@ -346,6 +346,31 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        # Delegated like the read-path translate above: this composite is not a
+        # SWA allocator itself, so it inherits neither the default nor an
+        # override, and the PD payload path calls this on whatever allocator
+        # the scheduler holds.
+        return self.logical_attn_allocator.translate_swa_indices_for_transfer(
+            kv_indices
+        )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        # Use this wrapper's capacity, which also includes the compressed pool.
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
