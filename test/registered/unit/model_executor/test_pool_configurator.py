@@ -1126,6 +1126,9 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.swa_prefix_tails = 0
         cfg.request_window_bytes = 0
         cfg.bytes_per_swa_token = 0.0
+        cfg._unified_fp8 = False
+        # object.__new__ skips __init__; bf16 unified row is 2B * latent
+        cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
 
     # Token pool plus the three request-scoped fixed pools, sized from the

@@ -51,6 +51,7 @@ def _jit_compress_norm_rope_module(
     page_size: int,
     bf16_store: bool,
     layout: KVLayout,
+    fp8_2buff: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -66,6 +67,13 @@ def _jit_compress_norm_rope_module(
     if head_dim == 128:
         cuda_wrappers.append(
             ("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4")
+        )
+    # elif because forward_fp8_2buff cannot even instantiate at head_dim 128 -- the kernel
+    # static_asserts the two-pool store is latent-only. The default latent arm skips it as
+    # well, so it doesn't carry a symbol nothing calls.
+    elif fp8_2buff:
+        cuda_wrappers.append(
+            ("forward_fp8_2buff", f"FusedNormRopeKernel<{args}>::forward_fp8_2buff")
         )
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
@@ -453,6 +461,8 @@ def compress_norm_rope_store(
     # Page layout of a FlashMLA (head_dim 512) main-KV cache: the 584-byte V4
     # layout, or the V4.1 fp8 / fp4 formats (CUDA only).
     layout: Union[KVLayout, str] = KVLayout.V4,
+    fp8_2buff: bool = False,
+    kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     layout = KVLayout.parse(layout)
     if layout is not KVLayout.V4:
@@ -482,6 +492,12 @@ def compress_norm_rope_store(
         )
         return
 
+    if fp8_2buff:
+        assert not (use_fp4 or bf16_store), "fp8 two-pool store is its own layout"
+        assert layout is KVLayout.V4, "fp8 two-pool store is a V4 (584 B page) cache"
+        assert kv.shape[-1] != 128, "fp8 two-pool store is the latent, not the indexer"
+        assert kvcache_rope is not None, "fp8 two-pool store needs the rope pool"
+        assert not _is_xpu, "fp8 two-pool store is only wired for the CUDA/HIP kernel"
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(
@@ -499,9 +515,20 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store, layout
+            kv.dtype,
+            kv.shape[-1],
+            freq_cis.shape[-1],
+            page_size,
+            bf16_store,
+            layout,
+            fp8_2buff,
         )
-        fn = module.forward_fp4 if use_fp4 else module.forward
+        if use_fp4:
+            fn, extra = module.forward_fp4, ()
+        elif fp8_2buff:
+            fn, extra = module.forward_fp8_2buff, (kvcache_rope,)
+        else:
+            fn, extra = module.forward, ()
         if norm_weight.dtype != kv.dtype:
             norm_weight = norm_weight.to(dtype=kv.dtype)
         fn(
@@ -512,6 +539,7 @@ def compress_norm_rope_store(
             freq_cis,
             out_loc,
             kvcache,
+            *extra,
             plan.is_decode,
             plan.compress_ratio,
         )

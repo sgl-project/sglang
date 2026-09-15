@@ -607,6 +607,10 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Charge the chunked-prefill compute budget in tokens, not page-ceiled
+    # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
+    # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
+    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1345,6 +1349,8 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Currently supported by the Kimi-K2.5 image processor only.
+    SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
@@ -1466,6 +1472,12 @@ class Envs:
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
     SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
+    # unified_kv only: split the pool into an fp8 nope pool plus a parallel
+    # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
+    # dtype, so --kv-cache-dtype has no effect there and this switch is the
+    # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
+    # picks the buffer dtype and this switch is inert.
+    SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
