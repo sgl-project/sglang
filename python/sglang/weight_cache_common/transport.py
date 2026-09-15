@@ -297,6 +297,9 @@ class CudaIpcImporter:
         module.__dict__["_weight_cache_importer"] = self
         self._guard.check_alive()
 
+    def check_alive(self) -> None:
+        self._guard.check_alive()
+
     def close(self) -> None:
         if any(not reference.expired() for reference in self._live_storages):
             raise RuntimeError(

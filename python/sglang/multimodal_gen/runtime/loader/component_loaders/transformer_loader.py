@@ -592,6 +592,22 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             quantized_attn_backend=quantized_attn_backend,
         )
 
+    def load_prepared(self, frozen: FrozenTransformerLoad, *, attention_backend):
+        recipe = frozen.thaw()
+        return self.load(
+            recipe.server_args.model_paths[recipe.component_name],
+            recipe.server_args,
+            recipe.component_name,
+            self.expected_library,
+            component_attn_backend=attention_backend,
+            component_attn_name=recipe.component_name,
+            allow_native_fallback=False,
+            prepared_load=recipe,
+        )
+
+    def materialize_prepared(self, prepared_load):
+        return self.materialize_customized(prepared_load)
+
     def materialize_customized(
         self, recipe: ResolvedTransformerLoad | FrozenTransformerLoad
     ) -> torch.nn.Module:

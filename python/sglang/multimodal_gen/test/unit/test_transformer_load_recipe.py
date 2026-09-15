@@ -2,9 +2,10 @@
 """Preparation decisions survive discovery/argument changes before loading."""
 
 import unittest
+from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
@@ -38,6 +39,49 @@ def _resolved():
 
 
 class TestTransformerLoadRecipe(unittest.TestCase):
+    def test_prepared_load_uses_shared_finalization_without_resolving_again(self):
+        recipe = _resolved()
+        args = Mock()
+        args.model_paths = {"transformer": "/frozen"}
+        args.should_use_fsdp_for_component.return_value = False
+        args.requested_component_attention_backend.return_value = None
+        recipe.server_args = args
+        frozen = Mock()
+        frozen.thaw.return_value = recipe
+        loader = TransformerLoader()
+        model = nn.Linear(3, 4, dtype=torch.bfloat16)
+        with (
+            patch.object(
+                loader,
+                "component_load_precision",
+                side_effect=AssertionError("resolve again"),
+            ),
+            patch.object(
+                loader,
+                "_load_customized_with_context",
+                side_effect=AssertionError("ordinary resolver"),
+            ),
+            patch.object(
+                loader,
+                "component_attention_backend_context",
+                return_value=nullcontext(),
+            ),
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(
+                loader, "materialize_customized", return_value=model
+            ) as materialize,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.current_platform.get_available_gpu_memory",
+                side_effect=[16.0, 15.5],
+            ),
+        ):
+            loaded, memory = loader.load_prepared(frozen, attention_backend=object())
+        self.assertIs(loaded, model)
+        self.assertFalse(model.training)
+        self.assertFalse(model.weight.requires_grad)
+        self.assertEqual(memory, 0.5)
+        materialize.assert_called_once_with(recipe)
+
     def test_frozen_recipe_has_no_shared_mutable_resolution_state(self):
         resolved = _resolved()
         frozen = resolved.freeze()

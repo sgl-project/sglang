@@ -9,6 +9,7 @@ import dataclasses
 import json
 import math
 import os
+import pickle
 import random
 import sys
 import tempfile
@@ -263,6 +264,18 @@ class ServerArgs(DisaggServerArgsMixin):
     model_path: str
     model_subfolder: str | None = None
     model_variant: str | None = None
+
+    weight_cache_mode: str = "off"
+    weight_cache_components: list[str] = field(default_factory=lambda: ["dit"])
+    weight_cache_fallback: str = "error"
+    weight_cache_socket: str | None = None
+    weight_cache_timeout: float = 1800.0
+    weight_cache_max_deliveries: int = 128
+    weight_cache_allow_weak_checkpoint_identity: bool = False
+    weight_cache_allow_unverified_build: bool = False
+    _weight_cache_admission: Any = field(default=None, init=False, repr=False)
+    _raw_inputs: bytes | None = field(default=None, init=False, repr=False)
+    _prepared_pipeline: Any = field(default=None, init=False, repr=False)
 
     # explicit model ID override (e.g. "Qwen-Image")
     model_id: str | None = None
@@ -618,6 +631,11 @@ class ServerArgs(DisaggServerArgsMixin):
         """set defaults and normalize values."""
         self._normalize_component_residency()
         self._adjust_cpu_offload_components()
+        from sglang.multimodal_gen.runtime.weight_cache.placement import (
+            pin_requested_components,
+        )
+
+        pin_requested_components(self)
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust_based_on_performance_mode()
         if auto_tuner.could_override_server_args():
@@ -643,6 +661,11 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+        from sglang.multimodal_gen.runtime.weight_cache.placement import (
+            validate_resolved_arguments,
+        )
+
+        validate_resolved_arguments(self)
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -1897,6 +1920,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        # Keep a private, immutable pre-tuning snapshot. Variant resolution never
+        # reuses already cache-pinned or memory-tuned options.
+        if self.weight_cache_mode != "off":
+            self._raw_inputs = pickle.dumps(
+                {
+                    f.name: getattr(self, f.name)
+                    for f in dataclasses.fields(self)
+                    if f.init
+                }
+            )
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -1998,6 +2031,25 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        parser.add_argument(
+            "--weight-cache-mode",
+            choices=["off", "client"],
+            default="off",
+            help="Strict client of a standalone diffusion weight-cache daemon (Wan 1.3B, TP=1).",
+        )
+        parser.add_argument("--weight-cache-components", nargs="+", default=["dit"])
+        parser.add_argument(
+            "--weight-cache-fallback", choices=["error"], default="error"
+        )
+        parser.add_argument("--weight-cache-socket", default=None)
+        parser.add_argument("--weight-cache-timeout", type=float, default=1800.0)
+        parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
+        parser.add_argument(
+            "--weight-cache-allow-weak-checkpoint-identity", action="store_true"
+        )
+        parser.add_argument(
+            "--weight-cache-allow-unverified-build", action="store_true"
+        )
         # Model and path configuration
         parser.add_argument(
             "--model-path",
@@ -3472,6 +3524,13 @@ class ServerArgs(DisaggServerArgsMixin):
         kwargs["_explicit_arg_names"] = explicit_arg_names
         return cls(**kwargs)
 
+    def resolve_variant(self, *, weight_cache_mode: str) -> "ServerArgs":
+        if self._raw_inputs is None:
+            raise ValueError("Raw cache candidate inputs are unavailable")
+        values = pickle.loads(self._raw_inputs)
+        values["weight_cache_mode"] = weight_cache_mode
+        return type(self)(**values)
+
     @staticmethod
     def get_provided_args(
         args: argparse.Namespace, unknown_args: list[str]
@@ -3858,6 +3917,11 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args, unknown_args = parser.parse_known_args(argv)
+    raw_args._sglang_explicit_arg_names = {
+        arg.split("=", 1)[0].lstrip("-").replace("-", "_")
+        for arg in argv
+        if arg.startswith("--")
+    }
     server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
 

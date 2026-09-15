@@ -33,16 +33,8 @@ class PipelineWithLoRA(LoRAPipeline, ComposedPipelineBase):
     pass
 
 
-def build_pipeline(
-    server_args: ServerArgs,
-) -> PipelineWithLoRA:
-    """
-    Only works with valid hf diffusers configs. (model_index.json)
-    We want to build a pipeline based on the inference args mode_path:
-    1. download the model from the hub if it's not already downloaded
-    2. verify the model config and directory
-    3. based on the config, determine the pipeline class
-    """
+def resolve_pipeline_class(server_args: ServerArgs):
+    """Shared class resolution for ordinary construction and launcher planning."""
     model_path = server_args.model_path
 
     # Check if pipeline class is explicitly specified
@@ -75,8 +67,28 @@ def build_pipeline(
         pipeline_cls = model_info.pipeline_cls
         logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
 
-    # instantiate the pipelines
-    pipeline = pipeline_cls(model_path, server_args)
+    return pipeline_cls
+
+
+def build_pipeline(server_args: ServerArgs) -> PipelineWithLoRA:
+    from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
+
+    prepared = server_args._prepared_pipeline
+    if prepared is None:
+        pipeline_cls = resolve_pipeline_class(server_args)
+        prepared = prepare_pipeline(
+            pipeline_cls, server_args, required=server_args.weight_cache_mode != "off"
+        )
+    if server_args.weight_cache_mode == "client":
+        from sglang.multimodal_gen.runtime.weight_cache.client import (
+            materialize_from_cache,
+        )
+
+        pipeline = materialize_from_cache(prepared, server_args)
+    elif prepared is not None:
+        pipeline = prepared.materialize(server_args)
+    else:
+        pipeline = pipeline_cls(server_args.model_path, server_args)
 
     logger.info("Pipeline instantiated")
 

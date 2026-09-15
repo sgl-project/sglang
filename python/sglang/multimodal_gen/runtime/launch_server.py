@@ -136,6 +136,15 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     configure_logger(server_args)
 
+    worker_ctx = mp
+    if server_args.weight_cache_mode != "off":
+        from sglang.multimodal_gen.runtime.weight_cache.preflight import preflight
+
+        preflight(server_args)
+        # Existing package imports may initialize CUDA; never fork that context
+        # into a cached worker. Legacy non-cache launch behavior is unchanged.
+        worker_ctx = mp.get_context("spawn")
+
     # Start a new server with multiple worker processes
     logger.info("Starting server...")
 
@@ -156,11 +165,18 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
     for i in range(local_num_gpus):
         rank = rank_offset + i
-        reader, writer = mp.Pipe(duplex=False)
+        device_index = i
+        if server_args.weight_cache_mode != "off":
+            from sglang.multimodal_gen.runtime.weight_cache.placement import (
+                local_device_index,
+            )
+
+            device_index = local_device_index(server_args, i)
+        reader, writer = worker_ctx.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        process = mp.Process(
+        process = worker_ctx.Process(
             target=run_scheduler_process,
-            args=(i, rank, server_args, writer),
+            args=(device_index, rank, server_args, writer),
             name=f"sglang-diffusionWorker-{rank}",
             daemon=True,
         )

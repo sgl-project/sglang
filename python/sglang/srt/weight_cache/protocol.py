@@ -239,7 +239,7 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
-def compute_env_stamp() -> Dict[str, str]:
+def compute_env_stamp(*, device_capability: Optional[str] = None) -> Dict[str, str]:
     """Local environment fingerprint for the IPC weight cache.
 
     Returns the device compute capability and torch version of the current
@@ -249,7 +249,8 @@ def compute_env_stamp() -> Dict[str, str]:
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
     """
-    device_capability = ""
+    planned_capability = device_capability
+    device_capability = device_capability or ""
     torch_version = ""
     try:
         import torch
@@ -258,11 +259,12 @@ def compute_env_stamp() -> Dict[str, str]:
     except Exception:
         pass
     try:
-        from sglang.srt.platforms import current_platform
+        if planned_capability is None:
+            from sglang.srt.platforms import current_platform
 
-        cap = current_platform.get_device_capability()
-        if cap is not None:
-            device_capability = f"{cap.major}.{cap.minor}"
+            cap = current_platform.get_device_capability()
+            if cap is not None:
+                device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
     return {"device_capability": device_capability, "torch_version": torch_version}
@@ -348,7 +350,13 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None:
+def cleanup_stale_daemon_files(
+    device_uuid: str,
+    *,
+    force: bool = False,
+    socket_path: Optional[str] = None,
+    ready_path: Optional[str] = None,
+) -> None:
     """Validate and clean up .ready/.sock files for a daemon's physical GPU.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
@@ -358,8 +366,10 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(device_uuid)
-    socket_path = get_socket_path(device_uuid)
+    ready_path = ready_path if ready_path is not None else get_ready_path(device_uuid)
+    socket_path = (
+        socket_path if socket_path is not None else get_socket_path(device_uuid)
+    )
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return
