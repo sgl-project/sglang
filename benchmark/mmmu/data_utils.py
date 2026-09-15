@@ -114,24 +114,25 @@ def process_single_sample(data):
         for img_path in current_o_imgs_paths:
             o_imgs_paths.append(img_path)
 
-    if len(o_imgs_paths) > 1:  # multiple images in options, used for random selection
-        return {
-            "id": data["id"],
-            "question": question,
-            "options": data["options"],
-            "answer": data["answer"],
-            "image": None,
-            "question_type": data["question_type"],
-        }
-    else:
-        return {
-            "id": data["id"],
-            "question": question,
-            "options": data["options"],
-            "answer": data["answer"],
-            "image": data["image_1"],
-            "question_type": data["question_type"],
-        }
+    # MMMU rows carry up to 7 images as image_1..image_7.
+    images = [
+        data[f"image_{i}"] for i in range(1, 8) if data.get(f"image_{i}") is not None
+    ]
+
+    common = {
+        "id": data["id"],
+        "question": question,
+        "options": data["options"],
+        "answer": data["answer"],
+        "question_type": data["question_type"],
+        "image": images[0] if images else None,
+        "images": images,
+    }
+    if len(o_imgs_paths) > 1:
+        # `<img='...'>` inlined-path variant — skip rather than misalign images.
+        common["image"] = None
+        common["images"] = []
+    return common
 
 
 # DATA SAVING
