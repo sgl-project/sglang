@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_spec,
 )
 from sglang.srt.utils import is_hip, is_npu
 
@@ -120,6 +121,28 @@ def get_dsv4_c128_state_indices(
     pages_per_req = ring_size // 128
     page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
     return np.array([page], dtype=np.int32)
+
+
+def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.ndarray:
+    """PD transfer indices of the request-scoped state component (C128_STATE).
+
+    The component carries the c128 ring, whose item is one c128 page (or the
+    single online row), or the ratio-2 pair ring, whose item is one request's
+    whole ring; there only an odd prefix leaves a pending half-pair that decode
+    reads, so an even prefix ships nothing.
+    """
+    if 128 in pool.kv_pools:
+        online = is_dsv4_c128_online_enabled()
+        ring_size = 1 if online else pool.get_ring_size(128)
+        return get_dsv4_c128_state_indices(
+            req_pool_idx, seq_len, online=online, ring_size=ring_size
+        )
+    assert 2 in pool.kv_pools, (
+        "the request-scoped state component holds the c128 or the ratio-2 ring"
+    )
+    if seq_len % 2 == 0:
+        return np.empty((0,), dtype=np.int32)
+    return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
 def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
@@ -1356,6 +1379,11 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    kv_args.mla_compression_ratios = (
+        list(token_to_kv_pool.compression_ratios)
+        if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        else None
+    )
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1687,6 +1715,29 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+    """Describe the positional transfer layout without pool capacities or pointers."""
+    ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return None
+
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if kv_args.state_types.count(StateType.SWA) != 2:
+        raise RuntimeError(
+            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+        )
+
+    return {
+        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+        "compression_ratios": list(ratios),
+        "kv_layer_ids": list(kv_args.kv_layer_ids),
+        "kv_item_lens": list(kv_args.kv_item_lens),
+        "state_types": [state_type.value for state_type in kv_args.state_types],
+        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
+    }
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

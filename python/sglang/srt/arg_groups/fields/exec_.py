@@ -96,6 +96,15 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    enable_encoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+    ] = False
+    enable_decoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -485,6 +494,11 @@ class ExecGraph(msgspec.Struct):
     ] = None
     cuda_graph_max_bs_prefill: A[
         Optional[int], "Maximum batch size captured for the prefill cuda graph."
+    ] = None
+    cuda_graph_max_seq_len_prefill: A[
+        Optional[int],
+        "Longest sequence a prefill cuda graph replay admits; longer batches "
+        "run eager prefill. Folds into cuda_graph_config[prefill].max_seq_len.",
     ] = None
     cuda_graph_bs_decode: A[
         Optional[List[int]],
