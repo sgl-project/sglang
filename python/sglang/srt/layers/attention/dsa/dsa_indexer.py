@@ -557,7 +557,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.index_page_size
+        page_size = pool.page_size
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -756,7 +756,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        page_size = get_token_to_kv_pool().index_page_size
+        page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
@@ -1067,7 +1067,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().index_page_size
+        page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
                 assert page_size % 16 == 0, (
@@ -1399,7 +1399,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.index_page_size,
+                pool.page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
@@ -1408,7 +1408,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key,
                 buf,
                 out_cache_loc,
-                pool.index_page_size,
+                pool.page_size,
             )
             return
 
@@ -1418,7 +1418,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.index_page_size
+            page_size = pool.page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc

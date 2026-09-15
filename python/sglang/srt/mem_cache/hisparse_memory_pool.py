@@ -46,7 +46,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
-        index_page_size: Optional[int] = None,
     ):
         super().__init__(
             size=size,
@@ -62,7 +61,6 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
-            index_page_size=index_page_size,
             index_kpool=index_kpool,
             index_kpool_compress=index_kpool_compress,
             tail_extra_slots=tail_extra_slots,

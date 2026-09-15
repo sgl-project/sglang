@@ -74,7 +74,6 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
 
         dsa_device_pool = _device_pool_stub(
             layer_num=2,
-            index_page_size=2,
             store_dtype=torch.float16,
             size=8,
             start_layer=0,
