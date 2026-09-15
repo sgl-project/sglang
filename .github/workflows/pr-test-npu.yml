@@ -16,7 +16,7 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
         required: false
         type: string
         default: ''

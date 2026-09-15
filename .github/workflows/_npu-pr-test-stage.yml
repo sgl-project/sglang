@@ -35,11 +35,11 @@ on:
         type: string
         default: '{"size":1,"arr":[0]}'
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
         type: string
         default: ''
       skip_pr_test_health_check:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Set to true to skip the PR test health check (fast-fail gate).'
         type: string
         default: 'false'
       is_nightly_pipeline_job:
