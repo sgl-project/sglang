@@ -622,9 +622,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
-
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
+    encoder_swa_replay: bool = False
+
     ngram_history: Optional[torch.Tensor] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)

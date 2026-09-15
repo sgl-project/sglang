@@ -4,10 +4,9 @@ import sys
 
 import pytest
 import torch
-from torch import nn
 
 from sglang.kernels.ops.attention.dsv4.c2 import c2_decode_or_verify_norm_rope_store
-from sglang.kernels.ops.attention.dsv4.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import RMSNorm
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -27,31 +26,6 @@ PAGE_SIZE = 128
 PAGE_BYTES = -(-584 * PAGE_SIZE // 576) * 576
 DRAFT_LENS = (2, 5, 6, 9)
 VERIFY_BATCHES = (1, 3, 8)
-
-
-class RMSNorm(nn.Module):
-    """fp32 statistics and fp32 weight multiply, cast back at the very end."""
-
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            x.is_cuda
-            and torch.version.cuda is not None
-            and x.dtype in (torch.bfloat16, torch.float32)
-            and self.weight.dtype in (torch.bfloat16, torch.float32)
-            and x.shape[-1] in (128, 512)
-            and x.is_contiguous()
-            and self.weight.is_contiguous()
-        ):
-            return rmsnorm_fp32(x, self.weight, self.eps)
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(dtype)
 
 
 def _norm(dim: int, seed: int) -> RMSNorm:

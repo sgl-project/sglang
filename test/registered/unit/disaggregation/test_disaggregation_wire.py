@@ -837,6 +837,7 @@ def _buf_infos(*ptrs):
 
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
+    pool.compression_ratios = [0, 2, 1]
     pool._unified_kv = unified
     pool.page_size = 256
     pool.sliding_window = 128

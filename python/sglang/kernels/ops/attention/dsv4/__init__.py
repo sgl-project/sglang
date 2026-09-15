@@ -32,7 +32,12 @@ from .moe import (
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
 )
-from .topk import plan_topk_v2, topk_transform_paged, topk_transform_paged_v2
+from .topk import (
+    plan_topk_v2,
+    topk_transform_paged,
+    topk_transform_paged_v2,
+    topk_transform_ragged_v2,
+)
 from .utils import make_name
 
 __all__ = [
@@ -56,6 +61,7 @@ __all__ = [
     "triton_create_paged_compress_data",
     "topk_transform_paged",
     "topk_transform_paged_v2",
+    "topk_transform_ragged_v2",
     "plan_topk_v2",
     "hash_topk",
     "mega_moe_pre_dispatch",
