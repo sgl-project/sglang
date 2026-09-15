@@ -67,7 +67,8 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             has_custom_logit_processor=True,
             custom_params=params,
             custom_logit_processor={0: processor},
-            custom_logit_processor_row_indices={0: ([0, 2], torch.tensor([0, 2]))},
+            custom_logit_processor_rows={0: [0, 2]},
+            custom_logit_processor_batch_indices={0: torch.tensor([0, 2])},
             device="cpu",
         )
         logits = torch.zeros(batch_size * num_tokens, 4)

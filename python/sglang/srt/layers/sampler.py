@@ -956,7 +956,8 @@ def apply_custom_logit_processor(
     )
     batch_size = len(sampling_batch_info)
     for key, processor in sampling_batch_info.custom_logit_processor.items():
-        rows, indices = sampling_batch_info.custom_logit_processor_row_indices[key]
+        rows = sampling_batch_info.custom_logit_processor_rows[key]
+        indices = sampling_batch_info.custom_logit_processor_batch_indices[key]
         assert not rows or rows[-1] < batch_size, (
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -68,8 +68,11 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     # Custom logit processor
     custom_logit_processor: Optional[Dict[int, CustomLogitProcessor]] = None
-    custom_logit_processor_row_indices: Dict[int, Tuple[List[int], torch.Tensor]] = (
-        dataclasses.field(default_factory=dict)
+    custom_logit_processor_rows: Dict[int, List[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    custom_logit_processor_batch_indices: Dict[int, torch.Tensor] = dataclasses.field(
+        default_factory=dict
     )
 
     # Used for deterministic sampling
@@ -156,6 +159,7 @@ class SamplingBatchInfo:
             return_sampling_masks, device
         )
 
+        processor_rows = {}
         processor_indices = {}
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -172,14 +176,15 @@ class SamplingBatchInfo:
                 hash(processor_str): CustomLogitProcessor.from_str(processor_str)
                 for processor_str in processor_dict
             }
-            processor_indices = {
-                hash(processor_str): (
-                    rows,
-                    torch.tensor(rows, dtype=torch.long, pin_memory=_pin).to(
-                        device, non_blocking=True
-                    ),
-                )
+            processor_rows = {
+                hash(processor_str): rows
                 for processor_str, rows in processor_dict.items()
+            }
+            processor_indices = {
+                key: torch.tensor(rows, dtype=torch.long, pin_memory=_pin).to(
+                    device, non_blocking=True
+                )
+                for key, rows in processor_rows.items()
             }
             custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
@@ -223,7 +228,8 @@ class SamplingBatchInfo:
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
-            custom_logit_processor_row_indices=processor_indices,
+            custom_logit_processor_rows=processor_rows,
+            custom_logit_processor_batch_indices=processor_indices,
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
@@ -382,11 +388,11 @@ class SamplingBatchInfo:
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
     def _filter_batch_custom_logit_processor(self, keep_indices: List[int]):
-        """Filter the custom logit processor and custom params."""
+        """Filter the custom logit processor and custom params"""
         self._filter_processor_rows(keep_indices)
         self.custom_logit_processor = {
             key: self.custom_logit_processor[key]
-            for key in self.custom_logit_processor_row_indices
+            for key in self.custom_logit_processor_rows
         }
         self.custom_params = [self.custom_params[i] for i in keep_indices]
 
@@ -471,40 +477,48 @@ class SamplingBatchInfo:
         self.adjusted_merge_batch(other)
 
     def _filter_processor_rows(self, keep_indices: List[int]) -> None:
+        filtered_rows = {}
         indices = {}
-        for key, (rows, _) in self.custom_logit_processor_row_indices.items():
+        for key, rows in self.custom_logit_processor_rows.items():
             selected = set(rows)
             new_rows = [i for i, old in enumerate(keep_indices) if old in selected]
-            if new_rows:
-                indices[key] = (
-                    new_rows,
-                    torch.tensor(
-                        new_rows,
-                        dtype=torch.long,
-                        pin_memory=is_pin_memory_available(self.device),
-                    ).to(self.device, non_blocking=True),
-                )
-        self.custom_logit_processor_row_indices = indices
+            if not new_rows:
+                continue
+            filtered_rows[key] = new_rows
+            if new_rows == rows:
+                indices[key] = self.custom_logit_processor_batch_indices[key]
+                continue
+            indices[key] = torch.tensor(
+                new_rows,
+                dtype=torch.long,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True)
+        self.custom_logit_processor_rows = filtered_rows
+        self.custom_logit_processor_batch_indices = indices
 
     def _merge_processor_rows(self, other: SamplingBatchInfo) -> None:
-        left_indices = self.custom_logit_processor_row_indices
-        right_indices = other.custom_logit_processor_row_indices
+        left_rows = self.custom_logit_processor_rows
+        right_rows = other.custom_logit_processor_rows
 
+        # This runs before temperatures are concatenated, so len(self) is the left batch size.
         offset = len(self)
+        merged_rows = {}
         indices = {}
-        for key in left_indices.keys() | right_indices.keys():
-            rows = list(left_indices[key][0]) if key in left_indices else []
-            if key in right_indices:
-                rows.extend(i + offset for i in right_indices[key][0])
-            indices[key] = (
+        for key in left_rows.keys() | right_rows.keys():
+            if key not in right_rows:
+                merged_rows[key] = left_rows[key]
+                indices[key] = self.custom_logit_processor_batch_indices[key]
+                continue
+            rows = list(left_rows[key]) if key in left_rows else []
+            rows.extend(i + offset for i in right_rows[key])
+            merged_rows[key] = rows
+            indices[key] = torch.tensor(
                 rows,
-                torch.tensor(
-                    rows,
-                    dtype=torch.long,
-                    pin_memory=is_pin_memory_available(self.device),
-                ).to(self.device, non_blocking=True),
-            )
-        self.custom_logit_processor_row_indices = indices
+                dtype=torch.long,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True)
+        self.custom_logit_processor_rows = merged_rows
+        self.custom_logit_processor_batch_indices = indices
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
