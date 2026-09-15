@@ -1,24 +1,8 @@
-"""CPU regression for the DSpark disaggregation-decode draft-input handoff.
-
-Scope is deliberately narrow: this pins the contract of
-``SpeculativeAlgorithm.DSPARK.build_disagg_draft_input()`` at the
-prefill -> decode boundary, i.e. the single point where a PD decode worker
-must already hold a ``SpecInput`` before the first
-``spec_prepare_for_decode()``. It is not a scheduler simulation.
-
-The invariant is worth pinning because the DSPARK branch used to be absent,
-so the call fell through to ``None`` and the first decode step raised
-``'NoneType' object has no attribute 'prepare_for_decode'`` -- while DSpark,
-DP attention and disaggregation each passed CI on their own.
-
-``FutureMap`` is autospecced (not hand-rolled) because ``publish()`` /
-``stash()`` write device-side relay buffers that a CPU job cannot allocate.
-Those two calls are themselves part of the handoff contract, so they are
-asserted rather than skipped.
-"""
+"""Regression tests for the DSpark PD decode draft-input handoff."""
 
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import create_autospec
 
 import torch
@@ -30,23 +14,20 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# Committed lengths / pool slots / transferred bonus tokens handed over by the
-# prefill instance for a two-request decode batch.
 SEQ_LENS = torch.tensor([11, 23], dtype=torch.int64)
 REQ_POOL_INDICES = torch.tensor([3, 7], dtype=torch.int64)
 LAST_TOKENS = torch.tensor([101, 202], dtype=torch.int64)
 
 
 class TestDSparkDisaggDraftInput(CustomTestCase):
-    def _make_batch(self, *, enable_overlap: bool):
-        # Exactly the three ScheduleBatch fields the builder reads.
+    def _make_batch(self, *, enable_overlap: bool) -> SimpleNamespace:
         return SimpleNamespace(
             seq_lens=SEQ_LENS,
             req_pool_indices=REQ_POOL_INDICES,
             enable_overlap=enable_overlap,
         )
 
-    def _build(self, *, enable_overlap: bool):
+    def _build(self, *, enable_overlap: bool) -> tuple[Any, FutureMap]:
         future_map = create_autospec(FutureMap, instance=True)
         spec_info = SpeculativeAlgorithm.DSPARK.build_disagg_draft_input(
             batch=self._make_batch(enable_overlap=enable_overlap),
