@@ -45,41 +45,13 @@ def handle_offload_compatibility(server_args: Any) -> None:
 
 
 def handle_gpu_memory_settings(server_args: Any):
-    """
-    Configure GPU memory-dependent settings including
-    chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
-
-    Here are our heuristics:
-    - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
-      This is because GPUs with more memory are generally more powerful, we need to use a larger
-      chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
-    - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
-
-      GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-
-      The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
-      or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
-
-      In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
-      The activation memory is proportional to the chunked_prefill_size.
-      The cuda graph memory is proportional to the decode max_bs.
-      We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
-      and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
-
-      The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
-    """
-    from sglang.srt.arg_groups.cuda_graph_hook import (
-        generate_cpu_graph_batch_sizes,
-        generate_decode_cuda_graph_batch_sizes,
-        generate_prefill_cuda_graph_batch_sizes,
-    )
-
+    """Resolve GPU-dependent capacity defaults before execution policy."""
     cfg = resolving_view(server_args)
     gpu_mem = get_device_memory_capacity(cfg.device)
+    server_args._gpu_memory_capacity = gpu_mem
     # A copy, so an earlier declaration keeps the value it recorded.
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
-    prefill_cuda_graph_config = cuda_graph_config.prefill
 
     # ------------------------------------------------------------------
     # GPU-dependent capacity defaults
@@ -186,9 +158,28 @@ def handle_gpu_memory_settings(server_args: Any):
         server_args, decode_cuda_graph_config, gpu_mem
     )
 
-    # ------------------------------------------------------------------
-    # CUDA graph batch-size materialization
-    # ------------------------------------------------------------------
+    if cuda_graph_config != cfg.cuda_graph_config:
+        declare_resolution(
+            server_args,
+            "_handle_gpu_memory_settings",
+            cuda_graph_config=cuda_graph_config,
+        )
+
+
+def handle_cuda_graph_sizes(server_args: Any):
+    """Materialize capture shapes after topology and speculative width are final."""
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        apply_deepep_adjustments,
+        generate_cpu_graph_batch_sizes,
+        generate_decode_cuda_graph_batch_sizes,
+        generate_prefill_cuda_graph_batch_sizes,
+    )
+
+    cfg = resolving_view(server_args)
+    cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+    decode_cuda_graph_config = cuda_graph_config.decode
+    prefill_cuda_graph_config = cuda_graph_config.prefill
+
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
@@ -202,7 +193,7 @@ def handle_gpu_memory_settings(server_args: Any):
         if decode_cuda_graph_config.bs is not None:
             declare_resolution(
                 server_args,
-                "_handle_gpu_memory_settings",
+                "handle_cuda_graph_sizes",
                 torch_compile_max_bs=max(decode_cuda_graph_config.bs),
             )
         else:
@@ -210,7 +201,7 @@ def handle_gpu_memory_settings(server_args: Any):
             # to generate decode_cuda_graph_config.bs
             declare_resolution(
                 server_args,
-                "_handle_gpu_memory_settings",
+                "handle_cuda_graph_sizes",
                 torch_compile_max_bs=cfg.torch_compile_max_bs
                 or decode_cuda_graph_config.max_bs,
             )
@@ -255,6 +246,18 @@ def handle_gpu_memory_settings(server_args: Any):
                 prefill_cuda_graph_config.max_bs, 4096
             )
 
+    # Per-DP capture must fit the same token budget as MoE dispatch.
+    if (
+        cfg.enable_dp_attention
+        and cfg.chunked_prefill_size > 0
+        and prefill_cuda_graph_config.backend != Backend.DISABLED
+        and prefill_cuda_graph_config.max_bs > cfg.chunked_prefill_size
+        and (Phase.PREFILL, "max_bs") not in server_args._cuda_graph_config_locked
+    ):
+        prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
+        if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
+            prefill_cuda_graph_config.bs = None
+
     if prefill_cuda_graph_config.bs is None:
         prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
             prefill_cuda_graph_config.max_bs
@@ -263,13 +266,18 @@ def handle_gpu_memory_settings(server_args: Any):
     if cuda_graph_config != cfg.cuda_graph_config:
         declare_resolution(
             server_args,
-            "_handle_gpu_memory_settings",
+            "handle_cuda_graph_sizes",
             cuda_graph_config=cuda_graph_config,
         )
 
-    # ------------------------------------------------------------------
-    # Static memory and runtime headroom
-    # ------------------------------------------------------------------
+    apply_deepep_adjustments(server_args)
+
+
+def handle_gpu_memory_budget(server_args: Any):
+    """Budget from final capture shapes, backends, and per-rank token counts."""
+    cfg = resolving_view(server_args)
+    gpu_mem = server_args._gpu_memory_capacity
+    decode_cuda_graph_config = cfg.cuda_graph_config.decode
 
     if cfg.mem_fraction_static is None:
         model_config = model_config_of(server_args)
@@ -322,18 +330,43 @@ def handle_gpu_memory_settings(server_args: Any):
 
         # Multimodal models need more memory for the image processing.
         if is_vlm:
-            mem_fraction_static = adjust_mem_fraction_for_vlm(
+            mem_fraction_static = model_config.adjust_mem_fraction_for_vlm(
                 mem_fraction_static,
-                model_config,
                 post_capture_kv_sizing,
                 gpu_mem,
             )
 
         declare_resolution(
             server_args,
-            "_handle_gpu_memory_settings",
+            "handle_gpu_memory_budget",
             mem_fraction_static=mem_fraction_static,
         )
+
+    # AMD platforms backends
+    if resolved_view(server_args).attention_backend == "aiter":
+        if model_config_of(server_args).context_len > 8192:
+            explicit_mem_fraction = (
+                getattr(server_args, "_raw_input", None) or {}
+            ).get("mem_fraction_static") is not None
+            if (
+                explicit_mem_fraction
+                and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
+            ):
+                logger.warning(
+                    "attention_backend=aiter with context_len=%d (>8192) normally "
+                    "scales mem_fraction_static by 0.85 to reserve non-static "
+                    "workspace, but SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION is set, "
+                    "so mem_fraction_static=%.3f is used as-is. Ensure enough memory "
+                    "is left for attention workspace and CUDA graphs.",
+                    model_config_of(server_args).context_len,
+                    cfg.mem_fraction_static,
+                )
+            else:
+                declare_resolution(
+                    server_args,
+                    "handle_gpu_memory_budget",
+                    mem_fraction_static=cfg.mem_fraction_static * 0.85,
+                )
 
     # ------------------------------------------------------------------
     # Symmetric-memory preallocation

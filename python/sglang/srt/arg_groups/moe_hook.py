@@ -24,6 +24,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import get_moe_weight_format
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
@@ -41,8 +42,9 @@ def handle_moe_kernel_config(server_args: Any):
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
+    moe_format = get_moe_weight_format(view.quantization)
     if view.moe_runner_backend == "flashinfer_cutlass":
-        assert view.quantization in [
+        assert moe_format == "nvfp4" or view.quantization in [
             "modelopt_fp4",
             "modelopt_fp8",
             "modelopt_mixed",
@@ -58,7 +60,8 @@ def handle_moe_kernel_config(server_args: Any):
     if view.moe_runner_backend == "flashinfer_cutedsl":
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
-            view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
+            moe_format == "nvfp4"
+            or view.quantization in ["modelopt_mixed", "nvfp4_online"]
             or model_config_of(server_args).nvfp4_moe_meta is not None
         ), (
             f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
@@ -85,7 +88,7 @@ def handle_moe_kernel_config(server_args: Any):
             )
 
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
-        assert view.quantization in [
+        assert moe_format in {"nvfp4", "mxfp8"} or view.quantization in [
             "modelopt_fp4",
             "nvfp4_online",
             "fp8",
@@ -99,7 +102,7 @@ def handle_moe_kernel_config(server_args: Any):
         )
 
     if view.moe_runner_backend == "flashinfer_trtllm_routed":
-        assert view.quantization in [
+        assert moe_format in {"nvfp4", "mxfp8"} or view.quantization in [
             "fp8",
             "mxfp8",
             "modelopt_fp4",
@@ -115,12 +118,7 @@ def handle_moe_kernel_config(server_args: Any):
     # invoked here at the legacy write slots.
     run_post_process_pass(server_args, _moe_runner_fusion_disable)
 
-    if resolved_view(server_args).moe_runner_backend == "cutlass" and resolved_view(
-        server_args
-    ).quantization in [
-        "fp8",
-        "mxfp8",
-    ]:
+    if view.moe_runner_backend == "cutlass" and moe_format in ("fp8", "mxfp8"):
         assert resolved_view(server_args).ep_size == 1, (
             "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
         )
@@ -140,11 +138,11 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
     dispatch_type = cli_dispatch_type or "auto"
 
     supports_nvfp4_dispatch = (
-        cfg.quantization == "modelopt_fp4"
+        get_moe_weight_format(cfg.quantization) == "nvfp4"
         or model_config_of(server_args).nvfp4_moe_meta is not None
     )
     if dispatch_type == "auto":
-        if cfg.quantization == "mxfp8":
+        if get_moe_weight_format(cfg.quantization) == "mxfp8":
             dispatch_type = "mxfp8"
         elif supports_nvfp4_dispatch:
             dispatch_type = "nvfp4"
@@ -152,7 +150,7 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
             dispatch_type = "bf16"
 
     if dispatch_type == "mxfp8":
-        if cfg.quantization != "mxfp8":
+        if get_moe_weight_format(cfg.quantization) != "mxfp8":
             raise ValueError(
                 "--flashinfer-a2a-dispatch-type mxfp8 requires --quantization mxfp8."
             )
@@ -217,7 +215,7 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
 
     quantization = resolved_view(server_args).quantization
     supports_megamoe_quantization = (
-        quantization in ("mxfp8", "modelopt_fp4")
+        get_moe_weight_format(quantization) in ("mxfp8", "nvfp4")
         or model_config.is_fp4_experts
         or model_config.nvfp4_moe_meta is not None
     )
@@ -419,7 +417,7 @@ def handle_a2a_moe(server_args: Any):
                 not use_cutedsl_w4a16
                 and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
                 and (
-                    resolved_view(server_args).quantization == "modelopt_fp4"
+                    get_moe_weight_format(cfg.quantization) == "nvfp4"
                     or model_config_of(server_args).nvfp4_moe_meta is not None
                 )
             ):
@@ -669,7 +667,7 @@ def validate_cutedsl_a2a_token_budget(server_args: Any):
 def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
     """Max tokens a single rank dispatches through MoRI in one forward."""
     cfg = resolving_view(server_args)
-    return cfg.chunked_prefill_size
+    return model_config_of(server_args).get_prefill_dispatch_tokens_per_rank(cfg)
 
 
 def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:

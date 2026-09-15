@@ -79,7 +79,8 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_decoding(server_args: ServerArgs) -> None:
+def handle_speculative_model_inputs(server_args: ServerArgs) -> None:
+    """Resolve model role, revision and aliases before any ModelConfig is built."""
     cfg = resolving_view(server_args)
     if (
         cfg.speculative_draft_model_path is not None
@@ -87,29 +88,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     ):
         declare_resolution(
             server_args,
-            "handle_speculative_decoding",
+            "handle_speculative_model_inputs",
             speculative_draft_model_revision="main",
         )
-
-    # Moved to the resolution pipeline (arg_groups/overrides.py:
-    # _speculative_moe_runner_default), invoked here at its legacy slot.
-
-    run_post_process_pass(server_args, _speculative_moe_runner_default)
 
     if cfg.speculative_algorithm is not None:
         declare_resolution(
             server_args,
-            "handle_speculative_decoding",
+            "handle_speculative_model_inputs",
             speculative_algorithm=cfg.speculative_algorithm.upper(),
-        )
-
-    # Removal notice for the retired env var; raw os.getenv on purpose -- the
-    # Envs descriptor is gone. Drop this check after one release.
-    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
-        logger.warning(
-            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
-            "always runs the V2 worker. Use --disable-overlap-schedule to "
-            "select the non-overlap (synchronous) path."
         )
 
     kwargs = {}
@@ -120,7 +107,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     declare_resolution(
         server_args,
-        "handle_speculative_decoding",
+        "handle_speculative_model_inputs",
         speculative_algorithm=_resolve_speculative_algorithm_alias(
             cfg.speculative_algorithm,
             cfg.speculative_draft_model_path,
@@ -128,6 +115,23 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             kwargs=kwargs,
         ),
     )
+
+
+def handle_speculative_decoding(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    # Moved to the resolution pipeline (arg_groups/overrides.py:
+    # _speculative_moe_runner_default), invoked here at its legacy slot.
+
+    run_post_process_pass(server_args, _speculative_moe_runner_default)
+
+    # Removal notice for the retired env var; raw os.getenv on purpose -- the
+    # Envs descriptor is gone. Drop this check after one release.
+    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
+        logger.warning(
+            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
+            "always runs the V2 worker. Use --disable-overlap-schedule to "
+            "select the non-overlap (synchronous) path."
+        )
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).

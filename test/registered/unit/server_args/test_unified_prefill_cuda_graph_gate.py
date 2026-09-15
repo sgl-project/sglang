@@ -34,13 +34,17 @@ touched.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import msgspec
 
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -50,9 +54,9 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 def _run_handler(*, prefill_backend, attention_backends):
     """Run just `handle_unified_memory_pool` over a minimal stand-in."""
     sa = ServerArgs(model_path="dummy")
-    cg = SimpleNamespace(
-        prefill=SimpleNamespace(backend=prefill_backend),
-        decode=SimpleNamespace(backend=Backend.FULL),
+    cg = CudaGraphConfig(
+        prefill=PhaseConfig(backend=prefill_backend),
+        decode=PhaseConfig(backend=Backend.FULL),
     )
     for name, value in {
         "enable_unified_memory": True,
@@ -72,7 +76,8 @@ def _run_handler(*, prefill_backend, attention_backends):
         return_value=attention_backends,
     ):
         handle_unified_memory_pool(sa)
-    return cg
+    assert cg.prefill.backend == prefill_backend
+    return resolution_result(sa, "cuda_graph_config")
 
 
 class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):

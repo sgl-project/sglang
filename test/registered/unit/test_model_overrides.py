@@ -2455,6 +2455,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        with patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", []):
+            for arch, supported in (
+                ("ExternalLinearForCausalLM", True),
+                ("Qwen3NextForCausalLM", False),
+            ):
+                registry.register_linear_attn_model(
+                    registry.LinearAttnModelSpec(
+                        config_class=SimpleNamespace,
+                        backend_class_name="external.LinearBackend",
+                        arch_names=[arch],
+                        support_mamba_cache_extra_buffer=supported,
+                    )
+                )
+                for backend in ("triton", "fla"):
+                    with self.subTest(architecture=arch, backend=backend):
+                        declared = _mamba_radix_cache_resolution(
+                            _view(arch, linear_attn_backend=backend)
+                        )
+                        self.assertEqual(
+                            declared["mamba_radix_cache_strategy"],
+                            "extra_buffer"
+                            if supported and backend == "triton"
+                            else "no_buffer",
+                        )
+
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
             _qwen3_5_hybrid_overrides,

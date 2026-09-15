@@ -431,8 +431,7 @@ def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
     locked = server_args._cuda_graph_config_locked
     if any((Phase.PREFILL, key) in locked for key in ("max_bs", "bs")):
         return
-    # Capacity defaults have already populated buckets. Replace the unlocked
-    # ceiling and its buckets together.
+    # Leave materialization to the final capture-shape stage.
     declare_resolution(
         server_args,
         "_apply_glm5_prefill_cuda_graph_policy",
@@ -440,10 +439,9 @@ def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
             cfg.cuda_graph_config,
             Phase.PREFILL,
             max_bs=4096,
-            bs=generate_prefill_cuda_graph_batch_sizes(4096),
+            bs=None,
         ),
     )
-    apply_deepep_adjustments(server_args)
 
 
 def apply_deepep_adjustments(server_args: Any):
@@ -524,17 +522,17 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
 
 
 def handle_cuda_graph_config(server_args: Any):
-    cfg = resolving_view(server_args)
-
+    """Parse operator intent before handlers inspect graph settings."""
     parse_cuda_graph_config(server_args)
-    apply_cuda_graph_compatibility(server_args)
-    apply_deepep_adjustments(server_args)
     apply_cuda_graph_disaggregation_roles(server_args)
     validate_cuda_graph_config(server_args)
-    # Warn on the final resolved config (not inside the compat cascade —
-    # that path is skipped when the user explicitly sets the backend,
-    # which is the only way to get 'full' for prefill today).
-    if cfg.cuda_graph_config.prefill.backend == Backend.FULL:
+
+
+def handle_cuda_graph_compatibility(server_args: Any):
+    """Apply final backend constraints before capture shapes and memory budgets."""
+    apply_cuda_graph_compatibility(server_args)
+    validate_cuda_graph_config(server_args)
+    if resolving_view(server_args).cuda_graph_config.prefill.backend == Backend.FULL:
         logger.warning(
             "cuda_graph_config[prefill].backend='full' is experimental. "
             "Use breakable or tc_piecewise for production workloads."

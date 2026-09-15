@@ -61,6 +61,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
     model_config_of,
+    model_metadata_of,
     record_of,
     register_model_override,
     register_model_override_predicate,
@@ -151,7 +152,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     `test_resolution_reads_the_declarations` pins.
 
     Every declaration goes through here, whenever it is made: inside
-    ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
+    the shared pipeline, at launcher stage (LoRA normalization, the auto-detected
     parsers -- they decide what the process will run with, so they belong to the
     pipeline even though they run after it), and on a copy about to cross a
     process boundary. A name that is not a field is rejected here rather than
@@ -469,8 +470,8 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     }
 )
 
-# Architectures that support the extra_buffer mamba radix cache strategy.
-# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
+
+# Built-in models not yet represented by LinearAttnModelSpec.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -501,13 +502,20 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 
 
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
-    """Whether ``model_arch`` supports the extra_buffer strategy on the
-    configured linear-attention backend (pure read)."""
+    """Use registered capabilities or the existing built-in model defaults."""
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
     if get_platform().is_xpu:
         return False
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        return view.linear_attn_backend == "triton"
-    return False
+    spec = get_linear_attn_spec_by_arch(model_arch)
+    supported = (
+        spec.support_mamba_cache_extra_buffer
+        if spec is not None
+        else model_arch in _MAMBA_EXTRA_BUFFER_ARCHS
+    )
+    return supported and view.linear_attn_backend == "triton"
 
 
 @register_post_process
@@ -1509,6 +1517,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     _handle_moe_kernel_config. The backend-compatibility asserts and the
     disable_shared_experts_fusion writes (post-publish writers exist for that
     field) stay in the handler."""
+    from sglang.srt.layers.quantization import get_moe_weight_format
+
+    moe_format = get_moe_weight_format(view.quantization)
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
         if not get_platform().is_sm100:
@@ -1534,7 +1545,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     # 128-alignment round-up off flashinfer_trtllm, so the experts would silently
     # load with gate and up exchanged. Leave the backend at "auto" and let
     # create_moe_runner resolve it to ASCEND.
-    if view.quantization == "mxfp8" and not get_platform().is_npu:
+    if moe_format == "mxfp8" and not get_platform().is_npu:
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
@@ -1558,7 +1569,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             moe_runner_backend = mxfp8_default
     if (
         moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
+        and moe_format == "nvfp4"
         and get_platform().is_sm120
     ):
         moe_runner_backend = "flashinfer_cutlass"

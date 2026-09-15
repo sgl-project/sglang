@@ -15,8 +15,9 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -222,31 +223,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
-        "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
-        f"--speculative-algorithm={cfg.speculative_algorithm!r}."
-    )
-    if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
-        )
+    run_hook(validate_unified_memory_speculation, server_args)
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
         "TBO's replay split hands each child a view without the pre-translate "
@@ -280,7 +257,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         backends = set(attention_backends_of(resolved_view(server_args)))
         backends.discard(None)
         if not backends <= full_cg_backends:
-            _cg_cfg.prefill.backend = Backend.DISABLED
+            declare_resolution(
+                server_args,
+                "unified_memory_prefill_graph",
+                cuda_graph_config=with_phase(
+                    _cg_cfg, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "--enable-unified-memory: disabling the FULL prefill "
                 "cuda-graph backend. It builds its block table in "
@@ -290,6 +273,36 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 sorted(full_cg_backends),
                 sorted(backends),
             )
+
+
+def validate_unified_memory_speculation(server_args: Any) -> None:
+    """Validate the algorithm/backend contract without hiding other pool checks."""
+    cfg = resolving_view(server_args)
+    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+        "--enable-unified-memory only supports --speculative-algorithm "
+        "DSPARK (chain draft); other speculative algorithms are not yet "
+        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        f"--speculative-algorithm={cfg.speculative_algorithm!r}."
+    )
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + DSPARK supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree "
+            "verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+        # Both roles: verify routes to either backend depending on
+        # --speculative-attention-mode.
+        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+        spec_backends = set(attention_backends_of(resolved_view(server_args)))
+        spec_backends.discard(None)
+        assert spec_backends <= spec_allowed, (
+            "--enable-unified-memory + DSPARK requires spec-verify-audited "
+            f"attention backends {sorted(spec_allowed)} for both prefill "
+            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
+            "not translate speculative verify indices to the unified "
+            "pool's kernel-facing space yet."
+        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:
@@ -358,6 +371,13 @@ def handle_page_major_kv_layout(server_args: Any):
         "reimplementation. Run with --enable-unified-memory, or drop "
         "--enable-page-major-kv-layout."
     )
+    run_hook(validate_page_major_attention, server_args)
+    validate_page_major_linear_attention(server_args)
+
+
+def validate_page_major_attention(server_args: Any) -> None:
+    """Validate the model rows and attention implementations for the pool layout."""
+    cfg = resolving_view(server_args)
     from sglang.srt.mem_cache.unified_memory_pool import (
         unified_memory_supported_for_model,
     )
@@ -413,6 +433,10 @@ def handle_page_major_kv_layout(server_args: Any):
         "envelope-strided views only Triton reads). Pass a compatible "
         "--attention-backend."
     )
+
+
+def validate_page_major_linear_attention(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):
     # - decode: triton; flashinfer (recurrent_kda compiles the state slot
@@ -430,6 +454,14 @@ def handle_page_major_kv_layout(server_args: Any):
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    for arch in model_config_of(server_args).hf_config.architectures or ():
+        spec = get_linear_attn_spec_by_arch(arch)
+        if spec is not None:
+            prefill_allowed.update(spec.strided_prefill_backends)
     resolved_linear_decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
     resolved_linear_prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
     assert resolved_linear_decode in decode_allowed | {None}, (

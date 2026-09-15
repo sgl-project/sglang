@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from functools import cached_property
 from pathlib import Path
@@ -45,11 +46,21 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-_MODEL_CONFIG_FACTORIES: dict[type[ServerArgs], Callable[..., "ModelConfig"]] = {}
+
+@dataclass(frozen=True)
+class _ModelConfigFactory:
+    build: Callable[..., "ModelConfig"]
+    inputs: Optional[Callable[..., dict]] = None
+
+
+_MODEL_CONFIG_FACTORIES: dict[type[ServerArgs], _ModelConfigFactory] = {}
 
 
 def register_model_config_factory(
-    server_args_type: type[ServerArgs], factory: Callable[..., "ModelConfig"]
+    server_args_type: type[ServerArgs],
+    factory: Callable[..., "ModelConfig"],
+    *,
+    inputs: Optional[Callable[..., dict]] = None,
 ) -> None:
     """Register a factory with the same signature as ModelConfig.from_server_args.
 
@@ -57,15 +68,102 @@ def register_model_config_factory(
     registered type in the argument record's MRO wins, so registrations cover
     subclasses too. Repeating the same registration is harmless; replacing a
     different factory for the same type is an error.
+
+    With ``inputs``, that callback accepts the from_server_args arguments and
+    returns constructor kwargs; ``factory`` consumes those kwargs directly.
+    It also receives ``_metadata`` with the prepared checkpoint configuration.
+    Resolution uses the same inputs for metadata and cache identity. Without
+    ``inputs``, the legacy factory receives the argument record and its cache
+    key conservatively includes every resolved field.
     """
     if not issubclass(server_args_type, ServerArgs):
         raise TypeError("model-config factories require a ServerArgs subclass")
     previous = _MODEL_CONFIG_FACTORIES.get(server_args_type)
-    if previous is not None and previous is not factory:
+    registration = _ModelConfigFactory(factory, inputs)
+    if previous is not None and previous != registration:
         raise ValueError(
             f"A model-config factory is already registered for {server_args_type.__qualname__}"
         )
-    _MODEL_CONFIG_FACTORIES[server_args_type] = factory
+    _MODEL_CONFIG_FACTORIES[server_args_type] = registration
+
+
+def _model_config_factory(server_args: ServerArgs) -> _ModelConfigFactory:
+    for record_type in type(server_args).__mro__:
+        if registration := _MODEL_CONFIG_FACTORIES.get(record_type):
+            return registration
+    return _ModelConfigFactory(ModelConfig, ModelConfig.get_config_inputs)
+
+
+@dataclass(frozen=True)
+class ModelMetadata:
+    """Parsed checkpoint facts, before dtype, architecture and runtime policy."""
+
+    model_path: str
+    hf_config: PretrainedConfig
+    model_weights: Optional[str] = None
+
+    @staticmethod
+    def load(
+        model_path: str,
+        trust_remote_code: bool,
+        revision: Optional[str],
+        model_override_args: str,
+        override_config_file: Optional[str],
+        model_config_parser: str,
+    ) -> "ModelMetadata":
+        model_weights = None
+        if is_runai_obj_uri(model_path):
+            model_weights = model_path
+            model_path = ObjectStorageModel.get_path(model_path)
+        else:
+            from sglang.srt.connector import create_remote_connector
+            from sglang.srt.utils import is_remote_url
+
+            if is_remote_url(model_path):
+                logger.info("Pulling model configs from remote...")
+                # The connector's signal handlers retain it until process exit.
+                client = create_remote_connector(model_path)
+                client.pull_files(allow_pattern=["*config.json"])
+                model_weights = model_path
+                model_path = client.get_local_dir()
+
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+        return ModelMetadata(
+            model_path,
+            get_config(
+                model_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                model_override_args=json.loads(model_override_args),
+                model_config_parser=model_config_parser,
+                **kwargs,
+            ),
+            model_weights,
+        )
+
+
+def model_metadata_from_inputs(server_args: ServerArgs, inputs: dict) -> ModelMetadata:
+    """Share source preparation between early policies and final construction."""
+    source_inputs = {
+        name: inputs[name]
+        for name in (
+            "model_path",
+            "trust_remote_code",
+            "revision",
+            "model_override_args",
+            "override_config_file",
+            "model_config_parser",
+        )
+    }
+    cache = getattr(server_args, "_model_metadata", None)
+    if cache is None:
+        cache = server_args._model_metadata = {}
+    key = tuple(source_inputs.items())
+    if key not in cache:
+        cache[key] = ModelMetadata.load(**source_inputs)
+    return cache[key]
 
 
 MIMO_V2_MODEL_ARCHS = (
@@ -434,6 +532,8 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        *,
+        _metadata: Optional[ModelMetadata] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -453,8 +553,17 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
-        self._maybe_pull_model_for_runai(self.model_path)
-        self._maybe_pull_model_tokenizer_from_remote()
+        metadata = _metadata or ModelMetadata.load(
+            model_path,
+            trust_remote_code,
+            revision,
+            model_override_args,
+            override_config_file,
+            model_config_parser,
+        )
+        self.model_path = metadata.model_path
+        if metadata.model_weights is not None:
+            self.model_weights = metadata.model_weights
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
@@ -462,16 +571,7 @@ class ModelConfig:
         # get_config() is cached. ModelConfig mutates hf_config for draft-model
         # remapping and architecture-specific normalization, so each instance
         # must own an isolated copy.
-        self.hf_config = copy.deepcopy(
-            get_config(
-                self.model_path,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                model_config_parser=model_config_parser,
-                **kwargs,
-            )
-        )
+        self.hf_config = copy.deepcopy(metadata.hf_config)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
         self.embedding_model_spec = resolve_embedding_model_spec(
@@ -723,8 +823,9 @@ class ModelConfig:
             self.hf_config, "is_matryoshka", False
         )
 
-    @staticmethod
+    @classmethod
     def from_server_args(
+        cls,
         server_args: ServerArgs,
         model_path: str = None,
         model_revision: str = None,
@@ -732,18 +833,35 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-        for record_type in type(server_args).__mro__:
-            factory = _MODEL_CONFIG_FACTORIES.get(record_type)
-            if factory is not None:
-                return factory(
-                    server_args,
-                    model_path=model_path,
-                    model_revision=model_revision,
-                    is_draft_model=is_draft_model,
-                    context_length=context_length,
-                    **kwargs,
-                )
+        registration = (
+            _model_config_factory(server_args)
+            if cls is ModelConfig
+            else _ModelConfigFactory(cls, cls.get_config_inputs)
+        )
+        options = dict(
+            model_path=model_path,
+            model_revision=model_revision,
+            is_draft_model=is_draft_model,
+            context_length=context_length,
+            **kwargs,
+        )
+        if registration.inputs is None:
+            return registration.build(server_args, **options)
+        inputs = registration.inputs(server_args, **options)
+        return registration.build(
+            **inputs, _metadata=model_metadata_from_inputs(server_args, inputs)
+        )
 
+    @staticmethod
+    def get_config_inputs(
+        server_args: ServerArgs,
+        model_path: str = None,
+        model_revision: str = None,
+        is_draft_model: bool = False,
+        context_length: Optional[int] = None,
+        **kwargs,
+    ) -> dict:
+        """Constructor inputs; external factories extend this instead of copying it."""
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -755,7 +873,7 @@ class ModelConfig:
             if is_draft_model
             else cfg.decrypted_config_file
         )
-        return ModelConfig(
+        return dict(
             model_path=model_path or cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
             revision=model_revision or cfg.revision,
@@ -777,13 +895,30 @@ class ModelConfig:
             encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
-                is_draft_model and cfg._speculative_draft_quantization_explicitly_set
+                is_draft_model
+                and getattr(
+                    cfg, "_speculative_draft_quantization_explicitly_set", False
+                )
             ),
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
         )
+
+    def adjust_mem_fraction_for_vlm(
+        self, mem_fraction_static: float, post_capture_kv_sizing: bool, gpu_mem
+    ) -> float:
+        """Apply the encoder's memory policy before the static budget is declared."""
+        from sglang.srt.arg_groups.memory_hook import adjust_mem_fraction_for_vlm
+
+        return adjust_mem_fraction_for_vlm(
+            mem_fraction_static, self, post_capture_kv_sizing, gpu_mem
+        )
+
+    def get_prefill_dispatch_tokens_per_rank(self, cfg) -> int:
+        """Maximum local dispatch workload; models with token sharding override it."""
+        return cfg.chunked_prefill_size
 
     def _derive_multimodal_cuda_graph_support(self, enable_multimodal: bool) -> None:
         """Declare graph capabilities before deriving shapes and validating config.
@@ -1991,36 +2126,6 @@ class ModelConfig:
         }
 
         return default_sampling_params
-
-    def _maybe_pull_model_for_runai(self, model: str) -> None:
-        if is_runai_obj_uri(model):
-            # local path for loading the config
-            self.model_path = ObjectStorageModel.get_path(model)
-            # remote path for loading the weights
-            self.model_weights = model
-
-    def _maybe_pull_model_tokenizer_from_remote(self) -> None:
-        """
-        Pull the model config files to a temporary
-        directory in case of remote.
-
-        Args:
-            model: The model name or path.
-
-        """
-        from sglang.srt.connector import create_remote_connector
-        from sglang.srt.utils import is_remote_url
-
-        if is_remote_url(self.model_path):
-            logger.info("Pulling model configs from remote...")
-            # BaseConnector implements __del__() to clean up the local dir.
-            # Since config files need to exist all the time, so we DO NOT use
-            # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
-            if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
-                self.model_weights = self.model_path
-                self.model_path = client.get_local_dir()
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py

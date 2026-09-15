@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.speculative_hook import (
+    handle_speculative_decoding,
+    handle_speculative_model_inputs,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -205,7 +208,7 @@ class TestValidatorHook(_RegistryIsolated):
 
         algo = SpeculativeAlgorithm.from_string("MY_FOO")
         self.assertIs(algo.validate_server_args, validator)
-        # Callers (e.g. ServerArgs.__post_init__) must invoke the hook themselves;
+        # The resolution pipeline must invoke the hook itself;
         # CustomSpecAlgo does not call it from create_worker.
         validator.assert_not_called()
 
@@ -236,6 +239,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_adaptive=False,
         )
 
+        handle_speculative_model_inputs(server_args)
         handle_speculative_decoding(server_args)
 
         self.assertEqual(

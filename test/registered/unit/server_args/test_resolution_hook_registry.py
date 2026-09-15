@@ -77,20 +77,20 @@ class TestWhitelistMatchesThePipeline(CustomTestCase):
     "this step nobody can ever replace" months later."""
 
     def _run_hook_call_targets(self) -> set:
-        """The first argument of every `run_hook(...)` call in pipeline.py,
-        statically -- the set of steps the pipeline actually dispatches
-        through the registry."""
-        tree = ast.parse(open(pipeline_module.__file__).read())
+        """Collect pipeline and family policy calls through the registry."""
         names = set()
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "run_hook"
-                and node.args
-                and isinstance(node.args[0], ast.Name)
-            ):
-                names.add(node.args[0].id)
+        hook_dir = os.path.dirname(pipeline_module.__file__)
+        for path in glob.glob(os.path.join(hook_dir, "**", "*.py"), recursive=True):
+            tree = ast.parse(open(path).read())
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "run_hook"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                ):
+                    names.add(node.args[0].id)
         return names
 
     def test_every_whitelisted_hook_has_a_call_site(self):
@@ -215,6 +215,50 @@ class TestRunHook(_IsolatedRegistry):
                 "second-after",
             ],
         )
+
+
+class TestResolutionFailure(_IsolatedRegistry):
+    def test_failed_hook_cannot_publish_or_resume_partial_resolution(self):
+        from sglang.srt.arg_groups.overrides import declare_resolution
+        from sglang.srt.runtime_context import publish
+
+        calls = []
+
+        @register_resolution_hook("handle_mega_moe")
+        def fail(server_args, previous):
+            calls.append(server_args)
+            self.assertFalse(server_args._resolution_finished)
+            declare_resolution(server_args, "failing_hook", random_seed=999)
+            raise ValueError("external policy failed")
+
+        args = ServerArgs(model_path="dummy")
+        with self.assertRaisesRegex(ValueError, "external policy failed"):
+            args.resolve_once()
+        self.assertFalse(args._resolution_finished)
+        self.assertTrue(args._resolution_failed)
+        self.assertFalse(args._resolution_in_progress)
+        with self.assertRaisesRegex(RuntimeError, "resolution already failed"):
+            args.resolve_once()
+        with self.assertRaisesRegex(RuntimeError, "resolution already failed"):
+            publish(args, role="test")
+        self.assertEqual(calls, [args])
+        self.assertFalse(ServerArgs(model_path="dummy")._resolution_failed)
+
+    def test_reentrant_hook_fails_without_running_a_second_pipeline(self):
+        calls = []
+
+        @register_resolution_hook("handle_mega_moe")
+        def reenter(server_args, previous):
+            calls.append(server_args)
+            server_args.resolve_once()
+
+        args = ServerArgs(model_path="dummy")
+        with self.assertRaisesRegex(RuntimeError, "resolution is already in progress"):
+            args.resolve_once()
+        self.assertEqual(calls, [args])
+        self.assertTrue(args._resolution_failed)
+        self.assertFalse(args._resolution_finished)
+        self.assertFalse(args._resolution_in_progress)
 
 
 class TestEndToEnd(_IsolatedRegistry):
