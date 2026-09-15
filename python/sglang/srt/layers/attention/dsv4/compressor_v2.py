@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -158,6 +159,7 @@ class CompressorBackendMixin:
         bf16_store: bool = False,
         kv_scale_cache: Optional[torch.Tensor] = None,
         rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_layout: KVLayout = KVLayout.V4,
         fp8_2buff: bool = False,
         kv_cache_rope: Optional[torch.Tensor] = None,
     ) -> None:
@@ -215,6 +217,7 @@ class CompressorBackendMixin:
             bf16_store=bf16_store,
             kvcache_scale=kv_scale_cache,
             rope_cache=rope_cache,
+            layout=kv_layout,
             # Derived once per forward by the backend; every C4 layer writes the
             # same rows to the same slots.
             fp4_k_write_metadata=(
@@ -268,6 +271,7 @@ class CompressorBackendMixin:
         )
         use_hip_fp4 = _is_hip and use_fp4_indexer
         bf16_store = False
+        kv_layout = KVLayout.V4
         kv_scale_cache = None
         fp8_2buff = False
         kv_cache_rope = None
@@ -295,6 +299,8 @@ class CompressorBackendMixin:
             assert compress_kv_pool is not None
             kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
+            kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
         self._forward_compress_all_in_one(
@@ -316,6 +322,7 @@ class CompressorBackendMixin:
             rope_cache=(
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
             ),
+            kv_layout=kv_layout,
             fp8_2buff=fp8_2buff,
             kv_cache_rope=(
                 None if kv_cache_rope is None else kv_cache_rope.view(dtype=torch.uint8)

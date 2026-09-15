@@ -46,11 +46,10 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
     is_aborted,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
@@ -239,7 +238,6 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -297,13 +295,6 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
-
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            # V4's KVCache is organized by compression-ratio
-            # buckets rather than by layer.
-            kv_args.mla_compression_ratios = list(
-                self.token_to_kv_pool.compression_ratios
-            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -1372,19 +1363,10 @@ class SchedulerDisaggregationPrefillMixin:
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = (
-                    1
-                    if online
-                    else self.token_to_kv_pool_allocator.get_kvcache().get_ring_size(
-                        128
-                    )
-                )
-                return get_dsv4_c128_state_indices(
+                return get_dsv4_request_state_indices(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
                     int(req.kv.req_pool_idx),
                     c128_seq_len,
-                    online=online,
-                    ring_size=ring_size,
                 )
 
             state_types = (
