@@ -3,11 +3,21 @@ from __future__ import annotations
 import logging
 import time
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.openai.output_padding import OutputPaddingPlan
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -65,7 +75,63 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
 
+        return self._validate_padded_output_budget(request)
+
+    def _validate_padded_output_budget(
+        self, request: CompletionRequest
+    ) -> Optional[str]:
+        target = get_serving().padded_output_tokens
+        if target is None:
+            return None
+        # Strictly greater, not >=: the emitted run is clamped at max_new_tokens
+        # inclusively, so a budget of exactly the target can never overrun it.
+        if request.max_tokens > target:
+            return (
+                f"max_tokens ({request.max_tokens}) exceeds --padded-output-tokens "
+                f"({target}). This server pads every completion to exactly {target} "
+                "tokens and cannot admit a request that could outrun that."
+            )
+        if self._pad_token_id() is None:
+            return (
+                "--padded-output-tokens is set but this model exposes no "
+                "eos_token_id to pad with, so output padding cannot be applied."
+            )
+        if request.echo:
+            # Echo replays the prompt through the completion stream, which the
+            # padding does not cover, and with logprobs it prepends the input
+            # positions into the payload the per-token split consumes.
+            return (
+                "echo is not supported with --padded-output-tokens: the echoed "
+                "prompt is not padded and would carry the prompt's own length."
+            )
         return None
+
+    def _pad_token_id(self) -> Optional[int]:
+        # hf_eos_token_id is a set, whose iteration order is arbitrary; min pins
+        # the pad id so it does not vary between restarts.
+        eos_ids = self.tokenizer_manager.model_config.hf_eos_token_id
+        if not eos_ids:
+            return None
+        return min(eos_ids)
+
+    def _build_padding_plan(
+        self, request: CompletionRequest
+    ) -> Optional[OutputPaddingPlan]:
+        target = get_serving().padded_output_tokens
+        if target is None:
+            return None
+        pad_token_id = self._pad_token_id()
+        if pad_token_id is None:
+            raise ValueError(
+                "--padded-output-tokens is set but this model exposes no eos_token_id."
+            )
+        return OutputPaddingPlan.build(
+            target_tokens=target,
+            pad_token_id=pad_token_id,
+            pad_token_text=self.tokenizer_manager.tokenizer.decode([pad_token_id]),
+            return_logprob=request.logprobs is not None,
+            top_logprobs_width=request.logprobs or 0,
+        )
 
     def _convert_to_internal_request(
         self,
@@ -219,6 +285,122 @@ class OpenAIServingCompletion(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
+    def _stream_frame(
+        self,
+        *,
+        request: CompletionRequest,
+        response_id: str,
+        created: int,
+        choice: CompletionResponseStreamChoice,
+        usage: Optional[Any] = None,
+    ) -> str:
+        chunk = CompletionStreamResponse(
+            id=response_id,
+            created=created,
+            object="text_completion",
+            choices=[choice],
+            model=request.model,
+        )
+        if usage is not None:
+            chunk.usage = usage
+        return f"data: {chunk.model_dump_json()}\n\n"
+
+    def _chunk_token_count(self, content: Dict[str, Any], already_framed: int) -> int:
+        output_ids = content.get("output_ids")
+        if output_ids is None:
+            return max(
+                0, content["meta_info"].get("completion_tokens", 0) - already_framed
+            )
+        if get_serving().incremental_streaming_output:
+            return len(output_ids)
+        return max(0, len(output_ids) - already_framed)
+
+    def _pad_run_frames(
+        self,
+        *,
+        request: CompletionRequest,
+        response_id: str,
+        created: int,
+        index: int,
+        padding: OutputPaddingPlan,
+        wire_tokens: Dict[int, int],
+        manager_tokens: int,
+        prompt_tokens: int,
+        reasoning_tokens: int,
+        continuous_usage_stats: bool,
+        carry_text: str = "",
+        carry_prompt_token_ids: Optional[List[int]] = None,
+    ) -> Iterator[str]:
+        framed = wire_tokens[index]
+        # Unreachable while the budget check stands, since that admits only
+        # max_tokens <= target. Reaching it means the bound broke, so refuse to
+        # report a padded count for a completion that outran the target. The real
+        # frames are already on the wire by now, so what this refuses is the false
+        # count, not the leak itself.
+        if max(framed, manager_tokens) > padding.target_tokens:
+            raise RuntimeError(
+                f"completion outran --padded-output-tokens: {framed} tokens framed "
+                f"and manager reported {manager_tokens}, target "
+                f"{padding.target_tokens}"
+            )
+
+        def usage_for(count: int) -> Optional[Any]:
+            if not continuous_usage_stats:
+                return None
+            return UsageProcessor.calculate_token_usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=count,
+                reasoning_tokens=reasoning_tokens,
+            )
+
+        for pad_offset in range(padding.pad_count(framed)):
+            wire_tokens[index] += 1
+            first = pad_offset == 0
+            yield self._stream_frame(
+                request=request,
+                response_id=response_id,
+                created=created,
+                choice=CompletionResponseStreamChoice(
+                    index=index,
+                    # Pad frames add no text of their own: the run moves the token
+                    # and frame counts, and emitting the terminal token's text
+                    # would change the completion the client reassembles.
+                    text=(carry_text if first else ""),
+                    logprobs=(
+                        padding.filler_logprobs() if padding.return_logprob else None
+                    ),
+                    finish_reason=None,
+                    matched_stop=None,
+                    token_ids=(
+                        [padding.pad_token_id] if request.return_token_ids else None
+                    ),
+                    prompt_token_ids=(carry_prompt_token_ids if first else None),
+                ),
+                usage=usage_for(wire_tokens[index]),
+            )
+        if padding.pad_count(framed):
+            carry_text, carry_prompt_token_ids = "", None
+
+        # Unpadded, the terminal frame is the last thing that tracks the verdict:
+        # a completion ending on its own token stops with "stop" and names the
+        # matched sequence, one filling the budget stops with "length". Every
+        # padded completion emits exactly target_tokens, so "length" is constant
+        # and true.
+        yield self._stream_frame(
+            request=request,
+            response_id=response_id,
+            created=created,
+            choice=CompletionResponseStreamChoice(
+                index=index,
+                text=carry_text,
+                logprobs=None,
+                finish_reason="length",
+                matched_stop=None,
+                prompt_token_ids=carry_prompt_token_ids,
+            ),
+            usage=usage_for(wire_tokens[index]),
+        )
+
     async def _generate_completion_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -242,6 +424,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
         routed_experts = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
+
+        padding = self._build_padding_plan(request)
+        # Tokens actually framed onto the wire, per index. Distinct from
+        # completion_tokens, which mirrors whatever the manager reports and can
+        # run ahead of what this loop emitted; the pad count must be derived
+        # from the emitted figure or the padded total drifts off the target.
+        wire_tokens = {}
+        # Chunk-scoped payload from a chunk that carried no new token. The offsets
+        # feeding it have already advanced, so it has to ride the next frame or it
+        # is lost; a zero-token completion has no next real frame, only pads.
+        pending_text = {}
+        pending_prompt_ids = {}
+        aborted = False
 
         stream_started = False
         try:
@@ -352,6 +547,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
                 # in tokenizer_manager._handle_abort_finish_reason.
+                if finish_reason_type == "abort":
+                    # Exempt from padding, including the graceful variant that
+                    # falls through below: an abort is not content-correlated, and
+                    # padding it would relabel a cancelled request as a normal
+                    # length-capped completion and hide the cancellation.
+                    aborted = True
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
@@ -364,37 +565,123 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     yield f"data: {error}\n\n"
                     break
 
-                choice_data = CompletionResponseStreamChoice(
-                    index=index,
-                    text=delta,
-                    logprobs=logprobs,
-                    finish_reason=finish_reason_type,
-                    matched_stop=(
-                        finish_reason["matched"]
-                        if finish_reason and "matched" in finish_reason
-                        else None
-                    ),
-                    token_ids=chunk_token_ids,
-                    prompt_token_ids=chunk_prompt_token_ids,
-                )
-                chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=created,
-                    object="text_completion",
-                    choices=[choice_data],
-                    model=request.model,
-                )
-
-                # Add usage stats if continuous_usage_stats is enabled
-                if continuous_usage_stats:
-                    chunk.usage = UsageProcessor.calculate_token_usage(
-                        prompt_tokens=prompt_tokens.get(index, 0),
-                        completion_tokens=completion_tokens.get(index, 0),
-                        reasoning_tokens=reasoning_tokens.get(index, 0),
+                if padding is None or aborted:
+                    choice_data = CompletionResponseStreamChoice(
+                        index=index,
+                        text=delta,
+                        logprobs=logprobs,
+                        finish_reason=finish_reason_type,
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
+                        ),
+                        token_ids=chunk_token_ids,
+                        prompt_token_ids=chunk_prompt_token_ids,
+                    )
+                    chunk = CompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=created,
+                        object="text_completion",
+                        choices=[choice_data],
+                        model=request.model,
                     )
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
-                stream_started = True
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if continuous_usage_stats:
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                            reasoning_tokens=reasoning_tokens.get(index, 0),
+                        )
+
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    stream_started = True
+                    continue
+
+                # Register the choice even on a chunk carrying no new token, so a
+                # completion that emits nothing still gets a full pad run.
+                wire_tokens.setdefault(index, 0)
+                emitted = wire_tokens[index]
+                new_tokens = self._chunk_token_count(content, emitted)
+
+                group_text = pending_text.pop(index, "") + delta
+                carry_prompt_ids = pending_prompt_ids.pop(index, None)
+                if chunk_prompt_token_ids is not None:
+                    carry_prompt_ids = chunk_prompt_token_ids
+                if new_tokens == 0:
+                    if group_text:
+                        pending_text[index] = group_text
+                    if carry_prompt_ids is not None:
+                        pending_prompt_ids[index] = carry_prompt_ids
+                    continue
+
+                position_logprobs = (
+                    padding.per_position_logprobs(logprobs, new_tokens)
+                    if padding.return_logprob
+                    else [None] * new_tokens
+                )
+                # One frame per token; the manager merges decode steps into a single
+                # delta when the consumer lags, and an unsplit delta would leave the
+                # frame count tracking the real length. Terminal frame comes with
+                # the pad run.
+                for offset_in_chunk in range(new_tokens):
+                    wire_tokens[index] = emitted + offset_in_chunk + 1
+                    yield self._stream_frame(
+                        request=request,
+                        response_id=content["meta_info"]["id"],
+                        created=created,
+                        choice=CompletionResponseStreamChoice(
+                            index=index,
+                            # The delta rides the group's last frame; slicing
+                            # detokenized text per id would not reassemble
+                            # byte-exactly for multi-token characters.
+                            text=(
+                                group_text if offset_in_chunk == new_tokens - 1 else ""
+                            ),
+                            logprobs=position_logprobs[offset_in_chunk],
+                            finish_reason=None,
+                            matched_stop=None,
+                            token_ids=(
+                                [chunk_token_ids[offset_in_chunk]]
+                                if chunk_token_ids is not None
+                                and offset_in_chunk < len(chunk_token_ids)
+                                else None
+                            ),
+                            prompt_token_ids=(
+                                carry_prompt_ids if offset_in_chunk == 0 else None
+                            ),
+                        ),
+                        usage=(
+                            UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=wire_tokens[index],
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
+                            )
+                            if continuous_usage_stats
+                            else None
+                        ),
+                    )
+                    stream_started = True
+
+            if padding is not None and wire_tokens and not aborted:
+                for index in sorted(wire_tokens):
+                    for pad_frame in self._pad_run_frames(
+                        request=request,
+                        response_id=content["meta_info"]["id"],
+                        created=created,
+                        index=index,
+                        padding=padding,
+                        wire_tokens=wire_tokens,
+                        manager_tokens=completion_tokens.get(index, 0),
+                        prompt_tokens=prompt_tokens.get(index, 0),
+                        reasoning_tokens=reasoning_tokens.get(index, 0),
+                        continuous_usage_stats=continuous_usage_stats,
+                        carry_text=pending_text.pop(index, ""),
+                        carry_prompt_token_ids=pending_prompt_ids.pop(index, None),
+                    ):
+                        stream_started = True
+                        yield pad_frame
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -470,10 +757,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
             # Handle final usage chunk
             if include_usage:
+                # An honest count hands back the exact completion length the
+                # padding exists to hide, so report what was framed instead.
+                reported_completion_tokens = (
+                    wire_tokens
+                    if padding is not None and not aborted
+                    else completion_tokens
+                )
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     reasoning_tokens,
-                    completion_tokens,
+                    reported_completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=get_serving().enable_cache_report,
