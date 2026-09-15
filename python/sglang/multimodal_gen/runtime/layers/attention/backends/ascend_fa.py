@@ -1,4 +1,3 @@
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +34,15 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
         return None
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
         return None
+
+    is_a5 = torch_npu.npu.get_soc_version() >= 260
+    if not is_a5:
+        logger.warning_once(
+            "MXFP8 attention is disabled because MXFP8 quantization is only "
+            "supported on Ascend 950 (A5) devices."
+        )
+        return None
+
     required_apis = (
         "npu_dynamic_mx_quant",
         "npu_fused_infer_attention_score_v2",
@@ -42,8 +50,9 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
     missing_apis = [name for name in required_apis if not hasattr(torch_npu, name)]
     if missing_apis:
         logger.warning_once(
-            "MXFP8 attention is disabled because torch_npu lacks: "
-            + ", ".join(missing_apis)
+            "MXFP8 attention is disabled because the installed torch_npu does not "
+            f"provide the required APIs: {', '.join(missing_apis)}. "
+            "Please install torch==2.10.0, torch_npu>=2.10.0.post4, and CANN>=9.1.1."
         )
         return None
     return "MXFP8"
@@ -206,7 +215,6 @@ class AscendFAMetadataBuilder(AttentionMetadataBuilder):
 
 
 class AscendFABackend(AttentionBackend):
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.FA
@@ -231,7 +239,9 @@ class AscendFABackend(AttentionBackend):
 
 
 class AscendFAImpl(AttentionImpl):
-
+    # npu_fused_infer_attention_score_v2 requires per-token-group
+    # quantization (mode 6) for Q/K and per-channel-group quantization (mode 8) for V.
+    # Only TND input lauout is available for MXFP8 scenario.
     _MXFP8_FA_PARAMS = {
         "q_quant_mode": 6,
         "k_quant_mode": 6,
@@ -240,8 +250,12 @@ class AscendFAImpl(AttentionImpl):
         "v_quant_axis": 0,
         "layout": "TND",
     }
+    # Online Q/K rotations are deterministic CPU FP32 tensors shared
+    # by all backend instances and keyed by head size. Applying the same
+    # orthogonal matrix R preserves scores because R @ R.T = I.
+    # (Q @ R) @ (K @ R).T = Q @ R @ R.T @ K = Q @ R.
+    # Offline ModelSlim checkpoint rotations are supplied by the model now.
     _rot_matrices: dict[int, torch.Tensor] = {}
-    _use_sub_head = int(os.getenv("USE_SUB_HEAD", "5"))
 
     def __init__(
         self,
@@ -267,8 +281,12 @@ class AscendFAImpl(AttentionImpl):
         )
         if self._quant_scheme is not None:
             self._head_size = head_size
-            self._ensure_rot_matrix(head_size)
-            self._rot_device: torch.Tensor | None = None
+            self._mxfp8_head_chunk_size = (
+                envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
+            )
+            if not self.use_offline_qk_rotation:
+                self._ensure_rot_matrix(head_size)
+                self._rot_device: torch.Tensor | None = None
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -465,10 +483,11 @@ class AscendFAImpl(AttentionImpl):
         if num_heads != num_kv_heads:
             raise NotImplementedError("MXFP8 attention currently requires MHA")
 
-        sub_heads = self._use_sub_head
-        if sub_heads > 0 and num_heads > sub_heads:
-            head_groups = [sub_heads] * (num_heads // sub_heads)
-            if remainder := num_heads % sub_heads:
+        head_chunk_size = self._mxfp8_head_chunk_size
+        if head_chunk_size > 0 and num_heads > head_chunk_size:
+            num_groups, remainder = divmod(num_heads, head_chunk_size)
+            head_groups = [head_chunk_size] * num_groups
+            if remainder:
                 head_groups.append(remainder)
             outputs = [
                 self._run_mxfp8_attention(

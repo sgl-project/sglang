@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
@@ -232,10 +233,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
     # Otherwise rotation matrix are generating online
-    # Default value for MXFP8Config false, for ``ModelSlimConfig`` true
     "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "false"
     ),
+    # Number of attention heads processed by each MXFP8 FA call.
+    # Smaller chunks can improve performance for large head counts
+    # The default value set to 4 is better for video generation
+    # For image generation task depends on image quality and the model config
+    "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(

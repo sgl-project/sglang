@@ -36,7 +36,6 @@ MXFP4_PACK_FACTOR = 2
 
 
 class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
-
     def __init__(
         self,
         quant_config: dict,
