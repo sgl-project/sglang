@@ -8,6 +8,30 @@ from typing import Any
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+# Lossy TeaCache calibrated via tools/teacache_calibrate.py (approximate, not
+# lossless: H3 packs video+audio at different timesteps per forward). Fit on 8
+# prompts, not the docs' >=50 (H3 generations are costly); usable ~1.9x, but
+# recalibrate on a richer prompt set for production coefficients.
+_MINIMAX_H3_COEFFICIENTS: list[float] = [
+    3775.2598779287778,
+    -897.482439152355,
+    3.3772464974753396,
+    6.8652441864960725,
+    -0.018736050605533083,
+]
+_MINIMAX_H3_TEACACHE_THRESH = 0.27
+
+
+def _minimax_h3_teacache_params() -> TeaCacheParams:
+    return TeaCacheParams(
+        teacache_thresh=_MINIMAX_H3_TEACACHE_THRESH,
+        start_skipping=2,
+        end_skipping=-1,
+        coefficients=list(_MINIMAX_H3_COEFFICIENTS),
+    )
+
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -57,6 +81,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
+    teacache_params: TeaCacheParams = field(default_factory=_minimax_h3_teacache_params)
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -235,11 +260,6 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_upscaling: the accepted "
                 "delivery contract is the resolved target canvas"
             )
-        if self.enable_teacache:
-            raise ValueError(
-                "MiniMax H3 does not support enable_teacache: its packed "
-                "video/audio denoise loop has no lossless TeaCache contract"
-            )
         if self.rollout:
             raise ValueError(
                 "MiniMax H3 does not support rollout: its coupled video/audio "
@@ -249,6 +269,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
             raise ValueError(
                 "MiniMax H3 does not support trajectory output for its coupled "
                 "video/audio denoise state"
+            )
+        if self.enable_teacache and self.quality == "lossless":
+            raise ValueError(
+                "MiniMax H3 TeaCache is lossy and conflicts with "
+                "quality='lossless' (the exact-reference contract); request a "
+                "non-lossless quality tier to enable it"
             )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
