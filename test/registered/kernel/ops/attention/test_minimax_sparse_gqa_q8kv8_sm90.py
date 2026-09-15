@@ -125,6 +125,84 @@ def _reference(
 
 
 @pytest.mark.skipif(
+    not is_sm90_supported(), reason="native Q8KV8 score-only prefill requires SM90 CUDA"
+)
+def test_native_q8kv8_score_handles_varlen_paged_batches():
+    native_module = importlib.import_module(MODULE_NAME)
+    torch.manual_seed(11)
+    device = "cuda"
+    q_lens = [7, 65]
+    seq_values = [130, 257]
+    prefix_values = [123, 192]
+    total_q = sum(q_lens)
+    num_q_heads = 8
+    max_seq_len = max(seq_values)
+    page_size = 128
+    page_counts = [(seq_len + page_size - 1) // page_size for seq_len in seq_values]
+    max_slots = sum(page_counts) * page_size
+
+    q = (torch.randn(total_q, num_q_heads, 128, device=device) * 0.2).to(FP8)
+    k = (torch.randn(max_slots, 1, 128, device=device) * 0.2).to(FP8)
+    req_to_token = torch.zeros(
+        len(q_lens), max_seq_len, dtype=torch.int32, device=device
+    )
+    page_offset = 0
+    for batch, (seq_len, page_count) in enumerate(zip(seq_values, page_counts)):
+        page_order = torch.randperm(page_count, device=device) + page_offset
+        slots = (
+            page_order[:, None] * page_size
+            + torch.arange(page_size, device=device, dtype=torch.int64)[None, :]
+        ).reshape(-1)
+        req_to_token[batch, :seq_len] = slots[:seq_len].to(torch.int32)
+        page_offset += page_count
+
+    slot_ids = torch.arange(len(q_lens), dtype=torch.int64, device=device)
+    cu_seqlens = torch.tensor([0, q_lens[0], total_q], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor(seq_values, dtype=torch.int32, device=device)
+    prefix_lens = torch.tensor(prefix_values, dtype=torch.int32, device=device)
+    sm_scale = 128**-0.5
+    q_scale, k_scale = 0.75, 1.25
+
+    actual = native_module.sgl_native_q8kv8_sparse_prefill_score(
+        q=q,
+        k_cache=k,
+        req_to_token=req_to_token,
+        slot_ids=slot_ids,
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        max_seqlen_k=max_seq_len,
+        block_size_k=128,
+        page_size=128,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+    )
+
+    expected = torch.full_like(actual, float("-inf"))
+    for batch, q_len in enumerate(q_lens):
+        q_start = cu_seqlens[batch].item()
+        for local_q in range(q_len):
+            q_idx = q_start + local_q
+            q_position = prefix_values[batch] + local_q
+            for q_head in range(num_q_heads):
+                for block in range(math.ceil(seq_values[batch] / 128)):
+                    begin = block * 128
+                    end = min(begin + 128, seq_values[batch], q_position + 1)
+                    if begin >= end:
+                        continue
+                    slots = req_to_token[batch, begin:end].long()
+                    logits = k[slots, 0].float() @ q[q_idx, q_head].float()
+                    expected[q_head, q_idx, block] = (
+                        logits.max() * sm_scale * q_scale * k_scale
+                    )
+
+    assert actual.dtype == torch.float32
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
     not is_sm90_supported(), reason="native Q8KV8 sparse GQA requires SM90 CUDA"
 )
 @pytest.mark.parametrize(

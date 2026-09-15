@@ -17,7 +17,9 @@ constexpr int kHeadDim = 128;
 constexpr int kBlockSize = 128;
 constexpr int kMmaRows = 64;
 constexpr int kTokenTile = 64;
+constexpr int kScoreTokenTile = 128;
 constexpr int kNumStages = 2;
+constexpr int kQueriesPerCta = 64;
 constexpr int kWarpGroupSize = cutlass::NumThreadsPerWarpGroup;
 
 enum NamedBarriers : uint32_t {
@@ -38,10 +40,15 @@ using SmemLayoutQ = decltype(coalesce(
 using SmemLayoutK = decltype(coalesce(
     tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<kTokenTile>, Int<kHeadDim>>{}, Step<_1, _2>{}),
     Shape<_1, _1>{}));
+using SmemLayoutScoreK = decltype(coalesce(
+    tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<kScoreTokenTile>, Int<kHeadDim>>{}, Step<_1, _2>{}),
+    Shape<_1, _1>{}));
 using SmemLayoutVt = decltype(coalesce(
     tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<kHeadDim>, Int<kTokenTile>>{}, Step<_1, _2>{}),
     Shape<_1, _1>{}));
 using TiledMmaQK = decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+using TiledMmaScoreQK =
+    decltype(make_tiled_mma(GMMA::MMA_64x128x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
 using TiledMmaPV = decltype(make_tiled_mma(GMMA::MMA_64x128x32_F32E4M3E4M3_RS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
 
 struct SharedStorage {
@@ -53,6 +60,16 @@ struct SharedStorage {
   alignas(8) uint64_t kv_ready[kNumStages];
   int32_t batch;
   int32_t q_position;
+  int32_t seq_len;
+  int32_t physical_page_start;
+  int64_t request;
+};
+
+struct ScoreSharedStorage {
+  array_aligned<fp8_t, cosize_v<SmemLayoutQ>> q;
+  array_aligned<fp8_t, cosize_v<SmemLayoutScoreK>> k;
+  bool valid[kScoreTokenTile];
+  alignas(8) uint64_t score_k_ready;
   int32_t seq_len;
   int32_t physical_page_start;
   int64_t request;
@@ -157,6 +174,41 @@ __device__ __forceinline__ void load_kv_tile(
     tma_load_3d(&sK(0, kHeadDim / 2), &tma.k, 0, physical_slot, kv_head * 2 + 1, &storage.kv_ready[stage]);
     tma_load_3d(&sV(0, 0), &tma.v, 0, physical_slot, kv_head * 2, &storage.kv_ready[stage]);
     tma_load_3d(&sV(0, kHeadDim / 2), &tma.v, 0, physical_slot, kv_head * 2 + 1, &storage.kv_ready[stage]);
+  }
+}
+
+__device__ __forceinline__ void load_k_tile(
+    ScoreSharedStorage& storage,
+    const TmaParams& tma,
+    const int32_t* req_to_token,
+    int selected_block,
+    int kv_head,
+    int max_slots,
+    int req_stride,
+    int tid) {
+  Tensor sK = make_tensor(make_smem_ptr(storage.k.data()), SmemLayoutScoreK{});
+
+  if (tid < kScoreTokenTile) {
+    const int logical_position = selected_block * kBlockSize + tid;
+    storage.valid[tid] = logical_position < storage.seq_len;
+  }
+  if (tid == 0) {
+    const int logical_block_start = selected_block * kBlockSize;
+    int first_slot = req_to_token[storage.request * static_cast<int64_t>(req_stride) + logical_block_start];
+    if (first_slot < 0) {
+      first_slot += max_slots;
+    } else if (first_slot >= max_slots) {
+      first_slot -= max_slots;
+    }
+    storage.physical_page_start = first_slot;
+
+    constexpr uint32_t kTransactionBytes = kScoreTokenTile * kHeadDim * sizeof(fp8_t);
+    mbarrier_arrive_expect_tx(&storage.score_k_ready, kTransactionBytes);
+    tma_load_3d(&sK(0, 0), &tma.k, 0, storage.physical_page_start, kv_head * 2, &storage.score_k_ready);
+    tma_load_3d(&sK(0, kHeadDim / 2), &tma.k, 0, storage.physical_page_start, kv_head * 2 + 1, &storage.score_k_ready);
+    tma_load_3d(&sK(64, 0), &tma.k, 0, storage.physical_page_start + 64, kv_head * 2, &storage.score_k_ready);
+    tma_load_3d(
+        &sK(64, kHeadDim / 2), &tma.k, 0, storage.physical_page_start + 64, kv_head * 2 + 1, &storage.score_k_ready);
   }
 }
 
@@ -379,6 +431,123 @@ __global__ void fp8_mha_fwd_q8kv8_kernel(
 #endif
 }
 
+__global__ void fp8_mha_score_q8k8_kernel(
+    float* __restrict__ score,
+    const fp8_t* __restrict__ q,
+    const fp8_t* __restrict__ k_cache,
+    const int32_t* __restrict__ req_to_token,
+    const int64_t* __restrict__ slot_ids,
+    const int32_t* __restrict__ cu_seqlens,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ prefix_lens,
+    __grid_constant__ const TmaParams tma,
+    int total_q,
+    int num_q_heads,
+    int num_kv_heads,
+    int max_slots,
+    int req_stride,
+    int max_seqblocks,
+    int batch_size,
+    int max_q_tiles,
+    int64_t q_stride_0,
+    int64_t q_stride_1,
+    int64_t q_stride_2,
+    float effective_sm_scale) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+  const int batch_q_tile = blockIdx.x;
+  const int batch = batch_q_tile / max_q_tiles;
+  const int q_tile = batch_q_tile % max_q_tiles;
+  const int q_head = blockIdx.y;
+  const int k_block = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int group_size = num_q_heads / num_kv_heads;
+  const int kv_head = q_head / group_size;
+  const int q_begin = cu_seqlens[batch] + q_tile * kQueriesPerCta;
+  const int q_end = min(cu_seqlens[batch + 1], q_begin + kQueriesPerCta);
+  const int q_count = q_end - q_begin;
+  if (q_count <= 0) {
+    return;
+  }
+  const int block_count = (seq_lens[batch] + kBlockSize - 1) / kBlockSize;
+  if (k_block >= block_count) {
+    return;
+  }
+
+  extern __shared__ char smem[];
+  ScoreSharedStorage& storage = *reinterpret_cast<ScoreSharedStorage*>(smem);
+  Tensor sQ = make_tensor(make_smem_ptr(storage.q.data()), SmemLayoutQ{});
+
+  if (tid == 0) {
+    storage.seq_len = seq_lens[batch];
+    storage.request = slot_ids[batch];
+    mbarrier_init(&storage.score_k_ready);
+    fence_mbarrier_init();
+  }
+
+  constexpr int kVectorsPerRow = kHeadDim / 16;
+  for (int vector_idx = tid; vector_idx < kMmaRows * kVectorsPerRow; vector_idx += blockDim.x) {
+    const int row = vector_idx / kVectorsPerRow;
+    const int col = (vector_idx % kVectorsPerRow) * 16;
+    fp8_t* dst = &sQ(row, col);
+    if (row < q_count) {
+      const int q_idx = q_begin + row;
+      const int64_t q_offset = static_cast<int64_t>(q_idx) * q_stride_0 + static_cast<int64_t>(q_head) * q_stride_1 +
+                               static_cast<int64_t>(col) * q_stride_2;
+      copy_q_16B(dst, q + q_offset, true);
+    } else {
+      copy_q_16B(dst, nullptr, false);
+    }
+  }
+  warpgroup_sync();
+
+  Tensor rP = partition_fragment_C(TiledMmaScoreQK{}, Shape<Int<kMmaRows>, Int<kScoreTokenTile>>{});
+  load_k_tile(storage, tma, req_to_token, k_block, kv_head, max_slots, req_stride, tid);
+  mbarrier_wait(&storage.score_k_ready, 0);
+  warpgroup_sync();
+
+  Tensor sK = make_tensor(make_smem_ptr(storage.k.data()), SmemLayoutScoreK{});
+  sm90::gemm_ss(true, TiledMmaScoreQK{}, sQ, sK, rP, tid);
+  warpgroup_commit_batch();
+  warpgroup_wait<0>();
+  warpgroup_fence_operand(rP);
+
+  float block_max[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+  for (int row_idx = 0; row_idx < 2; ++row_idx) {
+    const int row = sm90::get_AorC_row_idx(row_idx, tid);
+    const int q_position = prefix_lens[batch] + q_tile * kQueriesPerCta + row;
+    float tile_max = -INFINITY;
+#pragma unroll
+    for (int i = row_idx * 2; i < size(rP); i += 4) {
+      const int col = 8 * (i / 4) + (tid % 4) * 2;
+      const int logical_position = k_block * kBlockSize + col;
+      const bool valid_row = row < q_count;
+      const float v0 = valid_row && storage.valid[col] && logical_position <= q_position ? rP(i) : -INFINITY;
+      const float v1 =
+          valid_row && storage.valid[col + 1] && logical_position + 1 <= q_position ? rP(i + 1) : -INFINITY;
+      tile_max = max(tile_max, max(v0, v1));
+    }
+    tile_max = max(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+    tile_max = max(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+    block_max[row_idx] = tile_max;
+  }
+
+#pragma unroll
+  for (int row_idx = 0; row_idx < 2; ++row_idx) {
+    const int row = sm90::get_AorC_row_idx(row_idx, tid);
+    if (row < q_count && (tid % 4) == 0) {
+      const int q_idx = q_begin + row;
+      score[(static_cast<int64_t>(q_head) * total_q + q_idx) * max_seqblocks + k_block] =
+          block_max[row_idx] * effective_sm_scale;
+    }
+  }
+#else
+  if (cute::thread0()) {
+    CUTE_INVALID_CONTROL_PATH("fp8_mha_score_q8k8_kernel requires sm90");
+  }
+#endif
+}
+
 inline void launch_fp8_mha_fwd_q8kv8_sm90(
     bf16_t* output,
     const fp8_t* q,
@@ -458,6 +627,78 @@ inline void launch_fp8_mha_fwd_q8kv8_sm90(
       q_stride_2,
       effective_sm_scale,
       v_scale);
+}
+
+inline void launch_fp8_mha_score_q8k8_sm90(
+    float* score,
+    const fp8_t* q,
+    const fp8_t* k_cache,
+    const int32_t* req_to_token,
+    const int64_t* slot_ids,
+    const int32_t* cu_seqlens,
+    const int32_t* seq_lens,
+    const int32_t* prefix_lens,
+    int total_q,
+    int num_q_heads,
+    int num_kv_heads,
+    int max_slots,
+    int req_stride,
+    int max_seqblocks,
+    int batch_size,
+    int64_t q_stride_0,
+    int64_t q_stride_1,
+    int64_t q_stride_2,
+    float effective_sm_scale,
+    cudaStream_t stream) {
+  TmaParams tma{};
+  uint64_t size[3] = {
+      static_cast<uint64_t>(kHeadDim / 2), static_cast<uint64_t>(max_slots), static_cast<uint64_t>(2 * num_kv_heads)};
+  uint64_t stride[2] = {
+      static_cast<uint64_t>(kHeadDim) * static_cast<uint64_t>(num_kv_heads) * sizeof(fp8_t),
+      static_cast<uint64_t>((kHeadDim / 2) * sizeof(fp8_t))};
+  uint32_t box_size[3] = {kHeadDim / 2, kTokenTile, 1};
+  uint32_t elem_stride[3] = {1, 1, 1};
+  CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+      &tma.k,
+      CU_TENSOR_MAP_DATA_TYPE_UINT8,
+      3,
+      const_cast<fp8_t*>(k_cache),
+      size,
+      stride,
+      box_size,
+      elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_64B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  KU_ASSERT(result == CUDA_SUCCESS);
+
+  auto kernel = &fp8_mha_score_q8k8_kernel;
+  constexpr size_t smem_size = sizeof(ScoreSharedStorage);
+  KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  const int max_q_tiles = (total_q + kQueriesPerCta - 1) / kQueriesPerCta;
+  kernel<<<dim3(batch_size * max_q_tiles, num_q_heads, max_seqblocks), kWarpGroupSize, smem_size, stream>>>(
+      score,
+      q,
+      k_cache,
+      req_to_token,
+      slot_ids,
+      cu_seqlens,
+      seq_lens,
+      prefix_lens,
+      tma,
+      total_q,
+      num_q_heads,
+      num_kv_heads,
+      max_slots,
+      req_stride,
+      max_seqblocks,
+      batch_size,
+      max_q_tiles,
+      q_stride_0,
+      q_stride_1,
+      q_stride_2,
+      effective_sm_scale);
 }
 
 }  // namespace q8kv8_sm90

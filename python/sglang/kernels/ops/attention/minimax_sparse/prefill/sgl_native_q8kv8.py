@@ -21,7 +21,10 @@ def _jit_native_q8kv8_module() -> Module:
     return load_jit(
         "minimax_sparse_gqa_q8kv8_sm90",
         cuda_files=["attention/minimax_sparse_gqa_q8kv8_sm90.cuh"],
-        cuda_wrappers=[("dispatch", "minimax_sparse_gqa_q8kv8_sm90")],
+        cuda_wrappers=[
+            ("dispatch", "minimax_sparse_gqa_q8kv8_sm90"),
+            ("dispatch_score", "minimax_sparse_gqa_q8kv8_score_sm90"),
+        ],
         extra_cuda_cflags=[
             "-O3",
             "-DNDEBUG",
@@ -173,3 +176,121 @@ def sgl_native_q8kv8_sparse_prefill(
             int(stream),
         )
     return output
+
+
+@torch.no_grad()
+def sgl_native_q8kv8_sparse_prefill_score(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    slot_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_k: int,
+    block_size_k: int,
+    page_size: int,
+    sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Compute FP32 max scores per 128-token block for Triton Step 2."""
+    tensors = {
+        "q": q,
+        "k_cache": k_cache,
+        "req_to_token": req_to_token,
+        "slot_ids": slot_ids,
+        "cu_seqlens": cu_seqlens,
+        "seq_lens": seq_lens,
+        "prefix_lens": prefix_lens,
+    }
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if name != "q" and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if q.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"q must have dtype torch.float8_e4m3fn, got {q.dtype}")
+    if k_cache.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"k_cache must have dtype torch.float8_e4m3fn, got {k_cache.dtype}"
+        )
+    if q.ndim != 3 or k_cache.ndim != 3:
+        raise ValueError("q and k_cache must be rank-3 tensors")
+    if q.stride(-1) != 1:
+        raise ValueError("q last dimension must be contiguous")
+    total_q, num_q_heads, head_dim = q.shape
+    max_slots, num_kv_heads, k_head_dim = k_cache.shape
+    if head_dim != 128 or k_head_dim != 128:
+        raise ValueError("the native Q8KV8 score kernel requires head_dim=128")
+    _validate_page_contract(block_size_k, page_size)
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    group_size = num_q_heads // num_kv_heads
+    if group_size not in (1, 2, 4, 8, 16):
+        raise ValueError(f"unsupported local GQA group size: {group_size}")
+    if req_to_token.dtype != torch.int32:
+        raise ValueError("req_to_token must have dtype torch.int32")
+    if slot_ids.dtype != torch.int64:
+        raise ValueError("slot_ids must have dtype torch.int64")
+    for name, tensor in (
+        ("cu_seqlens", cu_seqlens),
+        ("seq_lens", seq_lens),
+        ("prefix_lens", prefix_lens),
+    ):
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32")
+    batch_size = cu_seqlens.numel() - 1
+    if slot_ids.numel() != batch_size:
+        raise ValueError("slot_ids length must match the prefill batch size")
+    if seq_lens.numel() != batch_size or prefix_lens.numel() != batch_size:
+        raise ValueError("sequence metadata length must match the prefill batch size")
+    if max_seqlen_k <= 0:
+        raise ValueError("max_seqlen_k must be positive")
+    if torch.cuda.get_device_capability(q.device)[0] != 9:
+        raise ValueError("the native Q8KV8 score kernel requires SM90")
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+    max_seqblocks = (int(max_seqlen_k) + block_size_k - 1) // block_size_k
+    score = torch.full(
+        (num_q_heads, total_q, max_seqblocks),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if total_q == 0:
+        return score
+    with torch.cuda.device(q.device):
+        stream = torch._C._cuda_getCurrentRawStream(q.device.index)
+        try:
+            module = _jit_native_q8kv8_module()
+        except (ImportError, RuntimeError) as err:
+            raise SglNativeQ8KV8BuildError(
+                "failed to build or load the native Q8KV8 JIT module"
+            ) from err
+        module.dispatch_score(
+            score,
+            q,
+            k_cache,
+            req_to_token,
+            slot_ids,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            int(total_q),
+            int(num_q_heads),
+            int(num_kv_heads),
+            int(max_slots),
+            int(req_to_token.shape[1]),
+            int(max_seqblocks),
+            int(batch_size),
+            int(q.stride(0)),
+            int(q.stride(1)),
+            int(q.stride(2)),
+            float(sm_scale),
+            _unit_scale(q_scale),
+            _unit_scale(k_scale),
+            int(stream),
+        )
+    return score
