@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 with patch.dict(
     sys.modules,
@@ -36,7 +37,7 @@ def _backend():
     return backend
 
 
-class TestFlashAttentionPagedMHA(unittest.TestCase):
+class TestFlashAttentionPagedMHA(CustomTestCase):
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
         backend.token_to_kv_pool = SimpleNamespace(
@@ -63,28 +64,75 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertEqual(key_cache.shape, (16, 1, 1, 16))
         self.assertEqual(value_cache.shape, (16, 1, 1, 16))
 
-    def test_prepare_paged_mha_query_reuses_fa_scaling_policy(self):
-        backend = _backend()
-        layer = SimpleNamespace(
-            head_dim=16,
-            k_scale=torch.tensor(2.0),
-            v_scale=torch.tensor(4.0),
-        )
-        q = torch.ones(2, 16, dtype=torch.bfloat16)
+    def test_fa4_bf16_kv_does_not_use_checkpoint_scales(self):
+        for is_prefill in (True, False):
+            for dtype_str in ("bf16", "bfloat16", "auto"):
+                with self.subTest(is_prefill=is_prefill, dtype_str=dtype_str):
+                    backend = _backend()
+                    backend.fa_impl_ver = 4
+                    backend.kv_cache_dtype = torch.bfloat16
+                    backend.kv_cache_dtype_str = dtype_str
+                    layer = SimpleNamespace(
+                        head_dim=16,
+                        k_scale=torch.tensor(2.0),
+                        v_scale=torch.tensor(4.0),
+                    )
+                    q = torch.arange(32, dtype=torch.bfloat16).reshape(2, 16)
+                    q_rope = q + 1
+                    k_rope = q + 2
 
-        q, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
-            q,
-            None,
-            None,
-            layer,
-            logical_batch_size=2,
-            kv_head_num=1,
-            is_prefill=True,
-        )
+                    result = backend.prepare_paged_mha_query(
+                        q,
+                        q_rope,
+                        k_rope,
+                        layer,
+                        logical_batch_size=2,
+                        kv_head_num=1,
+                        is_prefill=is_prefill,
+                    )
 
-        self.assertEqual(q.dtype, torch.float16)
-        self.assertEqual(k_descale.shape, (2, 1))
-        self.assertEqual(v_descale.shape, (2, 1))
+                    for actual, expected in zip(result[:3], (q, q_rope, k_rope)):
+                        torch.testing.assert_close(actual, expected)
+                    self.assertIsNone(result[3])
+                    self.assertIsNone(result[4])
+
+    def test_fp8_query_preserves_existing_scaling_policy(self):
+        for fa_impl_ver, is_prefill in ((3, True), (3, False), (4, False)):
+            for dtype_str, dtype in (
+                ("fp8_e4m3", torch.float8_e4m3fn),
+                ("fp8_e5m2", torch.float8_e5m2),
+            ):
+                with self.subTest(
+                    fa_impl_ver=fa_impl_ver, is_prefill=is_prefill, dtype_str=dtype_str
+                ):
+                    backend = _backend()
+                    backend.fa_impl_ver = fa_impl_ver
+                    backend.kv_cache_dtype = dtype
+                    backend.kv_cache_dtype_str = dtype_str
+                    layer = SimpleNamespace(
+                        head_dim=16,
+                        k_scale=torch.tensor(2.0),
+                        v_scale=torch.tensor(4.0),
+                    )
+                    q = torch.arange(32, dtype=torch.bfloat16).reshape(2, 16)
+
+                    result = backend.prepare_paged_mha_query(
+                        q,
+                        q + 1,
+                        q + 2,
+                        layer,
+                        logical_batch_size=2,
+                        kv_head_num=1,
+                        is_prefill=is_prefill,
+                    )
+
+                    for actual, expected in zip(result[:3], (q, q + 1, q + 2)):
+                        self.assertEqual(actual.dtype, dtype)
+                        torch.testing.assert_close(
+                            actual.float(), expected.to(dtype).float()
+                        )
+                    torch.testing.assert_close(result[3], torch.full((2, 1), 2.0))
+                    torch.testing.assert_close(result[4], torch.full((2, 1), 4.0))
 
 
 if __name__ == "__main__":
