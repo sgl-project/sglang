@@ -281,6 +281,43 @@ class LoRAMemoryPool:
             return self.attn_tp_size
         return self.tp_size
 
+    def _row_parallel_shard_tp(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ) -> int:
+        """Input shard count of a dense row-parallel module, probed from the base linear.
+
+        ``input_size // input_size_per_partition`` is what
+        ``RowParallelLinearWithLoRA.slice_lora_a_weights`` slices by, so the
+        buffer follows the layer's real TP group, e.g. the replicated dense
+        ``down_proj`` under ``--enable-dp-attention --moe-dense-tp-size 1``.
+        Falls back to ``tp_size`` when no module matches.
+        """
+        cache = self.__dict__.setdefault("_row_parallel_tp_cache", {})
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        def _probe(module: torch.nn.Module) -> Optional[int]:
+            in_size = getattr(module, "input_size", None)
+            per_part = getattr(module, "input_size_per_partition", None)
+            if in_size is not None and per_part:
+                return max(1, in_size // per_part)
+            inner = getattr(module, "base_layer", None)
+            if inner is not None and inner is not module:
+                return _probe(inner)
+            return None
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+        suffix = f".{module_name}"
+        shards = None
+        for name, module in base_model.named_modules():
+            if name.endswith(suffix) and any(m in name for m in layer_markers):
+                shards = _probe(module)
+                if shards is not None:
+                    break
+        cache[key] = shards if shards is not None else self.tp_size
+        return cache[key]
+
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
         cfg = base_model.config
@@ -415,7 +452,15 @@ class LoRAMemoryPool:
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            # Dense row-parallel inputs follow the base linear's real shard, not the outer tp_size.
+            if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(
+                module_name
+            ):
+                row_tp = effective_tp_size
+            else:
+                row_tp = self._row_parallel_shard_tp(module_name, base_model, layer_idx)
+            if row_tp > 1:
+                input_dim = divide(input_dim, row_tp)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
