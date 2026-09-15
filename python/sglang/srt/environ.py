@@ -333,6 +333,18 @@ class Envs:
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # ===================================================================
+    # Engine snapshot (process-level capture with CRIU)
+    # ===================================================================
+    # Artifact directory of the snapshot in progress. `sglang snapshot create`
+    # sets it for the engine child; it is not a user-facing knob, and it is
+    # excluded from the artifact's own environment identity.
+    SGLANG_SNAPSHOT_DIR = EnvStr("")
+    # External tools used by `sglang snapshot`, so the commands can be pointed
+    # at wrappers when the binaries are not named or not on PATH.
+    SGLANG_CRIU = EnvStr("criu")
+    SGLANG_CUDA_CHECKPOINT = EnvStr("cuda-checkpoint")
+
+    # ===================================================================
     # HTTP server and health
     # ===================================================================
     # Decompress request bodies tagged with `x-body-compressed`.
