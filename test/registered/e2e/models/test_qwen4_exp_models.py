@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1500, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=628, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "RadixArk/Qwen3.8-Flash-Next-NVFP4"
 

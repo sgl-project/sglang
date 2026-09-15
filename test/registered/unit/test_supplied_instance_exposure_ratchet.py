@@ -58,7 +58,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 # Also on a CUDA runner: the written set is derived by resolving on the running
 # host, and `is_cuda()` / capability gates only open on real hardware. The pin
 # is split by host so both registrations stay exact: `_EXPOSED` is asserted
@@ -70,7 +70,7 @@ register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 # shift the exact sets in ways none of the pinning hosts can verify; the ROCm
 # resolution surface is covered by `test_resolution_is_reproducible.py`
 # instead, whose assertion is device-agnostic.)
-register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
 
 _PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
 

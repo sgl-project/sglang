@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeReq:
