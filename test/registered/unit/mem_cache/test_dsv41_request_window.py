@@ -2,6 +2,7 @@ import pytest
 import torch
 from msgspec.structs import astuple
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.dsv41_request_window import (
     RequestWindow,
     copy_packed_tokens,
@@ -17,6 +18,7 @@ class PackedPool:
     def __init__(self, size, layers, page=4):
         self.size = size
         self.dtype = torch.uint8
+        self.kv_layout = KVLayout.V4
         self.kv_buffer = [
             torch.full(((size + page) // page, page * 584), 219, dtype=torch.uint8)
             for _ in range(layers)

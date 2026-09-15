@@ -67,6 +67,8 @@ class _DSV41Server(CustomTestCase):
                 "--speculative-dspark-block-size",
                 "5",
                 "--enable-decoder-swa-bounded-replay",
+                "--decode-log-interval",
+                "1",
             ]
         cls.process = popen_launch_server(
             cls.model,

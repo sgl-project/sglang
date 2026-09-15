@@ -359,6 +359,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             swa_page_size=128,
             seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
             query_start_loc=torch.tensor([0, 1, 2], **int32),
+            query_pos=torch.tensor([max_seq_len - 1, max_seq_len - 1], **int32),
             swa_token_ids=torch.empty(0, **int32),
             swa_first_pos=torch.zeros(2, **int32),
             swa_gather_lens=torch.zeros(2, **int32),
@@ -471,6 +472,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 backend.model_runner = SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
+                backend.token_to_kv_pool = SimpleNamespace(request_window=None)
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -493,7 +495,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 metadata = backend.forward_metadata
                 if builds:
                     backend._build_sparse_prefill_chunk_cache.assert_called_once_with(
-                        batch, num_qo_tokens=num_qo_tokens
+                        batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
                     )
                     self.assertIs(metadata.sparse_prefill_cache, cache)
                 else:
@@ -515,6 +517,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.model_runner = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH
         )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -732,7 +735,8 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = None
         backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc],
+            request_window=None,
         )
         return backend
 
