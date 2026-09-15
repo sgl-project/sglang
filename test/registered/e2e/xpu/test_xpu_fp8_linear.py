@@ -280,6 +280,17 @@ class TestXPUFP8Linear(CustomTestCase):
         out_torch = torch_w8a8_block_fp8_linear(
             x, weight, block_size, weight_scale, bias=bias
         )
+        weight_scale_post_load = torch.empty_strided(
+            weight_scale.shape,
+            (1, weight_scale.shape[0]),
+            dtype=weight_scale.dtype,
+            device=weight_scale.device,
+        )
+        weight_scale_post_load.copy_(weight_scale)
+        out_post_load = torch_w8a8_block_fp8_linear(
+            x, weight, block_size, weight_scale_post_load, bias=bias
+        )
+        torch.testing.assert_close(out_post_load, out_torch, rtol=0, atol=0)
         q_input, input_scale = per_token_group_quant_fp8(x, block_size[1])
         out_ref = reference_block_fp8_matmul(
             q_input, input_scale, weight, block_size, weight_scale, bias=bias
@@ -303,6 +314,17 @@ class TestXPUFP8Linear(CustomTestCase):
         out = torch_w8a8_block_fp8_linear(
             x, weight, block_size, weight_scale, bias=bias
         )
+        weight_scale_post_load = torch.empty_strided(
+            weight_scale.shape,
+            (1, weight_scale.shape[0]),
+            dtype=weight_scale.dtype,
+            device=weight_scale.device,
+        )
+        weight_scale_post_load.copy_(weight_scale)
+        out_post_load = torch_w8a8_block_fp8_linear(
+            x, weight, block_size, weight_scale_post_load, bias=bias
+        )
+        torch.testing.assert_close(out_post_load, out, rtol=0, atol=0)
         q_input, input_scale = per_token_group_quant_fp8(x, block_size[1])
         ref = reference_block_fp8_matmul(
             q_input, input_scale, weight, block_size, weight_scale, bias
