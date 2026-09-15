@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils import (
     get_jit_cuda_arch,
     is_arch_support_pdl,
     is_hip_runtime,
+    is_pre_ampere_cuda,
     load_jit,
     make_cpp_args,
 )
@@ -30,6 +31,10 @@ def _fast_math_flags() -> list[str]:
 
 @cache_once
 def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
+    if is_pre_ampere_cuda():
+        raise RuntimeError(
+            "CUDA JIT activation is disabled on pre-Ampere GPUs; use AOT/torch"
+        )
     fast_math_flags = _fast_math_flags()
     if not fast_math and not fast_math_flags:
         return activation_module(dtype)
@@ -63,6 +68,25 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
 
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
 SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
+
+
+def _run_activation_aot(
+    op_name: str,
+    input: torch.Tensor,
+    out: torch.Tensor,
+    expert_ids: Optional[torch.Tensor] = None,
+    expert_step: int = 1,
+) -> None:
+    import sgl_kernel
+
+    if expert_ids is not None:
+        raise RuntimeError("filtered activation is not supported on pre-Ampere AOT")
+    fn = {
+        "silu": sgl_kernel.silu_and_mul,
+        "gelu": sgl_kernel.gelu_and_mul,
+        "gelu_tanh": sgl_kernel.gelu_tanh_and_mul,
+    }[op_name]
+    fn(input, out)
 
 
 @register_custom_op(mutates_args=["out"])
@@ -131,6 +155,9 @@ def run_activation(
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
+    if is_pre_ampere_cuda():
+        _run_activation_aot(op_name, input, out, expert_ids, expert_step)
+        return out
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
