@@ -1281,25 +1281,22 @@ class Engine(EngineScoreMixin, EngineBase):
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
 
-            send_to_rpc = getattr(self, "send_to_rpc", None)
-            if send_to_rpc is not None:
-                send_to_rpc.close(linger=0)
+            if self.send_to_rpc is not None:
+                self.send_to_rpc.close(linger=0)
                 self.send_to_rpc = None
 
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
             # .sock/.ready files instead of being SIGKILLed and leaving stale state.
-            daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
-            if daemon_procs:
-                self._terminate_weight_cache_daemons(daemon_procs)
+            if self._weight_cache_daemon_procs:
+                self._terminate_weight_cache_daemons(self._weight_cache_daemon_procs)
                 self._weight_cache_daemon_procs = []
 
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
             if isinstance(self.tokenizer_manager, TokenizerManager):
-                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
-                if mm_processor is not None:
-                    mm_processor.shutdown()
+                if self.tokenizer_manager.mm_processor is not None:
+                    self.tokenizer_manager.mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
