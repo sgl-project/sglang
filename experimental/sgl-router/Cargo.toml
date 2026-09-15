@@ -44,9 +44,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
-# Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
-# this pulls no openssl/native-tls (matching reqwest's rustls-tls above).
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+# Blocking API for startup downloads; use rustls for HTTPS.
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 
 # Utilities
 anyhow = "1"
