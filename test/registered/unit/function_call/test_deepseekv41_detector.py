@@ -156,9 +156,7 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         self.assertIsNone(self.detector.get_structural_tag([], "required"))
 
     def test_required_tag_wraps_invokes_in_the_calls_block(self):
-        tag = self.detector.get_structural_tag(
-            tools=self.tools, tool_choice="required"
-        )
+        tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="required")
         opener, calls, closer = tag.format.elements
         self.assertEqual(opener.value, f"\n\n<{DSML} calls>\n")
         self.assertEqual(closer.value, f"</{DSML} calls>")

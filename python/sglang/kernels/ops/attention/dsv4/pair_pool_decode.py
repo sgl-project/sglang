@@ -62,9 +62,36 @@ def _pair_pool_decode_kernel(
     p_score = tl.load(
         state_score_ptr + r * STATE_SCORE_STRIDE + offs, mask=mask, other=0.0
     )
+    if RING_SIZE:
+        # Target verification lays each request's rows out consecutively. Resolve
+        # an in-batch predecessor from the projection input instead of racing its
+        # ring write from another program.
+        prev_req = tl.load(req_ptr + row - 1, mask=row > 0, other=-1)
+        prev_pos = tl.load(pos_ptr + row - 1, mask=row > 0, other=-2)
+        prev_raw_loc = tl.load(raw_out_loc_ptr + row - 1, mask=row > 0, other=0)
+        in_batch = (
+            (row > 0)
+            & (req == prev_req)
+            & (pos == prev_pos + 1)
+            & (raw_loc != 0)
+            & (prev_raw_loc != 0)
+        )
+        batch_p_kv = tl.load(
+            kv_ptr + (row - 1) * D + offs,
+            mask=mask & in_batch,
+            other=0.0,
+        )
+        batch_p_score = tl.load(
+            score_ptr + (row - 1) * D + offs,
+            mask=mask & in_batch,
+            other=0.0,
+        )
+        p_kv = tl.where(in_batch, batch_p_kv, p_kv)
+        p_score = tl.where(in_batch, batch_p_score, p_score)
 
     if RING_SIZE:
-        # Each live request has one decode row. Pad rows never modify the ring.
+        # Decode has one row per request; target verify writes consecutive,
+        # distinct ring positions. Pad rows never modify the ring.
         write_row = req * RING_SIZE + pos % RING_SIZE
         tl.store(
             state_kv_ptr + write_row * STATE_KV_STRIDE + offs,

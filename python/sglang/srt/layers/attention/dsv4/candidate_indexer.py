@@ -15,6 +15,13 @@ class CandidateMetadata:
 
 
 @dataclass(frozen=True)
+class HopperSparseBlockTable(CandidateMetadata):
+    blocks: torch.Tensor
+    valid_lens: torch.Tensor
+    topk_metadata: torch.Tensor
+
+
+@dataclass(frozen=True)
 class IndexerInputs:
     """One index-source layer's operands on the paged fp4 decode path (one query
     row per request, or per draft token under verify)."""
