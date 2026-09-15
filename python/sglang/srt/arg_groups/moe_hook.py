@@ -616,6 +616,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     validated_architectures = (
         "DeepseekV3ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
     )
     if architecture not in validated_architectures:
