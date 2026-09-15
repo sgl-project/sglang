@@ -35,11 +35,8 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
     get_config_file_name,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import (
     get_device,
     get_device_module,
@@ -129,11 +126,10 @@ class KernelWrapper:
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    server_args = get_global_server_args()
     model_config = get_model_config(
-        server_args.model_path,
-        tp_size=server_args.tp_size,
-        ep_size=server_args.ep_size,
+        get_model().model_path,
+        tp_size=get_parallel().tp_size,
+        ep_size=get_parallel().ep_size,
     )
     num_layers = model_config["num_layers"]
     dense_layers = model_config["dense_layers"]
