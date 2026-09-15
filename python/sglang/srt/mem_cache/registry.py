@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -108,7 +108,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if server_args.enable_unified_cache_external_linker:
+    if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
@@ -162,7 +162,7 @@ def _create_unified_radix_cache(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa and not get_exec().features.enable_encoder_swa_bounded_replay:
+    if ctx.is_hybrid_swa:
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
@@ -196,14 +196,20 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
-    elif server_args.enable_unified_cache_external_linker:
-        backend = server_args.unified_cache_external_linker_backend
+    elif get_memory().enable_unified_cache_external_linker:
+        backend = get_memory().unified_cache_external_linker_backend
         if backend == "mooncake":
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
                 MooncakeDirectLinker,
             )
 
             linker_cls = MooncakeDirectLinker
+        elif backend == "mori":
+            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+                UMBPDirectLinker,
+            )
+
+            linker_cls = UMBPDirectLinker
         else:
             raise ValueError(
                 f"Unknown unified cache external linker backend: {backend!r}"

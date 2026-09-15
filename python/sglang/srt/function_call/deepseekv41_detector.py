@@ -56,7 +56,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [
-                tool for tool in tools if tool.function.name == tool_choice.function.name
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
             ]
             if len(tools) != 1:
                 return None

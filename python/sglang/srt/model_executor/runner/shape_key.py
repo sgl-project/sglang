@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""ShapeKey — typed identifier for one captured CUDA-graph shape."""
 
 from __future__ import annotations
 
@@ -21,22 +20,12 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ShapeKey:
-    """Identifies one captured CUDA-graph shape across all runners.
-
-    size: the per-phase capture size — what the runner iterates over.
-        - prefill: num_tokens
-        - decode:  bs
-    stream_idx:   pdmux stream index, or None for single-stream runners.
-    variant_label: optional execution variant (for example, "lora",
-        "nolora", or "chunked_prefix"), or None for runners that don't
-        record per-variant graphs.
-    dsa_variant: DSA indexer ("dense" / "sparse") or V4.1 indexer variant
-        ("candidate_all", "candidate_c2_all", "candidate_unfiltered",
-        "candidate_filtered"), or None.
-        Composes with variant_label so LoRA and DSA variants are independent.
-    """
-
+    # Tokens for prefill/ragged verify; requests for ordinary decode.
     size: int
+    # PDMux stream, or None for a single stream.
     stream_idx: Optional[int] = None
+    # LoRA or prefill-prefix variant; None selects the default.
     variant_label: Optional[str] = None
-    dsa_variant: Optional[str] = None
+    # Independent attention variant (DSA dense/sparse, DeepSeek-V4.1
+    # candidate_*); None selects the default.
+    attention_variant: Optional[str] = None

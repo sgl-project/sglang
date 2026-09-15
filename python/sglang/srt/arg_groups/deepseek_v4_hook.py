@@ -135,6 +135,47 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
+    if cfg.dsv4_attn_backend == "trtllm":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert cfg.device == "cuda" and is_sm100_supported(), (
+            "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        )
+        # The resolution pipeline materializes "auto" as fp8_e4m3 on CUDA.
+        assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3"), (
+            "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
+            f"got {cfg.kv_cache_dtype}."
+        )
+        assert not cfg.enable_hisparse, (
+            "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        )
+        assert not (
+            cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp
+        ), (
+            "--dsv4-attn-backend trtllm does not support context parallelism "
+            "(prefill CP, attention CP, or decode CP)."
+        )
+        # The trtllm backend stores KV in a 512-byte uniform-FP8 layout while
+        # FlashMLA uses the 584-byte packed layout; the PD handshake only
+        # compares kv_cache_dtype, so mismatched prefill/decode backends would
+        # pass the check and transfer garbage. Reject until the handshake
+        # carries a layout identifier and the path is tested (#37838).
+        assert cfg.disaggregation_mode == "null", (
+            "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
+            "(uniform-FP8 KV layout is not part of the PD handshake; see "
+            "https://github.com/sgl-project/sglang/issues/37838)."
+        )
+        # The trtllm-gen semaphore buffer is sized from the prefill chunk
+        # bound; with chunking disabled a single long request has no bound.
+        assert cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0, (
+            "--dsv4-attn-backend trtllm requires chunked prefill "
+            "(--chunked-prefill-size > 0)."
+        )
+        logger.info(
+            "DeepSeek V4 attention: trtllm backend enabled "
+            "(uniform-FP8 KV pool, decode + sparse prefill)."
+        )
+
     if cfg.max_running_requests is None:
         declare_resolution(
             server_args,
@@ -169,24 +210,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
 
-    if get_platform().is_hip or get_platform().is_npu:
-        # Protected platform implementations still consume the legacy runtime
-        # fields. Generic backends use enable_prefill_cp/cp_strategy directly.
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_dsa_prefill_context_parallel=True,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            enable_prefill_context_parallel=False,
-        )
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v4_cp",
-            dsa_prefill_cp_mode="round-robin-split",
-        )
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
@@ -244,13 +267,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", cfg.enable_dp_attention),
-            # Note(kpham-sgl): DSpark keeps its paged SWA pool; encoder replay
-            # does not yet support speculative decoding.
-            ("speculative decoding", cfg.speculative_algorithm is not None),
-            (
-                "context parallelism",
-                cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
-            ),
+            ("context parallelism", cfg.attn_cp_size > 1),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -281,6 +298,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
+        # The trtllm-gen path serves swa/c4/c128 only; V4.1's ratio-1/2 layers
+        # and the encoder replay request window have no uniform-FP8 pool.
+        ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )
@@ -304,7 +324,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
-            or cfg.enable_prefill_context_parallel
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "

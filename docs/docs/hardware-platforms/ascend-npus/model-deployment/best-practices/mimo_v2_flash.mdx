@@ -7,22 +7,22 @@ metatags:
 <Note>
 This page focuses on optimal configuration and benchmark results for MiMo-V2-Flash on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [MiMo-V2-Flash Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/mimo_v2_flash).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | Ascend A3 Series Products | 12 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
@@ -32,7 +32,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 12
 
@@ -129,7 +129,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -159,7 +159,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -217,7 +217,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 12
 
@@ -314,7 +314,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -344,7 +344,7 @@ do
         --max-running-requests 32 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -402,7 +402,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 12
 
@@ -499,7 +499,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -529,7 +529,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \
@@ -587,7 +587,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 12
 
@@ -684,7 +684,7 @@ do
         --disaggregation-transfer-backend ascend \
         --disable-radix-cache \
         --disable-cuda-graph \
-        --disable-piecewise-cuda-graph \
+        --cuda-graph-backend-prefill=disabled \
         --dp-size 2
         break
     fi
@@ -714,7 +714,7 @@ do
         --max-running-requests 64 \
         --mem-fraction-static 0.8 \
         --swa-full-tokens-ratio 0.3 \
-        --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+        --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
         --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE \
         --speculative-num-steps 3 \

@@ -89,7 +89,7 @@ def moe_fused_gate_jit(
 
 @triton.jit
 def _router_triton_kernel(
-    scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
+    scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)
     bias_alt_ptr,
     input_ids_ptr,
@@ -142,9 +142,14 @@ def _router_triton_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # Prefetch a real bias before the PDL wait. Plain softmax routing has no
-    # bias, so keep the zero value in registers rather than materializing and
-    # clearing a device tensor for every routing call.
+    # PDL may start this grid before prior kernel stores are visible. Bias can
+    # be produced by a preceding cast or fill kernel, so wait before loading
+    # either bias or scores.
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    # Plain softmax routing has no bias, so keep the zero value in registers
+    # rather than materializing and clearing a device tensor per call.
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_n * stride_bias, mask=mask_n, other=0.0).to(
             tl.float32
@@ -155,9 +160,6 @@ def _router_triton_kernel(
         bias_alt = tl.load(
             bias_alt_ptr + offs_n * stride_bias_alt, mask=mask_n, other=0.0
         ).to(tl.float32)
-
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
     live_m = mask_m
     if HAS_PADDING:

@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.overrides import (
     use_mla_backend,
     validate_declarations,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -42,6 +43,30 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_two_batch_overlap:
+        return
+
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+    indexer_types = getattr(hf_config, "indexer_types", None)
+    if (
+        index_topk_freq > 1
+        or (index_topk_pattern is not None and "S" in index_topk_pattern)
+        or (indexer_types is not None and "shared" in indexer_types)
+    ):
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with DSA "
+            "index-topk sharing: the TBO op path does not propagate topk "
+            "indices across layers, so shared layers would run sparse "
+            "attention without indices. Got "
+            f"index_topk_freq={index_topk_freq!r}, "
+            f"index_topk_pattern={index_topk_pattern!r}, and "
+            f"indexer_types={indexer_types!r}."
+        )
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
@@ -159,6 +184,9 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
     ]:
@@ -181,19 +209,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # The "dsa" attention fill moved to the override registry
             # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-            index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-            index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-            if cfg.enable_two_batch_overlap and (
-                index_topk_freq > 1
-                or (index_topk_pattern is not None and "S" in index_topk_pattern)
-            ):
-                raise ValueError(
-                    "--enable-two-batch-overlap is not supported with DSA "
-                    "index-topk sharing (index_topk_freq > 1 or an "
-                    "index_topk_pattern containing shared layers): the TBO op "
-                    "path does not propagate topk indices across layers, so "
-                    "shared layers would run sparse attention without indices."
-                )
+            _validate_dsa_tbo_index_sharing(server_args, hf_config)
 
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
@@ -229,6 +245,21 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
+            elif get_platform().is_xpu:
+                run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
+                run_post_process_pass(server_args, _dsa_split_backend_resolution)
+                # Disable fused topk (requires sgl-kernel ops not available on XPU)
+                if (
+                    envs.SGLANG_DSA_FUSE_TOPK.is_set()
+                    and envs.SGLANG_DSA_FUSE_TOPK.get()
+                ):
+                    logger.warning(
+                        "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
+                    )
+                envs.SGLANG_DSA_FUSE_TOPK.set(False)
+                # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
             if cfg.enable_prefill_cp:
                 assert cfg.disaggregation_mode != "decode", (
                     "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
@@ -254,9 +285,7 @@ def handle_model_specific_adjustments(server_args: Any):
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split requires "
-                    "--enable-prefill-cp and --cp-strategy interleave "
-                    "(or legacy --enable-nsa-prefill-context-parallel with "
-                    "--nsa-prefill-cp-mode round-robin-split)."
+                    "--enable-prefill-cp and --cp-strategy interleave."
                 )
             # Layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
@@ -524,12 +553,13 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "intel_xpu",
             "intel_amx",
+            "aiter",
         )
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
-            f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override
@@ -568,6 +598,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         # The quantization/moe_runner_backend resolution moved to the
         # override registry (arg_groups/overrides.py:
@@ -760,7 +791,11 @@ def handle_model_capability_adjustments(server_args: Any):
                 "_handle_model_capability_adjustments",
                 prefill_only_disable_kv_cache=True,
             )
-            validate_prefill_only_disable_kv_cache_args(server_args)
+            # Through the registry, not a bare call: an out-of-tree
+            # replacement registered at this validator's own pipeline
+            # position must also win here, at this later re-validation after
+            # the Hopper/Blackwell no-KV-pool default declares itself.
+            run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",

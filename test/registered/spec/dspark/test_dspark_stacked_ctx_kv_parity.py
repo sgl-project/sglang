@@ -19,7 +19,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = torch.device("cuda")
 HEAD_DIM = 64
@@ -58,6 +58,9 @@ def _make_attn(rope, *, eps=EPS, has_bias=False, quantized=False, g=None):
         k_norm.weight.copy_(torch.randn(HEAD_DIM, device=DEVICE, generator=g))
     attn.k_norm = k_norm
     attn.rotary_emb = rope
+    # Real DFlashAttention always sets v_scale in __init__; the mock must match
+    # so kv_proj_only's v_scale read does not AttributeError.
+    attn.v_scale = None
     for name in ("kv_proj_only", "apply_k_norm", "apply_k_rope"):
         setattr(attn, name, types.MethodType(getattr(DFlashAttention, name), attn))
     return attn

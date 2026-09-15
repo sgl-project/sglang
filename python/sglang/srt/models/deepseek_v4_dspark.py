@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -440,6 +441,14 @@ class DSparkV4MarkovHead(nn.Module):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._vocab_gather = make_vocab_gather(
+            shard_group,
+            local_width=per_partition,
+            prefer_nvlink=envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        )
+        if shard_group.rank == 0:
+            cls_name = type(self._vocab_gather).__name__
+            logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -491,12 +500,37 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
-            assert self._shard_group is not None
-            full = self._shard_group.all_gather(step_local, dim=-1)
-        else:
-            full = step_local
+        full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
+
+    @property
+    def supports_sharded_greedy(self) -> bool:
+        return self._tp_shard is not None and self._opt_markov_w2_bf16
+
+    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+        if not self.supports_sharded_greedy or not base_logits.is_cuda:
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
+            sharded_greedy_step,
+        )
+
+        shard = self._tp_shard
+        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
+        prev = first_prev_tokens.long()
+        tokens = []
+        for step in range(base_logits.shape[1]):
+            latent = self.get_prev_embeddings(prev)
+            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
+            bias = F.linear(latent.to(weight.dtype), weight)
+            prev = sharded_greedy_step(
+                bias,
+                base_logits[:, step],
+                group=self._shard_group,
+                vocab_start=shard.org_vocab_start,
+                gather=self._vocab_gather.gather_stacked,
+            )
+            tokens.append(prev)
+        return torch.stack(tokens, dim=1)
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
@@ -696,32 +730,34 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
-        x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x, ffn_pre, ffn_post, ffn_comb = self._hc_mix_and_combine(
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
             hidden_states,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
+            stats_stream,
         )
-        x = self._run_ffn(x, forward_batch)
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
@@ -754,12 +790,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "shared experts into fused expert slots."
             )
 
-        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config, quant_config
-        )
-
-    @classmethod
-    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
@@ -908,6 +938,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+            # The FlashMLA writer reads an explicit KV row stride. Keep the
+            # stacked projection's views and avoid a copy for every draft stage.
+            allow_strided_output=(
+                get_platform().is_blackwell
+                and not is_unified_kv_triton()
+                and not pool.uniform_fp8
+            ),
         )
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
@@ -978,7 +1015,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 

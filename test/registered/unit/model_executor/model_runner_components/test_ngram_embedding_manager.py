@@ -1,4 +1,4 @@
-"""Unit tests for ngram token tables and Engram predecessor history."""
+"""Unit tests for LongCat ngram token table updates."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager i
     update_ngram_token_table_after_sampling,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_ngram_info(batch_size: int, skip_token_table_update=None):

@@ -3,8 +3,8 @@
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import argparse
 import unittest
@@ -15,11 +15,11 @@ import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
-    MambaComponent,
-)
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.mamba import (
+    MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import Any, List, Optional
 
 import torch
 
@@ -10,10 +10,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 _IS_SM120 = is_sm120_supported()
-
-if TYPE_CHECKING:
-    pass
-
 
 """
 Some comments on the common terms used in DeepSeekV4Backend:
@@ -45,8 +41,8 @@ positions:
 
 Some other notes:
     c4_ / c128_: means "compressed by 4" / "compressed by 128".
-    c4_page_size: page_size // 4
-    c4_seq_lens: seq_lens // 4, but bounded by at least 1, due to flash_mla requirement.
+    compressed_page_size: physical indexer pool page size
+    compressed_seq_lens: seq_lens // 4, but bounded by at least 1, due to flash_mla requirement.
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
@@ -114,17 +110,15 @@ class NonPagedIndexerPlan:
 @dataclass
 class PagedIndexerMetadata:
     page_size: int
+    compressed_page_size: int
     page_table: torch.Tensor
-    c4_seq_lens: torch.Tensor
+    compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
     # low-ratio sources. Drives the compressed-domain page size and seq lens.
     compress_ratio: int = 4
-    # Compressed-domain page size; 0 derives page_size // compress_ratio (the c4
-    # rule). The low-ratio indexer-K pool pages at 64 and passes it explicitly.
-    index_page_size: int = 0
     # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
     # all rows at once. Chunk plans are stacked so replay can copy them in place.
     row_chunk: int = 0
@@ -144,7 +138,7 @@ class PagedIndexerMetadata:
 
             use_jit_indexer = not self.force_deep_gemm_metadata and (
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
@@ -153,36 +147,36 @@ class PagedIndexerMetadata:
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
+            compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
+            if compressed_seq_lens.dim() == 1:
+                compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
             if self.row_chunk > 0:
                 self.deep_gemm_metadata = torch.stack(
                     [
                         get_paged_mqa_logits_metadata(
-                            _c4[_s : _s + self.row_chunk],
-                            self.c4_page_size,
+                            compressed_seq_lens[_s : _s + self.row_chunk],
+                            self.compressed_page_size,
                             deep_gemm.get_num_sms(),
                         )
-                        for _s in range(0, _c4.shape[0], self.row_chunk)
+                        for _s in range(0, compressed_seq_lens.shape[0], self.row_chunk)
                     ]
                 )
-            elif _IS_SM120 and _c4.shape[0] > _SM120_INDEXER_M_CHUNK:
-                # Chunk metadata is identical for every layer in the forward
-                # pass; compute the per-chunk list once here instead of per
-                # layer in the indexer.
+            elif _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
+                # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
-                        _c4[_s : _s + _SM120_INDEXER_M_CHUNK],
-                        self.c4_page_size,
+                        compressed_seq_lens[_s : _s + _SM120_INDEXER_M_CHUNK],
+                        self.compressed_page_size,
                         deep_gemm.get_num_sms(),
                     )
-                    for _s in range(0, _c4.shape[0], _SM120_INDEXER_M_CHUNK)
+                    for _s in range(
+                        0, compressed_seq_lens.shape[0], _SM120_INDEXER_M_CHUNK
+                    )
                 ]
             else:
                 self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                    _c4,
-                    self.c4_page_size,
+                    compressed_seq_lens,
+                    self.compressed_page_size,
                     deep_gemm.get_num_sms(),
                 )
 
@@ -191,7 +185,7 @@ class PagedIndexerMetadata:
         if self.use_topk_v2:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-            self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
+            self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
 
@@ -201,20 +195,16 @@ class PagedIndexerMetadata:
         )
 
     @property
-    def c4_page_size(self) -> int:
-        return self.index_page_size or self.page_size // self.compress_ratio
-
-    @property
     def max_seq_len(self) -> int:
         return self.page_table.shape[1] * self.page_size
 
     @property
-    def max_c4_seq_len(self) -> int:
-        return self.page_table.shape[1] * self.c4_page_size
+    def max_compressed_seq_len(self) -> int:
+        return self.page_table.shape[1] * self.compressed_page_size
 
     def row_chunks(self):
         """(rows, plan) per logits chunk; one chunk when row_chunk is 0."""
-        num_rows = self.c4_seq_lens.shape[0]
+        num_rows = self.compressed_seq_lens.shape[0]
         if self.row_chunk <= 0:
             return [(slice(0, num_rows), self.deep_gemm_metadata)]
         return [
@@ -226,10 +216,10 @@ class PagedIndexerMetadata:
 
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
-            copy_fields = ["page_table", "c4_seq_lens"]
+            copy_fields = ["page_table", "compressed_seq_lens"]
             assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
-            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+            copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
         copy_metadata(
@@ -237,8 +227,8 @@ class PagedIndexerMetadata:
             dst=self,
             check_eq_fields=[
                 "page_size",
+                "compressed_page_size",
                 "compress_ratio",
-                "index_page_size",
                 "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
