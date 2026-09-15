@@ -35,6 +35,7 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
+    enable_eic_cache=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
@@ -52,6 +53,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
+        enable_eic_cache=enable_eic_cache,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -273,6 +275,84 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             )
             ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_eic_hi_radix_cache_when_hierarchical_and_eic(self):
+        ctx = _make_ctx(enable_hierarchical_cache=True, enable_eic_cache=True)
+        # --enable-eic-cache routes through EIC's own builder, which owns the
+        # hierarchical integration (prefetch results land in the radix tree).
+        fake_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.mem_cache.eic_hiradix_cache": fake_module},
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_module.EICHiRadixCacheBuilder.build.assert_called_once_with(
+                params=ctx.params, server_args=ctx.server_args
+            )
+            ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once()
+            self.assertIs(result, fake_module.EICHiRadixCacheBuilder.build.return_value)
+
+    def test_eic_chunk_cache_when_chunked_prefill_disable_radix_and_eic(self):
+        ctx = _make_ctx(
+            enable_eic_cache=True,
+            disable_radix_cache=True,
+            effective_chunked_prefill_size=8192,
+        )
+        fake_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.mem_cache.eic_chunk_cache": fake_module},
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_module.EICChunkCache.assert_called_once_with(
+                params=ctx.params, server_args=ctx.server_args
+            )
+            fake_module.EICSWAChunkCache.assert_not_called()
+            self.assertIs(result, fake_module.EICChunkCache.return_value)
+
+    def test_eic_swa_chunk_cache_when_hybrid_swa_and_eic(self):
+        ctx = _make_ctx(
+            enable_eic_cache=True,
+            disable_radix_cache=True,
+            effective_chunked_prefill_size=8192,
+            is_hybrid_swa=True,
+        )
+        fake_module = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.mem_cache.eic_chunk_cache": fake_module},
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_module.EICSWAChunkCache.assert_called_once_with(
+                params=ctx.params, server_args=ctx.server_args
+            )
+            self.assertIs(result, fake_module.EICSWAChunkCache.return_value)
+
+    def test_eic_marks_swa_allocator_for_alias_dedup(self):
+        """EIC aliases FULL spans onto reused SWA slots, so free_swa must dedup.
+        Losing this wiring double-frees SWA slots with no error at the call site."""
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        for chunked in (False, True):
+            ctx = _make_ctx(
+                enable_hierarchical_cache=True,
+                enable_eic_cache=True,
+                is_hybrid_swa=True,
+                disable_radix_cache=chunked,
+                effective_chunked_prefill_size=8192 if chunked else None,
+            )
+            alloc = object.__new__(SWATokenToKVPoolAllocator)
+            ctx.params.token_to_kv_pool_allocator = alloc
+            with patch.dict(
+                "sys.modules",
+                {
+                    "sglang.srt.mem_cache.eic_hiradix_cache": MagicMock(),
+                    "sglang.srt.mem_cache.eic_chunk_cache": MagicMock(),
+                },
+            ):
+                default_radix_cache_factory(ctx)
+            self.assertTrue(alloc.dedup_aliased_swa)
+        self.assertFalse(SWATokenToKVPoolAllocator.dedup_aliased_swa)
 
     def test_unified_radix_cache_when_hierarchical_and_hybrid_ssm(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True, is_hybrid_ssm=True)

@@ -3621,7 +3621,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and (
+                    self.tree_cache.is_chunk_cache()
+                    or getattr(  # EIC-only hook; other caches lack it.
+                        self.tree_cache, "eic_swa_extend_eviction", lambda: False
+                    )()
+                ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
@@ -3649,6 +3654,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             is_chunk_cache=self.tree_cache.is_chunk_cache(),
             retain_floor=self.tree_cache.swa_retain_floor(req),
+            release_cache_protected_prefix=getattr(  # EIC-only hook.
+                self.tree_cache, "swa_evict_release_prefix", False
+            ),
         )
 
     def __str__(self):

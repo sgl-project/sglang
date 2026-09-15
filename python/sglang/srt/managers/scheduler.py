@@ -280,6 +280,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -486,6 +490,9 @@ class Scheduler(
         self.enable_hisparse = get_memory().enable_hisparse
         self.enable_dp_attention = get_parallel().enable_dp_attention
         self.enable_unified_memory = get_memory().enable_unified_memory
+        self.enable_eic_cache = (
+            get_memory().enable_eic_cache if self.enable_hierarchical_cache else False
+        )
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -597,6 +604,15 @@ class Scheduler(
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
+        # `enable_eic_cache` gates EIC-only bookkeeping on the tree cache
+        # (ongoing_load_admit, check_load_back_progress, release_load_admit,
+        # prefix_loading), so it must track what was actually built, not just the
+        # CLI flag. Only EICHiRadixCache has that bookkeeping: EICChunkCache (the
+        # PD decode-save path) has none, and aborting a waiting req there raised
+        # AttributeError on release_load_admit.
+        self.enable_eic_cache = self.enable_eic_cache and isinstance(
+            self.tree_cache, EICHiRadixCache
+        )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -3093,6 +3109,10 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
+                if self.enable_eic_cache:
+                    # Release any in-flight EIC load-admit lock/state (deferring req).
+                    self.tree_cache.release_load_admit(candidate_req.rid)
+
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3124,6 +3144,8 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
+                if self.enable_eic_cache:
+                    self.tree_cache.release_load_admit(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
                         req,
@@ -3544,6 +3566,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
 
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # EIC remote prefetch. Must run here -- before the PP-divergent
+            # early-returns and calc_priority below -- so every PP stage calls
+            # it in lockstep (its PP all_reduce would otherwise hang) and sees
+            # the waiting queue in FIFO order (a clean per-stage prefix).
+            self.tree_cache.match_from_remote(self.waiting_queue)
+
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -3622,6 +3651,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            enable_eic_cache=self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -3682,7 +3712,27 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            # EIC host load-back admits asynchronously via check_load_back_progress;
+            # a deferring req keeps its frozen match (re-matching a mutated tree would
+            # double-count) until its load resolves.
+            tc = self.tree_cache
+            deferring_load_back = (
+                self.enable_eic_cache and req.rid in tc.ongoing_load_admit
+            )
+            if not deferring_load_back:
+                req.init_next_round_input(tc)
+                if self.enable_eic_cache and tc.prefix_loading(req.last_node):
+                    continue
+            # PP>1 gates EVERY candidate (not only needs_host_load_back): host
+            # metadata is per-stage (EIC write acks fail per namespace), so the
+            # needs flag itself can diverge across stages; gating all candidates
+            # keeps the cross-PP report keysets symmetric, keyed by rid.
+            if self.enable_eic_cache and (
+                deferring_load_back or req.needs_host_load_back() or tc.pp_size > 1
+            ):
+                if not tc.check_load_back_progress(req):
+                    continue
+
             if (
                 self.enable_hicache_storage
                 and get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3702,6 +3752,7 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4606,6 +4657,11 @@ class Scheduler(
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
+                # EIC in-flight cross-PP admits. Gate ONLY on ongoing_load_admit:
+                # it is the PP-symmetric per-req marker (every stage registers on
+                # first encounter, all finalize at the verdict step). pending_report
+                # /_reports are rank0-only bookkeeping and would desync idle per rank.
+                idle &= len(getattr(tc, "ongoing_load_admit", ())) == 0
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
@@ -4989,6 +5045,8 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
+            if self.enable_eic_cache:
+                self.tree_cache.release_load_admit(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

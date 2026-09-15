@@ -12,6 +12,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 
@@ -265,8 +269,17 @@ class EICStorage(HiCacheStorage):
         self.is_mla_model = hicache_config.is_mla_model
         self.rank = hicache_config.tp_rank
         self.world_size = hicache_config.tp_size
+        self.pp_rank = hicache_config.pp_rank
+        self.pp_size = hicache_config.pp_size
         self.page_size = self.memory_pool_host.page_size
+        self.registered_pools = {}
+        self.logical_anchor = self.memory_pool_host.kv_buffer is None
         self.use_zero_copy = self.memory_pool_host.layout == "page_first"
+        if self.logical_anchor:
+            self.use_zero_copy = True
+            self.anchor_marker = torch.ones(
+                (1,), dtype=torch.uint8, device="cpu", pin_memory=True
+            )
         self.mha_zero_copy = self.use_zero_copy and not self.is_mla_model
         if not self.use_zero_copy:
             self.kv_cache_shape = self.memory_pool_host.get_data_page(
@@ -298,30 +311,78 @@ class EICStorage(HiCacheStorage):
             f"finish eic client warm up, warm up cost {time.perf_counter() - start_time:.2f} seconds"
         )
 
-    def register_mem_pool_host(self, memory_pool_host: HostKVCache) -> None:
+    def _register_tensors(self, tensors: List[torch.Tensor]) -> None:
+        tensors = [
+            buffer for buffer in tensors if buffer is not None and buffer.numel()
+        ]
+        if not tensors:
+            return
         # no need judge meminfo type, cuda_id, etc.
         meminfo = eic.MemoryInfo()
         meminfo.type = eic.MemoryType.MEMORY_CUDA
         meminfo.cuda_id = 0
         vals = eic.IOBuffers()
-        buffer = memory_pool_host.kv_buffer
-        vals.append(
-            buffer.data_ptr(),
-            buffer.numel() * buffer.element_size(),
-            True,
-        )
+        for buffer in tensors:
+            vals.append(
+                buffer.data_ptr(),
+                buffer.numel() * buffer.element_size(),
+                True,
+            )
         self.connection.register_memory(vals, meminfo)
 
+    def _pool_buffers(self, memory_pool_host: HostKVCache) -> List[torch.Tensor]:
+        # NSA indexer host has no kv_buffer; use get_hybrid_pool_buffer() if present.
+        get_hybrid = getattr(memory_pool_host, "get_hybrid_pool_buffer", None)
+        if callable(get_hybrid):
+            buffer = get_hybrid()
+        else:
+            buffer = memory_pool_host.kv_buffer
+        if buffer is None:
+            return []
+        if isinstance(buffer, list):
+            return buffer
+        return [buffer]
+
+    def register_mem_pool_host(self, memory_pool_host: HostKVCache) -> None:
+        self._register_tensors(self._pool_buffers(memory_pool_host))
+        if self.logical_anchor:
+            self._register_tensors([self.anchor_marker])
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            return
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+        self._register_tensors(self._pool_buffers(host_pool))
+
     def _init_eic_prefix(self):
+        # Same content hash means different bytes per stage; without this the
+        # stages overwrite each other's KV. Suffix only when pp_size > 1 so
+        # existing single-stage keys stay valid.
+        pp = f"_pp{self.pp_size}_{self.pp_rank}" if self.pp_size > 1 else ""
         if self.is_mla_model:
             self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}@sglang"
+                f"{self.model_name}_mla_att_{self.host_kvcache_layout}{pp}@sglang"
             )
         else:
-            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}{pp}_@sglang"
 
     def _get_eic_key(self, keys: List[str]) -> str:
         return [f"{self.eic_prefix}_{key}" for key in keys]
+
+    def _get_component_keys(
+        self, page_keys: List[str], transfer: PoolTransfer
+    ) -> Tuple[List[str], int]:
+        host_pool = self.registered_pools.get(transfer.name)
+        key_multiplier = len(self._pool_buffers(host_pool)) if host_pool else 0
+        if key_multiplier <= 0:
+            return [], 0
+        if key_multiplier == 1:
+            return [f"{key}_{transfer.name}" for key in page_keys], key_multiplier
+        return [
+            f"{key}_{transfer.name}_{i}"
+            for key in page_keys
+            for i in range(key_multiplier)
+        ], key_multiplier
 
     def set(
         self,
@@ -398,6 +459,7 @@ class EICStorage(HiCacheStorage):
                     f"eic exists {len(keys)} failed, status_code {status_code}"
                 )
                 result.extend([False] * len(batch_keys))
+                continue
             for err_code in exist_outcome.status_codes:
                 result.append(err_code == eic.StatusCode.SUCCESS)
         return result
@@ -411,6 +473,15 @@ class EICStorage(HiCacheStorage):
     ) -> int:
         if len(keys) == 0:
             return 0
+        if self.logical_anchor:
+            exist_mask = self._batch_exists_impl(keys)
+            prefix_success = 0
+            for exist in exist_mask:
+                if exist:
+                    prefix_success += 1
+                else:
+                    break
+            return prefix_success
         if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
         exist_mask = self._batch_exists_impl(keys)
@@ -521,6 +592,153 @@ class EICStorage(HiCacheStorage):
         get_data_execution_time = (get_data_end_time - get_data_start_time) * 1e6
         logger.debug(f"eic get {count} keys data cost %.2f us", get_data_execution_time)
         return success_mask
+
+    def _zero_copy_batch_set_ptrs(
+        self, keys: List[str], ptrs: List[int], sizes: List[int]
+    ) -> List[bool]:
+        if len(keys) == 0:
+            return []
+        eic_keys = self._get_eic_key(keys)
+        keys_vec = eic.StringVector()
+        vals_vec = eic.IOBuffers()
+        for key, ptr, size in zip(eic_keys, ptrs, sizes):
+            keys_vec.append(key)
+            vals_vec.append(ptr, size, True)
+        set_option = eic.SetOption()
+        set_option.ns = self.eic_namespace
+        set_option.ttl_second = -1
+        status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
+        if status_code != eic.StatusCode.SUCCESS:
+            logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
+        return [
+            err_code == eic.StatusCode.SUCCESS for err_code in set_outcome.status_codes
+        ]
+
+    def _zero_copy_batch_get_ptrs(
+        self, keys: List[str], ptrs: List[int], sizes: List[int]
+    ) -> List[bool]:
+        if len(keys) == 0:
+            return []
+        eic_keys = self._get_eic_key(keys)
+        keys_vec = eic.StringVector()
+        vals_vec = eic.IOBuffers()
+        for key, ptr, size in zip(eic_keys, ptrs, sizes):
+            keys_vec.append(key)
+            vals_vec.append(ptr, size, True)
+        get_option = eic.GetOption()
+        get_option.ns = self.eic_namespace
+        status_code, _data_vals, get_outcome = self.connection.mget(
+            keys_vec, get_option, vals_vec
+        )
+        if status_code not in (eic.StatusCode.SUCCESS, eic.StatusCode.PARTIAL_FAILED):
+            logger.error(f"eic mget {len(keys)} failed, status_code {status_code}")
+            return [False] * len(keys)
+        return [
+            err_code == eic.StatusCode.SUCCESS for err_code in get_outcome.status_codes
+        ]
+
+    def _object_results_to_page_results(
+        self, results: List[bool], key_multiplier: int
+    ) -> List[bool]:
+        if key_multiplier <= 0:
+            return []
+        return [
+            all(results[i : i + key_multiplier])
+            for i in range(0, len(results), key_multiplier)
+        ]
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+        hit_count = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            component_keys, key_multiplier = self._get_component_keys(
+                keys[:kv_pages], transfer
+            )
+            object_exists = self._batch_exists_impl(component_keys)
+            page_exists = self._object_results_to_page_results(
+                object_exists, key_multiplier
+            )
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(
+        self, transfers: List[PoolTransfer], is_set: bool
+    ) -> dict[str, List[bool]]:
+        results = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools.get(transfer.name)
+            keys = transfer.keys or []
+            host_indices = transfer.host_indices
+            if host_pool is None or host_indices is None or not keys:
+                results[transfer.name] = []
+                continue
+
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            assert len(keys) == len(host_indices) // page_size
+            ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+            component_keys, key_multiplier = self._get_component_keys(keys, transfer)
+            assert len(component_keys) == len(ptrs)
+
+            if is_set:
+                exists = self._batch_exists_impl(component_keys)
+                object_results = [True if x else False for x in exists]
+                missing = [i for i, x in enumerate(exists) if not x]
+                if missing:
+                    set_results = self._zero_copy_batch_set_ptrs(
+                        [component_keys[i] for i in missing],
+                        [ptrs[i] for i in missing],
+                        [sizes[i] for i in missing],
+                    )
+                    for i, ok in zip(missing, set_results):
+                        object_results[i] = ok
+            else:
+                object_results = self._zero_copy_batch_get_ptrs(
+                    component_keys, ptrs, sizes
+                )
+            results[transfer.name] = self._object_results_to_page_results(
+                object_results, key_multiplier
+            )
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
 
     def generic_batch_set(
         self,
@@ -747,6 +965,8 @@ class EICStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.logical_anchor:
+            return self._batch_exists_impl(keys)
         keys, values = self._batch_get_preprocess(keys, host_indices)
         results = self.batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
@@ -773,6 +993,12 @@ class EICStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.logical_anchor:
+            ptr = self.anchor_marker.data_ptr()
+            size = self.anchor_marker.numel() * self.anchor_marker.element_size()
+            return self._zero_copy_batch_set_ptrs(
+                keys, [ptr] * len(keys), [size] * len(keys)
+            )
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self.batch_set(keys, values)
         return results

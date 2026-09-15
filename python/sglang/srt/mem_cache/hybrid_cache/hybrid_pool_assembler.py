@@ -441,6 +441,7 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
+    device_indexed: bool = False,
 ) -> tuple[int, int]:
     allocator = params.token_to_kv_pool_allocator
     device_full_size = getattr(allocator, "size_full", kvcache.size)
@@ -454,6 +455,16 @@ def _deepseek_v4_num_host_pages(
             "use --hicache-ratio instead."
         )
     ratio = get_memory().hicache_ratio
+    if device_indexed:
+        # EIC host pages are device-indexed, so pages beyond device_pages are
+        # unreachable; allocating ratio * device_pages just pins dead RSS (OOM on TP8).
+        if ratio > 1.0:
+            logger.warning(
+                "DeepSeek V4 EIC host pools are device-indexed; ignoring "
+                "--hicache-ratio %.2f (using 1.0).",
+                ratio,
+            )
+        return device_full_pages + 1, device_swa_pages + 1
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
     return full_host_pages, swa_host_pages
@@ -483,6 +494,7 @@ def build_deepseek_v4_hicache_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
     layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
+    device_indexed: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
@@ -526,6 +538,7 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+        device_indexed=device_indexed,
     )
 
     logical_host_pool = LogicalHostPool(

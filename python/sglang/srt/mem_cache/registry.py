@@ -88,7 +88,23 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     ):
         return _create_unified_radix_cache(ctx, server_args, params)
 
+    if server_args.enable_eic_cache:
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        # Every EIC cache aliases FULL spans onto reused SWA slots.
+        if isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            params.token_to_kv_pool_allocator.dedup_aliased_swa = True
+
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
+        if server_args.enable_eic_cache:
+            from sglang.srt.mem_cache.eic_chunk_cache import (
+                EICChunkCache,
+                EICSWAChunkCache,
+            )
+
+            logger.info("Using EIC chunk cache for decode-save path.")
+            cls = EICSWAChunkCache if ctx.is_hybrid_swa else EICChunkCache
+            return cls(params=params, server_args=server_args)
         if not ctx.is_hybrid_swa:
             from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -100,6 +116,21 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if server_args.enable_eic_cache:
+        # EIC owns its own hierarchical integration, so it is dispatched ahead of
+        # the hybrid/DSA arms below: falling through to UnifiedRadixCache would
+        # leave --enable-eic-cache silently ignored and then trip the scheduler's
+        # EIC-only bookkeeping at the first request. EICHiRadixCacheBuilder raises
+        # for pool types it does not support, so an unsupported model fails at
+        # startup rather than mid-run.
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCacheBuilder
+
+        cache = EICHiRadixCacheBuilder.build(params=params, server_args=server_args)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+        return cache
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead

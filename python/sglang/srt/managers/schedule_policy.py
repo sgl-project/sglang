@@ -494,6 +494,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        enable_eic_cache: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -525,6 +526,7 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        self.enable_eic_cache = enable_eic_cache
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -1205,7 +1207,13 @@ class PrefillAdder:
         total_tokens += self._mamba_gap_budget_for_req(req)
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
+        if self.enable_eic_cache:
+            # Load-back already folded into prefix_indices by the admission gate,
+            # so the candidate extend length is exactly the recompute; do not
+            # re-subtract the host hit.
+            real_input_tokens = cand_extend_input_len
+        else:
+            real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -1286,7 +1294,8 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            if req.needs_host_load_back():
+            # EIC resolved its load-back in the async admission gate.
+            if not self.enable_eic_cache and req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,

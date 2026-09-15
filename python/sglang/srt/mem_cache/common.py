@@ -61,6 +61,7 @@ def free_swa_out_of_window_slots(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
     retain_floor: int | None = None,
+    release_cache_protected_prefix: bool = False,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -69,9 +70,17 @@ def free_swa_out_of_window_slots(
     assert (
         req.kv.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    req.kv.swa_evicted_seqlen = max(
-        req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
-    )
+    if release_cache_protected_prefix:
+        # EIC has no SWA tree: the out-of-window prefix is restored from host
+        # storage on reuse, so cache_protected_len is not a floor here.
+        evict_floor = getattr(req, "swa_evict_floor", 0)
+        if page_size > 1 and evict_floor > req.kv.cache_protected_len:
+            evict_floor = -(-evict_floor // page_size) * page_size
+        req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
+    else:
+        req.kv.swa_evicted_seqlen = max(
+            req.kv.swa_evicted_seqlen, req.kv.swa_dead_lo(page_size)
+        )
 
     if is_chunk_cache:
         # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
@@ -98,9 +107,14 @@ def free_swa_out_of_window_slots(
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
-        ]
+        lo, hi = req.kv.swa_evicted_seqlen, new_swa_evicted_seqlen
+        # Loaded full indices live in req.prefix_indices (set by the EIC
+        # load-admit gate), not req_to_token (0 for the loaded span). Read them
+        # from prefix_indices or the released prefix free would be dropped.
+        if release_cache_protected_prefix and hi <= len(req.prefix_indices):
+            free_slots = req.prefix_indices[lo:hi]
+        else:
+            free_slots = req_to_token_pool.req_to_token[req.kv.req_pool_idx, lo:hi]
         # Local import: multi_ended_allocator imports this module lazily for
         # eviction; a module-level import here would be a cycle hazard.
         from sglang.srt.mem_cache.multi_ended_allocator import (

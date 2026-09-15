@@ -2719,6 +2719,7 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
+
     hicache_host_memory_mode: A[
         str,
         Arg(
@@ -2727,6 +2728,12 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "cache"
+    enable_eic_cache: A[bool, "Enable EIC cache", NS("memory")] = False
+    disable_eic_shared: A[
+        bool,
+        "Disable EIC shared cache, which is used to share the cache between multiple servers.",
+        NS("memory"),
+    ] = False
     hicache_ratio: A[
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",

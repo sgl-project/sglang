@@ -23,6 +23,12 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    # --enable-eic-cache alone must turn the hierarchical cache on.
+    if getattr(cfg, "enable_eic_cache", False) and not cfg.enable_hierarchical_cache:
+        declare_resolution(
+            server_args, "handle_hicache_eic", enable_hierarchical_cache=True
+        )
+        cfg = resolving_view(server_args)
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
         cfg.enable_hierarchical_cache
