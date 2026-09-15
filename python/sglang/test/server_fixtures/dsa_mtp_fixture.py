@@ -38,7 +38,6 @@ class DsaMtpEvalConfigDefaults:
     gsm8k_accept_length_thres = 3.7
     gsm8k_num_questions = 500
     gsm8k_num_threads = 500
-    gsm8k_num_shots = 20
 
     # SpecDecodingMixin default; per-variant subclasses set `bs_1_speed_thres`.
     accept_length_thres = 4.0

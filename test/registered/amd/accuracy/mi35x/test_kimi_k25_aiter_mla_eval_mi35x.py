@@ -119,10 +119,10 @@ class TestKimiK25AiterMlaEvalMI35x(unittest.TestCase):
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_kimi_k25_accuracy(self):
-        """Test Kimi-K2.5 with GSM8K completion benchmark (default & fp8kv)."""
+        """Test Kimi-K2.5 with sgl-eval GSM8K chat benchmark (default & fp8kv)."""
         from types import SimpleNamespace
 
-        from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+        from sglang.test.run_eval import run_eval as run_gsm8k_eval
 
         all_results = []
         summary = "### Kimi-K2.5 aiter MLA (MI35x)\n\n"
@@ -155,15 +155,14 @@ class TestKimiK25AiterMlaEvalMI35x(unittest.TestCase):
 
                     try:
                         args = SimpleNamespace(
-                            num_shots=8,
-                            data_path=None,
-                            num_questions=self.num_questions,
-                            parallel=self.num_questions,
-                            max_new_tokens=512,
+                            eval_name="gsm8k",
+                            num_examples=self.num_questions,
+                            num_threads=self.num_questions,
+                            max_tokens=512,
                             host="http://127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )
-                        metrics = run_eval_few_shot_gsm8k(args)
+                        metrics = run_gsm8k_eval(args)
                         acc = metrics["accuracy"]
 
                         passed = acc >= config.accuracy_threshold

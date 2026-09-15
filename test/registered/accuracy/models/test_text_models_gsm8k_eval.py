@@ -82,9 +82,12 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         base_url=self.base_url,
                         model=model_setup.model_path,
                         eval_name="gsm8k",
-                        api="sgl_eval",
                         num_examples=None,
                         num_threads=1024,
+                        sgl_eval_thinking=(
+                            "qwen3.5" in model_setup.model_path.lower()
+                            or "qwen3-thinking" in model_setup.model_path.lower()
+                        ),
                     )
 
                     metrics = run_eval(args)

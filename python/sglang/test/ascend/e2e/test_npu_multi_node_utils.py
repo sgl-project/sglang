@@ -13,7 +13,7 @@ from typing import Iterable, Union
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
+from sglang.test.run_eval import run_eval as run_eval_gsm8k
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 logging.basicConfig(
@@ -950,18 +950,15 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
     def run_gsm8k_test(
         self,
         expect_accuracy,
-        num_shots=8,
-        data_path=None,
         num_questions=200,
         max_new_tokens=512,
         parallel=128,
     ):
         args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
+            eval_name="gsm8k",
+            num_examples=num_questions,
+            max_tokens=max_new_tokens,
+            num_threads=parallel,
             host=f"http://{self.host}",
             port=self.port,
         )
@@ -1060,18 +1057,15 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     def run_gsm8k_test(
         self,
         expect_accuracy,
-        num_shots=8,
-        data_path=None,
         num_questions=200,
         max_new_tokens=512,
         parallel=128,
     ):
         args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=data_path,
-            num_questions=num_questions,
-            max_new_tokens=max_new_tokens,
-            parallel=parallel,
+            eval_name="gsm8k",
+            num_examples=num_questions,
+            max_tokens=max_new_tokens,
+            num_threads=parallel,
             host=f"http://{self.host}",
             port=self.port,
         )

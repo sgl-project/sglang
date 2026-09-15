@@ -27,7 +27,6 @@ class GSM8KAscendMixin(ABC):
         "--disable-cuda-graph",
     ]
     server_cmd = ""
-    gsm8k_num_shots = 5
     num_questions = 200
     gsm8k_parallel = 128
 
@@ -79,7 +78,7 @@ class GSM8KAscendMixin(ABC):
 
         model_metrics = {
             "server": self.server_cmd,
-            "client": "few_shot_gsm8k",
+            "client": "sgl-eval",
             "accuracy_threshold": getattr(self, "accuracy", "N/A"),
             "output_throughput_threshold": getattr(self, "output_throughput", "N/A"),
         }
@@ -90,10 +89,8 @@ class GSM8KAscendMixin(ABC):
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
-                api="completion",
                 num_examples=self.num_questions,
                 num_threads=128,
-                num_shots=self.gsm8k_num_shots,
             )
             metrics = run_eval(args)
             model_metrics["accuracy"] = metrics["score"]

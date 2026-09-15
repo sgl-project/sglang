@@ -56,7 +56,6 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=self.lb_url,
             eval_name="gsm8k",
-            api="generate",  # the Rust server has no /v1/completions
             max_tokens=512,
             num_examples=64,
             num_threads=32,

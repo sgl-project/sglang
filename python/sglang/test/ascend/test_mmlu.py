@@ -15,7 +15,7 @@ class TestMMLU:
             "server": getattr(
                 self, "server_cmd", subprocess.list2cmdline(map(str, self.other_args))
             ),
-            "client": "simple_eval_mmlu",
+            "client": "sgl-eval",
             "accuracy_threshold": getattr(self, "accuracy_mmlu", "N/A"),
         }
 

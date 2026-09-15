@@ -55,7 +55,6 @@ class TestNPUQwen3_5_9B_GSM8K(TestNpuAccuracyTestCaseBase):
     other_args = QWEN3_5_9B_OTHER_ARGS
     accuracy = 0.8350
     datasets = ["gsm8k"]
-    few_shot_num = 5
     generation_config = {
         "max_tokens": 8192,
         "temperature": 0.6,

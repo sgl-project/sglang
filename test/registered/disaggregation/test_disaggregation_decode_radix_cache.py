@@ -106,11 +106,9 @@ class DisaggregationDecodeRadixCacheTestMixin:
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=500,
             num_threads=100,
-            num_shots=6,
         )
 
         metrics_first = run_eval(args)

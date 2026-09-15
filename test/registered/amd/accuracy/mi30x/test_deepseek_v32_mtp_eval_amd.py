@@ -1,7 +1,7 @@
 """AMD DeepSeek-V3.2 TP+MTP GSM8K Accuracy Evaluation Test (8-GPU)
 
-Tests DeepSeek-V3.2 with TP=8 + MTP (EAGLE speculative decoding) using few-shot
-completion benchmark on MI325/MI300X.
+Tests DeepSeek-V3.2 with TP=8 + MTP (EAGLE speculative decoding) using sgl-eval
+chat benchmark on MI325/MI300X.
 
 Registry: nightly-amd-accuracy-8-gpu-deepseek-v32-mtp suite
 """
@@ -14,7 +14,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -95,15 +95,14 @@ class TestDeepseekV32TPMTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1400,
+            num_threads=1400,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/server_info")

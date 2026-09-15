@@ -7,7 +7,7 @@ fp8 (e4m3) KV cache, and radix cache disabled — validated accuracy-neutral vs
 the bf16-KV / triton-attn baseline (0.972 vs 0.970 on GSM8K chat+thinking).
 
 MiniMax-M3 is a reasoning model: it must be evaluated through the chat template
-with thinking enabled (its `<mm:think>` reasoning path). Raw few-shot completion
+with thinking enabled (its `<mm:think>` reasoning path). Raw sgl-eval chat
 (no chat template) does NOT engage its reasoning and severely underscores it
 (~0.87 vs ~0.96 on GSM8K), so this test uses chat + thinking to match how the
 model is meant to be served and the published reference accuracy.
@@ -15,20 +15,15 @@ model is meant to be served and the published reference accuracy.
 Registry: nightly-amd-4-gpu-mi35x-minimax-m3-tp4 suite
 """
 
-import json
 import os
-import re
-import time
 import unittest
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
-
-import numpy as np
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,15 +31,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
     suite="nightly-amd-4-gpu-mi35x-minimax-m3-tp4",
     nightly=True,
 )
-
-INVALID = -9999999
 
 
 @dataclass
@@ -121,20 +113,6 @@ MI35X_MINIMAX_M3_TP4_MODELS = [
 ]
 
 
-def get_answer_value(answer_str):
-    """Extract numerical answer from response (last integer)."""
-    if not isinstance(answer_str, str):
-        return INVALID
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"-?\d+", answer_str)
-    if not numbers:
-        return INVALID
-    try:
-        return int(numbers[-1])
-    except ValueError:
-        return INVALID
-
-
 def run_gsm8k_benchmark(
     base_url: str,
     model_path: str,
@@ -142,55 +120,19 @@ def run_gsm8k_benchmark(
     parallel: int = 64,
     max_tokens: int = 4096,
 ) -> Tuple[float, float, float]:
-    """Run GSM8K in chat + thinking mode (M3's intended reasoning path).
-
-    Uses the OpenAI-compatible /v1/chat/completions endpoint so the chat
-    template is applied, and forces thinking via chat_template_kwargs
-    (M3's template reads ``thinking_mode``). The final answer is the last
-    integer in the response; the reasoning trace lives in ``<mm:think>`` tags
-    inside ``content`` (or in ``reasoning_content`` if a reasoning parser is on),
-    so both channels are scanned.
-    """
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
-
-    instruction = (
-        "\n\nPlease reason step by step, and give the final answer as a single "
-        "integer on the last line."
-    )
-    n = len(lines[:num_questions])
-    questions = [lines[i]["question"] for i in range(n)]
-    labels = [get_answer_value(lines[i]["answer"]) for i in range(n)]
-    assert all(l != INVALID for l in labels)
-
-    def query(question: str) -> str:
-        body = {
-            "model": model_path,
-            "messages": [{"role": "user", "content": question + instruction}],
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "chat_template_kwargs": {"thinking_mode": "enabled"},
-        }
-        req = urllib.request.Request(
-            base_url + "/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+    """Run the canonical sgl-eval GSM8K benchmark."""
+    metrics = run_eval(
+        SimpleNamespace(
+            eval_name="gsm8k",
+            base_url=base_url,
+            num_examples=num_questions,
+            num_threads=parallel,
+            max_tokens=max_tokens,
+            model=model_path,
+            chat_template_kwargs={"thinking_mode": "enabled"},
         )
-        with urllib.request.urlopen(req, timeout=1800) as resp:
-            msg = json.loads(resp.read())["choices"][0]["message"]
-        return (msg.get("content") or "") + " " + (msg.get("reasoning_content") or "")
-
-    tic = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=parallel) as ex:
-        outputs = list(ex.map(query, questions))
-    latency = time.perf_counter() - tic
-
-    preds = [get_answer_value(o) for o in outputs]
-    acc = float(np.mean(np.array(preds) == np.array(labels)))
-    invalid = float(np.mean(np.array(preds) == INVALID))
-
-    return acc, invalid, latency
+    )
+    return metrics["score"], metrics["invalid"], metrics["latency"]
 
 
 class TestMiniMaxM3TP4EvalMI35x(unittest.TestCase):

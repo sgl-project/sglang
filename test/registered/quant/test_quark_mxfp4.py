@@ -15,7 +15,7 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -160,14 +160,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             # Weights initialized on meta device (not for dense BF16->MXFP4)
             assert peak_memory_before_load < 5
 
-    def _test_gsm8k(self, accuracy_threshold):
+    def _test_gsm8k(self, accuracy_threshold, *, max_tokens=2048):
         """Helper method to test GSM8K accuracy against a threshold."""
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=500,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=500,
+            max_tokens=max_tokens,
+            sgl_eval_thinking=False if self.model.startswith("Qwen/Qwen3") else None,
+            num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -241,7 +241,7 @@ class TestDeepSeekR10528NVFP4ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.95.
-        self._test_gsm8k(accuracy_threshold=0.90)
+        self._test_gsm8k(accuracy_threshold=0.90, max_tokens=16384)
 
 
 class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):

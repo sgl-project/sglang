@@ -13,7 +13,7 @@ What the CI test (TestDSV31DCP8TP8GSM8K) covers:
   - DCP=8 extend path: prefix KV all-gather for MLA models (DeepSeek-V3.1)
   - Basic decode correctness: factual recall, math, no-repetition, temp=0 determinism,
     max_new_tokens=1 edge case (catches CUDA graph capture bugs)
-  - GSM8K accuracy gate (200 questions, 5-shot, completion API)
+  - GSM8K accuracy gate (200 questions, sgl-eval chat)
   - DCP activation verification (max_total_num_tokens scaled by dcp_world_size)
 
 What the CI test does NOT cover (and the manual tests address):
@@ -145,7 +145,6 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
     gsm8k_accuracy_thres = 0.90
     gsm8k_num_questions = 200
     gsm8k_num_threads = 128
-    gsm8k_num_shots = 5
 
     @classmethod
     def setUpClass(cls):
@@ -388,7 +387,6 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
     gsm8k_accuracy_thres = 0.90
     gsm8k_num_questions = 200
     gsm8k_num_threads = 128
-    gsm8k_num_shots = 5
 
     @classmethod
     def setUpClass(cls):

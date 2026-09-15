@@ -90,9 +90,8 @@ If your code changes model output, run an accuracy evaluation appropriate for th
 sglang serve --model-path Qwen/Qwen3-8B
 
 # Evaluate
-python3 -m sglang.test.run_eval \
-  --eval-name gsm8k \
-  --port 30000 \
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
   --num-examples 200
 ```
 

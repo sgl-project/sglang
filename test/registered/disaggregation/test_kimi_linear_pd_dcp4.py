@@ -53,7 +53,6 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
     gsm8k_score_threshold = 0.88
     gsm8k_num_examples = 200
     gsm8k_num_threads = 4
-    gsm8k_num_shots = 5
 
     @classmethod
     def setUpClass(cls):

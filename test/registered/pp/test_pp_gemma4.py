@@ -54,7 +54,7 @@ class TestGemma4PPAccuracy(unittest.TestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        # Gemma4 is instruction-tuned and doesn't follow few-shot completion
+        # Gemma4 is instruction-tuned and doesn't follow sgl-eval chat
         # prompts well — use the chat API (default in run_eval), which scores
         # ~0.98 on this model vs ~0.44 with api="completion".
         args = SimpleNamespace(

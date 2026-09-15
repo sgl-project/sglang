@@ -63,7 +63,6 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     # GSM8K Configs
     accuracy = 0.95  # GSM8K accuracy ≥0.95
     num_questions = 200
-    gsm8k_num_shots = 8
 
 
 if __name__ == "__main__":

@@ -71,10 +71,8 @@ class TestAscendMoeDenseTPSize(CustomTestCase):
             base_url=DEFAULT_URL_FOR_TEST,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             num_examples=200,
             num_threads=128,
-            num_shots=5,
         )
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.79)

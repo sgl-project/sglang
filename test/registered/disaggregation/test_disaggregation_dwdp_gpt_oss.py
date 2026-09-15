@@ -93,8 +93,6 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
-                api="chat",
-                num_shots=5,
                 num_examples=100,
                 max_tokens=4096,
                 num_threads=8,

@@ -5,7 +5,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -61,15 +61,14 @@ class TestDeepseekV3MTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         server_info = requests.get(self.base_url + "/server_info")

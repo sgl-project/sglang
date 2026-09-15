@@ -79,7 +79,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
     api_mode = getattr(args, "api", "chat")
     if api_mode == "completion":
-        # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
+        # Default stop tokens for completion API.
         stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
         sampler = CompletionSampler(
             **common_kwargs,
@@ -111,11 +111,10 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 def _run_sgl_eval(eval_name, args) -> dict:
     # Returns a metrics dict (score, latency, output_throughput) so the
     # existing write_results_to_json + threshold gate keep working.
+    from sglang.test.sgl_eval import api_base_url
     from sglang.test.test_utils import dump_metric
 
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
+    base_url = api_base_url(args)
     out_parent = Path(
         getattr(args, "sgl_eval_out_dir", None)
         or (Path.home() / ".sgl_eval" / "sglang_run_eval" / uuid.uuid4().hex)
@@ -260,14 +259,13 @@ def run_eval(args):
     if "OPENAI_API_KEY" not in os.environ:
         os.environ["OPENAI_API_KEY"] = "EMPTY"
 
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
+    from sglang.test.sgl_eval import api_base_url
+
+    base_url = api_base_url(args)
 
     if args.eval_name == "mmlu":
         # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
         # caller's threshold has to be measured against it, not inherited.
-        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
@@ -302,32 +300,11 @@ def run_eval(args):
     elif args.eval_name == "aime26":
         return _run_sgl_eval("aime26", args)
     elif args.eval_name == "gsm8k":
-        if getattr(args, "api", None) == "sgl_eval":
-            # Only the nightly correctness eval opts into sgl-eval (zero-shot
-            # chat, \boxed{}, math_verify). Every other gsm8k caller — spec
-            # decoding perf/accuracy, disaggregation, quant, model e2e — uses
-            # the 5-shot completion last-number scorer and relies on
-            # max_tokens/throughput behavior sgl-eval cannot provide.
+        if getattr(args, "load_preset_from_model_id", None):
             return _run_sgl_eval("gsm8k", args)
-        from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
+        from sglang.test.sgl_eval import run_sgl_eval
 
-        eval_obj = GSM8KEval(
-            num_examples=args.num_examples,
-            num_threads=args.num_threads,
-            num_shots=getattr(args, "num_shots", 5),
-            data_path=getattr(args, "gsm8k_data_path", None),
-        )
-    elif args.eval_name == "mixed_prefix_gsm8k":
-        from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
-
-        eval_obj = MixedPrefixGSM8KEval(
-            num_examples=args.num_examples,
-            num_threads=args.num_threads,
-            num_shots=args.num_shots,
-            secondary_pool_size=args.mixed_prefix_gsm8k_secondary_pool_size,
-            data_path=args.gsm8k_data_path,
-            seed=args.mixed_prefix_gsm8k_seed,
-        )
+        return run_sgl_eval(args)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -465,7 +442,7 @@ if __name__ == "__main__":
         type=str,
         default="chat",
         choices=["chat", "completion", "generate"],
-        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
+        help="API mode for benchmarks outside sgl-eval. GSM8K and MMLU always use sgl-eval chat completions.",
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
@@ -491,32 +468,6 @@ if __name__ == "__main__":
         type=str,
         choices=THINKING_MODE_CHOICES,
         help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
-    )
-
-    # LongBench-v2 specific arguments
-    parser.add_argument(
-        "--num-shots",
-        type=int,
-        default=5,
-        help="Number of few-shot examples for GSM8K (default: 5)",
-    )
-    parser.add_argument(
-        "--gsm8k-data-path",
-        type=str,
-        default=None,
-        help="Path to GSM8K data file (e.g., test.jsonl)",
-    )
-    parser.add_argument(
-        "--mixed-prefix-gsm8k-secondary-pool-size",
-        type=int,
-        default=15,
-        help="Size of secondary example pool for eval_name=mixed_prefix_gsm8k (default: 15)",
-    )
-    parser.add_argument(
-        "--mixed-prefix-gsm8k-seed",
-        type=int,
-        default=42,
-        help="Seed for per-question random sampling in mixed_prefix_gsm8k (default: 42)",
     )
 
     args = parser.parse_args()

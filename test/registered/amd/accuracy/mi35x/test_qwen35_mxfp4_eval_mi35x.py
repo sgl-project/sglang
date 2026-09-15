@@ -92,7 +92,7 @@ COMMON_ENV = {
 def _run_gsm8k(
     base_url: str, model: str, num_examples: int, max_tokens: int = 2048
 ) -> dict:
-    """Few-shot GSM8K against a running server; returns run_eval metrics.
+    """sgl-eval GSM8K against a running server; returns run_eval metrics.
 
     ``metrics["score"]`` is the accuracy in [0, 1].
     """
@@ -101,7 +101,6 @@ def _run_gsm8k(
         base_url=base_url,
         model=model,
         eval_name="gsm8k",
-        api="completion",
         max_tokens=max_tokens,
         num_examples=num_examples,
         num_threads=256,

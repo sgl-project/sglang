@@ -45,19 +45,18 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
     decode_cache_assert = staticmethod(_assert_pp_decode_cached_tokens)
 
     def test_gsm8k(self):
-        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
+        from sglang.test.run_eval import run_eval as run_gsm8k_eval
 
         url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=10,
-            data_path=None,
-            num_questions=self.num_gsm8k_questions,
-            max_new_tokens=2048,
-            parallel=self.max_running_requests,
+            eval_name="gsm8k",
+            num_examples=self.num_gsm8k_questions,
+            max_tokens=2048,
+            num_threads=self.max_running_requests,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
-        metrics = run_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(
             f"[{self.__class__.__name__}] GSM8K accuracy: {metrics['accuracy']:.3f} "
             f"(threshold: {self.gsm8k_threshold})"

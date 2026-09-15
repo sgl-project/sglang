@@ -37,12 +37,10 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         eval_args = SimpleNamespace(
             base_url=DEFAULT_URL_FOR_TEST,
             eval_name="gsm8k",
-            api="completion",
             model=QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
             num_examples=1319,
             num_threads=128,
             max_tokens=512,
-            num_shots=5,
             temperature=0.0,
         )
         return run_eval(eval_args)

@@ -58,7 +58,6 @@ class TestNPUGlm4_7Flash_1P_GSM8K(TestNpuAccuracyTestCaseBase):
     other_args = OTHER_ARGS
     accuracy = 0.9560
     datasets = ["gsm8k"]
-    few_shot_num = 5
     generation_config = {"max_tokens": 65536, "temperature": 1.0}
     eval_batch_size = 64
 

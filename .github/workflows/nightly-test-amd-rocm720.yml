@@ -1747,7 +1747,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common
 
       - name: Accuracy Test ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120
@@ -1801,7 +1801,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120

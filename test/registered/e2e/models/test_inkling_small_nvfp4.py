@@ -124,16 +124,15 @@ class TestInklingSmallNvfp4(CustomTestCase):
         """Answer quality on the real checkpoint: guards the modelopt_fp4 weight
         load and the FP4 GEMM/MoE kernels against changes that keep the server
         healthy but corrupt the numerics."""
-        from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k
+        from sglang.test.run_eval import run_eval as run_gsm8k_eval
 
         url = urlparse(self.base_url)
-        metrics = run_few_shot_gsm8k(
+        metrics = run_gsm8k_eval(
             SimpleNamespace(
-                num_shots=10,
-                data_path=None,
-                num_questions=200,
-                max_new_tokens=512,
-                parallel=128,
+                eval_name="gsm8k",
+                num_examples=200,
+                max_tokens=512,
+                num_threads=128,
                 host=f"http://{url.hostname}",
                 port=int(url.port),
             )

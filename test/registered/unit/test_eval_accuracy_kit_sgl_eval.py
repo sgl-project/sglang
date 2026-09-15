@@ -1,17 +1,4 @@
-"""Unit tests for sgl-eval-backed accuracy mixin dispatch.
-
-Hermetic (no server, no real sgl-eval install). These guard the behavior that
-existing consumers rely on -- not the sgl-eval happy path, which the live
-accuracy runs already cover:
-
-  1. The default GSM8K backend stays on ``run_eval`` (OpenAI completion API);
-     the ~47 existing GSM8K consumers must never be silently rerouted.
-  2. The legacy ``gsm8k_accuracy_thres`` alias is still honored as the pass/fail
-     gate when the canonical ``gsm8k_score_threshold`` is unset.
-  3. MMMU-Pro delegates model and sampling selection to a built-in model preset.
-  4. The sgl-eval reasoning path skips (does not error) when sgl-eval is absent,
-     so CI without the optional dependency stays green.
-"""
+"""Accuracy mixin dispatch, generation settings and score gates."""
 
 import sys
 import unittest
@@ -69,12 +56,23 @@ class TestEvalKitBackendDispatch(CustomTestCase):
             host.test_gsm8k()
         return captured["args"]
 
-    def test_default_backend_uses_run_eval_completion(self):
-        # The default path that all existing GSM8K consumers rely on must stay on
-        # run_eval's OpenAI completion API -- it must not touch sgl-eval.
-        args = self._run_gsm8k_default(0.95, gsm8k_accuracy_thres=0.5)
+    def test_gsm8k_forwards_sgl_eval_generation_settings(self):
+        args = self._run_gsm8k_default(
+            0.95,
+            gsm8k_accuracy_thres=0.5,
+            gsm8k_thinking=True,
+            gsm8k_temperature=0.7,
+            gsm8k_top_p=0.9,
+            gsm8k_max_tokens=8192,
+            gsm8k_n_repeats=3,
+        )
         self.assertEqual(args.eval_name, "gsm8k")
-        self.assertEqual(args.api, "completion")
+        self.assertFalse(hasattr(args, "api"))
+        self.assertTrue(args.sgl_eval_thinking)
+        self.assertEqual(args.max_tokens, 8192)
+        self.assertEqual(args.repeat, 3)
+        self.assertEqual(args.temperature, 0.7)
+        self.assertEqual(args.top_p, 0.9)
 
     def test_legacy_accuracy_thres_alias_gates_score(self):
         # Canonical gsm8k_score_threshold left unset (NaN) -> the legacy

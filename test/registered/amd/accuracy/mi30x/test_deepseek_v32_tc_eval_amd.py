@@ -1,7 +1,7 @@
 """AMD DeepSeek-V3.2 TC GSM8K Accuracy Evaluation Test (8-GPU)
 
-Tests DeepSeek-V3.2 with Torch Compile configuration using few-shot
-completion benchmark on MI325/MI300X.
+Tests DeepSeek-V3.2 with Torch Compile configuration using sgl-eval
+chat benchmark on MI325/MI300X.
 
 Registry: nightly-amd-accuracy-8-gpu-deepseek-v32-tc suite
 """
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -86,15 +86,14 @@ class TestDeepseekV32TC(CustomTestCase):
         Named with 'a' prefix to run first (alphabetically) to warm up the server.
         """
         args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1400,
+            num_threads=1400,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():

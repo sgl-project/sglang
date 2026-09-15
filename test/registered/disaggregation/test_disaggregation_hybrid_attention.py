@@ -77,8 +77,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=200,
             num_threads=128,
         )
@@ -153,8 +152,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=200,
             num_threads=128,
         )
@@ -232,8 +230,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=2048,
             num_examples=200,
             num_threads=128,
         )
@@ -305,8 +302,9 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=8192,
+            temperature=0.6,
+            top_p=0.95,
             num_examples=200,
             num_threads=128,
         )
@@ -381,8 +379,9 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
+            max_tokens=8192,
+            temperature=0.6,
+            top_p=0.95,
             num_examples=200,
             num_threads=128,
         )

@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -128,11 +128,10 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
         """Accuracy + spec path full forward."""
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=200,
+            max_tokens=512,
+            num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -144,11 +143,10 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
         """Degenerate spec step (still cuda-graph captured)."""
         requests.get(self.base_url + "/flush_cache")
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=100,
-            max_new_tokens=1,
-            parallel=128,
+            eval_name="gsm8k",
+            num_examples=100,
+            max_tokens=1,
+            num_threads=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )

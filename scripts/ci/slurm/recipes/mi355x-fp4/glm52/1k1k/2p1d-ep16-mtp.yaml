@@ -85,6 +85,5 @@ bench:
   random_range_ratio: 1.0
   accuracy:
     enabled: true
-    num_shots: 8
     num_questions: 1319
     threshold: 0.91

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval as run_gsm8k_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -125,15 +125,14 @@ class TestDeepseekV4ProFp4TboMTP(CustomTestCase):
 
     def test_gsm8k_tbo_mtp(self):
         args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=1319,
-            parallel=512,
-            max_new_tokens=512,
+            eval_name="gsm8k",
+            num_examples=1319,
+            num_threads=512,
+            max_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
