@@ -331,6 +331,14 @@ def minimax_sparse_decode(
         _skip_reduce = True
     else:
         _skip_reduce = False
+        # source layers publish their top-k: let the kernel write the shared buffer directly
+        _topk_direct_out = (
+            topk_out
+            if topk_out is not None
+            and dense_main_attn_fn is None
+            and idx_q.shape[1] == k_cache.shape[1]
+            else None
+        )
         # Step 1: Flash decode with topk index (using index head). When the dense main
         # attention is used, the indexer emits the page table directly (fused
         # transform) instead of block ids, plus the per-query effective KV length.
@@ -356,6 +364,7 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
+            topk_idx_out=_topk_direct_out,
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -381,7 +390,8 @@ def minimax_sparse_decode(
                     f"topk_out shape {tuple(topk_out.shape)} does not match "
                     f"reduced top-k shape {tuple(topk_idx.shape)}"
                 )
-            topk_out.copy_(topk_idx)
+            if topk_idx is not topk_out:
+                topk_out.copy_(topk_idx)
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
