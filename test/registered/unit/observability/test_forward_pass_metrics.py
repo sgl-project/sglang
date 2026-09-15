@@ -32,13 +32,11 @@ from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     _FpmPublisherThread,
     decode,
-)
-from sglang.srt.observability.fpm_timing import (
     wrap_forward_with_fpm,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval
-from sglang.test.fpm_test_utils import FakeInterval, capture_timing
+from sglang.test.forward_pass_metrics_test_utils import FakeInterval, capture_timing
 from sglang.test.test_utils import CustomTestCase
 
 

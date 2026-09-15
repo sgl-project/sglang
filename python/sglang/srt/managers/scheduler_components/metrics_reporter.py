@@ -17,8 +17,8 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.forward_pass_metrics import (
     ScheduledRequestMetrics,
     WelfordAccumulator,
+    wrap_forward_with_fpm,
 )
-from sglang.srt.observability.fpm_timing import wrap_forward_with_fpm
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,

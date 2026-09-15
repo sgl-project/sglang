@@ -2,7 +2,7 @@
 
 from contextlib import contextmanager
 
-from sglang.srt.observability.fpm_timing import FpmTiming
+from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
 class FakeEvent:
