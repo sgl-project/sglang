@@ -1423,6 +1423,39 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         self.assertIs(fb_view.input_embeds, embeds)
 
 
+class TestPrefillGlobalTokenCount(unittest.TestCase):
+    def test_live_attention_boundary_without_expert_parallelism(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=128,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+        )
+        self.assertFalse(reg.has_slot("num_token_non_padded"))
+        count = reg.get_slot("global_num_token_non_padded").buffer
+        address = count.data_ptr()
+        # A DP-padded input may already exceed its real global count.
+        for raw, bucket, real in [(50, 64, 50), (114, 128, 110), (33, 64, None)]:
+            fb = _MiniForwardBatch(
+                batch_size=1,
+                global_num_token_non_padded_cpu=real,
+            )
+            reg.fill_from(
+                fb,
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=raw,
+                padded_num_tokens=bucket,
+            )
+            self.assertEqual(count.data_ptr(), address)
+            self.assertEqual(count.item(), raw if real is None else real)
+
+
 class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
     """The prefill registry must re-derive the attn-TP-local pad boundary from
     the CAPTURE BUCKET, not trust the FB tensor.

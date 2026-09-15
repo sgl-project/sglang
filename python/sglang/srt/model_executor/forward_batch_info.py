@@ -547,7 +547,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #                                      registry localize from on each forward /
     #                                      replay. Present only when
     #                                      enable_num_token_non_padded()
-    #                                      (moe_ep_size > 1).
+    #                                      (moe_ep_size > 1), or in the prefill
+    #                                      graph runner to mask bucket padding.
     #     global_num_token_non_padded_cpu  host int. Host-side attention/backend
     #                                      slices read it directly; the prefill
     #                                      graph registry derives its per-rank GPU
