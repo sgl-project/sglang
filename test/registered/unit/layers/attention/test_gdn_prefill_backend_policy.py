@@ -268,6 +268,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         dispatcher = MagicMock()
         dispatcher.try_fused_extend.return_value = (sentinel.core_attn_out, None, None)
         backend.kernel_dispatcher = dispatcher
+        backend.mis_metadata = None
         backend.forward_metadata = SimpleNamespace(
             query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
             mamba_cache_indices=torch.tensor([0], dtype=torch.int32),
