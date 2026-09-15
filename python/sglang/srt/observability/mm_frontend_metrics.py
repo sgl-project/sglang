@@ -23,6 +23,13 @@ class MultimodalFrontendMetrics:
     def __init__(
         self, *, labels: dict[str, str], counter_cls, gauge_cls, histogram_cls
     ):
+        # Request-custom/static labels may reuse these names; the frontend
+        # dimensions must remain bounded and must not receive duplicate kwargs.
+        labels = {
+            name: value
+            for name, value in labels.items()
+            if name not in ("stage", "outcome", "modality")
+        }
         self._labels = labels
         self._duration = histogram_cls(
             name="sglang:mm_frontend_stage_seconds",
