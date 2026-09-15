@@ -1077,8 +1077,7 @@ def flash_decode_with_topk_idx(
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
     if pack > 1:
-        # one launch: [pack*H, bs, blocks] -> request-major [H, bs*pack, blocks], and re-force
-        # each row's own local blocks (the score kernel forced only the longest row's)
+        # un-pack to request-major rows in one launch, re-forcing each row's own local blocks
         num_seqblocks = score.shape[2]
         score_rows = torch.empty(
             (heads_per_row, num_rows, num_seqblocks),
