@@ -109,7 +109,8 @@ class EagerRunner(BaseRunner):
         else:
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
-                # dLLM runs block_size tokens/request (DLLM_EXTEND).
+                # Denoising runs block_size tokens/request; pure dLLM prefill is
+                # larger but is an EXTEND batch, covered by prefill_ceiling below.
                 num_tokens_per_req = dllm_config.block_size
         max_bs = mr.max_running_requests
         if (

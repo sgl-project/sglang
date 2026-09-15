@@ -81,10 +81,13 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     takes the prefill result path, which commits them per-req instead of
     through the batch decode fold, and member rows carry no req."""
 
-    def _vote(self, *, beam):
+    def _vote(self, *, beam, dllm_config=None, is_dllm_prefill=False):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
         runner.can_replay_locally.return_value = True
+        # Kept for the dLLM case below, which asserts on the tri-state the vote
+        # passes down rather than on the return value of this always-True mock.
+        self.runner = runner
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 2,
@@ -94,6 +97,10 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
             ],
+            # ScheduleBatch declares both; a double that omits them drifts from
+            # the record the vote reads.
+            dllm_config=dllm_config,
+            is_dllm_prefill=is_dllm_prefill,
         )
         with (
             patch.object(
@@ -125,9 +132,30 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_plain_decode_batch_votes_for_conversion(self):
         self.assertTrue(self._vote(beam=False))
+        # Ordinary batches leave the tri-state unset.
+        self.assertIsNone(
+            self.runner.can_replay_locally.call_args.kwargs["dllm_prefill"]
+        )
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+    def test_dllm_decode_batch_is_ineligible_for_conversion(self):
+        """A dLLM batch outside pure prefill must vote the conversion down.
+
+        `can_run_graph` returns False at forward time for any dLLM batch that is
+        not a pure prefill in EXTEND mode. The schedule-time vote has to reach
+        the same verdict by the other spelling -- passing `dllm_prefill=False`,
+        which `can_replay_locally` refuses -- or the dp ranks and the forward
+        disagree about whether the graph runs.
+        """
+        self._vote(beam=False, dllm_config=object(), is_dllm_prefill=True)
+
+        # True on the batch, False here: this is a DECODE batch, and the pure
+        # prefill phase only rides the EXTEND graph.
+        self.assertIs(
+            self.runner.can_replay_locally.call_args.kwargs["dllm_prefill"], False
+        )
 
 
 if __name__ == "__main__":

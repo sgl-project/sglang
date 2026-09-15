@@ -69,6 +69,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -502,6 +503,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Diffusion LLM config and scheduler-selected pure-prefill phase.
+    dllm_config: Optional[DllmConfig] = None
+    is_dllm_prefill: bool = False
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -855,6 +859,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            dllm_config=batch.dllm_config,
+            is_dllm_prefill=batch.is_dllm_prefill,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -908,7 +914,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return ret
 
         # Override the positions with diffusion LLM or spec_info
-        if batch.dllm_config is not None:
+        # DLLM decode uses a fixed-size mask block. Pure DLLM prefill is a
+        # regular EXTEND batch and must use the dynamic position calculation
+        # below so positions match its (potentially larger) extend length.
+        if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32

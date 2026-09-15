@@ -457,6 +457,13 @@ def apply_deepep_adjustments(server_args: Any):
     if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
         bs = cfg.cuda_graph_config.prefill.bs
         if bs is None:
+            if cfg.dllm_algorithm is not None:
+                # dLLM installs its own aggregate-token buckets at memory
+                # sizing, which only runs while `bs` is unset; filling it in
+                # here would leave pure dLLM prefill without a bucket it can
+                # ever hit. That generator already steps by a multiple of 8
+                # under DeepEP (memory_hook.dllm_prefill_graph_alignment).
+                return
             # 2048 = documented prefill default; max_bs unresolved here.
             max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
             bs = generate_prefill_cuda_graph_batch_sizes(max_bs)

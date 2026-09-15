@@ -340,6 +340,12 @@ def _local_prefill_cuda_graph_vote(
 
     if prefill_graph_runner is None:
         return True
+    # Keep the schedule-time vote identical to forward-time graph selection:
+    # ordinary batches use None, pure dLLM prefill uses True, and all other
+    # dLLM phases are explicitly ineligible.
+    dllm_prefill = None
+    if local_batch.dllm_config is not None:
+        dllm_prefill = local_batch.is_dllm_prefill and mode == ForwardMode.EXTEND
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,
@@ -350,6 +356,7 @@ def _local_prefill_cuda_graph_vote(
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
+        dllm_prefill=dllm_prefill,
     )
 
 
