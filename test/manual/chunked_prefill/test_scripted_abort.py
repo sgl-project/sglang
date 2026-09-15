@@ -7,27 +7,17 @@ from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_STEPS,
+    RID_RELEASE_SETTLE_STEPS,
     SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS,
     SMALL_KV_POOL_BALLAST_PROMPT_LEN,
     SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    drain_until_released,
     run_until,
     run_until_all_finished,
     run_until_finished,
 )
-
-
-def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
-    for _ in range(12):
-        if all(
-            h.kv_pages == 0
-            and h.lock_refs == 0
-            and (h.req is None or h.req.kv.req_pool_idx is None)
-            for h in handles
-        ):
-            return
-        yield
 
 
 class TestAbortBasic(ScriptedTestCase):
@@ -47,7 +37,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert pages_before > 0, "chunked req should own KV pages mid-chunk"
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.status in (
             "finished",
@@ -75,7 +65,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
@@ -91,7 +81,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
 
@@ -109,7 +99,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r1, lambda h: h.is_chunking)
 
         t.abort(r1)
-        yield from _drain_until_released(t, r1)
+        yield from drain_until_released(t, r1)
 
         assert r1.kv_pages == 0
         yield from run_until_finished(r2)
@@ -122,7 +112,7 @@ class TestAbortBasic(ScriptedTestCase):
     def _script_abort_with_zero_yield(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
@@ -135,7 +125,7 @@ class TestAbortBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
 
@@ -188,7 +178,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(reqs[0], lambda h: h.is_chunking)
         for r in reqs:
             t.abort(r)
-        yield from _drain_until_released(t, *reqs)
+        yield from drain_until_released(t, *reqs)
         for r in reqs:
             assert r.kv_pages == 0
             assert r.req is None or r.req.kv.req_pool_idx is None
@@ -248,7 +238,7 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.inflight_middle_chunks == 0
 
@@ -262,7 +252,7 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.chunks_done >= 2 and h.is_chunking)
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
@@ -277,8 +267,10 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r, lambda h: h.is_chunking)
         t.abort(r)
-        t.abort(r)
-        yield from _drain_until_released(t, r)
+        # A repeat abort is dropped at the TokenizerManager once abort_sent is
+        # set, so no second AbortReq reaches the scheduler to wait for.
+        t.abort(r, await_arrival=False)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -291,7 +283,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.status == "running")
         assert r.kv_pages > 0, "decode req must own KV before abort"
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -323,7 +315,7 @@ class TestAbortBasic(ScriptedTestCase):
         for r in reqs:
             t.abort(r)
             yield
-        yield from _drain_until_released(t, *reqs)
+        yield from drain_until_released(t, *reqs)
         for r in reqs:
             assert r.kv_pages == 0
 
@@ -339,7 +331,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.chunks_done >= 1 and h.is_chunking)
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
 
@@ -366,7 +358,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
@@ -397,12 +389,13 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         t.abort(r1)
+        for _ in range(RID_RELEASE_SETTLE_STEPS):
+            yield
         r2 = t.start_req(
             prompt_len=16,
             max_new_tokens=2,
             rid="abort-resubmit-same-step",
         )
-        yield
         yield from run_until_finished(r2)
         assert r2.finished, "resubmit under same rid must complete independently"
         assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
@@ -426,7 +419,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert r.req.inflight_middle_chunks > 0
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
@@ -452,7 +445,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         for _ in range(12):
             if t.scheduler.chunked_req is None and t.is_idle:
@@ -483,7 +476,7 @@ class TestAbortBasic(ScriptedTestCase):
 
         t.abort(r1)
         r2 = t.start_req(prompt_len=16, max_new_tokens=2)
-        yield from _drain_until_released(t, r1)
+        yield from drain_until_released(t, r1)
 
         cur = (
             t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
@@ -506,7 +499,7 @@ class TestAbortBasic(ScriptedTestCase):
 
         t.pause_generation(mode="retract")
         t.abort(r1)
-        yield from _drain_until_released(t, r1)
+        yield from drain_until_released(t, r1)
 
         assert r1.kv_pages == 0, (
             f"force_retract + abort same yield must release KV; got {r1.kv_pages}"
@@ -536,7 +529,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert (1 if t.scheduler.chunked_req is not None else 0) == 1
 
         t.abort(r1)
-        yield from _drain_until_released(t, r1)
+        yield from drain_until_released(t, r1)
 
         yield from run_until(r2, lambda h: h.is_chunking)
         assert r1.kv_pages == 0
@@ -567,7 +560,7 @@ class TestAbortPP(ScriptedTestCase):
         )
 
         t.abort(r)
-        yield from _drain_until_released(t, r)
+        yield from drain_until_released(t, r)
 
         assert r.kv_pages == 0
         assert r.req is None or r.req.kv.req_pool_idx is None
@@ -636,7 +629,7 @@ class TestAbortSmallPool(ScriptedTestCase):
 
         t.abort(b1)
         t.abort(b2)
-        yield from _drain_until_released(t, b1, b2)
+        yield from drain_until_released(t, b1, b2)
 
 
 if __name__ == "__main__":

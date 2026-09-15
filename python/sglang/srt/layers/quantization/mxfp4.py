@@ -60,7 +60,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import empty_device_cache, get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
@@ -1104,7 +1104,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
-        torch.cuda.empty_cache()
+        empty_device_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
