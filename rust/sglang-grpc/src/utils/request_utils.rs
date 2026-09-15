@@ -178,6 +178,76 @@ fn insert_disaggregated_params(
     }
 }
 
+/// Convert a `google.protobuf.Value` to JSON.
+///
+/// An integral `number_value` becomes a JSON integer: the Python side decodes
+/// action payloads into typed fields (block hashes and the like), where a float
+/// would not convert. Struct only carries f64, so a value above 2^53 has already
+/// lost precision on the wire -- an action that needs exact 64-bit integers must
+/// encode them as strings.
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                serde_json::json!(*n as i64)
+            } else {
+                serde_json::json!(n)
+            }
+        }
+        Some(Kind::StringValue(s)) => serde_json::json!(s),
+        Some(Kind::BoolValue(b)) => serde_json::json!(b),
+        Some(Kind::StructValue(s)) => prost_struct_to_json(s),
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(prost_value_to_json).collect())
+        }
+    }
+}
+
+fn prost_struct_to_json(s: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        s.fields
+            .iter()
+            .map(|(k, v)| (k.clone(), prost_value_to_json(v)))
+            .collect(),
+    )
+}
+
+/// Forward the KV-hint envelope untouched. Action payloads are opaque here; the
+/// component implementing an `action_type` owns its schema.
+fn insert_kv_hints(
+    request: &mut HashMap<String, serde_json::Value>,
+    kv_hints: &Option<proto::KvHintsEnvelope>,
+) {
+    let Some(envelope) = kv_hints else {
+        return;
+    };
+    let actions: Vec<serde_json::Value> = envelope
+        .actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+                "action_version": action.action_version,
+                "payload": action
+                    .payload
+                    .as_ref()
+                    .map_or_else(|| serde_json::json!({}), prost_struct_to_json),
+            })
+        })
+        .collect();
+    request.insert(
+        "kv_hints".into(),
+        serde_json::json!({
+            "protocol_version": envelope.protocol_version,
+            "message_id": envelope.message_id,
+            "actions": actions,
+        }),
+    );
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +320,7 @@ pub(crate) fn build_text_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -304,6 +375,7 @@ pub(crate) fn build_generate_dict(
         req.max_thinking_tokens,
     );
     insert_disaggregated_params(&mut d, &req.disaggregated_params);
+    insert_kv_hints(&mut d, &req.kv_hints);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -448,6 +520,90 @@ mod tests {
             assert!(!request.contains_key("bootstrap_host"));
             assert!(!request.contains_key("bootstrap_port"));
             assert!(!request.contains_key("bootstrap_room"));
+        }
+    }
+
+    #[test]
+    fn generate_dicts_forward_kv_hints_envelope() {
+        let payload = prost_types::Struct {
+            fields: [
+                (
+                    "endpoint".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(
+                            "tcp://10.0.0.2:7000".to_string(),
+                        )),
+                    },
+                ),
+                (
+                    "block_hashes".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::ListValue(
+                            prost_types::ListValue {
+                                values: vec![prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::NumberValue(7.0)),
+                                }],
+                            },
+                        )),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let kv_hints = Some(proto::KvHintsEnvelope {
+            protocol_version: "0.1".to_string(),
+            message_id: "msg-1".to_string(),
+            actions: vec![proto::KvHintAction {
+                action_id: "a-1".to_string(),
+                action_type: "kv.example".to_string(),
+                action_version: "1.0".to_string(),
+                payload: Some(payload),
+            }],
+        });
+        let text_req = proto::TextGenerateRequest {
+            kv_hints: kv_hints.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            kv_hints,
+            ..Default::default()
+        };
+
+        for request in [
+            build_text_generate_dict("request-1", &text_req),
+            build_generate_dict("request-2", &token_req),
+        ] {
+            assert_eq!(
+                request.unwrap().get("kv_hints"),
+                Some(&serde_json::json!({
+                    "protocol_version": "0.1",
+                    "message_id": "msg-1",
+                    "actions": [{
+                        "action_id": "a-1",
+                        "action_type": "kv.example",
+                        "action_version": "1.0",
+                        // An integral number stays an integer: the Python side
+                        // decodes payloads into typed fields.
+                        "payload": {
+                            "endpoint": "tcp://10.0.0.2:7000",
+                            "block_hashes": [7],
+                        },
+                    }],
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_omit_kv_hints_when_absent() {
+        let text_request =
+            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default()).unwrap();
+        let token_request =
+            build_generate_dict("request-2", &proto::GenerateRequest::default()).unwrap();
+
+        for request in [text_request, token_request] {
+            assert!(!request.contains_key("kv_hints"));
         }
     }
 
