@@ -846,6 +846,10 @@ class MoriKVManager(CommonKVManager):
         return grouped_plan.materialize(item_len)
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+        )
+
         page_size = self.kv_args.page_size
 
         src_item_len = self.kv_args.kv_item_lens[0]
@@ -861,27 +865,21 @@ class MoriKVManager(CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
 
-        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
 
         bytes_per_head_slice = bytes_per_token_dst // dst_heads_per_rank
         if bytes_per_head_slice == 0:
             raise ValueError("Head slice size evaluates to zero")
 
-        src_replication = max(1, prefill_tp_size // total_kv_heads)
-
-        local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
-        dst_tp_rank = peer_info.decode_tp_rank % decode_tp_size
-
-        if prefill_tp_size > decode_tp_size:
-            src_head_start = 0
-            num_heads_to_send = src_heads_per_rank
-            unique_head_idx = local_tp_rank // src_replication
-            dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
-        else:
-            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
-            num_heads_to_send = dst_heads_per_rank
-            dst_head_start = 0
+        src_head_start, num_heads_to_send, dst_head_start, _ = (
+            compute_head_slice_params(
+                prefill_tp_size,
+                decode_tp_size,
+                self.kv_args.engine_rank,
+                peer_info.decode_tp_rank,
+                total_kv_heads,
+            )
+        )
 
         src_head_slice_offset = src_head_start * bytes_per_head_slice
         dst_head_slice_offset = dst_head_start * bytes_per_head_slice
