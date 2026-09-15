@@ -2880,6 +2880,11 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
+    if artifact_path := envs.SGLANG_SNAPSHOT_DIR.get():
+        from sglang.srt.engine_snapshot.startup import server_barrier
+
+        server_barrier(server_args, artifact_path)
+
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
