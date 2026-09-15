@@ -185,6 +185,7 @@ def register_fake_ops(tp_size: int):
         "multimodal_rotary_embedding_cpu",
         "apply_multidimensional_rope_cpu",
         "fused_sigmoid_mul_cpu",
+        "fused_inplace_qknorm_cpu",
     ]
     for op in none_return_ops:
 

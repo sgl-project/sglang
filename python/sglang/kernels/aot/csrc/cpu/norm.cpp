@@ -1052,3 +1052,55 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
   });
   return std::make_tuple(q_out, k_out, gate_out);
 }
+
+void fused_inplace_qknorm_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    int64_t head_dim) {
+  const auto st = q.scalar_type();
+  CHECK_DIM(3, q);
+  CHECK_DIM(3, k);
+  CHECK_INPUT(q);
+  CHECK_INPUT(k);
+
+  TORCH_CHECK(head_dim > 0, "head_dim must be positive");
+  CHECK_EQ(q.size(2), head_dim);
+  CHECK_EQ(k.size(2), head_dim);
+  CHECK_EQ(k.size(0), q.size(0));
+  CHECK_EQ(k.scalar_type(), st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {head_dim}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(k_weight, {head_dim}, st);
+
+  const int64_t num_q_heads = q.size(1);
+  const int64_t num_kv_heads = k.size(1);
+
+  NormParams q_params{q, static_cast<float>(eps)};
+  q_params.H = num_q_heads;
+  q_params.T = 1;
+  q_params.D = head_dim;
+  q_params.i_strideH = head_dim;
+  q_params.weight = q_weight.data_ptr();
+  q_params.shift = 1.f;
+
+  NormParams k_params{k, static_cast<float>(eps)};
+  k_params.H = num_kv_heads;
+  k_params.T = 1;
+  k_params.D = head_dim;
+  k_params.i_strideH = head_dim;
+  k_params.weight = k_weight.data_ptr();
+  k_params.shift = 1.f;
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_inplace_qknorm", [&] {
+    fused_qk_norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        nullptr,
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        q_params,
+        k_params);
+  });
+}
