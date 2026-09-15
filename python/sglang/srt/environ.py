@@ -1186,6 +1186,9 @@ class Envs:
     # Deprecated in favor of '--deepep-dispatcher-output-dtype bf16' but still
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
+    # Experimental SM90 W4AFP8 LL: consume block-FP8 dispatch scales directly.
+    # GEMM2 uses dynamic block quantization rather than checkpoint static scales.
+    SGLANG_W4AFP8_CUTEDSL_LL = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
