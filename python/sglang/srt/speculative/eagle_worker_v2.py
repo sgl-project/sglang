@@ -98,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -318,7 +319,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        embed, head = self._resolve_shared_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -359,6 +360,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+    def _resolve_shared_embed_and_head(self):
+        target_runner = self.target_worker.model_runner
+        return resolve_draft_embed_and_head(
+            target_model=target_runner.model,
+            draft_model=self.draft_runner.model,
+            is_first_pp_rank=get_pp_group().is_first_rank,
+            pp_size=get_pp_group().world_size,
+            model_path=target_runner.model_config.model_path,
+            revision=target_runner.model_config.revision,
+            load_config=target_runner.load_config,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
