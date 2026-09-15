@@ -39,8 +39,10 @@ class TestDSADCPKernels(CustomTestCase):
                         attn_dcp_size=size, attn_dcp_rank=rank
                     ):
                         set_mla_kv_buffer_dcp_sharded_triton(cache, locs, k, None)
-                        local = DeepseekSparseAttnBackend._dcp_localize_page_table(
-                            virtual
+                        local = (
+                            DeepseekSparseAttnBackend._dcp_global_to_local_kv_indices(
+                                virtual
+                            )
                         )
                     expected_cache = torch.zeros_like(cache)
                     owned = locs % size == rank
