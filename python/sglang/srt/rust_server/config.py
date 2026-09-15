@@ -69,6 +69,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
+            model_type=getattr(mc.hf_config, "model_type", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
