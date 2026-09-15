@@ -930,6 +930,11 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # DSPARK: run the target lm_head projection (verify logits) in fp8 via
+    # torch._scaled_mm (per-token activation scale + per-output-channel weight
+    # scale, weight quantized once and cached). Halves the per-step head GEMM;
+    # off by default. Only engages for a floating-point (non-quantized) head.
+    SGLANG_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
 
     # ===================================================================
     # Apple Silicon and MLX
