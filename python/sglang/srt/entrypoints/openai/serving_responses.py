@@ -805,6 +805,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
+                finish_reason=meta_info.get("finish_reason") if meta_info else None,
             )
 
             if meta_info is not None:
@@ -1028,6 +1029,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         output_logprobs: Optional[list] = None,
         *,
         require_reasoning: bool,
+        finish_reason: Union[str, dict[str, Any], None] = None,
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
         if self.reasoning_parser:
@@ -1047,7 +1049,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and request.tool_choice != "none"
                 ),
             )
-            reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            reasoning_content, content = reasoning_parser.parse_non_stream(
+                final_output, finish_reason=finish_reason
+            )
         else:
             reasoning_content = None
             content = final_output
@@ -2318,7 +2322,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                     if flush:
                         end_reasoning, end_normal = (
-                            reasoning_parser_obj.parse_stream_end()
+                            reasoning_parser_obj.parse_stream_end(finish_reason)
                         )
                         if end_reasoning:
                             reasoning_chunk = (reasoning_chunk or "") + end_reasoning
