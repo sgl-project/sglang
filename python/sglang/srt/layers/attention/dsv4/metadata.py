@@ -116,6 +116,12 @@ class PagedIndexerMetadata:
     use_topk_v2: bool
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
+    # low-ratio sources. Drives the compressed-domain page size and seq lens.
+    compress_ratio: int = 4
+    # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
+    # all rows at once. Chunk plans are stacked so replay can copy them in place.
+    row_chunk: int = 0
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -144,7 +150,18 @@ class PagedIndexerMetadata:
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
                 compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
-            if _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
+            if self.row_chunk > 0:
+                self.deep_gemm_metadata = torch.stack(
+                    [
+                        get_paged_mqa_logits_metadata(
+                            compressed_seq_lens[_s : _s + self.row_chunk],
+                            self.compressed_page_size,
+                            deep_gemm.get_num_sms(),
+                        )
+                        for _s in range(0, compressed_seq_lens.shape[0], self.row_chunk)
+                    ]
+                )
+            elif _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
@@ -173,6 +190,9 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        assert self.page_size % self.compress_ratio == 0, (
+            f"{self.page_size = } must divide {self.compress_ratio = }"
+        )
 
     @property
     def max_seq_len(self) -> int:
@@ -181,6 +201,18 @@ class PagedIndexerMetadata:
     @property
     def max_compressed_seq_len(self) -> int:
         return self.page_table.shape[1] * self.compressed_page_size
+
+    def row_chunks(self):
+        """(rows, plan) per logits chunk; one chunk when row_chunk is 0."""
+        num_rows = self.compressed_seq_lens.shape[0]
+        if self.row_chunk <= 0:
+            return [(slice(0, num_rows), self.deep_gemm_metadata)]
+        return [
+            (slice(start, min(start + self.row_chunk, num_rows)), plan)
+            for start, plan in zip(
+                range(0, num_rows, self.row_chunk), self.deep_gemm_metadata
+            )
+        ]
 
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
@@ -196,6 +228,8 @@ class PagedIndexerMetadata:
             check_eq_fields=[
                 "page_size",
                 "compressed_page_size",
+                "compress_ratio",
+                "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",

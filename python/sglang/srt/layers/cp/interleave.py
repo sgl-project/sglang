@@ -55,6 +55,9 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    # Tail row -> packed all-gather slot; local tail metadata rows include padding.
+    gather_index: Optional[torch.Tensor] = None
+    local_index: Optional[torch.Tensor] = None
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
@@ -205,6 +208,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
         attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
 
+        if metadata.gather_index is not None:
+            return gathered.index_select(0, metadata.gather_index)
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
             flat_indices % self.cp_size
@@ -270,3 +275,15 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         k_nope = full_latent[..., :kv_lora_rank].unsqueeze(1)
         k_rope = full_latent[..., kv_lora_rank:].unsqueeze(1)
         return k_nope, k_rope
+
+
+def interleave_rows_per_request(
+    extend_lens: List[int], cp_rank: int, cp_size: int
+) -> List[int]:
+    """Rows of each request an interleave CP rank holds (batch index congruent to the rank)."""
+    counts, start = [], 0
+    for n in extend_lens:
+        end = start + n
+        counts.append((end - 1 - cp_rank) // cp_size - (start - 1 - cp_rank) // cp_size)
+        start = end
+    return counts

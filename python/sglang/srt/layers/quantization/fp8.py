@@ -56,15 +56,19 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
+    can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
+    resolve_block_fp8_mxfp8_backend,
     resolve_mxfp8_dense_gemm_backend,
     torch_w8a8_block_fp8_linear,
     unshuffle_aiter_fp8_weight,
@@ -72,6 +76,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -185,7 +190,7 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
         3.0,
         4.0,
         6.0,
-        0.0,
+        -0.0,
         -0.5,
         -1.0,
         -1.5,
@@ -282,6 +287,7 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
@@ -510,11 +516,18 @@ class Fp8LinearMethod(LinearMethodBase):
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
+        # Set by a model-owned startup hook after opting into prefill tuning.
+        # Other block-FP8 models retain their fixed tactic at every batch size.
+        self.mxfp8_prefill_autotune_min_tokens = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
+                weight_block_size=self.weight_block_size,
+                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0",
+            )
             if _is_npu and is_npu_arch35() and self.quant_config.scale_fmt != "ue8m0":
                 # The A5 backend expects the ue8m0 weight layout installed by
                 # the arch35 load path; keep plain block-FP8 checkpoints on
@@ -524,6 +537,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 self.w8a8_block_fp8_linear = triton_w8a8_block_fp8_linear
+        # 32-wide-K ue8m0 blocks can use FlashInfer MXFP8 on Blackwell;
+        # Triton is the fallback when no supported FlashInfer backend is selected.
+        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
+            self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+        )
+        if self.block_fp8_as_mxfp8:
+            self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
+            self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
+                self.mxfp8_dense_backend
+            )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -774,6 +797,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if self.block_fp8_as_mxfp8:
+            self._prepare_block_fp8_as_mxfp8(layer)
 
         # The preshuffle rewrites the weight into a layout only
         # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
@@ -823,8 +848,32 @@ class Fp8LinearMethod(LinearMethodBase):
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
 
-    def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
-        if not self.use_mxfp8:
+    def _prepare_block_fp8_as_mxfp8(self, layer: Module) -> None:
+        """Derive the MXFP8 scale layout of a 32-wide-K ue8m0 block weight. The block
+        scales stay in place for the Triton fallback and for consumers that read them."""
+        layer.block_fp8_mxfp8_ready = False
+        if getattr(layer, "skip_aiter_bpreshuffle", False):
+            # The model reads .weight / .weight_scale_inv directly (DeepSeek-V4 wo_a);
+            # the trtllm backend would shuffle the weight in place.
+            return
+        n, k = layer.weight.shape
+        backend = self.mxfp8_dense_backend
+        if k % 32 != 0 or (backend.is_flashinfer_trtllm() and (k // 32) % 4 != 0):
+            return
+        try:
+            scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+                layer.weight_scale_inv.data, (n, k), self.weight_block_size
+            )
+        except ValueError as e:
+            logger.warning("Block-fp8 layer stays on the Triton kernel: %s", e)
+            return
+        self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
+        layer.block_fp8_mxfp8_ready = True
+
+    def _process_mxfp8_linear_weight_scale(
+        self, layer: Module, scale_u8: Optional[torch.Tensor] = None
+    ) -> None:
+        if not (self.use_mxfp8 or scale_u8 is not None):
             return
 
         backend = self.mxfp8_dense_backend
@@ -832,7 +881,8 @@ class Fp8LinearMethod(LinearMethodBase):
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
-            scale_u8 = layer.weight_scale_inv.data
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
             n, k = weight.shape
             epilogue_tile_m = 128
             sf_cols = k // 32
@@ -872,7 +922,8 @@ class Fp8LinearMethod(LinearMethodBase):
         elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
             from flashinfer import block_scale_interleave
 
-            scale_u8 = layer.weight_scale_inv.data
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
             # block_scale_interleave may pad and/or reshape scales,
             # so store swizzled scales separately to keep weight update working
             copy_or_rebind_param(
@@ -886,7 +937,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             n, k = layer.weight.shape
-            scale_u8 = layer.weight_scale_inv.data
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
             layer.weight_scale_inv_swizzled = None
             if n % 64 != 0 or k % 128 != 0:
                 if not (get_platform().is_blackwell and is_flashinfer_available()):
@@ -1080,9 +1132,33 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.use_mxfp8:
+        if self.use_mxfp8 or (
+            self.block_fp8_as_mxfp8
+            and getattr(layer, "block_fp8_mxfp8_ready", False)
+            and (not isinstance(x, tuple) or isinstance(x, Mxfp8SwizzledInput))
+        ):
             backend = self.mxfp8_dense_backend
+            if isinstance(x, Mxfp8SwizzledInput):
+                if not (
+                    backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl()
+                ):
+                    raise ValueError(
+                        "128x4 MXFP8 input requires a FlashInfer CUTLASS backend"
+                    )
             extra_kwargs = {}
+            if self.mxfp8_prefill_autotune_min_tokens is not None:
+                input_tensor = x[0] if isinstance(x, tuple) else x
+                num_tokens = input_tensor.numel() // input_tensor.shape[-1]
+                if num_tokens >= self.mxfp8_prefill_autotune_min_tokens:
+                    from sglang.srt.batch_invariant_ops import (
+                        is_batch_invariant_mode_enabled,
+                    )
+                    from sglang.srt.runtime_context import get_exec
+
+                    extra_kwargs["pin_tactic"] = (
+                        is_batch_invariant_mode_enabled()
+                        or get_exec().deterministic.enable_deterministic_inference
+                    )
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
@@ -1101,7 +1177,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                     **extra_kwargs,
                 )
-            return self.w8a8_mxfp8_linear(
+            out = self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=weight_scale,
@@ -1109,6 +1185,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
                 **extra_kwargs,
             )
+            return out
 
         if self.block_quant:
             if use_intel_amx_backend(layer):
