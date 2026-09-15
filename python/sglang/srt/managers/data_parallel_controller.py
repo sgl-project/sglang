@@ -813,7 +813,9 @@ class DataParallelController:
             active = self._active_workers
             if not active:
                 raise RuntimeError("No active DP workers are available for routing.")
-            target = active[xxhash.xxh3_64_intdigest(req.routing_key) % len(active)]
+            target = active[
+                xxhash.xxh3_64_intdigest(req.routing_key.encode()) % len(active)
+            ]
             if self.status[target]:
                 sock_send(self.workers[target], req)
                 return
