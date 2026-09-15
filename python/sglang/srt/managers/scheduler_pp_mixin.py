@@ -126,7 +126,17 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if get_parallel().pp_async_batch_depth > 0:
+                # With zero async depth, non-last speculative ranks must
+                # exchange the previous outputs before launching the next batch.
+                # Tree planning synchronizes CUDA on the host; sending alone
+                # leaves the peer's return send unmatched and can block that
+                # synchronization while the peer waits for our next proxy.
+                # The last rank must launch first to produce its output.
+                exchange_outputs_before_forward = (
+                    get_parallel().pp_async_batch_depth > 0
+                    or (self._pp_spec_relay and not self.pp_group.is_last_rank)
+                )
+                if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -142,7 +152,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().pp_async_batch_depth == 0:
+                if not exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
