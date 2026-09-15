@@ -1138,9 +1138,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
-                for item in mm_inputs.mm_items:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
+                await self.mm_processor.hash_executor.set_pad_values(mm_inputs.mm_items)
         else:
             mm_inputs = None
 
