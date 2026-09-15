@@ -113,6 +113,8 @@ def _decode_score_kernel(
     stride_s_h,
     stride_s_b,
     stride_s_n,
+    stride_seq_lens,
+    stride_slot_ids,
     # META parameters
     BATCH_SIZE_BUCKET: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -133,7 +135,7 @@ def _decode_score_kernel(
     pid_c = pid_bc // batch_size
     pid_h = pid_kh * gqa_group_size
     # block-aligned fixed-count chunked decode (grid independent of seq_len for cuda graph)
-    seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
+    seq_len = tl.load(seq_lens + pid_b * stride_seq_lens).to(tl.int32)
     num_blocks = (seq_len + block_size - 1) // block_size
     if SKIP_TRIVIAL_TOPK_SCORE:
         if num_blocks <= topk:
@@ -145,7 +147,7 @@ def _decode_score_kernel(
     chunk_end = tl.minimum(chunk_end_block * block_size, seq_len)
     if chunk_start_block >= chunk_end_block:
         return
-    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
+    sid = (tl.load(slot_ids + pid_b * stride_slot_ids).to(tl.int64) + max_slots) % max_slots
     # init qkv pointer
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
@@ -818,6 +820,48 @@ def _topk_index_merge_kernel(
     )
 
 
+@triton.jit
+def _unpack_rows_force_local_kernel(
+    score_in,  # [PACK*HEADS_PER_ROW, bs, blocks], kernel head p*HEADS_PER_ROW + h
+    score_out,  # [HEADS_PER_ROW, bs*PACK, blocks], request-major rows
+    row_seq_lens,
+    num_seqblocks,
+    block_size,
+    local_blocks,
+    stride_in_h,
+    stride_in_b,
+    stride_in_n,
+    stride_out_h,
+    stride_out_r,
+    stride_out_n,
+    stride_row_sl,
+    PACK: tl.constexpr,
+    HEADS_PER_ROW: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_r, pid_h, pid_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    b = pid_r // PACK
+    p = pid_r % PACK
+    hk = p * HEADS_PER_ROW + pid_h
+    offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < num_seqblocks
+    x = tl.load(
+        score_in + hk * stride_in_h + b * stride_in_b + offs * stride_in_n,
+        mask=mask,
+        other=0.0,
+    )
+    seq_len = tl.load(row_seq_lens + pid_r * stride_row_sl).to(tl.int32)
+    num_blocks = (seq_len + block_size - 1) // block_size
+    local_start = tl.maximum(num_blocks - local_blocks, 0)
+    is_local = (offs >= local_start) & (offs < num_blocks)
+    x = tl.where(is_local, 1e29, x)
+    tl.store(
+        score_out + pid_h * stride_out_h + pid_r * stride_out_r + offs * stride_out_n,
+        x,
+        mask=mask,
+    )
+
+
 @torch.no_grad()
 def flash_decode_with_topk_idx(
     q: torch.Tensor,  # [batch_size, num_heads, head_dim]
@@ -842,6 +886,7 @@ def flash_decode_with_topk_idx(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     packed_queries: int = 1,
+    topk_idx_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -880,8 +925,9 @@ def flash_decode_with_topk_idx(
         batch_size = batch_size // pack
         q = q.reshape(batch_size, pack * num_q_heads, head_dim)
         num_q_heads = pack * num_q_heads
-        seq_lens = row_seq_lens.view(batch_size, pack)[:, -1].contiguous()
-        slot_ids = row_slot_ids.view(batch_size, pack)[:, 0].contiguous()
+        # strided views: the score kernel takes the row strides, so no copies per layer
+        seq_lens = row_seq_lens.view(batch_size, pack)[:, -1]
+        slot_ids = row_slot_ids.view(batch_size, pack)[:, 0]
     gqa_group_size = num_q_heads // num_kv_heads
     # sm scale
     if sm_scale is None:
@@ -958,6 +1004,8 @@ def flash_decode_with_topk_idx(
             score.stride(0),
             score.stride(1),
             score.stride(2),
+            seq_lens.stride(0),
+            slot_ids.stride(0),
             NUM_KV_CHUNKS=NUM_KV_CHUNKS,
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
@@ -1029,21 +1077,38 @@ def flash_decode_with_topk_idx(
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
     if pack > 1:
-        # [pack*H, bs, blocks] -> [H, bs*pack, blocks], request-major rows
-        score = (
-            score.view(pack, heads_per_row, batch_size, score.shape[2])
-            .permute(1, 2, 0, 3)
-            .reshape(heads_per_row, batch_size * pack, score.shape[2])
+        # one launch: [pack*H, bs, blocks] -> request-major [H, bs*pack, blocks], and re-force
+        # each row's own local blocks (the score kernel forced only the longest row's)
+        num_seqblocks = score.shape[2]
+        score_rows = torch.empty(
+            (heads_per_row, num_rows, num_seqblocks),
+            dtype=score.dtype,
+            device=score.device,
         )
+        UNPACK_BLOCK_N = 1024
+        _unpack_rows_force_local_kernel[
+            (num_rows, heads_per_row, triton.cdiv(num_seqblocks, UNPACK_BLOCK_N))
+        ](
+            score,
+            score_rows,
+            row_seq_lens,
+            num_seqblocks,
+            block_size,
+            local_blocks,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            score_rows.stride(0),
+            score_rows.stride(1),
+            score_rows.stride(2),
+            row_seq_lens.stride(0),
+            PACK=pack,
+            HEADS_PER_ROW=heads_per_row,
+            BLOCK_N=UNPACK_BLOCK_N,
+        )
+        score = score_rows
         batch_size, num_q_heads = num_rows, heads_per_row
         seq_lens, slot_ids = row_seq_lens, row_slot_ids
-        # the kernel forced only the longest row's local blocks, so re-force each row's own
-        num_blocks = (seq_lens.to(torch.long) + block_size - 1) // block_size
-        block_ids = torch.arange(score.shape[2], device=score.device)
-        is_local = (
-            block_ids[None, :] >= (num_blocks - local_blocks).clamp(min=0)[:, None]
-        ) & (block_ids[None, :] < num_blocks[:, None])
-        score = score.masked_fill(is_local[None], 1e29)
     real_seq_lens = None
     if use_dense_main_attn:
         from sglang.kernels.ops.attention.minimax_decode_topk import (
@@ -1065,11 +1130,18 @@ def flash_decode_with_topk_idx(
 
     # get topk index
     if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
+        if (
+            topk_idx_out is not None
+            and tuple(topk_idx_out.shape) == (num_q_heads, batch_size, topk)
+            and topk_idx_out.dtype == torch.int32
+        ):
+            topk_idx = topk_idx_out
+        else:
+            topk_idx = torch.empty(
+                (num_q_heads, batch_size, topk),
+                device=score.device,
+                dtype=torch.int32,
+            )
 
     if _skip_block_topk:
         pass
