@@ -9,7 +9,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
+from sglang.srt.function_call.deepseekv41_detector import (
+    ANY_OBJECT_BODY,
+    DeepSeekV41Detector,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -156,9 +159,7 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         self.assertIsNone(self.detector.get_structural_tag([], "required"))
 
     def test_required_tag_wraps_invokes_in_the_calls_block(self):
-        tag = self.detector.get_structural_tag(
-            tools=self.tools, tool_choice="required"
-        )
+        tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="required")
         opener, calls, closer = tag.format.elements
         self.assertEqual(opener.value, f"\n\n<{DSML} calls>\n")
         self.assertEqual(closer.value, f"</{DSML} calls>")
@@ -199,6 +200,56 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         reasoning, body = tag.format.elements
         self.assertEqual(reasoning.end, "</think>")
         self.assertEqual(body.elements[0].value, f"\n\n<{DSML} calls>\n")
+
+    def test_non_strict_body_is_any_json_object(self):
+        """The grammar must not admit `"Haifa"`, `[1]` or `null` as an invoke
+        body: the detector reads only objects and the forced call would come
+        back with `{}` arguments."""
+        tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="required")
+        _, calls, _ = tag.format.elements
+        self.assertEqual(
+            [t.content.json_schema for t in calls.tags],
+            [ANY_OBJECT_BODY, ANY_OBJECT_BODY],
+        )
+        self.assertEqual(
+            ANY_OBJECT_BODY, {"type": "object", "additionalProperties": True}
+        )
+
+    def test_strict_tool_keeps_its_parameters_schema(self):
+        tools = _tools()
+        tools[0].function.strict = True
+        tag = self.detector.get_structural_tag(tools=tools, tool_choice="required")
+        _, calls, _ = tag.format.elements
+        self.assertEqual(
+            calls.tags[0].content.json_schema, tools[0].function.parameters
+        )
+        self.assertEqual(calls.tags[1].content.json_schema, ANY_OBJECT_BODY)
+
+    def test_strict_tool_without_a_schema_gets_the_object_body(self):
+        tool = Tool(
+            type="function",
+            function=Function(name="submit", description="Submit", strict=True),
+        )
+        tag = self.detector.get_structural_tag(tools=[tool], tool_choice="required")
+        _, calls, _ = tag.format.elements
+        self.assertEqual(calls.tags[0].content.json_schema, ANY_OBJECT_BODY)
+
+    def test_object_bodies_parse_to_one_call(self):
+        """What the object grammar emits round-trips through the detector."""
+        for body in ("{}", '{"city": "Haifa"}', '{ "query": "a", "limit": 2 }'):
+            with self.subTest(body=body):
+                name = "get_weather" if "city" in body or body == "{}" else "lookup"
+                text = (
+                    f"\n\n<{DSML} calls>\n"
+                    f'<{DSML} invoke name="{name}">{body}</{DSML} invoke>\n'
+                    f"</{DSML} calls>"
+                )
+                result = DeepSeekV41Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(
+                    [(c.name, json.loads(c.parameters)) for c in result.calls],
+                    [(name, json.loads(body))],
+                )
+                self.assertEqual(result.normal_text, "")
 
     def test_parser_uses_the_native_tag_for_required(self):
         parser = FunctionCallParser(self.tools, "deepseekv41")
