@@ -879,18 +879,28 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c128_state_pool_size = max(
                 c128_state_pool_size, self.num_req_slots * c128_ring_size
             )
+        # Only the ratios the model has anywhere get a pool config: DeepSeek-V4.1
+        # has no c4 / c128 layers, and the backend, PD state transfer and HiCache
+        # read the pool registries as "the ratios this model has". A PP stage
+        # that lacks one of the model's ratios still keeps its (empty) pool so
+        # the PD wire layout stays aligned across stages.
+        model_ratios = set(compression_ratios)
         self.compressed_pool_configs = {
-            4: _CompressedPoolConfig(
-                kv_size=c4_size,
-                state_size=c4_state_pool_size,
-                state_dtype=c4_state_dtype,
-                indexer_size=c4_logical_size,
-            ),
-            128: _CompressedPoolConfig(
-                kv_size=c128_size,
-                state_size=c128_state_pool_size,
-                state_dtype=c128_state_dtype,
-            ),
+            ratio: config
+            for ratio, config in {
+                4: _CompressedPoolConfig(
+                    kv_size=c4_size,
+                    state_size=c4_state_pool_size,
+                    state_dtype=c4_state_dtype,
+                    indexer_size=c4_logical_size,
+                ),
+                128: _CompressedPoolConfig(
+                    kv_size=c128_size,
+                    state_size=c128_state_pool_size,
+                    state_dtype=c128_state_dtype,
+                ),
+            }.items()
+            if ratio in model_ratios
         }
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
@@ -1315,10 +1325,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 force_fp4=True,
             )
 
-        # HiCache and hardware backends still access the per-ratio attributes.
-        self.c4_kv_pool = self.kv_pools[4]
-        self.c128_kv_pool = self.kv_pools[128]
-        self.c4_indexer_kv_pool = self.index_pools[4]
+        # HiCache and hardware backends still access the per-ratio attributes;
+        # None when the model has no layer of that ratio (DeepSeek-V4.1).
+        self.c4_kv_pool = self.kv_pools.get(4)
+        self.c128_kv_pool = self.kv_pools.get(128)
+        self.c4_indexer_kv_pool = self.index_pools.get(4)
 
     def _make_kv_pool(
         self,
