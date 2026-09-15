@@ -160,15 +160,34 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                page_table_size_1 = (
-                    attn_metadata.page_table_1[batch_idx_list]
-                    if batch_idx_list is not None
-                    else attn_metadata.page_table_1
-                )
+                if batch_idx_list is not None:
+                    # Chunk path: pass row_to_page_table so the kernel can
+                    # directly index page_table_1, avoiding an
+                    # O(chunk_q * page_table_width) gather.
+                    row_to_page_table = (
+                        (
+                            batch_idx_list
+                            if isinstance(batch_idx_list, torch.Tensor)
+                            else torch.as_tensor(
+                                batch_idx_list, dtype=torch.int32, device=logits.device
+                            )
+                        )
+                        .to(dtype=torch.int32, device=logits.device)
+                        .contiguous()
+                    )
+                    return fast_topk_transform_fused(
+                        score=logits,
+                        lengths=lengths,
+                        page_table_size_1=attn_metadata.page_table_1,
+                        cu_seqlens_q=cu_seqlens_q_topk,
+                        topk=topk,
+                        row_starts=row_starts,
+                        row_to_page_table=row_to_page_table,
+                    )
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
-                    page_table_size_1=page_table_size_1,
+                    page_table_size_1=attn_metadata.page_table_1,
                     cu_seqlens_q=cu_seqlens_q_topk,
                     topk=topk,
                     row_starts=row_starts,
