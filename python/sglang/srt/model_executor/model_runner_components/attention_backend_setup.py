@@ -45,12 +45,22 @@ def configure_aux_hidden_state_capture(
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
     is_dspark: bool,
+    pp_size: int = 1,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
 
     Must be called before CUDA graph capture so the captured graphs
     include aux hidden state output paths.
     """
+    if pp_size > 1 and (eagle_use_aux_hidden_state or dflash_use_aux_hidden_state):
+        # Models' set_*_layers_to_capture return early on non-last stages, so
+        # capture layers on earlier stages would be silently skipped.
+        raise NotImplementedError(
+            "Auxiliary hidden-state capture (EAGLE3 / DFLASH / DSPARK drafts) is "
+            "not supported with pipeline parallelism; the capture layers live on "
+            "earlier stages and are never collected. Use a single-layer EAGLE/MTP "
+            "draft with PP (https://github.com/sgl-project/sglang/issues/39634)."
+        )
     if eagle_use_aux_hidden_state:
         model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
     if dflash_use_aux_hidden_state:

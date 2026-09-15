@@ -120,3 +120,26 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _configure_aux_capture(*, pp_size, eagle_aux):
+    attention_backend_setup.configure_aux_hidden_state_capture(
+        model=SimpleNamespace(),
+        eagle_use_aux_hidden_state=eagle_aux,
+        eagle_aux_hidden_state_layer_ids=None,
+        dflash_use_aux_hidden_state=False,
+        dflash_target_layer_ids=None,
+        is_dspark=False,
+        pp_size=pp_size,
+    )
+
+
+def test_aux_hidden_state_capture_rejected_under_pipeline_parallel():
+    # Regression: models' set_*_layers_to_capture return early on non-last stages,
+    # so EAGLE3 under PP silently captured nothing instead of failing.
+    with pytest.raises(NotImplementedError):
+        _configure_aux_capture(pp_size=2, eagle_aux=True)
+
+
+def test_single_layer_draft_under_pipeline_parallel_not_rejected():
+    _configure_aux_capture(pp_size=2, eagle_aux=False)
