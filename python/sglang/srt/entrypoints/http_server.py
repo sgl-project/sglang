@@ -165,6 +165,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -228,6 +229,10 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
+    # This is a fresh worker process and the record arrived by pickle, so
+    # nothing has loaded plugins here yet. Load them before the tokenizer
+    # worker resolves the model and tokenizer.
+    load_plugins()
     publish(server_args, role="tokenizer")
 
     # API key authentication is not supported in multi-tokenizer mode
