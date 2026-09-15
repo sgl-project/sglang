@@ -78,6 +78,25 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Edit an Image
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.edit(
+    model="sensenova/SenseNova-U1.5-8B-MoT",
+    image=open("image_google.png", "rb"),
+    prompt='Replace the text "Google" with "Goose".',
+    n=1,
+    seed=42,
+    guidance_scale=4.0,
+    num_inference_steps=50,
+    response_format="url",
+)
+```
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark
