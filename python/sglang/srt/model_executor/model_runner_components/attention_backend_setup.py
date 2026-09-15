@@ -45,7 +45,7 @@ def configure_aux_hidden_state_capture(
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
     is_dspark: bool,
-    pp_size: int = 1,
+    pp_size: int,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
 
