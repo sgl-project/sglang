@@ -440,6 +440,55 @@ def _topk_index_kernel(
 
 
 @torch.no_grad()
+def topk_prefill_from_score(
+    score: torch.Tensor,
+    block_size_q: int,
+    block_size_k: int,
+    cu_seqlens: torch.Tensor,
+    cu_seqblocks_q: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    max_seqblock_q: int,
+    all_seqblock_q: int,
+) -> torch.Tensor:
+    """Run the existing Triton Step-2 top-k extraction on precomputed scores."""
+    if score.ndim != 3:
+        raise ValueError("score must have shape [num_heads, total_q, max_seqblock_k]")
+    num_heads = score.shape[0]
+    batch_size = cu_seqlens.shape[0] - 1
+    topk_idx = torch.full(
+        (num_heads, all_seqblock_q, topk),
+        fill_value=-1,
+        device=score.device,
+        dtype=torch.int32,
+    )
+    grid = (max_seqblock_q, batch_size, num_heads)
+    _topk_index_kernel[grid](
+        score,
+        topk_idx,
+        block_size_q,
+        block_size_k,
+        cu_seqlens,
+        cu_seqblocks_q,
+        prefix_lens,
+        topk,
+        init_blocks,
+        local_blocks,
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        MASK_INIT=False,
+        MASK_LOCAL=False,
+    )
+    return topk_idx
+
+
+@torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
     k_cache: torch.Tensor,  # paged
@@ -571,33 +620,17 @@ def flash_prefill_with_topk_index(
         IS_FP8=is_fp8,
     )
 
-    # topk extraction kernel
-    topk_idx = torch.full(
-        (num_heads, all_seqblock_q, topk),
-        fill_value=-1,
-        device=score.device,
-        dtype=torch.int32,
-    )
-    # launch kernel
-    grid = (max_seqblock_q, batch_size, num_heads)
-    _topk_index_kernel[grid](
-        score,
-        topk_idx,
-        block_size_q,
-        block_size_k,
-        cu_seqlens,
-        cu_seqblocks_q,
-        prefix_lens,
-        topk,
-        init_blocks,
-        local_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        MASK_INIT=False,
-        MASK_LOCAL=False,
+    topk_idx = topk_prefill_from_score(
+        score=score,
+        block_size_q=block_size_q,
+        block_size_k=block_size_k,
+        cu_seqlens=cu_seqlens,
+        cu_seqblocks_q=cu_seqblocks_q,
+        prefix_lens=prefix_lens,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        max_seqblock_q=max_seqblock_q,
+        all_seqblock_q=all_seqblock_q,
     )
     return o, topk_idx
