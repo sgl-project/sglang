@@ -73,8 +73,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        layer_kv_shapes: Optional[Sequence[tuple[int, int, int]]] = None,
         **kwargs,
     ):
+        self.layer_kv_shapes = layer_kv_shapes
+        if layer_kv_shapes is not None:
+            assert len(layer_kv_shapes) == layer_num
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
@@ -100,6 +104,37 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         )
 
     def _create_buffers(self):
+        if self.layer_kv_shapes is not None:
+            # One full-capacity address space with tightly packed per-layer views.
+            # Layers may have different KV heads and K/V dimensions.
+            slots = (self.size // self.page_size + 1) * self.page_size
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                buffers = []
+                for dim_index in (1, 2):
+                    lengths = [
+                        slots * shape[0] * shape[dim_index]
+                        for shape in self.layer_kv_shapes
+                    ]
+                    storage = torch.zeros(
+                        sum(lengths), dtype=self.store_dtype, device=self.device
+                    )
+                    views = []
+                    for chunk, shape in zip(
+                        storage.split(lengths), self.layer_kv_shapes
+                    ):
+                        heads, dim = shape[0], shape[dim_index]
+                        views.append(
+                            chunk.view(
+                                -1,
+                                1 if self.use_fia else self.page_size,
+                                heads,
+                                dim,
+                            )
+                        )
+                    buffers.append((storage, views))
+                self.k_buffer_tensor, self.k_buffer = buffers[0]
+                self.v_buffer_tensor, self.v_buffer = buffers[1]
+            return
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -147,10 +182,25 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     for i in range(self.layer_num)
                 ]
 
+    def _layer_kv_shape(self, local_layer_id):
+        if self.layer_kv_shapes is not None:
+            return self.layer_kv_shapes[local_layer_id]
+        return self.head_num, self.head_dim, self.v_head_dim
+
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
+
+    def _move_kv_cache_impl(self, tgt_loc, src_loc):
+        if self.layer_kv_shapes is None:
+            return super()._move_kv_cache_impl(tgt_loc, src_loc)
+        for i, (kb, vb) in enumerate(zip(self.k_buffer, self.v_buffer)):
+            heads, k_dim, v_dim = self._layer_kv_shape(i)
+            kb = kb.view(-1, heads, k_dim)
+            vb = vb.view(-1, heads, v_dim)
+            kb[tgt_loc] = kb[src_loc]
+            vb[tgt_loc] = vb[src_loc]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -204,6 +254,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        head_num, head_dim, v_head_dim = self._layer_kv_shape(
+            layer_id - self.start_layer
+        )
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -220,8 +273,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
-            expected_k_numel = num_rows * self.head_num * self.head_dim
-            expected_v_numel = num_rows * self.head_num * self.v_head_dim
+            expected_k_numel = num_rows * head_num * head_dim
+            expected_v_numel = num_rows * head_num * v_head_dim
             if (
                 cache_k.numel() != expected_k_numel
                 or cache_v.numel() != expected_v_numel
@@ -230,8 +283,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     "NPU FIA KV scatter row mismatch: "
                     f"loc_rows={num_rows}, cache_k_shape={tuple(cache_k.shape)}, "
                     f"cache_v_shape={tuple(cache_v.shape)}, "
-                    f"head_num={self.head_num}, head_dim={self.head_dim}, "
-                    f"v_head_dim={self.v_head_dim}."
+                    f"head_num={head_num}, head_dim={head_dim}, "
+                    f"v_head_dim={v_head_dim}."
                 )
 
             # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
@@ -241,14 +294,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # unchanged.
             loc_indices = loc.contiguous().view(-1, 1)
             torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer.view(-1, self.head_num, self.head_dim),
+                k_buffer_layer.view(-1, head_num, head_dim),
                 loc_indices,
-                cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+                cache_k.contiguous().view(num_rows, head_num, head_dim),
             )
             torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
+                v_buffer_layer.view(-1, head_num, v_head_dim),
                 loc_indices,
-                cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
+                cache_v.contiguous().view(num_rows, head_num, v_head_dim),
             )
         else:
             loc = loc.to(torch.int32)
@@ -256,10 +309,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 key=cache_k,
                 value=cache_v,
                 key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.head_dim
+                    -1, self.page_size, head_num, head_dim
                 ),
                 value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.v_head_dim
+                    -1, self.page_size, head_num, v_head_dim
                 ),
                 slot_indices=loc,
             )
@@ -291,13 +344,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        head_num, head_dim, v_head_dim = self._layer_kv_shape(
+            layer_id - self.start_layer
+        )
         if loc_2d.ndim != 2:
             raise ValueError(f"loc_2d must be rank-2, got {tuple(loc_2d.shape)}")
 
         num_rows = loc_2d.numel()
         if (
-            cache_k.numel() != num_rows * self.head_num * self.head_dim
-            or cache_v.numel() != num_rows * self.head_num * self.v_head_dim
+            cache_k.numel() != num_rows * head_num * head_dim
+            or cache_v.numel() != num_rows * head_num * v_head_dim
         ):
             raise ValueError(
                 "dense NPU KV rows must match loc_2d size: "
@@ -330,10 +386,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         )
 
         store_kv_cache_prefix_valid_npu_triton(
-            k_buffer_layer.view(-1, self.head_num, self.head_dim),
-            v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
-            cache_k.reshape(num_rows, self.head_num, self.head_dim),
-            cache_v.reshape(num_rows, self.head_num, self.v_head_dim),
+            k_buffer_layer.view(-1, head_num, head_dim),
+            v_buffer_layer.view(-1, head_num, v_head_dim),
+            cache_k.reshape(num_rows, head_num, head_dim),
+            cache_v.reshape(num_rows, head_num, v_head_dim),
             loc_2d,
             commit_lens,
         )
@@ -364,12 +420,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         buf_of_layers = []
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(
-                -1, self.head_num, self.head_dim
-            )
-            v_layer = self.v_buffer[local_layer_id].view(
-                -1, self.head_num, self.head_dim
-            )
+            head_num, head_dim, v_head_dim = self._layer_kv_shape(local_layer_id)
+            k_layer = self.k_buffer[local_layer_id].view(-1, head_num, head_dim)
+            v_layer = self.v_buffer[local_layer_id].view(-1, head_num, v_head_dim)
             buf_of_layers.append([k_layer, v_layer])
         kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
@@ -381,12 +434,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(
-                -1, self.head_num, self.head_dim
-            )
-            v_layer = self.v_buffer[local_layer_id].view(
-                -1, self.head_num, self.head_dim
-            )
+            head_num, head_dim, v_head_dim = self._layer_kv_shape(local_layer_id)
+            k_layer = self.k_buffer[local_layer_id].view(-1, head_num, head_dim)
+            v_layer = self.v_buffer[local_layer_id].view(-1, head_num, v_head_dim)
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu, v_cpu = (
