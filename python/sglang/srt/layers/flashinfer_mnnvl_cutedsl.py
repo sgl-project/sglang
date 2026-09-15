@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import threading
 from dataclasses import dataclass, replace
@@ -12,6 +11,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_spec
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -19,34 +20,15 @@ logger = logging.getLogger(__name__)
 
 
 def _import_kernel_backend():
-    try:
-        from flashinfer.comm import AllReduceFusionPattern
-    except ImportError as error:
-        raise RuntimeError(
-            "MNNVL CuTe DSL fusion requires FlashInfer's communication "
-            "infrastructure (flashinfer >= 0.6.16)"
-        ) from error
-    try:
-        from sglang.kernels.ops.communication.mnnvl_cutedsl import DEFAULT_CONFIG
-        from sglang.kernels.ops.communication.mnnvl_cutedsl_ar import (
-            MNNVLCuteDSLAllReduceFusionWorkspace,
-            mnnvl_cutedsl_allreduce_fusion,
-        )
-    except ImportError as error:
-        raise RuntimeError(
-            "SGLang's in-tree MNNVL CuTe DSL kernels failed to import; check "
-            "their dependencies, including nvidia-cutlass-dsl and cuda-python"
-        ) from error
-    if importlib.util.find_spec("flashinfer.comm.mnnvl_cutedsl") is not None:
-        logger.warning(
-            "The installed FlashInfer now ships flashinfer.comm.mnnvl_cutedsl; "
-            "SGLang is still running its in-tree port "
-            "(sglang.kernels.ops.communication.mnnvl_cutedsl), which can now "
-            "be retired in favor of the upstream backend."
-        )
+    # Imported here rather than at module scope: the CuTe DSL backend drags in
+    # CUDA-only dependencies that CPU-side importers of this module never need.
+    from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
+    from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+    from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
+
     return (
         MNNVLCuteDSLAllReduceFusionWorkspace,
-        mnnvl_cutedsl_allreduce_fusion,
+        allreduce_fusion,
         AllReduceFusionPattern,
         DEFAULT_CONFIG,
     )
@@ -149,7 +131,6 @@ class FlashInferMNNVLCuteDSLARFusion:
             ) = _import_kernel_backend()
             # Only fused finalize launches have a completed shared-expert handoff;
             # standalone AllReduce kernels retain the safe load ordering.
-            from sglang.srt.runtime_context import get_spec
 
             if get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(default_config)
@@ -179,8 +160,8 @@ class FlashInferMNNVLCuteDSLARFusion:
                 config=self.workspace_config,
             )
 
-            # Publish only after the mailbox barrier; older FlashInfer workspace
-            # classes may not provide it and would desynchronize Lamport stages.
+            # Publish only after the mailbox barrier; without it the ranks
+            # would desynchronize their Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
 

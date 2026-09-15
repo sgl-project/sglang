@@ -105,6 +105,12 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
+class MMInputsProcessError(msgspec.Struct, frozen=True):
+    """Request-local multimodal input failure produced after tokenizer fanout."""
+
+    message: str
+
+
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
 
@@ -448,8 +454,18 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+                # Session history may supply the entire prompt. The scheduler
+                # rejects requests that are still empty after reconstruction.
+                session_id = (
+                    self.session_params.get("id")
+                    if isinstance(self.session_params, dict)
+                    else None
+                )
+                if not session_id:
+                    raise ValueError("input_ids cannot be empty.")
+                self.is_single = True
+                self.batch_size = 1
+            elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -2045,6 +2061,13 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+class EncoderDispatchErrorReq(BaseReq, kw_only=True):
+    """Tokenizer-to-scheduler failure for one EPD encoder dispatch."""
+
+    error_msg: str
+    error_code: int
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

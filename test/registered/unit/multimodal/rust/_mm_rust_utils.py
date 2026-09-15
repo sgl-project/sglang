@@ -1,4 +1,4 @@
-"""Shared fixtures for the native Rust multimodal suites.
+"""Shared fixtures for the Rust multimodal suites.
 
 Imported via ``sys.path`` from the sibling suites (unittest runs these files by
 path, so a package-relative import would break ``python <file>``); the module

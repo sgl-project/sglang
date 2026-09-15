@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Pool:
@@ -49,9 +49,7 @@ class TestDeviceAllocEviction(CustomTestCase):
     def test_sufficient_capacity_skips_eviction(self):
         cache = MagicMock()
         cache.token_to_kv_pool_allocator.swa_available_size.return_value = 10
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = (
-            10
-        )
+        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = 10
 
         _evict_swa_for_device_alloc(cache, required_size=10)
         _evict_mamba_for_device_alloc(cache, required_size=10)

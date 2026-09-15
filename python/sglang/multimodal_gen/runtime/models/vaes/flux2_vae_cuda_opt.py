@@ -8,8 +8,9 @@ decoder module family (``ResnetBlock2D`` GroupNorm+SiLU chains,
 
 All rewrites are mathematically exact re-associations of the original
 operators. Wrappers are installed once at VAE load and dispatch on a
-decode-scoped :class:`VaeFastPathGate`: ``quality == "high"`` runs the fast
-paths, the ``"lossless"`` default runs the original module path bit-for-bit.
+decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"`` and
+``quality="high"`` run the fast paths, while the ``"lossless"`` default runs
+the original module path bit-for-bit.
 
 - channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
   kernels; parameter layout is swapped at decode entry to match the gate.

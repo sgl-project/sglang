@@ -9,6 +9,7 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
+    use_mla_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,19 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_unified_cache_external_linker:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-unified-cache-external-linker and "
+                "--enable-hierarchical-cache are mutually exclusive."
+            )
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not use "
+                "--hicache-storage-backend."
+            )
+        return
+
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
         cfg.enable_hierarchical_cache
@@ -68,6 +82,7 @@ def handle_hicache_ratio_default(server_args: Any):
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
+
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
@@ -95,7 +110,7 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "--enable-hisparse with --dcp-size > 1 is not supported: the "
             "HiSparse host pool is constructed without DCP translation."
         )
-    if not server_args.use_mla_backend():
+    if not use_mla_backend(server_args):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 is only supported for MLA models: "
             "the index translation lives in MLATokenToKVPoolHost, and the "
@@ -138,7 +153,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend != "mooncake"
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -157,7 +172,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake storage backend does not support layer_first layout, "
+        f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 

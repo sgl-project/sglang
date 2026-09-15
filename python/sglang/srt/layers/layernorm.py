@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -110,8 +111,17 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-    from aiter import rmsnorm2d_fwd as rms_norm
-    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+    if is_gfx1250_supported():
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rms_norm,
+        )
+        from aiter.ops.triton.normalization.rmsnorm import (
+            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
+        )
+    else:
+        from aiter import rmsnorm2d_fwd as rms_norm
+        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
@@ -1306,6 +1316,19 @@ class Gemma3RMSNorm(BaseFusedOp):
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
+
+    def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None and x.dim() == 2:
+            # The decoder residual is token-major and contiguous. The fused
+            # kernel updates both tensors in place: x becomes the normalized
+            # output and residual becomes x + residual for the next layer.
+            gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
+            return x, residual
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
+        # can all go through it directly without a Python-side reshape.
+        elif residual is None and x.dim() in (2, 3, 4):
+            return gemma_rmsnorm(x, self.weight.data, self.eps)
+        return self.forward_native(x, residual)
 
     def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.

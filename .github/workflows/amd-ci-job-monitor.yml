@@ -152,7 +152,7 @@ jobs:
           # row, hiding a regression that only reproduces on one image. Nightly
           # names carry the runner too, so pair each job id with its runs-on.
           # Keep in sync with the rocm_version matrix in the nightly workflow.
-          rocm_flavors="rocm724 rocm720"
+          rocm_flavors="rocm10 rocm724 rocm720"
           nightly_jobs=$(yq -r '.jobs | to_entries[] | .key + " " + .value."runs-on"' .github/workflows/nightly-test-amd-rocm720.yml | \
             grep -v -E '^check-all-jobs ' | \
             while read -r id runner; do
