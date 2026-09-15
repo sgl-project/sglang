@@ -3747,7 +3747,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # synchronized SWA pressure and a retraction/re-prefill
                     # storm at high DP concurrency.
                     if req.decode_batch_idx >= 1 and (
-                        (use_forward_interval_eviction and swa_maintenance_step)
+                        (
+                            use_forward_interval_eviction
+                            and swa_maintenance_step
+                            and req.kv.holds_kv
+                        )
                         or (
                             not use_forward_interval_eviction
                             and req.kv.holds_kv
