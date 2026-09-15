@@ -136,9 +136,7 @@ class TestStep3p7Flash(CustomTestCase):
         # and batch-dependent GPU numerics can flip a small number of answers.
         # Reject a material regression while allowing up to two percentage
         # points of absolute score difference from the serialized control.
-        self.assertGreaterEqual(
-            scores["concurrent"], scores["serial"] - 0.02, summary
-        )
+        self.assertGreaterEqual(scores["concurrent"], scores["serial"] - 0.02, summary)
 
 
 if __name__ == "__main__":
