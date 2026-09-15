@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -33,6 +34,11 @@ _EXPERT_WEIGHT_NAMES = (
 
 class DwdpManager:
     def __init__(self, server_args: ServerArgs):
+        if not is_cuda():
+            raise RuntimeError(
+                "DWDP requires NVIDIA CUDA (cuda.bindings VMM and MNNVL handles); "
+                "--dwdp-size > 1 is unsupported on this platform."
+            )
         self.dwdp_size = get_parallel().dwdp_size
         self.dwdp_rank = get_parallel().tp_rank
         self.device_id = torch.cuda.current_device()
