@@ -370,9 +370,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
-        linear
-    )
+    # LoRA wrappers keep quant_method on the inner LinearBase.
+    while hasattr(linear, "base_layer"):
+        linear = linear.base_layer
+    quant_method = getattr(linear, "quant_method", None)
+    return quant_method is not None and quant_method.accepts_mxfp8_input(linear)
 
 
 def _modulate_scale_shift(
@@ -1526,6 +1528,25 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.audio_out",
         )
+        self._pdd_nfe = None
+        self._pdd_block_size = None
+        self._pdd_video_plan = None
+        self._pdd_audio_plan = None
+
+    def _project_outputs(
+        self, hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._pdd_video_plan is not None:
+            from sglang.multimodal_gen.runtime.pipelines_core.lora.pdd_lora import (
+                project_pdd_or_base,
+            )
+
+            pdd = project_pdd_or_base(self, hidden)
+            if pdd is not None:
+                return pdd
+        video, _ = self.video_out(hidden)
+        audio, _ = self.audio_out(hidden)
+        return video, audio
 
     def forward(
         self,
@@ -1559,8 +1580,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                     inverse_indices[start:stop],
                     dtype=_BF16_DTYPE,
                 ).to(_FP32_DTYPE)
-                video_chunk, _ = self.video_out(h)
-                audio_chunk, _ = self.audio_out(h)
+                video_chunk, audio_chunk = self._project_outputs(h)
                 if video is None:
                     video = torch.empty(
                         (x.shape[0], video_chunk.shape[-1]),
@@ -1583,9 +1603,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
-        video, _ = self.video_out(h)
-        audio, _ = self.audio_out(h)
-        return video, audio
+        return self._project_outputs(h)
 
 
 def _reject_adaln_lora(names: list[str]) -> None:
@@ -1985,6 +2003,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="final_layer",
             use_adaln_cache=self._adaln_precomputed,
         )
+        self.arm_pdd_step = None
         self.adaln_cache = (
             MiniMaxH3AdalnCache(
                 arch,
