@@ -82,6 +82,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.xllm_mova_fp8 import (
+    accept_mova_fp8_weight,
+    mova_fp8_source_shapes,
+    validate_mova_fp8,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -662,9 +667,20 @@ def _validate_mova_config(
                 "their weights and validated runtime contract are BF16."
             )
         if quant_config is not None and quant_config.get_name() != "compressed_tensors":
-            raise ValueError(
-                "Native xLLM/K2 Horizon serving supports only "
-                "compressed-tensors quantized model weights"
+            if quant_config.get_name() != "fp8":
+                raise ValueError(
+                    "Native xLLM/K2 Horizon serving supports only "
+                    "compressed-tensors quantized model weights"
+                )
+            if _get_xllm_source_router_gemm_partitions(config) is None:
+                raise ValueError(
+                    "Native MoVA FP8 requires source router GEMM provenance"
+                )
+            validate_mova_fp8(
+                config,
+                quant_config,
+                moe_tp_size=get_parallel().moe_tp_size,
+                moe_ep_size=get_parallel().moe_ep_size,
             )
 
         runtime = get_exec()
@@ -675,6 +691,12 @@ def _validate_mova_config(
             )
 
         moe_runtime = runtime.moe
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "fp8"
+            and moe_runtime.ep_join_mode is not None
+        ):
+            raise ValueError("Native MoVA FP8 does not support elastic expert joining")
         unsupported_expert_remap = (
             moe_runtime.enable_eplb
             or moe_runtime.init_expert_location != "trivial"
@@ -876,7 +898,9 @@ class XllmMoEGate(nn.Module):
     computation of router logits.
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(
+        self, config: PretrainedConfig, *, bias_dtype: torch.dtype = torch.float32
+    ):
         super().__init__()
         self.source_router_gemm_partitions = _get_xllm_source_router_gemm_partitions(
             config
@@ -885,10 +909,8 @@ class XllmMoEGate(nn.Module):
             torch.empty((config.num_experts, config.hidden_size))
         )
         if getattr(config, "moe_gate_bias", False):
-            # topk_sigmoid kernel requires correction_bias in float32
-            self.bias = nn.Parameter(
-                torch.empty(config.num_experts, dtype=torch.float32)
-            )
+            # Routing can derive an FP32 bias without changing this source parameter.
+            self.bias = nn.Parameter(torch.empty(config.num_experts, dtype=bias_dtype))
         else:
             self.bias = None
 
@@ -919,7 +941,16 @@ class XllmSparseMoeBlock(nn.Module):
 
         self.router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
 
-        self.gate = XllmMoEGate(config)
+        self.gate = XllmMoEGate(
+            config,
+            bias_dtype=(
+                torch.bfloat16
+                if _is_k2_horizon_hf_checkpoint(config)
+                and quant_config is not None
+                and quant_config.get_name() == "fp8"
+                else torch.float32
+            ),
+        )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -1227,9 +1258,14 @@ class _XllmMoVAAttentionBase(nn.Module):
     ) -> None:
         super().__init__()
         if quant_config is not None:
-            raise ValueError(
-                "K2 Horizon MoVA supports unquantized bf16/fp16 weights only"
-            )
+            if (
+                getattr(config, "model_type", None) != "k2_horizon"
+                or quant_config.get_name() != "fp8"
+            ):
+                raise ValueError(
+                    "MoVA attention supports BF16 or native expert-only FP8 weights"
+                )
+            _validate_mova_config(config, quant_config)
 
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
@@ -1399,11 +1435,12 @@ class XllmMoVAAttention(_XllmMoVAAttentionBase):
             prefix=add_prefix("v_router", prefix),
         )
         if getattr(config, "moe_gate_bias", False):
-            # SGLang's fused sigmoid top-k requires correction bias in fp32.
-            # It remains a loadable parameter for Miles weight updates, but is
-            # never included in the router logits matmul.
+            # Keep the FP8 source bias in BF16. Routing converts it when needed.
             self.v_router.bias = nn.Parameter(
-                torch.empty(self.num_values, dtype=torch.float32),
+                torch.empty(
+                    self.num_values,
+                    dtype=torch.bfloat16 if quant_config is not None else torch.float32,
+                ),
                 requires_grad=False,
             )
         self.v_experts = RoutedValueExperts(
@@ -1705,6 +1742,12 @@ class XllmForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         _validate_mova_config(config, quant_config)
+        self._mova_fp8_initial_load_only = (
+            _is_k2_horizon_hf_checkpoint(config)
+            and quant_config is not None
+            and quant_config.get_name() == "fp8"
+        )
+        self._mova_fp8_load_started = False
         self.model = XllmModel(
             config,
             quant_config,
@@ -1768,6 +1811,36 @@ class XllmForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        source_shapes = None
+        if getattr(self, "_mova_fp8_initial_load_only", False):
+            if self._mova_fp8_load_started:
+                raise ValueError(
+                    "MoVA FP8 requires a fresh model for every initial load"
+                )
+            # A failed or interrupted initial load also consumes this model.
+            self._mova_fp8_load_started = True
+            owned_experts = {}
+            for layer_id in range(
+                max(self.model.start_layer, self.config.num_dense_layers),
+                self.model.end_layer,
+            ):
+                experts = self.model.layers[layer_id].mlp.experts
+                owned_experts[layer_id] = {
+                    expert_id
+                    for expert_id in range(self.config.num_experts)
+                    if experts._map_global_expert_id_to_local_expert_id(expert_id) >= 0
+                }
+            source_shapes = mova_fp8_source_shapes(
+                self.config,
+                start_layer=self.model.start_layer,
+                end_layer=self.model.end_layer,
+                is_first_rank=self.pp_group.is_first_rank,
+                is_last_rank=self.pp_group.is_last_rank,
+                owned_experts=owned_experts,
+            )
+            pending = {
+                name for name, shape in source_shapes.items() if shape is not None
+            }
         stacked_params_mapping = self.stacked_params_mapping
         expert_params_mapping = self.expert_params_mapping
         strict_checkpoint = getattr(self.config, "model_type", None) in (
@@ -1801,6 +1874,13 @@ class XllmForCausalLM(nn.Module):
                 )
             ):
                 continue
+            if source_shapes is not None:
+                if name not in source_shapes and is_pipeline_missing_weight(name):
+                    continue
+                if not accept_mova_fp8_weight(
+                    name, loaded_weight, source_shapes, pending
+                ):
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if name == "model.embed_tokens.weight" and self.config.tie_word_embeddings:
@@ -1886,6 +1966,12 @@ class XllmForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        if source_shapes is not None and pending:
+            raise ValueError(
+                f"MoVA FP8 initial load is missing {len(pending)} tensors; "
+                f"first missing tensor: {min(pending)}"
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
