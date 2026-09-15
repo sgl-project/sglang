@@ -1053,8 +1053,6 @@ class KimiK3MoE(nn.Module):
             and self.use_latent_moe
             and hidden_states.shape[0] > 0
             and get_moe_a2a_backend().is_deepep()
-            # Per-forward hook registration is not traceable by Dynamo.
-            and not torch.compiler.is_compiling()
         ):
             return False
 

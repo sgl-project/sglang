@@ -2562,21 +2562,6 @@ def initialize_model_parallel(
             f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
 
-    if shared_experts_tensor_parallel_size is not None:
-        attn_width = (
-            tensor_model_parallel_size
-            // attention_data_parallel_size
-            // attention_context_model_parallel_size
-        )
-        if (
-            shared_experts_tensor_parallel_size < 1
-            or attn_width % shared_experts_tensor_parallel_size != 0
-        ):
-            raise ValueError(
-                "Shared-expert TP size must be a positive divisor of "
-                f"attention TP size ({attn_width})."
-            )
-
     # Build the tensor model-parallel groups.
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
