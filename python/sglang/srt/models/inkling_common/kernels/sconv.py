@@ -24,7 +24,7 @@ class SconvExtendMetadata(TypedDict):
 
 
 class SconvMetadataOut(TypedDict):
-    """Preallocated destinations for the fused metadata kernels.
+    """Preallocated destinations for metadata preparation.
 
     A caller that needs the addresses to stay stable across cuda-graph replays
     passes its static buffers, already sliced to this step's B / T, so the kernel
@@ -455,6 +455,43 @@ def _fused_extend_metadata_kernel(
         tl.store(si_ptr + offs_t, si.to(tl.int32), mask=mask_t)
 
 
+def _unfused_extend_metadata_out(
+    B: int,
+    T: int,
+    cache_indices: torch.Tensor,
+    his_mode: int,
+    extend_seq_lens: torch.Tensor,
+    his_src: torch.Tensor | None,
+    out: SconvMetadataOut,
+) -> tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata]:
+    """Large-batch fallback with graph-static output addresses."""
+    ci = cache_indices[:B]
+    lens = extend_seq_lens[:B]
+    cu = out["cu"]
+    cu[0].zero_()
+    torch.cumsum(lens, dim=0, dtype=torch.int64, out=cu[1:])
+    out["query_start_loc"].copy_(cu)
+    his = out["has_initial_state"]
+    if his_mode == HIS_ZEROS:
+        his.zero_()
+    elif his_mode == HIS_PREFIX:
+        torch.gt(his_src[:B], 0, out=his)
+    else:  # HIS_SEQ_MINUS_EXT
+        torch.gt(his_src[:B] - lens, 0, out=his)
+    torch.logical_and(his, ci != PAD_SLOT_ID, out=out["cache_mask"].view(-1))
+    out["safe_idx"].copy_(ci).clamp_min_(0)
+    tokens = torch.arange(T, dtype=torch.int64, device=ci.device)
+    torch.searchsorted(cu, tokens, right=True, out_int32=True, out=out["si"])
+    out["si"].sub_(1).clamp_max_(B - 1)
+    return (
+        out["query_start_loc"],
+        his,
+        SconvExtendMetadata(
+            **{key: out[key] for key in ("cache_mask", "safe_idx", "cu", "si")}
+        ),
+    )
+
+
 def fused_extend_sconv_metadata(
     *,
     B: int,
@@ -476,6 +513,8 @@ def fused_extend_sconv_metadata(
     Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
     tensors bit-identical to the unfused path, or None when the shape falls
     outside the variable-length kernel's single-tile bound (caller runs unfused).
+    With ``out``, larger batches use unfused ops into the same static buffers,
+    preserving captured addresses without limiting the graph's request capacity.
     Uniform-length target verification does not have that batch-size bound.
 
     ``his_mode`` selects the has_initial_state source: HIS_ZEROS (boundary-KV
@@ -485,7 +524,9 @@ def fused_extend_sconv_metadata(
     cuda-graph-static) destinations instead of fresh allocations.
     """
     is_verify = his_mode == HIS_ONES
-    if (not is_verify and B > _FUSED_EXTEND_MAX_B) or not cache_indices.is_cuda:
+    if (
+        not is_verify and B > _FUSED_EXTEND_MAX_B and out is None
+    ) or not cache_indices.is_cuda:
         return None
     assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
     if is_verify:
@@ -494,6 +535,10 @@ def fused_extend_sconv_metadata(
         assert extend_seq_lens is not None and extend_seq_lens.stride(0) == 1
     device = cache_indices.device
     dst = _metadata_out(out, B=B, T=T, device=device)
+    if not is_verify and B > _FUSED_EXTEND_MAX_B:
+        return _unfused_extend_metadata_out(
+            B, T, cache_indices, his_mode, extend_seq_lens, his_src, dst
+        )
     query_start_loc = dst["query_start_loc"]
     has_initial_state = dst["has_initial_state"]
     cache_mask = dst["cache_mask"]

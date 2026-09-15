@@ -71,7 +71,7 @@ VERIFY_CASES = get_ci_test_range(
 GRAPH_REPLAY_CASES = get_ci_test_range(
     [
         (b, his_mode)
-        for b in (1024, 1264, 2047)
+        for b in (1024, 1264, 2047, 2048, 4096)
         for his_mode in (HIS_ZEROS, HIS_PREFIX, HIS_SEQ_MINUS_EXT, HIS_ONES)
     ],
     [
@@ -79,6 +79,9 @@ GRAPH_REPLAY_CASES = get_ci_test_range(
         (1264, HIS_PREFIX),
         (2047, HIS_SEQ_MINUS_EXT),
         (1264, HIS_ONES),
+        (2048, HIS_PREFIX),
+        (4096, HIS_ZEROS),
+        (4096, HIS_SEQ_MINUS_EXT),
     ],
 )
 
@@ -189,11 +192,12 @@ def test_verify_matches_unfused(b, draft_token_num):
 
 @requires_cuda
 @pytest.mark.parametrize("b,his_mode", GRAPH_REPLAY_CASES)
-def test_large_extend_cuda_graph_replay(b, his_mode):
-    """Large MTP batches refresh static metadata after lengths/PAD slots change."""
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_large_extend_cuda_graph_replay(b, his_mode, dtype):
+    """Large batches refresh static metadata after lengths/PAD slots change."""
     draft_token_num = 3
-    cache_indices = _cache_indices(b, torch.int64)
-    lens = torch.full((b,), draft_token_num, dtype=torch.int64, device="cuda")
+    cache_indices = _cache_indices(b, dtype)
+    lens = torch.full((b,), draft_token_num, dtype=dtype, device="cuda")
     his_src = lens + 1
 
     def reference():
@@ -237,7 +241,7 @@ def test_large_extend_cuda_graph_replay(b, his_mode):
         assert value.data_ptr() == out[key].data_ptr()
 
     for offset in (0, 1):
-        cache_indices.copy_(torch.arange(b, dtype=torch.int64, device="cuda"))
+        cache_indices.copy_(torch.arange(b, dtype=dtype, device="cuda"))
         cache_indices[offset::2] = PAD_SLOT_ID
         lens.fill_(draft_token_num)
         lens[offset::3] = 0
