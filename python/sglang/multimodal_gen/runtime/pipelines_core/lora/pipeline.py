@@ -1197,7 +1197,9 @@ class LoRAPipeline(ComposedPipelineBase):
             if candidate is None:
                 continue
             if bank is not None:
-                raise ValueError("Only one PDD Acc LoRA head bank can be active at a time")
+                raise ValueError(
+                    "Only one PDD Acc LoRA head bank can be active at a time"
+                )
             bank = candidate
         if bank is None:
             clear_pdd_heads(module)
