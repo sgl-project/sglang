@@ -3594,9 +3594,11 @@ class DeepseekV4AttnBackend(
             )
             positions, slots, score_lens, source_ratio = candidates
             if ratio != source_ratio:
+                block_size = indexer.candidate_block_size
+                block_lens = (score_lens + block_size - 1) // block_size * block_size
                 valid = (
                     torch.arange(positions.shape[1], device=pos.device)
-                    < score_lens[:, None]
+                    < block_lens[:, None]
                 ) & (positions < lens[:, None])
                 slots = (
                     self.req_to_token[

@@ -789,7 +789,12 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                         torch.ones(3, 1), None, full_slots, lens, table, 64
                     )
                     candidates = module.select_candidate_blocks(
-                        source_scores, lens[:, None], 2, 4
+                        torch.nn.functional.pad(
+                            source_scores, (0, -width % 4), value=-torch.inf
+                        ),
+                        lens[:, None],
+                        2,
+                        4,
                     )
                     with (
                         mock.patch.object(
@@ -829,14 +834,10 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                                 candidate_mask = torch.zeros_like(
                                     expected_scores, dtype=torch.bool
                                 )
-                                shared_width = min(width, layer_width)
+                                shared_width = min(candidates.shape[1], layer_width)
                                 candidate_mask[:, :shared_width] = candidates[
                                     :, :shared_width
                                 ]
-                                if width >= 128 and mode == ForwardMode.DECODE:
-                                    candidate_mask &= (
-                                        torch.arange(layer_width) < lens[:, None]
-                                    )
                                 expected_scores.masked_fill_(
                                     ~candidate_mask, -torch.inf
                                 )
@@ -874,8 +875,12 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                                     positions < lens[:, None],
                                     torch.arange(slots.shape[1]) < counts[:, None],
                                 )
-                                visible = (positions < layer_lens[:, None]) & (
-                                    torch.arange(slots.shape[1]) < counts[:, None]
+                                visible = (
+                                    (positions < layer_lens[:, None])
+                                    & (positions < candidates.shape[1])
+                                    & candidates.gather(
+                                        1, positions.clamp_max(candidates.shape[1] - 1)
+                                    )
                                 )
                                 torch.testing.assert_close(
                                     logits.call_args.args[2],
