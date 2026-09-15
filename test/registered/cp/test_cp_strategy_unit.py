@@ -137,6 +137,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_num_tokens = [2048, 2304]
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
+        runner.model_runner = SimpleNamespace(attn_backend=None)
         return runner
 
     def _make_forward_batch(self):
