@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    RemovalReason,
     StorageMedium,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -98,6 +99,40 @@ class TestKVCacheEventQueue(unittest.TestCase):
         self.assertIsInstance(events[0], BlockRemoved)
         self.assertEqual(events[0].block_hashes, [1, 2, 3])
 
+    def test_enqueue_coalesces_removes_with_the_same_reason(self):
+        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+        for hashes in ([1], [2, 3]):
+            queue.enqueue(
+                BlockRemoved(
+                    block_hashes=hashes,
+                    medium=StorageMedium.GPU,
+                    reason=RemovalReason.DEMOTED,
+                )
+            )
+
+        events = queue.take()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].block_hashes, [1, 2, 3])
+        self.assertEqual(events[0].reason, RemovalReason.DEMOTED)
+
+    def test_record_remove_states_a_reason(self):
+        """The default is EVICTED because every call site that passes nothing is
+        a capacity eviction; the paths that keep a copy elsewhere name it."""
+        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+        node = TreeNode()
+        node.key = RadixKey(token_ids=array("i", [1, 2, 3, 4]))
+        # Hash values are hex digests; the recorder folds them into int64.
+        node.hash_value = ["a1" * 32]
+
+        queue.record_remove(node)
+        queue.record_remove(node, reason=RemovalReason.DEMOTED)
+
+        events = queue.take()
+        self.assertEqual(
+            [e.reason for e in events],
+            [RemovalReason.EVICTED, RemovalReason.DEMOTED],
+        )
+
     def test_enqueue_preserves_fusion_boundaries(self):
         incompatible_stores = [
             self._store(2, 1, medium=StorageMedium.CPU),
@@ -121,6 +156,20 @@ class TestKVCacheEventQueue(unittest.TestCase):
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
         queue.enqueue(BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU))
+        self.assertEqual(len(queue.take()), 2)
+
+        # Same tier, different cause. Merging these would tell a consumer that
+        # demoted blocks were evicted under capacity pressure.
+        queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
+        for hashes, reason in (
+            ([1], RemovalReason.EVICTED),
+            ([2], RemovalReason.DEMOTED),
+        ):
+            queue.enqueue(
+                BlockRemoved(
+                    block_hashes=hashes, medium=StorageMedium.GPU, reason=reason
+                )
+            )
         self.assertEqual(len(queue.take()), 2)
 
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
