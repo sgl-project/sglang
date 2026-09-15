@@ -97,7 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
-    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260913",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -1019,7 +1019,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1042,7 +1042,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1062,7 +1062,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1094,7 +1094,7 @@ sgl-eval run aime25 \\
     {
       match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "mtp-314", nodes: "single" },
       verified: false,
-      env: [],
+      env: ["SGLANG_OPT_USE_TOPK_V2=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
