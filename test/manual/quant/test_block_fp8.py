@@ -453,7 +453,9 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
                 num_warps=4,
                 num_stages=4,
             )
-            with patch.object(fk, "get_w8a8_block_fp8_configs", return_value={16: config}):
+            with patch.object(
+                fk, "get_w8a8_block_fp8_configs", return_value={16: config}
+            ):
                 return fk.w8a8_block_fp8_matmul_triton(
                     A, B, As, Bs, [32, 32], output_dtype=torch.bfloat16
                 )
