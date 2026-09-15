@@ -1,5 +1,5 @@
 //! The flume fabric between stages: the request-loop inbox ([`TmEvent`]), the
-//! abort lane ([`AbortSource`]), the producer-side handles ([`Senders`]), and
+//! abort lane ([`LifecycleEvent`]), the producer-side handles ([`Senders`]), and
 //! the shutdown-aware [`recv`].
 
 use crate::message::detok::DetokMsg;
@@ -20,38 +20,44 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
 pub enum TmEvent {
     /// A freshly received request from the API server.
     Intake(Request),
+    /// Ordered behind earlier submissions so cancellation also covers requests
+    /// that have not left the intake queue yet.
+    Abort {
+        rid_prefix: String,
+        abort_all: bool,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled)
     /// on success, or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
     /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
     /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
     /// result store (`Server.take_mm_result`), not this event.
-    MmEncoded { rid: Rid, input_ids: Vec<i32> },
+    MmEncoded {
+        rid: Rid,
+        input_ids: Vec<i32>,
+        response_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    },
     /// An MM worker rejected a request parked in `Encoding` (bad media URL,
     /// unsupported modality, preprocess error, …).
     MmFailed { rid: Rid, message: String },
 }
 
-/// The source of the abort request. Both variants do the same work in
-/// [`Intake::on_abort`] — deregister the detok entry, tell the scheduler to
-/// stop — and the source is kept for diagnostics.
-///
-/// There is no in-flight rid registry to keep consistent, and so no release
-/// ordering to get wrong: [`Rid::from_client`] makes every client-supplied rid
-/// internally unique, so a resubmit of the "same" rid is a different `Rid` and
-/// cannot be tangled up with an abort still in flight for the original.
+/// Terminal notifications use a separate lane so generation backpressure
+/// cannot prevent cancellation or release of request state.
 #[derive(Clone, Debug)]
-pub enum AbortSource {
+pub enum LifecycleEvent {
     /// From an `AbortGuard` drop. Owns the release.
-    Guard(Rid),
+    GuardAbort(Rid),
     /// From a detokenizer terminal path. Aborts the scheduler work.
-    Detok(Rid),
+    DetokAbort(Rid),
+    Finished(Rid),
 }
 
-impl AbortSource {
+impl LifecycleEvent {
     pub fn rid(&self) -> &Rid {
         match self {
-            Self::Guard(rid) | Self::Detok(rid) => rid,
+            Self::GuardAbort(rid) | Self::DetokAbort(rid) | Self::Finished(rid) => rid,
         }
     }
 }
@@ -61,8 +67,8 @@ impl AbortSource {
 pub struct Senders {
     /// → TokenizerManager loop.
     pub tok_manager_tx: flume::Sender<TmEvent>,
-    /// → the same loop, but UNBOUNDED and abort-only.
-    pub abort_tx: flume::Sender<AbortSource>,
+    /// → the same loop, with cancellation and terminal notifications.
+    pub lifecycle_tx: flume::Sender<LifecycleEvent>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
     pub tokenizer_tx: flume::Sender<Request>,
     /// → Detokenizer shards, indexed by `Rid::shard(detok.len())`.

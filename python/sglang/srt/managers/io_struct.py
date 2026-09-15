@@ -402,6 +402,7 @@ class GenerateReqInput:
 
         self._validate_inputs()
         self._determine_batch_size()
+        self._normalize_positional_embed_overrides()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
@@ -412,6 +413,27 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+    def _normalize_positional_embed_overrides(self):
+        def normalize(value):
+            if value is None or isinstance(value, PositionalEmbeds):
+                return value
+            if isinstance(value, dict):
+                return PositionalEmbeds.from_json(value)
+            raise ValueError(
+                "positional_embed_overrides must be an object or a per-prompt list"
+            )
+
+        value = self.positional_embed_overrides
+        if isinstance(value, list):
+            if len(value) != self.batch_size:
+                raise ValueError(
+                    "positional_embed_overrides list length must match batch size"
+                )
+            values = [normalize(item) for item in value]
+            self.positional_embed_overrides = values[0] if self.is_single else values
+        else:
+            self.positional_embed_overrides = normalize(value)
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -558,6 +580,8 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        if isinstance(self.positional_embed_overrides, list):
+            self.positional_embed_overrides *= self.parallel_sample_num
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
@@ -955,6 +979,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            routing_key=self.routing_key,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
@@ -1468,10 +1493,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Per-request chunks of output-token sampling supports. None when no request
     # in the batch asks for return_sampling_mask.
-    output_token_sampling_mask: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[Optional[List]]]
     # Per-request chunks of selected-token logprobs renormalized over the
     # corresponding sampling supports. None when sampling masks are not returned.
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_logprobs: Optional[List[Optional[List]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1537,6 +1562,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Bounded, unpadded prompt tails for the native decoder's first chunk.
+    # Later chunks contain empty rows; Python detokenization uses decode_ids.
+    rust_prompt_contexts: Optional[List[List[int]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1568,8 +1597,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
     # None when sampling masks are not returned.
-    output_token_sampling_mask: Optional[List[List]]
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[Optional[List]]]
+    output_token_sampling_logprobs: Optional[List[Optional[List]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -2253,6 +2282,14 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
     # msgpack-native.
     instances: List[Dict[str, Any]]
     parameters: Optional[Dict[str, Any]] = None
+
+
+class RustFrontendReadyReqInput(BaseReq, kw_only=True):
+    """The launch parent has finished warmup; no public HTTP equivalent."""
+
+
+class RustFrontendReadyReqOutput(BaseReq, kw_only=True):
+    dp_rank: int
 
 
 class RpcReqInput(BaseReq, kw_only=True):

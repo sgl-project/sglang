@@ -1,0 +1,482 @@
+[
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png"
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": null
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_hashes": [
+        "a1b2",
+        "not-hex"
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "a1b2",
+          "not-hex"
+        ],
+        "mm_content_hashes": null
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_hashes": [],
+      "mm_content_hashes": [
+        null
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": [
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "sha256:abababababababababababababababababababababababababababababababab"
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "sha256:ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": {
+        "url": "https://fixtures/image.png",
+        "content_hash": "sha256:abababababababababababababababababababababababababababababababab"
+      }
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": {
+        "url": "https://fixtures/image.png",
+        "content_hash": ""
+      }
+    },
+    "expected": [
+      {
+        "mm_hashes": [],
+        "mm_content_hashes": null
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": {
+        "url": "https://fixtures/image.png",
+        "content_hash": "sha256:abababababababababababababababababababababababababababababababab"
+      },
+      "mm_content_hashes": [
+        "sha256:ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+      ],
+      "mm_hashes": [
+        "0x2a"
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "0x2a"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        "https://fixtures/image.png",
+        "https://fixtures/image.png"
+      ],
+      "mm_hashes": [
+        "01",
+        "02"
+      ],
+      "mm_content_hashes": [
+        "sha256:abababababababababababababababababababababababababababababababab",
+        null
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "02"
+        ],
+        "mm_content_hashes": [
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        [
+          "https://fixtures/image.png"
+        ],
+        [
+          "https://fixtures/image.png",
+          "https://fixtures/image.png"
+        ]
+      ],
+      "mm_hashes": [
+        "01",
+        [
+          "02",
+          "03"
+        ]
+      ],
+      "mm_content_hashes": [
+        [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ],
+        [
+          null,
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      ]
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "02",
+          "03"
+        ],
+        "mm_content_hashes": [
+          null,
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        "https://fixtures/image.png",
+        "https://fixtures/image.png"
+      ],
+      "mm_hashes": [
+        [
+          "01"
+        ],
+        [
+          "02"
+        ]
+      ],
+      "mm_content_hashes": [
+        [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ],
+        [
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      ],
+      "sampling_params": {
+        "n": 3
+      }
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": [
+          "sha256:abababababababababababababababababababababababababababababababab"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "02"
+        ],
+        "mm_content_hashes": [
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "02"
+        ],
+        "mm_content_hashes": [
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      },
+      {
+        "mm_hashes": [
+          "02"
+        ],
+        "mm_content_hashes": [
+          "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        ]
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_hashes": [
+        "01"
+      ],
+      "sampling_params": {
+        "n": 3
+      }
+    },
+    "expected": [
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": null
+      },
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": null
+      },
+      {
+        "mm_hashes": [
+          "01"
+        ],
+        "mm_content_hashes": null
+      }
+    ]
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        "https://fixtures/image.png",
+        "https://fixtures/image.png"
+      ],
+      "mm_hashes": []
+    },
+    "error": "The length of mm_hashes should equal the batch size"
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        "https://fixtures/image.png",
+        "https://fixtures/image.png"
+      ],
+      "mm_content_hashes": [
+        "sha256:abababababababababababababababababababababababababababababababab"
+      ]
+    },
+    "error": "The length of mm_content_hashes should equal the batch size"
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        "https://fixtures/image.png",
+        "https://fixtures/image.png"
+      ],
+      "mm_hashes": [
+        [
+          "01",
+          "02"
+        ],
+        [
+          "03"
+        ]
+      ]
+    },
+    "error": "mm_hashes[0] has 2 entries for 1 images"
+  },
+  {
+    "body": {
+      "text": [
+        "one",
+        "two"
+      ],
+      "image_data": [
+        [
+          "https://fixtures/image.png",
+          "https://fixtures/image.png"
+        ],
+        [
+          "https://fixtures/image.png"
+        ]
+      ],
+      "mm_hashes": [
+        "01",
+        "02"
+      ]
+    },
+    "error": "mm_hashes[0] must be a list with one entry per image"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": []
+    },
+    "error": "mm_content_hashes has 0 entries for 1 images"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "sha256:abababababababababababababababababababababababababababababababab",
+        "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      ]
+    },
+    "error": "mm_content_hashes has 2 entries for 1 images"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "abababababababababababababababababababababababababababababababab"
+      ]
+    },
+    "error": "content_hash must use the form 'sha256:<64 hex digits>'"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    },
+    "error": "content_hash must contain exactly 64 SHA-256 hex digits"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": "https://fixtures/image.png",
+      "mm_content_hashes": [
+        "sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+    },
+    "error": "content_hash contains non-hexadecimal characters"
+  },
+  {
+    "body": {
+      "text": "one",
+      "image_data": {
+        "url": "https://fixtures/image.png",
+        "content_hash": "sha256:abababababababababababababababababababababababababababababababab"
+      },
+      "mm_content_hashes": [
+        "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      ]
+    },
+    "error": "Conflicting content hashes for image_data[0]"
+  }
+]

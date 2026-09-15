@@ -257,5 +257,12 @@ class BaseKVReceiver(ABC):
 
 
 class BaseKVBootstrapServer(ABC):
+    # The embedded frontend implements the shared HTTP bootstrap protocol.
+    # Backends with another wire protocol retain their own launch-time service.
+    bootstrap_protocol = "http"
+
     @abstractmethod
     def __init__(self, host: str, port: int): ...
+
+    @abstractmethod
+    def close(self): ...

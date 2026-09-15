@@ -9,14 +9,15 @@ use bytes::Bytes;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::response::{
-    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_RESULT, for_each_chunk,
+    ChunkEvent, DISPATCH_TAG_ABORT, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_RESULT,
+    DISPATCH_TAG_RESULT_PART, SchedulerAbort, for_each_chunk,
 };
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::FromSchedulerRx;
 use crate::tokenizer_manager::wiring::{Senders, recv};
 
 /// A monotonic counter bumped once per from_scheduler frame the dispatcher drains.
-/// It's the rust-native equivalent of the Python `TokenizerManager`'s
+/// Equivalent to the Python `TokenizerManager`'s
 /// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
 /// scheduler → detok path is alive (the value itself is meaningless).
 pub type ActivityCounter = Arc<AtomicU64>;
@@ -130,8 +131,18 @@ impl Runnable for Dispatcher {
                         self.route(&rid, msg);
                     }
                 }
+                DISPATCH_TAG_RESULT_PART => {
+                    if let Some((rid, msg)) = decode_result_part(body) {
+                        self.route(&rid, msg);
+                    }
+                }
                 DISPATCH_TAG_ERROR => {
                     if let Some((rid, msg)) = decode_error(body) {
+                        self.route(&rid, msg);
+                    }
+                }
+                DISPATCH_TAG_ABORT => {
+                    if let Some((rid, msg)) = decode_abort(body) {
                         self.route(&rid, msg);
                     }
                 }
@@ -154,6 +165,42 @@ impl Dispatcher {
 
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
 fn decode_result(body: &[u8]) -> Option<(Rid, DetokMsg)> {
+    let (rid, payload) = decode_payload(body)?;
+    Some((rid.clone(), DetokMsg::Result { rid, payload }))
+}
+
+fn decode_result_part(body: &[u8]) -> Option<(Rid, DetokMsg)> {
+    let (rid, dp_rank, payload): (String, u32, rmpv::Value) = rmp_serde::from_slice(body).ok()?;
+    let rmpv::Value::Binary(payload) = payload else {
+        return None;
+    };
+    let rid = Rid::from(rid);
+    Some((
+        rid.clone(),
+        DetokMsg::ResultPart {
+            rid,
+            dp_rank,
+            payload: Bytes::from(payload),
+        },
+    ))
+}
+
+fn decode_abort(body: &[u8]) -> Option<(Rid, DetokMsg)> {
+    let (rid, payload) = decode_payload(body)?;
+    let msg = match rmp_serde::from_slice::<SchedulerAbort>(&payload) {
+        Ok(outcome) => DetokMsg::Abort {
+            rid: rid.clone(),
+            outcome,
+        },
+        Err(_) => DetokMsg::Fail {
+            rid: rid.clone(),
+            message: "internal error: malformed scheduler abort".into(),
+        },
+    };
+    Some((rid, msg))
+}
+
+fn decode_payload(body: &[u8]) -> Option<(Rid, Bytes)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
@@ -166,7 +213,7 @@ fn decode_result(body: &[u8]) -> Option<(Rid, DetokMsg)> {
         rmpv::Value::String(s) => Bytes::from(s.into_bytes()),
         _ => return None,
     };
-    Some((rid.clone(), DetokMsg::Result { rid, payload }))
+    Some((rid, payload))
 }
 
 /// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).

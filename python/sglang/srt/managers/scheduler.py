@@ -162,6 +162,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    RustFrontendReadyReqInput,
+    RustFrontendReadyReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -872,6 +874,8 @@ class Scheduler(
         try:
             load = self.load_inquirer.get_loads()
             writer.write(load)
+            if self.rust_server is not None:
+                self.rust_server.publish_load_snapshot(load)
             return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
@@ -926,6 +930,10 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
+        self.init_reasoning_parser()
+
+    def init_reasoning_parser(self):
+        """Initialize grammar terminators after the model tokenizer is selected."""
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,
@@ -1281,7 +1289,7 @@ class Scheduler(
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
-            ipc_channels=self.ipc_channels,
+            send_output=self._send_control_output,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -1799,6 +1807,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
+                (RustFrontendReadyReqInput, self.handle_rust_frontend_ready),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (
@@ -1829,12 +1838,22 @@ class Scheduler(
         This method provides the initialization info needed by the tokenizer manager
         and other components to verify the scheduler is ready.
         """
+        if self.rust_server is not None:
+            self.publish_load_snapshot(force=True)
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+        if envs.SGLANG_RUST_SERVER.get() and (
+            self.ps.dp_size > 1 or get_observability().enable_metrics
+        ):
+            from sglang.srt.rust_server.topology import collect_worker_infos
+
+            result_dict["rust_worker_infos"] = collect_worker_infos(
+                self, metrics_enabled=get_observability().enable_metrics
+            )
 
         return result_dict
 
@@ -2104,20 +2123,22 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        sock_send(self.ipc_channels.recv_from_rpc, output)
-                else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                self._send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+
+    def _send_control_output(self, output, recv_req) -> None:
+        if isinstance(output, RustFrontendReadyReqOutput):
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+        elif isinstance(output, RpcReqOutput):
+            if self.ipc_channels.recv_from_rpc is not None:
+                sock_send(self.ipc_channels.recv_from_rpc, output)
+        elif self.rust_server is not None:
+            self.rust_server.push_control_output(recv_req, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -2253,19 +2274,16 @@ class Scheduler(
             self.scripted_scheduler_hook = None
 
     def _hosts_rust_server(self) -> bool:
-        """Whether this scheduler rank embeds the Rust server (rank 0 only) —
-        and with it the server-process duties a Python ``TokenizerManager``
-        would otherwise own (e.g. serving the PD KV bootstrap registry)."""
-        return envs.SGLANG_RUST_SERVER.get() and (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
+        """The TP/CP/PP leader embeds the frontend for its DP worker."""
+        from sglang.srt.rust_server.topology import FrontendTopology
+
+        return (
+            envs.SGLANG_RUST_SERVER.get()
+            and FrontendTopology.from_parallel_state(self.ps).is_leader
         )
 
     def maybe_init_rust_server(self) -> None:
-        """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
-        set, and point the ingress receiver at it. All the plumbing lives in
-        ``RustServer`` (scheduler_components/rust_scheduler.py)."""
+        """Start the DP worker's frontend and retain controller/RPC reception."""
 
         if not self._hosts_rust_server():
             # Always define the attribute: init_output_streamer and the
@@ -2273,13 +2291,24 @@ class Scheduler(
             self.rust_server = None
             return
 
-        rust_server = RustServer.launch(self)
+        rust_server = self.get_rust_server_class().launch(self)
+        if self.ps.dp_size > 1:
+            rust_server.start_control_transport(
+                self.ipc_channels.rust_control_ipc_name,
+                cross_node=get_parallel().nnodes > 1,
+            )
         self.rust_server = rust_server
+        self.ipc_channels.send_to_tokenizer.output_handler = (
+            rust_server.handle_scheduler_output
+        )
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
+    def get_rust_server_class(self) -> type[RustServer]:
+        return RustServer
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
@@ -2288,6 +2317,7 @@ class Scheduler(
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
+            recv_from_controller=self.ipc_channels.recv_from_tokenizer,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
@@ -5121,6 +5151,14 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def handle_rust_frontend_ready(self, recv_req: RustFrontendReadyReqInput):
+        if self.rust_server is not None:
+            self.rust_server.server.mark_ready()
+            return RustFrontendReadyReqOutput(
+                rid=recv_req.rid, dp_rank=self.ps.dp_rank or 0
+            )
+        return None
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -5834,6 +5872,8 @@ def run_scheduler_process(
                 pass
     finally:
         if scheduler is not None:
+            if scheduler.rust_server is not None:
+                scheduler.rust_server.close()
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()

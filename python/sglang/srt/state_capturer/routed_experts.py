@@ -30,11 +30,10 @@ def _is_scattered_a2a_backend() -> bool:
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
-    Routed experts share a global device buffer across DP ranks (indexed by
-    dp_rank), so `_get_local_slice` overrides the default to apply DP-rank-aware
-    slicing. The device cache also holds extra columns for any fused shared
-    experts; the host cache and user-facing return drop them via the
-    [:topk_size] truncation.
+    Routers can run before or after the DP token gather. Global captures need
+    DP-rank-aware slicing; local captures start at row zero, with attention-TP
+    sequence shards gathered before writing. The device cache also holds extra
+    columns for fused shared experts, which the user-facing return drops.
     """
 
     @staticmethod
@@ -68,6 +67,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         device: str,
     ):
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.capture_local = False
         topk_size = model_config.hf_text_config.num_experts_per_tok
         num_layers = model_config.hf_text_config.num_hidden_layers
 
@@ -91,11 +91,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # Rebuild the full token batch before routed-expert readback.
-        if _is_scattered_a2a_backend():
-            attn_tp_size = (
-                get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
-            )
+        # Allocate before graph capture; a model may select sequence sharding
+        # separately for each forward, including unaligned prefill fallbacks.
+        attn_tp_size = get_parallel().attn_tp_size
+        self.gather_buffer = None
+        if attn_tp_size > 1:
             self.gather_buffer = torch.empty(
                 (
                     self.device_cache.buffer.shape[0] * attn_tp_size,
@@ -105,8 +105,20 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 device=device,
             )
 
-    def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        if _is_scattered_a2a_backend():
+    def capture(
+        self,
+        layer_id: int,
+        topk_indices: torch.Tensor,
+        *,
+        local_tokens: bool = False,
+        sequence_sharded: bool = False,
+    ):
+        self.capture_local = local_tokens
+        # Generic DeepEP routing scatters across attention TP. Models that
+        # route local tokens explicitly also know this forward's SP layout.
+        gather = sequence_sharded or (not local_tokens and _is_scattered_a2a_backend())
+        if gather and get_parallel().attn_tp_size > 1:
+            assert self.gather_buffer is not None
             local_topk = topk_indices
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
@@ -121,7 +133,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
         # Gathered rows start at buffer offset zero on every DP rank.
-        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
+        if (
+            is_dp_attention_enabled()
+            and not self.capture_local
+            and not _is_scattered_a2a_backend()
+        ):
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
                 forward_batch, can_run_graph, cuda_graph_batch

@@ -1088,14 +1088,28 @@ class CommonKVManager(BaseKVManager):
 
     def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
-        for attempt in range(max_retries):
+        # The Rust listener starts inside a scheduler. Other ranks can finish
+        # model initialization first, so registration is also their readiness
+        # handshake. Do not continue startup with an incomplete rank directory.
+        deadline = (
+            time.monotonic() + envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            if envs.SGLANG_RUST_SERVER.get()
+            else None
+        )
+        attempt = 0
+        while deadline is None or time.monotonic() < deadline:
+            request_timeout = (
+                min(5, max(0.001, deadline - time.monotonic()))
+                if deadline is not None
+                else 5
+            )
             try:
-                response = requests.put(url, json=payload, timeout=5)
+                response = requests.put(url, json=payload, timeout=request_timeout)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
+                    f"Prefill register attempt {attempt + 1} to {url} failed: status {response.status_code}"
                 )
             except Exception as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
@@ -1103,14 +1117,22 @@ class CommonKVManager(BaseKVManager):
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
+                    f"Prefill register attempt {attempt + 1} to {url} failed: {cause}"
                 )
-            if attempt == max_retries - 1:
+            if deadline is None and attempt == max_retries - 1:
                 break
-            delay = min(initial_delay * (2**attempt), max_delay) * (
+            delay = min(initial_delay * (2 ** min(attempt, 5)), max_delay) * (
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
+            if deadline is not None:
+                delay = min(delay, max(0, deadline - time.monotonic()))
             time.sleep(delay)
+            attempt += 1
+        if deadline is not None:
+            raise RuntimeError(
+                f"Prefill rank could not register with the HTTP bootstrap service at {url} "
+                f"within {envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()} seconds"
+            )
         logger.error(
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )

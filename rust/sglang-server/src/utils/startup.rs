@@ -15,7 +15,11 @@ pub(crate) fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
 pub(crate) fn listen_addr(
     server_args: &ServerArgs,
     port_offset: Option<u16>,
+    http_port: Option<u16>,
 ) -> Result<SocketAddr, String> {
+    if port_offset.is_some() && http_port.is_some() {
+        return Err("http_port and port_offset cannot both be specified".into());
+    }
     let offset = port_offset.unwrap_or_default();
     let port = server_args
         .port
@@ -25,7 +29,7 @@ pub(crate) fn listen_addr(
         .bind()
         .parse()
         .map_err(|err| format!("invalid host {:?}: {err}", server_args.host))?;
-    addr.set_port(port);
+    addr.set_port(http_port.unwrap_or(port));
     Ok(addr)
 }
 
@@ -41,13 +45,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            listen_addr(&args, None).unwrap(),
+            listen_addr(&args, None, None).unwrap(),
             "[::]:30000".parse().unwrap()
         );
         assert_eq!(
-            listen_addr(&args, Some(7)).unwrap(),
+            listen_addr(&args, Some(7), None).unwrap(),
             "[::]:30007".parse().unwrap()
         );
+        assert_eq!(
+            listen_addr(&args, None, Some(0)).unwrap(),
+            "[::]:0".parse().unwrap()
+        );
+        assert!(listen_addr(&args, Some(7), Some(0)).is_err());
     }
 
     #[test]
@@ -56,6 +65,10 @@ mod tests {
             port: u16::MAX,
             ..Default::default()
         };
-        assert!(listen_addr(&args, Some(1)).unwrap_err().contains("exceeds"));
+        assert!(
+            listen_addr(&args, Some(1), None)
+                .unwrap_err()
+                .contains("exceeds")
+        );
     }
 }

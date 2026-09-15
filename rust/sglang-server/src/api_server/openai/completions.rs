@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -15,11 +15,11 @@ use axum::{
     routing::post,
 };
 use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    Choice, CompletionFinishReason, CreateCompletionRequest, CreateCompletionResponse, Logprobs,
+    Prompt, Stop,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use serde::Deserialize;
 
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
@@ -29,9 +29,9 @@ use super::{
 };
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::request::RequestKind;
 use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
-use crate::message::sampling::SamplingParams;
+use crate::message::sampling::{SamplingParams, SamplingParamsInput};
 use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
 
@@ -50,36 +50,45 @@ pub(super) struct SubmittedChoice {
     pub(super) prompt_index: usize,
     pub(super) rid: Rid,
     pub(super) echo: String,
-    pub(super) rx: mpsc::Receiver<ResponseItem>,
+    pub(super) rx: super::ResponseReceiver,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
     matched_stop: Option<serde_json::Value>,
     /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`, and native unknown finish types are preserved rather than lost.
+    /// `abort`; unrecognized scheduler finish types are preserved as well.
     finish_reason_override: Option<String>,
 }
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let started = std::time::Instant::now();
+    let custom_labels = state
+        .frontend_metrics
+        .as_ref()
+        .and_then(|metrics| metrics.custom_labels(&headers));
+    let raw_request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let request = match CreateCompletionRequest::deserialize(&raw_request) {
+        Ok(request) => request,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    let (mut native_body, output_options) =
+        match super::extensions::request_options(&raw_request, &headers, &state.server_args, false)
+        {
+            Ok(options) => options,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if model != state.server_args.served_model_name {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{model}` does not exist"),
-            false,
-        );
-    }
 
     if request.prompt_embeds.is_some() {
         return openai_error(
@@ -102,13 +111,6 @@ async fn completions(
             false,
         );
     }
-    if request.max_tokens == Some(0) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "max_tokens must be positive",
-            false,
-        );
-    }
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
@@ -124,6 +126,9 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
+    if let Err(error) = super::extensions::apply_sampling(&raw_request, &mut sampling, None) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
         state.server_args.model_config.vocab_size,
@@ -142,62 +147,78 @@ async fn completions(
             );
         }
     };
-    let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+    if native_body.rid.is_none() {
+        native_body.rid = Some(OneOrMany::One(format!(
+            "cmpl-{}",
+            uuid::Uuid::new_v4().simple()
+        )));
+    }
+    if matches!(prompts.first(), Some(PromptSpec::Text(_))) {
+        native_body.text = match serde_json::from_value(raw_request["prompt"].clone()) {
+            Ok(text) => Some(text),
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        };
+    } else {
+        native_body.input_ids = match serde_json::from_value(raw_request["prompt"].clone()) {
+            Ok(ids) => Some(ids),
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        };
+    }
+    sampling.n = n as i64;
+    native_body.sampling_params = Some(SamplingParamsInput::One(Box::new(sampling)));
+    native_body.stream = stream;
+    let native_requests = match native_body.into_requests() {
+        Ok((requests, _)) => requests,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+    };
+    let response_id = native_requests[0].rid.client_facing().to_owned();
     let created = unix_seconds_u32();
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut submitted = Vec::with_capacity(choice_count);
 
-    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        let (text, input_ids, mut prompt_echo) = match prompt {
-            PromptSpec::Text(text) => {
-                let prompt_echo = if echo { text.clone() } else { String::new() };
-                (Some(text), None, prompt_echo)
-            }
-            PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
-        };
-        for sample_index in 0..n {
-            let index = prompt_index * n + sample_index;
-            let rid = Rid::from_client(&format!("{response_id}-{index}"));
-            if echo
-                && sample_index == 0
-                && let Some(token_ids) = &input_ids
-            {
-                prompt_echo = match decode_prompt_echo(&state, token_ids.clone()).await {
+    let mut echoes = vec![String::new(); prompts.len()];
+    for (index, mut native) in native_requests.into_iter().enumerate() {
+        let prompt_index = index / n;
+        let rid = native.rid.clone();
+        if echo && index % n == 0 {
+            echoes[prompt_index] = match &prompts[prompt_index] {
+                PromptSpec::Text(text) => text.clone(),
+                PromptSpec::TokenIds(ids) => match decode_prompt_echo(&state, ids.clone()).await {
                     Ok(echo) => echo,
                     Err(response) => return response,
-                };
-            }
-            let native = GenerateRequest {
-                rid: rid.clone(),
-                text: text.clone(),
-                input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
-                stream,
-                return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if echo && request.logprobs.is_some() {
-                    0
-                } else {
-                    -1
                 },
-                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
-                return_text_in_logprobs: request.logprobs.map(|_| true),
-                ..Default::default()
             };
-            let rx = match submit_generation(&state, native, stream, &mut guard).await {
-                Ok(rx) => rx,
-                Err(response) => return response,
-            };
-            submitted.push(SubmittedChoice {
-                index,
-                prompt_index,
-                rid,
-                echo: prompt_echo.clone(),
-                rx,
-            });
         }
+        native.started = Some(started);
+        native.custom_labels = custom_labels.clone();
+        native.return_logprob = request.logprobs.is_some();
+        native.logprob_start_len = if echo && request.logprobs.is_some() {
+            0
+        } else {
+            -1
+        };
+        native.top_logprobs_num = request.logprobs.unwrap_or(0) as i64;
+        native.return_text_in_logprobs = Some(true);
+        let rx = match submit_generation(&state, native, stream, &mut guard).await {
+            Ok(rx) => rx,
+            Err(response) => return response,
+        };
+        submitted.push(SubmittedChoice {
+            index,
+            prompt_index,
+            rid,
+            echo: echoes[prompt_index].clone(),
+            rx,
+        });
     }
 
     if stream {
+        if let Err((index, status, message)) =
+            super::prime_stream(submitted.iter_mut().map(|choice| &mut choice.rx)).await
+        {
+            guard.disarm(&submitted[index].rid);
+            return openai_error(status, message, false);
+        }
         let include_usage = request
             .stream_options
             .map(|o| o.include_usage)
@@ -218,6 +239,7 @@ async fn completions(
             want_logprobs,
             include_usage,
             continuous_usage,
+            output_options,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
@@ -230,6 +252,7 @@ async fn completions(
             created,
             echo,
             request.logprobs.is_some(),
+            output_options,
         )
         .await
     }
@@ -240,7 +263,15 @@ async fn completions(
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
+    let Ok((_rid, mut rx)) = submit(
+        state,
+        RequestKind::Detokenize {
+            token_ids,
+            skip_special_tokens: true,
+        },
+        false,
+    )
+    .await
     else {
         // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
@@ -345,8 +376,7 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
         top_p: request.top_p.unwrap_or(1.0) as f64,
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
-        // OpenAI `n` is implemented by fan-out: every native request has one
-        // output, avoiding the native path's intentional `n > 1` rejection.
+        // OpenAI already expanded the choices before native admission.
         n: 1,
         logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
         sampling_seed: request.seed,
@@ -354,6 +384,7 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_completion(
     submitted: Vec<SubmittedChoice>,
     mut guard: AbortGuard,
@@ -362,14 +393,19 @@ pub(super) async fn unary_completion(
     created: u32,
     echo: bool,
     want_logprobs: bool,
+    output_options: super::extensions::OutputOptions,
 ) -> Response {
     // Every request is already submitted, so draining in choice order does not
     // serialize generation. The non-streaming native path sends one terminal
     // result, and the accumulator also tolerates intermediate frames.
     let mut choices = Vec::with_capacity(submitted.len());
     let mut extensions = Vec::with_capacity(submitted.len());
-    let mut prompt_tokens = BTreeMap::<usize, u32>::new();
-    let mut completion_tokens = 0u64;
+    let n = submitted
+        .iter()
+        .take_while(|c| c.prompt_index == 0)
+        .count()
+        .max(1);
+    let mut outputs = Vec::with_capacity(submitted.len());
 
     for choice in submitted {
         let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
@@ -379,10 +415,6 @@ pub(super) async fn unary_completion(
             }
         };
 
-        prompt_tokens
-            .entry(choice.prompt_index)
-            .or_insert(output.prompt_tokens);
-        completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
             if echo {
@@ -394,20 +426,15 @@ pub(super) async fn unary_completion(
             want_logprobs,
             echo,
         );
+        outputs.push(super::super::frame::frame_value(
+            &output,
+            choice.rid.client_facing(),
+        ));
         choices.push(response_choice);
         extensions.push(extension);
     }
 
-    let prompt_tokens = prompt_tokens
-        .values()
-        .copied()
-        .fold(0u32, u32::saturating_add);
-    let usage = completion_usage(
-        prompt_tokens,
-        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-    );
-
-    Json(completion_response_value(
+    let mut value = completion_response_value(
         CreateCompletionResponse {
             id: response_id,
             choices,
@@ -415,11 +442,12 @@ pub(super) async fn unary_completion(
             model,
             system_fingerprint: None,
             object: "text_completion".into(),
-            usage: Some(usage),
+            usage: None,
         },
         &extensions,
-    ))
-    .into_response()
+    );
+    output_options.unary_fields(&mut value, &outputs, n, false);
+    Json(value).into_response()
 }
 
 fn completion_choice(
@@ -445,7 +473,7 @@ fn completion_choice(
             Matched::Token(id) => serde_json::json!(id),
             Matched::Str(value) => serde_json::json!(value),
             // Python's OpenAI schema supports an integer or string here, not a
-            // multi-token list. Preserve the native value rather than dropping it.
+            // multi-token list. Preserve the original token IDs.
             Matched::Tokens(ids) => serde_json::json!(ids),
         });
     (
@@ -521,21 +549,21 @@ pub(super) fn completion_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     continuous_usage: bool,
+    output_options: super::extensions::OutputOptions,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
+        let mut last_response_id = response_id;
         let count = submitted.len();
+        let n = submitted.iter().take_while(|choice| choice.prompt_index == 0).count().max(1);
+        let mut snapshots: Vec<super::responses::StreamChoice> = (0..count).map(|_| Default::default()).collect();
         let mut rids = Vec::with_capacity(count);
-        let mut prompt_indexes = Vec::with_capacity(count);
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
-        let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
-        let mut completion_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
         for choice in submitted {
             let index = choice.index;
             rids.push(choice.rid);
-            prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
             streams.push(indexed_decode_stream(index, choice.rx));
         }
@@ -557,7 +585,7 @@ pub(super) fn completion_event_stream(
                     yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
+                ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::Tokenized(_) => continue,
             };
 
             if let Some((code, message)) = output
@@ -569,23 +597,14 @@ pub(super) fn completion_event_stream(
                 continue;
             }
 
-            prompt_tokens_by_prompt
-                .entry(prompt_indexes[index])
-                .or_insert(output.prompt_tokens);
-            completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
-                .saturating_add(output.completion_tokens);
+            snapshots[index].observe(&output, false);
+            last_response_id = output.rid.client_facing().into();
             let first = std::mem::replace(&mut first_chunks[index], false);
             let text = if echo && first {
                 echoes[index].clone() + &output.text
             } else {
                 output.text.clone()
             };
-            let chunk_usage = continuous_usage.then(|| {
-                completion_usage(
-                    output.prompt_tokens,
-                    u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
-                )
-            });
             let (choice, extension) = completion_choice(
                 index,
                 text,
@@ -594,49 +613,35 @@ pub(super) fn completion_event_stream(
                 echo && first,
             );
             let chunk = CreateCompletionResponse {
-                id: response_id.clone(),
+                id: output.rid.client_facing().into(),
                 choices: vec![choice],
                 created,
                 model: model.clone(),
                 system_fingerprint: None,
                 object: "text_completion".into(),
-                usage: chunk_usage,
+                usage: None,
             };
-            yield completion_response_value(chunk, &[extension]).to_string();
+            let mut value = completion_response_value(chunk, &[extension]);
+            value["choices"][0].as_object_mut().expect("OpenAI choice must be an object").entry("logprobs").or_insert(serde_json::Value::Null);
+            if output_options.return_token_ids {
+                value["choices"][0]["token_ids"] = serde_json::json!(output.token_ids);
+                if first && let Some(ids) = output.extras.as_ref().and_then(|e| e.prompt_token_ids.as_ref()) {
+                    value["choices"][0]["prompt_token_ids"] = serde_json::json!(ids.as_ref());
+                }
+            }
+            if continuous_usage {
+                let mut options = output_options.clone();
+                options.enable_cache_report = false;
+                value["usage"] = options.usage(&[snapshots[index].metadata_item()], 1, false);
+            } else { value["usage"] = serde_json::Value::Null; }
+            yield value.to_string();
         }
 
-        if include_usage {
-            let prompt_tokens = prompt_tokens_by_prompt
-                .values()
-                .copied()
-                .fold(0u32, u32::saturating_add);
-            let completion_tokens = completion_tokens_by_choice
-                .into_iter()
-                .fold(0u64, u64::saturating_add);
-            let final_chunk = CreateCompletionResponse {
-                id: response_id,
-                choices: vec![],
-                created,
-                model,
-                system_fingerprint: None,
-                object: "text_completion".into(),
-                usage: Some(completion_usage(
-                    prompt_tokens,
-                    u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                )),
-            };
-            yield completion_response_value(final_chunk, &[]).to_string();
+        let items: Vec<_> = snapshots.into_iter().map(|snapshot| snapshot.into_item()).collect();
+        for event in output_options.stream_tail(&items, n, false, &last_response_id, &model, created, include_usage) {
+            yield event.data;
         }
         yield "[DONE]".to_string();
-    }
-}
-
-pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens.saturating_add(completion_tokens),
-        ..Default::default()
     }
 }
 
@@ -764,17 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn max_tokens_zero_is_rejected_before_submission() {
-        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "prompt": "hello",
-            "max_tokens": 0
-        }))
-        .unwrap();
-        assert_eq!(request.max_tokens, Some(0));
-    }
-
-    #[test]
     fn token_prompt_is_normalized_without_echo_state() {
         let specs = completion_prompt_specs(&Prompt::IntegerArray(vec![1, 2])).unwrap();
         assert_eq!(specs, [PromptSpec::TokenIds(vec![1, 2])]);
@@ -834,6 +828,7 @@ mod tests {
             1,
             false,
             false,
+            Default::default(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -864,6 +859,7 @@ mod tests {
             false,
             true,
             false,
+            Default::default(),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;

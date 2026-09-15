@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use serde::Serialize;
 
+use super::embeddings::PositionalEmbedsWire;
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;
 use super::types::TokenIds;
@@ -20,7 +21,7 @@ wire_struct! {
         input_text: Option<&'a str>,
         /// Always nil: the ids ride the ring's columnar buffer, not msgpack.
         input_ids: (),
-        input_embeds: (),
+        input_embeds: Option<&'a [Vec<f32>]>,
         mm_inputs: (),
         token_type_ids: (),
         sampling_params: &'a SamplingParams,
@@ -29,23 +30,21 @@ wire_struct! {
         top_logprobs_num: i64,
         token_ids_logprob: Option<&'a TokenIds>,
         stream: bool,
-        /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
         return_flat_raw_top_logprobs: bool,
-        return_hidden_states: bool,
-        /// Filler block (not exposed by this server yet): default/nil slots so
-        /// the PD fields below land on their Python wire indices (25–31).
+        return_hidden_states: super::types::HiddenStatesMode,
+        /// Scheduler extensions and reserved session/LoRA slots. Keep the PD
+        /// fields below on their Python wire indices (25–31).
         return_routed_experts: bool,
         routed_experts_start_len: i64,
         return_indexer_topk: bool,
         session_id: (),
         session_params: (),
         lora_id: (),
-        custom_logit_processor: (),
-        positional_embed_overrides: (),
-        /// PD-disaggregation block — the last fields emitted; everything after
-        /// `disagg_prefill_dp_rank` in Python has a msgspec default and is
-        /// omitted (short arrays decode with defaulted tails).
+        custom_logit_processor: Option<&'a str>,
+        positional_embed_overrides: Option<PositionalEmbedsWire<'a>>,
+        /// PD-disaggregation and scheduler routing fields. The remaining
+        /// Python fields have defaults (short arrays decode with defaulted tails).
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -53,6 +52,19 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        routing_key: Option<&'a str>,
+        require_reasoning: bool,
+        priority: Option<i64>,
+        extra_key: Option<&'a str>,
+        no_logs: bool,
+        return_bytes: bool,
+        return_entropy: bool,
+        need_wait_for_mm_inputs: (),
+        num_items_assigned: (),
+        encoder_urls: (),
+        multi_item_delimiter_indices: Option<&'a [i32]>,
+        time_stats: (),
+        cache_salt: Option<&'a str>,
     }
 }
 
@@ -71,6 +83,12 @@ control_messages! {
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    FlushCacheReqInput {
+        timeout_s: Option<f64>,
+    }
+
+    ClearHiCacheReqInput {}
 }
 
 /// Borrow a request as its wire struct, resolving `Option` scalars to the wire
@@ -87,7 +105,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             rid: &req.rid,
             input_text: req.text.as_deref(),
             input_ids: (),
-            input_embeds: (),
+            input_embeds: req.input_embeds.as_deref(),
             mm_inputs: (),
             token_type_ids: (),
             sampling_params: &req.sampling_params,
@@ -97,16 +115,19 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             token_ids_logprob: req.token_ids_logprob.as_ref(),
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
-            return_flat_raw_top_logprobs: false,
+            return_flat_raw_top_logprobs: req.return_flat_raw_top_logprobs,
             return_hidden_states: req.return_hidden_states,
-            return_routed_experts: false,
-            routed_experts_start_len: 0,
-            return_indexer_topk: false,
+            return_routed_experts: req.return_routed_experts,
+            routed_experts_start_len: req.routed_experts_start_len,
+            return_indexer_topk: req.return_indexer_topk,
             session_id: (),
             session_params: (),
             lora_id: (),
-            custom_logit_processor: (),
-            positional_embed_overrides: (),
+            custom_logit_processor: req.custom_logit_processor.as_deref(),
+            positional_embed_overrides: req
+                .positional_embed_overrides
+                .as_ref()
+                .map(PositionalEmbedsWire),
             bootstrap_host: req.bootstrap_host.as_deref(),
             bootstrap_port: req.bootstrap_port,
             bootstrap_room: req.bootstrap_room,
@@ -114,11 +135,33 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            routing_key: req.routing_key.as_deref(),
+            require_reasoning: req.require_reasoning,
+            priority: req.priority,
+            extra_key: req.extra_key.as_deref(),
+            no_logs: false,
+            // TokenizerManager._create_tokenized_object leaves both at their
+            // defaults, including for nondefault HTTP inputs. The shared
+            // output-flags fixture checks this contract and the final response.
+            return_bytes: false,
+            return_entropy: false,
+            need_wait_for_mm_inputs: (),
+            num_items_assigned: (),
+            encoder_urls: (),
+            multi_item_delimiter_indices: req.multi_item_delimiter_indices.as_deref(),
+            time_stats: (),
+            cache_salt: req.cache_salt.as_deref(),
         }
     }
 }
 
 impl GetInternalStateReq {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+impl ClearHiCacheReqInput {
     pub fn new(rid: String) -> Self {
         Self { rid }
     }
@@ -135,9 +178,140 @@ impl AbortReq {
     }
 }
 
+impl FlushCacheReqInput {
+    pub fn new(rid: String, timeout_s: f64) -> Self {
+        Self {
+            rid,
+            timeout_s: Some(timeout_s),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::request::GenerateBody;
+
+    #[test]
+    fn routing_output_options_match_python_and_survive_dp_forwarding() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/routing_outputs_python.json"))
+                .unwrap();
+        for case in fixture["requests"].as_array().unwrap() {
+            let body: GenerateBody = serde_json::from_value(case["body"].clone()).unwrap();
+            let (requests, _) = body.into_requests().unwrap();
+            let expected = case["expected"].as_array().unwrap();
+            assert_eq!(requests.len(), expected.len());
+            for (request, expected) in requests.into_iter().zip(expected) {
+                let forwarded: GenerateBody =
+                    serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+                let (forwarded, _) = forwarded.into_requests().unwrap();
+                for request in std::iter::once(request).chain(forwarded) {
+                    let header: serde_json::Value =
+                        rmp_serde::from_slice(&request.encode_header().unwrap()).unwrap();
+                    assert_eq!(
+                        serde_json::json!([
+                            request.return_routed_experts,
+                            request.routed_experts_start_len,
+                            request.return_indexer_topk,
+                        ]),
+                        *expected
+                    );
+                    assert_eq!(
+                        &header.as_array().unwrap()[17..20],
+                        expected.as_array().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_prompt_options_survive_parallel_samples_dp_and_scheduler_transport() {
+        for base64 in [false, true] {
+            let body: GenerateBody = serde_json::from_value(serde_json::json!({
+                "input_ids": [[1], [2]], "sampling_params": {"n": 2},
+                "return_logprob": true, "top_logprobs_num": 2,
+                "return_flat_raw_top_logprobs": true,
+                "return_flat_raw_top_logprobs_b64": base64,
+            }))
+            .unwrap();
+            let (requests, batch) = body.into_requests().unwrap();
+            assert!(batch);
+            assert_eq!(requests.len(), 4);
+            for request in requests {
+                let forwarded: GenerateBody =
+                    serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+                let (forwarded, _) = forwarded.into_requests().unwrap();
+                for request in std::iter::once(request).chain(forwarded) {
+                    assert!(request.return_flat_raw_top_logprobs);
+                    assert_eq!(request.return_flat_raw_top_logprobs_b64, base64);
+                    let header: serde_json::Value =
+                        rmp_serde::from_slice(&request.encode_header().unwrap()).unwrap();
+                    assert_eq!(header[15], true);
+                }
+            }
+        }
+        for (options, error) in [
+            (
+                serde_json::json!({"return_flat_raw_top_logprobs_b64": true}),
+                "requires return_flat_raw_top_logprobs",
+            ),
+            (
+                serde_json::json!({"return_flat_raw_top_logprobs": true, "multi_item_delimiter_indices": [0, 1]}),
+                "does not support multi-item scoring",
+            ),
+        ] {
+            let mut body = options;
+            body["input_ids"] = serde_json::json!([1, 2]);
+            let body: GenerateBody = serde_json::from_value(body).unwrap();
+            assert!(
+                body.into_requests()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(error)
+            );
+        }
+    }
+
+    #[test]
+    fn cache_identity_survives_normalization_forwarding_and_scheduler_wire() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/cache_identity_python.json"))
+                .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let body: GenerateBody = serde_json::from_value(fixture["body"].clone()).unwrap();
+            let (requests, _) = body.into_requests().unwrap();
+            let expected = fixture["expected"].as_array().unwrap();
+            assert_eq!(requests.len(), expected.len());
+            for (request, expected) in requests.into_iter().zip(expected) {
+                let forwarded: GenerateBody =
+                    serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+                let (forwarded, batch) = forwarded.into_requests().unwrap();
+                assert!(!batch);
+                for request in std::iter::once(&request).chain(&forwarded) {
+                    let header = TokenizedGenerateReqInput::from(request).encode().unwrap();
+                    let fields: serde_json::Value = rmp_serde::from_slice(&header).unwrap();
+                    assert_eq!(
+                        serde_json::json!([fields[35], fields[44], fields[32]]),
+                        *expected,
+                        "{}",
+                        fixture["body"]
+                    );
+                }
+            }
+        }
+        for body in [
+            serde_json::json!({"text":"single", "cache_salt":["salt"]}),
+            serde_json::json!({"text":["a","b"], "extra_key":["tenant"]}),
+            serde_json::json!({"text":["a","b"], "cache_salt":["salt",null]}),
+        ] {
+            let result = serde_json::from_value::<GenerateBody>(body)
+                .map_err(|error| error.to_string())
+                .and_then(|body| body.into_requests().map_err(|error| error.to_string()));
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn abort_req_msgpack_shape() {
@@ -173,16 +347,14 @@ mod tests {
             return_logprob: true,
             logprob_start_len: -1,
             top_logprobs_num: 3,
-            return_hidden_states: true,
+            return_hidden_states: super::super::types::HiddenStatesMode::Full,
             stream: true,
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
-        // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        assert_eq!(arr.len(), 45, "header ends at cache_salt");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -227,6 +399,7 @@ mod tests {
             decode_tp_size: Some(2),
             routed_dp_rank: Some(3),
             disagg_prefill_dp_rank: Some(4),
+            priority: Some(-5),
             ..Default::default()
         };
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
@@ -245,5 +418,8 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        assert!(arr[32].is_nil(), "routing_key at 32");
+        assert_eq!(arr[33].as_bool(), Some(false), "require_reasoning at 33");
+        assert_eq!(arr[34].as_i64(), Some(-5), "priority at 34");
     }
 }

@@ -14,10 +14,15 @@ Covers:
 """
 
 import asyncio
+import json
 import unittest
+from array import array
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+from pydantic import TypeAdapter, ValidationError
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -28,6 +33,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -37,11 +43,16 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
+OUTPUT_FLAGS_FIXTURE = (
+    Path(__file__).resolve().parents[4]
+    / "rust/sglang-server/testdata/output_flags_python.json"
+)
 
 # ---------------------------------------------------------------------------
 # Per-request field defaults for BatchStrOutput construction.
@@ -215,6 +226,99 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
 
     return BatchStrOutput(**kwargs)
+
+
+def output_flags_fixture():
+    """Prove the current LLM contract for the two schema-only output switches."""
+    case = unittest.TestCase()
+    manager = _make_tokenizer_manager(case)
+    manager.preferred_sampling_params = {}
+    manager.sampling_params_class = SamplingParams
+    manager.model_config = SimpleNamespace(vocab_size=128)
+    manager.tokenizer = None
+    adapter = TypeAdapter(GenerateReqInput)
+    cases = []
+    rejected = []
+    try:
+        for stream in (False, True):
+            for batched in (False, True):
+                for return_bytes, return_entropy in (
+                    (False, False),
+                    (True, False),
+                    (False, True),
+                    (True, True),
+                ):
+                    body = {
+                        "input_ids": [[1, 2, 3], [4, 5, 6]] if batched else [1, 2, 3],
+                        "sampling_params": {"n": 2 if batched else 1},
+                        "stream": stream,
+                        "return_bytes": return_bytes,
+                        "return_entropy": return_entropy,
+                    }
+                    request = adapter.validate_json(json.dumps(body))
+                    request.normalize_batch_and_arguments()
+                    prompts = (
+                        [request]
+                        if request.is_single
+                        else [request[i] for i in range(request.batch_size)]
+                    )
+                    expected = []
+                    for prompt in prompts:
+                        state = ReqState(
+                            [], False, asyncio.Event(), prompt, APIServerReqTimeStats()
+                        )
+                        manager.rid_to_state[prompt.rid] = state
+                        tokenized = manager._create_tokenized_object(
+                            prompt, "", prompt.input_ids
+                        )
+                        assert prompt.return_bytes == return_bytes
+                        assert prompt.return_entropy == return_entropy
+                        assert tokenized.return_bytes is False
+                        assert tokenized.return_entropy is False
+                        output = _make_batch_str_output(
+                            prompt.rid, {"type": "length", "length": 2}
+                        )
+                        output.output_ids = [array("q", [5, 6])]
+                        output.prompt_tokens = [3]
+                        output.completion_tokens = [2]
+                        asyncio.run(manager._handle_batch_output(output))
+                        value = state.out_list[-1]
+                        assert "bytes" not in value and "entropy" not in value
+                        assert "output_token_entropy" not in value["meta_info"]
+                        assert "output_token_entropy_val" not in value["meta_info"]
+                        # Clock/weight provenance are separate, already-tested contracts.
+                        for key in ("id", "weight_version", "e2e_latency"):
+                            value["meta_info"].pop(key, None)
+                        expected.extend(
+                            value for _ in range(request.parallel_sample_num)
+                        )
+                    cases.append({"body": body, "expected": expected})
+        for field in ("return_bytes", "return_entropy"):
+            for value in (None, [], {}, "invalid", 2, 0.5):
+                body = {"input_ids": [1, 2, 3], field: value}
+                try:
+                    adapter.validate_json(json.dumps(body))
+                except ValidationError:
+                    rejected.append(body)
+                else:
+                    raise AssertionError(f"invalid flag accepted: {body}")
+    finally:
+        case.doCleanups()
+    return {
+        "wire_indices": {
+            field: TokenizedGenerateReqInput.__struct_fields__.index(field) + 1
+            for field in ("return_bytes", "return_entropy")
+        },
+        "cases": cases,
+        "rejected": rejected,
+    }
+
+
+class TestGenerationOutputFlags(CustomTestCase):
+    def test_nondefault_flags_preserve_python_wire_and_response_contract(self):
+        self.assertEqual(
+            json.loads(OUTPUT_FLAGS_FIXTURE.read_text()), output_flags_fixture()
+        )
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):

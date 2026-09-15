@@ -11,13 +11,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
 use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
 use tokio::sync::Semaphore;
 
-use crate::message::request::{GenerateRequest, MmData};
+use crate::HttpExtension;
+use crate::message::request::{GenerateRequest, MmFetchTiming, MmPrefetchStats};
 use crate::multi_modality::payload::io_sources;
 
 /// Global bound on concurrent media fetches across all in-flight requests;
@@ -34,11 +36,45 @@ static PERMITS: Semaphore = Semaphore::const_new(32);
 pub async fn prefetch_all(
     requests: &mut [GenerateRequest],
     modality_limits: &BTreeMap<String, usize>,
+    extension: Option<&Arc<dyn HttpExtension>>,
 ) -> Result<(), String> {
-    // The item budget rejects before a single byte is fetched.
-    let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
-        let Some(mm) = mm.as_deref() else {
-            return Ok(Vec::new());
+    validate_limits(requests, modality_limits)?;
+    let fetches = requests.iter().map(|request| {
+        let sources = request.mm.as_deref().map_or_else(Vec::new, |mm| {
+            [
+                ("image", &mm.image_data),
+                ("video", &mm.video_data),
+                ("audio", &mm.audio_data),
+            ]
+            .into_iter()
+            .flat_map(|(modality, items)| {
+                io_sources(items)
+                    .into_iter()
+                    .map(move |source| (source, modality))
+            })
+            .collect()
+        });
+        fetch_ordered(sources, MAX_REQUEST_BYTES, extension.cloned())
+    });
+    let fetched = futures::future::try_join_all(fetches).await?;
+    for (req, (bytes, stats)) in requests.iter_mut().zip(fetched) {
+        if let Some(mm) = req.mm.as_deref_mut() {
+            mm.prefetched = bytes;
+            mm.prefetch_stats = stats;
+        }
+    }
+    Ok(())
+}
+
+/// Check the original media counts before an extension replaces them with
+/// canonical input from prefill. Handoff must preserve configured input limits.
+pub(super) fn validate_limits(
+    requests: &[GenerateRequest],
+    modality_limits: &BTreeMap<String, usize>,
+) -> Result<(), String> {
+    for request in requests {
+        let Some(mm) = request.mm.as_deref() else {
+            continue;
         };
         let modalities = [
             ("image", &mm.image_data),
@@ -65,23 +101,6 @@ pub async fn prefetch_all(
                 ));
             }
         }
-        Ok(modalities
-            .iter()
-            .flat_map(|(_, items)| io_sources(items))
-            .collect())
-    };
-    let plans = requests
-        .iter()
-        .map(|r| plan(&r.mm))
-        .collect::<Result<Vec<_>, String>>()?;
-    let fetches = plans
-        .into_iter()
-        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES));
-    let fetched = futures::future::try_join_all(fetches).await?;
-    for (req, bytes) in requests.iter_mut().zip(fetched) {
-        if !bytes.is_empty() {
-            req.mm.as_mut().expect("sources came from mm").prefetched = bytes;
-        }
     }
     Ok(())
 }
@@ -91,10 +110,19 @@ pub async fn prefetch_all(
 /// per-source cap, matching Python's URL-only security limit. Overflow rejects
 /// before or during I/O and `try_join_all` drops the rest, so queued sources
 /// never start.
-async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Bytes>, String> {
+async fn fetch_ordered(
+    sources: Vec<(String, &'static str)>,
+    total_bytes: u64,
+    extension: Option<Arc<dyn HttpExtension>>,
+) -> Result<(Vec<Bytes>, MmPrefetchStats), String> {
+    if sources.is_empty() {
+        return Ok((Vec::new(), MmPrefetchStats::default()));
+    }
+    let started = Instant::now();
     let budget = Arc::new(ByteBudget::new(total_bytes));
-    futures::future::try_join_all(sources.into_iter().map(|src| {
+    let fetched = futures::future::try_join_all(sources.into_iter().map(|(src, modality)| {
         let budget = Arc::clone(&budget);
+        let extension = extension.clone();
         async move {
             let _permit = PERMITS.acquire().await.expect("semaphore never closed");
             // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
@@ -102,24 +130,80 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
             tokio::task::spawn_blocking(move || {
-                if src.starts_with('/') || src.starts_with("file://") {
-                    fetch_local_file_budgeted(&src, &budget)
-                } else {
+                let started = Instant::now();
+                let remote = src.starts_with("http://") || src.starts_with("https://");
+                let result = if remote {
                     fetch_bytes_budgeted(&src, &budget)
+                } else {
+                    fetch_local_file_budgeted(&src, &budget)
+                };
+                let elapsed = started.elapsed();
+                if remote && let Some(extension) = extension {
+                    extension.observe_media_fetch(modality, result.is_ok(), elapsed);
                 }
+                result.map(|bytes| {
+                    let timing = remote.then_some(MmFetchTiming {
+                        started,
+                        elapsed,
+                        bytes: bytes.len(),
+                    });
+                    (Bytes::from(bytes), timing)
+                })
             })
             .await
             .map_err(|e| format!("media prefetch: {e}"))?
-            .map(Bytes::from)
         }
     }))
-    .await
+    .await?;
+    let (bytes, downloads): (Vec<_>, Vec<_>) = fetched.into_iter().unzip();
+    Ok((
+        bytes,
+        MmPrefetchStats {
+            load_wall: started.elapsed(),
+            downloads: downloads.into_iter().flatten().collect(),
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::message::multimodal::MmItem;
+    use crate::message::request::MmData;
+
+    #[derive(Debug, Default)]
+    struct FetchObserver(std::sync::Mutex<Vec<(String, bool, std::time::Duration)>>);
+
+    impl HttpExtension for FetchObserver {
+        fn apply(&self, router: axum::Router) -> axum::Router {
+            router
+        }
+
+        fn observe_media_fetch(
+            &self,
+            modality: &str,
+            succeeded: bool,
+            elapsed: std::time::Duration,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((modality.into(), succeeded, elapsed));
+        }
+    }
+
+    async fn fetch_for_test(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Bytes>, String> {
+        super::fetch_ordered(
+            sources
+                .into_iter()
+                .map(|source| (source, "image"))
+                .collect(),
+            total_bytes,
+            None,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
 
     fn src(s: impl Into<String>) -> MmItem {
         MmItem::Source(s.into())
@@ -181,7 +265,9 @@ mod tests {
             })),
             ..Default::default()
         }];
-        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
+        prefetch_all(&mut requests, &BTreeMap::new(), None)
+            .await
+            .unwrap();
         std::fs::remove_dir_all(base).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         assert_eq!(
@@ -194,7 +280,7 @@ mod tests {
     /// order; CPU-only sources and mm-free requests are untouched.
     #[tokio::test]
     async fn resolves_io_sources() {
-        let addr = serve(vec![b"one".to_vec(), b"two".to_vec()]);
+        let addr = serve(vec![b"one".to_vec(), b"second".to_vec()]);
         let path = std::env::temp_dir().join(format!("sglang-prefetch-{}", std::process::id()));
         std::fs::write(&path, b"zzz").unwrap();
         let mut requests = vec![
@@ -206,25 +292,63 @@ mod tests {
             ]),
             GenerateRequest::default(),
         ];
-        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
+        let observer = Arc::new(FetchObserver::default());
+        let extension: Arc<dyn HttpExtension> = observer.clone();
+        prefetch_all(&mut requests, &BTreeMap::new(), Some(&extension))
+            .await
+            .unwrap();
         std::fs::remove_file(&path).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         // The one-shot server answers in accept order, so contents may swap
         // between the two URLs; all three bodies must arrive.
         let mut got: Vec<&[u8]> = fetched.iter().map(|b| b.as_ref()).collect();
         got.sort();
-        assert_eq!(got, vec![b"one".as_ref(), b"two".as_ref(), b"zzz".as_ref()]);
+        assert_eq!(
+            got,
+            vec![b"one".as_ref(), b"second".as_ref(), b"zzz".as_ref()]
+        );
+        let stats = &requests[0].mm.as_ref().unwrap().prefetch_stats;
+        assert_eq!(stats.downloads.len(), 2);
+        for (timing, bytes) in stats.downloads.iter().zip(fetched) {
+            assert_eq!(timing.bytes, bytes.len());
+            assert!(stats.load_wall >= timing.elapsed);
+        }
+        let observations = observer.0.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .all(|(modality, success, elapsed)| modality == "image"
+                    && *success
+                    && stats.downloads.iter().any(|item| item.elapsed == *elapsed))
+        );
+        let wire = serde_json::to_value(&requests[0]).unwrap();
+        assert!(wire.get("prefetch_stats").is_none());
         assert!(requests[1].mm.is_none());
     }
 
     #[tokio::test]
     async fn failed_download_rejects() {
         let mut requests = vec![mm_request(vec![src("http://127.0.0.1:1/nope.png")])];
-        let err = prefetch_all(&mut requests, &BTreeMap::new())
+        let observer = Arc::new(FetchObserver::default());
+        let extension: Arc<dyn HttpExtension> = observer.clone();
+        let err = prefetch_all(&mut requests, &BTreeMap::new(), Some(&extension))
             .await
             .err()
             .unwrap();
         assert!(err.contains("media fetch"), "{err}");
+        let observations = observer.0.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!((&*observations[0].0, observations[0].1), ("image", false));
+        assert!(
+            requests[0]
+                .mm
+                .as_ref()
+                .unwrap()
+                .prefetch_stats
+                .downloads
+                .is_empty()
+        );
     }
 
     /// The item budget rejects before any source is touched: all of these would
@@ -235,7 +359,7 @@ mod tests {
             .map(|i| src(format!("/definitely/not/here-{i}.png")))
             .collect();
         let mut requests = vec![mm_request(sources)];
-        let err = prefetch_all(&mut requests, &BTreeMap::new())
+        let err = prefetch_all(&mut requests, &BTreeMap::new(), None)
             .await
             .err()
             .unwrap();
@@ -260,7 +384,10 @@ mod tests {
             ..Default::default()
         }];
         let limits = BTreeMap::from([("image".to_owned(), 1), ("video".to_owned(), 1)]);
-        let err = prefetch_all(&mut requests, &limits).await.err().unwrap();
+        let err = prefetch_all(&mut requests, &limits, None)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err, "Image count 2 exceeds limit 1 per request.");
         assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
     }
@@ -275,7 +402,7 @@ mod tests {
             format!("http://{addr}/b.png"),
         ];
         // Room for one body, not both.
-        let err = fetch_ordered(sources, 6144).await.err().unwrap();
+        let err = fetch_for_test(sources, 6144).await.err().unwrap();
         assert!(err.contains("request media byte budget"), "{err}");
     }
 
@@ -287,7 +414,7 @@ mod tests {
             format!("http://{addr}/a.png"),
             format!("http://{addr}/b.png"),
         ];
-        let fetched = fetch_ordered(sources, MAX_REQUEST_BYTES).await.unwrap();
+        let fetched = fetch_for_test(sources, MAX_REQUEST_BYTES).await.unwrap();
         assert_eq!(fetched.iter().map(|b| b.len()).sum::<usize>(), 8192);
     }
 
@@ -304,8 +431,8 @@ mod tests {
         std::fs::write(&second, b"second").unwrap();
 
         let sources = vec![first.display().to_string(), second.display().to_string()];
-        let fetched = fetch_ordered(sources.clone(), 11).await.unwrap();
-        let error = fetch_ordered(sources, 10).await.err().unwrap();
+        let fetched = fetch_for_test(sources.clone(), 11).await.unwrap();
+        let error = fetch_for_test(sources, 10).await.err().unwrap();
         std::fs::remove_dir_all(base).ok();
         assert_eq!(fetched.len(), 2);
         assert!(error.contains("request media byte budget"), "{error}");

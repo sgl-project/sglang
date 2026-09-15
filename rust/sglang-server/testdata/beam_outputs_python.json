@@ -1,0 +1,1556 @@
+{
+  "tokenizer_fixture": 1,
+  "vocab_size": 265,
+  "header": [
+    [
+      "ordinary",
+      "best-stop",
+      "best-length"
+    ],
+    [
+      {
+        "type": "length",
+        "length": 1
+      },
+      {
+        "type": "length",
+        "length": 3
+      },
+      {
+        "type": "length",
+        "length": 3
+      }
+    ],
+    [
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      3,
+      3
+    ],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    {
+      "reasoning_tokens": [
+        0,
+        0,
+        0
+      ],
+      "cached_tokens": [
+        0,
+        0,
+        0
+      ],
+      "retraction_counts": [
+        0,
+        0,
+        0
+      ],
+      "cached_tokens_details": [
+        null,
+        null,
+        null
+      ],
+      "dp_ranks": [
+        0,
+        0,
+        0
+      ],
+      "image_tokens": [
+        0,
+        0,
+        0
+      ],
+      "audio_tokens": [
+        0,
+        0,
+        0
+      ],
+      "video_tokens": [
+        0,
+        0,
+        0
+      ],
+      "weight_version": "beam-fixture",
+      "weight_versions": [
+        [
+          [
+            "beam-fixture",
+            0,
+            1
+          ]
+        ],
+        [
+          [
+            "beam-fixture",
+            0,
+            3
+          ]
+        ],
+        [
+          [
+            "beam-fixture",
+            0,
+            3
+          ]
+        ]
+      ],
+      "generation_tokens": [
+        1,
+        5,
+        5
+      ],
+      "spec_verify_ct": [],
+      "spec_num_correct_drafts": [],
+      "spec_num_cap_tokens": [],
+      "spec_num_block_accept_tokens": [],
+      "spec_correct_drafts_histogram": [],
+      "spec_cap_lens_histogram": [],
+      "spec_num_draft_tokens": 0,
+      "spec_ragged_verify_cap_accept": false
+    },
+    {},
+    [
+      [
+        5
+      ],
+      [
+        5
+      ],
+      [
+        5
+      ]
+    ],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [
+      null,
+      [
+        [
+          2,
+          {
+            "type": "stop",
+            "matched": 2
+          },
+          -0.125
+        ],
+        [
+          3,
+          {
+            "type": "length",
+            "length": 3
+          },
+          -0.25
+        ]
+      ],
+      [
+        [
+          3,
+          {
+            "type": "length",
+            "length": 3
+          },
+          -0.125
+        ],
+        [
+          2,
+          {
+            "type": "stop",
+            "matched": 2
+          },
+          -0.25
+        ]
+      ]
+    ]
+  ],
+  "data_b64": "AwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAACAAAABwAAAAMAAAAFAAAABwAAAAMAAAAFAAAAAwAAAAIAAAA=",
+  "requests": [
+    {
+      "body": {
+        "input_ids": [
+          5
+        ],
+        "sampling_params": {
+          "beam_width": 4,
+          "n": 2
+        }
+      },
+      "expected": [
+        {
+          "input_ids": [
+            5
+          ],
+          "beam_width": 4,
+          "n": 2
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            5
+          ],
+          [
+            3,
+            7
+          ]
+        ],
+        "sampling_params": {
+          "beam_width": 4,
+          "n": 2
+        }
+      },
+      "expected": [
+        {
+          "input_ids": [
+            5
+          ],
+          "beam_width": 4,
+          "n": 2
+        },
+        {
+          "input_ids": [
+            3,
+            7
+          ],
+          "beam_width": 4,
+          "n": 2
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          5
+        ],
+        "sampling_params": {
+          "beam_width": 1,
+          "n": 2
+        }
+      },
+      "expected": [
+        {
+          "input_ids": [
+            5
+          ],
+          "beam_width": 1,
+          "n": 2
+        },
+        {
+          "input_ids": [
+            5
+          ],
+          "beam_width": 1,
+          "n": 2
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "skip_tokenizer": false,
+      "skip_special_tokens": false,
+      "no_stop_trim": false,
+      "expected": [
+        null,
+        {
+          "text": "hello",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "中helloworld",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": false,
+      "skip_special_tokens": false,
+      "no_stop_trim": true,
+      "expected": [
+        null,
+        {
+          "text": "hello</s>",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello</s>",
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "中helloworld",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello</s>",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": false,
+      "skip_special_tokens": true,
+      "no_stop_trim": false,
+      "expected": [
+        null,
+        {
+          "text": "hello",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "中helloworld",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": false,
+      "skip_special_tokens": true,
+      "no_stop_trim": true,
+      "expected": [
+        null,
+        {
+          "text": "hello",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "中helloworld",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "text": "中helloworld",
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "text": "hello",
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": true,
+      "skip_special_tokens": false,
+      "no_stop_trim": false,
+      "expected": [
+        null,
+        {
+          "text": "",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": true,
+      "skip_special_tokens": false,
+      "no_stop_trim": true,
+      "expected": [
+        null,
+        {
+          "text": "",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": true,
+      "skip_special_tokens": true,
+      "no_stop_trim": false,
+      "expected": [
+        null,
+        {
+          "text": "",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "skip_tokenizer": true,
+      "skip_special_tokens": true,
+      "no_stop_trim": true,
+      "expected": [
+        null,
+        {
+          "text": "",
+          "output_ids": [
+            3,
+            2
+          ],
+          "meta_info": {
+            "id": "best-stop",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "stop",
+              "matched": 2
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "id": "best-stop",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        },
+        {
+          "text": "",
+          "output_ids": [
+            7,
+            3,
+            5
+          ],
+          "meta_info": {
+            "id": "best-length",
+            "prompt_tokens": 1,
+            "finish_reason": {
+              "type": "length",
+              "length": 3
+            },
+            "weight_version": "beam-fixture",
+            "reasoning_tokens": 0,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "cached_tokens_details": null,
+            "num_retractions": 0,
+            "dp_rank": 0,
+            "weight_versions": [
+              {
+                "version": "beam-fixture",
+                "start": 0,
+                "end": 3
+              }
+            ],
+            "sequence_score": -0.125,
+            "beam_results": [
+              {
+                "output_ids": [
+                  7,
+                  3,
+                  5
+                ],
+                "meta_info": {
+                  "id": "best-length",
+                  "prompt_tokens": 1,
+                  "finish_reason": {
+                    "type": "length",
+                    "length": 3
+                  },
+                  "weight_version": "beam-fixture",
+                  "reasoning_tokens": 0,
+                  "completion_tokens": 5,
+                  "cached_tokens": 0,
+                  "cached_tokens_details": null,
+                  "num_retractions": 0,
+                  "dp_rank": 0,
+                  "weight_versions": [
+                    {
+                      "version": "beam-fixture",
+                      "start": 0,
+                      "end": 3
+                    }
+                  ],
+                  "sequence_score": -0.125
+                }
+              },
+              {
+                "output_ids": [
+                  3,
+                  2
+                ],
+                "meta_info": {
+                  "finish_reason": {
+                    "type": "stop",
+                    "matched": 2
+                  },
+                  "sequence_score": -0.25
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

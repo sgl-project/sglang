@@ -19,18 +19,28 @@ use crate::utils::fsm::RequestState;
 /// control request from its constructor — so this only echoes it back.
 pub(super) async fn submit(
     state: &AppState,
-    kind: RequestKind,
+    mut kind: RequestKind,
     // `stream`: the client is reading an SSE stream, so it expects 200 plus an
     // error frame rather than a 4xx — `utils::response::error_response`'s rule.
     stream: bool,
 ) -> Result<(Rid, mpsc::Receiver<ResponseItem>), Response> {
+    if let RequestKind::Generate(request) = &mut kind {
+        if request.priority.is_none() {
+            request.priority = state.server_args.default_priority_value;
+        }
+        request.metric_state = state
+            .frontend_metrics
+            .as_ref()
+            .and_then(|metrics| crate::metrics::RequestMetrics::new(metrics.clone(), request))
+            .map(Box::new);
+    }
     let rid = match &kind {
         // Generate rids are already final: `GenerateBody::into_requests` normalized the
         // client's, or minted one. Control requests have no client-facing rid.
         RequestKind::Generate(g) => g.rid.clone(),
         RequestKind::Control(c) => c.rid().into(),
         // Internal service call — no client-facing rid; mint a fresh one.
-        RequestKind::Detokenize { .. } => Rid::new(),
+        RequestKind::Tokenize { .. } | RequestKind::Detokenize { .. } => Rid::new(),
     };
     // Two in-flight requests can name the same client rid, but they cannot share a
     // `Rid`: `into_requests` built each through `Rid::from_client`, which appends a

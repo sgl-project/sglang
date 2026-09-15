@@ -1,0 +1,291 @@
+{
+  "requests": [
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "multi_item_delimiter_indices": [
+          0,
+          3
+        ]
+      },
+      "expected": [
+        [
+          0,
+          3
+        ]
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3,
+            4
+          ],
+          [
+            5,
+            6,
+            7
+          ]
+        ],
+        "multi_item_delimiter_indices": [
+          [
+            0,
+            3
+          ],
+          [
+            1,
+            2
+          ]
+        ]
+      },
+      "expected": [
+        [
+          0,
+          3
+        ],
+        [
+          1,
+          2
+        ]
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3,
+            4
+          ],
+          [
+            5,
+            6,
+            7
+          ]
+        ],
+        "multi_item_delimiter_indices": [
+          [
+            0,
+            3
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        }
+      },
+      "expected": [
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          3
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          1,
+          2
+        ]
+      ]
+    }
+  ],
+  "field_index": 42,
+  "header": [
+    [
+      "delimiter-scores"
+    ],
+    [
+      {
+        "type": "length",
+        "length": 0
+      }
+    ],
+    [
+      6
+    ],
+    [
+      0
+    ],
+    [
+      0
+    ],
+    [
+      2
+    ],
+    [
+      0
+    ],
+    [],
+    [
+      2
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      0
+    ],
+    [],
+    [
+      2
+    ],
+    [
+      2,
+      2
+    ],
+    [],
+    [],
+    {
+      "reasoning_tokens": [
+        0
+      ],
+      "cached_tokens": [
+        0
+      ],
+      "retraction_counts": [
+        0
+      ],
+      "cached_tokens_details": [
+        null
+      ],
+      "dp_ranks": [
+        0
+      ],
+      "image_tokens": [
+        0
+      ],
+      "audio_tokens": [
+        0
+      ],
+      "video_tokens": [
+        0
+      ],
+      "weight_version": "default",
+      "weight_versions": [
+        [
+          [
+            "default",
+            0,
+            0
+          ]
+        ]
+      ],
+      "generation_tokens": [
+        0
+      ],
+      "spec_verify_ct": [],
+      "spec_num_correct_drafts": [],
+      "spec_num_cap_tokens": [],
+      "spec_num_block_accept_tokens": [],
+      "spec_correct_drafts_histogram": [],
+      "spec_cap_lens_histogram": [],
+      "spec_num_draft_tokens": 0,
+      "spec_ragged_verify_cap_accept": false
+    },
+    {},
+    [
+      [
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    ],
+    [],
+    [],
+    [],
+    [],
+    [],
+    []
+  ],
+  "data_b64": "AAAAvwAAgL4AAAAAAAAAAAAAgL4AAAC/AAAAvgAAgL4LAAAAFgAAABYAAAALAAAAAACAvgAAAL8AAIC+AAAAvgsAAAAWAAAACwAAABYAAAA=",
+  "expected": {
+    "input_token_logprobs": [
+      [
+        -0.5,
+        0,
+        null
+      ],
+      [
+        -0.25,
+        0,
+        null
+      ]
+    ],
+    "output_token_logprobs": [],
+    "output_token_logprobs_length": 0,
+    "input_top_logprobs": [
+      [
+        [
+          -0.25,
+          11,
+          null
+        ],
+        [
+          -0.5,
+          22,
+          null
+        ]
+      ],
+      [
+        [
+          -0.125,
+          22,
+          null
+        ],
+        [
+          -0.25,
+          11,
+          null
+        ]
+      ]
+    ],
+    "output_top_logprobs": [],
+    "input_token_ids_logprobs": [
+      [
+        [
+          -0.25,
+          11,
+          null
+        ],
+        [
+          -0.5,
+          22,
+          null
+        ]
+      ],
+      [
+        [
+          -0.25,
+          11,
+          null
+        ],
+        [
+          -0.125,
+          22,
+          null
+        ]
+      ]
+    ],
+    "output_token_ids_logprobs": []
+  }
+}

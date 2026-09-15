@@ -2205,10 +2205,6 @@ def _execute_server_warmup(server_args: ServerArgs):
     url = server_args.url()
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
-    if envs.SGLANG_RUST_SERVER.get():
-        # The Rust listener binds before this request so /model_info is
-        # available, but health stays 503 until this marked request succeeds.
-        headers["x-sglang-startup-warmup"] = "1"
 
     ssl_verify = ssl_verify_of(server_args)
 
@@ -2344,6 +2340,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]
+            success = not failed_status_codes
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
@@ -2802,6 +2799,7 @@ def launch_server(
     run_detokenizer_process_func: Callable = run_detokenizer_process,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    rust_server_class=None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -2818,42 +2816,77 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-        _weight_cache_daemon_procs,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
+    from contextlib import nullcontext
 
-    if envs.SGLANG_RUST_SERVER.get():
-        # The Rust server serves api-server, tokenizer, and detokenizer, so the
-        # main process has no Python HTTP server / tokenizer manager to run.
-        # Run a warmup /generate before advertising readiness: the Rust /health
-        # and /get_model_info endpoints are static (200 as soon as the server
-        # binds, before any forward pass), so without this the first real request
-        # pays the cold-start cost (observed as a >60s first generation).
-        if not get_serving().skip_server_warmup:
-            _execute_server_warmup(server_args)
-        logger.info("The server is fired up and ready to roll!")
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
-    else:
-        _setup_and_run_http_server(
-            server_args,
+    from sglang.srt.rust_server.disaggregation import bootstrap_service
+    from sglang.srt.rust_server.metrics import MetricsExporter
+    from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
+
+    startup_tic = time.perf_counter()
+    cfg = resolving_view(server_args)
+    metrics = (
+        MetricsExporter(host=get_local_ip_auto() if cfg.nnodes > 1 else "127.0.0.1")
+        if envs.SGLANG_RUST_SERVER.get() and cfg.enable_metrics
+        else nullcontext()
+    )
+    with metrics as metrics_exporter, bootstrap_service(server_args):
+        # Launch subprocesses
+        (
             tokenizer_manager,
             template_manager,
             port_args,
-            scheduler_init_result.scheduler_infos,
+            scheduler_init_result,
             subprocess_watchdog,
-            execute_warmup_func=execute_warmup_func,
-            launch_callback=launch_callback,
+            _weight_cache_daemon_procs,
+        ) = Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+            defer_rust_readiness=True,
         )
+
+        if envs.SGLANG_RUST_SERVER.get():
+            # The Rust server serves api-server, tokenizer, and detokenizer, so the
+            # main process has no Python HTTP server / tokenizer manager to run.
+            # Discovery and generation remain available for warmup while health
+            # stays unavailable until every native frontend acknowledges it.
+            from sglang.srt.rust_server.readiness import publish_frontend_ready
+
+            if rust_server_class is None:
+                from sglang.srt.rust_server.server import RustServer
+
+                rust_server_class = RustServer
+            with rust_server_class.dp_ingress(
+                server_args, scheduler_init_result.scheduler_infos
+            ) as ingress:
+                if metrics_exporter is not None:
+                    host = {"::": "::1", "0.0.0.0": "127.0.0.1"}.get(cfg.host, cfg.host)
+                    metrics_exporter.configure(
+                        scheduler_init_result.scheduler_infos,
+                        (
+                            NetworkAddress(host, ingress.http_port).to_url()
+                            if ingress is not None
+                            else None
+                        ),
+                        tokenizer_e2e=time.perf_counter() - startup_tic,
+                    )
+                if not get_serving().skip_server_warmup:
+                    if execute_warmup_func(server_args) is False:
+                        raise RuntimeError("Rust frontend warmup failed")
+                publish_frontend_ready(server_args, port_args)
+                logger.info("The server is fired up and ready to roll!")
+                if launch_callback is not None:
+                    launch_callback()
+                scheduler_init_result.block_until_scheduler_exits()
+        else:
+            _setup_and_run_http_server(
+                server_args,
+                tokenizer_manager,
+                template_manager,
+                port_args,
+                scheduler_init_result.scheduler_infos,
+                subprocess_watchdog,
+                execute_warmup_func=execute_warmup_func,
+                launch_callback=launch_callback,
+            )

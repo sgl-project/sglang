@@ -1,7 +1,7 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. Native [`ChunkEvent`] values remain the one
+//! request and response primitives. Scheduler [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};
@@ -11,12 +11,15 @@ use tokio::sync::mpsc;
 
 mod chat;
 mod completions;
+mod extensions;
 mod models;
 mod reasoning;
+mod responses;
 mod template;
 mod template_builtins;
 mod template_legacy;
 mod template_loader;
+mod tokenize;
 mod tools;
 
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
@@ -40,6 +43,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(tokenize::routes())
 }
 
 /// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
@@ -114,14 +118,72 @@ pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> ser
 /// Form an OpenAI error response: unary → `code` plus the JSON `body`,
 /// streaming → 200 with one SSE error frame + `[DONE]`.
 pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
-    error_response(code, error_payload(code, message), stream)
+    let mut payload = error_payload(code, message);
+    // Python's legacy completion endpoints use a flat unary ErrorResponse;
+    // committed SSE errors keep the enclosing `error` field.
+    if !stream {
+        payload = payload["error"].take();
+    }
+    error_response(code, payload, stream)
+}
+
+pub(super) struct ResponseReceiver {
+    rx: mpsc::Receiver<ResponseItem>,
+    first: Option<ResponseItem>,
+}
+
+impl From<mpsc::Receiver<ResponseItem>> for ResponseReceiver {
+    fn from(rx: mpsc::Receiver<ResponseItem>) -> Self {
+        Self { rx, first: None }
+    }
+}
+
+impl ResponseReceiver {
+    async fn recv(&mut self) -> Option<ResponseItem> {
+        if self.first.is_some() {
+            self.first.take()
+        } else {
+            self.rx.recv().await
+        }
+    }
+
+    async fn prime(&mut self) -> Result<(), (StatusCode, String)> {
+        loop {
+            match self.rx.recv().await {
+                Some(ResponseItem::Error(error)) => {
+                    return Err((
+                        StatusCode::from_u16(error.http_status())
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        error.to_string(),
+                    ));
+                }
+                Some(
+                    ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::Tokenized(_),
+                ) => {}
+                item => {
+                    self.first = item;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Python advances the generator once before committing HTTP 200. Prime the
+/// first ready choice without serializing parallel generation or losing a frame.
+async fn prime_stream<'a>(
+    receivers: impl Iterator<Item = &'a mut ResponseReceiver>,
+) -> Result<(), (usize, StatusCode, String)> {
+    let pending: Vec<_> = receivers.map(|rx| Box::pin(rx.prime())).collect();
+    let (result, index, _) = futures::future::select_all(pending).await;
+    result.map_err(|(status, message)| (index, status, message))
 }
 
 /// Drain one submitted request to its terminal output: fold frames, disarm
 /// `guard` on a natural terminal, and map errors / validation aborts /
 /// truncation to `(status, message)` for the OpenAI error shape.
 async fn collect_output(
-    mut rx: mpsc::Receiver<ResponseItem>,
+    mut rx: ResponseReceiver,
     guard: &mut AbortGuard,
     rid: &Rid,
 ) -> Result<ChunkEvent, (StatusCode, String)> {
@@ -139,7 +201,9 @@ async fn collect_output(
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return Err((status, error.to_string()));
             }
-            Some(ResponseItem::Control(_)) | Some(ResponseItem::Data(_)) => {}
+            Some(ResponseItem::Control(_))
+            | Some(ResponseItem::Data(_))
+            | Some(ResponseItem::Tokenized(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -164,14 +228,42 @@ async fn collect_output(
 
 async fn submit_generation(
     state: &AppState,
-    request: GenerateRequest,
+    mut request: GenerateRequest,
     stream: bool,
     guard: &mut AbortGuard,
-) -> Result<mpsc::Receiver<ResponseItem>, Response> {
+) -> Result<ResponseReceiver, Response> {
+    if let Some(metadata) = state
+        .http_extension
+        .as_ref()
+        .and_then(|extension| extension.initial_response_metadata())
+    {
+        request
+            .response_metadata
+            .get_or_insert_default()
+            .extend(metadata);
+    }
+    let limits = &state.server_args.limit_mm_data_per_request;
+    if let Err(error) = super::prefetch::validate_limits(std::slice::from_ref(&request), limits) {
+        return Err(openai_error(StatusCode::BAD_REQUEST, error, false));
+    }
+    if let Some(extension) = &state.http_extension
+        && let Err(error) = extension.prepare_request(&mut request).await
+    {
+        return Err(openai_error(StatusCode::BAD_REQUEST, error, false));
+    }
+    if let Err(error) = super::prefetch::prefetch_all(
+        std::slice::from_mut(&mut request),
+        limits,
+        state.http_extension.as_ref(),
+    )
+    .await
+    {
+        return Err(openai_error(StatusCode::BAD_REQUEST, error, false));
+    }
     match submit(state, RequestKind::Generate(Box::new(request)), stream).await {
         Ok((rid, rx)) => {
             guard.arm(rid);
-            Ok(rx)
+            Ok(rx.into())
         }
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
@@ -186,7 +278,7 @@ async fn submit_generation(
 
 fn indexed_decode_stream(
     index: usize,
-    rx: mpsc::Receiver<ResponseItem>,
+    rx: ResponseReceiver,
 ) -> futures::stream::BoxStream<'static, (usize, Option<ResponseItem>)> {
     futures::stream::unfold((rx, false), move |(mut rx, finished)| async move {
         if finished {

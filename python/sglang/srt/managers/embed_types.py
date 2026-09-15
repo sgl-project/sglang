@@ -56,3 +56,44 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
                 f"embeds length ({self.embeds.shape[0]}) != "
                 f"positions length ({len(self.positions)})"
             )
+
+    @classmethod
+    def from_json(cls, value: dict) -> "PositionalEmbeds":
+        """Materialize HTTP rows as an owned CPU tensor, matching Rust's EXT 2 wire."""
+        rows, positions = value.get("embeds"), value.get("positions")
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or not all(isinstance(row, list) and row for row in rows)
+            or any(len(row) != len(rows[0]) for row in rows)
+            or any(type(item) not in (int, float) for row in rows for item in row)
+            or not isinstance(positions, list)
+            or any(type(position) is not int for position in positions)
+        ):
+            raise ValueError(
+                "positional_embed_overrides requires a nonempty numeric embeds "
+                "matrix and an integer positions list"
+            )
+        tensor = torch.tensor(rows, dtype=torch.float32, device="cpu")
+        if not torch.isfinite(tensor).all():
+            raise ValueError("positional_embed_overrides embeds must be finite")
+        return cls(tensor, positions)
+
+    def validate(self, input_len: int, hidden_size: int) -> None:
+        """Validate positions after tokenization, media expansion, and truncation."""
+        if (
+            self.embeds.ndim != 2
+            or self.embeds.shape != (len(self.positions), hidden_size)
+            or not torch.isfinite(self.embeds).all()
+        ):
+            raise ValueError(
+                "positional_embed_overrides must have one embedding with "
+                f"{hidden_size} finite values per position"
+            )
+        if any(
+            type(position) is not int or not 0 <= position < input_len
+            for position in self.positions
+        ):
+            raise ValueError(
+                f"positional_embed_overrides positions must be in [0, {input_len})"
+            )

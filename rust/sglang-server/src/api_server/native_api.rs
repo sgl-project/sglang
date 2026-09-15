@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -41,15 +41,16 @@ use crate::utils::{
 
 /// API-local timing for one request.
 ///
-/// Python records time-to-first-token on the first output batch and end-to-end
-/// latency when that request finishes. Keep both measurements here even though
-/// `/generate` currently exposes only `e2e_latency`; this avoids putting
-/// API-only timestamps onto scheduler messages.
+/// Python records first output, completion, and first HTTP delivery separately.
+/// Durations use a monotonic clock; public timestamps share its wall-clock anchor.
 #[derive(Clone, Debug)]
 struct RequestTiming {
-    // TODO: Move request lifecycle timing into a dedicated tracing/metrics
-    // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
+    wall_created: f64,
+    received_age: f64,
+    created_is_positive: bool,
+    detailed: bool,
+    response_sent_ts: Option<f64>,
     time_to_first_token: Option<Duration>,
     e2e_latency: Option<Duration>,
 }
@@ -58,8 +59,32 @@ impl RequestTiming {
     fn new() -> Self {
         Self {
             created_at: Instant::now(),
+            wall_created: crate::metrics::realtime_seconds(),
+            received_age: 0.,
+            created_is_positive: true,
+            detailed: false,
+            response_sent_ts: None,
             time_to_first_token: None,
             e2e_latency: None,
+        }
+    }
+
+    fn with_options(mut self, detailed: bool, received_time: Option<f64>) -> Result<Self, String> {
+        self.detailed = detailed;
+        if let Some(received) = received_time.filter(|value| *value != 0.) {
+            self.received_age = crate::metrics::monotonic_seconds()?
+                - self.created_at.elapsed().as_secs_f64()
+                - received;
+            self.created_is_positive = received > 0.;
+        }
+        Ok(self)
+    }
+
+    fn mark_response_sent(&mut self, value: &mut serde_json::Value) {
+        if self.response_sent_ts.is_none() {
+            let timestamp = self.wall_created + self.created_at.elapsed().as_secs_f64();
+            self.response_sent_ts = Some(timestamp);
+            value["meta_info"]["response_sent_to_client_ts"] = timestamp.into();
         }
     }
 
@@ -81,7 +106,7 @@ impl RequestTiming {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        .route("/generate", post(generate).put(generate))
         .merge(health_routes())
 }
 
@@ -96,14 +121,23 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// restart. The deep-probe handler is built once with
 /// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
-/// Python) decides whether `/health` shares it or, after startup warmup, is a
-/// plain 200 (routing the request proves the frontend is up).
+/// Python) decides whether `/health` shares it or only checks startup readiness.
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
     );
+    health_routes_with_settings(
+        timeout,
+        environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true),
+    )
+}
+
+fn health_routes_with_settings(
+    timeout: std::time::Duration,
+    generate: bool,
+) -> Router<Arc<AppState>> {
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout));
-    let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+    let health = if generate {
         probe.clone()
     } else {
         get(health_without_generation)
@@ -114,7 +148,10 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.startup_readiness.is_ready() {
+    if state
+        .startup_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -140,10 +177,12 @@ async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,
 ) -> Response {
-    if !state.startup_readiness.is_ready() {
+    if !state
+        .startup_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-
     let baseline = state
         .response_activity
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -166,6 +205,7 @@ async fn health_generate(
             ..Default::default()
         },
         stream: false,
+        log_metrics: Some(false),
         bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
         bootstrap_room: pd.then_some(0),
         ..Default::default()
@@ -207,6 +247,7 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
     let mut body = match body {
@@ -218,7 +259,26 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
+    if state.server_args.enable_request_header_overrides
+        && let Err(detail) = super::headers::apply_overrides(&mut body, &headers)
+    {
+        // Python raises HTTPException before entering the SSE generator.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"detail": detail})),
+        )
+            .into_response();
+    }
     let stream = body.stream;
+    if let Some(rank) = body.routed_dp_rank.or(body.data_parallel_rank)
+        && (rank < 0 || rank as u64 >= state.server_args.dp_size as u64)
+    {
+        return native_error(
+            StatusCode::BAD_REQUEST,
+            "routed_dp_rank is out of range",
+            stream,
+        );
+    }
     if let Some(preferred) = &state.server_args.preferred_sampling_params
         && let Err(error) = body.apply_preferred_sampling(&preferred.0)
     {
@@ -242,12 +302,41 @@ async fn generate(
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
-    let timing = RequestTiming::new();
+    let timing = match RequestTiming::new().with_options(
+        state.server_args.enable_metrics,
+        payloads.first().and_then(|request| request.received_time),
+    ) {
+        Ok(timing) => timing,
+        Err(error) => return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, stream),
+    };
+    for request in &mut payloads {
+        request.started = Some(timing.created_at);
+    }
+    if let Some(extension) = &state.http_extension {
+        if let Err(error) = super::prefetch::validate_limits(
+            &payloads,
+            &state.server_args.limit_mm_data_per_request,
+        ) {
+            return native_error(StatusCode::BAD_REQUEST, &error, stream);
+        }
+        let prepared = futures::future::try_join_all(
+            payloads
+                .iter_mut()
+                .map(|request| extension.prepare_request(request)),
+        )
+        .await;
+        if let Err(error) = prepared {
+            return native_error(StatusCode::BAD_REQUEST, &error, stream);
+        }
+    }
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
-    if let Err(e) =
-        super::prefetch::prefetch_all(&mut payloads, &state.server_args.limit_mm_data_per_request)
-            .await
+    if let Err(e) = super::prefetch::prefetch_all(
+        &mut payloads,
+        &state.server_args.limit_mm_data_per_request,
+        state.http_extension.as_ref(),
+    )
+    .await
     {
         return native_error(StatusCode::BAD_REQUEST, &e, stream);
     }
@@ -270,10 +359,15 @@ async fn generate(
 /// SSE frames or fold to one unary response.
 async fn generate_single(
     state: &AppState,
-    req: GenerateRequest,
+    mut req: GenerateRequest,
     stream: bool,
     timing: RequestTiming,
 ) -> Response {
+    let metadata = req.response_metadata.take();
+    let mut initial_metadata = state
+        .http_extension
+        .as_ref()
+        .and_then(|extension| extension.initial_response_metadata());
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
     let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
@@ -292,15 +386,30 @@ async fn generate_single(
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx, timing)], guard, incremental, false)
-            .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
+        let s = generation_event_stream(
+            vec![GenerationResponse {
+                rid: rid_str,
+                rx,
+                timing,
+                metadata,
+                initial_metadata,
+            }],
+            guard,
+            incremental,
+            false,
+        )
+        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing(), timing).await;
+        let (status, mut value, terminal) =
+            drain_unary(&mut rx, rid_str.client_facing(), timing, metadata.as_ref()).await;
         if terminal {
             guard.disarm(&rid_str);
+        }
+        if status.is_success() {
+            annotate_initial_value(&mut value, &mut initial_metadata);
         }
         (status, Json(value)).into_response()
     }
@@ -312,6 +421,7 @@ async fn drain_unary(
     rx: &mut mpsc::Receiver<ResponseItem>,
     rid_str: &str,
     mut timing: RequestTiming,
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
@@ -336,7 +446,9 @@ async fn drain_unary(
                     return (status, error_value(code, message), true);
                 }
                 let mut value = frame_value(&final_out, rid_str);
+                add_response_metadata(&mut value, metadata);
                 add_e2e_latency(&mut value, &timing);
+                timing.mark_response_sent(&mut value);
                 return (StatusCode::OK, value, true);
             }
             ResponseItem::Error(e) => {
@@ -346,7 +458,9 @@ async fn drain_unary(
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
             }
-            ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
+            ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::Tokenized(_) => {
+                continue;
+            } // never on `/generate`
         }
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
@@ -375,11 +489,21 @@ async fn generate_batch(
     // every other in-flight request.
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
-    for req in requests {
+    for mut req in requests {
+        let metadata = req.response_metadata.take();
         match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((rid, rx)) => {
                 guard.arm(rid.clone());
-                receivers.push((rid, rx, timing.clone()));
+                receivers.push(GenerationResponse {
+                    rid,
+                    rx,
+                    timing: timing.clone(),
+                    initial_metadata: state
+                        .http_extension
+                        .as_ref()
+                        .and_then(|extension| extension.initial_response_metadata()),
+                    metadata,
+                });
             }
             Err(resp) => return resp,
         }
@@ -398,10 +522,19 @@ async fn generate_batch(
         // preserves input order for the final JSON array, while each drain observes
         // its own terminal output promptly (important for per-item e2e_latency).
         let drained = futures::future::join_all(receivers.into_iter().map(
-            |(rid_str, mut rx, request_timing)| async move {
+            |GenerationResponse {
+                 rid: rid_str,
+                 mut rx,
+                 timing: request_timing,
+                 metadata,
+                 mut initial_metadata,
+             }| async move {
                 let client_rid = rid_str.client_facing().to_owned();
-                let (_status, value, terminal) =
-                    drain_unary(&mut rx, &client_rid, request_timing).await;
+                let (status, mut value, terminal) =
+                    drain_unary(&mut rx, &client_rid, request_timing, metadata.as_ref()).await;
+                if status.is_success() {
+                    annotate_initial_value(&mut value, &mut initial_metadata);
+                }
                 (rid_str, value, terminal)
             },
         ))
@@ -435,11 +568,19 @@ async fn recv_indexed(
     (index, rx, items)
 }
 
-/// Multiplex `receivers` (one per request) into SSE `data` strings + a final `[DONE]`;
-/// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
-/// `guard` aborts unfinished on drop.
+/// Per-request HTTP state stays outside the scheduler's per-token messages.
+struct GenerationResponse {
+    rid: Rid,
+    rx: mpsc::Receiver<ResponseItem>,
+    timing: RequestTiming,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    initial_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Multiplex receivers into SSE frames followed by `[DONE]`. Batch frames carry
+/// their input index; the guard aborts unfinished requests on disconnect.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<ResponseItem>, RequestTiming)>,
+    receivers: Vec<GenerationResponse>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -450,11 +591,11 @@ fn generation_event_stream(
         let n = receivers.len();
         let rid_strs: Vec<Rid> = receivers
             .iter()
-            .map(|(rid, _, _)| rid.clone())
+            .map(|response| response.rid.clone())
             .collect();
         let mut timings: Vec<RequestTiming> = receivers
             .iter()
-            .map(|(_, _, timing)| timing.clone())
+            .map(|response| response.timing.clone())
             .collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
@@ -465,8 +606,12 @@ fn generation_event_stream(
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
         let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, (_, rx, _)) in receivers.into_iter().enumerate() {
-            futs.push(recv_indexed(i, rx));
+        let mut metadata = Vec::with_capacity(n);
+        let mut initial_metadata = Vec::with_capacity(n);
+        for (i, response) in receivers.into_iter().enumerate() {
+            metadata.push(response.metadata);
+            initial_metadata.push(response.initial_metadata);
+            futs.push(recv_indexed(i, response.rx));
         }
 
         while let Some((i, rx, items)) = futs.next().await {
@@ -489,7 +634,7 @@ fn generation_event_stream(
                         timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
-                            yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
+                            yield annotate_initial_frame(stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i)), &mut initial_metadata[i], &mut timings[i]);
                         } else {
                             coalesced = true;
                         }
@@ -504,7 +649,7 @@ fn generation_event_stream(
                         timings[i].finish();
                         failed = Some(e);
                     }
-                    ResponseItem::Control(_) | ResponseItem::Data(_) => {} // never on /generate
+                    ResponseItem::Control(_) | ResponseItem::Data(_) | ResponseItem::Tokenized(_) => {} // never on /generate
                 }
             }
 
@@ -516,19 +661,23 @@ fn generation_event_stream(
                 // carries the full cumulative state, so any coalesced ones are moot.
                 yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
                     Some((code, message)) => tag_value(error_value(code, message), idx(i)),
-                    None => terminal_stream_frame_string(
-                        out,
-                        &accs[i],
-                        incremental,
-                        rid_strs[i].client_facing(),
-                        idx(i),
-                        &timings[i],
-                    ),
+                    None => {
+                        let frame = terminal_stream_frame_string(
+                            out,
+                            &accs[i],
+                            incremental,
+                            rid_strs[i].client_facing(),
+                            idx(i),
+                            &timings[i],
+                            metadata[i].as_ref(),
+                        );
+                        annotate_initial_frame(frame, &mut initial_metadata[i], &mut timings[i])
+                    }
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
                 if coalesced {
-                    yield cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i));
+                    yield annotate_initial_frame(cumulative_frame_string(&accs[i], rid_strs[i].client_facing(), idx(i)), &mut initial_metadata[i], &mut timings[i]);
                 }
                 futs.push(recv_indexed(i, rx)); // keep this item flowing
             }
@@ -546,7 +695,63 @@ fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
         .terminal_latencies()
         .expect("a successful terminal output has complete request timing");
     debug_assert!(time_to_first_token <= e2e_latency);
-    value["meta_info"]["e2e_latency"] = serde_json::json!(e2e_latency.as_secs_f64());
+    let metadata = &mut value["meta_info"];
+    metadata["e2e_latency"] = (e2e_latency.as_secs_f64() + timing.received_age).into();
+    if timing.detailed {
+        if timing.created_is_positive {
+            metadata["request_received_ts"] = (timing.wall_created - timing.received_age).into();
+            let latency = time_to_first_token.as_secs_f64() + timing.received_age;
+            if latency > 0. {
+                metadata["first_token_latency"] = latency.into();
+            }
+        }
+        metadata["request_finished_ts"] = (timing.wall_created + e2e_latency.as_secs_f64()).into();
+        if let Some(timestamp) = timing.response_sent_ts {
+            metadata["response_sent_to_client_ts"] = timestamp.into();
+        }
+        let decode_latency = (e2e_latency - time_to_first_token).as_secs_f64();
+        if decode_latency > 0.
+            && let Some(tokens) = metadata["completion_tokens"]
+                .as_u64()
+                .filter(|tokens| *tokens > 1)
+        {
+            metadata["decode_throughput"] = ((tokens - 1) as f64 / decode_latency).into();
+        }
+    }
+}
+
+fn annotate_initial_value(
+    value: &mut serde_json::Value,
+    metadata: &mut Option<serde_json::Map<String, serde_json::Value>>,
+) {
+    if let Some(metadata) = metadata.take()
+        && let Some(fields) = value.as_object_mut()
+    {
+        fields.extend(metadata);
+    }
+}
+
+fn annotate_initial_frame(
+    frame: String,
+    metadata: &mut Option<serde_json::Map<String, serde_json::Value>>,
+    timing: &mut RequestTiming,
+) -> String {
+    if metadata.is_none() && timing.response_sent_ts.is_some() {
+        return frame;
+    }
+    let mut value = serde_json::from_str(&frame).expect("native frame is serialized JSON");
+    annotate_initial_value(&mut value, metadata);
+    timing.mark_response_sent(&mut value);
+    value.to_string()
+}
+
+fn add_response_metadata(
+    value: &mut serde_json::Value,
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+) {
+    if let (Some(target), Some(metadata)) = (value["meta_info"].as_object_mut(), metadata) {
+        target.extend(metadata.clone());
+    }
 }
 
 /// Render a terminal streaming frame. Intermediate cumulative frames keep the
@@ -559,8 +764,10 @@ fn terminal_stream_frame_string(
     rid_str: &str,
     index: Option<usize>,
     timing: &RequestTiming,
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> String {
     let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str);
+    add_response_metadata(&mut value, metadata);
     add_e2e_latency(&mut value, timing);
     tag_value(value, index)
 }
@@ -573,10 +780,549 @@ mod tests {
     use crate::utils::error::Error;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[test]
+    fn timing_metadata_matches_python_clocks_and_scheduler_frames() {
+        use crate::message::response::{BatchHeader, for_each_chunk, frame_decode_batch_cols};
+        use base64::Engine;
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/timing_stats_python.json")).unwrap();
+        let epoch = fixture["epoch"].as_f64().unwrap();
+        for case in fixture["api"].as_array().unwrap() {
+            let times = &case["times"];
+            let created = times["created_time"].as_f64().unwrap();
+            let first = times["first_token_time"].as_f64().unwrap();
+            let finished = times["finished_time"].as_f64().unwrap();
+            let sent = times["response_sent_to_client_time"].as_f64().unwrap();
+            for age in [-0.25, 0., 0.25] {
+                let elapsed = Duration::from_secs_f64(finished - created - age);
+                let mut timing = RequestTiming {
+                    created_at: Instant::now() - elapsed,
+                    wall_created: epoch + created + age,
+                    received_age: age,
+                    detailed: true,
+                    response_sent_ts: (sent > 0.).then_some(epoch + sent),
+                    time_to_first_token: Some(Duration::from_secs_f64(first - created - age)),
+                    e2e_latency: Some(elapsed),
+                    ..RequestTiming::new()
+                };
+                let mut value = serde_json::json!({"meta_info":{
+                    "completion_tokens": case["tokens"],
+                    "api_server_dispatch_finish_ts": epoch + times["api_server_dispatch_finish_time"].as_f64().unwrap(),
+                }});
+                add_e2e_latency(&mut value, &timing);
+                value["meta_info"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("completion_tokens");
+                assert_eq!(value["meta_info"], case["expected"], "age={age} {case}");
+                timing.mark_response_sent(&mut value);
+                let timestamp = value["meta_info"]["response_sent_to_client_ts"]
+                    .as_f64()
+                    .unwrap();
+                assert!(timestamp >= epoch + if sent > 0. { sent } else { finished });
+                timing.mark_response_sent(&mut value);
+                assert_eq!(value["meta_info"]["response_sent_to_client_ts"], timestamp);
+            }
+        }
+        for case in fixture["scheduler"].as_array().unwrap() {
+            let header = rmp_serde::to_vec(&case["header"]).unwrap();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(case["data_b64"].as_str().unwrap())
+                .unwrap();
+            let frame = frame_decode_batch_cols(&header, &[&data]);
+            let mut outputs = Vec::new();
+            assert!(for_each_chunk(&frame[1..], |event| outputs.push(event)).ok);
+            assert_eq!(outputs.len(), case["expected"].as_array().unwrap().len());
+            for (out, expected) in outputs.iter().zip(case["expected"].as_array().unwrap()) {
+                let mut accumulator = OutputAccumulator::default();
+                accumulator.fold(out);
+                for incremental in [false, true] {
+                    let value = super::super::frame::stream_frame_value(
+                        out.clone(),
+                        &accumulator,
+                        incremental,
+                        out.rid.as_str(),
+                    );
+                    for key in ["queue_time", "forward_entry_time", "prefill_finished_time"] {
+                        assert_eq!(value["meta_info"].get(key), expected.get(key), "{case}");
+                    }
+                }
+            }
+            let mut header: BatchHeader = rmp_serde::from_slice(&header).unwrap();
+            if case["enabled"].as_bool().unwrap() {
+                header.time_metadata.pop();
+                let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&header).unwrap(), &[&data]);
+                assert!(
+                    !for_each_chunk(&frame[1..], |_| panic!("partial timing batch delivered")).ok
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_waits_for_parent_warmup_without_blocking_discovery_or_generation() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for probe_enabled in [false, true] {
+            let (tx, rx) = flume::unbounded();
+            let mut senders = senders();
+            senders.tok_manager_tx = tx;
+            let state = Arc::new(AppState {
+                senders,
+                response_buf: 8,
+                server_args: Arc::new(crate::ServerArgs::default()),
+                chat_formatter: None,
+                http_extension: None,
+                response_activity: Default::default(),
+                startup_ready: Arc::new(false.into()),
+                frontend_metrics: None,
+            });
+            let app = health_routes_with_settings(Duration::from_secs(1), probe_enabled)
+                .merge(super::super::common::routes())
+                .route("/generate", post(generate))
+                .with_state(state.clone());
+            for path in ["/health", "/health_generate"] {
+                let response = app
+                    .clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(rx.is_empty(), "starting health submitted a GPU probe");
+            }
+            let response = app
+                .clone()
+                .oneshot(Request::get("/model_info").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            for failed in [true, false] {
+                let warmup = tokio::spawn(
+                    app.clone().oneshot(
+                        Request::post("/generate")
+                            .header("content-type", "application/json")
+                            .header("x-sglang-startup-warmup", "1")
+                            .body(Body::from(
+                                r#"{"input_ids":[4],"sampling_params":{"max_new_tokens":1}}"#,
+                            ))
+                            .unwrap(),
+                    ),
+                );
+                let crate::tokenizer_manager::wiring::TmEvent::Intake(request) =
+                    rx.recv_async().await.unwrap()
+                else {
+                    panic!("warmup intake")
+                };
+                let output = if failed {
+                    ResponseItem::Error(crate::utils::error::Error::Internal(
+                        "warmup failed".into(),
+                    ))
+                } else {
+                    ResponseItem::Done(ChunkEvent {
+                        rid: request.rid.clone(),
+                        text: "warmup".into(),
+                        ..Default::default()
+                    })
+                };
+                request.sink.try_send(output).unwrap();
+                let response = warmup.await.unwrap().unwrap();
+                assert_eq!(
+                    response.status(),
+                    if failed {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    },
+                );
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                if !failed {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["text"],
+                        "warmup"
+                    );
+                }
+                assert!(
+                    !state
+                        .startup_ready
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+                for path in ["/health", "/health_generate"] {
+                    let response = app
+                        .clone()
+                        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert!(rx.is_empty(), "warmup health submitted a GPU probe");
+                }
+            }
+            state
+                .startup_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            for path in ["/health", "/health_generate"] {
+                let response = tokio::spawn(
+                    app.clone()
+                        .oneshot(Request::get(path).body(Body::empty()).unwrap()),
+                );
+                if probe_enabled || path == "/health_generate" {
+                    let crate::tokenizer_manager::wiring::TmEvent::Intake(request) =
+                        rx.recv_async().await.unwrap()
+                    else {
+                        panic!("health intake")
+                    };
+                    let RequestKind::Generate(request) = request.kind else {
+                        panic!("health generation")
+                    };
+                    assert_eq!(request.log_metrics, Some(false));
+                    state
+                        .response_activity
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+                assert!(rx.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_generate_honors_header_gate_and_rejects_invalid_headers_before_streaming() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for enabled in [false, true] {
+            let (tx, rx) = flume::unbounded();
+            let mut senders = senders();
+            senders.tok_manager_tx = tx;
+            let state = Arc::new(AppState {
+                senders,
+                response_buf: 8,
+                server_args: Arc::new(crate::ServerArgs {
+                    enable_request_header_overrides: enabled,
+                    default_priority_value: Some(0),
+                    ..Default::default()
+                }),
+                chat_formatter: None,
+                http_extension: None,
+                response_activity: Default::default(),
+                startup_ready: Arc::new(true.into()),
+                frontend_metrics: None,
+            });
+            let app = routes().with_state(state);
+            let scheduler = tokio::spawn(async move {
+                for expected_priority in [if enabled { -5 } else { 3 }, 0] {
+                    let crate::tokenizer_manager::wiring::TmEvent::Intake(request) =
+                        rx.recv_async().await.unwrap()
+                    else {
+                        panic!("intake")
+                    };
+                    let RequestKind::Generate(payload) = &request.kind else {
+                        panic!("generate")
+                    };
+                    assert_eq!(payload.priority, Some(expected_priority));
+                    if expected_priority != 0 {
+                        assert_eq!(
+                            payload.rid.client_facing(),
+                            if enabled { "header" } else { "body" }
+                        );
+                    }
+                    request.sink.try_send(done(0, "ok")).unwrap();
+                }
+            });
+            for body in [
+                r#"{"text":"hi","rid":"body","priority":3}"#,
+                r#"{"text":"hi"}"#,
+            ] {
+                let mut request = Request::builder()
+                    .method("PUT")
+                    .uri("/generate")
+                    .header("content-type", "application/json");
+                if body.contains("priority") {
+                    request = request
+                        .header("X-Override-Rid", "header")
+                        .header("x-override-priority", "-5");
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            scheduler.await.unwrap();
+            if enabled {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/generate")
+                            .header("content-type", "application/json")
+                            .header("x-override-bootstrap-room", "invalid")
+                            .body(Body::from(r#"{"text":"hi","stream":true}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.headers()["content-type"], "application/json");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                assert!(
+                    body["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("x-override-bootstrap-room")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_sampling_isolates_results_errors_logprobs_and_disconnects() {
+        use crate::message::response::ChunkExtras;
+        use crate::tokenizer_manager::wiring::{LifecycleEvent, TmEvent};
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for mode in ["unary", "stream", "disconnect"] {
+            let (tx, rx) = flume::unbounded();
+            let (lifecycle_tx, lifecycle_rx) = flume::unbounded();
+            let mut senders = senders();
+            senders.tok_manager_tx = tx;
+            senders.lifecycle_tx = lifecycle_tx;
+            let state = Arc::new(AppState {
+                senders,
+                response_buf: 8,
+                server_args: Arc::new(crate::ServerArgs::default()),
+                chat_formatter: None,
+                http_extension: None,
+                response_activity: Default::default(),
+                startup_ready: Arc::new(true.into()),
+                frontend_metrics: None,
+            });
+            let request = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "text":"prompt", "rid":"samples", "stream":mode != "unary",
+                        "return_logprob":true, "sampling_params":{"n":5,"sampling_seed":17}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let task = tokio::spawn(routes().with_state(state).oneshot(request));
+            let mut children = Vec::new();
+            for sample in 0..5 {
+                let TmEvent::Intake(request) =
+                    tokio::time::timeout(Duration::from_secs(2), rx.recv_async())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                else {
+                    panic!("generation intake");
+                };
+                let RequestKind::Generate(payload) = &request.kind else {
+                    panic!("generation payload");
+                };
+                assert_eq!(payload.rid.client_facing(), format!("samples_{sample}"));
+                assert_eq!(payload.sampling_params.n, 1);
+                assert_eq!(payload.sampling_params.sampling_seed, Some(17));
+                assert!(payload.return_logprob);
+                children.push(request);
+            }
+            if mode == "disconnect" {
+                drop(task.await.unwrap().unwrap());
+                let mut aborted = std::collections::HashSet::new();
+                for _ in 0..5 {
+                    let event =
+                        tokio::time::timeout(Duration::from_secs(2), lifecycle_rx.recv_async())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    let LifecycleEvent::GuardAbort(rid) = event else {
+                        panic!("guard abort");
+                    };
+                    aborted.insert(rid.as_str().to_owned());
+                }
+                for request in &children {
+                    assert!(aborted.contains(request.rid.as_str()));
+                }
+                continue;
+            }
+            for (sample, request) in children.iter().enumerate().rev() {
+                let item = if sample == 2 {
+                    ResponseItem::Error(Error::Validation("failed sample".into()))
+                } else {
+                    ResponseItem::Done(ChunkEvent {
+                        rid: request.rid.clone(),
+                        text: format!("sample-{sample}"),
+                        token_ids: vec![10 + sample as i32],
+                        prompt_tokens: 3,
+                        completion_tokens: 1,
+                        finish_reason: serde_json::from_value(
+                            serde_json::json!({"type":"length","length":1}),
+                        )
+                        .unwrap(),
+                        extras: Some(Box::new(ChunkExtras {
+                            out_lp_val: vec![-(sample as f32)],
+                            out_lp_idx: vec![10 + sample as i32],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })
+                };
+                request.sink.try_send(item).unwrap();
+            }
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 32768).await.unwrap();
+            let values: Vec<serde_json::Value> = if mode == "unary" {
+                serde_json::from_slice(&bytes).unwrap()
+            } else {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert_eq!(text.matches("data: [DONE]").count(), 1);
+                let mut values: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                values.sort_by_key(|value| value["index"].as_u64());
+                values
+            };
+            assert_eq!(values.len(), 5);
+            for (sample, value) in values.iter().enumerate() {
+                if sample == 2 {
+                    assert_eq!(value["error"]["code"], 400);
+                } else {
+                    assert_eq!(value["text"], format!("sample-{sample}"));
+                    assert_eq!(value["meta_info"]["id"], format!("samples_{sample}"));
+                    assert_eq!(value["output_ids"], serde_json::json!([10 + sample]));
+                    assert_eq!(
+                        value["meta_info"]["output_token_logprobs"][0][0],
+                        -(sample as f64)
+                    );
+                    assert_eq!(
+                        value["meta_info"]["output_token_logprobs"][0][1],
+                        10 + sample
+                    );
+                }
+            }
+            assert!(
+                lifecycle_rx.try_recv().is_err(),
+                "finished children must be disarmed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_handoff_runs_before_media_io_and_retains_per_item_terminal_metadata() {
+        use crate::HttpExtension;
+        use axum::body::to_bytes;
+
+        #[derive(Debug)]
+        struct CanonicalInput;
+        impl HttpExtension for CanonicalInput {
+            fn apply(&self, router: axum::Router) -> axum::Router {
+                router
+            }
+            fn initial_response_metadata(
+                &self,
+            ) -> Option<serde_json::Map<String, serde_json::Value>> {
+                Some(serde_json::from_value(serde_json::json!({"model_info": {"checkpoint_path": "original-checkpoint"}})).unwrap())
+            }
+            fn prepare_request<'a>(
+                &'a self,
+                request: &'a mut GenerateRequest,
+            ) -> crate::RequestPreparation<'a> {
+                Box::pin(async move {
+                    assert!(request.has_multimodal());
+                    assert_eq!(
+                        request.disagg_prefill_serve_addr.as_deref(),
+                        Some("http://prefill")
+                    );
+                    request.set_canonical_mm_input(vec![1, 2], vec![])?;
+                    request.response_metadata = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "media_stats": { "room": request.bootstrap_room }
+                        }))
+                        .unwrap(),
+                    );
+                    Ok(())
+                })
+            }
+        }
+        let (tx, rx) = flume::unbounded();
+        let mut senders = senders();
+        senders.tok_manager_tx = tx;
+        let state = Arc::new(AppState {
+            senders,
+            response_buf: 8,
+            server_args: Arc::new(crate::ServerArgs {
+                limit_mm_data_per_request: [("image".into(), 1)].into(),
+                ..Default::default()
+            }),
+            chat_formatter: None,
+            http_extension: Some(Arc::new(CanonicalInput)),
+            response_activity: Default::default(),
+            startup_ready: Arc::new(true.into()),
+            frontend_metrics: None,
+        });
+        let scheduler = tokio::spawn(async move {
+            for _ in 0..2 {
+                let crate::tokenizer_manager::wiring::TmEvent::Intake(request) =
+                    rx.recv_async().await.unwrap()
+                else {
+                    panic!("intake")
+                };
+                let RequestKind::Generate(payload) = &request.kind else {
+                    panic!("generate")
+                };
+                assert!(!payload.has_multimodal());
+                assert_eq!(payload.input_ids.as_deref(), Some([1, 2].as_slice()));
+                assert!(
+                    payload.response_metadata.is_none(),
+                    "metadata stays at the HTTP layer"
+                );
+                request.sink.try_send(done(0, "ok")).unwrap();
+            }
+        });
+        let body: GenerateBody = serde_json::from_value(serde_json::json!({
+            "text": ["first", "second"], "image_data": [["/missing/first.jpg"], ["/missing/second.jpg"]],
+            "bootstrap_room": [17, 18], "disagg_prefill_serve_addr": "http://prefill"
+        })).unwrap();
+        let response = generate(State(state.clone()), HeaderMap::new(), Ok(Json(body))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(result[0]["meta_info"]["media_stats"]["room"], 17);
+        assert_eq!(result[1]["meta_info"]["media_stats"]["room"], 18);
+        for output in result.as_array().unwrap() {
+            assert_eq!(
+                output["model_info"]["checkpoint_path"],
+                "original-checkpoint"
+            );
+        }
+        scheduler.await.unwrap();
+        let body = serde_json::from_value(serde_json::json!({
+            "text": "too many images", "image_data": ["/missing/one.jpg", "/missing/two.jpg"]
+        }))
+        .unwrap();
+        let response = generate(State(state), HeaderMap::new(), Ok(Json(body))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     fn senders() -> Senders {
         Senders {
             tok_manager_tx: flume::unbounded().0,
-            abort_tx: flume::unbounded().0,
+            lifecycle_tx: flume::unbounded().0,
             tokenizer_tx: flume::unbounded().0,
             detokenizer_tx: vec![],
         }
@@ -607,19 +1353,19 @@ mod tests {
         serde_json::from_str(s).expect("frame is JSON")
     }
 
-    fn timed_receiver(
-        rid: u64,
-        rx: mpsc::Receiver<ResponseItem>,
-    ) -> (Rid, mpsc::Receiver<ResponseItem>, RequestTiming) {
-        (
-            Rid::from(rid.to_string()),
+    fn timed_receiver(rid: u64, rx: mpsc::Receiver<ResponseItem>) -> GenerationResponse {
+        GenerationResponse {
+            rid: Rid::from(rid.to_string()),
             rx,
-            RequestTiming {
+            timing: RequestTiming {
                 created_at: Instant::now() - Duration::from_millis(10),
                 time_to_first_token: None,
                 e2e_latency: None,
+                ..RequestTiming::new()
             },
-        )
+            metadata: None,
+            initial_metadata: None,
+        }
     }
 
     #[tokio::test]
@@ -630,7 +1376,9 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             chat_formatter: None,
             response_activity: Default::default(),
-            startup_readiness: Default::default(),
+            startup_ready: Arc::new(false.into()),
+            http_extension: None,
+            frontend_metrics: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO).await;
@@ -643,6 +1391,7 @@ mod tests {
             created_at: Instant::now() - Duration::from_millis(10),
             time_to_first_token: None,
             e2e_latency: None,
+            ..RequestTiming::new()
         };
         assert!(timing.terminal_latencies().is_none());
 
@@ -695,8 +1444,9 @@ mod tests {
             created_at: Instant::now() - Duration::from_millis(20),
             time_to_first_token: None,
             e2e_latency: None,
+            ..RequestTiming::new()
         };
-        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", timing).await;
+        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", timing, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(terminal);
         assert_eq!(value["meta_info"]["id"], "client-rid");
@@ -724,7 +1474,20 @@ mod tests {
     async fn interleaves_indexes_and_accumulates() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
+        let mut first = timed_receiver(10, rx0);
+        first.metadata = Some(
+            serde_json::from_value(serde_json::json!({"media_stats": {"download_bytes": [42]}}))
+                .unwrap(),
+        );
+        first.initial_metadata = Some(
+            serde_json::from_value(serde_json::json!({
+                "model_info": {"checkpoint_path": "original-checkpoint"}
+            }))
+            .unwrap(),
+        );
+        let mut second = timed_receiver(11, rx1);
+        second.initial_metadata = first.initial_metadata.clone();
+        let receivers = vec![first, second];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
@@ -734,16 +1497,24 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["text"], "a");
+        assert_eq!(v["model_info"]["checkpoint_path"], "original-checkpoint");
+        assert!(v["meta_info"].get("media_stats").is_none());
 
         tx1.send(frame(11, "b")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 1);
         assert_eq!(v["text"], "b");
+        assert_eq!(v["model_info"]["checkpoint_path"], "original-checkpoint");
 
         tx0.send(done(10, "!")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["text"], "a!", "cumulative per item");
+        assert!(v.get("model_info").is_none());
+        assert_eq!(
+            v["meta_info"]["media_stats"]["download_bytes"],
+            serde_json::json!([42])
+        );
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
@@ -751,6 +1522,8 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 1);
         assert_eq!(v["text"], "b?");
+        assert!(v.get("model_info").is_none());
+        assert!(v["meta_info"].get("media_stats").is_none());
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
@@ -870,7 +1643,14 @@ mod tests {
     #[tokio::test]
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![timed_receiver(10, rx)];
+        let mut receiver = timed_receiver(10, rx);
+        receiver.initial_metadata = Some(
+            serde_json::from_value(serde_json::json!({
+                "model_info": {"checkpoint_path": "original-checkpoint"}
+            }))
+            .unwrap(),
+        );
+        let receivers = vec![receiver];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
         futures::pin_mut!(stream);
@@ -882,6 +1662,7 @@ mod tests {
         for (n, expect) in [(1, "a"), (2, "b"), (3, "c")] {
             let v = parse(&stream.next().await.unwrap());
             assert_eq!(v["text"], expect, "delta {n} must not be dropped");
+            assert_eq!(v.get("model_info").is_some(), n == 1);
             assert_eq!(
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"

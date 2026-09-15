@@ -5,11 +5,17 @@
 //! `http_server.generate_request`; `/server_info` reuses it for one control result.
 pub mod app;
 mod common;
+mod decompression;
 mod disaggregation;
+pub(crate) mod dp;
 mod frame;
 mod guard;
+mod headers;
+pub(crate) mod loads;
 mod log;
+pub(crate) mod metrics;
 mod native_api;
 mod openai;
 mod prefetch;
 mod submit;
+mod transport;

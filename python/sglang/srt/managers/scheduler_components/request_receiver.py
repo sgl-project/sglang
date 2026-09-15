@@ -79,6 +79,7 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    recv_from_controller: Optional[zmq.Socket] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -119,6 +120,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _pull_raw_reqs(self) -> Optional[List]:
+        rust_mode = envs.SGLANG_RUST_SERVER.get()
         if self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
@@ -126,29 +128,41 @@ class SchedulerRequestReceiver:
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
-                if envs.SGLANG_RUST_SERVER.get():
+                if rust_mode:
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
-                    return recv_reqs
+                    socket = self.recv_from_controller
+                else:
+                    socket = self.recv_from_tokenizer
 
-                while True:
+                controls_received = 0
+                # Match the native ring's reserved control capacity per poll;
+                # continued control traffic must not monopolize the GPU loop.
+                while socket is not None and (not rust_mode or controls_received < 64):
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        # Collective controls must not starve behind a full
+                        # drain of generation requests from the Rust ring.
+                        if not rust_mode and self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        recv_req = sock_recv(socket, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
+                    controls_received += 1
 
-                while True:
+                rpc_received = 0
+                while self.recv_from_rpc is not None and (
+                    not rust_mode or rpc_received < 64
+                ):
                     try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                        if not rust_mode and self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                    rpc_received += 1
             else:
                 recv_reqs = None
         else:

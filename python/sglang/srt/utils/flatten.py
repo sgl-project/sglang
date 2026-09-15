@@ -169,18 +169,121 @@ class NestedRowColumns:
         self.v = array("f")
         self.pos = []
         self.req = []
+        self.shapes = []
 
     def columns(self):
         return ((self.name, self.rows),)
 
     def accept(self, j):
-        hv, hlens = flatten_hidden(self.rows[j] if self.rows else None)
+        value = self.rows[j] if self.rows else None
+        hv, hlens = flatten_hidden(value)
         self.v.extend(hv)
         self.pos.extend(hlens)
         self.req.append(len(hlens))
+        self.shapes.append(_hidden_shape(value) if value is not None else None)
 
     def header_cols(self):
         return [self.req, self.pos]
 
     def data_cols(self):
         return [self.v.tobytes()]
+
+
+def _hidden_shape(value):
+    """Describe nested vectors without moving their floats into the header."""
+    if not value or isinstance(value[0], (int, float)):
+        return len(value)
+    return [_hidden_shape(child) for child in value]
+
+
+class SamplingMaskColumns:
+    """Sparse per-token supports and selected-token logprobs, with explicit
+    absent-request, null-token, and empty-support shapes."""
+
+    def __init__(self, masks, logprobs):
+        assert len(masks) == len(logprobs), "sampling mask/logprob batch sizes differ"
+        self.shapes = []
+        self.ids = array("i")
+        self.logprobs = array("f")
+        for request_masks, request_logprobs in zip(masks, logprobs):
+            if request_masks is None:
+                assert request_logprobs is None
+                self.shapes.append(None)
+                continue
+            assert request_logprobs is not None and len(request_masks) == len(
+                request_logprobs
+            ), "sampling mask/logprob token counts differ"
+            self.shapes.append(
+                [None if mask is None else len(mask) for mask in request_masks]
+            )
+            for mask, logprob in zip(request_masks, request_logprobs):
+                if mask is not None:
+                    self.ids.extend(mask)
+                self.logprobs.append(float("nan") if logprob is None else logprob)
+
+    def data_cols(self):
+        return [self.ids.tobytes(), self.logprobs.tobytes()]
+
+
+class FlatTopLogprobColumns:
+    """Keep scheduler-produced rectangular prompt arrays in their raw dtypes."""
+
+    def __init__(self, vals, idxs, null_prefixes):
+        assert len(vals) == len(idxs) == len(null_prefixes)
+        self.shapes = []
+        self.vals = []
+        self.idxs = []
+        for val, idx, null_prefix in zip(vals, idxs, null_prefixes):
+            if val is None:
+                assert idx is None and null_prefix is None
+                self.shapes.append(None)
+                continue
+            assert val.ndim == 2 and val.shape == idx.shape
+            assert val.dtype.str == "<f4" and idx.dtype.str == "<i4"
+            assert null_prefix is not None and null_prefix >= 0
+            self.shapes.append([*val.shape, null_prefix])
+            self.vals.append(val.tobytes())
+            self.idxs.append(idx.tobytes())
+
+    def data_cols(self):
+        return self.vals + self.idxs
+
+
+class TensorBytesColumn:
+    """Preserve CPU tensor bytes, including empty tensors and absent requests."""
+
+    def __init__(self, tensors):
+        self.lengths = []
+        self.buffers = []
+        for tensor in tensors:
+            if tensor is None:
+                self.lengths.append(None)
+                continue
+            data = tensor.numpy().tobytes()
+            self.lengths.append(len(data))
+            self.buffers.append(data)
+
+    def data_cols(self):
+        return self.buffers
+
+
+class BeamSearchColumns:
+    """Ranked beam headers with generated token IDs in one raw i32 column."""
+
+    def __init__(self, outputs):
+        self.headers = []
+        self.tokens = array("i")
+        for output in outputs:
+            if output is None:
+                self.headers.append(None)
+                continue
+            headers = []
+            for sequence in output.sequences:
+                headers.append(
+                    (len(sequence.tokens), sequence.finish_reason, sequence.beam_score)
+                )
+                self.tokens.extend(sequence.tokens)
+            self.headers.append(headers)
+
+    def data_cols(self):
+        return [self.tokens.tobytes()]

@@ -1,4 +1,6 @@
+import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +14,48 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHiddenStateServerMode(CustomTestCase):
+    def test_native_request_fixture_matches_python_modes_and_validation(self):
+        fixtures = json.loads(
+            (
+                Path(__file__).resolve().parents[4]
+                / "rust/sglang-server/testdata/hidden_states_python.json"
+            ).read_text()
+        )
+        for maximum in (None, "last", "full"):
+            manager = self._make_tokenizer_manager(maximum)
+            for fixture in fixtures["requests"]:
+                request = GenerateReqInput(**fixture["body"])
+                request.normalize_batch_and_arguments()
+                prompts = (
+                    [request]
+                    if request.is_single
+                    else [request[i] for i in range(request.batch_size)]
+                )
+                self.assertEqual(
+                    [
+                        prompt.return_hidden_states
+                        for prompt in prompts
+                        for _ in range(request.parallel_sample_num)
+                    ],
+                    fixture["modes"],
+                )
+                for prompt in prompts:
+                    supported = (
+                        prompt.return_hidden_states is False
+                        or maximum == "full"
+                        or (maximum == "last" and prompt.return_hidden_states == "last")
+                    )
+                    if supported:
+                        manager._validate_one_request(prompt, prompt.input_ids)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "return-hidden-states"):
+                            manager._validate_one_request(prompt, prompt.input_ids)
+        for invalid in fixtures["invalid_modes"]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                request = GenerateReqInput(input_ids=[1], return_hidden_states=invalid)
+                request.normalize_batch_and_arguments()
+                manager._validate_one_request(request, request.input_ids)
+
     def _make_tokenizer_manager(self, mode):
         # The server-side hidden-state mode is a bag leaf.
         override = get_context().override_server_args(

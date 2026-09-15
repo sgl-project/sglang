@@ -5,7 +5,7 @@ import pytest
 
 from sglang.srt import rust_extensions
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, get_serving
 from sglang.srt.rust_server import server as rust_server
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,16 +13,16 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
-    "nnodes,tp_size,dp_size,ep_join_mode,ranks,expected",
+    "nnodes,tp_size,dp_size,ep_join_mode,ranks,bound_ports",
     [
-        (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
-        (4, 4, 2, None, (0, 2), [0, 0]),
-        (2, 2, 2, "scale", (0, 1), [0, 1]),
+        (2, 4, 4, None, (0, 1, 2, 3), [42107, 43329, 42107, 43329]),
+        (4, 4, 2, None, (0, 2), [42107, 42107]),
+        (2, 2, 2, "scale", (0, 1), [42107, 43329]),
     ],
     ids=["multiple-listeners-per-node", "dp-spans-nodes", "scale-joiner"],
 )
-def test_dp_leaders_reuse_node_local_ports(
-    nnodes, tp_size, dp_size, ep_join_mode, ranks, expected
+def test_dp_leaders_publish_allocated_worker_ports(
+    nnodes, tp_size, dp_size, ep_join_mode, ranks, bound_ports
 ):
     with (
         get_context().override_server_args(
@@ -39,6 +39,9 @@ def test_dp_leaders_reuse_node_local_ports(
         patch.object(rust_server, "_build_server_args"),
     ):
         parallel = get_parallel()
+        extension.return_value.Server.side_effect = [
+            SimpleNamespace(http_port=port) for port in bound_ports
+        ]
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):
             scheduler = SimpleNamespace(
@@ -50,16 +53,24 @@ def test_dp_leaders_reuse_node_local_ports(
                     attn_tp_size=parallel.attn_tp_size,
                     attn_cp_size=parallel.attn_cp_size,
                     attn_dp_rank=dp_rank,
+                    dp_rank=dp_rank,
                     dp_size=dp_size,
+                    pp_rank=0,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
                 ),
                 model_config=SimpleNamespace(is_multimodal=False),
             )
-            ports.append(rust_server.RustServer.launch(scheduler).http_port)
+            frontend = rust_server.RustServer.launch(scheduler)
+            ports.append(frontend.http_port)
+            assert frontend.topology.dp_rank == dp_rank
 
         calls = extension.return_value.Server.call_args_list
-        assert [c.kwargs["port_offset"] for c in calls] == expected
-        # P/D bootstrap must register against the same ports Rust binds.
-        assert ports == [30000 + offset for offset in expected]
+        assert [call.kwargs["http_port"] for call in calls] == [0] * dp_size
+        assert all(call.kwargs.get("port_offset") is None for call in calls)
+        assert get_serving().port == 30000
+        # Discovery and P/D bootstrap must publish the ports Rust actually bound.
+        assert ports == bound_ports
 
 
 @pytest.mark.parametrize(

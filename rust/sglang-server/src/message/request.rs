@@ -1,18 +1,20 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use itertools::izip;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use super::embeddings::PositionalEmbeds;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
-use super::sampling::{SamplingParams, SamplingParamsInput};
-use super::types::{OneOrMany, OneOrManyItem, TokenIds};
+use super::sampling::{CustomParamValue, SamplingParams, SamplingParamsInput};
+use super::types::{HiddenStatesMode, InputEmbeddings, OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -44,18 +46,53 @@ const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
 /// the wire form does not); 8 is the ceiling of that range, not a worst case.
 const JSON_TO_HEAP_FACTOR: usize = 8;
 
+/// Top-level fields in this namespace belong to the selected multimodal
+/// processor. Everything else unknown to [`GenerateBody`] keeps Python's
+/// accepted-but-ignored behavior.
+const PROCESSOR_EXTENSION_PREFIX: &str = "multimodal_";
+
+/// Model-owned request fields. The shared server preserves and batches their
+/// MessagePack value representation; the selected processor deserializes that
+/// map into its own concrete schema.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ProcessorExtensions(BTreeMap<String, rmpv::Value>);
+
+impl ProcessorExtensions {
+    /// Deserialize the model-agnostic value tree directly into the selected
+    /// processor's schema. This does not encode or decode MessagePack bytes.
+    pub fn deserialize<T: DeserializeOwned>(self) -> Result<T, String> {
+        let fields = self
+            .0
+            .into_iter()
+            .map(|(name, value)| (rmpv::Value::from(name), value))
+            .collect();
+        rmpv::ext::from_value(rmpv::Value::Map(fields))
+            .map_err(|error| format!("invalid processor extensions: {error}"))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &rmpv::Value> {
+        self.0.values()
+    }
+}
+
+impl FromIterator<(String, rmpv::Value)> for ProcessorExtensions {
+    fn from_iter<T: IntoIterator<Item = (String, rmpv::Value)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
 /// [`into_requests`](GenerateBody::into_requests).
 ///
-/// Unknown keys are IGNORED, matching Python: FastAPI builds `GenerateReqInput`
-/// as a pydantic dataclass, which drops extras. `deny_unknown_fields` here turned
-/// every `GenerateReqInput` field this server has not ported — `priority`,
-/// `extra_key`, `session_id`, `session_params`, `return_sampling_mask`,
-/// `custom_logit_processor`, and ~40 more — into a 400, so a client that worked
-/// against the Python server broke against this one. The cost of dropping it is
-/// that a typo (`temperature`) is silently ignored rather than reported; that is
-/// the same trade Python already makes.
+/// Unknown keys are ignored, matching Python, except `multimodal_*` fields. Those
+/// are opaque processor extensions: this layer only fans them out with the
+/// request batch and passes them to the selected multimodal processor.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
@@ -63,6 +100,8 @@ pub struct GenerateBody {
     pub rid: Option<OneOrMany<String>>,
     pub text: Option<OneOrMany<String>>,
     pub input_ids: Option<OneOrMany<TokenIds>>,
+    pub input_embeds: Option<OneOrMany<InputEmbeddings>>,
+    pub positional_embed_overrides: Option<OneOrMany<Option<PositionalEmbeds>>>,
     #[serde(default)]
     pub stream: bool,
     /// One params object (broadcast) or a list of them (per item); see
@@ -71,13 +110,35 @@ pub struct GenerateBody {
     /// Logprob / hidden-state options: a scalar broadcasts to every prompt, a
     /// list is per-prompt (Python `_normalize_logprob_params`).
     pub return_logprob: Option<OneOrMany<bool>>,
+    pub return_sampling_mask: Option<OneOrMany<bool>>,
+    #[serde(default)]
+    pub return_flat_raw_top_logprobs: bool,
+    #[serde(default)]
+    pub return_flat_raw_top_logprobs_b64: bool,
+    #[serde(default)]
+    pub return_routed_experts: bool,
+    #[serde(default)]
+    pub routed_experts_start_len: i64,
+    #[serde(default)]
+    pub return_indexer_topk: bool,
+    #[serde(default)]
+    pub return_prompt_token_ids: bool,
+    /// Python accepts these switches, but its LLM tokenizer/scheduler path
+    /// does not produce image bytes or token entropy. Preserve them for DP
+    /// transport and validate their types without inventing response fields.
+    #[serde(default)]
+    pub return_bytes: bool,
+    #[serde(default)]
+    pub return_entropy: bool,
     pub logprob_start_len: Option<OneOrMany<i64>>,
     pub top_logprobs_num: Option<OneOrMany<i64>>,
     /// Token ids to report logprobs for: one list (broadcast to every prompt) or
     /// one list per prompt, mirroring Python's
     /// `Union[List[int], List[List[int]]]` fan-out in `_normalize_batch`.
     pub token_ids_logprob: Option<OneOrMany<TokenIds>>,
-    pub return_hidden_states: Option<OneOrMany<bool>>,
+    pub multi_item_delimiter_indices: Option<OneOrMany<TokenIds>>,
+    #[serde(default)]
+    pub return_hidden_states: OneOrMany<HiddenStatesMode>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
     pub return_text_in_logprobs: Option<bool>,
     // PD-disaggregation routing, injected per request by the PD router
@@ -93,18 +154,36 @@ pub struct GenerateBody {
     pub decode_tp_size: Option<OneOrMany<Option<i64>>>,
     /// DP routing hints — per-request scalars even for batches, as in Python.
     pub routed_dp_rank: Option<i64>,
+    pub data_parallel_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    pub disagg_prefill_serve_addr: Option<OneOrMany<Option<String>>>,
+    pub conversation_id: Option<String>,
+    pub routing_key: Option<String>,
+    pub extra_key: Option<OneOrMany<String>>,
+    pub cache_salt: Option<OneOrMany<String>>,
+    pub custom_logit_processor: Option<OneOrMany<Option<String>>>,
+    pub require_reasoning: Option<bool>,
+    pub max_thinking_tokens: Option<i64>,
+    pub priority: Option<i64>,
+    pub log_metrics: Option<bool>,
+    pub custom_labels: Option<BTreeMap<String, String>>,
+    pub received_time: Option<f64>,
     // Multimodal inputs (Python `MultimodalDataInputFormat`), fanned out per
     // request by `multimodal::fan_out`.
     pub image_data: Option<MmDataInput>,
-    /// Caller-supplied per-item content hashes (hex) overriding the computed
-    /// ones, so an external router's keys align with the prefix cache. Single
-    /// requests only: Python declares the batched (nested) shape but
-    /// `__getitem__` never forwards it, so a batch is rejected here rather than
-    /// answered with hashes it did not ask for.
-    pub mm_hashes: Option<OneOrMany<Vec<String>>>,
+    /// Caller-supplied per-item feature hashes (hex) overriding the computed
+    /// ones, so an external router's keys align with the prefix cache.
+    pub mm_hashes: Option<Vec<OneOrMany<String>>>,
+    /// Original-media identities, separate from the processor-feature hashes.
+    pub mm_content_hashes: Option<Vec<OneOrMany<Option<String>>>>,
     pub video_data: Option<MmDataInput>,
     pub audio_data: Option<MmDataInput>,
+    #[serde(flatten)]
+    pub processor_options: multimodal::MmProcessorOptions,
+    /// Model-specific multimodal fields, retained without teaching the shared
+    /// request schema their contents. Other unknown fields remain ignored.
+    #[serde(flatten)]
+    processor_extensions: ProcessorExtensions,
 }
 
 impl GenerateBody {
@@ -121,22 +200,45 @@ impl GenerateBody {
     }
 
     /// Validate, normalize and fan the body into one [`GenerateRequest`] per
-    /// prompt + `is_batch` (list form — a 1-element list is still a batch → JSON
-    /// array response). The Rust counterpart of Python
+    /// prompt/sample + `is_batch` (list form or n > 1 → JSON array response).
+    /// The Rust counterpart of Python
     /// `GenerateReqInput.normalize_batch_and_arguments`; an invalid/inconsistent
     /// batch is [`Error::Validation`], which the handler surfaces with the
     /// variant's own status (400).
     pub fn into_requests(self) -> Result<(Vec<GenerateRequest>, bool), Error> {
+        reject_unsupported_fields(&self.processor_extensions)?;
+        if self.return_flat_raw_top_logprobs_b64 && !self.return_flat_raw_top_logprobs {
+            return Err(Error::Validation(
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs.".into(),
+            ));
+        }
+        if self.return_flat_raw_top_logprobs && self.multi_item_delimiter_indices.is_some() {
+            return Err(Error::Validation(
+                "return_flat_raw_top_logprobs does not support multi-item scoring: delimiter-sparse top logprob rows have no contiguous position mapping.".into(),
+            ));
+        }
         let GenerateBody {
             rid,
             text,
             input_ids,
+            input_embeds,
+            positional_embed_overrides,
             stream,
             sampling_params,
             return_logprob,
+            return_sampling_mask,
+            return_flat_raw_top_logprobs,
+            return_flat_raw_top_logprobs_b64,
+            return_routed_experts,
+            routed_experts_start_len,
+            return_indexer_topk,
+            return_prompt_token_ids,
+            return_bytes,
+            return_entropy,
             logprob_start_len,
             top_logprobs_num,
             token_ids_logprob,
+            multi_item_delimiter_indices,
             return_hidden_states,
             return_text_in_logprobs,
             bootstrap_host,
@@ -145,69 +247,142 @@ impl GenerateBody {
             bootstrap_pair_key,
             decode_tp_size,
             routed_dp_rank,
+            data_parallel_rank,
             disagg_prefill_dp_rank,
+            disagg_prefill_serve_addr,
+            conversation_id,
+            routing_key,
+            extra_key,
+            cache_salt,
+            custom_logit_processor,
+            require_reasoning,
+            max_thinking_tokens,
+            priority,
+            log_metrics,
+            custom_labels,
+            received_time,
             image_data,
             video_data,
             audio_data,
             mm_hashes,
-            // Unported `GenerateReqInput` fields land here and are dropped, as they
-            // are on the Python path.
-            ..
+            mm_content_hashes,
+            processor_options,
+            processor_extensions,
         } = self;
+        let routed_dp_rank = routed_dp_rank.or(data_parallel_rank);
+        let samples = parallel_sample_count(sampling_params.as_ref())?;
 
         // Cap the batch BEFORE the columns below allocate anything. Reading the
         // declared length off the input costs nothing; the previous placement (after
         // the match) had already allocated ~1.7 GiB for a 114 MiB body, most of it
         // the `vec![None; n]` twin column.
-        let declared_n = match (&text, &input_ids) {
-            (Some(OneOrMany::Many(v)), None) => v.len(),
-            (None, Some(OneOrMany::Many(v))) => v.len(),
+        let declared_n = match (&text, &input_ids, &input_embeds) {
+            (Some(OneOrMany::Many(v)), None, None) => v.len(),
+            (None, Some(OneOrMany::Many(v)), None) => v.len(),
+            (None, None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if batch_size_exceeds_limit(declared_n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
+        let expanded_n = declared_n.checked_mul(samples).ok_or_else(|| {
+            Error::Validation("prompt count times n overflows the request limit".into())
+        })?;
+        if batch_size_exceeds_limit(expanded_n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
             return Err(Error::Validation(format!(
-                "batch size {declared_n} exceeds the maximum of {}",
+                "batch size {expanded_n} exceeds the maximum of {}",
                 *MAX_BATCH_REQS_PER_HTTP_REQ
             )));
         }
+        if samples > 1 {
+            for (per_prompt, name) in [
+                (
+                    matches!(return_logprob, Some(OneOrMany::Many(_))),
+                    "return_logprob",
+                ),
+                (
+                    matches!(return_sampling_mask, Some(OneOrMany::Many(_))),
+                    "return_sampling_mask",
+                ),
+                (
+                    matches!(logprob_start_len, Some(OneOrMany::Many(_))),
+                    "logprob_start_len",
+                ),
+                (
+                    matches!(top_logprobs_num, Some(OneOrMany::Many(_))),
+                    "top_logprobs_num",
+                ),
+                (
+                    matches!(token_ids_logprob, Some(OneOrMany::Many(_))),
+                    "token_ids_logprob",
+                ),
+                (
+                    matches!(custom_logit_processor, Some(OneOrMany::Many(_))),
+                    "custom_logit_processor",
+                ),
+            ] {
+                if per_prompt {
+                    return Err(Error::Validation(format!(
+                        "Cannot use list {name} with parallel_sample_num > 1"
+                    )));
+                }
+            }
+        }
 
-        // Per-item (text, input_ids) columns + whether the input used list form.
-        type Columns = (Vec<Option<String>>, Vec<Option<TokenIds>>, bool);
-        // Exactly one of text / input_ids (Python `_validate_inputs`), and no
-        // empty id list (Python `_determine_batch_size`).
-        let (texts, id_lists, is_batch): Columns = match (text, input_ids) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Validation(
-                    "provide either `text` or `input_ids`, not both".into(),
-                ));
-            }
-            (None, None) => {
-                return Err(Error::Validation(
-                    "either `text` or `input_ids` must be provided".into(),
-                ));
-            }
-            (Some(OneOrMany::One(s)), None) => (vec![Some(s)], vec![None], false),
-            (Some(OneOrMany::Many(v)), None) => {
+        type Columns = (
+            Vec<Option<String>>,
+            Vec<Option<TokenIds>>,
+            Vec<Option<InputEmbeddings>>,
+            bool,
+        );
+        let (texts, id_lists, embeddings, is_batch): Columns = match (text, input_ids, input_embeds)
+        {
+            (Some(OneOrMany::One(s)), None, None) => (vec![Some(s)], vec![None], vec![None], false),
+            (Some(OneOrMany::Many(v)), None, None) => {
                 let n = v.len();
-                (v.into_iter().map(Some).collect(), vec![None; n], true)
+                (
+                    v.into_iter().map(Some).collect(),
+                    vec![None; n],
+                    vec![None; n],
+                    true,
+                )
             }
             // `[]` parses as `One(vec![])` (one prompt with no ids), so the
             // `n == 0` guard below never sees it — reject it here, as Python's
             // `_determine_batch_size` does.
-            (None, Some(OneOrMany::One(x))) => {
+            (None, Some(OneOrMany::One(x)), None) => {
                 if x.is_empty() {
                     return Err(Error::Validation("input_ids cannot be empty".into()));
                 }
-                (vec![None], vec![Some(x)], false)
+                (vec![None], vec![Some(x)], vec![None], false)
             }
-            (None, Some(OneOrMany::Many(vv))) => {
+            (None, Some(OneOrMany::Many(vv)), None) => {
                 if vv.iter().any(|ids| ids.is_empty()) {
                     return Err(Error::Validation(
                         "input_ids cannot be empty for any prompt in the batch".into(),
                     ));
                 }
                 let n = vv.len();
-                (vec![None; n], vv.into_iter().map(Some).collect(), true)
+                (
+                    vec![None; n],
+                    vv.into_iter().map(Some).collect(),
+                    vec![None; n],
+                    true,
+                )
+            }
+            (None, None, Some(OneOrMany::One(embeds))) => {
+                (vec![None], vec![None], vec![Some(embeds)], false)
+            }
+            (None, None, Some(OneOrMany::Many(embeds))) => {
+                let n = embeds.len();
+                (
+                    vec![None; n],
+                    vec![None; n],
+                    embeds.into_iter().map(Some).collect(),
+                    true,
+                )
+            }
+            _ => {
+                return Err(Error::Validation(
+                    "provide exactly one of `text`, `input_ids`, or `input_embeds`".into(),
+                ));
             }
         };
         let n = texts.len();
@@ -215,6 +390,21 @@ impl GenerateBody {
             return Err(Error::Validation(
                 "batch must contain at least one item".into(),
             ));
+        }
+        if let Some(key) = &routing_key {
+            check_broadcast_budget(key.len(), n, "routing_key")?;
+        }
+        let extra_keys = cache_key_column(extra_key, n, is_batch || samples > 1, "extra_key")?;
+        let cache_salts = cache_key_column(cache_salt, n, is_batch || samples > 1, "cache_salt")?;
+        if n > 1
+            && let Some(labels) = &custom_labels
+        {
+            let bytes = labels.iter().fold(0usize, |size, (name, value)| {
+                size.saturating_add(name.len())
+                    .saturating_add(value.len())
+                    .saturating_add(96)
+            });
+            check_broadcast_budget(bytes, n, "custom_labels")?;
         }
 
         // A list is per-item; a single object broadcasts to every item.
@@ -276,7 +466,7 @@ impl GenerateBody {
                     .collect()
             }
             Some(OneOrMany::Many(v)) => {
-                if !is_batch || v.len() != n {
+                if (!is_batch && samples == 1) || v.len() != n {
                     return Err(Error::Validation(format!(
                         "rid list length {} does not match batch size {n}",
                         v.len()
@@ -305,14 +495,35 @@ impl GenerateBody {
         // lists is per item (Python `_normalize_batch`'s nested branch). Empties
         // are collapsed per item below, not here.
         let tid_logprobs = fan_out(token_ids_logprob, n, "token_ids_logprob")?;
+        if is_batch && matches!(multi_item_delimiter_indices, Some(OneOrMany::One(_))) {
+            return Err(Error::Validation(
+                "multi_item_delimiter_indices must contain one list per request".into(),
+            ));
+        }
+        let delimiter_indices = fan_out(
+            multi_item_delimiter_indices,
+            n,
+            "multi_item_delimiter_indices",
+        )?;
+        let positional_embeds = flatten_column(fan_out(
+            positional_embed_overrides,
+            n,
+            "positional_embed_overrides",
+        )?);
 
         // Each logprob/hidden opt: absent → None for every item, a scalar
         // broadcasts, a list is per-item (Python `normalize_param`, plus a length
         // check Python lacks — it would `IndexError` later instead).
         let return_logprobs = fan_out(return_logprob, n, "return_logprob")?;
+        let return_sampling_masks = fan_out(return_sampling_mask, n, "return_sampling_mask")?;
         let logprob_start_lens = fan_out(logprob_start_len, n, "logprob_start_len")?;
         let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
-        let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
+        let return_hidden = fan_out(Some(return_hidden_states), n, "return_hidden_states")?;
+        let custom_logit_processors = flatten_column(fan_out(
+            custom_logit_processor,
+            n,
+            "custom_logit_processor",
+        )?);
 
         // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
         // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
@@ -335,30 +546,27 @@ impl GenerateBody {
         let bootstrap_pair_keys =
             flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
         let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
-        // `mm_hashes` has no batch form: honoring it only here would give the two
-        // servers different prefix-cache keys for the same body. Reject instead of
-        // dropping it silently as Python does — the field exists to align a
-        // caller's keys, so ignoring it returns subtly wrong ones.
-        let mm_hashes: Vec<String> = match mm_hashes {
-            None => Vec::new(),
-            Some(OneOrMany::One(hashes)) if hashes.is_empty() => Vec::new(),
-            Some(_) if is_batch => {
-                return Err(Error::Validation(
-                    "mm_hashes is not supported for batch requests; send one request per prompt"
-                        .into(),
-                ));
-            }
-            Some(OneOrMany::One(hashes)) => hashes,
-            Some(OneOrMany::Many(_)) => {
-                return Err(Error::Validation(
-                    "mm_hashes must be a flat list of hex strings for a single request".into(),
-                ));
-            }
-        };
         // Multimodal columns; see `multimodal::fan_out` for the Python parity rules.
         let images = multimodal::fan_out(image_data, n, is_batch, "image_data")?;
         let videos = multimodal::fan_out(video_data, n, is_batch, "video_data")?;
         let audios = multimodal::fan_out(audio_data, n, is_batch, "audio_data")?;
+        let mm_hashes = multimodal::fan_out_hashes(mm_hashes, &images, is_batch, "mm_hashes")?;
+        let mm_content_hashes =
+            multimodal::fan_out_hashes(mm_content_hashes, &images, is_batch, "mm_content_hashes")?;
+        if n > 1 && !processor_options.is_default() {
+            let bytes = serde_json::to_vec(&processor_options)
+                .map_err(|error| Error::Validation(error.to_string()))?
+                .len()
+                .saturating_mul(JSON_TO_HEAP_FACTOR);
+            check_broadcast_budget(bytes, n, "multimodal processor options")?;
+        }
+        let processor_options = vec![processor_options; n];
+        let prefill_serve_addrs = flatten_column(fan_out(
+            disagg_prefill_serve_addr,
+            n,
+            "disagg_prefill_serve_addr",
+        )?);
+        let processor_extensions = split_extension_columns(processor_extensions, n, is_batch)?;
 
         // Every column above is exactly `n` long, so zip them by value: each
         // request takes ownership of its cell, with no indexing or bounds checks.
@@ -366,11 +574,15 @@ impl GenerateBody {
             rids,
             texts,
             id_lists,
+            embeddings,
+            positional_embeds,
             sps,
             return_logprobs,
+            return_sampling_masks,
             logprob_start_lens,
             top_logprobs_nums,
             tid_logprobs,
+            delimiter_indices,
             return_hidden,
             bootstrap_hosts,
             bootstrap_ports,
@@ -380,17 +592,29 @@ impl GenerateBody {
             images,
             videos,
             audios,
+            mm_hashes,
+            mm_content_hashes,
+            processor_extensions,
+            processor_options,
+            prefill_serve_addrs,
+            extra_keys,
+            cache_salts,
+            custom_logit_processors,
         )
         .map(
             |(
                 rid,
                 text,
                 input_ids,
+                input_embeds,
+                positional_embed_overrides,
                 sampling_params,
                 return_logprob,
+                return_sampling_mask,
                 logprob_start_len,
                 top_logprobs_num,
                 token_ids_logprob,
+                multi_item_delimiter_indices,
                 return_hidden_states,
                 bootstrap_host,
                 bootstrap_port,
@@ -400,11 +624,21 @@ impl GenerateBody {
                 image_data,
                 video_data,
                 audio_data,
+                mm_hashes,
+                mm_content_hashes,
+                processor_extensions,
+                processor_options,
+                disagg_prefill_serve_addr,
+                extra_key,
+                cache_salt,
+                custom_logit_processor,
             )| GenerateRequest {
                 rid,
                 text,
                 input_ids,
-                // Native text prompts keep the post-processor specials; the
+                input_embeds,
+                positional_embed_overrides,
+                // Plain text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
                 skip_special_tokens: false,
                 sampling_params,
@@ -416,8 +650,17 @@ impl GenerateBody {
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
-                return_hidden_states: return_hidden_states.unwrap_or(false),
+                multi_item_delimiter_indices,
+                return_sampling_mask: return_sampling_mask.unwrap_or(false),
+                return_flat_raw_top_logprobs,
+                return_flat_raw_top_logprobs_b64,
+                return_routed_experts,
+                routed_experts_start_len,
+                return_indexer_topk,
+                return_prompt_token_ids,
+                return_bytes,
+                return_entropy,
+                return_hidden_states: return_hidden_states.unwrap_or_default(),
                 return_text_in_logprobs,
                 bootstrap_host,
                 bootstrap_port,
@@ -426,17 +669,153 @@ impl GenerateBody {
                 decode_tp_size,
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
-                mm: pack_mm(image_data, video_data, audio_data),
+                disagg_prefill_serve_addr,
+                conversation_id: conversation_id.clone(),
+                routing_key: routing_key.clone(),
+                extra_key,
+                cache_salt,
+                custom_logit_processor,
+                require_reasoning: require_reasoning.unwrap_or(false),
+                max_thinking_tokens,
+                priority,
+                log_metrics,
+                custom_labels: custom_labels.clone(),
+                received_time,
+                started: None,
+                metric_state: None,
+                response_metadata: None,
+                mm_pad_spans: Vec::new(),
+                mm: pack_mm(
+                    image_data,
+                    video_data,
+                    audio_data,
+                    mm_hashes,
+                    mm_content_hashes,
+                    processor_extensions,
+                    processor_options,
+                ),
             },
         )
         .collect();
-        // Single requests only (batches rejected above). Malformed entries are
-        // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
-        if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
-            mm.mm_hashes = mm_hashes;
+        for request in &mut requests {
+            if let Some(mm) = request.mm.as_deref_mut() {
+                mm.mm_content_hashes = multimodal::normalize_content_hashes(
+                    &mm.image_data,
+                    mm.mm_content_hashes.take(),
+                )
+                .map_err(Error::Validation)?;
+            }
+            if let Some(budget) = request.max_thinking_tokens {
+                request
+                    .sampling_params
+                    .custom_params
+                    .get_or_insert_default()
+                    .insert("thinking_budget".into(), CustomParamValue::Signed(budget));
+            }
         }
-        Ok((requests, is_batch))
+        Ok((
+            expand_parallel_samples(requests, samples)?,
+            is_batch || samples > 1,
+        ))
     }
+}
+
+fn reject_unsupported_fields(fields: &ProcessorExtensions) -> Result<(), Error> {
+    for name in [
+        "session_id",
+        "session_params",
+        "lora_path",
+        "lora_id",
+        "background",
+        "no_logs",
+        "external_trace_header",
+        "http_worker_ipc",
+        "need_wait_for_mm_inputs",
+        "num_items_assigned",
+        "encoder_urls",
+    ] {
+        if fields.0.get(name).is_some_and(feature_requested) {
+            return Err(Error::Validation(format!(
+                "The Rust frontend does not support `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn feature_requested(value: &rmpv::Value) -> bool {
+    match value {
+        rmpv::Value::Nil | rmpv::Value::Boolean(false) => false,
+        rmpv::Value::String(value) => !value.as_str().is_some_and(str::is_empty),
+        rmpv::Value::Array(values) => values.iter().any(feature_requested),
+        rmpv::Value::Map(values) => !values.is_empty(),
+        _ => true,
+    }
+}
+
+fn parallel_sample_count(params: Option<&SamplingParamsInput>) -> Result<usize, Error> {
+    let values = match params {
+        None => return Ok(1),
+        Some(SamplingParamsInput::One(params)) => std::slice::from_ref(params.as_ref()),
+        Some(SamplingParamsInput::Many(params)) => params.as_slice(),
+    };
+    let Some(first) = values.first() else {
+        return Ok(1);
+    };
+    let count = usize::try_from(first.n)
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| Error::Validation("n must be at least 1".into()))?;
+    if values.iter().any(|params| params.n != first.n) {
+        return Err(Error::Validation(
+            "The parallel_sample_num should be the same for all samples in sample params.".into(),
+        ));
+    }
+    // The scheduler expands beam rows jointly; n selects returned beams there.
+    Ok(if first.beam_width.is_some_and(|width| width > 1) {
+        1
+    } else {
+        count
+    })
+}
+
+fn expand_parallel_samples(
+    requests: Vec<GenerateRequest>,
+    samples: usize,
+) -> Result<Vec<GenerateRequest>, Error> {
+    if samples == 1 {
+        return Ok(requests);
+    }
+    // Validate the aggregate clone cost before allocating children. This uses
+    // the same memory budget as scalar-to-batch field expansion above.
+    let mut bytes = 0usize;
+    for request in &requests {
+        let size = serde_json::to_vec(request)
+            .map_err(|error| Error::Validation(format!("cannot expand parallel samples: {error}")))?
+            .len();
+        bytes = bytes.saturating_add(size.saturating_mul(JSON_TO_HEAP_FACTOR));
+    }
+    check_broadcast_budget(bytes, samples, "parallel samples")?;
+    let mut expanded = Vec::with_capacity(requests.len() * samples);
+    for mut request in requests {
+        // A forwarded scalar child must not expand again on its DP worker.
+        // Python copies the seed unchanged for every sample as well.
+        request.sampling_params.n = 1;
+        let parent = request.rid.client_facing().to_owned();
+        let room = request.bootstrap_room;
+        for sample in 0..samples {
+            let mut child = request.clone();
+            child.rid = Rid::from_client(&format!("{parent}_{sample}"));
+            // Keep the P/D pairing deterministic while giving concurrent samples
+            // distinct transfer rooms, even when the caller supplies room lists.
+            child.bootstrap_room = room.map(|room| {
+                room.wrapping_mul(samples as i64)
+                    .wrapping_add(sample as i64)
+            });
+            expanded.push(child);
+        }
+    }
+    Ok(expanded)
 }
 
 /// Box the per-item mm values, `None` when the item has none — the common
@@ -445,16 +824,77 @@ fn pack_mm(
     image_data: Vec<MmItem>,
     video_data: Vec<MmItem>,
     audio_data: Vec<MmItem>,
+    mm_hashes: Option<Vec<String>>,
+    mm_content_hashes: Option<Vec<Option<String>>>,
+    processor_extensions: ProcessorExtensions,
+    processor_options: multimodal::MmProcessorOptions,
 ) -> Option<Box<MmData>> {
-    if image_data.is_empty() && video_data.is_empty() && audio_data.is_empty() {
+    if image_data.is_empty()
+        && video_data.is_empty()
+        && audio_data.is_empty()
+        && processor_extensions.is_empty()
+        && processor_options.is_default()
+    {
         return None;
     }
     Some(Box::new(MmData {
         image_data,
         video_data,
         audio_data,
+        mm_hashes: mm_hashes.unwrap_or_default(),
+        mm_content_hashes,
+        processor_extensions,
+        processor_options,
         ..Default::default()
     }))
+}
+
+fn split_extension_columns(
+    fields: ProcessorExtensions,
+    n: usize,
+    is_batch: bool,
+) -> Result<Vec<ProcessorExtensions>, Error> {
+    let mut requests = vec![ProcessorExtensions::default(); n];
+    for (name, value) in fields.0 {
+        if !name.starts_with(PROCESSOR_EXTENSION_PREFIX) || value.is_nil() {
+            continue;
+        }
+        if !is_batch {
+            requests[0].0.insert(name, value);
+            continue;
+        }
+        let rmpv::Value::Array(values) = value else {
+            return Err(Error::Validation(format!(
+                "{name} must be a list for batch processing"
+            )));
+        };
+        if values.is_empty() {
+            for request in &mut requests {
+                request
+                    .0
+                    .insert(name.clone(), rmpv::Value::Array(Vec::new()));
+            }
+            continue;
+        }
+        if values.len() != n {
+            return Err(Error::Validation(format!(
+                "{name} list length {} does not match batch size {n}",
+                values.len()
+            )));
+        }
+        for (request, value) in requests.iter_mut().zip(values) {
+            request.0.insert(name.clone(), value);
+        }
+    }
+    Ok(requests)
+}
+
+fn extension_value_present(value: &rmpv::Value) -> bool {
+    match value {
+        rmpv::Value::Nil => false,
+        rmpv::Value::Array(values) => values.iter().any(extension_value_present),
+        _ => true,
+    }
 }
 
 /// One request handed to the MM worker pool: the rid to correlate the result,
@@ -465,19 +905,42 @@ pub struct MmRequest {
     pub work: MmWorkItem,
 }
 
+#[derive(Debug, Clone)]
+pub struct MmFetchTiming {
+    pub started: Instant,
+    pub elapsed: Duration,
+    pub bytes: usize,
+}
+
+/// Local measurements, kept out of client JSON and DP forwarding. Downloads
+/// retain request order even when their I/O completes out of order.
+#[derive(Debug, Clone, Default)]
+pub struct MmPrefetchStats {
+    pub load_wall: Duration,
+    pub downloads: Vec<MmFetchTiming>,
+}
+
 /// The parked request's fields the MM worker owns; converted to the driver input
 /// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
+    pub queued_at: Option<Instant>,
+    pub prefetch_stats: MmPrefetchStats,
+    /// PD pairing identity, retained through preprocessing for metadata handoff.
+    pub bootstrap_room: Option<i64>,
     pub text: Option<String>,
     pub input_ids: Option<Vec<i32>>,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
+    pub processor_extensions: ProcessorExtensions,
+    pub processor_options: multimodal::MmProcessorOptions,
     /// See [`MmData::prefetched`].
     pub prefetched: Vec<Bytes>,
     /// See [`GenerateBody::mm_hashes`].
     pub mm_hashes: Vec<String>,
+    /// See [`GenerateBody::mm_content_hashes`].
+    pub mm_content_hashes: Option<Vec<Option<String>>>,
 }
 
 /// The owned request as it travels request stages (single owner, so `state` is
@@ -511,21 +974,28 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
+    /// Encode text on a tokenizer worker without submitting scheduler work.
+    Tokenize {
+        text: String,
+        add_special_tokens: bool,
+    },
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
     /// stage that answers it is the detok shard itself, never the scheduler
     /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
+    /// (the raw UTF-8 text). Used by `/detokenize` and completion prompt echo.
+    Detokenize {
+        token_ids: TokenIds,
+        skip_special_tokens: bool,
+    },
 }
 
 /// A single in-flight `/generate` request (per-item from
 /// [`GenerateBody::into_requests`]),
-/// serialized to the scheduler wire once tokenized (see `to_header_msgpack`). Not a
-/// wire type — built by `into_requests`/handlers, never (de)serialized; `input_ids` is
-/// client-supplied or filled by the Tokenizer stage.
-#[derive(Debug, Default)]
+/// serialized to the scheduler wire once tokenized (see `to_header_msgpack`).
+/// The DP ingress can serialize its client fields back to a scalar HTTP body;
+/// internal identity suffixes, decoded media and trusted metadata never leave it.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GenerateRequest {
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
     /// uuid minted there when none was sent. A [`Rid`], not a `String`: the wire
@@ -542,18 +1012,25 @@ pub struct GenerateRequest {
     /// ID detected"). Serving both is the friendlier answer and strictly safer —
     /// what the rejection protected against was one request evicting the other's
     /// detok sink, which is now unrepresentable.
+    #[serde(serialize_with = "serialize_client_rid")]
     pub rid: Rid,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
+    /// Owned through batch/DP transport; scheduler intake creates the same
+    /// placeholder ids as Python's `Scheduler.handle_generate_request`.
+    pub input_embeds: Option<InputEmbeddings>,
+    pub positional_embed_overrides: Option<PositionalEmbeds>,
     /// Template-rendered prompts (chat) already contain their role/special
     /// tokens, so the tokenizer pool strips the auto-added BOS/EOS prefix —
     /// the Rust analogue of Python's `add_special_tokens=False` at the
     /// chat-template encode site (`serving_chat._encode_messages`). Consumed
     /// by the pool before the header is built; never reaches the scheduler wire.
+    #[serde(skip)]
     pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
+    #[serde(serialize_with = "SamplingParams::serialize_client")]
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
@@ -569,8 +1046,19 @@ pub struct GenerateRequest {
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
     pub token_ids_logprob: Option<TokenIds>,
+    /// Scoring boundaries in the finalized prompt; the scheduler's MIS path
+    /// uses them to select both attention segments and logprob positions.
+    pub multi_item_delimiter_indices: Option<TokenIds>,
     pub return_sampling_mask: bool,
-    pub return_hidden_states: bool,
+    pub return_flat_raw_top_logprobs: bool,
+    pub return_flat_raw_top_logprobs_b64: bool,
+    pub return_routed_experts: bool,
+    pub routed_experts_start_len: i64,
+    pub return_indexer_topk: bool,
+    pub return_prompt_token_ids: bool,
+    pub return_bytes: bool,
+    pub return_entropy: bool,
+    pub return_hidden_states: HiddenStatesMode,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -585,15 +1073,50 @@ pub struct GenerateRequest {
     pub bootstrap_room: Option<i64>,
     pub bootstrap_pair_key: Option<String>,
     pub decode_tp_size: Option<i64>,
-    /// DP routing hints. The embedded server is rank-0-only (no DP controller),
-    /// so these are pure passthrough for the scheduler/LB protocol.
+    /// DP routing hints, resolved before worker tokenization and media I/O.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    pub disagg_prefill_serve_addr: Option<String>,
+    pub conversation_id: Option<String>,
+    pub routing_key: Option<String>,
+    pub extra_key: Option<String>,
+    pub cache_salt: Option<String>,
+    pub custom_logit_processor: Option<String>,
+    pub require_reasoning: bool,
+    pub max_thinking_tokens: Option<i64>,
+    pub priority: Option<i64>,
+    pub log_metrics: Option<bool>,
+    pub custom_labels: Option<BTreeMap<String, String>>,
+    pub received_time: Option<f64>,
+    #[serde(skip)]
+    pub started: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub metric_state: Option<Box<crate::metrics::RequestMetrics>>,
+    /// Model-owned metadata attached only to the terminal native response.
+    /// Never accepted from the HTTP body or passed to the scheduler.
+    #[serde(skip)]
+    pub response_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Only `set_canonical_mm_input` can install validated pad spans. They
+    /// permit canonical media pads without weakening text-token validation.
+    #[serde(skip)]
+    pub(crate) mm_pad_spans: Vec<MmPadSpan>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
     /// every `Request` moved between stages.
+    #[serde(flatten)]
     pub mm: Option<Box<MmData>>,
+}
+
+fn serialize_client_rid<S: serde::Serializer>(rid: &Rid, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(rid.client_facing())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmPadSpan {
+    pub start: usize,
+    pub end: usize,
+    pub pad_value: i32,
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
@@ -601,21 +1124,73 @@ pub struct GenerateRequest {
 ///
 /// Constructed directly only by tests: `api_server::prefetch` fills its
 /// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MmData {
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
+    #[serde(flatten)]
+    pub processor_extensions: ProcessorExtensions,
+    #[serde(flatten)]
+    pub processor_options: multimodal::MmProcessorOptions,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
     /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
+    #[serde(skip)]
     pub prefetched: Vec<bytes::Bytes>,
+    #[serde(skip)]
+    pub prefetch_stats: MmPrefetchStats,
     /// See [`GenerateBody::mm_hashes`]; applied by the MM worker.
     pub mm_hashes: Vec<String>,
+    /// See [`GenerateBody::mm_content_hashes`]; normalized before processing.
+    pub mm_content_hashes: Option<Vec<Option<String>>>,
 }
 
 impl GenerateRequest {
+    /// Install canonical input from a paired prefill. Every declared media span
+    /// must contain exactly its pad value; ordinary ids still undergo vocabulary
+    /// validation before admission. No media features are needed on decode.
+    pub fn set_canonical_mm_input(
+        &mut self,
+        input_ids: Vec<i32>,
+        mut spans: Vec<MmPadSpan>,
+    ) -> Result<(), String> {
+        if input_ids.is_empty() {
+            return Err("input metadata token ids cannot be empty".into());
+        }
+        spans.sort_unstable_by_key(|span| span.start);
+        let mut normalized: Vec<MmPadSpan> = Vec::with_capacity(spans.len());
+        for span in spans {
+            if span.start > span.end || span.end >= input_ids.len() || span.pad_value < 0 {
+                return Err("invalid input metadata pad span".into());
+            }
+            if let Some(previous) = normalized.last_mut()
+                && span.start <= previous.end
+            {
+                if previous.pad_value != span.pad_value {
+                    return Err("input metadata has conflicting overlapping spans".into());
+                }
+                previous.end = previous.end.max(span.end);
+            } else {
+                normalized.push(span);
+            }
+        }
+        for span in &normalized {
+            if input_ids[span.start..=span.end]
+                .iter()
+                .any(|&id| id != span.pad_value)
+            {
+                return Err("input metadata span does not contain the declared pad value".into());
+            }
+        }
+        self.input_ids = Some(input_ids);
+        self.text = None;
+        self.mm_pad_spans = normalized;
+        self.mm = None;
+        Ok(())
+    }
+
     /// True when the client already supplied token ids → skip tokenization.
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|v| !v.is_empty())
@@ -625,7 +1200,13 @@ impl GenerateRequest {
     /// Python `GenerateReqInput.contains_mm_input()`.
     pub fn has_multimodal(&self) -> bool {
         self.mm.as_ref().is_some_and(|mm| {
-            !mm.image_data.is_empty() || !mm.video_data.is_empty() || !mm.audio_data.is_empty()
+            !mm.image_data.is_empty()
+                || !mm.video_data.is_empty()
+                || !mm.audio_data.is_empty()
+                || mm
+                    .processor_extensions
+                    .values()
+                    .any(extension_value_present)
         })
     }
 
@@ -634,6 +1215,8 @@ impl GenerateRequest {
     /// the mm values move wholesale.
     pub fn take_mm_work(&mut self) -> MmWorkItem {
         let mut work = MmWorkItem {
+            queued_at: Some(Instant::now()),
+            bootstrap_room: self.bootstrap_room,
             text: self.text.clone(),
             input_ids: self.input_ids.take(),
             ..Default::default()
@@ -642,8 +1225,12 @@ impl GenerateRequest {
             work.image_data = std::mem::take(&mut m.image_data);
             work.video_data = std::mem::take(&mut m.video_data);
             work.audio_data = std::mem::take(&mut m.audio_data);
+            work.processor_extensions = std::mem::take(&mut m.processor_extensions);
+            work.processor_options = std::mem::take(&mut m.processor_options);
             work.prefetched = std::mem::take(&mut m.prefetched);
+            work.prefetch_stats = std::mem::take(&mut m.prefetch_stats);
             work.mm_hashes = std::mem::take(&mut m.mm_hashes);
+            work.mm_content_hashes = m.mm_content_hashes.take();
         }
         work
     }
@@ -677,6 +1264,11 @@ impl HeapBytes for bool {
         0
     }
 }
+impl HeapBytes for HiddenStatesMode {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
 impl HeapBytes for i64 {
     fn heap_bytes(&self) -> usize {
         0
@@ -692,6 +1284,19 @@ impl HeapBytes for TokenIds {
         self.len() * std::mem::size_of::<i32>()
     }
 }
+impl HeapBytes for PositionalEmbeds {
+    fn heap_bytes(&self) -> usize {
+        self.embeds.iter().fold(
+            self.positions
+                .len()
+                .saturating_mul(std::mem::size_of::<i64>()),
+            |size, row| {
+                size.saturating_add(std::mem::size_of::<Vec<f32>>())
+                    .saturating_add(row.len().saturating_mul(std::mem::size_of::<f32>()))
+            },
+        )
+    }
+}
 impl<T: HeapBytes> HeapBytes for Option<T> {
     fn heap_bytes(&self) -> usize {
         self.as_ref().map_or(0, HeapBytes::heap_bytes)
@@ -703,6 +1308,23 @@ impl<T: HeapBytes> HeapBytes for Option<T> {
 /// element) both mean "not set".
 fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
     column.into_iter().map(Option::flatten).collect()
+}
+
+fn cache_key_column(
+    value: Option<OneOrMany<String>>,
+    n: usize,
+    is_batch: bool,
+    name: &str,
+) -> Result<Vec<Option<String>>, Error> {
+    if !is_batch && matches!(value, Some(OneOrMany::Many(_))) {
+        return Err(Error::Validation(format!(
+            "{name} should be a string for a single request"
+        )));
+    }
+    Ok(fan_out(value, n, name)?
+        .into_iter()
+        .map(|key| key.filter(|key| !key.is_empty()))
+        .collect())
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
@@ -751,9 +1373,16 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
 mod tests {
     use super::*;
 
-    /// Vocab size for tests that aren't about the vocab bound (see
-    /// `sampling::tests::TEST_VOCAB`).
-    const TEST_VOCAB: u64 = 1000;
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestProcessorExtensions {
+        multimodal_custom: TestProcessorExtension,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct TestProcessorExtension {
+        value: i64,
+    }
 
     fn requests(body: &str) -> Result<(Vec<GenerateRequest>, bool), Error> {
         serde_json::from_str::<GenerateBody>(body)
@@ -824,34 +1453,82 @@ mod tests {
     fn split_validates_inputs() {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
-        // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization, not here.
-        let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
-        assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
+        assert!(requests(r#"{"text": "a", "sampling_params": {"n": 0}}"#).is_err());
     }
 
-    /// Unported `GenerateReqInput` fields are IGNORED, not rejected.
-    ///
-    /// These are all real fields on Python's `GenerateReqInput` that this server
-    /// has not ported. `deny_unknown_fields` turned every one of them into a 400,
-    /// so a client that worked against the Python server broke here — and the
-    /// wire-compat fields (`lora_path`, `image_data`, `return_routed_experts`) had
-    /// to be declared and dropped by hand just to let `bench_serving` through.
-    /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
-    /// behavior; a typo being silently ignored is the same trade Python makes.
     #[test]
-    fn unported_generate_req_input_fields_are_ignored() {
+    fn parallel_samples_preserve_prompt_order_seed_and_pairing_without_reexpansion() {
+        let (samples, batch) = requests(
+            r#"{
+            "text":["first","second"], "rid":["a","b"],
+            "bootstrap_room":[10,11], "return_logprob":true,
+            "sampling_params":[
+                {"n":3,"sampling_seed":17,"regex":"[a-z]+"},
+                {"n":3,"sampling_seed":19,"regex":"[0-9]+"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        assert!(batch);
+        assert_eq!(samples.len(), 6);
+        for (index, sample) in samples.iter().enumerate() {
+            let prompt = index / 3;
+            assert_eq!(sample.text.as_deref(), Some(["first", "second"][prompt]));
+            assert_eq!(sample.sampling_params.sampling_seed, Some([17, 19][prompt]));
+            assert_eq!(
+                sample.sampling_params.regex.as_deref(),
+                Some(["[a-z]+", "[0-9]+"][prompt])
+            );
+            assert_eq!(
+                sample.rid.client_facing(),
+                format!("{}_{}", ["a", "b"][prompt], index % 3)
+            );
+            assert_eq!(sample.bootstrap_room, Some(30 + index as i64));
+            assert!(sample.return_logprob);
+            let forwarded: GenerateBody =
+                serde_json::from_slice(&serde_json::to_vec(sample).unwrap()).unwrap();
+            let (forwarded, batch) = forwarded.into_requests().unwrap();
+            assert!(!batch);
+            assert_eq!(forwarded.len(), 1);
+            assert_eq!(forwarded[0].bootstrap_room, sample.bootstrap_room);
+            assert_eq!(forwarded[0].rid.client_facing(), sample.rid.client_facing());
+        }
+        let (samples, batch) = requests(r#"{"text":"only","sampling_params":{"n":5}}"#).unwrap();
+        assert!(batch);
+        assert_eq!(samples.len(), 5);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.rid.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            5
+        );
+        for (body, expected) in [
+            (
+                r#"{"text":["a","b"],"sampling_params":[{"n":2},{"n":3}]}"#,
+                "same for all",
+            ),
+            (
+                r#"{"text":"a","sampling_params":{"n":2},"return_logprob":[true]}"#,
+                "Cannot use list",
+            ),
+            (
+                r#"{"text":"a","sampling_params":{"n":2},"custom_logit_processor":[null]}"#,
+                "Cannot use list custom_logit_processor",
+            ),
+            (
+                r#"{"text":["a","b"],"sampling_params":{"n":9223372036854775807}}"#,
+                "maximum",
+            ),
+        ] {
+            assert!(requests(body).unwrap_err().to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_generate_fields_are_ignored() {
         for field in [
-            r#""priority": 3"#,
-            r#""extra_key": "k""#,
-            r#""session_id": "s""#,
-            r#""session_params": {"a": 1}"#,
-            r#""return_sampling_mask": true"#,
-            r#""custom_logit_processor": "cls""#,
-            r#""lora_path": "adapter""#,
-            r#""image_data": "base64""#,
-            r#""return_routed_experts": true"#,
-            r#""bootstrap_host": "h""#,
             // Python has no top-level `n` either, and ignores it just the same.
             r#""n": 1"#,
             r#""totally_made_up": 1"#,
@@ -861,6 +1538,75 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+        }
+    }
+
+    #[test]
+    fn beam_requests_preserve_group_width_and_return_count() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/beam_outputs_python.json")).unwrap();
+        for case in fixture["requests"].as_array().unwrap() {
+            let (mut normalized, _) = requests(&case["body"].to_string()).unwrap();
+            let expected = case["expected"].as_array().unwrap();
+            assert_eq!(normalized.len(), expected.len(), "{case}");
+            for (request, expected) in normalized.iter_mut().zip(expected) {
+                request
+                    .sampling_params
+                    .normalize(true, fixture["vocab_size"].as_u64().unwrap())
+                    .unwrap();
+                assert_eq!(serde_json::json!(request.input_ids), expected["input_ids"]);
+                assert_eq!(
+                    serde_json::json!(request.sampling_params.beam_width),
+                    expected["beam_width"]
+                );
+                // Ordinary n-way sampling is already split into independent
+                // requests; a beam group's return count must reach the scheduler.
+                assert_eq!(
+                    serde_json::json!(request.sampling_params.n),
+                    if expected["beam_width"].as_u64().unwrap() > 1 {
+                        expected["n"].clone()
+                    } else {
+                        serde_json::json!(1)
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_features_reject_nondefaults_but_accept_default_serialization() {
+        for (name, value) in [
+            ("session_id", serde_json::json!("session")),
+            ("session_params", serde_json::json!({"id":"session"})),
+            ("lora_path", serde_json::json!([null, "adapter"])),
+            ("lora_id", serde_json::json!("adapter")),
+            ("background", serde_json::json!(true)),
+            ("no_logs", serde_json::json!(true)),
+            (
+                "external_trace_header",
+                serde_json::json!({"trace":"value"}),
+            ),
+            ("http_worker_ipc", serde_json::json!("ipc:///worker")),
+            ("need_wait_for_mm_inputs", serde_json::json!(true)),
+            ("num_items_assigned", serde_json::json!({"image":[0]})),
+            ("encoder_urls", serde_json::json!(["http://encoder"])),
+        ] {
+            let mut body = serde_json::json!({"text":"prompt"});
+            body[name] = value;
+            let error = requests(&body.to_string()).unwrap_err();
+            assert_eq!(error.http_status(), 400);
+            assert!(error.to_string().contains(name));
+            for empty in [
+                serde_json::Value::Null,
+                serde_json::json!(false),
+                serde_json::json!([]),
+                serde_json::json!([null, null]),
+                serde_json::json!({}),
+                serde_json::json!(""),
+            ] {
+                body[name] = empty;
+                assert!(requests(&body.to_string()).is_ok(), "{body}");
+            }
         }
     }
 
@@ -900,10 +1646,8 @@ mod tests {
         );
     }
 
-    /// The native `bench_serving` payload (a `GenerateReqInput` superset) parses:
-    /// its `lora_path`/`return_routed_experts` are accepted-but-ignored and a
-    /// `null` `image_data` means "no multimodal input", so `split` succeeds
-    /// while the real fields survive.
+    /// Full benchmark payloads include default values for optional features.
+    /// Null media/adapters and disabled auxiliary outputs preserve text serving.
     #[test]
     fn accepts_bench_serving_payload() {
         let (ps, is_batch) = requests(
@@ -935,7 +1679,13 @@ mod tests {
         let (ps, _) = requests(r#"{"text": "a", "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
         assert_eq!(
             images_of(&ps[0]),
-            vec![src("u1"), MmItem::Ref { url: "u2".into() }]
+            vec![
+                src("u1"),
+                MmItem::Ref {
+                    url: "u2".into(),
+                    content_hash: None
+                }
+            ]
         );
 
         // Batch + scalar image: broadcast, one image per item.
@@ -972,6 +1722,89 @@ mod tests {
         assert!(ps[1].has_multimodal());
     }
 
+    #[test]
+    fn multimodal_extensions_follow_request_batch_shape() {
+        let single = r#"{"input_ids":[9],"image_data":"u","multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        let (reqs, is_batch) = requests(single).unwrap();
+        assert!(!is_batch);
+        let value = reqs[0]
+            .mm
+            .as_ref()
+            .unwrap()
+            .processor_extensions
+            .0
+            .get("multimodal_placeholders")
+            .unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+
+        let batched = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[[{"type":"image","token_index":0,"item_index":0}],[{"type":"image","token_index":0,"item_index":0}]]}"#;
+        let (reqs, is_batch) = requests(batched).unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(GenerateRequest::has_multimodal));
+        assert!(reqs.iter().all(|request| {
+            request
+                .mm
+                .as_ref()
+                .and_then(|mm| mm.processor_extensions.0.get("multimodal_placeholders"))
+                .and_then(rmpv::Value::as_array)
+                .is_some_and(|placeholders| placeholders.len() == 1)
+        }));
+
+        let invalid = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_placeholders":[{"type":"image","token_index":0,"item_index":0}]}"#;
+        assert!(requests(invalid).is_err());
+
+        let generic = r#"{"input_ids":[[9],[8]],"image_data":["u","v"],"multimodal_custom":[{"value":1},{"value":2}]}"#;
+        let (reqs, _) = requests(generic).unwrap();
+        assert_eq!(
+            reqs[1]
+                .mm
+                .as_ref()
+                .unwrap()
+                .processor_extensions
+                .0
+                .get("multimodal_custom")
+                .unwrap()
+                .as_map()
+                .unwrap()[0]
+                .1
+                .as_i64(),
+            Some(2)
+        );
+
+        let extensions: TestProcessorExtensions =
+            requests(r#"{"input_ids":[9],"multimodal_custom":{"value":3}}"#)
+                .unwrap()
+                .0
+                .pop()
+                .unwrap()
+                .mm
+                .unwrap()
+                .processor_extensions
+                .deserialize()
+                .unwrap();
+        assert_eq!(extensions.multimodal_custom.value, 3);
+
+        for fields in [
+            r#"{"multimodal_custom":{"value":true}}"#,
+            r#"{"multimodal_custom":{"value":"3"}}"#,
+            r#"{"multimodal_custom":{"value":3,"unknown":0}}"#,
+            r#"{"multimodal_custom":{}}"#,
+        ] {
+            let extensions: ProcessorExtensions = serde_json::from_str(fields).unwrap();
+            assert!(
+                extensions.deserialize::<TestProcessorExtensions>().is_err(),
+                "{fields}"
+            );
+        }
+
+        let (reqs, _) = requests(r#"{"text":"hi","totally_made_up":1}"#).unwrap();
+        assert!(reqs[0].mm.is_none());
+
+        let (reqs, _) = requests(r#"{"input_ids":[9],"multimodal_custom":null}"#).unwrap();
+        assert!(!reqs[0].has_multimodal());
+    }
+
     /// A scalar broadcast is budget-checked before the deep clones (16 MiB ×
     /// 4096 prompts would be 64 GiB and an abort); per-item lists clone nothing
     /// and are never charged.
@@ -990,32 +1823,53 @@ mod tests {
         assert!(multimodal::fan_out(Some(small), 2, true, "audio_data").is_ok());
     }
 
-    /// `mm_hashes` rides only on single requests (Python `__getitem__`
-    /// parity: batches drop it) and moves into the work item.
+    /// Hashes follow their image lists through batching, forwarding, and the
+    /// worker handoff. Python generates the expected normalization and errors.
     #[test]
-    fn mm_hashes_single_only() {
-        let (mut ps, _) =
-            requests(r#"{"text": "a", "image_data": "u", "mm_hashes": ["a1b2", "0xff"]}"#).unwrap();
-        assert_eq!(ps[0].mm.as_ref().unwrap().mm_hashes, vec!["a1b2", "0xff"]);
-        assert_eq!(ps[0].take_mm_work().mm_hashes, vec!["a1b2", "0xff"]);
-        assert!(ps[0].mm.as_ref().unwrap().mm_hashes.is_empty());
-
-        // A batch cannot carry hashes (Python drops them), so it is rejected,
-        // as is the nested batch shape on a single request...
-        for body in [
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": [["x"], ["y"]]}"#,
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": ["x", "y"]}"#,
-            r#"{"text": "a", "image_data": "u", "mm_hashes": [["x"]]}"#,
-        ] {
-            let err = requests(body).err().unwrap();
-            assert!(matches!(err, Error::Validation(_)), "{body}: {err:?}");
-        }
-        // ...while an absent or empty field is not a payload and must still pass.
-        for body in [
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": null}"#,
-            r#"{"text": ["a", "b"], "image_data": ["u", "v"], "mm_hashes": []}"#,
-        ] {
-            assert!(requests(body).is_ok(), "{body}");
+    fn mm_hashes_match_python_request_contract() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/mm_hashes_python.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let normalized = serde_json::from_value::<GenerateBody>(case["body"].clone())
+                .unwrap()
+                .into_requests();
+            if let Err(error) = &normalized {
+                assert_eq!(error.http_status(), 400, "{case}");
+            }
+            let result = (|| {
+                let (requests, _) = normalized.map_err(|error| error.to_string())?;
+                let mut values = Vec::new();
+                for mut request in requests {
+                    // DP forwarding serializes the normalized child back through
+                    // GenerateBody before running its processor.
+                    let forwarded = serde_json::to_value(&request).unwrap();
+                    let (mut children, _) = serde_json::from_value::<GenerateBody>(forwarded)
+                        .unwrap()
+                        .into_requests()
+                        .unwrap();
+                    assert_eq!(children.len(), 1);
+                    let direct = request.take_mm_work();
+                    let work = children[0].take_mm_work();
+                    assert_eq!(direct.mm_hashes, work.mm_hashes);
+                    assert_eq!(direct.mm_content_hashes, work.mm_content_hashes);
+                    assert!(request.mm.as_ref().unwrap().mm_hashes.is_empty());
+                    let content = multimodal::normalize_content_hashes(
+                        &work.image_data,
+                        work.mm_content_hashes,
+                    )?;
+                    values.push(serde_json::json!({
+                        "mm_hashes": work.mm_hashes, "mm_content_hashes": content,
+                    }));
+                }
+                Ok::<_, String>(values)
+            })();
+            match result {
+                Ok(values) => assert_eq!(serde_json::json!(values), case["expected"], "{case}"),
+                Err(error) => assert!(
+                    error.contains(case["error"].as_str().unwrap()),
+                    "{error}: {case}"
+                ),
+            }
         }
     }
 
@@ -1150,7 +2004,7 @@ mod tests {
         assert!(!ps[1].return_logprob);
         assert_eq!(ps[0].logprob_start_len, 0);
         assert_eq!(ps[1].logprob_start_len, 2);
-        assert!(ps[1].return_hidden_states);
+        assert_eq!(ps[1].return_hidden_states, HiddenStatesMode::Full);
 
         let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
         assert!(
@@ -1267,5 +2121,24 @@ mod tests {
         assert_eq!(ps[0].bootstrap_host.as_deref(), Some("2.2.2.2"));
         assert_eq!(ps[0].bootstrap_room, Some(0));
         assert_eq!(ps[0].routed_dp_rank, Some(0));
+    }
+
+    #[test]
+    fn prompt_ids_option_survives_batches_parallel_samples_and_dp_forwarding() {
+        let body: GenerateBody = serde_json::from_value(serde_json::json!({
+            "input_ids": [[1, 2], [3]],
+            "return_prompt_token_ids": true,
+            "sampling_params": {"n": 2},
+        }))
+        .unwrap();
+        let (requests, is_batch) = body.into_requests().unwrap();
+        assert!(is_batch);
+        assert_eq!(requests.len(), 4);
+        for request in requests {
+            assert!(request.return_prompt_token_ids);
+            let forwarded: GenerateBody =
+                serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+            assert!(forwarded.into_requests().unwrap().0[0].return_prompt_token_ids);
+        }
     }
 }

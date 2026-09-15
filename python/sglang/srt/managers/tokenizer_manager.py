@@ -1245,6 +1245,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
+            if obj.positional_embed_overrides is not None:
+                obj.positional_embed_overrides.validate(
+                    len(input_ids), self.model_config.hidden_size
+                )
             self._validate_token_ids_logprob(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states

@@ -4,7 +4,6 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
@@ -133,9 +132,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "Prefill server does not support 'fake' as the transfer backend"
         )
 
-        if envs.SGLANG_RUST_SERVER.get():
-            _alias_bootstrap_port_to_api_port(server_args)
-
     if cfg.disaggregation_mode in ("prefill", "decode"):
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -146,44 +142,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
-
-
-def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
-    """Rust-server prefill serves the KV bootstrap registry on the api listener
-    itself, so the resolved bootstrap port must BE the api port — every internal
-    consumer (KVManager registration, PrefillBootstrapQueue) reads the resolved
-    field and agrees automatically. Decode is untouched: there the field names
-    the PREFILL side's bootstrap port and must stay as the operator set it.
-    """
-    cfg = resolving_view(server_args)
-    default_port = next(
-        f.default
-        for f in record_fields(type(server_args))
-        if f.name == "disaggregation_bootstrap_port"
-    )
-    if cfg.disaggregation_bootstrap_port not in (
-        default_port,
-        cfg.port,
-    ):
-        raise ValueError(
-            "SGLANG_RUST_SERVER serves the PD KV bootstrap registry on the api "
-            "port itself; --disaggregation-bootstrap-port "
-            f"{cfg.disaggregation_bootstrap_port} conflicts with --port "
-            f"{cfg.port}. Drop --disaggregation-bootstrap-port (decode "
-            "nodes and the PD router must then target the prefill api port)."
-        )
-    if cfg.disaggregation_bootstrap_port != cfg.port:
-        logger.info(
-            "SGLANG_RUST_SERVER: KV bootstrap registry is served on the api "
-            "port; disaggregation_bootstrap_port %d -> %d",
-            cfg.disaggregation_bootstrap_port,
-            cfg.port,
-        )
-        declare_resolution(
-            server_args,
-            "_alias_bootstrap_port_to_api_port",
-            disaggregation_bootstrap_port=cfg.port,
-        )
 
 
 def handle_encoder_disaggregation(server_args: Any):

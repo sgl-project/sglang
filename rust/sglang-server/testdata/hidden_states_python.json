@@ -1,0 +1,19 @@
+{
+  "requests": [
+    {"body": {"input_ids": [1]}, "modes": [false]},
+    {"body": {"input_ids": [1], "return_hidden_states": "last"}, "modes": ["last"]},
+    {"body": {"input_ids": [1], "return_hidden_states": true}, "modes": [true]},
+    {"body": {"input_ids": [[1], [2], [3]], "return_hidden_states": [false, "last", true]}, "modes": [false, "last", true]},
+    {"body": {"input_ids": [[1], [2]], "return_hidden_states": ["last", true], "sampling_params": {"n": 2}}, "modes": ["last", "last", true, true]},
+    {"body": {"input_ids": [[1], [2]], "return_hidden_states": "last"}, "modes": ["last", "last"]}
+  ],
+  "invalid_modes": [null, "full", "false", "LAST", 1, [true, "full"]],
+  "outputs": [
+    {"mode": "last", "stored": [[0.125, 0.25]], "output": [0.125, 0.25], "shape": 2, "lengths": [1, 1], "values": [0.125, 0.25]},
+    {"mode": true, "stored": [[[0.125, 0.25], [0.5, 1.0]], [-0.5, -0.25]], "output": [[[0.125, 0.25], [0.5, 1.0]], [-0.5, -0.25]], "shape": [[2, 2], 2], "lengths": [4, 2], "values": [0.125, 0.25, 0.5, 1.0, -0.5, -0.25]},
+    {"mode": false, "stored": [], "output": null, "shape": null, "lengths": [], "values": []},
+    {"mode": true, "stored": [], "output": [], "shape": 0, "lengths": [], "values": []},
+    {"mode": "last", "stored": [], "output": null, "shape": null, "lengths": [], "values": []},
+    {"mode": true, "stored": [[0.5, 0.25], [0.125, 0.0]], "output": [[0.5, 0.25], [0.125, 0.0]], "shape": [2, 2], "lengths": [2, 2], "values": [0.5, 0.25, 0.125, 0.0]}
+  ]
+}

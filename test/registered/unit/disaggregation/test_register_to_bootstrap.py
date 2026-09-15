@@ -17,6 +17,9 @@ class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
 
     def setUp(self):
+        # The five-attempt tests exercise the Python frontend policy. Rust's
+        # deadline policy is exercised explicitly below with an advancing clock.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
         # register_to_bootstrap reads get_parallel().load_balance_method /
         # .enable_dsa_cache_layer_split and get_serving().port from the
         # published config.
@@ -25,6 +28,40 @@ class TestRegisterToBootstrap(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_rust_registration_waits_for_a_delayed_listener_and_fails_at_deadline(
+        self, mock_put, mock_time
+    ):
+        now = 0.0
+
+        def sleep(delay):
+            nonlocal now
+            now += delay
+
+        mock_time.monotonic.side_effect = lambda: now
+        mock_time.sleep.side_effect = sleep
+        ready = MagicMock(status_code=200)
+        # Other TP ranks can arrive before the leader finishes loading its
+        # frontend. More than five failed attempts must still be recoverable.
+        mock_put.side_effect = [ConnectionRefusedError("not ready")] * 6 + [ready]
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(120),
+        ):
+            manager = self._make_manager()
+            manager.register_to_bootstrap()
+            self.assertEqual(mock_put.call_count, 7)
+            mock_put.reset_mock(side_effect=True)
+            mock_put.side_effect = ConnectionRefusedError("never ready")
+            start = now
+            with self.assertRaisesRegex(RuntimeError, "HTTP bootstrap.*120 seconds"):
+                manager.register_to_bootstrap()
+            self.assertAlmostEqual(now - start, 120)
+            self.assertTrue(
+                all(0 < c.kwargs["timeout"] <= 5 for c in mock_put.call_args_list)
+            )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")

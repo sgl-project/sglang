@@ -402,7 +402,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
                     printable = find_printable_text(new_text)
-                    s.sent_offset = s.decoded_text_len + len(printable)
+                    # Additional fallback bytes can temporarily shorten the
+                    # printable prefix. Never rewind text already sent.
+                    s.sent_offset = max(
+                        s.sent_offset, s.decoded_text_len + len(printable)
+                    )
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 

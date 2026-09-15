@@ -1,0 +1,755 @@
+[
+  {
+    "name": "wordlevel",
+    "tokenizer": {
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        {
+          "id": 0,
+          "content": "<s>",
+          "single_word": false,
+          "lstrip": false,
+          "rstrip": false,
+          "normalized": false,
+          "special": true
+        },
+        {
+          "id": 1,
+          "content": "</s>",
+          "single_word": false,
+          "lstrip": false,
+          "rstrip": false,
+          "normalized": false,
+          "special": true
+        }
+      ],
+      "normalizer": null,
+      "pre_tokenizer": null,
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": {
+          "<s>": 0,
+          "</s>": 1,
+          "[UNK]": 2,
+          "hello": 3,
+          "world": 4,
+          "世界": 5,
+          "hi": 6
+        },
+        "unk_token": "[UNK]"
+      }
+    },
+    "vocab_size": 7,
+    "cases": [
+      {
+        "name": "prompt_space",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            4
+          ],
+          [
+            5
+          ],
+          [
+            6
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " world",
+          " 世界",
+          " hi"
+        ]
+      },
+      {
+        "name": "unicode_context",
+        "prompt_context": [
+          5
+        ],
+        "chunks": [
+          [
+            3
+          ],
+          [
+            4
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " hello",
+          " world"
+        ]
+      },
+      {
+        "name": "surrogate_context",
+        "prompt_context": [
+          -101,
+          2000000000,
+          3
+        ],
+        "chunks": [
+          [
+            4
+          ],
+          [
+            5
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " world",
+          " 世界"
+        ]
+      },
+      {
+        "name": "surrogate_output",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            -102,
+            2000000000
+          ],
+          [
+            4
+          ]
+        ],
+        "skip_special_tokens": false,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " <s> <s>",
+          " world"
+        ]
+      },
+      {
+        "name": "special_True_True",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            0,
+            1
+          ],
+          [
+            4
+          ],
+          [
+            1
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "",
+          " world",
+          ""
+        ]
+      },
+      {
+        "name": "special_True_False",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            0,
+            1
+          ],
+          [
+            4
+          ],
+          [
+            1
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": false,
+        "expected": [
+          "",
+          " world",
+          ""
+        ]
+      },
+      {
+        "name": "special_False_True",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            0,
+            1
+          ],
+          [
+            4
+          ],
+          [
+            1
+          ]
+        ],
+        "skip_special_tokens": false,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " <s> </s>",
+          " world",
+          " </s>"
+        ]
+      },
+      {
+        "name": "special_False_False",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            0,
+            1
+          ],
+          [
+            4
+          ],
+          [
+            1
+          ]
+        ],
+        "skip_special_tokens": false,
+        "spaces_between_special_tokens": false,
+        "expected": [
+          " <s> </s>",
+          " world",
+          " </s>"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "bytefallback",
+    "tokenizer": {
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        {
+          "id": 1,
+          "content": "<s>",
+          "single_word": false,
+          "lstrip": false,
+          "rstrip": false,
+          "normalized": false,
+          "special": true
+        },
+        {
+          "id": 2,
+          "content": "</s>",
+          "single_word": false,
+          "lstrip": false,
+          "rstrip": false,
+          "normalized": false,
+          "special": true
+        }
+      ],
+      "normalizer": null,
+      "pre_tokenizer": null,
+      "post_processor": null,
+      "decoder": {
+        "type": "Sequence",
+        "decoders": [
+          {
+            "type": "ByteFallback"
+          },
+          {
+            "type": "Fuse"
+          }
+        ]
+      },
+      "model": {
+        "type": "BPE",
+        "dropout": null,
+        "unk_token": "[UNK]",
+        "continuing_subword_prefix": null,
+        "end_of_word_suffix": null,
+        "fuse_unk": false,
+        "byte_fallback": true,
+        "ignore_merges": false,
+        "vocab": {
+          "[UNK]": 0,
+          "<s>": 1,
+          "</s>": 2,
+          "hello": 3,
+          " ": 4,
+          "world": 5,
+          "😀": 6,
+          "中": 7,
+          "\n": 8,
+          "<0x00>": 9,
+          "<0x01>": 10,
+          "<0x02>": 11,
+          "<0x03>": 12,
+          "<0x04>": 13,
+          "<0x05>": 14,
+          "<0x06>": 15,
+          "<0x07>": 16,
+          "<0x08>": 17,
+          "<0x09>": 18,
+          "<0x0A>": 19,
+          "<0x0B>": 20,
+          "<0x0C>": 21,
+          "<0x0D>": 22,
+          "<0x0E>": 23,
+          "<0x0F>": 24,
+          "<0x10>": 25,
+          "<0x11>": 26,
+          "<0x12>": 27,
+          "<0x13>": 28,
+          "<0x14>": 29,
+          "<0x15>": 30,
+          "<0x16>": 31,
+          "<0x17>": 32,
+          "<0x18>": 33,
+          "<0x19>": 34,
+          "<0x1A>": 35,
+          "<0x1B>": 36,
+          "<0x1C>": 37,
+          "<0x1D>": 38,
+          "<0x1E>": 39,
+          "<0x1F>": 40,
+          "<0x20>": 41,
+          "<0x21>": 42,
+          "<0x22>": 43,
+          "<0x23>": 44,
+          "<0x24>": 45,
+          "<0x25>": 46,
+          "<0x26>": 47,
+          "<0x27>": 48,
+          "<0x28>": 49,
+          "<0x29>": 50,
+          "<0x2A>": 51,
+          "<0x2B>": 52,
+          "<0x2C>": 53,
+          "<0x2D>": 54,
+          "<0x2E>": 55,
+          "<0x2F>": 56,
+          "<0x30>": 57,
+          "<0x31>": 58,
+          "<0x32>": 59,
+          "<0x33>": 60,
+          "<0x34>": 61,
+          "<0x35>": 62,
+          "<0x36>": 63,
+          "<0x37>": 64,
+          "<0x38>": 65,
+          "<0x39>": 66,
+          "<0x3A>": 67,
+          "<0x3B>": 68,
+          "<0x3C>": 69,
+          "<0x3D>": 70,
+          "<0x3E>": 71,
+          "<0x3F>": 72,
+          "<0x40>": 73,
+          "<0x41>": 74,
+          "<0x42>": 75,
+          "<0x43>": 76,
+          "<0x44>": 77,
+          "<0x45>": 78,
+          "<0x46>": 79,
+          "<0x47>": 80,
+          "<0x48>": 81,
+          "<0x49>": 82,
+          "<0x4A>": 83,
+          "<0x4B>": 84,
+          "<0x4C>": 85,
+          "<0x4D>": 86,
+          "<0x4E>": 87,
+          "<0x4F>": 88,
+          "<0x50>": 89,
+          "<0x51>": 90,
+          "<0x52>": 91,
+          "<0x53>": 92,
+          "<0x54>": 93,
+          "<0x55>": 94,
+          "<0x56>": 95,
+          "<0x57>": 96,
+          "<0x58>": 97,
+          "<0x59>": 98,
+          "<0x5A>": 99,
+          "<0x5B>": 100,
+          "<0x5C>": 101,
+          "<0x5D>": 102,
+          "<0x5E>": 103,
+          "<0x5F>": 104,
+          "<0x60>": 105,
+          "<0x61>": 106,
+          "<0x62>": 107,
+          "<0x63>": 108,
+          "<0x64>": 109,
+          "<0x65>": 110,
+          "<0x66>": 111,
+          "<0x67>": 112,
+          "<0x68>": 113,
+          "<0x69>": 114,
+          "<0x6A>": 115,
+          "<0x6B>": 116,
+          "<0x6C>": 117,
+          "<0x6D>": 118,
+          "<0x6E>": 119,
+          "<0x6F>": 120,
+          "<0x70>": 121,
+          "<0x71>": 122,
+          "<0x72>": 123,
+          "<0x73>": 124,
+          "<0x74>": 125,
+          "<0x75>": 126,
+          "<0x76>": 127,
+          "<0x77>": 128,
+          "<0x78>": 129,
+          "<0x79>": 130,
+          "<0x7A>": 131,
+          "<0x7B>": 132,
+          "<0x7C>": 133,
+          "<0x7D>": 134,
+          "<0x7E>": 135,
+          "<0x7F>": 136,
+          "<0x80>": 137,
+          "<0x81>": 138,
+          "<0x82>": 139,
+          "<0x83>": 140,
+          "<0x84>": 141,
+          "<0x85>": 142,
+          "<0x86>": 143,
+          "<0x87>": 144,
+          "<0x88>": 145,
+          "<0x89>": 146,
+          "<0x8A>": 147,
+          "<0x8B>": 148,
+          "<0x8C>": 149,
+          "<0x8D>": 150,
+          "<0x8E>": 151,
+          "<0x8F>": 152,
+          "<0x90>": 153,
+          "<0x91>": 154,
+          "<0x92>": 155,
+          "<0x93>": 156,
+          "<0x94>": 157,
+          "<0x95>": 158,
+          "<0x96>": 159,
+          "<0x97>": 160,
+          "<0x98>": 161,
+          "<0x99>": 162,
+          "<0x9A>": 163,
+          "<0x9B>": 164,
+          "<0x9C>": 165,
+          "<0x9D>": 166,
+          "<0x9E>": 167,
+          "<0x9F>": 168,
+          "<0xA0>": 169,
+          "<0xA1>": 170,
+          "<0xA2>": 171,
+          "<0xA3>": 172,
+          "<0xA4>": 173,
+          "<0xA5>": 174,
+          "<0xA6>": 175,
+          "<0xA7>": 176,
+          "<0xA8>": 177,
+          "<0xA9>": 178,
+          "<0xAA>": 179,
+          "<0xAB>": 180,
+          "<0xAC>": 181,
+          "<0xAD>": 182,
+          "<0xAE>": 183,
+          "<0xAF>": 184,
+          "<0xB0>": 185,
+          "<0xB1>": 186,
+          "<0xB2>": 187,
+          "<0xB3>": 188,
+          "<0xB4>": 189,
+          "<0xB5>": 190,
+          "<0xB6>": 191,
+          "<0xB7>": 192,
+          "<0xB8>": 193,
+          "<0xB9>": 194,
+          "<0xBA>": 195,
+          "<0xBB>": 196,
+          "<0xBC>": 197,
+          "<0xBD>": 198,
+          "<0xBE>": 199,
+          "<0xBF>": 200,
+          "<0xC0>": 201,
+          "<0xC1>": 202,
+          "<0xC2>": 203,
+          "<0xC3>": 204,
+          "<0xC4>": 205,
+          "<0xC5>": 206,
+          "<0xC6>": 207,
+          "<0xC7>": 208,
+          "<0xC8>": 209,
+          "<0xC9>": 210,
+          "<0xCA>": 211,
+          "<0xCB>": 212,
+          "<0xCC>": 213,
+          "<0xCD>": 214,
+          "<0xCE>": 215,
+          "<0xCF>": 216,
+          "<0xD0>": 217,
+          "<0xD1>": 218,
+          "<0xD2>": 219,
+          "<0xD3>": 220,
+          "<0xD4>": 221,
+          "<0xD5>": 222,
+          "<0xD6>": 223,
+          "<0xD7>": 224,
+          "<0xD8>": 225,
+          "<0xD9>": 226,
+          "<0xDA>": 227,
+          "<0xDB>": 228,
+          "<0xDC>": 229,
+          "<0xDD>": 230,
+          "<0xDE>": 231,
+          "<0xDF>": 232,
+          "<0xE0>": 233,
+          "<0xE1>": 234,
+          "<0xE2>": 235,
+          "<0xE3>": 236,
+          "<0xE4>": 237,
+          "<0xE5>": 238,
+          "<0xE6>": 239,
+          "<0xE7>": 240,
+          "<0xE8>": 241,
+          "<0xE9>": 242,
+          "<0xEA>": 243,
+          "<0xEB>": 244,
+          "<0xEC>": 245,
+          "<0xED>": 246,
+          "<0xEE>": 247,
+          "<0xEF>": 248,
+          "<0xF0>": 249,
+          "<0xF1>": 250,
+          "<0xF2>": 251,
+          "<0xF3>": 252,
+          "<0xF4>": 253,
+          "<0xF5>": 254,
+          "<0xF6>": 255,
+          "<0xF7>": 256,
+          "<0xF8>": 257,
+          "<0xF9>": 258,
+          "<0xFA>": 259,
+          "<0xFB>": 260,
+          "<0xFC>": 261,
+          "<0xFD>": 262,
+          "<0xFE>": 263,
+          "<0xFF>": 264
+        },
+        "merges": []
+      }
+    },
+    "vocab_size": 265,
+    "cases": [
+      {
+        "name": "utf8_word_prefix",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            4,
+            249
+          ],
+          [
+            168
+          ],
+          [
+            161,
+            137
+          ],
+          [
+            5
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " ",
+          "",
+          "😀",
+          "world"
+        ]
+      },
+      {
+        "name": "utf8_cjk_prefix",
+        "prompt_context": [],
+        "chunks": [
+          [
+            7,
+            249
+          ],
+          [
+            168
+          ],
+          [
+            161,
+            137
+          ],
+          [
+            4,
+            5
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "中",
+          "",
+          "😀",
+          " world"
+        ]
+      },
+      {
+        "name": "utf8_terminal_partial",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            4
+          ],
+          [
+            237
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " ",
+          "�"
+        ]
+      },
+      {
+        "name": "utf8_terminal_partial_with_printed_prefix",
+        "prompt_context": [],
+        "chunks": [
+          [
+            3,
+            4,
+            237
+          ],
+          []
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "hello ",
+          "�"
+        ]
+      },
+      {
+        "name": "utf8_prompt_boundary",
+        "prompt_context": [
+          237,
+          193
+        ],
+        "chunks": [
+          [
+            182
+          ],
+          [
+            4,
+            5
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "",
+          "world"
+        ]
+      },
+      {
+        "name": "utf8_unicode_prompt_boundary",
+        "prompt_context": [
+          7,
+          249
+        ],
+        "chunks": [
+          [
+            168
+          ],
+          [
+            161,
+            137
+          ],
+          [
+            4,
+            5
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "",
+          "",
+          " world"
+        ]
+      },
+      {
+        "name": "newline_and_unicode",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            8
+          ],
+          [
+            7
+          ],
+          [
+            249,
+            168
+          ],
+          [
+            161,
+            137
+          ]
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          "\n",
+          "中",
+          "",
+          "😀"
+        ]
+      },
+      {
+        "name": "empty_terminal_chunk",
+        "prompt_context": [
+          3
+        ],
+        "chunks": [
+          [
+            4,
+            5
+          ],
+          []
+        ],
+        "skip_special_tokens": true,
+        "spaces_between_special_tokens": true,
+        "expected": [
+          " world",
+          ""
+        ]
+      }
+    ]
+  }
+]

@@ -1,4 +1,5 @@
 import copy
+import json
 import re
 import unittest
 import weakref
@@ -43,6 +44,53 @@ register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    def test_native_cache_identity_matches_python_batch_and_scheduler_contract(self):
+        fixtures = json.loads(
+            (
+                Path(__file__).resolve().parents[4]
+                / "rust/sglang-server/testdata/cache_identity_python.json"
+            ).read_text()
+        )
+        for fixture in fixtures:
+            with self.subTest(body=fixture["body"]):
+                request = GenerateReqInput(**fixture["body"])
+                request.normalize_batch_and_arguments()
+                prompts = (
+                    [request]
+                    if request.is_single
+                    else [request[i] for i in range(request.batch_size)]
+                )
+                # The Python parallel path copies each tokenized prompt n times.
+                actual = [
+                    [prompt.extra_key, prompt.cache_salt, prompt.routing_key]
+                    for prompt in prompts
+                    for _ in range(request.parallel_sample_num)
+                ]
+                self.assertEqual(actual, fixture["expected"])
+                for extra_key, cache_salt, routing_key in actual:
+                    tokenized = TokenizedGenerateReqInput(
+                        rid="cache-identity",
+                        input_text="prompt",
+                        input_ids=array("q", [1, 2]),
+                        input_embeds=None,
+                        mm_inputs=None,
+                        token_type_ids=None,
+                        sampling_params=SamplingParams(),
+                        return_logprob=False,
+                        logprob_start_len=-1,
+                        top_logprobs_num=0,
+                        token_ids_logprob=None,
+                        stream=False,
+                        extra_key=extra_key,
+                        cache_salt=cache_salt,
+                        routing_key=routing_key,
+                    )
+                    header = msgspec.msgpack.decode(msgpack_encode(tokenized))
+                    self.assertEqual(
+                        [header[35], header[44], header[32]],
+                        [extra_key, cache_salt, routing_key],
+                    )
+
     def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
         """Compare the Rust wire declaration with the imported Python schema."""
         rust_path = (

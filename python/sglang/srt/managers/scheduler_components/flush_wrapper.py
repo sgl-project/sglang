@@ -3,9 +3,6 @@ import time
 from typing import Callable, Optional, Tuple
 
 from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
-from sglang.srt.managers.scheduler_components.ipc_channels import (
-    SchedulerIpcChannels,
-)
 
 
 class SchedulerFlushWrapper:
@@ -14,11 +11,11 @@ class SchedulerFlushWrapper:
         *,
         flush_cache: Callable[[], bool],
         is_fully_idle: Callable[[], bool],
-        ipc_channels: SchedulerIpcChannels,
+        send_output: Callable[[FlushCacheReqOutput, FlushCacheReqInput], None],
     ) -> None:
         self._flush_cache = flush_cache
         self._is_fully_idle = is_fully_idle
-        self._ipc_channels = ipc_channels
+        self._send_output = send_output
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
 
     def handle(self, recv_req: FlushCacheReqInput) -> Optional[FlushCacheReqOutput]:
@@ -47,9 +44,7 @@ class SchedulerFlushWrapper:
         if self._is_fully_idle():
             success = self._flush_cache()
             self._pending = None
-            self._ipc_channels.send_to_tokenizer.send_output(
-                FlushCacheReqOutput(success=success), pending_req
-            )
+            self._send_output(FlushCacheReqOutput(success=success), pending_req)
             return
 
         if time.monotonic() >= deadline:
@@ -57,7 +52,7 @@ class SchedulerFlushWrapper:
                 "Deferred flush_cache timed out while waiting for idle state."
             )
             self._pending = None
-            self._ipc_channels.send_to_tokenizer.send_output(
+            self._send_output(
                 FlushCacheReqOutput(
                     success=False, message="Timed out waiting for idle state."
                 ),

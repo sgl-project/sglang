@@ -1,0 +1,22 @@
+[
+  {
+    "body": {"input_ids": [1, 2], "custom_logit_processor": "processor", "require_reasoning": true, "max_thinking_tokens": 0, "sampling_params": {"custom_params": {"thinking_budget": 99, "other": 7}}},
+    "expected": [["processor", true, {"thinking_budget": 0, "other": 7}]]
+  },
+  {
+    "body": {"input_ids": [[1], [2]], "custom_logit_processor": ["processor", null], "require_reasoning": true, "max_thinking_tokens": 32},
+    "expected": [["processor", true, {"thinking_budget": 32}], [null, true, {"thinking_budget": 32}]]
+  },
+  {
+    "body": {"input_ids": [[1], [2]], "custom_logit_processor": "processor", "require_reasoning": true, "max_thinking_tokens": 32, "sampling_params": {"n": 2}},
+    "expected": [["processor", true, {"thinking_budget": 32}], ["processor", true, {"thinking_budget": 32}], ["processor", true, {"thinking_budget": 32}], ["processor", true, {"thinking_budget": 32}]]
+  },
+  {
+    "body": {"input_ids": [1], "custom_logit_processor": "", "max_thinking_tokens": -1},
+    "expected": [["", false, {"thinking_budget": -1}]]
+  },
+  {
+    "body": {"input_ids": [[1], [2]], "custom_logit_processor": null, "max_thinking_tokens": null},
+    "expected": [[null, false, null], [null, false, null]]
+  }
+]

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// (or a broadcast) and a list of lists is per-prompt.
 pub type TokenIds = Vec<i32>;
 
+/// One prompt's token embeddings, in row-major `[tokens, hidden_size]` order.
+pub type InputEmbeddings = Vec<Vec<f32>>;
+
 /// A field taking a bare `T` **or** `[T,…]` (`text: "hi"` or `text: ["a","b"]`).
 /// `untagged` takes the first variant that matches, so a `T` that itself accepts
 /// a sequence would make `Many` unreachable — hence the [`OneOrManyItem`] gate.
@@ -17,6 +20,67 @@ pub type TokenIds = Vec<i32>;
 pub enum OneOrMany<T: OneOrManyItem> {
     One(T),
     Many(Vec<T>),
+}
+
+impl<T: OneOrManyItem + Default> Default for OneOrMany<T> {
+    fn default() -> Self {
+        Self::One(T::default())
+    }
+}
+
+/// Request capture modes and the resolved server maximum use the same ordering.
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HiddenStatesMode {
+    #[default]
+    Off,
+    Last,
+    Full,
+}
+
+impl Serialize for HiddenStatesMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_bool(false),
+            Self::Last => serializer.serialize_str("last"),
+            Self::Full => serializer.serialize_bool(true),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HiddenStatesMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = HiddenStatesMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or the string literal 'last'")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    HiddenStatesMode::Full
+                } else {
+                    HiddenStatesMode::Off
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "last" {
+                    Ok(HiddenStatesMode::Last)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 /// Types vetted for [`OneOrMany`]. Sealed, so adding one is a deliberate act in
@@ -45,7 +109,9 @@ mod sealed {
     impl SealedItem for bool {}
     impl SealedItem for i64 {}
     impl SealedItem for String {}
+    impl SealedItem for super::HiddenStatesMode {}
     impl SealedItem for super::TokenIds {}
+    impl SealedItem for super::InputEmbeddings {}
     /// `mm_hashes`: a flat list is one request's hashes, nested is per-request.
     impl SealedItem for Vec<String> {}
     // Nullable elements for the PD bootstrap fields (`List[Optional[...]]` in
@@ -54,6 +120,9 @@ mod sealed {
     // outer `Option<OneOrMany<…>>` field consumes it first.
     impl SealedItem for Option<i64> {}
     impl SealedItem for Option<String> {}
+    // An object is one prompt's overrides; a list contains per-prompt objects
+    // or nulls. Unlike the embedding matrix itself, an object cannot match a list.
+    impl SealedItem for Option<super::super::embeddings::PositionalEmbeds> {}
 }
 
 /// A msgspec `tag=True` struct: element 0 of its array is the Python class name

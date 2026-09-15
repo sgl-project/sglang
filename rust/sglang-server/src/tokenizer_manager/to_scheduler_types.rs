@@ -21,6 +21,7 @@ pub struct MmDispatch {
 /// Resolved once at boot from the scheduler's `server_args`.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    pub dp_size: usize,
     /// Token-ids-in mode: a generate request must arrive already tokenized.
     pub skip_tokenizer_init: bool,
     /// `model_config.vocab_size`; bounds client-supplied token ids. A required
@@ -33,18 +34,27 @@ pub struct Limits {
     /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
     pub allow_auto_truncate: bool,
     /// Whether the server can produce hidden states at all.
-    pub enable_return_hidden_states: bool,
+    pub max_return_hidden_states: crate::message::types::HiddenStatesMode,
+    pub enable_custom_logit_processor: bool,
+    pub enable_strict_thinking: bool,
+    pub disable_radix_cache: bool,
+    pub hidden_size: u64,
 }
 
 impl From<&ServerArgs> for Limits {
     fn from(sa: &ServerArgs) -> Self {
         Self {
+            dp_size: sa.dp_size,
             skip_tokenizer_init: sa.skip_tokenizer_init,
             vocab_size: sa.model_config.vocab_size,
             context_len: sa.model_config.context_len,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
-            enable_return_hidden_states: sa.enable_return_hidden_states,
+            max_return_hidden_states: sa.max_return_hidden_states,
+            enable_custom_logit_processor: sa.enable_custom_logit_processor,
+            enable_strict_thinking: sa.enable_strict_thinking,
+            disable_radix_cache: sa.disable_radix_cache,
+            hidden_size: sa.model_config.hidden_size,
         }
     }
 }

@@ -1,0 +1,434 @@
+{
+  "sglang:cached_tokens_total": {
+    "help": "Number of cached prompt tokens by source (device/host/storage).",
+    "labels": [
+      "cache_source",
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:e2e_request_latency_seconds": {
+    "buckets": [
+      0.1,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0,
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      20.0,
+      40.0,
+      60.0,
+      80.0,
+      100.0,
+      200.0,
+      400.0,
+      600.0,
+      1200.0,
+      1800.0,
+      2400.0
+    ],
+    "help": "Histogram of End-to-end request latency in seconds",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "is_streaming",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:generation_tokens_histogram": {
+    "buckets": [
+      100.0,
+      300.0,
+      500.0,
+      700.0,
+      1000.0,
+      1500.0,
+      2000.0,
+      3000.0,
+      4000.0,
+      5000.0,
+      6000.0,
+      7000.0,
+      8000.0,
+      9000.0,
+      10000.0,
+      12500.0,
+      15000.0,
+      17500.0,
+      20000.0,
+      22500.0,
+      25000.0,
+      27500.0,
+      30000.0,
+      35000.0,
+      40000.0,
+      60000.0,
+      80000.0,
+      100000.0,
+      200000.0,
+      300000.0,
+      400000.0,
+      600000.0,
+      800000.0,
+      1000000.0,
+      1100000.0
+    ],
+    "help": "Histogram of generation token length.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:generation_tokens_total": {
+    "help": "Number of generation tokens processed.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "is_streaming",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:get_loads_duration_seconds": {
+    "buckets": [
+      0.0001,
+      0.0005,
+      0.001,
+      0.005,
+      0.01,
+      0.05,
+      0.1,
+      0.5,
+      1.0
+    ],
+    "help": "Time spent serving /v1/loads requests (seconds).",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:http_requests_active": {
+    "gauge_mode": "livesum",
+    "help": "Number of currently active HTTP requests",
+    "labels": [
+      "cluster",
+      "endpoint",
+      "method"
+    ],
+    "type": "gauge",
+    "zero_series": false
+  },
+  "sglang:http_requests_total": {
+    "help": "Total number of HTTP requests by endpoint and method",
+    "labels": [
+      "cluster",
+      "endpoint",
+      "method"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:http_responses_total": {
+    "help": "Total number of HTTP responses by endpoint and status code",
+    "labels": [
+      "cluster",
+      "endpoint",
+      "method",
+      "status_code"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:inter_token_latency_seconds": {
+    "buckets": [
+      0.002,
+      0.004,
+      0.006,
+      0.008,
+      0.01,
+      0.015,
+      0.02,
+      0.025,
+      0.03,
+      0.035,
+      0.04,
+      0.06,
+      0.08,
+      0.1,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0,
+      2.0,
+      4.0,
+      6.0,
+      8.0
+    ],
+    "help": "Histogram of inter-token latency in seconds.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:num_aborted_requests_total": {
+    "help": "Number of requests aborted.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:num_requests_total": {
+    "help": "Number of requests processed.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "is_streaming",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:num_so_requests_total": {
+    "help": "Number of structured output requests processed.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:prompt_tokens_histogram": {
+    "buckets": [
+      100.0,
+      300.0,
+      500.0,
+      700.0,
+      1000.0,
+      1500.0,
+      2000.0,
+      3000.0,
+      4000.0,
+      5000.0,
+      6000.0,
+      7000.0,
+      8000.0,
+      9000.0,
+      10000.0,
+      12500.0,
+      15000.0,
+      17500.0,
+      20000.0,
+      22500.0,
+      25000.0,
+      27500.0,
+      30000.0,
+      35000.0,
+      40000.0,
+      60000.0,
+      80000.0,
+      100000.0,
+      200000.0,
+      300000.0,
+      400000.0,
+      600000.0,
+      800000.0,
+      1000000.0,
+      1100000.0
+    ],
+    "help": "Histogram of prompt token length.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:prompt_tokens_total": {
+    "help": "Number of prefill tokens processed.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "is_streaming",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:routing_keys_active": {
+    "gauge_mode": "livesum",
+    "help": "Number of unique routing keys with active requests",
+    "labels": [],
+    "type": "gauge",
+    "zero_series": true
+  },
+  "sglang:spec_verify_calls_total": {
+    "help": "Number of speculative decoding verification calls.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "counter",
+    "zero_series": false
+  },
+  "sglang:startup_cuda_graph_time_seconds": {
+    "gauge_mode": "mostrecent",
+    "help": "CUDA graph capture duration by phase in seconds.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "phase",
+      "priority",
+      "tenant"
+    ],
+    "type": "gauge",
+    "zero_series": false
+  },
+  "sglang:startup_time_seconds": {
+    "gauge_mode": "mostrecent",
+    "help": "Engine startup duration by phase in seconds.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "phase",
+      "priority",
+      "tenant"
+    ],
+    "type": "gauge",
+    "zero_series": false
+  },
+  "sglang:time_to_first_token_seconds": {
+    "buckets": [
+      0.1,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0,
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      20.0,
+      40.0,
+      60.0,
+      80.0,
+      100.0,
+      200.0,
+      400.0
+    ],
+    "help": "Histogram of time to first token in seconds.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "is_streaming",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  },
+  "sglang:uncached_prompt_tokens_histogram": {
+    "buckets": [
+      100.0,
+      300.0,
+      500.0,
+      700.0,
+      1000.0,
+      1500.0,
+      2000.0,
+      3000.0,
+      4000.0,
+      5000.0,
+      6000.0,
+      7000.0,
+      8000.0,
+      9000.0,
+      10000.0,
+      12500.0,
+      15000.0,
+      17500.0,
+      20000.0,
+      22500.0,
+      25000.0,
+      27500.0,
+      30000.0,
+      35000.0,
+      40000.0,
+      60000.0,
+      80000.0,
+      100000.0,
+      200000.0,
+      300000.0,
+      400000.0,
+      600000.0,
+      800000.0,
+      1000000.0,
+      1100000.0
+    ],
+    "help": "Histogram of uncached (compute) prompt token length.",
+    "labels": [
+      "cluster",
+      "engine_type",
+      "model_name",
+      "priority",
+      "tenant"
+    ],
+    "type": "histogram",
+    "zero_series": false
+  }
+}

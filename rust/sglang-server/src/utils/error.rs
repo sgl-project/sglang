@@ -14,6 +14,7 @@ pub enum Error {
     #[error("tokenize failed: {0}")]
     Tokenize(String),
 
+    /// Request media rejected by the MM worker before scheduler admission.
     #[error("encode failed: {0}")]
     Encode(String),
 
@@ -40,7 +41,7 @@ impl Error {
     /// codes used in the Python `_create_error_response`.
     pub fn http_status(&self) -> u16 {
         match self {
-            Error::Validation(_) => 400,
+            Error::Validation(_) | Error::Encode(_) => 400,
             Error::Disconnected => 499, // nginx-style client closed request
             Error::QueueFull => 503,
             _ => 500,

@@ -5,7 +5,8 @@
 //! `mpsc`/`mpmc`, no shared memory, no serialization beyond the msgpack bytes
 //! the payload already is.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -18,11 +19,14 @@ use crate::message::request::SchedulerRequest;
 /// single msgpack blob, so the large `input_ids` tensor bypasses msgpack.
 #[derive(Clone)]
 pub struct ToSchedulerTx {
-    tx: flume::Sender<SchedulerRequest>,
+    tx: flume::Sender<SchedulerMessage>,
+    work_slots: Arc<AtomicUsize>,
+    control_slots: Arc<AtomicUsize>,
+    work_capacity: usize,
 }
 
 pub struct ToSchedulerRx {
-    rx: flume::Receiver<SchedulerRequest>,
+    rx: flume::Receiver<SchedulerMessage>,
     /// One-slot buffer holding a message consumed by a blocking [`wait`] so the
     /// scheduler can park on idle without losing it — the next [`drain`] returns
     /// it first. Only ever touched by the single consumer (the Python thread),
@@ -31,7 +35,22 @@ pub struct ToSchedulerRx {
     ///
     /// [`wait`]: ToSchedulerRx::wait
     /// [`drain`]: ToSchedulerRx::drain
-    stash: Mutex<Option<SchedulerRequest>>,
+    stash: Mutex<Option<SchedulerMessage>>,
+}
+
+const CONTROL_CAPACITY: usize = 64;
+
+struct QueuePermit(Arc<AtomicUsize>);
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct SchedulerMessage {
+    request: SchedulerRequest,
+    _permit: QueuePermit,
 }
 
 /// A drained request batch in **columnar** (struct-of-arrays) form. The `ids`
@@ -69,7 +88,40 @@ impl ToSchedulerTx {
     /// caller can fail the request rather than block a worker thread.
     #[inline]
     pub fn try_push(&self, msg: SchedulerRequest) -> bool {
-        self.tx.try_send(msg).is_ok()
+        self.push(msg, &self.work_slots, self.work_capacity).is_ok()
+    }
+
+    /// Reserved control capacity shares FIFO order with work: an abort must
+    /// reach the scheduler after the generation request it cancels.
+    pub fn try_push_control(&self, msg: SchedulerRequest) -> Result<(), Option<SchedulerRequest>> {
+        self.push(msg, &self.control_slots, CONTROL_CAPACITY)
+    }
+
+    fn push(
+        &self,
+        request: SchedulerRequest,
+        slots: &Arc<AtomicUsize>,
+        capacity: usize,
+    ) -> Result<(), Option<SchedulerRequest>> {
+        if self.tx.is_disconnected() {
+            return Err(None);
+        }
+        if slots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < capacity).then_some(used + 1)
+            })
+            .is_err()
+        {
+            return Err(Some(request));
+        }
+        let message = SchedulerMessage {
+            request,
+            _permit: QueuePermit(slots.clone()),
+        };
+        self.tx.try_send(message).map_err(|error| match error {
+            flume::TrySendError::Full(message) => Some(message.request),
+            flume::TrySendError::Disconnected(_) => None,
+        })
     }
 }
 
@@ -85,11 +137,11 @@ impl ToSchedulerRx {
         let mut batch = RequestColumns::default();
         // A message parked by a prior blocking `wait` is delivered first.
         if let Some(m) = self.stash.lock().unwrap().take() {
-            push_msg(&mut batch, m);
+            push_msg(&mut batch, m.request);
         }
         while batch.headers.len() < max {
             match self.rx.try_recv() {
-                Ok(m) => push_msg(&mut batch, m),
+                Ok(m) => push_msg(&mut batch, m.request),
                 Err(_) => break, // Empty or Disconnected -> stop now
             }
         }
@@ -164,9 +216,14 @@ impl FromSchedulerRx {
 
 /// Build both halves of a bounded ring.
 pub fn to_scheduler(cap: usize) -> (ToSchedulerTx, ToSchedulerRx) {
-    let (tx, rx) = flume::bounded(cap);
+    let (tx, rx) = flume::bounded(cap.saturating_add(CONTROL_CAPACITY));
     (
-        ToSchedulerTx { tx },
+        ToSchedulerTx {
+            tx,
+            work_slots: Arc::new(AtomicUsize::new(0)),
+            control_slots: Arc::new(AtomicUsize::new(0)),
+            work_capacity: cap,
+        },
         ToSchedulerRx {
             rx,
             stash: Mutex::new(None),
@@ -188,6 +245,37 @@ mod tests {
             header: Bytes::from_static(h),
             ids: Bytes::new(),
         }
+    }
+
+    #[test]
+    fn control_reserve_preserves_fifo_and_releases_permits_after_drain() {
+        let (tx, rx) = to_scheduler(1);
+        assert!(tx.try_push(msg(b"work")));
+        assert!(!tx.try_push(msg(b"full")));
+        assert!(rx.wait(Duration::ZERO));
+        assert!(!tx.try_push(msg(b"stash still occupies a work slot")));
+        for _ in 0..CONTROL_CAPACITY {
+            tx.try_push_control(msg(b"abort")).unwrap();
+        }
+        let Err(Some(retry)) = tx.try_push_control(msg(b"retry")) else {
+            panic!("full reserve must return the undelivered control");
+        };
+        let first = rx.drain(1);
+        assert_eq!(first.headers, vec![Bytes::from_static(b"work")]);
+        assert!(tx.try_push(msg(b"next")));
+        assert_eq!(
+            rx.drain(CONTROL_CAPACITY).headers,
+            vec![Bytes::from_static(b"abort"); CONTROL_CAPACITY]
+        );
+        tx.try_push_control(retry).unwrap();
+        assert_eq!(
+            rx.drain(8).headers,
+            vec![Bytes::from_static(b"next"), Bytes::from_static(b"retry")]
+        );
+        drop(rx);
+        assert!(matches!(tx.try_push_control(msg(b"closed")), Err(None)));
+        assert_eq!(tx.work_slots.load(Ordering::Relaxed), 0);
+        assert_eq!(tx.control_slots.load(Ordering::Relaxed), 0);
     }
 
     /// `wait` parks when empty (times out), stashes a pushed message

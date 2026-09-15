@@ -1,0 +1,26 @@
+{
+  "requests": [
+    {"body": {"input_ids": [1], "return_sampling_mask": true}, "masks": [true]},
+    {"body": {"input_ids": [[1], [2]], "return_sampling_mask": [false, true]}, "masks": [false, true]},
+    {"body": {"input_ids": [[1], [2]], "return_sampling_mask": true, "sampling_params": {"n": 2}}, "masks": [true, true, true, true]},
+    {"body": {"input_ids": [1], "return_sampling_mask": null}, "masks": [false]}
+  ],
+  "steps": [
+    {
+      "tokens": [[9], [4], []],
+      "masks": [[[9, 10]], null, []],
+      "logprobs": [[-0.5], null, []],
+      "shapes": [[2], null, []],
+      "ids": [9, 10],
+      "values": [-0.5]
+    },
+    {
+      "tokens": [[5, 6], [8], [7]],
+      "masks": [[null, []], null, [[7]]],
+      "logprobs": [[null, -1.25], null, [0.0]],
+      "shapes": [[null, 0], null, [1]],
+      "ids": [7],
+      "values": [null, -1.25, 0.0]
+    }
+  ]
+}

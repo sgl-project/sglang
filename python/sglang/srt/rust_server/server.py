@@ -3,44 +3,75 @@
 The Rust server replaces the Python api-server + `TokenizerManager` +
 `DetokenizerManager` stack, running them as Rust threads inside the scheduler
 process. This wrapper keeps all `SGLANG_RUST_SERVER` plumbing — startup,
-CPU-core partitioning, the typed `server_args` handoff, and control-response
+CPU-core partitioning, the typed `server_args`, and control-response
 routing — out of `scheduler.py`. The scheduler holds an `Optional[RustServer]`
 and delegates to it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from array import array
+from contextlib import contextmanager
 from itertools import chain
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    TokenizedGenerateReqInput,
+    unwrap_from_pickle,
+)
+from sglang.srt.managers.load_snapshot import LoadSnapshot, snapshot_encoder
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.rust_server.control import RustControlTransport
 from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
 )
+from sglang.srt.rust_server.topology import FrontendTopology
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.utils.flatten import (
+    BeamSearchColumns,
     FlatPairColumns,
+    FlatTopLogprobColumns,
     NestedRowColumns,
     RaggedPairColumns,
+    SamplingMaskColumns,
+    TensorBytesColumn,
 )
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
+    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.rust_extensions._server import (
+        MmEncodedResult,
+        MmSpec,
+        Server,
+        ServerArgs,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -58,43 +89,129 @@ class RustServer:
         http_port: int,
         mm_spec: Optional[RustMmSpec] = None,
         max_per_poll: int = 256,
+        topology: Optional[FrontendTopology] = None,
     ):
         self.server = server
         self.http_port = http_port
         self.mm_spec = mm_spec
+        self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+        self.topology = topology or FrontendTopology(1, None, True)
+        self.control_transport: Optional[RustControlTransport] = None
+
+    @classmethod
+    def _load_extension(cls) -> ModuleType:
+        from sglang.srt.rust_extensions import load_rust_extension
+
+        return load_rust_extension("sglang.srt.rust_extensions._server")
+
+    @classmethod
+    @contextmanager
+    def dp_ingress(cls, server_args, scheduler_infos):
+        cfg = resolving_view(server_args)
+        if cfg.dp_size == 1:
+            yield
+            return
+
+        from sglang.srt.environ import envs
+        from sglang.srt.rust_server.metrics import frontend_metrics_config
+
+        workers = {}
+        for info in scheduler_infos:
+            for worker in info["rust_worker_infos"]:
+                rank, url = worker["dp_rank"], worker["url"]
+                if rank in workers and workers[rank] != url:
+                    raise ValueError(f"Conflicting Rust listener for DP rank {rank}")
+                workers[rank] = url
+        if set(workers) != set(range(cfg.dp_size)):
+            raise ValueError(f"Incomplete Rust DP worker discovery: {sorted(workers)}")
+        ingress = cls._load_extension().DpIngress(
+            host=cfg.host,
+            port=cfg.port,
+            workers=sorted(workers.items()),
+            load_balance_method=get_parallel().load_balance_method,
+            enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+            enable_request_decompression=envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get(),
+            enable_http2=cfg.enable_http2,
+            http2_max_concurrent_streams=cfg.http2_max_concurrent_streams,
+            http2_initial_connection_window_size=cfg.http2_initial_connection_window_size,
+            preferred_sampling_params=(
+                json.dumps(get_serving().preferred_sampling_params)
+                if get_serving().preferred_sampling_params is not None
+                else None
+            ),
+            metrics_config=frontend_metrics_config(),
+        )
+        try:
+            logger.info(
+                "Rust DP ingress serving %d workers on port %d",
+                len(workers),
+                ingress.http_port,
+            )
+            yield ingress
+        finally:
+            ingress.close()
+
+    def _start_multimodal(self, scheduler: Scheduler) -> None:
+        """Start the model's Rust workers and retain their scheduler-side state."""
+        mm_host = RustMmProcessor(
+            server_args=scheduler.server_args,
+            model_config=scheduler.model_config,
+            processor=scheduler.processor,
+        )
+        mm_spec = mm_host.resolve_spec()
+        if mm_spec is None:
+            supported = sorted(
+                set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
+            )
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
+                f"model_type={scheduler.model_config.hf_config.model_type!r} "
+                f"(supported: {', '.join(supported)}; "
+                "images only). Unset SGLANG_RUST_SERVER to serve this model."
+            )
+        self.server.start_mm_workers(self._build_mm_spec(mm_spec), mm_host.mm_workers)
+        self.mm_spec = mm_spec
+
+    @staticmethod
+    def _server_core_budget(allowed_core_count: int, mm_workers: int) -> int:
+        """Maximum cores available to the Rust frontend and MM workers."""
+        return max(8, mm_workers + 4)
+
+    @classmethod
+    def _partition_cores(
+        cls, mm_workers: int = 0
+    ) -> tuple[Optional[List[int]], Optional[List[int]]]:
+        return _partition_cores(
+            mm_workers=mm_workers,
+            server_core_budget=cls._server_core_budget,
+        )
+
+    @classmethod
+    def _start_server(
+        cls,
+        scheduler: Scheduler,
+        extension: ModuleType,
+        server_args: ServerArgs,
+        *,
+        cores: Optional[List[int]],
+        http_port: Optional[int],
+    ) -> Server:
+        return extension.Server(server_args, cores=cores, http_port=http_port)
 
     @classmethod
     def launch(cls, scheduler: Scheduler) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
-        The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
-        creates.
+        The caller gates this on the Rust flag and this DP worker's leader.
         """
-        from sglang.srt.rust_extensions import load_rust_extension
-
-        Server = load_rust_extension("sglang.srt.rust_extensions._server").Server
-
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        server_args = scheduler.server_args
-        # Preserve the DP startup log; ports use node-local offsets.
-        dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = scheduler.ps.tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // scheduler.ps.pp_size, 1)
-            tp_size_per_node = scheduler.ps.tp_size // nnodes_per_pp_rank
-        dp_group_width = scheduler.ps.attn_tp_size * scheduler.ps.attn_cp_size
-        # Count DP leaders within this node's TP range. The first leader must
-        # use the base port even when a DP group spans multiple nodes.
-        local_dp_rank = (scheduler.ps.tp_rank % tp_size_per_node) // dp_group_width
-        listen_port = get_serving().port + local_dp_rank
-        listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
+        topology = FrontendTopology.from_parallel_state(scheduler.ps)
+        dp_rank = topology.dp_rank
 
-        launch_cores, server_cores = _partition_cores(
+        launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
@@ -102,16 +219,23 @@ class RustServer:
             )
         )
 
-        server = Server(
-            _build_server_args(scheduler),
-            # None -> run unpinned; the list carries the pinning decision.
+        extension = cls._load_extension()
+        server = cls._start_server(
+            scheduler,
+            extension,
+            _build_server_args(scheduler, extension=extension),
+            # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
-            port_offset=local_dp_rank,
+            # Worker listeners cannot consume the public port or its neighbors.
+            http_port=0 if topology.dp_size > 1 else None,
         )
+        instance = cls(server, http_port=server.http_port, topology=topology)
+        listen_addr = NetworkAddress(
+            get_serving().host, instance.http_port
+        ).to_host_port_str()
 
         # Multimodal models must have a Rust pipeline — there is no Python
         # fallback.
-        mm_spec = None
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread still holds the full mask. Narrow it first so every MM thread
@@ -125,23 +249,8 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
-            mm_host = RustMmProcessor(
-                server_args=server_args,
-                model_config=scheduler.model_config,
-                processor=scheduler.processor,
-            )
-            mm_spec = mm_host.resolve_spec()
-            if mm_spec is None:
-                supported = sorted(
-                    set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
-                )
-                raise RuntimeError(
-                    "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
-                    f"model_type={scheduler.model_config.hf_config.model_type!r} "
-                    f"(supported: {', '.join(supported)}; "
-                    "images only). Unset SGLANG_RUST_SERVER to serve this model."
-                )
-            server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
+            instance._start_multimodal(scheduler)
+            instance._multimodal_enabled = True
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -162,13 +271,32 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, http_port=listen_port, mm_spec=mm_spec)
+        return instance
+
+    def _wrap_mm_result(self, entry: MmEncodedResult) -> MultimodalProcessorOutput:
+        assert self.mm_spec is not None
+        return RustMmProcessor.wrap_encoded(self.mm_spec, entry)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
         elapses.
         """
+        # Controller messages use ZMQ; bound their idle wakeup latency while
+        # generation still wakes immediately through the native channel.
+        if self.control_transport is not None:
+            timeout_ms = min(timeout_ms, 20)
         self.server.wait_request(timeout_ms)
+
+    def start_control_transport(self, endpoint: str, *, cross_node: bool) -> None:
+        assert self.topology.dp_rank is not None
+        self.control_transport = RustControlTransport(
+            self.server, endpoint, self.topology.dp_rank, cross_node=cross_node
+        )
+
+    def close(self) -> None:
+        if self.control_transport is not None:
+            self.control_transport.close()
+            self.control_transport = None
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
@@ -188,6 +316,8 @@ class RustServer:
         Parking for work is :meth:`wait_request`, which does release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
+        if self.control_transport is not None:
+            self.control_transport.drain_replies()
         batch = self.server.recv_requests(limit)
         # Bind once: each attribute access converts the rust vec to a fresh list.
         headers, data, lengths = batch.headers, batch.data, batch.lengths
@@ -215,20 +345,25 @@ class RustServer:
                 ids.frombytes(ids_view[pos : pos + nbytes])
                 obj.input_ids = ids
                 pos += nbytes
-            if self.mm_spec is not None and isinstance(obj, TokenizedGenerateReqInput):
+            if self._multimodal_enabled and isinstance(obj, TokenizedGenerateReqInput):
                 # The buffers were parked in the Rust result store before the
                 # ring push; wrapping them into tensors is the only Python step
                 # of the Rust path. `None` for a text-only request on a
                 # multimodal model.
-                encoded = self.server.take_mm_result(obj.rid)
-                if encoded is not None:
-                    obj.mm_inputs = RustMmProcessor.wrap_encoded(self.mm_spec, encoded)
-            out.append(obj)
+                mm_result = self.server.take_mm_result(obj.rid)
+                if mm_result is not None:
+                    obj.mm_inputs = self._wrap_mm_result(mm_result)
+            if self.control_transport is not None and not isinstance(
+                obj, TokenizedGenerateReqInput
+            ):
+                self.control_transport.broadcast(obj)
+            else:
+                out.append(obj)
         return out
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
-        request (routed by rid), encoded as **msgpack** (the ring's native
+        request (routed by rid), encoded as **msgpack** (the ring's message
         format).
 
         A msgspec struct is converted to a *named map* (``structs.asdict``, since
@@ -254,7 +389,29 @@ class RustServer:
         # rendering happens in Rust.
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
 
-        self.server.push_control_result(recv_req.rid, encoded)
+        if self.control_transport is not None:
+            self.control_transport.send_result(recv_req, encoded)
+        else:
+            self.server.push_control_result(recv_req.rid, encoded)
+
+    def publish_load_snapshot(self, snapshot: LoadSnapshot) -> None:
+        self.server.publish_load_snapshot(snapshot_encoder.encode(snapshot.to_dict()))
+
+    def handle_scheduler_output(self, output: object) -> bool:
+        """Deliver scheduler rejections and queue aborts to the native request."""
+        if not isinstance(output, AbortReq):
+            return False
+        payload = {
+            "finished_reason": output.finished_reason
+            or {
+                "type": "abort",
+                "message": output.abort_message or "Abort in waiting queue",
+            },
+            "weight_version": get_serving().weight_version,
+            "weight_versions": output.weight_versions,
+        }
+        self.server.push_abort_result(output.rid, msgspec.msgpack.encode(payload))
+        return True
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
@@ -267,10 +424,9 @@ class RustServer:
             scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
-            and hidden ones).
-          - ``data``: the raw little-endian numeric buffer — every column is a
-            4-byte element (``f32`` values, ``i32`` indices), concatenated in the
-            order the Rust ``for_each_chunk`` reads them.
+            and hidden ones), followed by the scheduler token-accounting map.
+          - ``data``: little-endian ``f32`` values and ``i32`` indices followed
+            by optional raw tensor buffers, in Rust ``for_each_chunk`` order.
 
         Logprobs are columnar: output families are per-step deltas, input
         (prefill) families ride once on the first chunk. Ragged families (top-k,
@@ -398,6 +554,85 @@ class RustServer:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
 
+        else:
+            # Keep the optional numeric-column positions before the token-count
+            # map, without constructing per-request empty logprob columns.
+            header_cols.extend([()] * 12)
+
+        header_cols.append(
+            {
+                "reasoning_tokens": payload.reasoning_tokens,
+                "cached_tokens": payload.cached_tokens,
+                "retraction_counts": payload.retraction_counts or [],
+                "cached_tokens_details": payload.cached_tokens_details or [],
+                "dp_ranks": payload.dp_ranks or [],
+                "image_tokens": payload.image_tokens or [],
+                "audio_tokens": payload.audio_tokens or [],
+                "video_tokens": payload.video_tokens or [],
+                "weight_version": get_serving().weight_version,
+                "weight_versions": payload.weight_versions or [],
+                "generation_tokens": payload.completion_tokens or [],
+                "spec_verify_ct": payload.spec_verify_ct or [],
+                "spec_num_correct_drafts": payload.spec_num_correct_drafts or [],
+                "spec_num_cap_tokens": payload.spec_num_cap_tokens or [],
+                "spec_num_block_accept_tokens": payload.spec_num_block_accept_tokens
+                or [],
+                "spec_correct_drafts_histogram": payload.spec_correct_drafts_histogram
+                or [],
+                "spec_cap_lens_histogram": payload.spec_cap_lens_histogram or [],
+                "spec_num_draft_tokens": get_spec().speculative_num_draft_tokens or 0,
+                "spec_ragged_verify_cap_accept": read_ragged_verify_mode()
+                is RaggedVerifyMode.CAP_ACCEPT,
+            }
+        )
+
+        # The embedded path keeps these token-aligned columns in process;
+        # legacy callers may still supply the Python IPC wrapper.
+        header_cols.append(unwrap_from_pickle(payload.customized_info) or {})
+        header_cols.append(payload.rust_prompt_contexts or [])
+        header_cols.append(extras[-1].shapes if has_extra else [])
+        if payload.output_token_sampling_mask is not None:
+            masks = SamplingMaskColumns(
+                payload.output_token_sampling_mask,
+                payload.output_token_sampling_logprobs,
+            )
+            assert len(masks.shapes) == len(rids)
+            header_cols.append(masks.shapes)
+            data_cols.extend(masks.data_cols())
+        else:
+            header_cols.append([])
+        if payload.input_top_logprobs_val_flat is not None:
+            flat_top = FlatTopLogprobColumns(
+                payload.input_top_logprobs_val_flat,
+                payload.input_top_logprobs_idx_flat,
+                payload.input_top_logprobs_flat_null_prefix,
+            )
+            assert len(flat_top.shapes) == len(rids)
+            header_cols.append(flat_top.shapes)
+            data_cols.extend(flat_top.data_cols())
+        else:
+            header_cols.append([])
+        for tensors in (payload.routed_experts, payload.indexer_topk):
+            if tensors is None:
+                header_cols.append([])
+            else:
+                column = TensorBytesColumn(tensors)
+                assert len(column.lengths) == len(rids)
+                header_cols.append(column.lengths)
+                data_cols.extend(column.data_cols())
+        if payload.beam_search_output is not None:
+            beams = BeamSearchColumns(payload.beam_search_output)
+            assert len(beams.headers) == len(rids)
+            header_cols.append(beams.headers)
+            data_cols.extend(beams.data_cols())
+        else:
+            header_cols.append([])
+        if get_observability().enable_metrics and payload.time_stats is not None:
+            time_stats = unwrap_from_pickle(payload.time_stats)
+            assert len(time_stats) == len(rids)
+            header_cols.append(
+                [stats.convert_to_output_meta_info() for stats in time_stats]
+            )
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.
@@ -407,16 +642,14 @@ class RustServer:
                 len(rids),
             )
 
-    @staticmethod
-    def _build_mm_spec(spec: RustMmSpec) -> MmSpec:
-        """The typed MM handoff for ``Server.start_mm_workers``: the
+    @classmethod
+    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+        """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
-        :meth:`_build_server_args`; ``family`` / ``resample`` become the
+        :func:`_build_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
-        from sglang.srt.rust_extensions import load_rust_extension
-
-        ext = load_rust_extension("sglang.srt.rust_extensions._server")
+        ext = cls._load_extension()
         family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample

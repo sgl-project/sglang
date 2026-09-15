@@ -1,0 +1,1154 @@
+{
+  "wire_indices": {
+    "return_bytes": 37,
+    "return_entropy": 38
+  },
+  "cases": [
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": false,
+        "return_bytes": false,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": false,
+        "return_bytes": true,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": false,
+        "return_bytes": false,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": false,
+        "return_bytes": true,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": false,
+        "return_bytes": false,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": false,
+        "return_bytes": true,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": false,
+        "return_bytes": false,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": false,
+        "return_bytes": true,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": true,
+        "return_bytes": false,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": true,
+        "return_bytes": true,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": true,
+        "return_bytes": false,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "sampling_params": {
+          "n": 1
+        },
+        "stream": true,
+        "return_bytes": true,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": true,
+        "return_bytes": false,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": true,
+        "return_bytes": true,
+        "return_entropy": false
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": true,
+        "return_bytes": false,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "sampling_params": {
+          "n": 2
+        },
+        "stream": true,
+        "return_bytes": true,
+        "return_entropy": true
+      },
+      "expected": [
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        },
+        {
+          "text": "hello",
+          "output_ids": [
+            5,
+            6
+          ],
+          "meta_info": {
+            "finish_reason": {
+              "type": "length",
+              "length": 2
+            },
+            "prompt_tokens": 3,
+            "num_retractions": 0,
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0
+          }
+        }
+      ]
+    }
+  ],
+  "rejected": [
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": null
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": []
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": {}
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": "invalid"
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": 2
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_bytes": 0.5
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": null
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": []
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": {}
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": "invalid"
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": 2
+    },
+    {
+      "input_ids": [
+        1,
+        2,
+        3
+      ],
+      "return_entropy": 0.5
+    }
+  ]
+}

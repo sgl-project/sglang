@@ -7,7 +7,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.io_struct import AbortReq, FlushCacheReqOutput
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
@@ -27,6 +27,31 @@ def _make_scheduler_req(http_worker_ipc: str) -> Req:
 
 
 class TestSenderWrapper(CustomTestCase):
+    @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
+    def test_native_handler_receives_return_route_and_unhandled_outputs_keep_socket(
+        self, mock_sock_send
+    ):
+        socket = MagicMock()
+        sender = SenderWrapper(socket)
+        seen = []
+
+        def handle(output):
+            seen.append(output)
+            return isinstance(output, AbortReq)
+
+        sender.output_handler = handle
+        aborted = AbortReq(rid="request")
+        sender.send_output(aborted, _make_scheduler_req("ipc:///origin"))
+        self.assertEqual(aborted.http_worker_ipc, "ipc:///origin")
+        self.assertEqual(seen, [aborted])
+        mock_sock_send.assert_not_called()
+        other = FlushCacheReqOutput(success=True)
+        sender.send_output(other)
+        mock_sock_send.assert_called_once_with(socket, other)
+        sender.socket = None
+        sender.send_output(aborted)
+        self.assertEqual(seen, [aborted, other, aborted])
+
     @patch("sglang.srt.managers.scheduler_components.output_sender.sock_send")
     def test_preserves_existing_output_route(self, mock_sock_send):
         socket = MagicMock()

@@ -1,21 +1,33 @@
-"""Configuration handoff and CPU placement for the embedded Rust server."""
+"""Configuration and CPU placement for the embedded Rust server."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import ModuleType
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.model_executor.forward_batch_info import (
+    get_server_return_hidden_states_mode,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
+    get_memory,
     get_mm,
     get_model,
     get_observability,
+    get_schedule,
     get_serving,
 )
+from sglang.srt.rust_server.disaggregation import http_bootstrap_port
+from sglang.srt.rust_server.metrics import METRICS_SOCKET_ENV, frontend_metrics_config
+from sglang.srt.rust_server.topology import FrontendTopology
+from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -25,8 +37,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_server_args(scheduler: Scheduler) -> ServerArgs:
-    """The typed launch handoff for the scheduler's embedded Rust server:
+def _build_server_args(
+    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+) -> ServerArgs:
+    """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
     ``model_config``, and launch-time facts — as the Rust extension's own
     ``ServerArgs`` class. Its constructor takes every field as a required
@@ -35,10 +49,18 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     running on a silently-defaulted knob."""
     from sglang.srt.rust_extensions import load_rust_extension
 
-    ext = load_rust_extension("sglang.srt.rust_extensions._server")
+    ext = extension or load_rust_extension("sglang.srt.rust_extensions._server")
 
     sa = resolving_view(scheduler.server_args)
     mc = scheduler.model_config
+    topology = FrontendTopology.from_parallel_state(scheduler.ps)
+    tokenizer_model_max_length = getattr(scheduler.tokenizer, "model_max_length", -1)
+    if not -(2**63) <= tokenizer_model_max_length < 2**64:
+        tokenizer_model_max_length = mc.context_len
+    try:
+        tokenizer_vocab_size = len(scheduler.tokenizer)
+    except TypeError:
+        tokenizer_vocab_size = getattr(scheduler.tokenizer, "vocab_size", None)
     disaggregation_mode = {
         "null": ext.DisaggregationMode.Null,
         "prefill": ext.DisaggregationMode.Prefill,
@@ -48,17 +70,40 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
         tokenizer_path=scheduler.rust_server_tokenizer_path(),
+        public_tokenizer_path=get_serving().tokenizer_path,
+        tokenizer_model_max_length=tokenizer_model_max_length,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        wait_for_parent_warmup=True,
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
-        host=get_serving().host,
+        host=("::" if topology.dp_size > 1 and sa.nnodes > 1 else get_serving().host),
         port=get_serving().port,
+        enable_http2=get_serving().enable_http2,
+        http2_max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+        http2_initial_connection_window_size=get_serving().http2_initial_connection_window_size,
+        enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+        enable_request_decompression=envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get(),
+        default_priority_value=(
+            get_schedule().default_priority_value
+            if get_schedule().enable_priority_scheduling
+            else None
+        ),
+        dp_size=topology.dp_size,
+        dp_rank=topology.dp_rank,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
+        enable_metrics=get_observability().enable_metrics,
+        metrics_socket=os.environ.get(METRICS_SOCKET_ENV),
+        metrics_config=frontend_metrics_config(),
+        disaggregation_bootstrap_port=http_bootstrap_port(scheduler.server_args),
         chat_template=get_serving().chat_template,
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
+        enable_cache_report=get_serving().enable_cache_report,
+        return_input_ids=get_serving().return_input_ids,
+        return_output_ids=get_serving().return_output_ids,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
@@ -68,8 +113,13 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         model_config=ext.ModelConfig(
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
+            hidden_size=mc.hidden_size,
             is_multimodal=mc.is_multimodal,
+            is_generation=mc.is_generation,
+            has_image_understanding=mc.is_image_understandable_model,
+            has_audio_understanding=mc.is_audio_understandable_model,
             model_type=getattr(mc.hf_config, "model_type", None),
+            architectures=getattr(mc.hf_config, "architectures", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -86,7 +136,14 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         ),
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
-        enable_return_hidden_states=sa.enable_return_hidden_states,
+        max_return_hidden_states=(
+            ext.HiddenStatesMode.Off,
+            ext.HiddenStatesMode.Last,
+            ext.HiddenStatesMode.Full,
+        )[get_server_return_hidden_states_mode()],
+        enable_custom_logit_processor=get_exec().features.enable_custom_logit_processor,
+        enable_strict_thinking=get_serving().enable_strict_thinking,
+        disable_radix_cache=get_memory().disable_radix_cache,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
@@ -95,11 +152,16 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        accelerator=get_device_name(),
+        num_accelerators=(
+            sa.tp_size * sa.pp_size // (sa.dp_size if sa.enable_dp_attention else 1)
+        ),
     )
 
 
 def _partition_cores(
     mm_workers: int = 0,
+    server_core_budget: Optional[Callable[[int, int], int]] = None,
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
@@ -138,7 +200,11 @@ def _partition_cores(
     # once bounded. The budget covers the CPU-hot threads (MM workers, plus
     # the I/O-shaped tokenizer/ingress/egress/api ones that are rarely all hot
     # at once) and leaves the rest of the node to the scheduler ranks.
-    pool_budget = max(8, mm_workers + 4)
+    pool_budget = (
+        server_core_budget(len(allowed), mm_workers)
+        if server_core_budget is not None
+        else max(8, mm_workers + 4)
+    )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
         "rust server cores=%s, scheduler launch cores=%s",

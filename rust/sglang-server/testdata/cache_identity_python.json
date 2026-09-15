@@ -1,0 +1,30 @@
+[
+  {
+    "body": {"text": "single", "extra_key": "tenant", "cache_salt": "salt", "routing_key": "session"},
+    "expected": [["tenant", "salt", "session"]]
+  },
+  {
+    "body": {"text": "empty", "extra_key": "", "cache_salt": "", "routing_key": ""},
+    "expected": [[null, null, ""]]
+  },
+  {
+    "body": {"text": ["first", "second"], "extra_key": ["tenant-a", ""], "cache_salt": ["salt-a", "salt-b"], "routing_key": "session"},
+    "expected": [["tenant-a", "salt-a", "session"], [null, "salt-b", "session"]]
+  },
+  {
+    "body": {"text": ["first", "second"], "sampling_params": {"n": 2}, "extra_key": "tenant", "cache_salt": "salt", "routing_key": "session"},
+    "expected": [["tenant", "salt", "session"], ["tenant", "salt", "session"], ["tenant", "salt", "session"], ["tenant", "salt", "session"]]
+  },
+  {
+    "body": {"text": ["first", "second"], "sampling_params": {"n": 2}, "extra_key": ["tenant-a", "tenant-b"], "cache_salt": ["salt-a", ""], "routing_key": "session"},
+    "expected": [["tenant-a", "salt-a", "session"], ["tenant-a", "salt-a", "session"], ["tenant-b", null, "session"], ["tenant-b", null, "session"]]
+  },
+  {
+    "body": {"text": "parallel", "sampling_params": {"n": 2}, "extra_key": ["tenant"], "cache_salt": ["salt"]},
+    "expected": [["tenant", "salt", null], ["tenant", "salt", null]]
+  },
+  {
+    "body": {"text": ["default", "null"], "extra_key": null, "cache_salt": null, "routing_key": null},
+    "expected": [[null, null, null], [null, null, null]]
+  }
+]

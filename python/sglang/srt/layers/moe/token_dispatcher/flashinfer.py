@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
@@ -142,6 +142,9 @@ class FlashinferDispatcher(BaseDispatcher):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
+        # Models that own their sequence layout may leave small or unaligned
+        # forwards replicated. The policy is static and evaluated per DP count.
+        self.attn_tp_sharded_fn: Optional[Callable[[int], bool]] = None
         runner_backend = get_moe_runner_backend()
         self.invalid_token_expert_id = (
             -1
@@ -266,6 +269,52 @@ class FlashinferDispatcher(BaseDispatcher):
         super().set_quant_config(quant_config)
         self.prefill_dispatcher.set_quant_config(quant_config)
 
+    def _source_token_counts(self, dp_global: list[int]) -> list[int]:
+        attn_tp_size = get_parallel().attn_tp_size
+        if self.attn_tp_sharded_fn is None:
+            return _scattered_source_token_counts(dp_global, attn_tp_size)
+        counts = []
+        for num_tokens in dp_global:
+            counts.extend(
+                _scattered_source_token_counts([num_tokens], attn_tp_size)
+                if self.attn_tp_sharded_fn(num_tokens)
+                else [num_tokens] * attn_tp_size
+            )
+        return counts
+
+    def _set_runtime_max_tokens_per_rank(self, local_num_tokens: int) -> None:
+        # Every EP rank must use the same fixed geometry, including graph
+        # capture. Derive it from the shared counts and the model's layout policy,
+        # never from a rank-local maximum. Different DP prefills can use different
+        # sharding decisions within one forward.
+        dp_global = get_dp_global_num_tokens()
+        if dp_global is not None and len(dp_global) > 1:
+            self.runtime_max_tokens_per_rank = (
+                _max_tokens_per_scattered_source(dp_global, get_parallel().attn_tp_size)
+                if self.attn_tp_sharded_fn is None
+                else max(self._source_token_counts(dp_global))
+            )
+        else:
+            assert not is_dp_attention_enabled() or self.ep_size == 1, (
+                "FlashInfer A2A: DP attention reached the local token fallback "
+                f"with ep_size={self.ep_size} > 1 (dp_global={dp_global}); "
+                "runtime_max_tokens_per_rank would not be rank-invariant."
+            )
+            self.runtime_max_tokens_per_rank = local_num_tokens
+
+        assert self.runtime_max_tokens_per_rank <= self.max_num_tokens, (
+            "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
+            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} > "
+            f"max_num_tokens={self.max_num_tokens}. Increase "
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK to cover the "
+            "largest mixed prefill and speculative-verify batch."
+        )
+        assert self.runtime_max_tokens_per_rank >= local_num_tokens, (
+            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} < "
+            f"local_num_tokens={local_num_tokens}: MoeAlltoAll recv buffer would "
+            "overflow."
+        )
+
     def _dispatch_prefill_allgather(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
@@ -289,9 +338,7 @@ class FlashinferDispatcher(BaseDispatcher):
         if dp_global is None:
             source_sizes = [hidden_states.shape[0]] * self.ep_size
         else:
-            source_sizes = _scattered_source_token_counts(
-                dp_global, get_parallel().attn_tp_size
-            )
+            source_sizes = self._source_token_counts(dp_global)
         if len(source_sizes) != self.ep_size:
             raise RuntimeError(
                 "FlashInfer WideEP prefill AG source geometry does not match "
@@ -406,63 +453,7 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
-        # runtime_max_tokens_per_rank selection
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # MoeAlltoAll uses fixed-geometry buffers shaped
-        # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank must pass
-        # the SAME value. This code (Python) runs during eager forwards and during
-        # CUDA-graph *capture*; on *replay* dispatch() is not re-executed and the
-        # value baked at capture is reused. Two cases, both rank-invariant:
-        #
-        # Each EP source owns ceil(max(dp_global) / attn_tp_size) tokens; the
-        # shared maximum keeps graph geometry rank-uniform (issue #30242).
-        #
-        # Case 2 — x.shape[0]: no per-rank DP list (dp_global absent or scalar).
-        #   This is SP attention feeding EP (tokens are sequence-parallel scattered
-        #   uniformly, so x.shape[0] is already identical on every EP rank), a
-        #   single EP rank, or CUDA-graph capture of those. x.shape[0] is
-        #   rank-invariant here, so it is both correct and right-sized.
-        dp_global = get_dp_global_num_tokens()
-        if dp_global is not None and len(dp_global) > 1:
-            # Case 1
-            attn_tp_size = get_parallel().attn_tp_size
-            self.runtime_max_tokens_per_rank = _max_tokens_per_scattered_source(
-                dp_global, attn_tp_size
-            )
-        else:
-            # Case 2. Guard against the #30242 failure mode: DP attention must
-            # never land here with ep_size > 1, because there x.shape[0] differs
-            # across ranks and is NOT a safe fixed geometry. DP attention is
-            # routed to Case 1 via require_mlp_tp_gather=True; reaching here with
-            # DP attention on and ep_size > 1 means the DP all-gather was skipped
-            # (e.g. SGLANG_SCHEDULER_SKIP_ALL_GATHER, unsupported) -> fail fast.
-            assert not is_dp_attention_enabled() or self.ep_size == 1, (
-                "FlashInfer A2A: DP attention reached the x.shape[0] fallback "
-                f"with ep_size={self.ep_size} > 1 (dp_global={dp_global}); "
-                "runtime_max_tokens_per_rank would not be rank-invariant."
-            )
-            self.runtime_max_tokens_per_rank = x.shape[0]
-
-        # MoeAlltoAll does not resize its max_num_tokens workspace; reject larger
-        # runtime geometry here before it becomes an illegal memory access.
-        assert self.runtime_max_tokens_per_rank <= self.max_num_tokens, (
-            "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
-            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} > "
-            f"max_num_tokens={self.max_num_tokens}. Increase "
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK to cover the "
-            "largest mixed prefill and speculative-verify batch."
-        )
-
-        # The recv buffer reserves runtime_max_tokens_per_rank slots for THIS
-        # rank, so it must cover this rank's own tokens. This holds in both cases
-        # (Case 1: ceil(max(dp_global) / attn_tp_size) covers every token-scatter
-        # shard; Case 2: exactly x.shape[0]),
-        # so a violation signals a sizing/plumbing bug (e.g. an un-adjusted spec
-        # count) rather than a benign case.
-        assert self.runtime_max_tokens_per_rank >= x.shape[0], (
-            f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} < "
-            f"x.shape[0]={x.shape[0]}: MoeAlltoAll recv buffer would overflow."
-        )
+        self._set_runtime_max_tokens_per_rank(x.shape[0])
 
         # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
         # inside moe_a2a. The recv buffer has shape

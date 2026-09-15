@@ -3,6 +3,14 @@
 //! (batch / control result / error), and the columnar batch decode into
 //! per-request [`ChunkEvent`]s.
 
+mod flat_logprobs;
+mod speculative;
+
+pub use flat_logprobs::{FlatTopLogprobShape, FlatTopLogprobs, LogprobOptions};
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -11,6 +19,11 @@ use super::finish_reason::FinishReason;
 use super::types::TokenIds;
 use crate::message::ids::Rid;
 use crate::utils::error::Error;
+use speculative::SpeculativeStats;
+
+/// Python's `INIT_INCREMENTAL_DETOKENIZATION_OFFSET`: the unpadded prompt tail
+/// needed to distinguish a generated prefix from the tokenizer's prompt text.
+pub(crate) const PROMPT_CONTEXT_TOKENS: usize = 5;
 
 /// Per-request back-channel the detok shard writes decode frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
@@ -28,6 +41,11 @@ pub enum SinkError {
 }
 
 impl ResponseSink {
+    pub fn is_closed(&self) -> bool {
+        match self {
+            ResponseSink::Local(tx) => tx.is_closed(),
+        }
+    }
     /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
     pub fn try_send(&self, item: ResponseItem) -> Result<(), SinkError> {
         match self {
@@ -46,13 +64,14 @@ pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 /// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
 #[derive(Debug)]
 pub enum ResponseItem {
+    Tokenized(crate::message::types::TokenIds),
     /// An intermediate streamed generation step (only sent for streaming reqs).
     Frame(ChunkEvent),
     /// The final generation step.
     Done(ChunkEvent),
     /// A control-request result: one verbatim payload (e.g. `/server_info`),
     /// delivered as-is with no per-protocol formatting.
-    Control(Bytes),
+    Control(Vec<Bytes>),
     /// Reply to an internal service request (`RequestKind::Detokenize`): raw
     /// bytes for the SUBMITTER to consume (e.g. the decoded prompt text), not
     /// client-bound JSON like `Control` and not a generation frame. Generation
@@ -71,6 +90,9 @@ pub const DISPATCH_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
 /// header, so it routes a 400 back to that request instead of crashing the loop.
 pub const DISPATCH_TAG_ERROR: u8 = 3;
+/// A scheduler abort echo, preserving the generation state already delivered.
+pub const DISPATCH_TAG_ABORT: u8 = 4;
+pub const DISPATCH_TAG_RESULT_PART: u8 = 5;
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
 /// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
@@ -119,9 +141,9 @@ pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
 }
 
 /// Columnar scalar header for a whole decode batch. The first four fields are
-/// required; every field after `tok_lens` defaults empty, so the hot path emits
-/// a four-element header. Field order is the wire ABI and must match
-/// `RustTokenizerManager.push_generation`'s `header_cols` in
+/// required; later fields default empty for legacy frames. Field order is the
+/// wire ABI and must match
+/// `RustServer.push_generation`'s `header_cols` in
 /// `python/sglang/srt/rust_server/server.py`.
 ///
 /// Field names follow `direction_family_shape`:
@@ -164,6 +186,304 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default)]
+    pub counts: Option<BatchTokenCounts>,
+    #[serde(default)]
+    pub customized_info: BTreeMap<String, Vec<Vec<serde_json::Value>>>,
+    #[serde(default)]
+    pub prompt_contexts: Vec<Vec<i32>>,
+    #[serde(default)]
+    pub hidden_shapes: Vec<Option<HiddenStateShape>>,
+    /// Per request: absent, or one nullable support length per emitted token.
+    /// Raw support IDs and selected-token logprobs follow the hidden-state data.
+    #[serde(default)]
+    pub sampling_mask_shapes: Vec<Option<Vec<Option<u32>>>>,
+    #[serde(default)]
+    pub flat_top_logprob_shapes: Vec<Option<FlatTopLogprobShape>>,
+    /// Byte lengths, with null for an absent request and zero for an empty tensor.
+    #[serde(default)]
+    pub routed_experts_bytes: Vec<Option<u32>>,
+    #[serde(default)]
+    pub indexer_topk_bytes: Vec<Option<u32>>,
+    /// Ranked candidates per request; generated token IDs follow all tensor data.
+    #[serde(default)]
+    pub beam_headers: Vec<Option<Vec<BeamSequenceHeader>>>,
+    /// Scheduler-owned timestamps and queue durations, when metrics are enabled.
+    #[serde(default)]
+    pub time_metadata: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeamSequenceHeader {
+    pub token_count: u32,
+    pub finish_reason: Option<FinishReason>,
+    pub sequence_score: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BeamSequence {
+    pub token_ids: Vec<i32>,
+    pub finish_reason: Option<FinishReason>,
+    pub sequence_score: Option<f64>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BeamOutput {
+    pub sequences: Vec<BeamSequence>,
+    // Python copies scheduler metadata onto the first candidate before
+    // frontend response processors annotate the top-level result.
+    pub scheduler_metadata: OutputMetadata,
+}
+
+/// Shape of Python's nested hidden-state lists. Numeric data remains in the
+/// shared f32 column; a vector contributes only its length to the header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HiddenStateShape {
+    Vector(u32),
+    Nested(Vec<HiddenStateShape>),
+}
+
+impl HiddenStateShape {
+    fn elements(&self) -> Option<usize> {
+        match self {
+            Self::Vector(length) => Some(*length as usize),
+            Self::Nested(children) => children
+                .iter()
+                .try_fold(0usize, |total, child| total.checked_add(child.elements()?)),
+        }
+    }
+
+    pub fn reshape(&self, values: &[f32]) -> Option<serde_json::Value> {
+        fn read(shape: &HiddenStateShape, values: &mut &[f32]) -> Option<serde_json::Value> {
+            match shape {
+                HiddenStateShape::Vector(length) => {
+                    let (head, tail) = values.split_at_checked(*length as usize)?;
+                    *values = tail;
+                    Some(serde_json::json!(head))
+                }
+                HiddenStateShape::Nested(children) => children
+                    .iter()
+                    .map(|child| read(child, values))
+                    .collect::<Option<Vec<_>>>()
+                    .map(serde_json::Value::Array),
+            }
+        }
+        let mut remaining = values;
+        let result = read(self, &mut remaining)?;
+        remaining.is_empty().then_some(result)
+    }
+}
+
+/// Scheduler-owned accounting stays columnar across the Python/Rust boundary.
+/// Unlike emitted token deltas, these counts are cumulative request snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchTokenCounts {
+    pub reasoning_tokens: Vec<u64>,
+    pub cached_tokens: Vec<u64>,
+    #[serde(default)]
+    pub retraction_counts: Vec<u64>,
+    #[serde(default)]
+    pub cached_tokens_details: Vec<Option<CachedTokensDetails>>,
+    #[serde(default)]
+    pub dp_ranks: Vec<Option<u32>>,
+    #[serde(default)]
+    pub image_tokens: Vec<u64>,
+    #[serde(default)]
+    pub audio_tokens: Vec<u64>,
+    #[serde(default)]
+    pub video_tokens: Vec<u64>,
+    #[serde(default)]
+    pub weight_version: Option<String>,
+    #[serde(default)]
+    pub weight_versions: Vec<Option<Vec<WeightVersionSpan>>>,
+    #[serde(default)]
+    pub generation_tokens: Vec<u64>,
+    #[serde(default)]
+    pub spec_verify_ct: Vec<u64>,
+    #[serde(default)]
+    pub spec_num_correct_drafts: Vec<u64>,
+    #[serde(default)]
+    pub spec_num_cap_tokens: Vec<u64>,
+    #[serde(default)]
+    pub spec_num_block_accept_tokens: Vec<u64>,
+    #[serde(default)]
+    pub spec_correct_drafts_histogram: Vec<Vec<u64>>,
+    #[serde(default)]
+    pub spec_cap_lens_histogram: Vec<Vec<u64>>,
+    #[serde(default)]
+    pub spec_num_draft_tokens: u64,
+    #[serde(default)]
+    pub spec_ragged_verify_cap_accept: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightVersionSpan {
+    pub version: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SchedulerAbort {
+    pub finished_reason: FinishReason,
+    pub weight_version: Option<String>,
+    pub weight_versions: Option<Vec<WeightVersionSpan>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedTokensDetails {
+    pub device: u64,
+    pub host: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_backend: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TokenCounts {
+    #[serde(skip)]
+    pub generation_tokens: Option<u64>,
+    #[serde(skip)]
+    pub spec_verify_ct: Option<u64>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<Box<SpeculativeStats>>,
+    pub reasoning_tokens: u64,
+    pub cached_tokens: u64,
+    pub num_retractions: u64,
+    // The outer option preserves an absent batch column versus a null entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens_details: Option<Option<CachedTokensDetails>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dp_rank: Option<Option<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_tokens: Option<u64>,
+    #[serde(skip)]
+    pub weight_version: Option<String>,
+    /// Spans are projected onto visible output ids by `metadata`, including
+    /// when the final stop token has been trimmed or the request was aborted.
+    #[serde(skip)]
+    pub weight_versions: Option<Vec<WeightVersionSpan>>,
+}
+
+impl TokenCounts {
+    pub fn metadata(&self, visible_tokens: usize) -> impl Serialize + '_ {
+        TokenMetadata {
+            counts: self,
+            weight_version: self
+                .weight_versions
+                .as_ref()
+                .and_then(|spans| {
+                    spans
+                        .iter()
+                        .rfind(|span| span.start == 0 || span.start < visible_tokens as u64)
+                })
+                .map(|span| span.version.as_str())
+                .or(self.weight_version.as_deref()),
+            weight_versions: self
+                .weight_versions
+                .as_ref()
+                .map(|spans| VisibleWeightVersions {
+                    spans,
+                    visible_tokens: visible_tokens as u64,
+                }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TokenMetadata<'a> {
+    #[serde(flatten)]
+    counts: &'a TokenCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight_version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight_versions: Option<VisibleWeightVersions<'a>>,
+}
+
+struct VisibleWeightVersions<'a> {
+    spans: &'a [WeightVersionSpan],
+    visible_tokens: u64,
+}
+
+impl Serialize for VisibleWeightVersions<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct VisibleSpan<'a> {
+            version: &'a str,
+            start: u64,
+            end: u64,
+        }
+
+        serializer.collect_seq(
+            self.spans
+                .iter()
+                .filter(|span| span.start == 0 || span.start < self.visible_tokens)
+                .map(|span| VisibleSpan {
+                    version: &span.version,
+                    start: span.start,
+                    end: span.end.min(self.visible_tokens),
+                }),
+        )
+    }
+}
+
+impl BatchTokenCounts {
+    fn valid_batch_size(&self, n: usize) -> bool {
+        self.spec_verify_ct.iter().all(|count| {
+            count
+                .checked_mul(self.spec_num_draft_tokens.saturating_sub(1))
+                .is_some()
+        }) && self.reasoning_tokens.len() == n
+            && self.cached_tokens.len() == n
+            && [
+                self.cached_tokens_details.len(),
+                self.retraction_counts.len(),
+                self.dp_ranks.len(),
+                self.image_tokens.len(),
+                self.audio_tokens.len(),
+                self.video_tokens.len(),
+                self.weight_versions.len(),
+                self.generation_tokens.len(),
+                self.spec_verify_ct.len(),
+            ]
+            .into_iter()
+            .all(|len| len == 0 || len == n)
+            && [
+                self.spec_num_correct_drafts.len(),
+                self.spec_num_cap_tokens.len(),
+                self.spec_num_block_accept_tokens.len(),
+                self.spec_correct_drafts_histogram.len(),
+                self.spec_cap_lens_histogram.len(),
+            ]
+            .into_iter()
+            .all(|len| len <= n)
+    }
+
+    fn take_request(&mut self, i: usize) -> TokenCounts {
+        let nonzero = |column: &[u64]| column.get(i).copied().filter(|&count| count != 0);
+        TokenCounts {
+            speculative: SpeculativeStats::take(self, i).map(Box::new),
+            generation_tokens: self.generation_tokens.get(i).copied(),
+            spec_verify_ct: self.spec_verify_ct.get(i).copied(),
+            reasoning_tokens: self.reasoning_tokens[i],
+            cached_tokens: self.cached_tokens[i],
+            num_retractions: self.retraction_counts.get(i).copied().unwrap_or(0),
+            cached_tokens_details: self.cached_tokens_details.get_mut(i).map(Option::take),
+            dp_rank: self.dp_ranks.get(i).copied(),
+            image_tokens: nonzero(&self.image_tokens),
+            audio_tokens: nonzero(&self.audio_tokens),
+            video_tokens: nonzero(&self.video_tokens),
+            weight_version: self.weight_version.clone(),
+            weight_versions: self.weight_versions.get_mut(i).and_then(Option::take),
+        }
+    }
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -265,6 +585,42 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
         reject!()
     }
+    if h.counts
+        .as_ref()
+        .is_some_and(|counts| !counts.valid_batch_size(n))
+    {
+        reject!()
+    }
+    if h.customized_info.values().any(|column| column.len() != n) {
+        reject!()
+    }
+    if !h.hidden_shapes.is_empty() && h.hidden_shapes.len() != n {
+        reject!()
+    }
+    if !h.sampling_mask_shapes.is_empty() && h.sampling_mask_shapes.len() != n {
+        reject!()
+    }
+    if !h.flat_top_logprob_shapes.is_empty() && h.flat_top_logprob_shapes.len() != n {
+        reject!()
+    }
+    for lengths in [&h.routed_experts_bytes, &h.indexer_topk_bytes] {
+        if !lengths.is_empty() && lengths.len() != n {
+            reject!()
+        }
+    }
+    if !h.beam_headers.is_empty() && h.beam_headers.len() != n {
+        reject!()
+    }
+    if !h.time_metadata.is_empty() && h.time_metadata.len() != n {
+        reject!()
+    }
+    if (!h.prompt_contexts.is_empty() && h.prompt_contexts.len() != n)
+        || h.prompt_contexts
+            .iter()
+            .any(|ids| ids.len() > PROMPT_CONTEXT_TOKENS)
+    {
+        reject!()
+    }
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
     let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
@@ -296,7 +652,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let mut base = 0usize;
     let mut col = |count: usize| -> usize {
         let start = base;
-        base += count * 4;
+        base = base.saturating_add(count.saturating_mul(4));
         start
     };
     // Each val/idx column pair shares one element count — sum it once.
@@ -322,6 +678,39 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let mut c_id_v = col(n_id);
     let mut c_id_i = col(n_id);
     let mut c_h_v = col(n_h);
+    let n_mask_ids = h
+        .sampling_mask_shapes
+        .iter()
+        .flatten()
+        .flatten()
+        .flatten()
+        .map(|&length| length as usize)
+        .sum();
+    let n_mask_logprobs = h.sampling_mask_shapes.iter().flatten().map(Vec::len).sum();
+    let mut c_mask_ids = col(n_mask_ids);
+    let mut c_mask_logprobs = col(n_mask_logprobs);
+    let Some(n_flat_top) = h
+        .flat_top_logprob_shapes
+        .iter()
+        .flatten()
+        .try_fold(0usize, |total, shape| total.checked_add(shape.elements()?))
+    else {
+        reject!()
+    };
+    let mut c_flat_top_values = col(n_flat_top);
+    let mut c_flat_top_indices = col(n_flat_top);
+    let mut c_routed_experts = base;
+    for &length in h.routed_experts_bytes.iter().flatten() {
+        base = base.saturating_add(length as usize);
+    }
+    let mut c_indexer_topk = base;
+    for &length in h.indexer_topk_bytes.iter().flatten() {
+        base = base.saturating_add(length as usize);
+    }
+    let mut c_beam_tokens = base;
+    for sequence in h.beam_headers.iter().flatten().flatten() {
+        base = base.saturating_add((sequence.token_count as usize).saturating_mul(4));
+    }
 
     // `col` summed every column's span into `base`, so a truncated frame is caught
     // here — the one rejection that is genuinely whole-frame, since it precedes the
@@ -361,7 +750,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely.
-        let extras = if !has_extras {
+        let mut extras = if !has_extras {
             None
         } else {
             let (out_lp_val, out_lp_idx) =
@@ -429,6 +818,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 in_tid_lens,
                 hidden_val,
                 hidden_lens,
+                hidden_shape: None,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -437,9 +827,118 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 in_top_txt: Vec::new(),
                 out_tid_txt: Vec::new(),
                 in_tid_txt: Vec::new(),
+                metadata: OutputMetadata::default(),
+                prompt_context: Vec::new(),
+                flat_input_top_logprobs: None,
+                logprobs: None,
+                routed_experts: None,
+                indexer_topk: None,
+                beam_output: None,
+                prompt_token_ids: None,
             };
             (!ex.is_empty()).then(|| Box::new(ex))
         };
+        if let Some(shape) = h.hidden_shapes.get_mut(i).and_then(Option::take) {
+            let ex = extras.get_or_insert_with(Default::default);
+            if shape.elements() != Some(ex.hidden_val.len()) {
+                return None;
+            }
+            ex.hidden_shape = Some(shape);
+        }
+        if !h.customized_info.is_empty() {
+            let metadata = &mut extras.get_or_insert_with(Default::default).metadata;
+            for (key, values) in &mut h.customized_info {
+                metadata
+                    .customized_info
+                    .insert(key.clone(), std::mem::take(&mut values[i]));
+            }
+        }
+        if let Some(fields) = h
+            .time_metadata
+            .get_mut(i)
+            .filter(|fields| !fields.is_empty())
+        {
+            extras
+                .get_or_insert_with(Default::default)
+                .metadata
+                .fields
+                .extend(std::mem::take(fields));
+        }
+        if let Some(context) = h.prompt_contexts.get_mut(i).filter(|ids| !ids.is_empty()) {
+            extras.get_or_insert_with(Default::default).prompt_context = std::mem::take(context);
+        }
+        if let Some(shape) = h.sampling_mask_shapes.get(i).and_then(Option::as_ref) {
+            let masks = shape
+                .iter()
+                .map(|length| match length {
+                    Some(length) => take_i32(data, &mut c_mask_ids, *length as usize)
+                        .map(|ids| serde_json::json!(ids)),
+                    None => Some(serde_json::Value::Null),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let logprobs = take_f32(data, &mut c_mask_logprobs, shape.len())?
+                .into_iter()
+                .map(|value| serde_json::json!(value))
+                .collect();
+            let metadata = &mut extras.get_or_insert_with(Default::default).metadata;
+            metadata
+                .customized_info
+                .insert("output_token_sampling_mask".into(), masks);
+            metadata
+                .customized_info
+                .insert("output_token_sampling_logprobs".into(), logprobs);
+        }
+        if let Some(shape) = h.flat_top_logprob_shapes.get(i).copied().flatten() {
+            let bytes = shape.elements()?.checked_mul(4)?;
+            let read = |offset: &mut usize| {
+                let end = offset.checked_add(bytes)?;
+                let value = Bytes::copy_from_slice(data.get(*offset..end)?);
+                *offset = end;
+                Some(value)
+            };
+            extras
+                .get_or_insert_with(Default::default)
+                .flat_input_top_logprobs = Some(FlatTopLogprobs {
+                shape,
+                values: read(&mut c_flat_top_values)?,
+                indices: read(&mut c_flat_top_indices)?,
+            });
+        }
+        for (lengths, offset, routed) in [
+            (&h.routed_experts_bytes, &mut c_routed_experts, true),
+            (&h.indexer_topk_bytes, &mut c_indexer_topk, false),
+        ] {
+            if let Some(length) = lengths.get(i).copied().flatten() {
+                let end = offset.checked_add(length as usize)?;
+                let bytes = Bytes::copy_from_slice(data.get(*offset..end)?);
+                *offset = end;
+                let extras = extras.get_or_insert_with(Default::default);
+                if routed {
+                    extras.routed_experts = Some(bytes);
+                } else {
+                    extras.indexer_topk = Some(bytes);
+                }
+            }
+        }
+        if let Some(headers) = h.beam_headers.get_mut(i).and_then(Option::take) {
+            let sequences = headers
+                .into_iter()
+                .map(|header| {
+                    Some(BeamSequence {
+                        token_ids: take_i32(data, &mut c_beam_tokens, header.token_count as usize)?,
+                        finish_reason: header.finish_reason,
+                        sequence_score: header.sequence_score,
+                        text: None,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if !sequences.is_empty() {
+                extras.get_or_insert_with(Default::default).beam_output = Some(BeamOutput {
+                    sequences,
+                    scheduler_metadata: OutputMetadata::default(),
+                });
+            }
+        }
 
         Some(ChunkEvent {
             // Any string is a valid rid; hash to the routing key. An unknown
@@ -448,6 +947,12 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
+            counts: Arc::new(
+                h.counts
+                    .as_mut()
+                    .map(|counts| counts.take_request(i))
+                    .unwrap_or_default(),
+            ),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
             // `ChunkEvent` and wired into the response must fail to compile here
@@ -510,10 +1015,31 @@ pub struct Decoded {
 
 /// Frame a control result `[rid, payload]` for the response ring (tag prepended).
 pub fn frame_control_result(rid: &str, payload: &[u8]) -> Bytes {
+    frame_payload(DISPATCH_TAG_RESULT, rid, payload)
+}
+
+pub fn frame_control_result_part(rid: &str, dp_rank: u32, payload: &[u8]) -> Bytes {
+    use rmpv::Value;
+    let arr = Value::Array(vec![
+        Value::from(rid),
+        Value::from(dp_rank),
+        Value::Binary(payload.to_vec()),
+    ]);
+    let mut buf = Vec::with_capacity(1 + payload.len() + rid.len() + 16);
+    buf.push(DISPATCH_TAG_RESULT_PART);
+    let _ = rmpv::encode::write_value(&mut buf, &arr);
+    Bytes::from(buf)
+}
+
+pub fn frame_abort_result(rid: &str, payload: &[u8]) -> Bytes {
+    frame_payload(DISPATCH_TAG_ABORT, rid, payload)
+}
+
+fn frame_payload(tag: u8, rid: &str, payload: &[u8]) -> Bytes {
     use rmpv::Value;
     let arr = Value::Array(vec![Value::from(rid), Value::Binary(payload.to_vec())]);
     let mut buf = Vec::with_capacity(1 + payload.len() + rid.len() + 8);
-    buf.push(DISPATCH_TAG_RESULT);
+    buf.push(tag);
     let _ = rmpv::encode::write_value(&mut buf, &arr);
     Bytes::from(buf)
 }
@@ -556,6 +1082,9 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Immutable scheduler accounting, shared with cumulative response state so
+    /// each stream frame stays small and avoids cloning cache-source strings.
+    pub counts: Arc<TokenCounts>,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
@@ -569,6 +1098,10 @@ pub struct ChunkEvent {
 /// [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
+    /// Final preprocessed prompt, shared across the request's output chunks.
+    pub prompt_token_ids: Option<Arc<[i32]>>,
+    /// Frontend request options also describe requested-but-empty columns.
+    pub logprobs: Option<LogprobOptions>,
     /// Output-token logprobs (parallel `val`/`idx`, one entry per new output token).
     pub out_lp_val: Vec<f32>,
     pub out_lp_idx: Vec<i32>,
@@ -583,6 +1116,11 @@ pub struct ChunkExtras {
     pub in_top_val: Vec<f32>,
     pub in_top_idx: Vec<i32>,
     pub in_top_lens: Vec<u32>,
+    pub flat_input_top_logprobs: Option<FlatTopLogprobs>,
+    /// CPU tensor bytes; encoded to base64 on the detokenizer shard.
+    pub routed_experts: Option<Bytes>,
+    pub indexer_topk: Option<Bytes>,
+    pub beam_output: Option<BeamOutput>,
     /// Token-ids logprobs (same ragged layout); set only when `token_ids_logprob` was.
     pub out_tid_val: Vec<f32>,
     pub out_tid_idx: Vec<i32>,
@@ -594,6 +1132,7 @@ pub struct ChunkExtras {
     /// across chunks (the final message has the full set).
     pub hidden_val: Vec<f32>,
     pub hidden_lens: Vec<u32>,
+    pub hidden_shape: Option<HiddenStateShape>,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -602,19 +1141,40 @@ pub struct ChunkExtras {
     pub in_top_txt: Vec<String>,
     pub out_tid_txt: Vec<String>,
     pub in_tid_txt: Vec<String>,
+    pub metadata: OutputMetadata,
+    /// Consumed once by the native decoder; never exposed as response metadata.
+    pub prompt_context: Vec<i32>,
+}
+
+/// Token-aligned scheduler output and model-owned response annotations. A
+/// processor may consume a raw column and replace it with reduced metadata.
+#[derive(Debug, Clone, Default)]
+pub struct OutputMetadata {
+    pub customized_info: BTreeMap<String, Vec<serde_json::Value>>,
+    pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ChunkExtras {
     /// True when no logprob / hidden column carries data — lets the decoder skip the
     /// box allocation for the common (extras-free) frame.
     fn is_empty(&self) -> bool {
-        self.out_lp_val.is_empty()
+        self.prompt_token_ids.is_none()
+            && self.logprobs.is_none()
+            && self.out_lp_val.is_empty()
             && self.in_lp_val.is_empty()
             && self.out_top_lens.is_empty()
             && self.in_top_lens.is_empty()
+            && self.flat_input_top_logprobs.is_none()
+            && self.routed_experts.is_none()
+            && self.indexer_topk.is_none()
+            && self.beam_output.is_none()
             && self.out_tid_lens.is_empty()
             && self.in_tid_lens.is_empty()
             && self.hidden_lens.is_empty()
+            && self.hidden_shape.is_none()
+            && self.metadata.customized_info.is_empty()
+            && self.metadata.fields.is_empty()
+            && self.prompt_context.is_empty()
     }
 }
 
@@ -623,6 +1183,174 @@ mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
 
+    #[test]
+    fn beam_columns_reject_partial_batches_and_misaligned_tokens() {
+        use base64::Engine;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/beam_outputs_python.json")).unwrap();
+        let original = rmp_serde::to_vec(&fixture["header"]).unwrap();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(fixture["data_b64"].as_str().unwrap())
+            .unwrap();
+        for failure in 0..5 {
+            let mut header: BatchHeader = rmp_serde::from_slice(&original).unwrap();
+            let mut data = data.clone();
+            match failure {
+                0 => {
+                    header.beam_headers.pop();
+                }
+                1 => header.beam_headers.push(None),
+                2 => header.beam_headers[1].as_mut().unwrap()[0].token_count = u32::MAX,
+                3 => {
+                    data.pop();
+                }
+                _ => data.push(0),
+            }
+            let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&header).unwrap(), &[&data]);
+            let mut delivered = 0;
+            let result = for_each_chunk(&frame[1..], |_| delivered += 1);
+            assert!(!result.ok, "case {failure}");
+            assert_eq!(
+                delivered, 0,
+                "a malformed beam must reject the complete batch"
+            );
+            assert_eq!(
+                result
+                    .rids
+                    .iter()
+                    .map(|rid| rid.as_str())
+                    .collect::<Vec<_>>(),
+                header.rids.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn customized_output_preserves_sparse_rows_and_rejects_partial_batches() {
+        let mut header = BatchHeader {
+            rids: vec!["sparse".into(), "empty".into()],
+            finish_reasons: vec![None, None],
+            prompt_tokens: vec![3, 4],
+            tok_lens: vec![2, 0],
+            prompt_contexts: vec![vec![-101, 3], vec![]],
+            customized_info: [(
+                "probe".into(),
+                vec![
+                    vec![serde_json::Value::Null, serde_json::json!(0.25)],
+                    vec![],
+                ],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let data: Vec<u8> = [11i32, 12].into_iter().flat_map(i32::to_le_bytes).collect();
+        let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&header).unwrap(), &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+        assert_eq!(events[0].rid, Rid::from("sparse"));
+        assert_eq!(events[0].token_ids, vec![11, 12]);
+        assert_eq!(
+            events[0].extras.as_ref().unwrap().prompt_context,
+            vec![-101, 3]
+        );
+        assert_eq!(
+            events[0].extras.as_ref().unwrap().metadata.customized_info["probe"],
+            header.customized_info["probe"][0]
+        );
+        assert_eq!(events[1].rid, Rid::from("empty"));
+        assert!(events[1].extras.as_ref().unwrap().prompt_context.is_empty());
+        assert!(events[1].extras.as_ref().unwrap().metadata.customized_info["probe"].is_empty());
+        for invalid_contexts in [
+            vec![vec![]],
+            vec![vec![3; PROMPT_CONTEXT_TOKENS + 1], vec![]],
+        ] {
+            header.prompt_contexts = invalid_contexts;
+            let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&header).unwrap(), &[&data]);
+            let invalid =
+                for_each_chunk(&frame[1..], |_| panic!("invalid context batch was routed"));
+            assert!(!invalid.ok);
+            assert_eq!(invalid.rids, vec![Rid::from("sparse"), Rid::from("empty")]);
+        }
+        header.prompt_contexts.clear();
+        header.customized_info.get_mut("probe").unwrap().pop();
+        let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&header).unwrap(), &[&data]);
+        let invalid = for_each_chunk(&frame[1..], |_| panic!("partial batch was routed"));
+        assert!(!invalid.ok);
+        assert_eq!(invalid.rids, vec![Rid::from("sparse"), Rid::from("empty")]);
+    }
+
+    #[test]
+    fn scheduler_token_counts_keep_request_identity_and_reject_partial_columns() {
+        use serde_json::json;
+
+        // Literal Python header layout: four base columns, twelve optional
+        // numeric shapes, then one named map of scheduler accounting columns.
+        let mut columns = vec![
+            json!(["cached", "cold"]),
+            json!([null, null]),
+            json!([512, 64]),
+            json!([1, 1]),
+        ];
+        columns.extend(std::iter::repeat_n(json!([]), 12));
+        columns.push(json!({
+            "reasoning_tokens": [3, 0],
+            "retraction_counts": [2, 0],
+            "cached_tokens": [192, 0],
+            "cached_tokens_details": [{"device": 128, "host": 32, "storage": 32,
+                                       "storage_backend": "FileSystem"}, null],
+            "dp_ranks": [2, null],
+            "image_tokens": [8, 0],
+            "audio_tokens": [0, 0],
+            "video_tokens": []
+        }));
+        let data: Vec<u8> = [11i32, 12].into_iter().flat_map(i32::to_le_bytes).collect();
+        let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&columns).unwrap(), &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&frame[1..], |event| events.push(event)).ok);
+        assert_eq!(events[0].rid, Rid::from("cached"));
+        assert_eq!(events[0].counts.cached_tokens, 192);
+        assert_eq!(events[0].counts.reasoning_tokens, 3);
+        assert_eq!(events[0].counts.num_retractions, 2);
+        let details = events[0]
+            .counts
+            .cached_tokens_details
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            (details.device, details.host, details.storage),
+            (128, 32, Some(32))
+        );
+        assert_eq!(details.storage_backend.as_deref(), Some("FileSystem"));
+        assert_eq!(events[0].counts.dp_rank, Some(Some(2)));
+        assert_eq!(events[0].counts.image_tokens, Some(8));
+        assert_eq!(events[1].rid, Rid::from("cold"));
+        assert_eq!(events[1].counts.cached_tokens, 0);
+        let cold = serde_json::to_value(events[1].counts.as_ref()).unwrap();
+        assert_eq!(
+            cold,
+            json!({"reasoning_tokens": 0, "cached_tokens": 0, "num_retractions": 0,
+                               "cached_tokens_details": null, "dp_rank": null})
+        );
+
+        for (field, bad) in [
+            ("cached_tokens", json!([192])),
+            ("reasoning_tokens", json!([])),
+            ("retraction_counts", json!([2])),
+            ("cached_tokens_details", json!([null])),
+            ("dp_ranks", json!([0, 1, 2])),
+            ("image_tokens", json!([8])),
+            ("cached_tokens", json!([-1, 0])),
+        ] {
+            let mut invalid = columns.clone();
+            invalid[16][field] = bad;
+            let frame = frame_decode_batch_cols(&rmp_serde::to_vec(&invalid).unwrap(), &[&data]);
+            let decoded = for_each_chunk(&frame[1..], |_| panic!("partial {field} was routed"));
+            assert!(!decoded.ok, "{field}");
+            assert_eq!(decoded.rids, vec![Rid::from("cached"), Rid::from("cold")]);
+        }
+    }
     #[test]
     fn batch_cols_match_single_joined_buffer() {
         let header = [1u8, 2, 3];

@@ -13,7 +13,10 @@ the e2e serve tests; this file pins the unit-level invariants the wiring
 relies on.
 """
 
+import copy
+import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -28,7 +31,106 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def rust_hash_fixtures():
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.utils import ImageData
+
+    digest = "sha256:" + "ab" * 32
+    other = "sha256:" + "cd" * 32
+    image = "https://fixtures/image.png"
+    single = {"text": "one", "image_data": image}
+    batch = {"text": ["one", "two"], "image_data": [image, image]}
+    bodies = [
+        single,
+        {**single, "mm_hashes": ["a1b2", "not-hex"]},
+        {**single, "mm_hashes": [], "mm_content_hashes": [None]},
+        {**single, "mm_content_hashes": [digest]},
+        {**single, "mm_content_hashes": ["sha256:" + "AB" * 32]},
+        {**single, "image_data": {"url": image, "content_hash": digest}},
+        {**single, "image_data": {"url": image, "content_hash": ""}},
+        {
+            **single,
+            "image_data": {"url": image, "content_hash": digest},
+            "mm_content_hashes": ["sha256:" + "AB" * 32],
+            "mm_hashes": ["0x2a"],
+        },
+        {**batch, "mm_hashes": ["01", "02"], "mm_content_hashes": [digest, None]},
+        {
+            **batch,
+            "image_data": [[image], [image, image]],
+            "mm_hashes": ["01", ["02", "03"]],
+            "mm_content_hashes": [[digest], [None, other]],
+        },
+        {
+            **batch,
+            "mm_hashes": [["01"], ["02"]],
+            "mm_content_hashes": [[digest], [other]],
+            "sampling_params": {"n": 3},
+        },
+        {**single, "mm_hashes": ["01"], "sampling_params": {"n": 3}},
+        {**batch, "mm_hashes": []},
+        {**batch, "mm_content_hashes": [digest]},
+        {**batch, "mm_hashes": [["01", "02"], ["03"]]},
+        {**batch, "image_data": [[image, image], [image]], "mm_hashes": ["01", "02"]},
+        {**single, "mm_content_hashes": []},
+        {**single, "mm_content_hashes": [digest, other]},
+        {**single, "mm_content_hashes": ["ab" * 32]},
+        {**single, "mm_content_hashes": ["sha256:" + "a" * 63]},
+        {**single, "mm_content_hashes": ["sha256:" + "x" * 64]},
+        {
+            **single,
+            "image_data": {"url": image, "content_hash": digest},
+            "mm_content_hashes": [other],
+        },
+    ]
+
+    def image_objects(value):
+        if isinstance(value, list):
+            return [image_objects(item) for item in value]
+        if isinstance(value, dict):
+            return ImageData(**value)
+        return value
+
+    cases = []
+    for body in bodies:
+        case = {"body": body}
+        request = GenerateReqInput(**copy.deepcopy(body))
+        # OpenAI image_url objects reach TokenizerManager as ImageData.
+        request.image_data = image_objects(request.image_data)
+        try:
+            request.normalize_batch_and_arguments()
+            parents = (
+                [request]
+                if request.is_single
+                else [request[index] for index in range(request.batch_size)]
+            )
+            expected = []
+            for item in parents:
+                if not isinstance(item.image_data, list):
+                    item.image_data = [item.image_data]
+                TokenizerManager._normalize_mm_content_hashes(item)
+                expected.extend(
+                    {
+                        "mm_hashes": item.mm_hashes or [],
+                        "mm_content_hashes": item.mm_content_hashes,
+                    }
+                    for _ in range(request.parallel_sample_num)
+                )
+            case["expected"] = expected
+        except ValueError as error:
+            case["error"] = str(error)
+        cases.append(case)
+    return cases
+
+
 class TestMmHashesContract(CustomTestCase):
+    def test_rust_hash_fixture_matches_python_normalization(self):
+        fixture = (
+            Path(__file__).resolve().parents[4]
+            / "rust/sglang-server/testdata/mm_hashes_python.json"
+        )
+        self.assertEqual(json.loads(fixture.read_text()), rust_hash_fixtures())
+
     def test_generate_req_input_accepts_mm_hashes(self):
         """GenerateReqInput exposes mm_hashes as an optional field."""
         req = GenerateReqInput(

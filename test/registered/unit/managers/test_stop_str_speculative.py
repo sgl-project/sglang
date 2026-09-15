@@ -8,8 +8,13 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 import unittest
 from array import array
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    _GenerationStreamAccumulator,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -67,6 +72,37 @@ def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset())
 
 
 class TestStopStrSpeculative(unittest.TestCase):
+    def test_stream_and_forced_unary_updates_withhold_literal_stop_prefix(self):
+        for stream in (False, True):
+            for regex in (False, True):
+                with self.subTest(stream=stream, regex=regex):
+                    req = _make_req(
+                        [10, 70],
+                        **{"stop_regex" if regex else "stop": ["XY"]},
+                    )
+                    req.stream = stream
+                    accumulator = _GenerationStreamAccumulator(
+                        return_logprob=False,
+                        return_hidden_states=False,
+                        return_routed_experts=False,
+                        return_indexer_topk=False,
+                        spec_algorithm=SpeculativeAlgorithm.NONE,
+                        disaggregation_mode=DisaggregationMode.NULL,
+                        default_stream_interval=1,
+                        default_force_stream_interval=1,
+                        get_cached_tokens_details=lambda req: None,
+                        current_weight_version=None,
+                    )
+                    self.assertTrue(req.check_match_stop_str_prefix())
+                    accumulator.accept(req=req)
+                    self.assertEqual(accumulator.output_ids, [])
+                    self.assertEqual(req.send_token_offset, 0)
+                    req.output_ids.append(71)
+                    req.update_finish_state()
+                    accumulator.accept(req=req)
+                    self.assertEqual(list(accumulator.output_ids[0]), [10, 70, 71])
+                    self.assertEqual(req.send_token_offset, 3)
+
     def test_no_stop_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)

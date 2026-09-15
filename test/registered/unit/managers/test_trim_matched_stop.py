@@ -6,7 +6,9 @@ but the trailing over-generation still dropped (`output[:end]`); without it the
 stop is removed (`output[:pos]`). Pure CPU: calls the method with a stub self,
 so no DetokenizerManager.__init__ / IPC / tokenizer."""
 
+import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -26,6 +28,25 @@ def _trim(output, matched, no_stop_trim, *, gpt_oss=False):
 
 
 class TestTrimMatchedStop(unittest.TestCase):
+    def test_rust_chunk_fixtures_match_python_full_text_trimming(self):
+        cases = json.loads(
+            (
+                Path(__file__).resolve().parents[4]
+                / "rust/sglang-server/testdata/stop_text_python.json"
+            ).read_text()
+        )
+        for case in cases:
+            for keep in (False, True):
+                with self.subTest(case=case["name"], no_stop_trim=keep):
+                    self.assertEqual(
+                        _trim(
+                            "".join(case["chunks"]),
+                            case["finish"].get("matched"),
+                            keep,
+                        ),
+                        case["kept" if keep else "trimmed"],
+                    )
+
     def test_no_finished_reason_returns_output(self):
         self.assertEqual(_trim("abc", None, False), "abc")
 

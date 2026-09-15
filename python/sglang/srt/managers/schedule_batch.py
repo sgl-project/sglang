@@ -1287,7 +1287,12 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Override vectors are absent from the token cache key. Keep their KV
+        # private, including after completion, so ordinary prompts cannot reuse it.
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1678,7 +1683,10 @@ class Req(ReqDllmMixin):
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
-        if not self.sampling_params.stop_strs:
+        if (
+            not self.sampling_params.stop_strs
+            and not self.sampling_params.stop_regex_strs
+        ):
             return False
 
         tail_str = self.tail_str()
@@ -1687,7 +1695,11 @@ class Req(ReqDllmMixin):
         if not tail_str:
             return False
 
-        for stop_str in self.sampling_params.stop_strs:
+        # Regex finish reasons carry the pattern itself. DetokenizerManager
+        # trims that literal string, so its prefixes need the same protection.
+        for stop_str in (
+            self.sampling_params.stop_strs + self.sampling_params.stop_regex_strs
+        ):
             if not stop_str:
                 continue
             # Check if stop_str is contained in tail_str (fastest check first)

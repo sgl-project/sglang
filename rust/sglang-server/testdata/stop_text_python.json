@@ -1,0 +1,13 @@
+[
+  {"name":"split_with_empty_delta","stops":["END"],"chunks":["答 ","E","","N","Dignored"],"finish":{"type":"stop","matched":"END"},"trimmed":"答 ","kept":"答 END"},
+  {"name":"overlapping_prefixes","stops":["ENDING","ENDLESS"],"chunks":["x E","N","D","L","E","SStail"],"finish":{"type":"stop","matched":"ENDLESS"},"trimmed":"x ","kept":"x ENDLESS"},
+  {"name":"release_failed_prefix","stops":["END"],"chunks":["hi E","X ","EN","Drest"],"finish":{"type":"stop","matched":"END"},"trimmed":"hi EX ","kept":"hi EX END"},
+  {"name":"unicode_stop","stops":["終わり"],"chunks":["先 ","終","わ","り後"],"finish":{"type":"stop","matched":"終わり"},"trimmed":"先 ","kept":"先 終わり"},
+  {"name":"length_flushes_prefix","stops":["END"],"chunks":["x E","N",""],"finish":{"type":"length","length":2},"trimmed":"x EN","kept":"x EN"},
+  {"name":"abort_flushes_prefix","stops":["END"],"chunks":["x E","N",""],"finish":{"type":"abort","message":"cancelled","status_code":400},"trimmed":"x EN","kept":"x EN"},
+  {"name":"regex_keeps_actual_match","stops":["E.D"],"chunks":["x E","A","D"],"finish":{"type":"stop","matched":"E.D"},"trimmed":"x EAD","kept":"x EAD"},
+  {"name":"regex_literal_is_trimmed","stops":["E.D"],"chunks":["x E",".","Drest"],"finish":{"type":"stop","matched":"E.D"},"trimmed":"x ","kept":"x E.D"},
+  {"name":"empty_match_is_ignored","stops":[""],"chunks":["x",""],"finish":{"type":"stop","matched":""},"trimmed":"x","kept":"x"},
+  {"name":"special_token_text","stops":["<|end|>"],"chunks":["\n<|","end","|>tail"],"finish":{"type":"stop","matched":"<|end|>"},"trimmed":"\n","kept":"\n<|end|>"},
+  {"name":"first_full_occurrence","stops":["END"],"chunks":["x ENDtail","later END"],"finish":{"type":"stop","matched":"END"},"trimmed":"x ","kept":"x END"}
+]

@@ -238,6 +238,10 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    # Routers before the DP gather capture local tokens. Their model supplies
+    # the actual attention-TP sequence-sharding decision for each forward.
+    routed_experts_capture_local: bool = False
+    routed_experts_capture_sequence_sharded: bool = False
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -546,6 +550,7 @@ class TopK(BaseFusedOp):
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
+        routed_experts_capture_local: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -585,6 +590,7 @@ class TopK(BaseFusedOp):
             output_format=output_format,
             scoring_func=scoring_func,
             allow_routed_experts_capture=allow_routed_experts_capture,
+            routed_experts_capture_local=routed_experts_capture_local,
         )
 
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
@@ -2119,6 +2125,8 @@ def capture_routed_experts_if_allowed(
         cap.capture(
             layer_id=layer_id,
             topk_indices=topk_ids,
+            local_tokens=topk_config.routed_experts_capture_local,
+            sequence_sharded=topk_config.routed_experts_capture_sequence_sharded,
         )
 
 

@@ -5,23 +5,51 @@ use std::fmt;
 
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::request::{HeapBytes, check_broadcast_budget};
+use super::types::{OneOrMany, OneOrManyItem};
 use crate::utils::error::Error;
+
+/// Request-scoped options exposed by Python's multimodal input schema.
+/// Each processor applies the hints supported by its preprocessing configuration.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct MmProcessorOptions {
+    #[serde(default)]
+    pub use_audio_in_video: bool,
+    pub video_config: Option<serde_json::Map<String, serde_json::Value>>,
+    pub modalities: Option<Vec<String>>,
+    pub max_dynamic_patch: Option<i64>,
+    pub min_dynamic_patch: Option<i64>,
+    pub image_max_dynamic_patch: Option<i64>,
+    pub video_max_dynamic_patch: Option<i64>,
+    pub images_config: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl MmProcessorOptions {
+    pub(super) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 /// One media item: Python `MultimodalDataInputItem` as it can arrive over JSON.
 /// `bytes` and PIL images exist only on the in-process Engine path, so they have
 /// no variant here.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum MmItem {
     /// URL, `file://` / absolute path, `data:` URI, or bare base64 (Python `str`).
     Source(String),
-    /// Python `ImageData` / `VideoData` (`{"url": …, …}`). Only `url` is kept:
-    /// the hint keys (`detail`, `max_dynamic_patch`, `preprocess_kwargs`, ...)
+    /// Python `ImageData` / `VideoData` (`{"url": …, …}`). Content identity is
+    /// distinct from the caller's processor-feature hash. The hint keys
+    /// (`detail`, `max_dynamic_patch`, `preprocess_kwargs`, ...)
     /// are read by model families this pipeline does not run, and Python's
     /// `load_image` itself reduces the item to `.url`.
-    Ref { url: String },
+    Ref {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_hash: Option<String>,
+    },
     /// A preprocessed item (`{"format": "processor_output" | "precomputed_embedding", …}`).
     /// Parsed only far enough to be rejected by name at the MM stage; Python
     /// ignores it the same way on a text-only model.
@@ -33,7 +61,7 @@ impl MmItem {
     /// preprocessed item.
     pub fn source(&self) -> Option<&str> {
         match self {
-            MmItem::Source(source) | MmItem::Ref { url: source } => Some(source),
+            MmItem::Source(source) | MmItem::Ref { url: source, .. } => Some(source),
             MmItem::Preprocessed { .. } => None,
         }
     }
@@ -42,8 +70,9 @@ impl MmItem {
 impl HeapBytes for MmItem {
     fn heap_bytes(&self) -> usize {
         match self {
-            MmItem::Source(s) | MmItem::Ref { url: s } | MmItem::Preprocessed { format: s } => {
-                s.len()
+            MmItem::Source(s) | MmItem::Preprocessed { format: s } => s.len(),
+            MmItem::Ref { url, content_hash } => {
+                url.len() + content_hash.as_ref().map_or(0, String::len)
             }
         }
     }
@@ -57,6 +86,8 @@ struct ItemObject {
     url: Option<String>,
     #[serde(default)]
     format: Option<String>,
+    #[serde(default)]
+    content_hash: Option<String>,
 }
 
 impl TryFrom<ItemObject> for MmItem {
@@ -65,10 +96,135 @@ impl TryFrom<ItemObject> for MmItem {
     fn try_from(object: ItemObject) -> Result<Self, Self::Error> {
         match (object.format, object.url) {
             (Some(format), _) => Ok(MmItem::Preprocessed { format }),
-            (None, Some(url)) => Ok(MmItem::Ref { url }),
+            (None, Some(url)) => Ok(MmItem::Ref {
+                url,
+                content_hash: object.content_hash,
+            }),
             (None, None) => Err("a multimodal item object needs a `url` or a `format` key"),
         }
     }
+}
+
+/// Align each hash column with Python's normalized image lists. A batch can
+/// mix a scalar for a one-image request with a list for a multi-image request.
+/// Single-request feature hashes retain the worker's warning/fallback policy
+/// for a count mismatch; content-hash alignment is checked before processing.
+pub(super) fn fan_out_hashes<T: OneOrManyItem + Clone>(
+    hashes: Option<Vec<OneOrMany<T>>>,
+    images: &[Vec<MmItem>],
+    is_batch: bool,
+    field: &str,
+) -> Result<Vec<Option<Vec<T>>>, Error> {
+    let Some(hashes) = hashes else {
+        return Ok(vec![None; images.len()]);
+    };
+    if !is_batch {
+        let values = hashes
+            .into_iter()
+            .map(|hash| match hash {
+                OneOrMany::One(value) => Ok(value),
+                OneOrMany::Many(_) => Err(Error::Validation(format!(
+                    "{field} must be a flat list for a single request"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(vec![Some(values)]);
+    }
+    if hashes.len() != images.len() {
+        return Err(Error::Validation(format!(
+            "The length of {field} should equal the batch size"
+        )));
+    }
+    hashes
+        .into_iter()
+        .zip(images)
+        .enumerate()
+        .map(|(index, (hashes, images))| {
+            let values = match hashes {
+                OneOrMany::One(value) if images.len() == 1 => vec![value],
+                OneOrMany::One(_) => {
+                    return Err(Error::Validation(format!(
+                        "{field}[{index}] must be a list with one entry per image"
+                    )));
+                }
+                OneOrMany::Many(values) => values,
+            };
+            if values.len() != images.len() {
+                return Err(Error::Validation(format!(
+                    "{field}[{index}] has {} entries for {} images",
+                    values.len(),
+                    images.len()
+                )));
+            }
+            Ok(Some(values))
+        })
+        .collect()
+}
+
+/// Python TokenizerManager merges native and inline OpenAI identities before
+/// calling a processor. These identities never replace the feature hash.
+pub(crate) fn normalize_content_hashes(
+    images: &[MmItem],
+    explicit: Option<Vec<Option<String>>>,
+) -> Result<Option<Vec<Option<String>>>, String> {
+    let has_inline = images.iter().any(|image| {
+        matches!(
+            image,
+            MmItem::Ref {
+                content_hash: Some(value),
+                ..
+            } if !value.is_empty()
+        )
+    });
+    if explicit.is_none() && !has_inline {
+        return Ok(None);
+    }
+    if let Some(hashes) = &explicit
+        && hashes.len() != images.len()
+    {
+        return Err(format!(
+            "mm_content_hashes has {} entries for {} images",
+            hashes.len(),
+            images.len()
+        ));
+    }
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let embedded = match image {
+                MmItem::Ref { content_hash, .. } => content_hash.as_deref(),
+                _ => None,
+            };
+            let embedded = parse_content_hash(embedded)?;
+            let provided = parse_content_hash(
+                explicit
+                    .as_ref()
+                    .and_then(|hashes| hashes[index].as_deref()),
+            )?;
+            if provided.is_some() && embedded.is_some() && provided != embedded {
+                return Err(format!(
+                    "Conflicting content hashes for image_data[{index}]"
+                ));
+            }
+            Ok(provided.or(embedded))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn parse_content_hash(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let digest = value
+        .strip_prefix("sha256:")
+        .ok_or("content_hash must use the form 'sha256:<64 hex digits>'")?;
+    if digest.len() != 64 {
+        return Err("content_hash must contain exactly 64 SHA-256 hex digits".into());
+    }
+    if !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("content_hash contains non-hexadecimal characters".into());
+    }
+    Ok(Some(format!("sha256:{}", digest.to_ascii_lowercase())))
 }
 
 /// Hand-written rather than `#[serde(untagged)]` so a bad item is reported as
@@ -300,6 +456,50 @@ fn check_len(len: usize, n: usize, name: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn processor_options_validate_python_types_and_reach_forwarded_media_work() {
+        use crate::message::request::GenerateBody;
+        use crate::multi_modality::payload::resolve_media_work;
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../testdata/mm_processor_options_python.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let body: GenerateBody = serde_json::from_value(case["body"].clone()).unwrap();
+            let options = body.processor_options.clone();
+            let (requests, _) = body.into_requests().unwrap();
+            assert_eq!(requests.len(), case["requests"].as_u64().unwrap() as usize);
+            for request in requests {
+                let forwarded: GenerateBody =
+                    serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+                let (forwarded, _) = forwarded.into_requests().unwrap();
+                assert_eq!(forwarded.len(), 1);
+                for mut request in std::iter::once(request).chain(forwarded) {
+                    assert!(request.has_multimodal());
+                    let resolved = resolve_media_work(request.take_mm_work()).unwrap();
+                    assert_eq!(resolved.processor_options, options);
+                    assert_eq!(resolved.images.len() + resolved.videos.len(), 1);
+                }
+            }
+        }
+        for body in fixture["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<GenerateBody>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+        let body: GenerateBody = serde_json::from_value(serde_json::json!({
+            "input_ids": [1], "max_dynamic_patch": 2, "use_audio_in_video": true
+        }))
+        .unwrap();
+        let (requests, _) = body.into_requests().unwrap();
+        assert!(
+            !requests[0].has_multimodal(),
+            "hints alone must not trigger media processing"
+        );
+    }
+
     fn parse(json: &str) -> Result<MmDataInput, serde_json::Error> {
         serde_json::from_str(json)
     }
@@ -330,7 +530,10 @@ mod tests {
     fn parses_item_objects() {
         assert_eq!(
             parse(r#"{"url": "u", "detail": "high"}"#).unwrap(),
-            MmDataInput::One(MmItem::Ref { url: "u".into() })
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                content_hash: None
+            })
         );
         assert_eq!(
             parse(r#"[{"format": "processor_output", "url": "u", "pixel_values": [1]}]"#).unwrap(),

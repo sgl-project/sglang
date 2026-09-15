@@ -8,27 +8,238 @@ Covers:
 - Score mixin override resolution (tokenizer_manager_score_mixin.py)
 """
 
+import json
 import unittest
+from array import array
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import msgspec
 import torch
 
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 HIDDEN_DIM = 4
+POSITIONAL_FIXTURE = (
+    Path(__file__).resolve().parents[4]
+    / "rust/sglang-server/testdata/positional_embeds_python.json"
+)
+
+
+def positional_embeds_fixture():
+    manager = object.__new__(TokenizerManager)
+    manager.context_len = 6
+    manager.num_reserved_tokens = 0
+    manager.allow_auto_truncate = False
+    manager.validate_total_tokens = True
+    manager.model_config = SimpleNamespace(vocab_size=128, hidden_size=HIDDEN_DIM)
+    manager.preferred_sampling_params = {}
+    manager.sampling_params_class = SamplingParams
+    manager.tokenizer = None
+    manager.rid_to_state = {}
+    runner = object.__new__(ModelRunner)
+    runner.support_pp = False
+    runner.is_generation = True
+    embedding = torch.nn.Embedding.from_pretrained(
+        torch.arange(128 * HIDDEN_DIM, dtype=torch.float32).reshape(128, HIDDEN_DIM)
+        / 16
+    )
+    runner.model = SimpleNamespace(get_input_embeddings=lambda: embedding)
+    override = {"embeds": [[0.125, -2, 3.5, 4], [5, 6, 7, 8]], "positions": [0, 2]}
+    bodies = [
+        {"input_ids": [1, 2, 3], "positional_embed_overrides": value}
+        for value in (None, override, [override])
+    ] + [
+        {"input_ids": [[1, 2, 3], [4, 5, 6, 7]], "positional_embed_overrides": value}
+        for value in (override, [override, None])
+    ]
+    bodies += [{**deepcopy(body), "sampling_params": {"n": 2}} for body in bodies]
+    rejected = [
+        {"input_ids": [1, 2, 3], "positional_embed_overrides": value}
+        for value in (
+            {},
+            [],
+            "bad",
+            {"embeds": [], "positions": []},
+            {"embeds": [[1, 2, 3, 4], [5]], "positions": [0, 1]},
+            {"embeds": [[1, 2, 3]], "positions": [0]},
+            {"embeds": [[1, 2, 3, 4]], "positions": [0, 1]},
+            {"embeds": [[1, 2, 3, 4]], "positions": [-1]},
+            {"embeds": [[1, 2, 3, 4]], "positions": [3]},
+            {"embeds": [[1, 2, 3, 4]], "positions": [0.5]},
+            {"embeds": [[1, 2, 3, 4]], "positions": [True]},
+            {"embeds": [[1, 2, "3", 4]], "positions": [0]},
+            {"embeds": [[1, 2, True, 4]], "positions": [0]},
+        )
+    ] + [
+        {"input_ids": [[1, 2, 3], [4, 5, 6]], "positional_embed_overrides": [override]}
+    ]
+    accepted = []
+    context = get_context().override_server_args()
+    context.install()
+    try:
+        for body in bodies:
+            request = GenerateReqInput(**deepcopy(body))
+            request.normalize_batch_and_arguments()
+            prompts = (
+                [request]
+                if request.is_single
+                else [request[i] for i in range(request.batch_size)]
+            )
+            expected = []
+            for prompt in prompts:
+                manager._validate_one_request(prompt, prompt.input_ids)
+                manager.rid_to_state[prompt.rid] = SimpleNamespace(
+                    time_stats=MagicMock()
+                )
+                tokenized = manager._create_tokenized_object(
+                    prompt, "", prompt.input_ids
+                )
+                overrides = tokenized.positional_embed_overrides
+                encoded = bytearray(
+                    msgspec.msgpack.encode(overrides, enc_hook=enc_hook)
+                )
+                restored = msgspec.msgpack.decode(
+                    encoded,
+                    type=PositionalEmbeds | None,
+                    dec_hook=dec_hook,
+                    ext_hook=ext_hook,
+                )
+                wire_hex = encoded.hex()
+                encoded[:] = b"\x00" * len(encoded)
+                ids = torch.tensor(prompt.input_ids)
+                if restored is None:
+                    values = embedding(ids)
+                else:
+                    kwargs = runner._extend_forward_kwargs(
+                        SimpleNamespace(
+                            input_ids=ids,
+                            input_embeds=None,
+                            replace_embeds=restored.embeds,
+                            replace_positions=restored.positions,
+                        ),
+                        None,
+                    )
+                    values = kwargs["input_embeds"]
+                    torch.testing.assert_close(
+                        values[restored.positions], overrides.embeds
+                    )
+                    assert restored.embeds.device.type == "cpu"
+                    assert restored.embeds.dtype == torch.float32
+                expected.extend(
+                    {"wire_hex": wire_hex, "input_embeds": values.tolist()}
+                    for _ in range(request.parallel_sample_num)
+                )
+            accepted.append({"body": body, "expected": expected})
+        for body in rejected:
+            try:
+                request = GenerateReqInput(**deepcopy(body))
+                request.normalize_batch_and_arguments()
+                prompts = (
+                    [request]
+                    if request.is_single
+                    else [request[i] for i in range(request.batch_size)]
+                )
+                for prompt in prompts:
+                    manager._validate_one_request(prompt, prompt.input_ids)
+            except (ValueError, TypeError):
+                continue
+            raise AssertionError(f"invalid overrides accepted: {body}")
+    finally:
+        context.restore()
+    return {
+        "field_index": TokenizedGenerateReqInput.__struct_fields__.index(
+            "positional_embed_overrides"
+        )
+        + 1,
+        "hidden_size": HIDDEN_DIM,
+        "accepted": accepted,
+        "rejected": rejected,
+    }
+
+
+class TestPositionalEmbedsHttp(CustomTestCase):
+    def test_native_fixture_matches_python_tensor_transport_and_model_inputs(self):
+        self.assertEqual(
+            json.loads(POSITIONAL_FIXTURE.read_text()), positional_embeds_fixture()
+        )
+
+    def test_override_chunks_keep_private_kv_and_do_not_publish_token_only_keys(self):
+        context = get_context().override_server_args()
+        context.install()
+        try:
+            allocator = SimpleNamespace(
+                page_size=1, device="cpu", free_segments=MagicMock()
+            )
+            tree = RadixCache.create_simulated(mock_allocator=allocator)
+            tree.req_to_token_pool = SimpleNamespace(
+                req_to_token=torch.arange(100, 108, dtype=torch.int32).reshape(1, 8),
+                free=MagicMock(),
+            )
+            existing = RadixKey(array("q", [1, 2, 3]))
+            tree.insert(InsertParams(key=existing))
+            request = Req(
+                "overrides",
+                "",
+                array("q", [1, 2, 3, 4, 5, 6]),
+                SamplingParams(max_new_tokens=1),
+                positional_embed_overrides=PositionalEmbeds([_vec()], [4]),
+            )
+            match_prefix_for_req(tree, request)
+            self.assertEqual(request.num_matched_prefix_tokens, 0)
+            request.init_next_round_input(tree)
+            self.assertEqual(len(request.prefix_indices), 0)
+            request.kv.req_pool_idx = 0
+            request.kv.kv_committed_len = 4
+            request.kv.kv_allocated_len = 6
+            request.extend_range = SimpleNamespace(end=4)
+            maybe_cache_unfinished_req(request, tree, chunked=True)
+            self.assertEqual(request.prefix_indices.tolist(), [100, 101, 102, 103])
+            self.assertEqual(request.kv.cache_protected_len, 0)
+            request.init_next_round_input()
+            self.assertEqual(len(request.prefix_indices), 4)
+            request.extend_range = SimpleNamespace(end=6)
+            request.kv.kv_committed_len = 6
+            maybe_cache_unfinished_req(request, tree)
+            self.assertEqual(request.prefix_indices.tolist(), list(range(100, 106)))
+            release_kv_cache(request, tree)
+            segments = allocator.free_segments.call_args.args[0]
+            self.assertEqual(segments[0][0].tolist(), list(range(100, 106)))
+            self.assertEqual(segments[0][1], 0)
+            self.assertTrue(request.kv.is_kv_released)
+            match = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(request.origin_input_ids))
+            )
+            self.assertEqual(len(match.device_indices), 3)
+        finally:
+            context.restore()
 
 
 def _vec(val: float = 1.0) -> torch.Tensor:

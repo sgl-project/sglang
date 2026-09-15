@@ -1,0 +1,1856 @@
+[
+  {
+    "endpoint": "completions",
+    "body": {
+      "model": "org/model",
+      "n": 1,
+      "return_hidden_states": "last",
+      "return_routed_experts": true,
+      "return_cached_tokens_details": true,
+      "return_spec_tokens_details": true,
+      "return_token_ids": true,
+      "prompt": [
+        1,
+        2
+      ],
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": true,
+      "return_input_ids": false,
+      "return_output_ids": false,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {},
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            0.25,
+            0.5
+          ]
+        },
+        "index": 0
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 0,
+              "text": "",
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null,
+              "hidden_states": [
+                0.25,
+                0.5
+              ]
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "routed_experts": "AAECAw==",
+            "cached_tokens_details": {
+              "device": 1,
+              "host": 0,
+              "storage": 0,
+              "storage_backend": "file"
+            },
+            "spec_tokens_details": {
+              "spec_accept_rate": 0.5,
+              "spec_accept_length": 2.0,
+              "spec_cap_length": 0.0,
+              "spec_block_accept_length": 0.0,
+              "spec_num_correct_drafts": 1,
+              "spec_num_proposed_drafts": 2,
+              "spec_verify_ct": 1,
+              "spec_correct_drafts_histogram": [],
+              "spec_cap_lens_histogram": []
+            }
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 2,
+            "total_tokens": 4,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "reasoning_tokens": 1
+          }
+        }
+      }
+    ]
+  },
+  {
+    "endpoint": "completions",
+    "body": {
+      "model": "org/model",
+      "n": 2,
+      "return_hidden_states": true,
+      "return_routed_experts": true,
+      "return_cached_tokens_details": true,
+      "return_spec_tokens_details": true,
+      "return_token_ids": true,
+      "prompt": [
+        [
+          1,
+          2
+        ],
+        [
+          3,
+          4,
+          5
+        ]
+      ],
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": true,
+      "return_input_ids": false,
+      "return_output_ids": false,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {},
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      },
+      {
+        "text": "o",
+        "output_ids": [
+          11
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-1",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 2,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 1
+      },
+      {
+        "text": "o",
+        "output_ids": [
+          12
+        ],
+        "prompt_token_ids": [
+          3,
+          4,
+          5
+        ],
+        "meta_info": {
+          "id": "contract-2",
+          "prompt_tokens": 3,
+          "completion_tokens": 1,
+          "reasoning_tokens": 3,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 2
+      },
+      {
+        "text": "o",
+        "output_ids": [
+          13
+        ],
+        "prompt_token_ids": [
+          3,
+          4,
+          5
+        ],
+        "meta_info": {
+          "id": "contract-3",
+          "prompt_tokens": 3,
+          "completion_tokens": 1,
+          "reasoning_tokens": 4,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 3
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            [
+              [
+                1.0,
+                2.0
+              ]
+            ],
+            [
+              0.25,
+              0.5
+            ]
+          ]
+        },
+        "index": 0
+      },
+      {
+        "text": "ok",
+        "output_ids": [
+          11,
+          21
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-1",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 2,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            [
+              [
+                1.0,
+                2.0
+              ]
+            ],
+            [
+              0.25,
+              0.5
+            ]
+          ]
+        },
+        "index": 1
+      },
+      {
+        "text": "ok",
+        "output_ids": [
+          12,
+          22
+        ],
+        "prompt_token_ids": [
+          3,
+          4,
+          5
+        ],
+        "meta_info": {
+          "id": "contract-2",
+          "prompt_tokens": 3,
+          "completion_tokens": 2,
+          "reasoning_tokens": 3,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            [
+              [
+                1.0,
+                2.0
+              ]
+            ],
+            [
+              0.25,
+              0.5
+            ]
+          ]
+        },
+        "index": 2
+      },
+      {
+        "text": "ok",
+        "output_ids": [
+          13,
+          23
+        ],
+        "prompt_token_ids": [
+          3,
+          4,
+          5
+        ],
+        "meta_info": {
+          "id": "contract-3",
+          "prompt_tokens": 3,
+          "completion_tokens": 2,
+          "reasoning_tokens": 4,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            [
+              [
+                1.0,
+                2.0
+              ]
+            ],
+            [
+              0.25,
+              0.5
+            ]
+          ]
+        },
+        "index": 3
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 0,
+              "text": "",
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null,
+              "hidden_states": [
+                0.25,
+                0.5
+              ]
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 1,
+              "text": "",
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null,
+              "hidden_states": [
+                0.25,
+                0.5
+              ]
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 2,
+              "text": "",
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null,
+              "hidden_states": [
+                0.25,
+                0.5
+              ]
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 3,
+              "text": "",
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null,
+              "hidden_states": [
+                0.25,
+                0.5
+              ]
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "routed_experts": "AAECAw==",
+            "cached_tokens_details": {
+              "device": 1,
+              "host": 0,
+              "storage": 0,
+              "storage_backend": "file"
+            },
+            "spec_tokens_details": [
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              },
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              },
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              },
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              }
+            ]
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-3",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 5,
+            "total_tokens": 13,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {
+              "cached_tokens": 2
+            },
+            "reasoning_tokens": 10
+          }
+        }
+      }
+    ]
+  },
+  {
+    "endpoint": "completions",
+    "body": {
+      "model": "org/model",
+      "n": 1,
+      "return_hidden_states": false,
+      "return_routed_experts": false,
+      "return_cached_tokens_details": false,
+      "return_spec_tokens_details": false,
+      "return_token_ids": false,
+      "prompt": [
+        1,
+        2
+      ],
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": false,
+      "return_input_ids": false,
+      "return_output_ids": false,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {},
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "text_completion",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 2,
+            "total_tokens": 4,
+            "completion_tokens": 2,
+            "reasoning_tokens": 1
+          }
+        }
+      }
+    ]
+  },
+  {
+    "endpoint": "chat",
+    "body": {
+      "model": "org/model",
+      "n": 1,
+      "return_hidden_states": true,
+      "return_routed_experts": true,
+      "return_cached_tokens_details": true,
+      "return_spec_tokens_details": true,
+      "return_token_ids": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "return_meta_info": false,
+      "return_input_ids_in_sglext": true,
+      "return_output_ids_in_sglext": true,
+      "tool_choice": "none",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": true,
+      "return_input_ids": false,
+      "return_output_ids": false,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {},
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "output_token_sampling_mask": [
+            true,
+            false
+          ],
+          "model_info": {
+            "checkpoint_path": "model/checkpoint"
+          }
+        },
+        "index": 0
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            [
+              [
+                1.0,
+                2.0
+              ]
+            ],
+            [
+              0.25,
+              0.5
+            ]
+          ],
+          "output_token_sampling_mask": [
+            true,
+            false
+          ],
+          "model_info": {
+            "checkpoint_path": "model/checkpoint"
+          }
+        },
+        "index": 0
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": null,
+                "content": null,
+                "reasoning_content": null,
+                "tool_calls": null,
+                "hidden_states": [
+                  0.25,
+                  0.5
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "routed_experts": "AAECAw==",
+            "cached_tokens_details": {
+              "device": 1,
+              "host": 0,
+              "storage": 0,
+              "storage_backend": "file"
+            },
+            "spec_tokens_details": {
+              "spec_accept_rate": 0.5,
+              "spec_accept_length": 2.0,
+              "spec_cap_length": 0.0,
+              "spec_block_accept_length": 0.0,
+              "spec_num_correct_drafts": 1,
+              "spec_num_proposed_drafts": 2,
+              "spec_verify_ct": 1,
+              "spec_correct_drafts_histogram": [],
+              "spec_cap_lens_histogram": []
+            },
+            "input_ids": [
+              1,
+              2
+            ],
+            "output_ids": [
+              [
+                10,
+                20
+              ]
+            ]
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 2,
+            "total_tokens": 4,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {
+              "cached_tokens": 1,
+              "image_tokens": 3,
+              "audio_tokens": 4,
+              "video_tokens": 5
+            },
+            "reasoning_tokens": 1
+          }
+        }
+      }
+    ]
+  },
+  {
+    "endpoint": "chat",
+    "body": {
+      "model": "org/model",
+      "n": 2,
+      "return_hidden_states": "last",
+      "return_routed_experts": true,
+      "return_cached_tokens_details": true,
+      "return_spec_tokens_details": true,
+      "return_token_ids": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "return_meta_info": false,
+      "return_input_ids_in_sglext": true,
+      "return_output_ids_in_sglext": true,
+      "tool_choice": "none",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": true,
+      "return_input_ids": false,
+      "return_output_ids": false,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {
+      "x-sglext-ids-framed": "1"
+    },
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      },
+      {
+        "text": "o",
+        "output_ids": [
+          11
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-1",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 2,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 1
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            0.25,
+            0.5
+          ]
+        },
+        "index": 0
+      },
+      {
+        "text": "ok",
+        "output_ids": [
+          11,
+          21
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-1",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 2,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1,
+          "hidden_states": [
+            0.25,
+            0.5
+          ]
+        },
+        "index": 1
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-1",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": null,
+                "content": null,
+                "reasoning_content": null,
+                "tool_calls": null,
+                "hidden_states": [
+                  0.25,
+                  0.5
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-1",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [
+            {
+              "index": 1,
+              "delta": {
+                "role": null,
+                "content": null,
+                "reasoning_content": null,
+                "tool_calls": null,
+                "hidden_states": [
+                  0.25,
+                  0.5
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": null,
+              "matched_stop": null
+            }
+          ],
+          "usage": null
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-1",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "routed_experts": "AAECAw==",
+            "cached_tokens_details": {
+              "device": 1,
+              "host": 0,
+              "storage": 0,
+              "storage_backend": "file"
+            },
+            "spec_tokens_details": [
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              },
+              {
+                "spec_accept_rate": 0.5,
+                "spec_accept_length": 2.0,
+                "spec_cap_length": 0.0,
+                "spec_block_accept_length": 0.0,
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "spec_correct_drafts_histogram": [],
+                "spec_cap_lens_histogram": []
+              }
+            ]
+          }
+        }
+      },
+      {
+        "event": "sglext_ids",
+        "data": {
+          "id": "contract-1",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "input_ids": [
+              1,
+              2
+            ],
+            "output_ids": [
+              [
+                10,
+                20
+              ],
+              [
+                11,
+                21
+              ]
+            ]
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-1",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 2,
+            "total_tokens": 6,
+            "completion_tokens": 4,
+            "prompt_tokens_details": {
+              "cached_tokens": 1,
+              "image_tokens": 3,
+              "audio_tokens": 4,
+              "video_tokens": 5
+            },
+            "reasoning_tokens": 3
+          }
+        }
+      }
+    ]
+  },
+  {
+    "endpoint": "chat",
+    "body": {
+      "model": "org/model",
+      "n": 1,
+      "return_hidden_states": false,
+      "return_routed_experts": false,
+      "return_cached_tokens_details": false,
+      "return_spec_tokens_details": false,
+      "return_token_ids": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "return_meta_info": false,
+      "return_input_ids_in_sglext": false,
+      "return_output_ids_in_sglext": false,
+      "tool_choice": "none",
+      "stream": true,
+      "stream_options": {
+        "include_usage": true,
+        "continuous_usage_stats": true
+      }
+    },
+    "args": {
+      "enable_cache_report": false,
+      "return_input_ids": true,
+      "return_output_ids": true,
+      "incremental_streaming_output": false,
+      "stream_response_default_include_usage": false
+    },
+    "headers": {},
+    "chunks": [
+      {
+        "text": "",
+        "output_ids": [
+          10
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": null,
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      },
+      {
+        "text": "",
+        "output_ids": [
+          10,
+          20
+        ],
+        "prompt_token_ids": [
+          1,
+          2
+        ],
+        "meta_info": {
+          "id": "contract-0",
+          "prompt_tokens": 2,
+          "completion_tokens": 2,
+          "reasoning_tokens": 1,
+          "cached_tokens": 1,
+          "num_retractions": 0,
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0,
+            "storage": 0,
+            "storage_backend": "file"
+          },
+          "image_tokens": 3,
+          "audio_tokens": 4,
+          "video_tokens": 5,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 1
+            },
+            {
+              "version": "v2",
+              "start": 1,
+              "end": 2
+            }
+          ],
+          "finish_reason": {
+            "type": "stop",
+            "matched": "END"
+          },
+          "routed_experts": "AAECAw==",
+          "spec_accept_rate": 0.5,
+          "spec_accept_length": 2.0,
+          "spec_num_correct_drafts": 1,
+          "spec_num_proposed_drafts": 2,
+          "spec_verify_ct": 1
+        },
+        "index": 0
+      }
+    ],
+    "tail": [
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": null,
+          "sglext": {
+            "input_ids": [
+              1,
+              2
+            ],
+            "output_ids": [
+              [
+                10,
+                20
+              ]
+            ]
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "contract-0",
+          "object": "chat.completion.chunk",
+          "created": 123,
+          "model": "org/model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 2,
+            "total_tokens": 4,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "image_tokens": 3,
+              "audio_tokens": 4,
+              "video_tokens": 5
+            },
+            "reasoning_tokens": 1
+          }
+        }
+      }
+    ]
+  }
+]

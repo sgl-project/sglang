@@ -778,6 +778,9 @@ class PortArgs:
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
 
+    # Rust worker controls enter the existing DP controller broadcast.
+    rust_control_ipc_name: str = ""
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -843,12 +846,8 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + dp_size
-            # rust-path slots); derive from server_args only (never dp_rank) so
-            # every init_new call agrees, decrementing below dist_init_port on
-            # overflow.
-            is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
+            # All workers use the ports allocated by the DP controller.
+            NUM_DERIVED_PORTS = 6
             if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -865,10 +864,6 @@ class PortArgs:
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
-            elif is_rust_server:
-                # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
-                # DataParallelController allocating worker ports.
-                scheduler_input_port = port_base + 6 + dp_rank
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]

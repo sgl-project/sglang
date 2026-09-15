@@ -1,0 +1,343 @@
+{
+  "epoch": 1700000000,
+  "scheduler": [
+    {
+      "enabled": false,
+      "header": [
+        [
+          "0",
+          "1",
+          "2"
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        {
+          "reasoning_tokens": [
+            0,
+            0,
+            0
+          ],
+          "cached_tokens": [
+            0,
+            0,
+            0
+          ],
+          "retraction_counts": [
+            0,
+            0,
+            0
+          ],
+          "cached_tokens_details": [
+            null,
+            null,
+            null
+          ],
+          "dp_ranks": [
+            0,
+            0,
+            0
+          ],
+          "image_tokens": [
+            0,
+            0,
+            0
+          ],
+          "audio_tokens": [
+            0,
+            0,
+            0
+          ],
+          "video_tokens": [
+            0,
+            0,
+            0
+          ],
+          "weight_version": "default",
+          "weight_versions": [],
+          "generation_tokens": [
+            1,
+            1,
+            1
+          ],
+          "spec_verify_ct": [],
+          "spec_num_correct_drafts": [],
+          "spec_num_cap_tokens": [],
+          "spec_num_block_accept_tokens": [],
+          "spec_correct_drafts_histogram": [],
+          "spec_cap_lens_histogram": [],
+          "spec_num_draft_tokens": 0,
+          "spec_ragged_verify_cap_accept": false
+        },
+        {},
+        [
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        []
+      ],
+      "data_b64": "AwAAAAMAAAADAAAA",
+      "expected": [
+        {},
+        {},
+        {}
+      ]
+    },
+    {
+      "enabled": true,
+      "header": [
+        [
+          "0",
+          "1",
+          "2"
+        ],
+        [
+          null,
+          null,
+          null
+        ],
+        [
+          2,
+          2,
+          2
+        ],
+        [
+          1,
+          1,
+          1
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        {
+          "reasoning_tokens": [
+            0,
+            0,
+            0
+          ],
+          "cached_tokens": [
+            0,
+            0,
+            0
+          ],
+          "retraction_counts": [
+            0,
+            0,
+            0
+          ],
+          "cached_tokens_details": [
+            null,
+            null,
+            null
+          ],
+          "dp_ranks": [
+            0,
+            0,
+            0
+          ],
+          "image_tokens": [
+            0,
+            0,
+            0
+          ],
+          "audio_tokens": [
+            0,
+            0,
+            0
+          ],
+          "video_tokens": [
+            0,
+            0,
+            0
+          ],
+          "weight_version": "default",
+          "weight_versions": [],
+          "generation_tokens": [
+            1,
+            1,
+            1
+          ],
+          "spec_verify_ct": [],
+          "spec_num_correct_drafts": [],
+          "spec_num_cap_tokens": [],
+          "spec_num_block_accept_tokens": [],
+          "spec_correct_drafts_histogram": [],
+          "spec_cap_lens_histogram": [],
+          "spec_num_draft_tokens": 0,
+          "spec_ragged_verify_cap_accept": false
+        },
+        {},
+        [
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "queue_time": 0
+          },
+          {
+            "forward_entry_time": 1700000014,
+            "prefill_finished_time": 1700000015,
+            "queue_time": 4
+          },
+          {
+            "forward_entry_time": 1700000022.5,
+            "queue_time": 2.5
+          }
+        ]
+      ],
+      "data_b64": "AwAAAAMAAAADAAAA",
+      "expected": [
+        {
+          "queue_time": 0
+        },
+        {
+          "forward_entry_time": 1700000014,
+          "prefill_finished_time": 1700000015,
+          "queue_time": 4
+        },
+        {
+          "forward_entry_time": 1700000022.5,
+          "queue_time": 2.5
+        }
+      ]
+    }
+  ],
+  "api": [
+    {
+      "times": {
+        "created_time": 10.0,
+        "first_token_time": 11.0,
+        "finished_time": 14.0,
+        "api_server_dispatch_finish_time": 10.5,
+        "response_sent_to_client_time": 0.0
+      },
+      "tokens": 9,
+      "expected": {
+        "request_received_ts": 1700000010.0,
+        "first_token_latency": 1.0,
+        "api_server_dispatch_finish_ts": 1700000010.5,
+        "request_finished_ts": 1700000014.0,
+        "decode_throughput": 2.6666666666666665,
+        "e2e_latency": 4.0
+      }
+    },
+    {
+      "times": {
+        "created_time": 10.0,
+        "first_token_time": 11.0,
+        "finished_time": 14.0,
+        "api_server_dispatch_finish_time": 10.5,
+        "response_sent_to_client_time": 11.25
+      },
+      "tokens": 9,
+      "expected": {
+        "request_received_ts": 1700000010.0,
+        "first_token_latency": 1.0,
+        "api_server_dispatch_finish_ts": 1700000010.5,
+        "response_sent_to_client_ts": 1700000011.25,
+        "request_finished_ts": 1700000014.0,
+        "decode_throughput": 2.6666666666666665,
+        "e2e_latency": 4.0
+      }
+    },
+    {
+      "times": {
+        "created_time": 10.0,
+        "first_token_time": 11.0,
+        "finished_time": 11.0,
+        "api_server_dispatch_finish_time": 10.5,
+        "response_sent_to_client_time": 0.0
+      },
+      "tokens": 1,
+      "expected": {
+        "request_received_ts": 1700000010.0,
+        "first_token_latency": 1.0,
+        "api_server_dispatch_finish_ts": 1700000010.5,
+        "request_finished_ts": 1700000011.0,
+        "e2e_latency": 1.0
+      }
+    },
+    {
+      "times": {
+        "created_time": 10.0,
+        "first_token_time": 11.0,
+        "finished_time": 14.0,
+        "api_server_dispatch_finish_time": 10.5,
+        "response_sent_to_client_time": 0.0
+      },
+      "tokens": 0,
+      "expected": {
+        "request_received_ts": 1700000010.0,
+        "first_token_latency": 1.0,
+        "api_server_dispatch_finish_ts": 1700000010.5,
+        "request_finished_ts": 1700000014.0,
+        "e2e_latency": 4.0
+      }
+    }
+  ]
+}

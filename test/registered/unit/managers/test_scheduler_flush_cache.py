@@ -19,13 +19,14 @@ register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 class TestSchedulerFlushCache(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rust_server = None
         scheduler.ipc_channels = MagicMock()
         scheduler.flush_cache = MagicMock(return_value=True)
         scheduler.is_fully_idle = MagicMock(return_value=False)
         scheduler.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=scheduler.flush_cache,
             is_fully_idle=scheduler.is_fully_idle,
-            ipc_channels=scheduler.ipc_channels,
+            send_output=scheduler._send_control_output,
         )
         return scheduler
 
@@ -121,6 +122,32 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+    def test_deferred_rust_flush_preserves_request_identity(self):
+        for idle, expected_success in [(True, True), (False, False)]:
+            with self.subTest(idle=idle):
+                scheduler = self._new_scheduler()
+                scheduler.rust_server = MagicMock()
+                req = FlushCacheReqInput(rid="rust-flush", timeout_s=1.0)
+                with patch(
+                    "sglang.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
+                    return_value=100.0,
+                ):
+                    self.assertIsNone(scheduler.flush_wrapper.handle(req))
+                scheduler.is_fully_idle.return_value = idle
+                with patch(
+                    "sglang.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
+                    return_value=102.0,
+                ):
+                    scheduler.flush_wrapper.check_pending()
+                scheduler.rust_server.push_control_output.assert_called_once()
+                sent_req, output = (
+                    scheduler.rust_server.push_control_output.call_args.args
+                )
+                self.assertIs(sent_req, req)
+                self.assertEqual(output.success, expected_success)
+                self.assertIsNone(scheduler.flush_wrapper._pending)
+                scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
 if __name__ == "__main__":

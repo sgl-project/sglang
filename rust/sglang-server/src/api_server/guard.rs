@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::message::ids::Rid;
-use crate::tokenizer_manager::wiring::{AbortSource, Senders};
+use crate::tokenizer_manager::wiring::{LifecycleEvent, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
@@ -64,7 +64,10 @@ impl Drop for AbortGuard {
         // The lane is unbounded, so this send only fails at shutdown, when the loop
         // is gone and nothing is generating anyway.
         for rid in self.rids.drain() {
-            let _ = self.senders.abort_tx.send(AbortSource::Guard(rid));
+            let _ = self
+                .senders
+                .lifecycle_tx
+                .send(LifecycleEvent::GuardAbort(rid));
         }
     }
 }
@@ -73,10 +76,10 @@ impl Drop for AbortGuard {
 mod tests {
     use super::*;
 
-    fn senders_with_abort(abort: flume::Sender<AbortSource>) -> Senders {
+    fn senders_with_abort(abort: flume::Sender<LifecycleEvent>) -> Senders {
         Senders {
             tok_manager_tx: flume::unbounded().0,
-            abort_tx: abort,
+            lifecycle_tx: abort,
             tokenizer_tx: flume::unbounded().0,
             detokenizer_tx: vec![],
         }
@@ -86,18 +89,18 @@ mod tests {
     /// requests never reached a terminal — and leaves the finished ones alone.
     #[test]
     fn guard_aborts_only_the_rids_still_armed() {
-        let (abort_tx, abort_rx) = flume::unbounded();
+        let (lifecycle_tx, lifecycle_rx) = flume::unbounded();
         let done: Rid = "done".into();
-        let mut guard = AbortGuard::new(senders_with_abort(abort_tx), done.clone());
+        let mut guard = AbortGuard::new(senders_with_abort(lifecycle_tx), done.clone());
         guard.arm("aborted".into());
         guard.disarm(&done); // finished naturally
         drop(guard);
 
         assert!(
-            matches!(abort_rx.try_recv().unwrap(), AbortSource::Guard(r) if r.as_str() == "aborted")
+            matches!(lifecycle_rx.try_recv().unwrap(), LifecycleEvent::GuardAbort(r) if r.as_str() == "aborted")
         );
         assert!(
-            abort_rx.try_recv().is_err(),
+            lifecycle_rx.try_recv().is_err(),
             "a disarmed rid must not be aborted"
         );
     }
@@ -111,7 +114,7 @@ mod tests {
         let (tm_tx, tm_rx) = flume::unbounded();
         drop(AbortGuard::new(senders_with_abort(tm_tx), "r7".into()));
         assert!(
-            matches!(tm_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid.as_str() == "r7"),
+            matches!(tm_rx.try_recv(), Ok(LifecycleEvent::GuardAbort(rid)) if rid.as_str() == "r7"),
             "armed guard must abort its rid on drop",
         );
         assert!(tm_rx.try_recv().is_err(), "exactly one abort");

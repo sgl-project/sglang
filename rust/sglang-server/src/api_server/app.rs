@@ -2,23 +2,97 @@
 //! registers its routes here, and [`serve`] runs the assembled app on the
 //! pre-bound listener until shutdown.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
-use axum::{
-    Router,
-    extract::{Request, State},
-    middleware::Next,
-    response::Response,
-};
+use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
+use super::transport::{Http2Settings, serve_listener};
 use super::{common, log, native_api, openai};
 use crate::message::config::ServerArgs;
+use crate::message::request::{GenerateRequest, MmData};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
+
+pub struct Listeners {
+    pub api: std::net::TcpListener,
+    pub bootstrap: Option<std::net::TcpListener>,
+}
+
+/// Model packages may add native routes and middleware at startup. Request
+/// handling remains on the Rust HTTP runtime and never calls into Python.
+pub trait HttpExtension: std::fmt::Debug + Send + Sync {
+    fn apply(&self, router: Router) -> Router;
+
+    /// Model-owned measurements join the worker registry at startup. Scrapes
+    /// are handled by the same collector as the frontend's native metrics.
+    fn register_metrics(
+        &self,
+        _registry: &prometheus::Registry,
+        _labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// One actual remote-media fetch, independent of generation completion.
+    fn observe_media_fetch(
+        &self,
+        _modality: &str,
+        _succeeded: bool,
+        _elapsed: std::time::Duration,
+    ) {
+    }
+
+    /// Preserve model-specific chat fields before the standard OpenAI adapter
+    /// projects the response. Runs on the HTTP runtime's blocking pool.
+    fn render_chat(&self, _request: &serde_json::Value) -> Result<Option<ChatInput>, String> {
+        Ok(None)
+    }
+
+    /// Model-owned fields emitted once, on each native request's first result.
+    fn initial_response_metadata(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        None
+    }
+
+    /// A fresh reducer for each request. It observes scheduler deltas on the
+    /// detokenizer shard before HTTP buffering or stream coalescing.
+    fn new_response_processor(&self) -> Option<Box<dyn ResponseProcessor>> {
+        None
+    }
+
+    /// Resolve model-specific request metadata before media I/O or scheduler
+    /// admission. Dropping the HTTP task cancels this future with it.
+    fn prepare_request<'a>(&'a self, _request: &'a mut GenerateRequest) -> RequestPreparation<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+pub trait ResponseProcessor: std::fmt::Debug + Send {
+    /// Called once after tokenization and sampling normalization, before output.
+    fn prepare(&mut self, _sampling_params: &crate::SamplingParams) {}
+
+    fn process(
+        &mut self,
+        output: &mut crate::message::response::OutputMetadata,
+        finished: bool,
+    ) -> Result<(), String>;
+}
+
+pub type RequestPreparation<'a> = futures::future::BoxFuture<'a, Result<(), String>>;
+
+#[derive(Clone, Debug)]
+pub struct ChatInput {
+    pub text: String,
+    pub mm: Option<Box<MmData>>,
+}
+
+pub struct AuxiliaryRoutes {
+    pub startup_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub metrics: Router,
+    pub loads: Router,
+    pub extension: Option<Arc<dyn HttpExtension>>,
+    pub(crate) frontend_metrics: Option<Arc<crate::metrics::FrontendMetrics>>,
+}
 
 /// Shared handler state: submission handles, immutable server configuration,
 /// and the API-owned chat formatter.
@@ -32,67 +106,20 @@ pub(super) struct AppState {
     pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
+    pub(super) http_extension: Option<Arc<dyn HttpExtension>>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
-    /// Whether the main process's startup warmup has completed. The listener
-    /// binds before warmup so `/model_info` is available to construct that
-    /// request, but health endpoints must not advertise readiness yet.
-    pub(super) startup_readiness: StartupReadiness,
-}
-
-pub(super) struct StartupReadiness(AtomicBool);
-
-impl StartupReadiness {
-    fn new(skip_server_warmup: bool) -> Self {
-        Self(AtomicBool::new(skip_server_warmup))
-    }
-
-    pub(super) fn is_ready(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    fn record_warmup_status(&self, status: axum::http::StatusCode) {
-        if status.is_success() {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-}
-
-impl Default for StartupReadiness {
-    fn default() -> Self {
-        Self::new(false)
-    }
-}
-
-/// Private marker attached by the main process to its startup warmup request.
-/// The middleware flips readiness only after that request returns successfully.
-const STARTUP_WARMUP_HEADER: &str = "x-sglang-startup-warmup";
-
-async fn mark_startup_ready(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let is_startup_warmup = req.headers().contains_key(STARTUP_WARMUP_HEADER)
-        && matches!(
-            req.uri().path(),
-            "/generate" | "/encode" | "/v1/chat/completions"
-        );
-    let response = next.run(req).await;
-    if is_startup_warmup && response.status().is_success() {
-        state
-            .startup_readiness
-            .record_warmup_status(response.status());
-    }
-    response
+    pub(super) startup_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) frontend_metrics: Option<Arc<crate::metrics::FrontendMetrics>>,
 }
 
 pub async fn serve(
-    listener: std::net::TcpListener,
+    listeners: Listeners,
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
     response_activity: ActivityCounter,
+    auxiliary: AuxiliaryRoutes,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
@@ -105,8 +132,10 @@ pub async fn serve(
         response_buf,
         server_args: server_args.clone(),
         chat_formatter,
+        http_extension: auxiliary.extension.clone(),
         response_activity,
-        startup_readiness: StartupReadiness::new(server_args.skip_server_warmup),
+        startup_ready: auxiliary.startup_ready,
+        frontend_metrics: auxiliary.frontend_metrics.clone(),
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
@@ -121,44 +150,65 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            mark_startup_ready,
-        ))
-        .with_state(state);
+        .with_state(state)
+        .merge(auxiliary.metrics)
+        .merge(auxiliary.loads);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
     // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
     // shows in the access log.
+    let mut bootstrap_app = None;
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();
         tokio::spawn(sweeper); // cancelled with the runtime on shutdown
-        app = app.merge(routes);
-        tracing::info!("PD KV bootstrap registry mounted on the api listener");
+        app = app.merge(routes.clone());
+        bootstrap_app = Some(log::apply(
+            routes.route("/health", axum::routing::get(|| async { "OK" })),
+            &server_args,
+        ));
+        tracing::info!(
+            port = server_args.disaggregation_bootstrap_port,
+            "PD KV bootstrap registry ready"
+        );
+    }
+
+    if let Some(extension) = auxiliary.extension {
+        app = extension.apply(app);
     }
 
     // Apply logging and access log middleware.
+    let app = super::decompression::apply(app, server_args.enable_request_decompression);
+    let app = match auxiliary
+        .frontend_metrics
+        .filter(|_| server_args.dp_size == 1)
+    {
+        Some(metrics) => crate::metrics::apply_http(app, metrics),
+        None => app,
+    };
     let app = log::apply(app, &server_args);
 
-    // The listener was already bound synchronously in `runtime::start` (so a port
-    // conflict fails startup); adopt it into the tokio reactor here.
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to adopt pre-bound listener");
-            return;
+    let bootstrap = async {
+        if let Some(listener) = listeners.bootstrap {
+            let routes = bootstrap_app
+                .ok_or_else(|| std::io::Error::other("bootstrap listener has no registry"))?;
+            serve_listener(listener, routes, None).await
+        } else {
+            std::future::pending::<std::io::Result<()>>().await
         }
     };
-    // `with_connect_info` exposes the peer address to the access-log middleware.
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
     tokio::select! {
-        r = serve => {
+        r = serve_listener(listeners.api, app, server_args.enable_http2.then_some(Http2Settings {
+            max_concurrent_streams: server_args.http2_max_concurrent_streams,
+            initial_connection_window_size: server_args.http2_initial_connection_window_size,
+        })) => {
             if let Err(e) = r {
                 tracing::error!(error = %e, "axum serve exited");
+            }
+        }
+        r = bootstrap => {
+            if let Err(e) = r {
+                tracing::error!(error = %e, "PD bootstrap listener exited");
             }
         }
         _ = shutdown.recv_async() => {
@@ -170,19 +220,35 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use crate::message::config::{RuntimeConfig, RustServerServerArgs};
+    use std::sync::atomic::Ordering;
 
     #[test]
-    fn startup_readiness_requires_successful_warmup_unless_skipped() {
-        let readiness = StartupReadiness::new(false);
-        assert!(!readiness.is_ready());
-
-        readiness.record_warmup_status(StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!readiness.is_ready());
-
-        readiness.record_warmup_status(StatusCode::OK);
-        assert!(readiness.is_ready());
-
-        assert!(StartupReadiness::new(true).is_ready());
+    fn parent_acknowledgement_controls_readiness_even_when_warmup_is_skipped() {
+        for wait_for_parent_warmup in [false, true] {
+            for skip_server_warmup in [false, true] {
+                let runtime = crate::utils::runtime::start(RuntimeConfig {
+                    rust_server_args: RustServerServerArgs {
+                        http_addr: "127.0.0.1:0".parse().unwrap(),
+                        http_api_worker_num: 1,
+                        ..Default::default()
+                    },
+                    server_args: Arc::new(ServerArgs {
+                        skip_tokenizer_init: true,
+                        wait_for_parent_warmup,
+                        skip_server_warmup,
+                        ..Default::default()
+                    }),
+                })
+                .unwrap();
+                assert_eq!(
+                    runtime.startup_ready.load(Ordering::Acquire),
+                    !wait_for_parent_warmup,
+                );
+                runtime.startup_ready.store(true, Ordering::Release);
+                assert!(runtime.startup_ready.load(Ordering::Acquire));
+                runtime.request_shutdown();
+            }
+        }
     }
 }

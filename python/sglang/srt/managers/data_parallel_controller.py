@@ -158,7 +158,10 @@ class DataParallelController:
         self.context = zmq.Context(1 + get_parallel().dp_size)
         if get_parallel().node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                self.context,
+                zmq.PULL,
+                port_args.scheduler_input_ipc_name,
+                bind=envs.SGLANG_RUST_SERVER.get(),
             )
 
         # Dispatch method
@@ -195,6 +198,8 @@ class DataParallelController:
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
+        self.worker_info_lock = threading.Lock()
+        self.rust_worker_infos: dict[int, dict] = {}
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -379,6 +384,7 @@ class DataParallelController:
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
             tmp_port_args.instance_id = port_args.instance_id
+            tmp_port_args.rust_control_ipc_name = port_args.scheduler_input_ipc_name
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -671,6 +677,9 @@ class DataParallelController:
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
+                    rank_port_args.rust_control_ipc_name = (
+                        port_args.scheduler_input_ipc_name
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -748,6 +757,16 @@ class DataParallelController:
         self.startup_time = aggregate_scheduler_startup_times(
             info.get("startup_time") for info in scheduler_info
         )
+        with self.worker_info_lock:
+            for info in scheduler_info:
+                for worker in info.get("rust_worker_infos", []):
+                    rank = worker["dp_rank"]
+                    previous = self.rust_worker_infos.get(rank)
+                    if previous is not None and previous != worker:
+                        raise RuntimeError(
+                            f"Conflicting Rust worker addresses for DP rank {rank}"
+                        )
+                    self.rust_worker_infos[rank] = worker
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -863,6 +882,10 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
                 "startup_time": controller.startup_time,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
+                "rust_worker_infos": [
+                    controller.rust_worker_infos[rank]
+                    for rank in sorted(controller.rust_worker_infos)
+                ],
             }
         )
         # The primary owns routing for the expanded scheduler set.

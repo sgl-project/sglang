@@ -31,13 +31,38 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
             "rid is {client_rid_len} bytes, over the {MAX_RID_LEN}-byte limit"
         )));
     }
+    if let RequestKind::Generate(g) = &mut req.kind
+        && let Some(embeds) = &g.input_embeds
+    {
+        if !limits.disable_radix_cache {
+            return Err(Error::Validation(
+                "input_embeds is provided while disable_radix_cache is False. \
+                 Please add `--disable-radix-cache` when you launch the server \
+                 if you want to use input_embeds as inputs."
+                    .into(),
+            ));
+        }
+        if embeds.is_empty()
+            || embeds.iter().any(|row| {
+                row.len() as u64 != limits.hidden_size || !row.iter().all(|v| v.is_finite())
+            })
+        {
+            return Err(Error::Validation(format!(
+                "input_embeds must be a nonempty matrix with {} finite values per token",
+                limits.hidden_size
+            )));
+        }
+        // The scheduler uses placeholder ids for positions and token accounting;
+        // the model consumes the supplied embeddings instead of their lookup.
+        g.input_ids = Some(vec![1; embeds.len()]);
+    }
     if skip_tokenizer_init
         && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
     {
         // `Validation` (400), not `Tokenize` (500): the client sent a request this
         // server cannot serve, which is their error to fix — Python 400s it too.
         return Err(Error::Validation(
-            "skip_tokenizer_init is set: request must provide input_ids".into(),
+            "skip_tokenizer_init is set: request must provide input_ids or input_embeds".into(),
         ));
     }
 
@@ -45,6 +70,24 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // Validate their resulting ids at PreSendValidating instead. Non-MM client
     // ids can be rejected now.
     if let RequestKind::Generate(g) = &req.kind {
+        if g.custom_logit_processor
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+            && !limits.enable_custom_logit_processor
+        {
+            return Err(Error::Validation(
+                "The server is not configured to enable custom logit processor. \
+                 Please set `--enable-custom-logit-processor` to enable this feature."
+                    .into(),
+            ));
+        }
+        if g.max_thinking_tokens.is_some() && !limits.enable_strict_thinking {
+            return Err(Error::Validation(
+                "max_thinking_tokens requires the server to be launched with \
+                 --enable-strict-thinking"
+                    .into(),
+            ));
+        }
         if !g.has_multimodal() {
             validate_input_ids(g, vocab_size)?;
         }
@@ -64,7 +107,12 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // bound — parity with the retired direct decode service: an unknown id is
     // the tokenizer's error to report, and nothing here reaches the scheduler's
     // embedding lookup.
-    if let RequestKind::Detokenize { token_ids } = &req.kind {
+    if skip_tokenizer_init && matches!(req.kind, RequestKind::Tokenize { .. }) {
+        return Err(Error::Validation(
+            "tokenizer is unavailable when skip_tokenizer_init=True".into(),
+        ));
+    }
+    if let RequestKind::Detokenize { token_ids, .. } = &req.kind {
         for &id in token_ids {
             if u32::try_from(id).is_err() {
                 return Err(Error::Validation(format!("Token ID {id} is out of range")));
@@ -75,12 +123,21 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // The scheduler only computes hidden states when launched for it, so without
     // this the request would 200 with `meta_info.hidden_states` silently absent
     // (Python `TokenizerManager._validate_one_request`).
-    if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
+    if matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states > limits.max_return_hidden_states)
     {
+        if limits.max_return_hidden_states == crate::message::types::HiddenStatesMode::Last {
+            return Err(Error::Validation(
+                "The requested return_hidden_states mode exceeds the server maximum `last`. \
+                 Please launch with `--return-hidden-states-mode full` \
+                 to allow return_hidden_states=True."
+                    .into(),
+            ));
+        }
         return Err(Error::Validation(
-            "The server is not configured to return the hidden states. \
-             Please set `--enable-return-hidden-states` to enable this feature."
+            "The server is not configured to return hidden states. \
+             Please set `--return-hidden-states-mode last`, \
+             `--return-hidden-states-mode full`, or the legacy \
+             `--enable-return-hidden-states` flag."
                 .into(),
         ));
     }
@@ -92,13 +149,39 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
 /// this after placeholder expansion; all other requests also run it at intake.
 pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result<(), Error> {
     if let Some(ids) = &g.input_ids {
-        for &id in ids {
-            if id < 0 || id as u64 >= vocab_size {
+        let mut spans = g.mm_pad_spans.iter().peekable();
+        for (index, &id) in ids.iter().enumerate() {
+            while spans.peek().is_some_and(|span| span.end < index) {
+                spans.next();
+            }
+            let is_declared_pad = spans.peek().is_some_and(|span| {
+                span.start <= index && index <= span.end && id == span.pad_value
+            });
+            if (id < 0 || id as u64 >= vocab_size) && !is_declared_pad {
                 return Err(Error::Validation(format!(
                     "input_ids contains out-of-vocabulary token id {id}; \
                      valid range is [0, {vocab_size})"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Delimiter positions address the final prompt, after tokenization, media
+/// expansion, and any allowed truncation. Invalid indices must not reach the
+/// GPU gather or the segmented-attention mask builder.
+pub(super) fn validate_delimiter_indices(g: &GenerateRequest) -> Result<(), Error> {
+    if let Some(indices) = &g.multi_item_delimiter_indices {
+        let input_len = g.input_ids.as_ref().map_or(0, Vec::len);
+        if indices.is_empty()
+            || indices
+                .iter()
+                .any(|index| *index < 0 || *index as usize >= input_len)
+        {
+            return Err(Error::Validation(format!(
+                "multi_item_delimiter_indices must be a nonempty list of positions in [0, {input_len})"
+            )));
         }
     }
     Ok(())
@@ -131,6 +214,9 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
         }
         if let Some(ids) = &mut g.input_ids {
             ids.truncate(max_req_len as usize);
+        }
+        if let Some(embeds) = &mut g.input_embeds {
+            embeds.truncate(max_req_len as usize);
         }
     }
     let input_len =

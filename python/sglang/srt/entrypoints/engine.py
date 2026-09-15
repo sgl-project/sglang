@@ -1056,6 +1056,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
         placement_group=None,
+        defer_rust_readiness: bool = False,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1197,6 +1198,10 @@ class Engine(EngineScoreMixin, EngineBase):
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
             scheduler_init_result.wait_for_ready()
+            if not defer_rust_readiness:
+                from sglang.srt.rust_server.readiness import publish_frontend_ready
+
+                publish_frontend_ready(server_args, port_args)
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]

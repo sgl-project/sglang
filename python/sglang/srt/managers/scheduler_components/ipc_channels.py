@@ -20,6 +20,7 @@ class SchedulerIpcChannels:
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
     send_metrics_from_scheduler: Optional[zmq.Socket]
+    rust_control_ipc_name: str = ""
 
     @classmethod
     def create(
@@ -85,4 +86,5 @@ class SchedulerIpcChannels:
             send_to_tokenizer=send_to_tokenizer,
             send_to_detokenizer=send_to_detokenizer,
             send_metrics_from_scheduler=send_metrics_from_scheduler,
+            rust_control_ipc_name=port_args.rust_control_ipc_name,
         )

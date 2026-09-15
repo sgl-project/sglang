@@ -10,8 +10,11 @@ import pickle
 import time
 import unittest
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import msgspec
 import numpy as np
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -38,6 +41,7 @@ from sglang.srt.managers.tokenizer_manager import (
     _build_flat_input_top_logprobs_fields_from_arrays,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -625,6 +629,54 @@ class TestBatchOutputTransport(CustomTestCase):
             input_top_logprobs_idx_flat=[None, idx_arr],
             input_top_logprobs_flat_null_prefix=[None, null_prefix],
         )
+
+    def test_rust_columns_and_response_fixture_preserve_shape_and_raw_bytes(self):
+        override = rc.get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        fixtures = json.loads(
+            (
+                Path(__file__).resolve().parents[4]
+                / "rust/sglang-server/testdata/flat_logprobs_python.json"
+            ).read_text()
+        )
+        state = _make_state(
+            return_logprob=True, top_logprobs_num=2, token_ids_logprob=[3]
+        )
+        meta = {}
+        _TokenizerManagerStub().add_logprob_to_meta_info(
+            meta,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=[3],
+            return_text_in_logprobs=False,
+        )
+        self.assertEqual(meta, fixtures["empty_logprobs"])
+        for fixture in fixtures["cases"]:
+            rows, k, prefix = fixture["shape"]
+            vals = np.asarray(fixture["values"], dtype=np.float32).reshape(rows, k)
+            idxs = np.asarray(fixture["indices"], dtype=np.int32).reshape(rows, k)
+            for b64, key in ((False, "json"), (True, "base64")):
+                self.assertEqual(
+                    _build_flat_input_top_logprobs_fields_from_arrays(
+                        vals, idxs, prefix, return_b64=b64
+                    ),
+                    fixture[key],
+                )
+            native = Mock()
+            RustServer(native, http_port=30000).push_generation(
+                _make_batch_token_id_output(
+                    output_ids=[array("i", [1]), array("i", [2])],
+                    input_top_logprobs_val_flat=[None, vals],
+                    input_top_logprobs_idx_flat=[None, idxs],
+                    input_top_logprobs_flat_null_prefix=[None, prefix],
+                )
+            )
+            header, columns = native.push_decode_result_batch.call_args.args
+            self.assertEqual(
+                msgspec.msgpack.decode(header)[21], [None, fixture["shape"]]
+            )
+            self.assertEqual(columns[-2:], [vals.tobytes(), idxs.tobytes()])
 
     def _check_roundtrip(self, decoded, original):
         self.assertIsNone(decoded.input_top_logprobs_val_flat[0])

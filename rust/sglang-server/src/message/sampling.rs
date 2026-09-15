@@ -386,6 +386,54 @@ impl Default for SamplingParams {
 }
 
 impl SamplingParams {
+    /// HTTP forwarding carries the client schema. The positional scheduler
+    /// serializer also includes normalization state, which HTTP must reject.
+    pub(crate) fn serialize_client<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap; // codespell:ignore ser
+        macro_rules! client_fields {
+            ($($field:ident),+ $(,)?) => {{
+                let mut map = serializer.serialize_map(Some([$(stringify!($field)),+].len() + 2))?;
+                $(map.serialize_entry(stringify!($field), &self.$field)?;)+
+                // OpenAI validates before DP forwarding. Restore the input
+                // aliases so the destination normalizes the same stop rules.
+                let stop = self.stop.clone().or_else(|| (!self.stop_strs.is_empty()).then(|| OneOrMany::Many(self.stop_strs.clone())));
+                let stop_regex = self.stop_regex.clone().or_else(|| (!self.stop_regex_strs.is_empty()).then(|| OneOrMany::Many(self.stop_regex_strs.clone())));
+                map.serialize_entry("stop", &stop)?;
+                map.serialize_entry("stop_regex", &stop_regex)?;
+                map.end()
+            }};
+        }
+        client_fields!(
+            max_new_tokens,
+            stop_token_ids,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            frequency_penalty,
+            presence_penalty,
+            repetition_penalty,
+            min_new_tokens,
+            n,
+            beam_width,
+            json_schema,
+            regex,
+            ebnf,
+            structural_tag,
+            ignore_eos,
+            skip_special_tokens,
+            spaces_between_special_tokens,
+            no_stop_trim,
+            stream_interval,
+            logit_bias,
+            sampling_seed,
+            custom_params,
+        )
+    }
+
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's
@@ -633,24 +681,8 @@ impl SamplingParams {
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set".into(),
             ));
         }
-        // Not a Python restriction: the rust from_scheduler maps one rid to one response,
-        // so parallel sampling would drop all but the first sample. This is the
-        // only place it is rejected — `n` lives in `sampling_params`, where
-        // Python reads it, and the `/generate` body has no `n` of its own.
-        if self.n != 1 {
-            return Err(bad(format!(
-                "n must be 1 (parallel sampling is not supported), got {}",
-                self.n
-            )));
-        }
-        if let Some(beam_width) = self.beam_width {
-            // Also not a Python restriction: beam search returns its candidates
-            // in `meta_info.beam_results`, which from_scheduler does not carry.
-            if beam_width > 1 {
-                return Err(bad(format!(
-                    "beam_width must be 1 (beam search is not supported), got {beam_width}"
-                )));
-            }
+        if self.n < 1 {
+            return Err(bad("n must be at least 1".into()));
         }
         Ok(())
     }
@@ -925,8 +957,7 @@ mod tests {
             (r#"{"temperature": -0.1}"#, "temperature"),
             (r#"{"max_new_tokens": -1}"#, "max_new_tokens"),
             (r#"{"regex": "a", "ebnf": "b"}"#, "Only one of"),
-            (r#"{"n": 2}"#, "n must be 1"),
-            (r#"{"beam_width": 2}"#, "beam_width must be 1"),
+            (r#"{"n": 0}"#, "n must be at least 1"),
             (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
         ] {
             let err = norm_err(json).to_string();
@@ -1052,6 +1083,15 @@ mod tests {
         // first pass, which is not in the greedy window.
         once.normalize(false, TEST_VOCAB).unwrap();
         assert_eq!(once.top_k, twice.top_k);
+        let forwarded = once
+            .serialize_client(serde_json::value::Serializer)
+            .unwrap();
+        let mut decoded: SamplingParams = serde_json::from_value(forwarded).unwrap();
+        decoded.normalize(false, TEST_VOCAB).unwrap();
+        assert_eq!(
+            once, decoded,
+            "DP forwarding must retain normalized stop rules"
+        );
     }
 
     #[test]

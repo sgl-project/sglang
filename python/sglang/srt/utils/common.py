@@ -2605,7 +2605,7 @@ def delete_directory(dirpath):
 
 # Temporary directory for prometheus multiprocess mode
 # Cleaned up automatically when this object is garbage collected
-prometheus_multiproc_dir: tempfile.TemporaryDirectory
+prometheus_multiproc_dir: Optional[tempfile.TemporaryDirectory] = None
 
 
 def set_prometheus_multiproc_dir():
@@ -2617,9 +2617,9 @@ def set_prometheus_multiproc_dir():
 
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
+        # The caller (or a previous call here) owns this directory. Replacing
+        # its TemporaryDirectory handle can delete live collector files.
+        return
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name

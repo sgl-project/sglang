@@ -1,0 +1,1130 @@
+{
+  "request_fields": [
+    "text",
+    "input_ids",
+    "cache_salt",
+    "extra_key",
+    "priority",
+    "routing_key",
+    "routed_dp_rank",
+    "disagg_prefill_dp_rank",
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "return_hidden_states",
+    "return_routed_experts",
+    "routed_experts_start_len",
+    "return_prompt_token_ids",
+    "return_sampling_mask",
+    "custom_logit_processor",
+    "return_logprob",
+    "logprob_start_len",
+    "top_logprobs_num"
+  ],
+  "sampling_fields": [
+    "max_new_tokens",
+    "min_new_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "stop_token_ids",
+    "stop_strs",
+    "stop_regex_strs",
+    "no_stop_trim",
+    "ignore_eos",
+    "skip_special_tokens",
+    "json_schema",
+    "regex",
+    "ebnf",
+    "structural_tag",
+    "custom_params",
+    "sampling_seed"
+  ],
+  "cases": [
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "rid": "contract",
+        "max_tokens": 8,
+        "top_k": 7,
+        "min_p": 0.25,
+        "min_tokens": 1,
+        "repetition_penalty": 1.25,
+        "temperature": 0.75,
+        "top_p": 0.875,
+        "frequency_penalty": 0.25,
+        "presence_penalty": -0.25,
+        "seed": 17,
+        "stop": [
+          "END"
+        ],
+        "stop_token_ids": [
+          12,
+          13
+        ],
+        "stop_regex": "X{2,3}",
+        "no_stop_trim": true,
+        "ignore_eos": true,
+        "skip_special_tokens": false,
+        "custom_params": {
+          "scale": 2
+        },
+        "cache_salt": "tenant",
+        "extra_key": "classification",
+        "priority": 3,
+        "routed_dp_rank": 1,
+        "disagg_prefill_dp_rank": 2,
+        "bootstrap_host": "::1",
+        "bootstrap_port": 8998,
+        "bootstrap_room": 10,
+        "return_hidden_states": "last",
+        "return_routed_experts": true,
+        "routed_experts_start_len": 2,
+        "return_token_ids": true,
+        "custom_logit_processor": "processor",
+        "prompt": [
+          1,
+          2,
+          3
+        ]
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3"
+      },
+      "model_defaults": {},
+      "expected": [
+        {
+          "text": null,
+          "input_ids": [
+            1,
+            2,
+            3
+          ],
+          "cache_salt": "tenant",
+          "extra_key": "classification",
+          "priority": 3,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 10,
+          "return_hidden_states": "last",
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "rid": null,
+        "max_tokens": 8,
+        "top_k": 7,
+        "min_p": 0.25,
+        "min_tokens": 1,
+        "repetition_penalty": 1.25,
+        "temperature": 0.75,
+        "top_p": 0.875,
+        "frequency_penalty": 0.25,
+        "presence_penalty": -0.25,
+        "seed": 17,
+        "stop": [
+          "END"
+        ],
+        "stop_token_ids": [
+          12,
+          13
+        ],
+        "stop_regex": "X{2,3}",
+        "no_stop_trim": true,
+        "ignore_eos": true,
+        "skip_special_tokens": false,
+        "custom_params": {
+          "scale": 2
+        },
+        "cache_salt": [
+          "first",
+          "second"
+        ],
+        "extra_key": [
+          "a",
+          "b"
+        ],
+        "priority": 3,
+        "routed_dp_rank": 1,
+        "disagg_prefill_dp_rank": 2,
+        "bootstrap_host": "::1",
+        "bootstrap_port": 8998,
+        "bootstrap_room": [
+          10,
+          11
+        ],
+        "return_hidden_states": true,
+        "return_routed_experts": true,
+        "routed_experts_start_len": 2,
+        "return_token_ids": true,
+        "custom_logit_processor": "processor",
+        "prompt": [
+          [
+            1,
+            2
+          ],
+          [
+            3,
+            4,
+            5
+          ]
+        ],
+        "n": 2,
+        "stream": true
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3"
+      },
+      "model_defaults": {},
+      "expected": [
+        {
+          "text": null,
+          "input_ids": [
+            1,
+            2
+          ],
+          "cache_salt": "first",
+          "extra_key": "a",
+          "priority": 3,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 10,
+          "return_hidden_states": true,
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        },
+        {
+          "text": null,
+          "input_ids": [
+            1,
+            2
+          ],
+          "cache_salt": "first",
+          "extra_key": "a",
+          "priority": 3,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 10,
+          "return_hidden_states": true,
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        },
+        {
+          "text": null,
+          "input_ids": [
+            3,
+            4,
+            5
+          ],
+          "cache_salt": "second",
+          "extra_key": "b",
+          "priority": 3,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 11,
+          "return_hidden_states": true,
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        },
+        {
+          "text": null,
+          "input_ids": [
+            3,
+            4,
+            5
+          ],
+          "cache_salt": "second",
+          "extra_key": "b",
+          "priority": 3,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 11,
+          "return_hidden_states": true,
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": "json",
+        "max_tokens": 4,
+        "response_format": {
+          "type": "json_object"
+        }
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3"
+      },
+      "model_defaults": {},
+      "expected": [
+        {
+          "text": "json",
+          "input_ids": null,
+          "cache_salt": null,
+          "extra_key": null,
+          "priority": null,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": false,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 4,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 1073741824,
+            "min_p": 0.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": "{\"type\": \"object\"}",
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": "regex",
+        "max_tokens": 4,
+        "regex": "[a-z]+"
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3"
+      },
+      "model_defaults": {},
+      "expected": [
+        {
+          "text": "regex",
+          "input_ids": null,
+          "cache_salt": null,
+          "extra_key": null,
+          "priority": null,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": false,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 4,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 1073741824,
+            "min_p": 0.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": null,
+            "regex": "[a-z]+",
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": "ebnf",
+        "max_tokens": 4,
+        "ebnf": "root ::= \"yes\""
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3"
+      },
+      "model_defaults": {},
+      "expected": [
+        {
+          "text": "ebnf",
+          "input_ids": null,
+          "cache_salt": null,
+          "extra_key": null,
+          "priority": null,
+          "routing_key": "session",
+          "routed_dp_rank": 3,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": false,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 4,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 1073741824,
+            "min_p": 0.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": "root ::= \"yes\"",
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "rid": "contract",
+        "max_tokens": 8,
+        "top_k": 7,
+        "min_p": 0.25,
+        "min_tokens": 1,
+        "repetition_penalty": 1.25,
+        "temperature": 0.75,
+        "top_p": 0.875,
+        "frequency_penalty": 0.25,
+        "presence_penalty": -0.25,
+        "seed": 17,
+        "stop": [
+          "END"
+        ],
+        "stop_token_ids": [
+          12,
+          13
+        ],
+        "stop_regex": "X{2,3}",
+        "no_stop_trim": true,
+        "ignore_eos": true,
+        "skip_special_tokens": false,
+        "custom_params": {
+          "scale": 2
+        },
+        "cache_salt": "tenant",
+        "extra_key": "classification",
+        "priority": 3,
+        "routed_dp_rank": 1,
+        "disagg_prefill_dp_rank": 2,
+        "bootstrap_host": "::1",
+        "bootstrap_port": 8998,
+        "bootstrap_room": 10,
+        "return_hidden_states": "last",
+        "return_routed_experts": true,
+        "routed_experts_start_len": 2,
+        "return_token_ids": true,
+        "custom_logit_processor": "processor",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          1,
+          2,
+          3
+        ],
+        "return_meta_info": true,
+        "return_sampling_mask": true,
+        "tool_choice": "none"
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3",
+        "x-override-priority": "-5",
+        "x-override-routed-dp-rank": "4"
+      },
+      "model_defaults": {
+        "top_k": 23,
+        "min_p": 0.125,
+        "repetition_penalty": 1.125
+      },
+      "expected": [
+        {
+          "text": null,
+          "input_ids": [
+            1,
+            2,
+            3
+          ],
+          "cache_salt": "tenant",
+          "extra_key": "classification",
+          "priority": -5,
+          "routing_key": "session",
+          "routed_dp_rank": 4,
+          "disagg_prefill_dp_rank": 2,
+          "bootstrap_host": "::1",
+          "bootstrap_port": 8998,
+          "bootstrap_room": 10,
+          "return_hidden_states": "last",
+          "return_routed_experts": true,
+          "routed_experts_start_len": 2,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": true,
+          "custom_logit_processor": "processor",
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 8,
+            "min_new_tokens": 1,
+            "temperature": 0.75,
+            "top_p": 0.875,
+            "top_k": 7,
+            "min_p": 0.25,
+            "frequency_penalty": 0.25,
+            "presence_penalty": -0.25,
+            "repetition_penalty": 1.25,
+            "stop_token_ids": [
+              12,
+              13
+            ],
+            "stop_strs": [
+              "END"
+            ],
+            "stop_regex_strs": [
+              "X{2,3}"
+            ],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": {
+              "scale": 2
+            },
+            "sampling_seed": 17
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          2,
+          3
+        ],
+        "n": 2,
+        "max_tokens": 5,
+        "cache_salt": "chat",
+        "return_input_ids_in_sglext": true,
+        "return_output_ids_in_sglext": true,
+        "tool_choice": "none"
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3",
+        "x-override-priority": "-5",
+        "x-override-routed-dp-rank": "4"
+      },
+      "model_defaults": {
+        "top_k": 23,
+        "min_p": 0.125,
+        "repetition_penalty": 1.125
+      },
+      "expected": [
+        {
+          "text": null,
+          "input_ids": [
+            2,
+            3
+          ],
+          "cache_salt": "chat",
+          "extra_key": null,
+          "priority": -5,
+          "routing_key": "session",
+          "routed_dp_rank": 4,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 5,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 23,
+            "min_p": 0.125,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.125,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        },
+        {
+          "text": null,
+          "input_ids": [
+            2,
+            3
+          ],
+          "cache_salt": "chat",
+          "extra_key": null,
+          "priority": -5,
+          "routing_key": "session",
+          "routed_dp_rank": 4,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": true,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 5,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 23,
+            "min_p": 0.125,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.125,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          4,
+          5
+        ],
+        "max_tokens": 6,
+        "stream": true,
+        "json_schema": "ignored by the Python chat protocol",
+        "tool_choice": "none"
+      },
+      "headers": {
+        "x-smg-routing-key": "session",
+        "x-data-parallel-rank": "3",
+        "x-override-priority": "-5",
+        "x-override-routed-dp-rank": "4"
+      },
+      "model_defaults": {
+        "top_k": 23,
+        "min_p": 0.125,
+        "repetition_penalty": 1.125
+      },
+      "expected": [
+        {
+          "text": null,
+          "input_ids": [
+            4,
+            5
+          ],
+          "cache_salt": null,
+          "extra_key": null,
+          "priority": -5,
+          "routing_key": "session",
+          "routed_dp_rank": 4,
+          "disagg_prefill_dp_rank": null,
+          "bootstrap_host": null,
+          "bootstrap_port": null,
+          "bootstrap_room": null,
+          "return_hidden_states": false,
+          "return_routed_experts": false,
+          "routed_experts_start_len": 0,
+          "return_prompt_token_ids": false,
+          "return_sampling_mask": false,
+          "custom_logit_processor": null,
+          "return_logprob": false,
+          "logprob_start_len": -1,
+          "top_logprobs_num": 0,
+          "sampling": {
+            "max_new_tokens": 6,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 23,
+            "min_p": 0.125,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.125,
+            "stop_token_ids": null,
+            "stop_strs": [],
+            "stop_regex_strs": [],
+            "no_stop_trim": false,
+            "ignore_eos": false,
+            "skip_special_tokens": true,
+            "json_schema": null,
+            "regex": null,
+            "ebnf": null,
+            "structural_tag": null,
+            "custom_params": null,
+            "sampling_seed": null
+          }
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ],
+        "return_hidden_states": "full"
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ],
+        "priority": []
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ],
+        "min_p": 1.5
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ],
+        "cache_salt": [
+          "tenant"
+        ]
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ],
+        "regex": "x",
+        "json_schema": "{}"
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "completions",
+      "body": {
+        "model": "org/model",
+        "prompt": [
+          1,
+          2
+        ]
+      },
+      "headers": {
+        "x-data-parallel-rank": "bad"
+      }
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          1,
+          2
+        ],
+        "stream": true,
+        "return_prompt_token_ids": true,
+        "tool_choice": "none"
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          1,
+          2
+        ],
+        "stream": true,
+        "return_token_ids": true,
+        "tool_choice": "none"
+      },
+      "headers": {}
+    },
+    {
+      "endpoint": "chat",
+      "body": {
+        "model": "org/model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unused pretokenized prompt"
+          }
+        ],
+        "input_ids": [
+          1,
+          2
+        ],
+        "stream": true,
+        "return_meta_info": true,
+        "tool_choice": "none"
+      },
+      "headers": {}
+    }
+  ]
+}

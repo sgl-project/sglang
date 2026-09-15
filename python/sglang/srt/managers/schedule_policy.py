@@ -163,6 +163,9 @@ def match_prefix_for_req(
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
+    if getattr(req, "positional_embed_overrides", None) is not None:
+        # Cache-aware scheduling must use the same override isolation as intake.
+        token_ids = array("q")
 
     # unified_kv SWA lives in a per-request ring that's not content-stable and is
     # never stored in the radix tree, so a reused prefix carries stale SWA. Cap

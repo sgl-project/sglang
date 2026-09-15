@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod detok;
+pub mod embeddings;
 pub mod finish_reason;
 pub mod ids;
 pub mod io_struct;

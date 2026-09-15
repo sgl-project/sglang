@@ -1,12 +1,80 @@
 //! Tests for scheduler intake.
 
 use super::*;
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateBody, GenerateRequest};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
+use crate::message::types::HiddenStatesMode;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::RequestState;
 use tokio::sync::mpsc;
+
+#[test]
+fn canonical_media_pads_do_not_exempt_other_ids_from_vocabulary_validation() {
+    use crate::message::request::MmPadSpan;
+
+    let mut request = GenerateRequest {
+        text: Some("original prompt".into()),
+        ..Default::default()
+    };
+    assert!(request.set_canonical_mm_input(vec![], vec![]).is_err());
+    assert_eq!(request.text.as_deref(), Some("original prompt"));
+    assert!(request.input_ids.is_none());
+    request
+        .set_canonical_mm_input(
+            vec![1, 1_000_005, 1_000_005, 2],
+            vec![
+                MmPadSpan {
+                    start: 1,
+                    end: 2,
+                    pad_value: 1_000_005,
+                },
+                MmPadSpan {
+                    start: 1,
+                    end: 1,
+                    pad_value: 1_000_005,
+                },
+            ],
+        )
+        .unwrap();
+    assert!(validate_input_ids(&request, 128).is_ok());
+    assert!(request.text.is_none());
+    assert!(request.already_tokenized());
+    assert_eq!(
+        request.mm_pad_spans.len(),
+        1,
+        "overlapping equal pads normalize once"
+    );
+    request.input_ids.as_mut().unwrap()[0] = 1_000_005;
+    assert!(validate_input_ids(&request, 128).is_err());
+    request.input_ids.as_mut().unwrap()[0] = 1;
+    request.input_ids.as_mut().unwrap()[1] = 1_000_006;
+    assert!(validate_input_ids(&request, 128).is_err());
+    for span in [
+        MmPadSpan {
+            start: 2,
+            end: 1,
+            pad_value: 5,
+        },
+        MmPadSpan {
+            start: 0,
+            end: 9,
+            pad_value: 5,
+        },
+        MmPadSpan {
+            start: 0,
+            end: 0,
+            pad_value: -1,
+        },
+        MmPadSpan {
+            start: 0,
+            end: 0,
+            pad_value: 6,
+        },
+    ] {
+        assert!(request.set_canonical_mm_input(vec![5], vec![span]).is_err());
+    }
+}
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —
 /// dropping it closes the channel → false QueueFull), tm inbox sender, and the
@@ -22,7 +90,7 @@ fn make_intake() -> (
 }
 
 fn make_intake_with_abort(
-    abort_rx: flume::Receiver<AbortSource>,
+    lifecycle_rx: flume::Receiver<LifecycleEvent>,
 ) -> (
     Intake,
     flume::Receiver<DetokMsg>,
@@ -30,7 +98,7 @@ fn make_intake_with_abort(
     flume::Sender<TmEvent>,
     flume::Receiver<MmRequest>,
 ) {
-    make_intake_inner(test_limits(), abort_rx)
+    make_intake_inner(test_limits(), lifecycle_rx)
 }
 
 fn make_intake_with(
@@ -42,14 +110,14 @@ fn make_intake_with(
     flume::Sender<TmEvent>,
     flume::Receiver<MmRequest>,
 ) {
-    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-    std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
-    make_intake_inner(limits, abort_rx)
+    let (lifecycle_tx, lifecycle_rx) = flume::unbounded::<LifecycleEvent>();
+    std::mem::forget(lifecycle_tx); // keep the lane open; tests end by dropping tm_tx
+    make_intake_inner(limits, lifecycle_rx)
 }
 
 fn make_intake_inner(
     limits: Limits,
-    abort_rx: flume::Receiver<AbortSource>,
+    lifecycle_rx: flume::Receiver<LifecycleEvent>,
 ) -> (
     Intake,
     flume::Receiver<DetokMsg>,
@@ -61,7 +129,7 @@ fn make_intake_inner(
     let (detok_tx, detok_rx) = flume::unbounded();
     let senders = Senders {
         tok_manager_tx: flume::unbounded().0,
-        abort_tx: flume::unbounded().0,
+        lifecycle_tx: flume::unbounded().0,
         tokenizer_tx: tok_tx,
         detokenizer_tx: vec![detok_tx],
     };
@@ -74,12 +142,13 @@ fn make_intake_inner(
     std::mem::forget(sd_tx);
     let intake = Intake::new(
         tm_rx,
-        abort_rx,
+        lifecycle_rx,
         senders,
         to_scheduler_tx,
         limits,
         test_mm(mm_tx, true),
         sd_rx,
+        None,
     );
     (intake, detok_rx, consumer, tm_tx, mm_rx)
 }
@@ -93,51 +162,38 @@ fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
     }
 }
 
-/// Both abort sources do the same two things: drop the detok entry so no
-/// further chunk can be delivered, and tell the scheduler to stop generating.
-///
-/// Neither releases anything, and nothing needs them to. Release ordering used
-/// to be the delicate part here — `AbortGuard::drop` releasing a rid right
-/// after enqueuing the abort ordered the SEND, not the EFFECT, so a retry of
-/// the same rid could `Register` ahead of the stale abort and be torn down by
-/// it. `Rid::from_client` removes the premise: a retry carries a different
-/// `Rid`, so no abort in flight can name it.
+/// Both terminal error paths stop admitted scheduler work exactly once.
 #[test]
 fn every_abort_source_deregisters_and_stops_the_scheduler() {
     for source in [
-        AbortSource::Guard("x".into()),
-        AbortSource::Detok("x".into()),
+        LifecycleEvent::GuardAbort("1".into()),
+        LifecycleEvent::DetokAbort("1".into()),
     ] {
-        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
-        let (to_scheduler_tx, consumer) = to_scheduler(16);
-        let (sd_tx, sd_rx) = flume::unbounded::<()>();
-        std::mem::forget(sd_tx);
-        let mut intake = Intake::new(
-            flume::unbounded().1,
-            flume::unbounded().1,
-            Senders {
-                tok_manager_tx: flume::unbounded().0,
-                abort_tx: flume::unbounded().0,
-                tokenizer_tx: flume::unbounded().0,
-                detokenizer_tx: vec![detok_tx],
-            },
-            to_scheduler_tx,
-            test_limits(),
-            test_mm(flume::unbounded().0, true),
-            sd_rx,
-        );
-
-        intake.on_abort(source.clone());
-
+        let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+        let (req, mut rx) = generate_req(1, SamplingParams::default());
+        intake.drive(req);
+        assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
         assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "x"),
-            "{source:?} must drop the detok entry",
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Prepared { rid, .. }) if rid.as_str() == "1")
         );
-        assert_eq!(
-            consumer.drain(8).headers.len(),
-            1,
-            "{source:?} must push an AbortReq so the scheduler stops",
+        assert_eq!(consumer.drain(16).headers.len(), 1);
+
+        intake.on_lifecycle(source.clone());
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "1")
         );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        let headers = consumer.drain(16).headers;
+        assert_eq!(headers.len(), 1);
+        let wire: Vec<rmpv::Value> = rmp_serde::from_slice(&headers[0]).unwrap();
+        assert_eq!(wire[0].as_str(), Some("AbortReq"));
+        assert_eq!(wire[1].as_str(), Some("1"));
+        assert!(intake.in_flight.is_empty());
+        intake.on_lifecycle(source);
+        assert!(consumer.drain(16).headers.is_empty(), "duplicate abort");
     }
 }
 
@@ -154,18 +210,26 @@ const NO_CONTEXT_CEILING: u64 = 1 << 40;
 /// request instead of behaving like "unset".
 fn test_limits() -> Limits {
     Limits {
+        dp_size: 1,
         skip_tokenizer_init: false,
         vocab_size: 1000,
         context_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
-        enable_return_hidden_states: false,
+        max_return_hidden_states: HiddenStatesMode::Off,
+        enable_custom_logit_processor: false,
+        enable_strict_thinking: false,
+        disable_radix_cache: false,
+        hidden_size: 2,
     }
 }
 
-fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
-    let (tx, _rx) = mpsc::channel(8);
-    Request {
+fn generate_req(
+    id: u64,
+    sampling_params: SamplingParams,
+) -> (Request, mpsc::Receiver<ResponseItem>) {
+    let (tx, rx) = mpsc::channel(8);
+    let request = Request {
         rid: id.to_string().into(),
         state: RequestState::Received,
         sink: ResponseSink::Local(tx),
@@ -175,7 +239,8 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
             sampling_params,
             ..Default::default()
         })),
-    }
+    };
+    (request, rx)
 }
 
 /// `input + max_new_tokens` past the context window is an actionable 400, not a
@@ -343,34 +408,417 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
 }
 
-/// `return_hidden_states` on a server not launched for it is a 400: the
-/// scheduler never computes them, so the request would otherwise 200 with
-/// `meta_info.hidden_states` silently missing.
 #[test]
-fn hidden_states_gated_on_server_support() {
-    let req = |want| {
-        let mut r = generate_req(31, SamplingParams::default());
-        if let RequestKind::Generate(g) = &mut r.kind {
-            g.return_hidden_states = want;
+fn hidden_states_match_python_modes_and_server_maximum() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/hidden_states_python.json")).unwrap();
+    for case in fixtures["requests"].as_array().unwrap() {
+        let body: GenerateBody = serde_json::from_value(case["body"].clone()).unwrap();
+        let (requests, _) = body.into_requests().unwrap();
+        let expected = case["modes"].as_array().unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let forwarded: GenerateBody =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            let (forwarded, _) = forwarded.into_requests().unwrap();
+            for request in std::iter::once(request).chain(forwarded) {
+                assert_eq!(
+                    serde_json::to_value(request.return_hidden_states).unwrap(),
+                    *expected
+                );
+                let header: serde_json::Value =
+                    rmp_serde::from_slice(&request.encode_header().unwrap()).unwrap();
+                assert_eq!(header[16], *expected);
+                for maximum in [
+                    HiddenStatesMode::Off,
+                    HiddenStatesMode::Last,
+                    HiddenStatesMode::Full,
+                ] {
+                    let (mut candidate, _) = generate_req(31, SamplingParams::default());
+                    candidate.kind = RequestKind::Generate(Box::new(request.clone()));
+                    let result = validate(
+                        &mut candidate,
+                        &Limits {
+                            max_return_hidden_states: maximum,
+                            ..test_limits()
+                        },
+                    );
+                    if request.return_hidden_states > maximum {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.http_status(), 400);
+                        assert!(error.to_string().contains("--return-hidden-states-mode"));
+                    } else {
+                        result.unwrap();
+                    }
+                }
+            }
         }
-        r
-    };
-    let disabled = test_limits();
-    let err = validate(&mut req(true), &disabled).unwrap_err();
-    assert_eq!(err.http_status(), 400);
+    }
+    for invalid in fixtures["invalid_modes"].as_array().unwrap() {
+        assert!(
+            serde_json::from_value::<GenerateBody>(serde_json::json!({
+                "input_ids": [1], "return_hidden_states": invalid
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn sampling_mask_options_match_python_and_survive_dp_forwarding() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/sampling_masks_python.json")).unwrap();
+    for case in fixtures["requests"].as_array().unwrap() {
+        let body: GenerateBody = serde_json::from_value(case["body"].clone()).unwrap();
+        let (requests, _) = body.into_requests().unwrap();
+        let expected = case["masks"].as_array().unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let forwarded: GenerateBody =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            let (forwarded, _) = forwarded.into_requests().unwrap();
+            for request in std::iter::once(request).chain(forwarded) {
+                let header: serde_json::Value =
+                    rmp_serde::from_slice(&request.encode_header().unwrap()).unwrap();
+                assert_eq!(header[14], *expected);
+            }
+        }
+    }
+    let body: GenerateBody = serde_json::from_value(serde_json::json!({
+        "input_ids": [[1], [2]], "return_sampling_mask": [true, false],
+        "sampling_params": {"n": 2},
+    }))
+    .unwrap();
     assert!(
-        err.to_string().contains("--enable-return-hidden-states"),
-        "message must name the flag: {err}"
+        body.into_requests()
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot use list return_sampling_mask")
     );
-    // Not asking for them (the client sent `false`, or sent nothing and
-    // `into_requests` resolved the default), or asking on a server that
-    // supports them, is fine.
-    assert!(validate(&mut req(false), &disabled).is_ok());
-    let enabled = Limits {
-        enable_return_hidden_states: true,
-        ..test_limits()
-    };
-    assert!(validate(&mut req(true), &enabled).is_ok());
+}
+
+#[test]
+fn input_embeddings_preserve_python_shapes_through_dp_and_scheduler_intake() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/input_embeddings_python.json")).unwrap();
+    for case in fixtures.as_array().unwrap() {
+        let body: GenerateBody = serde_json::from_value(case["body"].clone()).unwrap();
+        let (requests, _) = body.into_requests().unwrap();
+        let expected = case["expected"].as_array().unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let forwarded: GenerateBody =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            let (forwarded, _) = forwarded.into_requests().unwrap();
+            for request in std::iter::once(request).chain(forwarded) {
+                for disable_radix_cache in [false, true] {
+                    let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+                        skip_tokenizer_init: true,
+                        disable_radix_cache,
+                        ..test_limits()
+                    });
+                    let (sink, mut response) = mpsc::channel(8);
+                    intake.drive(Request {
+                        rid: request.rid.clone(),
+                        state: RequestState::Received,
+                        sink: ResponseSink::Local(sink),
+                        kind: RequestKind::Generate(Box::new(request.clone())),
+                    });
+                    let batch = consumer.drain(16);
+                    if disable_radix_cache {
+                        assert_eq!(batch.headers.len(), 1);
+                        let header: serde_json::Value =
+                            rmp_serde::from_slice(&batch.headers[0]).unwrap();
+                        assert_eq!(header[5], *expected);
+                        let rows = expected.as_array().unwrap().len();
+                        assert_eq!(batch.lengths, vec![rows as u32]);
+                        assert_eq!(
+                            batch.ids[0].as_ref(),
+                            [1i64.to_le_bytes()].repeat(rows).concat()
+                        );
+                    } else {
+                        let ResponseItem::Error(error) = response.try_recv().unwrap() else {
+                            panic!("embedding inputs require the radix-cache capability check");
+                        };
+                        assert_eq!(error.http_status(), 400);
+                        assert!(error.to_string().contains("--disable-radix-cache"));
+                        assert!(batch.headers.is_empty());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn delimiter_scoring_validates_final_prompt_positions_before_admission() {
+    for (indices, truncate, should_pass) in [
+        (vec![0, 3], false, true),
+        (vec![0, 3], true, true),
+        (vec![], false, false),
+        (vec![-1, 3], false, false),
+        (vec![1, 4], false, false),
+        (vec![1, 4], true, false),
+    ] {
+        let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+            skip_tokenizer_init: true,
+            context_len: if truncate { 4 } else { 5 },
+            allow_auto_truncate: truncate,
+            ..test_limits()
+        });
+        let (sink, mut response) = mpsc::channel(8);
+        let request = GenerateRequest {
+            input_ids: Some(if truncate { vec![1; 5] } else { vec![1; 4] }),
+            multi_item_delimiter_indices: Some(indices),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        intake.drive(Request {
+            rid: request.rid.clone(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(sink),
+            kind: RequestKind::Generate(Box::new(request)),
+        });
+        let batch = consumer.drain(16);
+        if should_pass {
+            assert_eq!(batch.lengths, vec![4]);
+        } else {
+            let ResponseItem::Error(error) = response.try_recv().unwrap() else {
+                panic!("invalid delimiter indices must return a validation error");
+            };
+            assert_eq!(error.http_status(), 400);
+            assert!(error.to_string().contains("multi_item_delimiter_indices"));
+            assert!(batch.headers.is_empty());
+        }
+    }
+    for body in [
+        serde_json::json!({"input_ids": [[1, 2], [3, 4]], "multi_item_delimiter_indices": [0, 1]}),
+        serde_json::json!({"input_ids": [[1, 2], [3, 4]], "multi_item_delimiter_indices": [[0, 1]]}),
+        serde_json::json!({"input_ids": [1, 2], "multi_item_delimiter_indices": [0, 1],
+            "return_flat_raw_top_logprobs": true, "top_logprobs_num": 2}),
+    ] {
+        assert!(
+            serde_json::from_value::<GenerateBody>(body)
+                .unwrap()
+                .into_requests()
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn positional_embeddings_match_python_normalization_owned_tensor_wire_and_validation() {
+    use crate::message::embeddings::PositionalEmbeds;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/positional_embeds_python.json")).unwrap();
+    let index = fixture["field_index"].as_u64().unwrap() as usize;
+    for case in fixture["accepted"].as_array().unwrap() {
+        let (requests, _) = serde_json::from_value::<GenerateBody>(case["body"].clone())
+            .unwrap()
+            .into_requests()
+            .unwrap();
+        let expected = case["expected"].as_array().unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, expected) in requests.into_iter().zip(expected) {
+            // Exercise the scalar body sent from DP ingress to a worker too.
+            let (mut forwarded, _) =
+                serde_json::from_value::<GenerateBody>(serde_json::to_value(&request).unwrap())
+                    .unwrap()
+                    .into_requests()
+                    .unwrap();
+            assert_eq!(forwarded.len(), 1);
+            let request = forwarded.pop().unwrap();
+            let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+                skip_tokenizer_init: true,
+                hidden_size: fixture["hidden_size"].as_u64().unwrap(),
+                ..test_limits()
+            });
+            let (sink, _response) = mpsc::channel(8);
+            intake.drive(Request {
+                rid: request.rid.clone(),
+                state: RequestState::Received,
+                sink: ResponseSink::Local(sink),
+                kind: RequestKind::Generate(Box::new(request)),
+            });
+            let batch = consumer.drain(16);
+            assert_eq!(batch.headers.len(), 1, "{}", case["body"]);
+            let header: rmpv::Value = rmp_serde::from_slice(&batch.headers[0]).unwrap();
+            let wire = rmp_serde::to_vec(&header[index]).unwrap();
+            let hex: String = wire.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(hex, expected["wire_hex"].as_str().unwrap());
+        }
+    }
+    for body in fixture["rejected"].as_array().unwrap() {
+        let Ok(body) = serde_json::from_value::<GenerateBody>(body.clone()) else {
+            continue;
+        };
+        let Ok((requests, _)) = body.into_requests() else {
+            continue;
+        };
+        for request in requests {
+            let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+                skip_tokenizer_init: true,
+                hidden_size: fixture["hidden_size"].as_u64().unwrap(),
+                ..test_limits()
+            });
+            let (sink, mut response) = mpsc::channel(8);
+            intake.drive(Request {
+                rid: request.rid.clone(),
+                state: RequestState::Received,
+                sink: ResponseSink::Local(sink),
+                kind: RequestKind::Generate(Box::new(request)),
+            });
+            assert!(consumer.drain(16).headers.is_empty());
+            let ResponseItem::Error(error) = response.try_recv().unwrap() else {
+                panic!("invalid positional overrides must return a validation error");
+            };
+            assert_eq!(error.http_status(), 400);
+            assert!(error.to_string().contains("positional_embed_overrides"));
+        }
+    }
+    for (position, value, should_pass) in
+        [(3, 1.0, true), (4, 1.0, false), (1, f32::INFINITY, false)]
+    {
+        let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+            skip_tokenizer_init: true,
+            context_len: 4,
+            allow_auto_truncate: true,
+            ..test_limits()
+        });
+        let request = GenerateRequest {
+            input_ids: Some(vec![1; 5]),
+            positional_embed_overrides: Some(PositionalEmbeds {
+                embeds: vec![vec![value, 2.0]],
+                positions: vec![position],
+            }),
+            ..Default::default()
+        };
+        let (sink, mut response) = mpsc::channel(8);
+        intake.drive(Request {
+            rid: request.rid.clone(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(sink),
+            kind: RequestKind::Generate(Box::new(request)),
+        });
+        assert_eq!(consumer.drain(16).headers.len(), usize::from(should_pass));
+        if !should_pass {
+            assert!(
+                matches!(response.try_recv(), Ok(ResponseItem::Error(error)) if error.http_status() == 400 && error.to_string().contains("positional_embed_overrides"))
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_embedding_shapes_and_context_limits_do_not_reach_the_scheduler() {
+    for (embeddings, truncate, should_pass) in [
+        (vec![], false, false),
+        (vec![vec![]], false, false),
+        (vec![vec![1.0, 2.0], vec![3.0]], false, false),
+        (vec![vec![f32::INFINITY, 2.0]], false, false),
+        (vec![vec![1.0, 2.0]; 5], false, false),
+        (vec![vec![1.0, 2.0]; 5], true, true),
+    ] {
+        let (mut intake, detok, consumer, _tm, _mm) = make_intake_with(Limits {
+            skip_tokenizer_init: true,
+            disable_radix_cache: true,
+            context_len: 4,
+            allow_auto_truncate: truncate,
+            ..test_limits()
+        });
+        let (sink, mut response) = mpsc::channel(8);
+        let request = GenerateRequest {
+            input_embeds: Some(embeddings),
+            return_prompt_token_ids: true,
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        intake.drive(Request {
+            rid: request.rid.clone(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(sink),
+            kind: RequestKind::Generate(Box::new(request)),
+        });
+        let batch = consumer.drain(16);
+        if should_pass {
+            assert!(matches!(detok.try_recv(), Ok(DetokMsg::Register { .. })));
+            assert!(
+                matches!(detok.try_recv(), Ok(DetokMsg::Prepared { prompt_token_ids, .. })
+                if prompt_token_ids.as_deref() == Some(&[1, 1, 1, 1][..]))
+            );
+            let header: serde_json::Value = rmp_serde::from_slice(&batch.headers[0]).unwrap();
+            assert_eq!(header[5].as_array().unwrap().len(), 4);
+            assert_eq!(batch.lengths, vec![4]);
+            assert_eq!(header[8][0], 0);
+        } else {
+            let ResponseItem::Error(error) = response.try_recv().unwrap() else {
+                panic!("invalid embeddings must return a validation error");
+            };
+            assert_eq!(error.http_status(), 400);
+            assert!(batch.headers.is_empty());
+        }
+    }
+}
+
+#[test]
+fn generation_policy_matches_python_and_requires_server_capabilities() {
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../testdata/generation_policy_python.json")).unwrap();
+    for fixture in fixtures.as_array().unwrap() {
+        let body: GenerateBody = serde_json::from_value(fixture["body"].clone()).unwrap();
+        let (requests, _) = body.into_requests().unwrap();
+        let expected = fixture["expected"].as_array().unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, expected) in requests.into_iter().zip(expected) {
+            let forwarded: GenerateBody =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            let (forwarded, _) = forwarded.into_requests().unwrap();
+            for request in std::iter::once(request).chain(forwarded) {
+                for enabled in [false, true] {
+                    let (mut intake, _detok, consumer, _tm, _mm) = make_intake_with(Limits {
+                        enable_custom_logit_processor: enabled,
+                        enable_strict_thinking: enabled,
+                        ..test_limits()
+                    });
+                    let needs_capability = request
+                        .custom_logit_processor
+                        .as_ref()
+                        .is_some_and(|processor| !processor.is_empty())
+                        || request.max_thinking_tokens.is_some();
+                    let (sink, mut response) = mpsc::channel(8);
+                    intake.drive(Request {
+                        rid: request.rid.clone(),
+                        state: RequestState::Received,
+                        sink: ResponseSink::Local(sink),
+                        kind: RequestKind::Generate(Box::new(request.clone())),
+                    });
+                    let batch = consumer.drain(16);
+                    if needs_capability && !enabled {
+                        let ResponseItem::Error(error) = response.try_recv().unwrap() else {
+                            panic!("unsupported policy must fail before scheduler admission");
+                        };
+                        assert_eq!(error.http_status(), 400);
+                        assert!(error.to_string().contains("--enable-"));
+                        assert!(batch.headers.is_empty());
+                    } else {
+                        assert_eq!(batch.headers.len(), 1);
+                        let header: serde_json::Value =
+                            rmp_serde::from_slice(&batch.headers[0]).unwrap();
+                        assert_eq!(
+                            serde_json::json!([header[23], header[33], header[8][25]]),
+                            *expected
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
@@ -381,13 +829,14 @@ fn over_context_request_deregisters_and_never_reaches_the_ring() {
         context_len: 4,
         ..test_limits()
     });
-    intake.drive(generate_req(
+    let (req, _rx) = generate_req(
         33,
         SamplingParams {
             max_new_tokens: Some(64),
             ..Default::default()
         },
-    ));
+    );
+    intake.drive(req);
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "33"),
         "registered before the check",
@@ -418,6 +867,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_ring() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![7, 8, 9],
+            skip_special_tokens: false,
         },
     });
     assert!(
@@ -427,7 +877,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_ring() {
     assert!(
         matches!(
             detok_rx.try_recv(),
-            Ok(DetokMsg::Decode { rid, token_ids })
+            Ok(DetokMsg::Decode { rid, token_ids, skip_special_tokens: false })
                 if rid.as_str() == "41" && token_ids == [7, 8, 9]
         ),
         "the decode job follows, ids intact",
@@ -456,6 +906,7 @@ fn detokenize_negative_ids_reject_before_registration() {
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Detokenize {
             token_ids: vec![1, -1],
+            skip_special_tokens: true,
         },
     });
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
@@ -467,64 +918,247 @@ fn detokenize_negative_ids_reject_before_registration() {
     assert!(consumer.drain(16).headers.is_empty());
 }
 
-/// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
-/// so under load the scheduler never learns to stop and keeps generating; its
-/// chunks then arrive for a rid the detok table no longer holds and are
-/// dropped. That wastes GPU work but cannot MISDELIVER, because
-/// `Rid::from_client` guarantees no later request ever answers to that rid.
-/// The detok entry is dropped either way — that is the half that must not
-/// depend on the ring.
-///
-/// Ring capacity 1: the first abort pushes, the second finds it full.
+/// Saturating the control reserve cannot lose an abort. Pending cancellation
+/// blocks new GPU work until every admitted generation has its abort queued.
 #[test]
-fn abort_deregisters_even_when_the_ring_push_is_dropped() {
-    let (tok_tx, _tok_rx) = flume::unbounded();
-    let (detok_tx, detok_rx) = flume::unbounded();
-    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-    let senders = Senders {
-        tok_manager_tx: flume::unbounded().0,
-        abort_tx,
-        tokenizer_tx: tok_tx,
-        detokenizer_tx: vec![detok_tx],
-    };
-    let (producer, _consumer) = to_scheduler(1);
-    let (_tm_tx, tm_rx) = flume::unbounded();
-    let (sd_tx, sd_rx) = flume::unbounded::<()>();
-    std::mem::forget(sd_tx);
-    let mut intake = Intake::new(
-        tm_rx,
-        abort_rx,
-        senders,
-        producer,
-        test_limits(),
-        test_mm(flume::unbounded().0, true),
-        sd_rx,
-    );
-
-    intake.on_abort(AbortSource::Guard("pushed".into()));
-    intake.on_abort(AbortSource::Guard("dropped".into()));
-
-    // Both deregisters land regardless of whether the ring accepted the push.
-    for expected in ["pushed", "dropped"] {
-        assert!(
-            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == expected),
-            "{expected}: the detok entry must be dropped even when the ring is full",
-        );
+fn aborts_are_retried_until_the_scheduler_can_drain_them() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut clients = Vec::new();
+    for id in 0..65 {
+        let (req, rx) = generate_req(id, SamplingParams::default());
+        clients.push(rx);
+        intake.drive(req);
+        assert_eq!(consumer.drain(1).headers.len(), 1);
     }
+    for id in 0..65 {
+        intake.on_lifecycle(LifecycleEvent::GuardAbort(id.to_string().into()));
+    }
+    assert!(
+        !intake.pending_aborts.is_empty(),
+        "control reserve saturated"
+    );
+    assert!(intake.in_flight.is_empty());
+
+    let (req, mut rejected) = generate_req(100, SamplingParams::default());
+    intake.drive(req);
+    assert!(matches!(
+        rejected.try_recv(),
+        Ok(ResponseItem::Error(Error::QueueFull))
+    ));
+
+    let mut aborted = Vec::new();
+    while !intake.pending_aborts.is_empty() {
+        aborted.extend(consumer.drain(128).headers);
+        intake.flush_pending_aborts();
+    }
+    aborted.extend(consumer.drain(128).headers);
+    let ids: Vec<_> = aborted
+        .iter()
+        .map(|header| {
+            let wire: Vec<rmpv::Value> = rmp_serde::from_slice(header).unwrap();
+            assert_eq!(wire[0].as_str(), Some("AbortReq"));
+            wire[1].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(ids, (0..65).map(|id| id.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn disconnect_before_admission_and_late_tokenizer_result_do_not_schedule_work() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (req, rx) = generate_req(1, SamplingParams::default());
+    drop(rx);
+    intake.drive(req);
+    assert!(intake.in_flight.is_empty());
+    assert!(detok_rx.try_recv().is_err());
+
+    let (tokenizer_tx, tokenizer_rx) = flume::unbounded();
+    intake.senders.tokenizer_tx = tokenizer_tx;
+    let (mut req, _rx) = generate_req(2, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = None;
+        g.text = Some("hello".into());
+    }
+    intake.drive(req);
+    let mut req = tokenizer_rx.try_recv().unwrap();
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.on_lifecycle(LifecycleEvent::GuardAbort(req.rid.clone()));
+    req.state = RequestState::PreSendValidating;
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = Some(vec![1]);
+    }
+    intake.drive(req);
+    assert!(intake.in_flight.is_empty());
+    assert!(consumer.drain(16).headers.is_empty());
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+    assert!(detok_rx.try_recv().is_err());
+}
+
+#[test]
+fn finished_requests_release_tracking_without_scheduling_an_abort() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (req, _rx) = generate_req(1, SamplingParams::default());
+    intake.drive(req);
+    assert_eq!(consumer.drain(16).headers.len(), 1);
+    intake.on_lifecycle(LifecycleEvent::Finished("1".into()));
+    assert!(intake.in_flight.is_empty());
+    intake.on_lifecycle(LifecycleEvent::GuardAbort("1".into()));
+    assert!(consumer.drain(16).headers.is_empty());
+}
+
+#[test]
+fn full_worker_queues_cannot_block_scheduler_cancellation() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let (tok_tx, _tok_rx) = flume::bounded(0);
+    intake.senders.tokenizer_tx = tok_tx;
+    let (mut req, mut rx) = generate_req(1, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = None;
+        g.text = Some("hello".into());
+    }
+    intake.drive(req);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(ResponseItem::Error(Error::QueueFull))
+    ));
+    assert!(intake.in_flight.is_empty());
+
+    let (detok_tx, detok_rx) = flume::bounded(2);
+    intake.senders.detokenizer_tx = vec![detok_tx];
+    let (req, _rx) = generate_req(2, SamplingParams::default());
+    intake.drive(req);
+    assert_eq!(consumer.drain(16).headers.len(), 1);
+    // Registration and preparation fill the queue; cancellation still reaches Python.
+    intake.on_lifecycle(LifecycleEvent::GuardAbort("2".into()));
+    assert_eq!(consumer.drain(16).headers.len(), 1);
+    assert_eq!(intake.pending_deregistrations.len(), 1);
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Prepared { .. })));
+    intake.flush_pending_deregistrations();
+    assert!(intake.pending_deregistrations.is_empty());
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+}
+
+#[test]
+fn full_preparation_queue_rejects_before_scheduler_admission() {
+    let (mut intake, _detok, consumer, _tm, _mm) = make_intake();
+    let (detok_tx, detok_rx) = flume::bounded(1);
+    intake.senders.detokenizer_tx = vec![detok_tx];
+    let (request, mut response) = generate_req(1, SamplingParams::default());
+    intake.drive(request);
+    assert!(matches!(
+        response.try_recv(),
+        Ok(ResponseItem::Error(Error::QueueFull))
+    ));
+    assert!(consumer.drain(16).headers.is_empty());
+    assert!(intake.in_flight.is_empty());
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.flush_pending_deregistrations();
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+    assert!(intake.pending_deregistrations.is_empty());
+}
+
+#[test]
+fn explicit_abort_matches_client_ids_and_preserves_scheduler_response_registration() {
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let mut clients = Vec::new();
+    let mut expected = Vec::new();
+    for client_id in ["batch-1", "batch-1", "other"] {
+        let (mut req, rx) = generate_req(1, SamplingParams::default());
+        req.rid = Rid::from_client(client_id);
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.rid = req.rid.clone();
+        }
+        if client_id == "batch-1" {
+            expected.push(req.rid.to_string());
+        }
+        clients.push(rx);
+        intake.drive(req);
+    }
+    let (req, mut mm_response) = mm_generate_req("batch-2");
+    intake.drive(req);
+    assert_eq!(consumer.drain(16).headers.len(), 3);
+    assert!(mm_rx.try_recv().is_ok());
+    let mut registered = 0;
+    let mut prepared = 0;
+    for message in detok_rx.drain() {
+        match message {
+            DetokMsg::Register { .. } => registered += 1,
+            DetokMsg::Prepared { .. } => prepared += 1,
+            _ => panic!("request unexpectedly terminated"),
+        }
+    }
+    assert_eq!((registered, prepared), (4, 3));
+
+    intake.on_client_abort("", false);
+    assert!(
+        consumer.drain(16).headers.is_empty(),
+        "empty rid is a no-op"
+    );
+    intake.on_client_abort("batch-", false);
+    let mut actual: Vec<_> = consumer
+        .drain(16)
+        .headers
+        .iter()
+        .map(|header| {
+            let wire: Vec<rmpv::Value> = rmp_serde::from_slice(header).unwrap();
+            assert_eq!(wire[0].as_str(), Some("AbortReq"));
+            wire[1].as_str().unwrap().to_owned()
+        })
+        .collect();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    let Ok(ResponseItem::Done(output)) = mm_response.try_recv() else {
+        panic!("CPU-only request must complete locally");
+    };
+    let reason = output.finish_reason.unwrap();
+    assert_eq!(reason.kind_name(), Some("abort"));
+    assert_eq!(reason.abort_status(), None);
+    assert!(intake.pending_mm.is_empty());
+    assert_eq!(
+        intake.in_flight.len(),
+        3,
+        "GPU requests still await their final output"
+    );
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "batch-2")
+    );
+    assert!(detok_rx.try_recv().is_err());
+    intake.on_client_abort("batch-", false);
+    assert!(
+        consumer.drain(16).headers.is_empty(),
+        "duplicate abort is idempotent"
+    );
+    intake.on_client_abort("", true);
+    assert_eq!(
+        consumer.drain(16).headers.len(),
+        1,
+        "abort-all includes the other request"
+    );
 }
 
 /// The rid keys the detok table and rides on every chunk of every decode step,
 /// so an unbounded client-supplied one is a recurring cost, not a one-off.
 #[test]
 fn oversized_rid_is_rejected() {
-    let mut req = generate_req(51, SamplingParams::default());
+    let (mut req, _rx) = generate_req(51, SamplingParams::default());
     req.rid = "x".repeat(MAX_RID_LEN + 1).into();
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
     assert_eq!(err.http_status(), 400);
     assert!(err.to_string().contains("over the"), "{err}");
 
     // A uuid-sized rid — what Python mints — is nowhere near the cap.
-    let mut req = generate_req(52, SamplingParams::default());
+    let (mut req, _rx) = generate_req(52, SamplingParams::default());
     req.rid = "0123456789abcdef0123456789abcdef".into();
     assert!(validate(&mut req, &test_limits()).is_ok());
 }
@@ -537,7 +1171,7 @@ fn oversized_rid_is_rejected() {
 fn pre_registration_failure_does_not_deregister() {
     // Rejected inside `validate` (out-of-vocab id), which runs before registration.
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(41, SamplingParams::default());
+    let (mut req, _rx) = generate_req(41, SamplingParams::default());
     if let RequestKind::Generate(g) = &mut req.kind {
         g.input_ids = Some(vec![2_000_000_000]);
     }
@@ -550,13 +1184,14 @@ fn pre_registration_failure_does_not_deregister() {
 
     // A post-registration reject still deregisters (the leak fix stays fixed).
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    intake.drive(generate_req(
+    let (req, _rx) = generate_req(
         42,
         SamplingParams {
             top_p: 2.0, // rejected by `normalize`, after registration
             ..Default::default()
         },
-    ));
+    );
+    intake.drive(req);
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
     assert!(matches!(
         detok_rx.try_recv(),
@@ -574,7 +1209,8 @@ fn rejected_request_deregisters_from_shard() {
         top_p: 2.0,
         ..Default::default()
     };
-    intake.drive(generate_req(7, bad));
+    let (req, _rx) = generate_req(7, bad);
+    intake.drive(req);
 
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "7"),
@@ -596,7 +1232,7 @@ fn rejected_request_deregisters_from_shard() {
 #[test]
 fn out_of_vocab_input_ids_rejected() {
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(21, SamplingParams::default());
+    let (mut req, _rx) = generate_req(21, SamplingParams::default());
     if let RequestKind::Generate(g) = &mut req.kind {
         g.input_ids = Some(vec![1, 2_000_000_000]);
     }
@@ -614,7 +1250,7 @@ fn out_of_vocab_input_ids_rejected() {
 #[test]
 fn negative_and_logprob_token_ids_rejected() {
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(22, SamplingParams::default());
+    let (mut req, _rx) = generate_req(22, SamplingParams::default());
     if let RequestKind::Generate(g) = &mut req.kind {
         g.input_ids = Some(vec![-1]);
     }
@@ -625,7 +1261,7 @@ fn negative_and_logprob_token_ids_rejected() {
     }
 
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(23, SamplingParams::default());
+    let (mut req, _rx) = generate_req(23, SamplingParams::default());
     if let RequestKind::Generate(g) = &mut req.kind {
         g.token_ids_logprob = Some(vec![999_999]);
     }
@@ -638,7 +1274,7 @@ fn negative_and_logprob_token_ids_rejected() {
 
 #[test]
 fn multimodal_sentinel_is_validated_after_expansion() {
-    let mut req = generate_req(24, SamplingParams::default());
+    let (mut req, _rx) = generate_req(24, SamplingParams::default());
     let RequestKind::Generate(g) = &mut req.kind else {
         unreachable!()
     };
@@ -663,39 +1299,100 @@ fn multimodal_sentinel_is_validated_after_expansion() {
 #[test]
 fn admitted_request_keeps_registration() {
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    // Empty map → all sampling defaults, passes normalization.
-    intake.drive(generate_req(9, SamplingParams::default()));
-
-    assert!(
-        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "9"),
-        "expected Register for rid 9",
-    );
-    assert!(
-        detok_rx.try_recv().is_err(),
-        "admitted request must not be deregistered",
-    );
+    for (id, skip_specials, keep_stop) in [(9, true, false), (10, false, true)] {
+        let (mut req, _rx) = generate_req(
+            id,
+            SamplingParams {
+                skip_special_tokens: skip_specials,
+                no_stop_trim: keep_stop,
+                stop: Some(crate::message::types::OneOrMany::Many(vec!["END".into()])),
+                stop_regex: Some(crate::message::types::OneOrMany::Many(vec!["E.D".into()])),
+                ..Default::default()
+            },
+        );
+        if let RequestKind::Generate(request) = &mut req.kind {
+            request.return_prompt_token_ids = true;
+            request.return_logprob = true;
+            request.top_logprobs_num = 2;
+            request.return_flat_raw_top_logprobs = true;
+            request.return_flat_raw_top_logprobs_b64 = keep_stop;
+            if keep_stop {
+                request.sampling_params.normalize(false, 1000).unwrap();
+            }
+        }
+        intake.drive(req);
+        assert!(matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::Register { rid, skip_special_tokens, no_stop_trim, stop_texts, logprobs, .. })
+                if rid.as_str() == id.to_string()
+                    && skip_special_tokens == skip_specials && no_stop_trim == keep_stop
+                    && stop_texts == vec!["END", "E.D"]
+                    && logprobs.is_some_and(|options| options.top_k == 2 && options.flat && options.base64 == keep_stop)
+        ));
+        assert!(matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::Prepared { rid, prompt_token_ids, sampling_params, .. })
+                if rid.as_str() == id.to_string()
+                    && prompt_token_ids.as_deref() == Some(&[1, 2, 3][..])
+                    && sampling_params.stop_strs == vec!["END"]
+                    && sampling_params.stop_regex_strs == vec!["E.D"]
+        ));
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "admitted request must not be deregistered",
+        );
+    }
 }
 
-/// A pool return in `Failed` state (failed encode) is rejected via the same
-/// path and deregistered, not leaked.
+/// Worker success and failure return through the same registered request path.
 #[test]
-fn tokenize_failure_deregisters_via_intake() {
-    let (intake, detok_rx, _consumer, tm_tx, _mm_rx) = make_intake();
-    // The pool marks a failed encode as `Failed(err)` before returning it.
-    let mut req = generate_req(11, SamplingParams::default());
-    let _ = req
-        .state
-        .apply(Event::Error(Error::Tokenize("boom".into())));
-    tm_tx.send(TmEvent::Tokenized(req)).unwrap();
-    // Close the inbox so the run loop returns after draining the one event.
-    drop(tm_tx);
-    intake.run();
-
-    assert!(
-        matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "11"),
-        "tokenize failure must deregister rid 11",
-    );
-    assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+fn tokenizer_return_preserves_or_cleans_up_registration() {
+    for success in [false, true] {
+        let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+        let (tokenizer_tx, tokenizer_rx) = flume::unbounded();
+        intake.senders.tokenizer_tx = tokenizer_tx;
+        let (mut req, mut rx) = generate_req(11, SamplingParams::default());
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = None;
+            g.text = Some("hello".into());
+            g.return_prompt_token_ids = true;
+        }
+        intake.drive(req);
+        assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+        let mut req = tokenizer_rx.try_recv().unwrap();
+        if success {
+            if let RequestKind::Generate(g) = &mut req.kind {
+                g.input_ids = Some(vec![1, 2, 3]);
+            }
+            req.state = RequestState::PreSendValidating;
+        } else {
+            req.state
+                .apply(Event::Error(Error::Tokenize("boom".into())))
+                .unwrap();
+        }
+        intake.drive(req);
+        if success {
+            assert_eq!(consumer.drain(16).headers.len(), 1);
+            assert!(intake.in_flight.contains_key(&"11".into()));
+            assert!(matches!(
+                detok_rx.try_recv(),
+                Ok(DetokMsg::Prepared { rid, prompt_token_ids, .. })
+                    if rid.as_str() == "11"
+                        && prompt_token_ids.as_deref() == Some(&[1, 2, 3][..])
+            ));
+            assert!(detok_rx.try_recv().is_err());
+        } else {
+            assert!(consumer.drain(16).headers.is_empty());
+            assert!(intake.in_flight.is_empty());
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(ResponseItem::Error(Error::Tokenize(_)))
+            ));
+            assert!(
+                matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "11")
+            );
+        }
+    }
 }
 
 /// An abort deregisters (by the id hashed from the rid string), so a request
@@ -703,10 +1400,12 @@ fn tokenize_failure_deregisters_via_intake() {
 #[test]
 fn abort_deregisters_from_shard() {
     // Aborts arrive on their own unbounded lane now, not the request inbox.
-    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-    let (intake, detok_rx, _consumer, tm_tx, _mm_rx) = make_intake_with_abort(abort_rx);
-    abort_tx.send(AbortSource::Guard("rid-13".into())).unwrap();
-    drop(abort_tx);
+    let (lifecycle_tx, lifecycle_rx) = flume::unbounded::<LifecycleEvent>();
+    let (intake, detok_rx, _consumer, tm_tx, _mm_rx) = make_intake_with_abort(lifecycle_rx);
+    lifecycle_tx
+        .send(LifecycleEvent::GuardAbort("rid-13".into()))
+        .unwrap();
+    drop(lifecycle_tx);
     drop(tm_tx);
     intake.run();
 
@@ -717,34 +1416,12 @@ fn abort_deregisters_from_shard() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
-/// A successful pool return (Queued, ids filled) is pushed to the ring, not
-/// rejected; its registration is untouched.
-#[test]
-fn tokenized_return_pushes_without_deregister() {
-    let (intake, detok_rx, _consumer, tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(15, SamplingParams::default());
-    // Simulate a successful pool return: ids filled, PreSendValidating.
-    if let RequestKind::Generate(g) = &mut req.kind {
-        g.input_ids = Some(vec![1, 2, 3]);
-    }
-    req.state = RequestState::PreSendValidating;
-    tm_tx.send(TmEvent::Tokenized(req)).unwrap();
-    drop(tm_tx);
-    intake.run();
-
-    // Pushed to the ring; the shard sees nothing.
-    assert!(
-        detok_rx.try_recv().is_err(),
-        "a queued pool-return must be pushed, not touch the shard",
-    );
-}
-
 /// If the pool is gone, a request needing tokenization is rejected +
 /// deregistered, not silently dropped.
 #[test]
 fn tokenize_pool_gone_deregisters() {
     let (mut intake, detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
-    let mut req = generate_req(21, SamplingParams::default());
+    let (mut req, _rx) = generate_req(21, SamplingParams::default());
     if let RequestKind::Generate(g) = &mut req.kind {
         g.input_ids = None;
     }
@@ -763,9 +1440,9 @@ fn tokenize_pool_gone_deregisters() {
 
 /// Build a generate request carrying an image. The parked entry and the
 /// `MmEncoded` resume path agree on identity via the rid string.
-fn mm_generate_req(rid: &str) -> Request {
-    let (tx, _rx) = mpsc::channel(8);
-    Request {
+fn mm_generate_req(rid: &str) -> (Request, mpsc::Receiver<ResponseItem>) {
+    let (tx, rx) = mpsc::channel(8);
+    let request = Request {
         rid: rid.to_string().into(),
         state: RequestState::Received,
         sink: ResponseSink::Local(tx),
@@ -780,7 +1457,8 @@ fn mm_generate_req(rid: &str) -> Request {
             })),
             ..Default::default()
         })),
-    }
+    };
+    (request, rx)
 }
 
 /// An abort while the request is parked for MM cancels it: the pending
@@ -789,26 +1467,32 @@ fn mm_generate_req(rid: &str) -> Request {
 #[test]
 fn abort_cancels_parked_mm_request() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-gone"));
+    let (req, _rx) = mm_generate_req("mm-gone");
+    intake.drive(req);
     mm_rx.try_recv().expect("parked to mm pool");
 
     // The worker parks its result, as it always does before MmEncoded.
     intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::result_store::MmEncodedEntry {
-            features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
-            grids: vec![],
-            hashes: vec![],
-            offsets: vec![],
-            mrope: vec![],
-            mrope_delta: 0,
-        },
+        crate::multi_modality::result_store::MmEncodedEntry::Qwen(
+            crate::multi_modality::result_store::QwenMmEncodedEntry {
+                features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
+                grids: vec![],
+                hashes: vec![],
+                offsets: vec![],
+                mrope: vec![],
+                mrope_delta: 0,
+            },
+        ),
     );
-    intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
-    assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
+    intake.on_abort(LifecycleEvent::GuardAbort("mm-gone".to_string().into()));
+    assert!(
+        consumer.drain(16).headers.is_empty(),
+        "never sent to the scheduler"
+    );
 
     // The late result must be dropped, not queued, and the parked result purged.
-    intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
+    intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6], None);
     assert!(
         consumer.drain(16).headers.is_empty(),
         "cancelled, not queued"
@@ -821,8 +1505,14 @@ fn abort_cancels_parked_mm_request() {
 /// it → ring.
 #[test]
 fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
-    let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-1"));
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let (mut req, _rx) = mm_generate_req("mm-1");
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.return_prompt_token_ids = true;
+    }
+    intake.drive(req);
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    assert!(detok_rx.try_recv().is_err(), "prompt is not ready yet");
 
     // Submitted to the mm pool with the typed work item; nothing on the ring yet.
     let sub = mm_rx.try_recv().expect("mm pool must receive the request");
@@ -836,7 +1526,20 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
 
     // The worker returns the final expanded ids → pushed to the ring.
-    intake.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8]);
+    intake.on_mm_encoded(
+        "mm-1".to_string().into(),
+        vec![5, 6, 7, 8],
+        Some(serde_json::Map::from_iter([(
+            "media_stats".into(),
+            serde_json::json!({"preprocess_e2e_ms": 17}),
+        )])),
+    );
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Prepared { prompt_token_ids, response_metadata, .. })
+            if prompt_token_ids.as_deref() == Some(&[5, 6, 7, 8][..])
+                && response_metadata.as_ref().unwrap()["media_stats"]["preprocess_e2e_ms"] == 17
+    ));
     let batch = consumer.drain(16);
     assert_eq!(batch.headers.len(), 1);
     assert_eq!(
@@ -850,7 +1553,8 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
 #[test]
 fn mm_failure_rejects_parked_request() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-2"));
+    let (req, mut rx) = mm_generate_req("mm-2");
+    intake.drive(req);
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })),
         "registered before parking",
@@ -863,6 +1567,12 @@ fn mm_failure_rejects_parked_request() {
         "mm failure must deregister",
     );
     assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+    let ResponseItem::Error(error) = rx.try_recv().unwrap() else {
+        panic!("invalid media must reach the HTTP consumer as an error");
+    };
+    assert_eq!(error.http_status(), 400);
+    assert_eq!(error.to_string(), "encode failed: bad image");
+    assert!(!intake.pending_mm.contains_key(&Rid::from("mm-2")));
 }
 
 /// On a non-multimodal model (`MmDispatch::enabled == false`), image_data is silently
@@ -874,28 +1584,30 @@ fn mm_fields_ignored_when_disabled() {
     let (detok_tx, _detok_rx) = flume::unbounded();
     let senders = Senders {
         tok_manager_tx: flume::unbounded().0,
-        abort_tx: flume::unbounded().0,
+        lifecycle_tx: flume::unbounded().0,
         tokenizer_tx: tok_tx,
         detokenizer_tx: vec![detok_tx],
     };
     let (to_scheduler_tx, _consumer) = to_scheduler(16);
     let (_tm_tx, tm_rx) = flume::unbounded();
     let (mm_tx, mm_rx) = flume::unbounded();
-    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-    std::mem::forget(abort_tx);
+    let (lifecycle_tx, lifecycle_rx) = flume::unbounded::<LifecycleEvent>();
+    std::mem::forget(lifecycle_tx);
     let (sd_tx, sd_rx) = flume::unbounded::<()>();
     std::mem::forget(sd_tx);
     let mut intake = Intake::new(
         tm_rx,
-        abort_rx,
+        lifecycle_rx,
         senders,
         to_scheduler_tx,
         test_limits(),
         test_mm(mm_tx, false),
         sd_rx,
+        None,
     );
 
-    intake.drive(mm_generate_req("mm-3"));
+    let (req, _rx) = mm_generate_req("mm-3");
+    intake.drive(req);
     assert!(
         mm_rx.try_recv().is_err(),
         "mm disabled: nothing submitted to the mm channel",
@@ -911,7 +1623,7 @@ fn mm_fields_ignored_when_disabled() {
 #[test]
 fn late_mm_result_is_dropped() {
     let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-    intake.on_mm_encoded("ghost".to_string().into(), vec![1]);
+    intake.on_mm_encoded("ghost".to_string().into(), vec![1], None);
     intake.on_mm_failed("ghost".to_string().into(), "boom".into());
     assert!(consumer.drain(16).headers.is_empty());
 }

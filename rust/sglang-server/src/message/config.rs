@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use super::types::HiddenStatesMode;
+
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
 /// `Server::start` parameters.
@@ -34,6 +36,7 @@ pub struct RustServerServerArgs {
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
+    pub http_extension: Option<Arc<dyn crate::HttpExtension>>,
 }
 
 impl Default for RustServerServerArgs {
@@ -45,6 +48,7 @@ impl Default for RustServerServerArgs {
             from_scheduler_cap: 8192,
             stage_channel_cap: 8192,
             cores: None,
+            http_extension: None,
         }
     }
 }
@@ -83,6 +87,14 @@ pub struct ServerArgs {
     /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
     /// in standalone (test) configs — then boot requires `skip_tokenizer_init`.
     pub tokenizer_path: String,
+    /// Public tokenizer identity, before exporting a temporary Rust tokenizer.
+    pub public_tokenizer_path: String,
+    /// Python tokenizers accept a signed negative or unsigned 64-bit maximum.
+    pub tokenizer_model_max_length: i128,
+    /// Actual tokenizer vocabulary, including added tokens, for decode-ID clamping.
+    pub tokenizer_vocab_size: Option<u64>,
+    /// Keep health unavailable until the launch parent finishes its warmup.
+    pub wait_for_parent_warmup: bool,
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
     /// Weight format selected by `--load-format`, reported by `/get_model_info`.
@@ -98,10 +110,24 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    pub enable_http2: bool,
+    pub http2_max_concurrent_streams: u32,
+    pub http2_initial_connection_window_size: u32,
+    pub enable_request_header_overrides: bool,
+    pub enable_request_decompression: bool,
+    pub default_priority_value: Option<i64>,
+    pub dp_size: usize,
+    pub dp_rank: Option<u32>,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
     pub log_level_http: Option<String>,
+    pub enable_metrics: bool,
+    /// Private collector service owned by the Python launch process.
+    pub metrics_socket: Option<String>,
+    pub metrics_config: Option<String>,
+    /// HTTP KV bootstrap port. Non-HTTP backends own a separate service.
+    pub disaggregation_bootstrap_port: Option<u16>,
     /// Optional built-in chat-template name or path to a Jinja/legacy JSON
     /// template file. Without an override, uses the tokenizer config template.
     pub chat_template: Option<String>,
@@ -113,6 +139,9 @@ pub struct ServerArgs {
     pub reasoning_parser: Option<String>,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     pub stream_response_default_include_usage: bool,
+    pub enable_cache_report: bool,
+    pub return_input_ids: bool,
+    pub return_output_ids: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
@@ -142,7 +171,10 @@ pub struct ServerArgs {
     /// `return_hidden_states` is refused unless the server was launched with it:
     /// the scheduler simply won't produce them, so the request would 200 with the
     /// field silently missing.
-    pub enable_return_hidden_states: bool,
+    pub max_return_hidden_states: HiddenStatesMode,
+    pub enable_custom_logit_processor: bool,
+    pub enable_strict_thinking: bool,
+    pub disable_radix_cache: bool,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -151,6 +183,8 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    pub accelerator: Option<String>,
+    pub num_accelerators: usize,
 }
 
 #[pyo3::pymethods]
@@ -160,17 +194,36 @@ impl ServerArgs {
         model_path,
         served_model_name,
         tokenizer_path,
+        public_tokenizer_path,
+        tokenizer_model_max_length,
+        tokenizer_vocab_size,
+        wait_for_parent_warmup,
         revision,
         load_format,
         weight_version,
         host,
         port,
+        enable_http2,
+        http2_max_concurrent_streams,
+        http2_initial_connection_window_size,
+        enable_request_header_overrides,
+        enable_request_decompression,
+        default_priority_value,
+        dp_size,
+        dp_rank,
         log_level,
         log_level_http,
+        enable_metrics,
+        metrics_socket,
+        metrics_config,
+        disaggregation_bootstrap_port,
         chat_template,
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
+        enable_cache_report,
+        return_input_ids,
+        return_output_ids,
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
@@ -181,10 +234,15 @@ impl ServerArgs {
         preferred_sampling_params,
         limit_mm_data_per_request,
         allow_auto_truncate,
-        enable_return_hidden_states,
+        max_return_hidden_states,
+        enable_custom_logit_processor,
+        enable_strict_thinking,
+        disable_radix_cache,
         num_reserved_tokens,
         version,
         max_total_num_tokens,
+        accelerator,
+        num_accelerators,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -192,17 +250,36 @@ impl ServerArgs {
         model_path: String,
         served_model_name: String,
         tokenizer_path: String,
+        public_tokenizer_path: String,
+        tokenizer_model_max_length: i128,
+        tokenizer_vocab_size: Option<u64>,
+        wait_for_parent_warmup: bool,
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
         host: String,
         port: u16,
+        enable_http2: bool,
+        http2_max_concurrent_streams: u32,
+        http2_initial_connection_window_size: u32,
+        enable_request_header_overrides: bool,
+        enable_request_decompression: bool,
+        default_priority_value: Option<i64>,
+        dp_size: usize,
+        dp_rank: Option<u32>,
         log_level: String,
         log_level_http: Option<String>,
+        enable_metrics: bool,
+        metrics_socket: Option<String>,
+        metrics_config: Option<String>,
+        disaggregation_bootstrap_port: Option<u16>,
         chat_template: Option<String>,
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
+        enable_cache_report: bool,
+        return_input_ids: bool,
+        return_output_ids: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
@@ -213,26 +290,50 @@ impl ServerArgs {
         preferred_sampling_params: Option<PreferredSamplingParams>,
         limit_mm_data_per_request: BTreeMap<String, usize>,
         allow_auto_truncate: bool,
-        enable_return_hidden_states: bool,
+        max_return_hidden_states: HiddenStatesMode,
+        enable_custom_logit_processor: bool,
+        enable_strict_thinking: bool,
+        disable_radix_cache: bool,
         num_reserved_tokens: u64,
         version: String,
         max_total_num_tokens: u64,
+        accelerator: Option<String>,
+        num_accelerators: usize,
     ) -> Self {
         Self {
             model_path,
             served_model_name,
             tokenizer_path,
+            public_tokenizer_path,
+            tokenizer_model_max_length,
+            tokenizer_vocab_size,
+            wait_for_parent_warmup,
             revision,
             load_format,
             weight_version,
             host,
             port,
+            enable_http2,
+            http2_max_concurrent_streams,
+            http2_initial_connection_window_size,
+            enable_request_header_overrides,
+            enable_request_decompression,
+            default_priority_value,
+            dp_size,
+            dp_rank,
             log_level,
             log_level_http,
+            enable_metrics,
+            metrics_socket,
+            metrics_config,
+            disaggregation_bootstrap_port,
             chat_template,
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
+            enable_cache_report,
+            return_input_ids,
+            return_output_ids,
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
@@ -243,10 +344,15 @@ impl ServerArgs {
             preferred_sampling_params,
             limit_mm_data_per_request,
             allow_auto_truncate,
-            enable_return_hidden_states,
+            max_return_hidden_states,
+            enable_custom_logit_processor,
+            enable_strict_thinking,
+            disable_radix_cache,
             num_reserved_tokens,
             version,
             max_total_num_tokens,
+            accelerator,
+            num_accelerators,
         }
     }
 }
@@ -260,17 +366,36 @@ impl Default for ServerArgs {
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),
+            public_tokenizer_path: String::new(),
+            tokenizer_model_max_length: -1,
+            tokenizer_vocab_size: None,
+            wait_for_parent_warmup: false,
             revision: None,
             load_format: None,
             weight_version: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            enable_http2: false,
+            http2_max_concurrent_streams: 200,
+            http2_initial_connection_window_size: 1024 * 1024,
+            enable_request_header_overrides: false,
+            enable_request_decompression: false,
+            default_priority_value: None,
+            dp_size: 1,
+            dp_rank: None,
             log_level: "info".into(),
             log_level_http: None,
+            enable_metrics: false,
+            metrics_socket: None,
+            metrics_config: None,
+            disaggregation_bootstrap_port: None,
             chat_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
+            enable_cache_report: false,
+            return_input_ids: false,
+            return_output_ids: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
@@ -281,10 +406,15 @@ impl Default for ServerArgs {
             preferred_sampling_params: None,
             limit_mm_data_per_request: BTreeMap::new(),
             allow_auto_truncate: false,
-            enable_return_hidden_states: false,
+            max_return_hidden_states: HiddenStatesMode::Off,
+            enable_custom_logit_processor: false,
+            enable_strict_thinking: false,
+            disable_radix_cache: false,
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
+            accelerator: None,
+            num_accelerators: 1,
         }
     }
 }
@@ -329,18 +459,23 @@ pub enum DisaggregationMode {
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
-    /// Authoritative HF model type, used to select a native chat formatter.
-    pub model_type: Option<String>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
     /// Bounds client-supplied token ids — return 400s out-of-vocab ids before
     /// they crash the scheduler's embedding lookup.
     pub vocab_size: u64,
+    /// Required width of a client-supplied input embedding row.
+    pub hidden_size: u64,
     /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
     /// in to-scheduler; `false` silently ignores mm fields, as the Python
     /// `TokenizerManager` does with `mm_processor is None`.
     pub is_multimodal: bool,
+    pub is_generation: bool,
+    pub has_image_understanding: bool,
+    pub has_audio_understanding: bool,
+    pub model_type: Option<String>,
+    pub architectures: Option<Vec<String>>,
     /// Resolved default sampling parameters, from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
     /// `--sampling-defaults`: holds the model's generation_config.json values
@@ -353,20 +488,31 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, hidden_size, is_multimodal, is_generation, has_image_understanding, has_audio_understanding, model_type, architectures, default_sampling_params))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
+        hidden_size: u64,
         is_multimodal: bool,
-        default_sampling_params: DefaultSamplingParams,
+        is_generation: bool,
+        has_image_understanding: bool,
+        has_audio_understanding: bool,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
+        default_sampling_params: DefaultSamplingParams,
     ) -> Self {
         Self {
             context_len,
             vocab_size,
+            hidden_size,
             is_multimodal,
-            default_sampling_params,
+            is_generation,
+            has_image_understanding,
+            has_audio_understanding,
             model_type,
+            architectures,
+            default_sampling_params,
         }
     }
 }
@@ -376,9 +522,14 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             context_len: 2048,
-            model_type: None,
             vocab_size: 1000,
+            hidden_size: 4,
             is_multimodal: false,
+            is_generation: true,
+            has_image_understanding: false,
+            has_audio_understanding: false,
+            model_type: None,
+            architectures: None,
             default_sampling_params: DefaultSamplingParams::default(),
         }
     }
@@ -544,6 +695,28 @@ fn join_host_port(host: &str, port: u16) -> String {
 impl ServerArgs {
     /// Fail fast at startup on values the types cannot express.
     pub fn validate(&self) -> Result<(), String> {
+        if self.dp_size == 0
+            || (self.dp_size > 1 && self.dp_rank.is_none())
+            || self
+                .dp_rank
+                .is_some_and(|rank| rank as usize >= self.dp_size)
+        {
+            return Err("invalid frontend DP rank or size".into());
+        }
+        if self.enable_http2 {
+            if self.http2_max_concurrent_streams == 0 {
+                return Err("http2_max_concurrent_streams must be nonzero".into());
+            }
+            if !(1024..(1 << 31)).contains(&self.http2_initial_connection_window_size) {
+                return Err(
+                    "http2_initial_connection_window_size must be between 1024 and 2147483647"
+                        .into(),
+                );
+            }
+        }
+        if self.disaggregation_bootstrap_port == Some(0) {
+            return Err("disaggregation_bootstrap_port must be a nonzero advertised port".into());
+        }
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
         }
@@ -559,14 +732,11 @@ impl ServerArgs {
         self.disaggregation_mode != DisaggregationMode::Null
     }
 
-    /// Serve the PD KV bootstrap registry on the api listener: every prefill
-    /// rust server hosts it, unconditionally — no extra topology gating. KV
-    /// managers and decode nodes reach the registry at the resolved
-    /// `disaggregation_bootstrap_port`, which rust-server mode aliases to the
-    /// api port, so whichever prefill server that port names is the one that
-    /// receives the registrations.
+    /// Only HTTP transfer backends use the embedded bootstrap registry.
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == DisaggregationMode::Prefill
+            && self.disaggregation_bootstrap_port.is_some()
+            && self.dp_rank.unwrap_or(0) == 0
     }
 
     /// Whether the served model is multimodal, from the scheduler's config. See
@@ -623,6 +793,7 @@ mod tests {
     fn pd_role_derivations() {
         let prefill = ServerArgs {
             disaggregation_mode: DisaggregationMode::Prefill,
+            disaggregation_bootstrap_port: Some(8998),
             ..Default::default()
         };
         assert!(prefill.is_disaggregation());
@@ -644,6 +815,22 @@ mod tests {
             ..Default::default()
         };
         assert!(sa.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_http2_settings_fail_before_startup() {
+        for (streams, window) in [(0, 1024), (1, 1023), (1, 1 << 31)] {
+            let mut sa = ServerArgs {
+                served_model_name: "m".into(),
+                enable_http2: true,
+                http2_max_concurrent_streams: streams,
+                http2_initial_connection_window_size: window,
+                ..Default::default()
+            };
+            assert!(sa.validate().is_err());
+            sa.enable_http2 = false;
+            assert!(sa.validate().is_ok());
+        }
     }
 
     /// `--log-level-http` overrides `--log-level` for the access log; unset or

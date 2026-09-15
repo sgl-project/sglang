@@ -1,0 +1,363 @@
+[
+  {
+    "columns": {
+      "cached_tokens": [
+        0,
+        0,
+        0
+      ],
+      "generation_tokens": [
+        9,
+        6,
+        0
+      ],
+      "reasoning_tokens": [
+        0,
+        0,
+        0
+      ],
+      "spec_cap_lens_histogram": [
+        [
+          1,
+          1
+        ],
+        [],
+        []
+      ],
+      "spec_correct_drafts_histogram": [
+        [
+          0,
+          1,
+          1
+        ],
+        [],
+        [
+          1
+        ]
+      ],
+      "spec_num_block_accept_tokens": [
+        7,
+        2,
+        0
+      ],
+      "spec_num_cap_tokens": [
+        8,
+        0,
+        0
+      ],
+      "spec_num_correct_drafts": [
+        5,
+        0,
+        8
+      ],
+      "spec_num_draft_tokens": 4,
+      "spec_ragged_verify_cap_accept": false,
+      "spec_verify_ct": [
+        2,
+        3,
+        0
+      ]
+    },
+    "expected": [
+      {
+        "spec_accept_histogram": [
+          0,
+          1,
+          1
+        ],
+        "spec_accept_length": 4.5,
+        "spec_accept_rate": 0.8333333333333334,
+        "spec_accepted_drafts": 5,
+        "spec_cap_length": 4.0,
+        "spec_cap_lens_histogram": [
+          1,
+          1
+        ],
+        "spec_correct_drafts_histogram": [
+          0,
+          1,
+          1
+        ],
+        "spec_num_correct_drafts": 5,
+        "spec_num_proposed_drafts": 6,
+        "spec_proposed_drafts": 6,
+        "spec_verify_ct": 2
+      },
+      {
+        "spec_accept_length": 2.0,
+        "spec_accept_rate": 0.0,
+        "spec_accepted_drafts": 0,
+        "spec_num_correct_drafts": 0,
+        "spec_num_proposed_drafts": 9,
+        "spec_proposed_drafts": 9,
+        "spec_verify_ct": 3
+      },
+      {}
+    ],
+    "name": "static"
+  },
+  {
+    "columns": {
+      "cached_tokens": [
+        0,
+        0
+      ],
+      "generation_tokens": [
+        13,
+        4
+      ],
+      "reasoning_tokens": [
+        0,
+        0
+      ],
+      "spec_cap_lens_histogram": [
+        [
+          0,
+          0,
+          1,
+          1
+        ],
+        [
+          4
+        ]
+      ],
+      "spec_correct_drafts_histogram": [
+        [
+          0,
+          0,
+          2
+        ],
+        [
+          4
+        ]
+      ],
+      "spec_num_block_accept_tokens": [
+        12,
+        0
+      ],
+      "spec_num_cap_tokens": [
+        14,
+        4
+      ],
+      "spec_num_correct_drafts": [
+        11,
+        0
+      ],
+      "spec_num_draft_tokens": 8,
+      "spec_ragged_verify_cap_accept": true,
+      "spec_verify_ct": [
+        2,
+        4
+      ]
+    },
+    "expected": [
+      {
+        "spec_accept_histogram": [
+          0,
+          0,
+          2
+        ],
+        "spec_accept_length": 6.5,
+        "spec_accept_rate": 0.7857142857142857,
+        "spec_accepted_drafts": 11,
+        "spec_block_accept_length": 6.0,
+        "spec_cap_length": 7.0,
+        "spec_cap_lens_histogram": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "spec_correct_drafts_histogram": [
+          0,
+          0,
+          2
+        ],
+        "spec_num_correct_drafts": 11,
+        "spec_num_proposed_drafts": 14,
+        "spec_proposed_drafts": 14,
+        "spec_verify_ct": 2
+      },
+      {
+        "spec_accept_histogram": [
+          4
+        ],
+        "spec_accept_length": 1.0,
+        "spec_accept_rate": 0.0,
+        "spec_accepted_drafts": 0,
+        "spec_block_accept_length": 0.0,
+        "spec_cap_length": 1.0,
+        "spec_cap_lens_histogram": [
+          4
+        ],
+        "spec_correct_drafts_histogram": [
+          4
+        ],
+        "spec_num_correct_drafts": 0,
+        "spec_num_proposed_drafts": 28,
+        "spec_proposed_drafts": 28,
+        "spec_verify_ct": 4
+      }
+    ],
+    "name": "ragged_cap_accept"
+  },
+  {
+    "columns": {
+      "cached_tokens": [
+        0
+      ],
+      "generation_tokens": [
+        2
+      ],
+      "reasoning_tokens": [
+        0
+      ],
+      "spec_cap_lens_histogram": [
+        [
+          2
+        ]
+      ],
+      "spec_correct_drafts_histogram": [
+        [
+          2
+        ]
+      ],
+      "spec_num_block_accept_tokens": [
+        0
+      ],
+      "spec_num_cap_tokens": [
+        2
+      ],
+      "spec_num_correct_drafts": [
+        0
+      ],
+      "spec_num_draft_tokens": 1,
+      "spec_ragged_verify_cap_accept": true,
+      "spec_verify_ct": [
+        2
+      ]
+    },
+    "expected": [
+      {
+        "spec_accept_histogram": [
+          2
+        ],
+        "spec_cap_lens_histogram": [
+          2
+        ],
+        "spec_correct_drafts_histogram": [
+          2
+        ]
+      }
+    ],
+    "name": "no_proposals"
+  },
+  {
+    "columns": {
+      "cached_tokens": [
+        0
+      ],
+      "generation_tokens": [
+        4
+      ],
+      "reasoning_tokens": [
+        0
+      ],
+      "spec_cap_lens_histogram": [],
+      "spec_correct_drafts_histogram": [
+        [
+          1
+        ]
+      ],
+      "spec_num_block_accept_tokens": [],
+      "spec_num_cap_tokens": [],
+      "spec_num_correct_drafts": [],
+      "spec_num_draft_tokens": 4,
+      "spec_ragged_verify_cap_accept": false,
+      "spec_verify_ct": [
+        1
+      ]
+    },
+    "expected": [
+      {}
+    ],
+    "name": "unreported_correct_counts"
+  },
+  {
+    "columns": {
+      "cached_tokens": [
+        0,
+        0,
+        0
+      ],
+      "generation_tokens": [
+        3,
+        1,
+        2
+      ],
+      "reasoning_tokens": [
+        0,
+        0,
+        0
+      ],
+      "spec_cap_lens_histogram": [],
+      "spec_correct_drafts_histogram": [
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "spec_num_block_accept_tokens": [
+        0
+      ],
+      "spec_num_cap_tokens": [
+        0
+      ],
+      "spec_num_correct_drafts": [
+        2,
+        0
+      ],
+      "spec_num_draft_tokens": 3,
+      "spec_ragged_verify_cap_accept": true,
+      "spec_verify_ct": [
+        1,
+        1,
+        1
+      ]
+    },
+    "expected": [
+      {
+        "spec_accept_histogram": [
+          0,
+          0,
+          1
+        ],
+        "spec_accept_length": 3.0,
+        "spec_accept_rate": 1.0,
+        "spec_accepted_drafts": 2,
+        "spec_block_accept_length": 0.0,
+        "spec_correct_drafts_histogram": [
+          0,
+          0,
+          1
+        ],
+        "spec_num_correct_drafts": 2,
+        "spec_num_proposed_drafts": 2,
+        "spec_proposed_drafts": 2,
+        "spec_verify_ct": 1
+      },
+      {
+        "spec_accept_length": 1.0,
+        "spec_accept_rate": 0.0,
+        "spec_accepted_drafts": 0,
+        "spec_num_correct_drafts": 0,
+        "spec_num_proposed_drafts": 2,
+        "spec_proposed_drafts": 2,
+        "spec_verify_ct": 1
+      },
+      {}
+    ],
+    "name": "partial_optional_columns"
+  }
+]

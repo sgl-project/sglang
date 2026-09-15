@@ -1,0 +1,158 @@
+{
+  "requests": [
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2
+        ]
+      },
+      "expected": [
+        [
+          false,
+          0,
+          false
+        ]
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5
+          ]
+        ],
+        "return_routed_experts": true,
+        "routed_experts_start_len": 2,
+        "return_indexer_topk": true,
+        "sampling_params": {
+          "n": 2
+        },
+        "routed_dp_rank": 3
+      },
+      "expected": [
+        [
+          true,
+          2,
+          true
+        ],
+        [
+          true,
+          2,
+          true
+        ],
+        [
+          true,
+          2,
+          true
+        ],
+        [
+          true,
+          2,
+          true
+        ]
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1
+        ],
+        "return_routed_experts": true,
+        "routed_experts_start_len": -1
+      },
+      "expected": [
+        [
+          true,
+          -1,
+          false
+        ]
+      ]
+    },
+    {
+      "body": {
+        "input_ids": [
+          1,
+          2
+        ],
+        "return_indexer_topk": true,
+        "routed_experts_start_len": 123,
+        "stream": true
+      },
+      "expected": [
+        [
+          false,
+          123,
+          true
+        ]
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "routed_experts": {
+        "values": [
+          [
+            1,
+            2,
+            3
+          ],
+          [
+            4,
+            5,
+            6
+          ]
+        ],
+        "transpose": true
+      },
+      "indexer_topk": {
+        "values": [
+          [
+            -1,
+            0
+          ],
+          [
+            2,
+            999
+          ]
+        ],
+        "transpose": false
+      },
+      "expected": {
+        "routed_experts": "AQAAAAQAAAACAAAABQAAAAMAAAAGAAAA",
+        "indexer_topk": "/////wAAAAACAAAA5wMAAA=="
+      }
+    },
+    {
+      "routed_experts": null,
+      "indexer_topk": {
+        "values": [],
+        "transpose": false
+      },
+      "expected": {
+        "indexer_topk": ""
+      }
+    },
+    {
+      "routed_experts": {
+        "values": [],
+        "transpose": false
+      },
+      "indexer_topk": null,
+      "expected": {
+        "routed_experts": ""
+      }
+    },
+    {
+      "routed_experts": null,
+      "indexer_topk": null,
+      "expected": {}
+    }
+  ]
+}

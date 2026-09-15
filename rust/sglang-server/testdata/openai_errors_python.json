@@ -1,0 +1,100 @@
+[
+  {
+    "endpoint": "completions",
+    "late": false,
+    "body": {
+      "model": "org/model",
+      "stream": true,
+      "prompt": [
+        1,
+        2
+      ]
+    },
+    "status": 400,
+    "error": {
+      "object": "error",
+      "message": "validation failed: bad input",
+      "type": "BadRequestError",
+      "param": null,
+      "code": 400
+    }
+  },
+  {
+    "endpoint": "completions",
+    "late": true,
+    "body": {
+      "model": "org/model",
+      "stream": true,
+      "prompt": [
+        1,
+        2
+      ]
+    },
+    "status": 200,
+    "error": {
+      "error": {
+        "object": "error",
+        "message": "validation failed: bad input",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+      }
+    }
+  },
+  {
+    "endpoint": "chat",
+    "late": false,
+    "body": {
+      "model": "org/model",
+      "stream": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "input_ids": [
+        1,
+        2
+      ],
+      "tool_choice": "none"
+    },
+    "status": 400,
+    "error": {
+      "object": "error",
+      "message": "validation failed: bad input",
+      "type": "BadRequestError",
+      "param": null,
+      "code": 400
+    }
+  },
+  {
+    "endpoint": "chat",
+    "late": true,
+    "body": {
+      "model": "org/model",
+      "stream": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "input_ids": [
+        1,
+        2
+      ],
+      "tool_choice": "none"
+    },
+    "status": 200,
+    "error": {
+      "error": {
+        "object": "error",
+        "message": "validation failed: bad input",
+        "type": "BadRequestError",
+        "param": null,
+        "code": 400
+      }
+    }
+  }
+]

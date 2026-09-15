@@ -156,6 +156,13 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        if req.positional_embed_overrides is not None:
+            # Keep chunk progress in the request's own row without publishing
+            # embedding-dependent KV under a token-only radix key. These slots
+            # stay request-owned (cache_protected_len remains unchanged).
+            req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : req.extend_range.end
+            ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

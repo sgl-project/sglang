@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
+    INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
     BaseFinishReason,
     Req,
 )
@@ -330,6 +331,7 @@ class _GenerationStreamAccumulator:
     decoded_texts: list = field(default_factory=list)
     decode_ids_list: list = field(default_factory=list)
     read_offsets: list = field(default_factory=list)
+    rust_prompt_contexts: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
     skip_special_tokens: list = field(default_factory=list)
     spaces_between_special_tokens: list = field(default_factory=list)
@@ -379,8 +381,8 @@ class _GenerationStreamAccumulator:
     output_token_sampling_mask: Optional[list] = None
     output_token_sampling_logprobs: Optional[list] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
-    # output tokens itself and never consumes the scheduler's incremental-detok
-    # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+    # output tokens itself. Only the first chunk needs a bounded prompt tail;
+    # Python's incremental-detok offsets are not maintained on this path.
     rust_server_mode: bool = False
 
     def __post_init__(self) -> None:
@@ -436,14 +438,14 @@ class _GenerationStreamAccumulator:
                     if stream_interval > 1
                     else len(req.output_ids) % stream_interval == 0
                 )
-
-                if should_output:
-                    # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
-                    should_output &= not req.check_match_stop_str_prefix()
             else:
                 should_output = (
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
+            # Forced updates for unary requests also reach the incremental
+            # detokenizer, which cannot retract an already emitted stop prefix.
+            if should_output:
+                should_output = not req.check_match_stop_str_prefix()
 
         if not should_output:
             return
@@ -467,14 +469,30 @@ class _GenerationStreamAccumulator:
         )
         self.beam_search_output.append(beam_output)
 
-        if not self.rust_server_mode:
-            # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics)
-            # or gets pickled into the payload (time_stats). The Rust server
-            # replaces those stages and builds its own metadata from the
-            # ChunkEvent, so `push_generation` never reads these — skip the whole
-            # block. The parallel lists stay empty; the payload goes straight to
-            # `push_generation`, which only indexes the fields appended above.
+        # These describe scheduler work, which the frontend cannot reconstruct
+        # from output tokens (in particular HiCache hits and reasoning spans).
+        self.reasoning_tokens.append(req.reasoning_tokens)
+        self.cached_tokens.append(req.cached_tokens)
+        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        self.completion_tokens.append(
+            beam_completion_tokens(beam_output)
+            if beam_output is not None
+            else len(output_ids_)
+        )
+
+        if self.rust_server_mode:
+            self.rust_prompt_contexts.append(
+                list(
+                    req.origin_input_ids_unpadded[
+                        -INIT_INCREMENTAL_DETOKENIZATION_OFFSET:
+                    ]
+                )
+                if send_token_offset == 0
+                else []
+            )
+        else:
+            # Rust detokenizes the raw output-token deltas itself, so only the
+            # Python frontend needs this incremental-decoder bookkeeping.
             self.http_worker_ipcs.append(req.http_worker_ipc)
             self.decoded_texts.append(req.decoded_text)
             decode_ids, read_offset = req.init_incremental_detokenize()
@@ -486,16 +504,6 @@ class _GenerationStreamAccumulator:
                 req.sampling_params.spaces_between_special_tokens
             )
             self.no_stop_trim.append(req.sampling_params.no_stop_trim)
-            self.reasoning_tokens.append(req.reasoning_tokens)
-            self.completion_tokens.append(
-                beam_completion_tokens(beam_output)
-                if beam_output is not None
-                else len(output_ids_)
-            )
-            self.cached_tokens.append(req.cached_tokens)
-
-            # Collect detailed cache breakdown if available
-            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -640,8 +648,8 @@ class _GenerationStreamAccumulator:
                 )
                 req.send_output_sampling_mask_offset = sampling_mask_end
             else:
-                self.output_token_sampling_mask.append([])
-                self.output_token_sampling_logprobs.append([])
+                self.output_token_sampling_mask.append(None)
+                self.output_token_sampling_logprobs.append(None)
 
         if self.return_hidden_states:
             if req.return_hidden_states:
@@ -702,11 +710,16 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
+            time_stats=(
+                self.time_stats
+                if self.rust_server_mode
+                else wrap_as_pickle(self.time_stats)
+            ),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
             read_offsets=self.read_offsets,
+            rust_prompt_contexts=self.rust_prompt_contexts or None,
             output_ids=self.output_ids,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
@@ -755,7 +768,13 @@ class _GenerationStreamAccumulator:
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
             customized_info=(
-                wrap_as_pickle(self.customized_info) if self.customized_info else None
+                (
+                    self.customized_info
+                    if self.rust_server_mode
+                    else wrap_as_pickle(self.customized_info)
+                )
+                if self.customized_info
+                else None
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
