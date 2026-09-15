@@ -103,21 +103,17 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
-        # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
-        # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
-        # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
-        # at startup with a clear message instead. Remove once unified-KV HiSparse lands.
+        # bf16 unified-KV HiSparse is wired (shrunk C4 device region + host
+        # mirror). fp8 is a two-buffer layout and still needs its own adapter.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
+            is_unified_kv_fp8,
         )
 
-        if is_unified_kv_triton():
+        if is_unified_kv_fp8():
             raise ValueError(
-                "--enable-hisparse is not supported with the unified-KV path on ROCm"
-                "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton) for DeepSeek-V4: "
-                "HiSparse currently requires the separate packed KV layout. "
-                "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
-                "--enable-hisparse."
+                "--enable-hisparse is not supported with unified-KV fp8 on ROCm "
+                "(SGLANG_DSV4_UNIFIED_KV_FP8=1). Unset that env to use bf16 "
+                "unified-KV HiSparse, or run without --enable-hisparse."
             )
         return
 

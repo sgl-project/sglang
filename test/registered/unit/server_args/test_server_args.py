@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
 )
@@ -1055,6 +1056,45 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             validate_hisparse_kv_cache_dtype(server_args)
+
+
+class TestHiSparseUnifiedKvFp8Guard(unittest.TestCase):
+    """ROCm DSv4 HiSparse is wired for bf16 unified-KV only; fp8 is refused."""
+
+    def _v4_hisparse_args(self):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+        return args
+
+    @override_platform(is_hip=True)
+    def test_rejects_unified_kv_fp8(self):
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_fp8",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"SGLANG_DSV4_UNIFIED_KV_FP8"):
+                validate_hisparse(self._v4_hisparse_args())
+
+    @override_platform(is_hip=True)
+    def test_accepts_unified_kv_bf16(self):
+        # bf16 unified-KV HiSparse is allowed; only fp8 is refused.
+        with (
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_fp8",
+                return_value=False,
+            ),
+        ):
+            validate_hisparse(self._v4_hisparse_args())
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
