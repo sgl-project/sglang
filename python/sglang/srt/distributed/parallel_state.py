@@ -3109,8 +3109,6 @@ def abort_distributed_environment() -> None:
     ``destroy_process_group`` is collective and blocks when a peer is gone,
     which on a shutdown path is the common case.
     """
-    if envs.SGLANG_DISABLE_SHUTDOWN_NCCL_ABORT.get():
-        return
     if not torch.distributed.is_initialized():
         return
     abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
