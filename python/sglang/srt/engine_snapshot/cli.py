@@ -3,6 +3,9 @@
 """The `sglang snapshot` command surface: argument declarations and dispatch."""
 
 import argparse
+import json
+
+import msgspec
 
 from sglang.srt.engine_snapshot.errors import SnapshotUsageError
 
@@ -28,14 +31,14 @@ def _port(value):
 
 
 def add_cli_args(parser):
-    """Declare the `create` and `restore` subcommands on `parser`."""
+    """Declare the `create`, `restore` and `inspect` subcommands on `parser`."""
     commands = parser.add_subparsers(dest="action", required=True)
 
     create = commands.add_parser(
         "create", help="Initialize an engine and checkpoint it into an artifact."
     )
     create.add_argument(
-        "--output",
+        "--artifact",
         required=True,
         help="Artifact directory to create; it must not exist yet.",
     )
@@ -78,11 +81,27 @@ def add_cli_args(parser):
         help="Listen port to use instead of the captured one.",
     )
 
+    inspect = commands.add_parser(
+        "inspect",
+        help="Report what an artifact contains and whether this host can restore it.",
+    )
+    inspect.add_argument(
+        "--artifact",
+        required=True,
+        help="Artifact directory produced by `create`.",
+    )
+    inspect.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the report as JSON.",
+    )
+
 
 def execute(options):
     """Run the selected snapshot action and return the process exit code."""
     from sglang.srt.engine_snapshot.controller import (
         create_snapshot,
+        inspect_snapshot,
         restore_snapshot,
     )
 
@@ -92,9 +111,10 @@ def execute(options):
             argv = argv[1:]
         if not argv:
             raise SnapshotUsageError("create requires server arguments after --")
-        create_snapshot(options.output, argv, options.timeout)
-        print(f"Snapshot created: {options.output}")
-    elif options.action == "restore":
+        create_snapshot(options.artifact, argv, options.timeout)
+        print(f"Snapshot created: {options.artifact}")
+        return 0
+    if options.action == "restore":
         outcome = restore_snapshot(
             options.artifact, options.timeout, host=options.host, port=options.port
         )
@@ -102,4 +122,45 @@ def execute(options):
             f"Engine restored: pid={outcome.root_pid} "
             f"address={outcome.host}:{outcome.port}"
         )
-    return 0
+        return 0
+    if options.action == "inspect":
+        manifest, checks = inspect_snapshot(options.artifact)
+        if options.json:
+            print(
+                json.dumps(
+                    {
+                        "manifest": msgspec.to_builtins(manifest),
+                        "checks": checks,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            _print_report(manifest, checks)
+        return 0 if checks["identity"] == "match" else 1
+    raise SnapshotUsageError(f"unsupported snapshot action: {options.action}")
+
+
+def _print_report(manifest, checks):
+    fields = (
+        ("artifact", manifest.artifact_path),
+        ("format", manifest.format),
+        ("created", manifest.created_at),
+        ("model", manifest.model_path),
+        ("engine", f"{manifest.host}:{manifest.port}"),
+        ("gpu", f"{manifest.identity.gpu_name} {manifest.identity.gpu_uuid}"),
+        (
+            "process",
+            f"root_pid={manifest.root_pid} pids={len(manifest.pids)} "
+            f"cuda={len(manifest.cuda_pids)}",
+        ),
+        ("canary", f"token {manifest.canary.token_id}"),
+        ("files", f"{len(manifest.files)} carried, {len(manifest.dev_shm)} /dev/shm"),
+        ("bytes", manifest.artifact_bytes),
+        ("identity", checks["identity"]),
+        ("pids", "free" if not checks["occupied_pids"] else checks["occupied_pids"]),
+        ("address", checks["listen_address"]),
+    )
+    width = max(len(name) for name, _ in fields)
+    for name, value in fields:
+        print(f"{name:>{width}}  {value}")
