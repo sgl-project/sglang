@@ -2178,17 +2178,18 @@ class MHATokenToKVPool(KVCache):
         has_v_workspace = self.dq_v_buffer is not None
         has_k_native_scales = self.native_k_scale_buffer is not None
         has_v_native_scales = self.native_v_scale_buffer is not None
+        requires_native_scales = (
+            self.quant_method.needs_native_fp4_scales()
+            if hasattr(self.quant_method, "needs_native_fp4_scales")
+            else False
+        )
         if has_k_native_scales != has_v_native_scales:
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} created only one "
                 "native FP4 scale buffer."
             )
-        if self.quant_method.needs_native_fp4_scales() != has_k_native_scales:
-            expectation = (
-                "requires"
-                if self.quant_method.needs_native_fp4_scales()
-                else "does not require"
-            )
+        if requires_native_scales != has_k_native_scales:
+            expectation = "requires" if requires_native_scales else "does not require"
             raise RuntimeError(
                 f"KV cache method {self.quant_method.name!r} {expectation} native "
                 f"FP4 scales, but buffer presence is {has_k_native_scales}."
@@ -2710,6 +2711,12 @@ class MHATokenToKVPool(KVCache):
         loc, _, _ = unwrap_write_loc(loc_info)
         local_layer_id = layer_id - self.start_layer
         k_scale, v_scale = self._quantized_scales(global_layer_id, k_scale, v_scale)
+        native_scale_kwargs = {}
+        if self.native_k_scale_buffer is not None:
+            native_scale_kwargs = {
+                "native_k_scale_buffer": self.native_k_scale_buffer[local_layer_id],
+                "native_v_scale_buffer": self.native_v_scale_buffer[local_layer_id],
+            }
         self.quant_method.quantize_and_store(
             self.k_buffer[local_layer_id],
             self.v_buffer[local_layer_id],
@@ -2728,16 +2735,7 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_scale,
             v_scale,
-            native_k_scale_buffer=(
-                self.native_k_scale_buffer[local_layer_id]
-                if self.native_k_scale_buffer is not None
-                else None
-            ),
-            native_v_scale_buffer=(
-                self.native_v_scale_buffer[local_layer_id]
-                if self.native_v_scale_buffer is not None
-                else None
-            ),
+            **native_scale_kwargs,
         )
 
     def get_raw_kv_buffer(
