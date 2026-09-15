@@ -38,7 +38,9 @@ use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{
     ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
 };
-use crate::server::metrics::{MetricsRegistry, PolicySelectionFailureReason};
+use crate::server::metrics::{
+    DecodeAffinityOutcome, MetricsRegistry, PolicySelectionFailureReason,
+};
 use crate::workers::Worker;
 
 /// Everything one prefill selection reads. Collaborators first, then the
@@ -438,6 +440,10 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     /// without one the ladder reports no peer at all rather than picking one
     /// blind.
     pub load_snapshot: Option<&'a EngineLoadSnapshot>,
+    /// Metrics sink for `sgl_router_decode_affinity_total`. `None` in unit
+    /// tests that don't assert on metrics; the production route passes the
+    /// shared registry.
+    pub metrics: Option<&'a MetricsRegistry>,
 }
 
 /// Runs the decode selection ladder.
@@ -499,16 +505,34 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
             load_snapshot_version = decode_decision.load_snapshot_version,
             "decode policy decision",
         );
-        Some(decode_decision.selected)
+        // Only `legacy_host_affinity` tags its proposal with an affinity
+        // outcome. When admission overrode the affinity pick (capacity
+        // fallback), the affinity was not honored — the honest label is a
+        // load fallback, not the branch the proposal took.
+        let affinity_outcome = decode_proposal.decode_affinity_outcome.map(|outcome| {
+            if decode_decision.selected.id == decode_proposal.primary.id {
+                outcome
+            } else {
+                DecodeAffinityOutcome::FallbackLoadImbalance
+            }
+        });
+        Some((decode_decision.selected, affinity_outcome))
     };
-    decode_domains
+    let (selected, affinity_outcome) = decode_domains
         .iter()
         .find_map(|domain| select_in_domain(domain, false))
         .or_else(|| {
             decode_domains
                 .iter()
                 .find_map(|domain| select_in_domain(domain, true))
-        })
+        })?;
+    // Exactly one bump per successful PD decode selection (issue #32752).
+    // Failed selections return `None` above and record nothing; plain-mode
+    // requests never reach this ladder.
+    if let (Some(metrics), Some(outcome)) = (inputs.metrics, affinity_outcome) {
+        metrics.record_decode_affinity(outcome);
+    }
+    Some(selected)
 }
 
 /// Project the peak sequence length without integer wraparound.
@@ -623,6 +647,7 @@ mod tests {
             ttft_slo_ms: None,
             tps_slo: None,
             load_snapshot,
+            metrics: None,
         }
     }
 
@@ -752,6 +777,105 @@ mod tests {
             select_decode_peer(&decode_inputs(&buckets, &model, &workers, Some(&loads), 64))
                 .expect("the capacity fallback must still place the decode peer");
         assert!(selected.id == full.id || selected.id == also_full.id);
+    }
+
+    /// Builds legacy-host-affinity decode inputs with a metrics sink —
+    /// the production shape of the #32752 fix.
+    fn legacy_affinity_inputs<'a>(
+        bucket_selector: &'a BucketSelector,
+        metrics: &'a MetricsRegistry,
+        model_id: &'a ModelId,
+        decode_workers: &'a [Arc<Worker>],
+        load_snapshot: Option<&'a EngineLoadSnapshot>,
+    ) -> DecodeSelectionInputs<'a> {
+        DecodeSelectionInputs {
+            decode_policy_kind: DecodePolicyKind::LegacyHostAffinity,
+            bucket_selector,
+            model_id,
+            prefill_url: "http://prefill:30000",
+            decode_workers,
+            request_input_tokens: 64,
+            requested_max_output_tokens: None,
+            ttft_slo_ms: None,
+            tps_slo: None,
+            load_snapshot,
+            metrics: Some(metrics),
+        }
+    }
+
+    /// #32752: a successful `legacy_host_affinity` decode selection
+    /// records exactly one `sgl_router_decode_affinity_total` outcome on
+    /// the production ladder — here the same-host branch (`worker
+    /// "prefill"` shares its host with the prefill URL).
+    #[test]
+    fn legacy_affinity_decode_selection_records_the_affinity_metric() {
+        let same_host = worker("prefill");
+        let remote = worker("remote");
+        let workers = vec![Arc::clone(&same_host), Arc::clone(&remote)];
+        let loads = snapshot(&[(&same_host, 0, 100_000), (&remote, 0, 100_000)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let metrics = MetricsRegistry::new();
+
+        let selected = select_decode_peer(&legacy_affinity_inputs(
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+        ))
+        .expect("a healthy same-host peer must route");
+        assert_eq!(selected.id, same_host.id);
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_decode_affinity_total{outcome="same_host_picked"} 1"#),
+            "metrics: {rendered}",
+        );
+    }
+
+    /// #32752: a selection that fails (no load snapshot → no peer) must
+    /// not record an affinity outcome.
+    #[test]
+    fn failed_decode_selection_records_no_affinity_outcome() {
+        let peer = worker("decode");
+        let workers = vec![Arc::clone(&peer)];
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let metrics = MetricsRegistry::new();
+
+        assert!(select_decode_peer(&legacy_affinity_inputs(
+            &buckets, &metrics, &model, &workers, None,
+        ))
+        .is_none());
+        assert!(
+            !metrics
+                .render()
+                .contains("sgl_router_decode_affinity_total{"),
+            "a failed selection must not bump the affinity counter",
+        );
+    }
+
+    /// The metric is scoped to `select_decode_with_affinity` — the
+    /// power-of-two decode policy must not emit it even with a metrics
+    /// sink attached.
+    #[test]
+    fn power_of_two_decode_selection_records_no_affinity_outcome() {
+        let peer = worker("decode");
+        let workers = vec![Arc::clone(&peer)];
+        let loads = snapshot(&[(&peer, 0, 100_000)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let metrics = MetricsRegistry::new();
+
+        let mut inputs = decode_inputs(&buckets, &model, &workers, Some(&loads), 64);
+        inputs.metrics = Some(&metrics);
+        assert!(select_decode_peer(&inputs).is_some());
+        assert!(
+            !metrics
+                .render()
+                .contains("sgl_router_decode_affinity_total{"),
+            "power-of-two selections must not emit affinity outcomes",
+        );
     }
 
     #[test]

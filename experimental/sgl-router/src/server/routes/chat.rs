@@ -340,6 +340,7 @@ pub async fn chat_completions(
                 ttft_slo_ms,
                 tps_slo,
                 load_snapshot: load_snapshot.as_ref(),
+                metrics: Some(ctx.metrics.as_ref()),
             })
             .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
                 model: model_str.clone(),
