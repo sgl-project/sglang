@@ -1718,7 +1718,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -1773,7 +1773,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
 
@@ -2128,7 +2128,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")

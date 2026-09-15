@@ -1,11 +1,12 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -30,7 +31,7 @@ def _weather_call(city: str = "SF") -> str:
     return _wrapped(_invoke("get_weather", _param("city", "true", city)))
 
 
-class TestDeepSeekV4Streaming(CustomTestCase):
+class TestDeepSeekV4Streaming(unittest.TestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -83,16 +84,135 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
         self.assertNotIn(DSML, normal)
 
-    def test_malformed_partial_json_falls_back_to_raw_value(self):
-        """A partial non-string parameter must not escape as MalformedJSON."""
+    def test_streaming_waits_for_complete_invoke(self):
         detector = DeepSeekV4Detector()
-        result = detector.parse_streaming_increment(
+        partial = detector.parse_streaming_increment(
             f'<{DSML}tool_calls>\n<{DSML}invoke name="get_weather">\n'
             f'<{DSML}parameter name="city" string="false">{{"a"',
             self.tools,
         )
 
-        self.assertEqual([c.name for c in result.calls if c.name], ["get_weather"])
+        self.assertEqual(partial.calls, [])
+
+        complete = detector.parse_streaming_increment(
+            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>",
+            self.tools,
+        )
+        self.assertEqual(len(complete.calls), 1)
+        self.assertEqual(complete.calls[0].name, "get_weather")
+        self.assertEqual(complete.calls[0].parameters, '{"city": "{\\"a\\""}')
+        self.assertEqual(
+            detector.prev_tool_call_arr,
+            [{"name": "get_weather", "arguments": complete.calls[0].parameters}],
+        )
+        self.assertEqual(
+            detector.streamed_args_for_tool, [complete.calls[0].parameters]
+        )
+
+    def test_streaming_matches_complete_parse_at_every_chunk_width(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="create_tasks",
+                    description="Create tasks",
+                    parameters={
+                        "type": "object",
+                        "properties": {"tasks": {"type": "array"}},
+                    },
+                ),
+            )
+        ]
+        values = (
+            '[{"description":"first","priority":"medium"}]',
+            '[{"description":"unterminated,"priority":"medium"}]',
+            "[{]",
+            "[}",
+        )
+
+        for value in values:
+            text = _wrapped(_invoke("create_tasks", _param("tasks", "false", value)))
+            expected = DeepSeekV4Detector().detect_and_parse(text, tools).calls[0]
+            for width in range(1, len(text) + 1):
+                with self.subTest(value=value, width=width):
+                    chunks = [
+                        text[index : index + width]
+                        for index in range(0, len(text), width)
+                    ]
+                    normal, calls = self._feed_with_tools(chunks, tools)
+
+                    self.assertEqual(normal.strip(), "")
+                    self.assertNotIn(DSML, normal)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0].name, "create_tasks")
+                    self.assertEqual(calls[0].parameters, expected.parameters)
+
+    def test_complete_invoke_emits_name_and_arguments_together(self):
+        text = _weather_call()
+
+        _, calls = self._feed([text[:-1], text[-1:]])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(calls[0].parameters, '{"city": "SF"}')
+
+    def test_multiple_invokes_emit_one_complete_item_each(self):
+        text = _wrapped(
+            _invoke("get_weather", _param("city", "true", "SF"))
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        _, calls = self._feed([text])
+
+        self.assertEqual(
+            [(call.tool_index, call.name, call.parameters) for call in calls],
+            [
+                (0, "get_weather", '{"city": "SF"}'),
+                (1, "get_weather", '{"city": "NY"}'),
+            ],
+        )
+
+    def test_closed_invoke_rejects_incomplete_parameter(self):
+        text = _wrapped(
+            _invoke(
+                "get_weather",
+                f'<{DSML}parameter name="city" string="true">SF',
+            )
+        )
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual(calls, [])
+        self.assertIn(DSML, normal)
+
+    def test_closed_invoke_rejects_malformed_direct_json(self):
+        text = _wrapped(_invoke("get_weather", '{"city": }'))
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual(calls, [])
+        self.assertIn(DSML, normal)
+
+    def test_stream_end_drops_incomplete_invoke(self):
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        normal, calls = parser.parse_stream_chunk(
+            "Checking.\n\n"
+            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="true">SF'
+        )
+
+        self.assertEqual((normal, calls), ("", []))
+        self.assertEqual(parser.parse_stream_end(), ("Checking.", []))
+
+    def _feed_with_tools(self, chunks, tools):
+        detector = DeepSeekV4Detector()
+        normal, calls = "", []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            normal += result.normal_text
+            calls.extend(result.calls)
+        return normal, calls
 
     def test_non_streaming_parses_every_tool_calls_section(self):
         """A turn with two tool_calls sections must yield both calls."""
@@ -124,6 +244,4 @@ class TestDeepSeekV4Streaming(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
