@@ -10,8 +10,12 @@ or processes carrying the artifact's marker.
 """
 
 import os
+import re
+import select
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -64,6 +68,7 @@ def _cache_root_prefixes():
 
 _CACHE_ROOT_PREFIXES = _cache_root_prefixes()
 _ALIVE_POLL_SECONDS = 0.05
+_CLEANUP_GRACE_SECONDS = 0.5
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 
@@ -271,12 +276,15 @@ class SnapshotRuntime:
         return name, driver
 
     def _tool_version(self, command):
+        """Version banner of an external tool, recorded in the identity."""
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            return "unknown"
+        except (OSError, subprocess.SubprocessError) as error:
+            raise SnapshotRuntimeFailure(f"cannot run {command[0]}: {error}") from error
         output = (result.stdout or result.stderr).strip().splitlines()
-        return output[0] if output else "unknown"
+        if not output:
+            raise SnapshotRuntimeFailure(f"{command[0]} reported no version")
+        return output[0]
 
     # ------------------------------------------------------------------ #
     # process tree
@@ -291,7 +299,13 @@ class SnapshotRuntime:
         return [pid] + [child.pid for child in children]
 
     def cuda_holders(self, pids):
-        """Return the captured pids that hold GPU memory, and that GPU's UUID."""
+        """Return the captured pids that hold GPU state, and that GPU's UUID.
+
+        ``nvidia-smi`` reports the processes with a compute context, but a
+        process that only opened the device still maps ``/dev/nvidia*``; CRIU
+        refuses to dump that mapping unless ``cuda-checkpoint`` handled the
+        process as well, so both views are unioned.
+        """
         rows = self._capture(
             [
                 self.nvidia_smi,
@@ -321,13 +335,26 @@ class SnapshotRuntime:
             raise SnapshotRuntimeFailure(
                 f"engine tree uses {len(uuids)} GPUs; exactly one is supported"
             )
+        holders.update(
+            pid
+            for pid in pids
+            if any("nvidia" in path for path in self._mapped_paths(pid))
+        )
         return sorted(holders), uuids.pop()
 
     def alive(self, pid):
+        """Whether ``pid`` is a live, non-zombie process.
+
+        Callers use this to conclude that a process tree is gone, so only a
+        missing process counts as dead: a status that cannot be read is an
+        error, not evidence of death.
+        """
         try:
             return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
-        except psutil.Error:
+        except psutil.NoSuchProcess:
             return False
+        except psutil.Error as error:
+            raise SnapshotRuntimeFailure(f"cannot read the status of {pid}") from error
 
     def descriptor_targets(self, pid):
         """Every target the process has open as a descriptor."""
@@ -341,15 +368,26 @@ class SnapshotRuntime:
         for descriptor in descriptors:
             try:
                 targets.append(os.readlink(descriptor))
-            except (FileNotFoundError, PermissionError):
+            except FileNotFoundError:
+                # Closed while it was being read; it is gone either way.
                 continue
+            except PermissionError as error:
+                raise SnapshotRuntimeFailure(
+                    f"cannot read descriptor {descriptor} of {pid}"
+                ) from error
         return targets
 
     def _mapped_paths(self, pid):
         try:
             lines = Path(f"/proc/{pid}/maps").read_text().splitlines()
-        except (FileNotFoundError, PermissionError):
-            return []
+        except FileNotFoundError as error:
+            raise SnapshotRuntimeFailure(
+                f"engine process {pid} exited during inventory"
+            ) from error
+        except PermissionError as error:
+            raise SnapshotRuntimeFailure(
+                f"cannot read the mappings of {pid}"
+            ) from error
         paths = []
         for line in lines:
             fields = line.split(None, 5)
@@ -384,6 +422,10 @@ class SnapshotRuntime:
             if target.startswith(_CACHE_ROOT_PREFIXES):
                 escapes.add(target)
         return sorted(escapes)
+
+    def occupied_pids(self, pids):
+        """Captured PIDs that a restore would have to reuse."""
+        return [pid for pid in pids if Path(f"/proc/{pid}").exists()]
 
     # ------------------------------------------------------------------ #
     # cleanup
@@ -433,6 +475,138 @@ class SnapshotRuntime:
                 )
             time.sleep(_ALIVE_POLL_SECONDS)
 
+    def _pidfd_exited(self, pidfd):
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        return bool(poller.poll(0))
+
+    def _process_state(self, pid):
+        """Return (ppid, process group, session, start time) for a PID."""
+        try:
+            stat_fields = Path(f"/proc/{pid}/stat").read_text()
+        except OSError as error:
+            raise SnapshotRuntimeFailure(
+                f"cannot read process state of {pid}"
+            ) from error
+        end = stat_fields.rfind(")")
+        fields = stat_fields[end + 2 :].split()
+        if end < 0 or len(fields) < 20:
+            raise SnapshotRuntimeFailure(f"invalid process state for PID {pid}")
+        return tuple(int(fields[index]) for index in (1, 2, 3, 19))
+
+    def _session_pids(self, session):
+        """Every PID in ``session``.
+
+        The result is compared against the captured process tree, so a PID that
+        is present in /proc but cannot be read is an error, not a member to
+        skip.
+        """
+        pids = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            if not Path(f"/proc/{pid}").exists():
+                continue
+            if self._process_state(pid)[2] == session:
+                pids.append(pid)
+        return pids
+
+    def _process_command(self, pid):
+        try:
+            payload = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError as error:
+            raise SnapshotRuntimeFailure(
+                f"cannot read the command line of {pid}"
+            ) from error
+        return tuple(
+            os.fsdecode(argument) for argument in payload.split(b"\0") if argument
+        )
+
+    def pin_restored_tree(self, root_pid, pids):
+        """Take ownership of a restored tree, or refuse to signal it later.
+
+        The tree is only ours if every captured PID is alive, the artifact_path is the
+        session and process-group leader, its command line is this snapshot's
+        entry module, and no process joined or left the session meanwhile.
+        """
+        if root_pid in self._restored:
+            raise SnapshotRuntimeFailure(f"restored tree {root_pid} is already pinned")
+        handles = []
+        try:
+            for pid in pids:
+                try:
+                    handles.append((pid, os.pidfd_open(pid)))
+                except OSError as error:
+                    raise SnapshotRuntimeFailure(
+                        f"restored process {pid} is not available"
+                    ) from error
+            if any(self._pidfd_exited(pidfd) for _pid, pidfd in handles):
+                raise SnapshotRuntimeFailure("a restored process exited during pinning")
+            state = self._process_state(root_pid)
+            if state[1] != root_pid or state[2] != root_pid:
+                raise SnapshotRuntimeFailure(
+                    "restored root process is not the session and process-group leader"
+                )
+            command = self._process_command(root_pid)
+            if not any(
+                command[index : index + 2] == ("-m", _ENGINE_MODULE)
+                for index in range(len(command) - 1)
+            ):
+                raise SnapshotRuntimeFailure(
+                    "restored root process command does not match the snapshot barrier"
+                )
+            session = self._session_pids(root_pid)
+            if sorted(session) != sorted(pids):
+                raise SnapshotRuntimeFailure(
+                    "restored session does not match the captured process tree"
+                )
+            if any(self._pidfd_exited(pidfd) for _pid, pidfd in handles):
+                raise SnapshotRuntimeFailure("a restored process exited during pinning")
+        except BaseException:
+            for _pid, pidfd in handles:
+                os.close(pidfd)
+            raise
+        self._restored[root_pid] = tuple(handles)
+
+    def cleanup_restored(self, root_pid):
+        """Stop a pinned restored tree and release its process handles."""
+        handles = self._restored.pop(root_pid, None)
+        if handles is not None:
+            signal_pid = signal.pidfd_send_signal
+            for _pid, pidfd in handles:
+                try:
+                    signal_pid(pidfd, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            time.sleep(min(_CLEANUP_GRACE_SECONDS, _CLEANUP_TIMEOUT_SECONDS))
+            for _pid, pidfd in handles:
+                try:
+                    signal_pid(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+            pending = [pidfd for _pid, pidfd in handles]
+            while pending:
+                pending = [pidfd for pidfd in pending if not self._pidfd_exited(pidfd)]
+                if not pending:
+                    break
+                if time.monotonic() >= deadline:
+                    raise SnapshotRuntimeFailure(
+                        f"restored process cleanup is incomplete: {root_pid}"
+                    )
+                time.sleep(_ALIVE_POLL_SECONDS)
+            for _pid, pidfd in handles:
+                os.close(pidfd)
+
+    def complete_restore(self, root_pid):
+        """Commit the restore transaction and release its process handles."""
+        handles = self._restored.pop(root_pid, None)
+        if handles is None:
+            raise SnapshotRuntimeFailure("no pinned restore transaction to complete")
+        for _pid, pidfd in handles:
+            os.close(pidfd)
+
     # ------------------------------------------------------------------ #
     # cuda-checkpoint
     # ------------------------------------------------------------------ #
@@ -468,6 +642,47 @@ class SnapshotRuntime:
             env=dict(os.environ, SGLANG_SNAPSHOT_DIR=str(artifact_path)),
         )
 
+    def restore_process_tree(self, artifact_path, work, pidfile, streams, timeout):
+        # The captured streams are remapped onto the caller's descriptors, so
+        # the restored engine logs where this command logs.
+        inherit = [
+            argument
+            for resource, fd in streams
+            for argument in ("--inherit-fd", f"fd[{fd}]:{resource}")
+        ]
+        self._run(
+            [
+                self.criu,
+                "restore",
+                "--images-dir",
+                str(artifact_path / "images"),
+                "--work-dir",
+                str(work),
+                *self.CRIU_ARGS,
+                "--restore-detached",
+                "--pidfile",
+                str(pidfile),
+                *inherit,
+                "-o",
+                "restore.log",
+                "-v4",
+            ],
+            work / "command.log",
+            timeout,
+            pass_fds=tuple(fd for _resource, fd in streams),
+            env=dict(os.environ, SGLANG_SNAPSHOT_DIR=str(artifact_path)),
+        )
+
+    def _read_restored_pid(self, pidfile):
+        try:
+            payload = pidfile.read_text()
+        except OSError as error:
+            raise SnapshotRuntimeFailure("restored PID file is missing") from error
+        match = re.fullmatch(r"([1-9][0-9]{0,9})\n?", payload)
+        if match is None or int(match.group(1)) > 2**31 - 1:
+            raise SnapshotRuntimeFailure("restored PID file is invalid")
+        return int(match.group(1))
+
     # ------------------------------------------------------------------ #
     # artifact runtime files
     # ------------------------------------------------------------------ #
@@ -484,11 +699,35 @@ class SnapshotRuntime:
                 copy.mkdir(parents=True, exist_ok=True)
                 continue
             if not path.is_file():
+                # Sockets, FIFOs and device nodes are not carried as bytes:
+                # CRIU restores those descriptors itself. A path that vanished
+                # between the walk and the check lands here too.
                 continue
             copy.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, copy)
             records.append(SnapshotFile(relative, sha256_file(copy)))
         return records
+
+    def restore_files(self, artifact_path, records):
+        for source in (artifact_path / "files").rglob("*"):
+            if source.is_dir():
+                resolve_artifact_path(
+                    artifact_path / "runtime",
+                    str(source.relative_to(artifact_path / "files")),
+                ).mkdir(parents=True, exist_ok=True)
+        for record in records:
+            source = resolve_artifact_path(artifact_path / "files", record.path)
+            try:
+                digest = sha256_file(source)
+            except FileNotFoundError as error:
+                raise SnapshotRuntimeFailure(
+                    f"Snapshot file is missing: {record.path}"
+                ) from error
+            if digest != record.sha256:
+                raise SnapshotRuntimeFailure(f"Corrupt snapshot file: {record.path}")
+            target = resolve_artifact_path(artifact_path / "runtime", record.path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
     # ------------------------------------------------------------------ #
     # /dev/shm references
@@ -502,6 +741,65 @@ class SnapshotRuntime:
             shutil.copy2(path, target)
             records.append(SnapshotFile(path.name, sha256_file(target)))
         return records
+
+    def rollback_dev_shm(self, created):
+        for path, identity in created.items():
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (metadata.st_dev, metadata.st_ino) == identity:
+                path.unlink()
+
+    def restore_dev_shm(self, artifact_path, records):
+        """Recreate /dev/shm files, accepting an identical leftover.
+
+        A failed restore is retried on the same artifact, and CRIU needs the
+        file to exist with the captured bytes. An unrelated file under the same
+        name is never replaced.
+        """
+        created = {}
+        try:
+            for record in records:
+                if len(Path(record.path).parts) != 1:
+                    raise SnapshotSecurityError(
+                        f"Invalid /dev/shm file name: {record.path}"
+                    )
+                source = resolve_artifact_path(artifact_path / "dev_shm", record.path)
+                if sha256_file(source) != record.sha256:
+                    raise SnapshotRuntimeFailure(
+                        f"Corrupt /dev/shm file: {record.path}"
+                    )
+                target = self.SHM_DIR / record.path
+                if target.exists() or target.is_symlink():
+                    if self._same_dev_shm(target, source):
+                        continue
+                    raise SnapshotSecurityError(
+                        f"/dev/shm file already exists: {target}"
+                    )
+                fd = os.open(
+                    target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+                )
+                with os.fdopen(fd, "wb") as output:
+                    metadata = os.fstat(output.fileno())
+                    created[target] = (metadata.st_dev, metadata.st_ino)
+                    with source.open("rb") as data:
+                        shutil.copyfileobj(data, output)
+        except BaseException:
+            self.rollback_dev_shm(created)
+            raise
+        return created
+
+    def _same_dev_shm(self, target, source):
+        try:
+            metadata = target.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                return False
+            if metadata.st_uid != os.geteuid():
+                return False
+            return sha256_file(target) == sha256_file(source)
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------ #
     # readiness
@@ -533,6 +831,16 @@ class SnapshotRuntime:
             )
         except requests.RequestException:
             return False
+
+    def check_port_free(self, host, port):
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            with socket.socket(family) as probe:
+                probe.bind((host, port))
+        except OSError as error:
+            raise SnapshotUsageError(
+                f"snapshot restore address is already in use: {host}:{port}"
+            ) from error
 
     # ------------------------------------------------------------------ #
     # create steps
@@ -677,6 +985,76 @@ class SnapshotRuntime:
                 failures.append(f"engine process {root_pid} survived SIGKILL")
         self._attempt(failures, "process sweep", self.cleanup_tagged, artifact_path)
 
+    def stop_restored_tree(self, root_pid, artifact_path, failures):
+        """Best-effort teardown of a restore that will not be completed."""
+        self._attempt(failures, "restore cleanup", self.cleanup_restored, root_pid)
+        self._attempt(failures, "process sweep", self.cleanup_tagged, artifact_path)
+
     def discard_new_link_remaps(self, before):
         for path in set(self.SHM_DIR.glob("link_remap.*")) - before:
             path.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------ #
+    # restore steps
+    # ------------------------------------------------------------------ #
+    def verify_restorable(self, manifest, host, port):
+        """Fail early: occupied captured PID, busy listen address."""
+        if occupied := self.occupied_pids(manifest.pids):
+            raise SnapshotUsageError(
+                "captured PIDs are already in use ("
+                f"{', '.join(map(str, occupied))}); use a fresh container PID namespace"
+            )
+        self.check_port_free(host, port)
+
+    def restore(self, artifact_path, manifest, timeout):
+        """Recreate the captured tree, return the restored root process PID."""
+        self.restore_files(artifact_path, manifest.files)
+        work = artifact_path / "work" / f"restore-{time.time_ns()}"
+        work.mkdir()
+        pidfile = work / "root-process.pid"
+        created = {}
+        try:
+            created = self.restore_dev_shm(artifact_path, manifest.dev_shm)
+            stream_fds = (os.dup(sys.stdout.fileno()), os.dup(sys.stderr.fileno()))
+            try:
+                self.restore_process_tree(
+                    artifact_path,
+                    work,
+                    pidfile,
+                    list(zip(manifest.stdio, stream_fds)),
+                    timeout,
+                )
+            finally:
+                for fd in stream_fds:
+                    os.close(fd)
+            restored = self._read_restored_pid(pidfile)
+            if restored != manifest.root_pid:
+                raise SnapshotRuntimeFailure(
+                    "restored root process PID differs from manifest"
+                )
+            self.pin_restored_tree(manifest.root_pid, manifest.pids)
+            self.cuda_action(manifest.cuda_pids, "restore", work, timeout)
+            self.cuda_action(manifest.cuda_pids, "unlock", work, timeout)
+        except BaseException as error:
+            failures = []
+            self.stop_restored_tree(manifest.root_pid, artifact_path, failures)
+            self._attempt(failures, "/dev/shm rollback", self.rollback_dev_shm, created)
+            if failures:
+                raise SnapshotRuntimeFailure(
+                    f"Snapshot restore failed: {error_detail(error)}; "
+                    + "; ".join(failures)
+                ) from error
+            raise
+        return manifest.root_pid
+
+    def wait_listener(self, artifact_path, manifest, host, port, timeout):
+        control_dir = artifact_path / control.CONTROL_DIRNAME
+        self.wait_until(
+            artifact_path,
+            lambda: (
+                (control_dir / control.RESUMED).is_file() and self.health_ok(host, port)
+            ),
+            manifest.root_pid,
+            timeout,
+            "engine did not become healthy",
+        )
