@@ -14,7 +14,12 @@ from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+    DecLockRefParams,
+    EvictParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -74,17 +79,14 @@ class _SchedulerHarness:
     _abort_dllm_req_exact = SchedulerDllmMixin._abort_dllm_req_exact
     _retract_dllm_req = SchedulerDllmMixin._retract_dllm_req
     _retract_or_abort_dllm_req = SchedulerDllmMixin._retract_or_abort_dllm_req
-    # The real teardown, plus the three flags it reads: a stub or an attribute
-    # default would let this double drift from what the scheduler runs.
+    # Use the real teardown so the cache-handle contract is exercised.
     _release_aborted_request = Scheduler._release_aborted_request
-    enable_hierarchical_cache = False
-    enable_hicache_storage = False
-    enable_unified_cache_external_linker = False
 
 
 def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
     return SimpleNamespace(
         rid=rid,
+        cache_request_handle=CacheRequestHandle(rid=rid, attempt_id=0),
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
         # Admitted at some point, which is what stashes a request as locked.
         dllm_phase=DllmReqPhase.STAGING_DECODE,
@@ -361,7 +363,13 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         scheduler = _SchedulerHarness()
         scheduler.dllm_manager = manager
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(free=free)
-        scheduler.tree_cache = SimpleNamespace(dec_lock_ref=dec_lock_ref)
+
+        def finish(handle, outcome):
+            self.assertEqual(handle, req.cache_request_handle)
+            self.assertEqual(outcome, CacheRequestOutcome.ABORT)
+            events.append("finish")
+
+        scheduler.tree_cache = SimpleNamespace(dec_lock_ref=dec_lock_ref, finish=finish)
         scheduler.ipc_channels = SimpleNamespace(
             send_to_tokenizer=SimpleNamespace(send_output=send_output)
         )
@@ -369,7 +377,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         last_node = req.last_node
         scheduler._abort_dllm_req_exact(req)
 
-        self.assertEqual(events, ["free_kv", "unlock", "pop", "send"])
+        self.assertEqual(events, ["finish", "free_kv", "unlock", "pop", "send"])
         self.assertEqual(len(freed), 1)
         self.assertEqual(freed[0].tolist(), [12, 13])
         self.assertEqual(unlocked, [last_node])
@@ -563,9 +571,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(cache.evictable_size(), 0)
         self.assertEqual(freed, [])
 
-    def test_retract_keeps_the_rid_keyed_cache_state_that_abort_drops(self):
-        """A retracted request keeps its rid and re-enters admission, so only
-        the abort path may drop the cache state keyed by that rid."""
+    def test_retract_keeps_the_cache_attempt_state_that_abort_drops(self):
+        """Retraction preserves the cache attempt; abort finishes its handle."""
         released = []
         manager = DllmManager(SimpleNamespace(max_running_requests=4))
         retracted = _make_req("job_1", [1], self.block_size)
@@ -584,15 +591,13 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         manager.waiting_queue = [retracted, aborted]
 
         scheduler = _SchedulerHarness()
-        # Without one of these flags `_release_aborted_request` is a no-op.
-        scheduler.enable_hierarchical_cache = True
         scheduler.dllm_manager = manager
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
             free=lambda indices: None
         )
         scheduler.tree_cache = SimpleNamespace(
-            release_aborted_request=released.append,
-            dec_lock_ref=lambda node: None,
+            finish=lambda handle, outcome: released.append((handle, outcome)),
+            dec_lock_ref=lambda node, params: None,
         )
         scheduler.ipc_channels = SimpleNamespace(
             send_to_tokenizer=SimpleNamespace(send_output=lambda msg, req: None)
@@ -604,7 +609,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(retracted.kv.kv_allocated_len, 0)
 
         scheduler._abort_dllm_req_exact(aborted)
-        self.assertEqual(released, ["job_2"])
+        self.assertEqual(
+            released, [(aborted.cache_request_handle, CacheRequestOutcome.ABORT)]
+        )
 
 
 if __name__ == "__main__":

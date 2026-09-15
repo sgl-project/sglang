@@ -494,11 +494,11 @@ class SchedulerDllmMixin:
 
     def _cleanup_dllm_req(self: Scheduler, req: Req, *, is_abort: bool) -> None:
         if is_abort:
-            # Cancels the in-flight prefetch and staged host hold keyed by
-            # this rid. A retracted request keeps its rid and re-enters
+            # Cancels the in-flight prefetch and staged host hold for this
+            # request's cache handle. A retracted request re-enters
             # admission, so it would only pay for that work twice;
             # `ScheduleBatch.retract_decode` does not touch it either.
-            self._release_aborted_request(req.rid)
+            self._release_aborted_request(req)
 
         # `Req.kv` is always a ReqKvInfo, so every field below is present.
         kv = req.kv
