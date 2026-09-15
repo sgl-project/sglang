@@ -183,7 +183,7 @@ class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTest
                 MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(8))
             ]
         )
-        manager.mm_processor = SimpleNamespace(
+        manager.mm_processor = AsyncMock(
             prefer_tokenized_input=True,
             process_mm_data_async=AsyncMock(return_value=output),
         )
@@ -198,7 +198,7 @@ class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTest
             envs.SGLANG_MM_PRECOMPUTE_HASH.override(True),
         ):
             result = await manager._tokenize_one_request(request)
-            self.assertIsNotNone(result.mm_items[0].pad_value)
+            self.assertIs(result, output)
             self.assertEqual(
                 self.sample(
                     "stage_seconds_count", stage="preprocess", outcome="success"
