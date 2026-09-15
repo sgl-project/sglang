@@ -1989,9 +1989,8 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
-        """Two calls to the same tool must be numbered 0 and 1, as the
-        streaming deltas number them; a detector's tool_index is the tool's
-        position in the request and is 0 for both."""
+        """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
+        not by the detector's tool_index (0 for both)."""
         self.chat.tool_call_parser = "deepseekv4"
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
         with patch(

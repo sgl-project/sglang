@@ -967,8 +967,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            # Refreshed at replay only under expert parallelism; otherwise hand
-            # out None like the eager batch so routing sees no stale count.
+            # Refreshed at replay only under expert parallelism; otherwise None,
+            # like the eager batch, so routing sees no stale count.
             num_token_non_padded=(
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),

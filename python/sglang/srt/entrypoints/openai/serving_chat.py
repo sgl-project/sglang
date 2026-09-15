@@ -2409,9 +2409,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_id = self._process_tool_call_id(
                             call_info, history_tool_calls_cnt
                         )
-                        # index is the call's position in tool_calls, as in the
-                        # streaming deltas; tool_index is the tool's position
-                        # in the request for some detectors.
+                        # Call ordinal, as in the streaming deltas;
+                        # tool_index is the tool's position in the request.
                         tool_calls.append(
                             ToolCall(
                                 id=tool_id,

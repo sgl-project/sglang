@@ -1782,16 +1782,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return static_forward_batch
 
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
-        """Refresh the captured input_embeds slot from this batch.
-
-        For text-only batches, compute embeddings from input_ids to avoid replaying
-        stale embeddings from the previous batch.
-        """
         ie_idx = self._input_embeds_arg_idx
         ie = layer_kwargs.get("input_embeds")
         if ie is None and ie_idx is not None and len(args) > ie_idx:
             ie = args[ie_idx]
         if ie is None:
+            # Otherwise the graph replays the previous batch's embeddings.
             input_ids = layer_kwargs.get("input_ids")
             if input_ids is None and len(args) > 0:
                 input_ids = args[0]
