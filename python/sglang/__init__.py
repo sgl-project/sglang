@@ -8,6 +8,7 @@ import sys as _sys
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
 # the one that sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.environ import envs as _envs
 from sglang.srt.environ import (
     redirect_third_party_caches as _redirect_third_party_caches,
 )
@@ -68,12 +69,7 @@ def _install_hf_patch_hook():
 # launcher's import path up to the pre-spawn point must stay free of torch and
 # transformers, so the patches are applied when transformers is imported and
 # the frontend API resolves on first attribute access (PEP 562, below).
-_LAZY_INIT = _os.environ.get("SGLANG_PRESPAWN_WORKERS", "").strip().lower() in (
-    "true",
-    "1",
-    "yes",
-    "y",
-)
+_LAZY_INIT = _envs.SGLANG_PRESPAWN_WORKERS.get()
 if _LAZY_INIT:
     _install_hf_patch_hook()
 else:

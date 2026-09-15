@@ -59,7 +59,7 @@ def _statement_lines(func) -> list:
     if (
         body
         and isinstance(body[0], ast.Expr)
-        and isinstance(getattr(body[0], "value", None), ast.Constant)
+        and isinstance(body[0].value, ast.Constant)
         and isinstance(body[0].value.value, str)
     ):
         body = body[1:]

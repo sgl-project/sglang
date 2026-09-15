@@ -1071,9 +1071,8 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         startup_tic = time.perf_counter()
 
-        # Workers started by prespawn.maybe_prespawn() (SGLANG_PRESPAWN_WORKERS=1,
-        # right after argument parsing) are adopted here; the preparation in the
-        # else-branch already ran there. Only the default entry point may adopt.
+        # Pre-spawned workers (SGLANG_PRESPAWN_WORKERS=1) already went through the
+        # else-branch below in prespawn.maybe_prespawn(); adopt them here.
         pre = prespawn.take(server_args) if port_args is None else None
         if pre is not None and run_scheduler_process_func is not run_scheduler_process:
             prespawn.abandon(pre)
