@@ -35,7 +35,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-mori-pd') ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-mori-pd'))
-    runs-on: linux-mi35x-gpu-8.fabric
+    runs-on: linux-mi35x-gpu-8.fabric.test
     timeout-minutes: 90
     steps:
       - name: Checkout code
@@ -72,7 +72,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-mori-hicache') ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-mori-hicache'))
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.test
     timeout-minutes: 120
     steps:
       - name: Checkout code
