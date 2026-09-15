@@ -77,6 +77,10 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Callback invoked after a layer's wait resolves, to trigger
+        # on-demand prefetch of the next layer on the load stream.
+        self.on_layer_consumed: Optional[Callable] = None
+        self._last_consumed_layer: int = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -87,15 +91,31 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        self._last_consumed_layer = -1
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
 
+    def consume_layer(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        if self.on_layer_consumed is not None and threshold > self._last_consumed_layer:
+            self._last_consumed_layer = threshold
+            self.on_layer_consumed(threshold + 1)
+
+    def wait_for_prefetch(self, layer_id: int):
+        if self.consumer_index < 0:
+            return
+        if layer_id >= self.num_layers:
+            return
+        self.events[self.consumer_index].wait(layer_id)
+
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self._last_consumed_layer = -1
 
 
 class CacheOperation:
@@ -346,6 +366,7 @@ class HiCacheController:
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -942,6 +963,8 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
+        self._drain_pending_prefetch()
+
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
@@ -962,6 +985,7 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
+            on_demand=True,
         )
 
         self.ack_load_queue.append(
@@ -976,6 +1000,18 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def trigger_layer_load(self, layer_id: int) -> None:
+        handle = self.l2_transfer_engine.prefetch_handle
+        if handle is None:
+            return
+        handle.trigger_layer(layer_id)
+
+    def _drain_pending_prefetch(self) -> None:
+        handle = self.l2_transfer_engine.prefetch_handle
+        if handle is None:
+            return
+        handle.drain()
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

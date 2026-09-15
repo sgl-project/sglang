@@ -698,6 +698,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.consume_layer(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
         return (
             self.k_buffer[layer_id - self.start_layer],
