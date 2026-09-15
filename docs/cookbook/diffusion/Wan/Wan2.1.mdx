@@ -7,24 +7,13 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Wan21Deployment } from '/src/snippets/diffusion/wan21-deployment.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "LoRA", "text rendering"]} />
+<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "1.3B / 14B", "bilingual text"]} />
 
 ## 1. Model Introduction
 
-[Wan2.1 series](https://github.com/Wan-Video/Wan2.1) is an open and advanced suite of large-scale video generative models from Wan-AI.
+[Wan2.1](https://github.com/Wan-Video/Wan2.1) is a broad open video family covering text-to-video and image-to-video across 1.3B and 14B checkpoints. Its practical strengths are motion-rich generation, temporal consistency, and readable Chinese/English text, with 480p and 720p variants for different quality and memory targets.
 
-Key characteristics:
-
-- **State-of-the-art video quality**: Consistently outperforms many open-source and commercial video models on internal and public benchmarks, especially for motion richness and temporal consistency.
-- **Consumer GPU friendly**: The T2V-1.3B variant can generate 5-second 480P videos on consumer GPUs with modest VRAM requirements.
-- **Multi-capability suite**: Supports Text-to-Video (T2V), Image-to-Video (I2V), video editing, text-to-image, and video-to-audio generation.
-- **Robust text rendering**: First-generation Wan model capable of generating both Chinese and English text in videos with strong readability.
-- **Powerful Wan-VAE**: A 3D causal VAE that encodes/decodes long 1080P videos while preserving temporal information, enabling efficient high-resolution video generation.
-
-For more details, refer to the official Wan2.1 resources:
-
-- **GitHub**: [Wan-Video/Wan2.1](https://github.com/Wan-Video/Wan2.1)
-- **Hugging Face collection**: [Wan-AI Wan2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B)
+Choose the 1.3B T2V model for consumer-GPU experiments and the 14B models when quality matters more than footprint. Wan2.1 is a dense DiT family; for timestep-specialized MoE capacity or the unified 5B TI2V path, use Wan2.2 instead.
 
 ## 2. SGLang-diffusion Installation
 
@@ -38,7 +27,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2, A3 NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
+The Wan2.1 series offers models in multiple sizes and resolutions. SGLang supports Wan2.1 deployment on NVIDIA B200, B300, H200, H100, and AMD MI300X, MI325X, MI355X GPUs and Ascend A2/A3 Series NPUs. The recommended launch configurations vary by hardware, model size, and memory headroom.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
@@ -228,11 +217,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two A3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     sglang serve \
       --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
       --tp-size 2 \
@@ -332,11 +321,11 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```
   </Tab>
 
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```bash Command
-    #One A3 card has 2 npu chips. Benchmark was did with two Atlas 3 cards
+    #One A3 Series card has 2 npu chips. Benchmark was done with two A3 Series cards
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \

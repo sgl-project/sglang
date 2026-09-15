@@ -10,7 +10,7 @@ This module wires the causal DMD denoising stage into the modular pipeline.
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -116,24 +117,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.v_data_ptrs = make_kernel_ptr_table(
+            self.v_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools and not _is_npu:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-            self.packed_device_k_data_ptrs = torch.cat(
-                [pool.k_data_ptrs for pool in device_pools]
-            )
-            self.packed_device_v_data_ptrs = torch.cat(
-                [pool.v_data_ptrs for pool in device_pools]
-            )
+            if not _is_npu:
+                self.packed_device_k_data_ptrs = torch.cat(
+                    [pool.k_data_ptrs for pool in device_pools]
+                )
+                self.packed_device_v_data_ptrs = torch.cat(
+                    [pool.v_data_ptrs for pool in device_pools]
+                )
+            else:
+                self.packed_device_k_data_ptrs = None
+                self.packed_device_v_data_ptrs = None
             self.packed_device_k_buffers = [
                 buffer for pool in device_pools for buffer in pool.k_buffer
             ]
@@ -190,6 +195,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
         return buffer
 
@@ -778,10 +788,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         else:
             self.k_data_refs = []
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
 
     def get_size_per_token(self):
@@ -812,6 +822,11 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=(
+                self.page_size * self.layout_dim
+                if self.layout in ("page_first", "page_first_direct")
+                else None
+            ),
         )
 
     def get_hybrid_pool_buffer(self):
@@ -1135,6 +1150,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._k_layout_dim(),
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1142,6 +1158,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
 

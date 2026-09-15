@@ -58,7 +58,7 @@ import { DeepSeekV3Deployment } from "/src/snippets/autoregressive/deepseek-v3-d
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>INT8</strong></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Ascend A3 Series</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 / AWQ / MXFP4 / NVFP4</strong></td>
@@ -392,7 +392,7 @@ python3 -m sglang.launch_server \
 The default configuration is `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. Find the best values for your workload with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py). The minimum viable config is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`.
 
 <Note>
-For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs` to include your target batch sizes (default captured sizes for speculative decoding: 48).
+For large batch sizes (>48), increase `--max-running-requests` beyond the default of 48 for MTP. Also set `--cuda-graph-bs-decode` to include your target batch sizes (default captured sizes for speculative decoding: 48).
 </Note>
 
 <Tip>
@@ -404,7 +404,7 @@ The spec-v2 overlap scheduler is enabled by default. It improves performance by 
 DeepSeek V3 uses [Multi-head Latent Attention (MLA)](https://arxiv.org/pdf/2405.04434), an attention mechanism that improves inference efficiency. SGLang implements several optimizations:
 
 - **Weight Absorption:** Reorders matrix multiplications to improve decoding phase efficiency.
-- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, CutlassMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
+- **MLA Attention Backends:** FA3, Flashinfer, FlashMLA, TRTLLM MLA (Blackwell), and Triton. FA3 is the default.
 - **FP8 Quantization:** W8A8 FP8 and KV Cache FP8, with BMM operators for weight-absorbed MLA in FP8.
 - **CUDA Graph & Torch.compile:** Both MLA and MoE support CUDA Graph and Torch.compile for reduced decoding latency.
 - **Chunked Prefix Cache:** Increases throughput for long-sequence chunked prefill (FlashAttention3 backend only).
@@ -425,7 +425,7 @@ For multi-node serving and hardware-specific examples:
 - [16× A100 INT8](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32× L40S INT8](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 - [Xeon 6980P CPU](../../../docs/hardware-platforms/cpu_server#example-running-deepseek-v3-1-terminus)
-- [4× Atlas 800I A3 (int8)](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1#multi-node-pd-disaggregation-deployment)
+- [4× Ascend A3 Series (int8)](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1#multi-node-pd-disaggregation-deployment)
 
 **Blog references for large-scale deployment:**
 

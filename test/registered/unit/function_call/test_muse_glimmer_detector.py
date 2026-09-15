@@ -400,8 +400,7 @@ class TestMuseGlimmerDetector(CustomTestCase):
         it never will. Goes red if the tool parser loses its stream-end flush
         (``parse_stream_end`` / detector ``finish``)."""
         raw = (
-            " to=self<|message|>r<|eom|>"
-            "<|start|>assistant to=user<|message|>answer<|st"
+            " to=self<|message|>r<|eom|><|start|>assistant to=user<|message|>answer<|st"
         )
         for chunk_size in (1, 7, 100):
             _, content, calls = self.pipeline_stream(raw, chunk_size)

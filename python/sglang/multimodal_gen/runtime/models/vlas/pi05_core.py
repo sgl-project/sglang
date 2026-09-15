@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
+    MergedReplicatedLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -169,31 +170,26 @@ class PiGemmaMLP(nn.Module):
             self.gate_proj = None
             self.up_proj = None
         else:
-            self.gate_proj = nn.Linear(
-                self.hidden_size, self.intermediate_size, bias=False
-            )
-            self.up_proj = nn.Linear(
-                self.hidden_size, self.intermediate_size, bias=False
+            self.gate_up_proj = MergedReplicatedLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.intermediate_size] * 2,
+                bias=False,
             )
             self.down_proj = nn.Linear(
                 self.intermediate_size, self.hidden_size, bias=False
             )
-            self.gate_up_proj = None
+            self.gate_proj = None
+            self.up_proj = None
         if config.hidden_act != "gelu_pytorch_tanh":
             raise ValueError(f"Unsupported PiGemma activation: {config.hidden_act}")
         self.act_fn = GeluAndMul(approximate="tanh")
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        if self.tensor_parallel:
-            return self.gate_up_proj.weight.dtype
-        return self.up_proj.weight.dtype
+        return self.gate_up_proj.weight.dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tensor_parallel:
-            gate_up = linear_forward(self.gate_up_proj, x)
-        else:
-            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+        gate_up = linear_forward(self.gate_up_proj, x)
         return linear_forward(self.down_proj, self.act_fn(gate_up))
 
 
@@ -291,19 +287,11 @@ class PiGemmaAttention(nn.Module):
         else:
             self.num_heads = config.num_attention_heads
             self.num_key_value_heads = config.num_key_value_heads
-            self.q_proj = nn.Linear(
-                config.hidden_size,
-                self.num_heads * self.head_dim,
-                bias=config.attention_bias,
-            )
-            self.k_proj = nn.Linear(
-                config.hidden_size,
-                self.num_key_value_heads * self.head_dim,
-                bias=config.attention_bias,
-            )
-            self.v_proj = nn.Linear(
-                config.hidden_size,
-                self.num_key_value_heads * self.head_dim,
+            self.q_size = self.num_heads * self.head_dim
+            self.kv_size = self.num_key_value_heads * self.head_dim
+            self.qkv_proj = MergedReplicatedLinear(
+                input_size=config.hidden_size,
+                output_sizes=[self.q_size, self.kv_size, self.kv_size],
                 bias=config.attention_bias,
             )
             self.o_proj = nn.Linear(
@@ -311,9 +299,9 @@ class PiGemmaAttention(nn.Module):
                 config.hidden_size,
                 bias=config.attention_bias,
             )
-            self.qkv_proj = None
-            self.q_size = self.num_heads * self.head_dim
-            self.kv_size = self.num_key_value_heads * self.head_dim
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -350,9 +338,7 @@ class PiGemmaAttention(nn.Module):
 
     @property
     def projection_dtype(self) -> torch.dtype:
-        if self.tensor_parallel:
-            return self.qkv_proj.weight.dtype
-        return self.q_proj.weight.dtype
+        return self.qkv_proj.weight.dtype
 
     def project_qkv(
         self,
@@ -362,16 +348,11 @@ class PiGemmaAttention(nn.Module):
         query_shape = (*input_shape, self.num_heads, self.head_dim)
         kv_shape = (*input_shape, self.num_key_value_heads, self.head_dim)
 
-        if self.tensor_parallel:
-            qkv = linear_forward(self.qkv_proj, hidden_states)
-            query_states, key_states, value_states = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size],
-                dim=-1,
-            )
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+        qkv = linear_forward(self.qkv_proj, hidden_states)
+        query_states, key_states, value_states = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size],
+            dim=-1,
+        )
         return (
             query_states.view(query_shape).transpose(1, 2),
             key_states.view(kv_shape).transpose(1, 2),
@@ -828,20 +809,22 @@ def create_sinusoidal_pos_embedding(
     dimension: int,
     min_period: float,
     max_period: float,
+    scaling: torch.Tensor | None = None,
 ) -> Tensor:
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
     if time.ndim != 1:
         raise ValueError("time must have shape [batch]")
-    fraction = torch.linspace(
-        0.0,
-        1.0,
-        dimension // 2,
-        dtype=torch.float64,
-        device=time.device,
-    )
-    period = min_period * (max_period / min_period) ** fraction
-    scaling = 1.0 / period * 2 * math.pi
+    if scaling is None:
+        fraction = torch.linspace(
+            0.0,
+            1.0,
+            dimension // 2,
+            dtype=torch.float64,
+            device=time.device,
+        )
+        period = min_period * (max_period / min_period) ** fraction
+        scaling = 1.0 / period * 2 * math.pi
     sin_input = scaling[None, :] * time[:, None].to(torch.float64)
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
@@ -1223,6 +1206,11 @@ class Pi05CoreModel(nn.Module):
             self.action_out_proj = None
             self.time_mlp_in = None
             self.time_mlp_out = None
+        self.register_buffer(
+            "_time_embedding_scaling",
+            torch.empty(0, dtype=torch.float64),
+            persistent=False,
+        )
 
     def retain_runtime_components(
         self,
@@ -1280,12 +1268,34 @@ class Pi05CoreModel(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._time_embedding_scaling.numel()
+            != self.action_in_proj.out_features // 2
+            or self._time_embedding_scaling.device != timestep.device
+        ):
+            fraction = torch.linspace(
+                0.0,
+                1.0,
+                self.action_in_proj.out_features // 2,
+                dtype=torch.float64,
+                device=timestep.device,
+            )
+            period = (
+                self.config.time_embedding_min_period
+                * (
+                    self.config.time_embedding_max_period
+                    / self.config.time_embedding_min_period
+                )
+                ** fraction
+            )
+            self._time_embedding_scaling = 1.0 / period * 2 * math.pi
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
             min_period=self.config.time_embedding_min_period,
             max_period=self.config.time_embedding_max_period,
+            scaling=self._time_embedding_scaling,
         )
         action_emb = self.action_in_proj(
             noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
@@ -1296,21 +1306,54 @@ class Pi05CoreModel(nn.Module):
         time_emb = self.time_mlp_out(time_emb)
         adarms_cond = F.silu(time_emb)
 
-        batch_size, action_len = action_emb.shape[:2]
+        return action_emb, adarms_cond
+
+    def prepare_denoise_layout(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        x_t: torch.Tensor,
+        prefix_full_attention: bool = False,
+        *,
+        action_position_offset: int = 0,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        batch_size, action_len = x_t.shape[:2]
         pad_masks = torch.ones(
             batch_size,
             action_len,
             dtype=torch.bool,
-            device=noisy_actions.device,
+            device=x_t.device,
         )
         att_masks_t = torch.zeros(
             batch_size,
             action_len,
-            dtype=action_emb.dtype,
-            device=noisy_actions.device,
+            dtype=x_t.dtype,
+            device=x_t.device,
         )
         att_masks_t[:, 0] = 1
-        return action_emb, pad_masks, att_masks_t, adarms_cond
+        if prefix_full_attention:
+            attention_mask = None
+        else:
+            prefix_len = prefix_pad_masks.shape[1]
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, action_len, prefix_len
+            )
+            suffix_att_2d_masks = make_att_2d_masks(pad_masks, att_masks_t)
+            full_att_2d_masks = torch.cat(
+                [prefix_pad_2d_masks, suffix_att_2d_masks],
+                dim=2,
+            )
+            # A masked prefix guarantees that the concatenated layout is not
+            # full attention. Avoid a device-to-host ``.item()`` here so this
+            # path remains CUDA-graph capturable.
+            attention_mask = self.prepare_attention_masks_4d(
+                full_att_2d_masks,
+                full_attention=False,
+            )
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = (
+            prefix_offsets + action_position_offset + torch.cumsum(pad_masks, dim=1) - 1
+        )
+        return attention_mask, position_ids
 
     def _move_prefix_image_encoder_to_device(self, device: torch.device) -> None:
         paligemma = self.paligemma_with_expert.paligemma
@@ -1384,12 +1427,16 @@ class Pi05CoreModel(nn.Module):
         )
         self._offload_prefix_image_encoder_after_embed()
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_full_attention = bool(prefix_full_attention_hint)
-        if prefix_full_attention:
+        if prefix_full_attention_hint is True:
+            prefix_full_attention = True
             attention_mask = None
         else:
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_full_attention = bool(prefix_att_2d_masks.all().item())
+            prefix_full_attention = (
+                bool(prefix_att_2d_masks.all().item())
+                if prefix_full_attention_hint is None
+                else False
+            )
             attention_mask = self.prepare_attention_masks_4d(
                 prefix_att_2d_masks,
                 full_attention=prefix_full_attention,
@@ -1420,32 +1467,17 @@ class Pi05CoreModel(nn.Module):
         prefix_full_attention: bool = False,
         *,
         action_position_offset: int = 0,
+        denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(x_t, timestep)
-        )
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-        if prefix_full_attention:
-            attention_mask = None
-        else:
-            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
-                batch_size, suffix_len, prefix_len
+        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep)
+        if denoise_layout is None:
+            denoise_layout = self.prepare_denoise_layout(
+                prefix_pad_masks,
+                x_t,
+                prefix_full_attention,
+                action_position_offset=action_position_offset,
             )
-            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-            full_att_2d_masks = torch.cat(
-                [prefix_pad_2d_masks, suffix_att_2d_masks],
-                dim=2,
-            )
-            attention_mask = self.prepare_attention_masks_4d(full_att_2d_masks)
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = (
-            prefix_offsets
-            + action_position_offset
-            + torch.cumsum(suffix_pad_masks, dim=1)
-            - 1
-        )
+        attention_mask, position_ids = denoise_layout
         with set_forward_context(current_timestep=0, attn_metadata=None):
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=attention_mask,

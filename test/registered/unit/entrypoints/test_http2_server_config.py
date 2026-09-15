@@ -5,7 +5,7 @@ from unittest.mock import patch
 from sglang.srt.entrypoints.http_server import _run_granian_server
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @unittest.skipUnless(
@@ -31,9 +31,14 @@ class TestGranianHTTP2Config(unittest.TestCase):
                 port=30000,
                 log_level="info",
                 http2_max_concurrent_streams=37,
+                http2_initial_connection_window_size=8 * 1024 * 1024,
             )
 
         self.assertEqual(configured["http2_settings"].max_concurrent_streams, 37)
+        self.assertEqual(
+            configured["http2_settings"].initial_connection_window_size,
+            8 * 1024 * 1024,
+        )
 
 
 if __name__ == "__main__":

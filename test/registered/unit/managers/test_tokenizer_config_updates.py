@@ -10,6 +10,9 @@ import re
 import unittest
 from pathlib import Path
 
+import msgspec
+import msgspec.structs
+
 import sglang
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -17,7 +20,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _manager(case, **fields):
@@ -85,14 +88,15 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         )
 
     def test_the_dump_snapshot_identifies_the_running_checkpoint(self):
-        import dataclasses
 
         manager = _manager(self, load_format="auto")
         manager.model_path = "at-startup"
         manager.served_model_name = "at-startup"
         manager._update_model_path_info("after-reload", "dummy")
 
-        snapshot = manager.resolved_config_dict(dataclasses.asdict(manager.server_args))
+        snapshot = manager.resolved_config_dict(
+            msgspec.structs.asdict(manager.server_args)
+        )
         self.assertEqual(snapshot["model_path"], "after-reload")
         self.assertEqual(snapshot["served_model_name"], "after-reload")
         self.assertEqual(snapshot["load_format"], "dummy")
@@ -107,28 +111,27 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             def __deepcopy__(self, memo):
                 raise RuntimeError("refuses to be copied")
 
-        manager = _manager(self)
+        # Through the constructor: the field is raw input, and a resolved
+        # record refuses to be written.
+        manager = _manager(self, custom_sigquit_handler=Hostile())
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
-        manager.server_args.custom_sigquit_handler = Hostile()
 
         self.assertIsNone(manager._dump_config_snapshot())
 
     def test_an_unpickleable_field_does_not_lose_the_dump(self):
-        import dataclasses
         import pickle
 
-        manager = _manager(self)
+        # What --custom-sigquit-handler leaves on a real ServerArgs.
+        manager = _manager(self, custom_sigquit_handler=lambda *_: None)
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
-        # What --custom-sigquit-handler leaves on a real ServerArgs.
-        manager.server_args.custom_sigquit_handler = lambda *_: None
 
         payload = {
             "server_args": manager.server_args,
             "config_updates": get_context().overrides_log(),
             "resolved_config": manager.resolved_config_dict(
-                dataclasses.asdict(manager.server_args)
+                msgspec.structs.asdict(manager.server_args)
             ),
             "requests": [],
         }

@@ -93,7 +93,9 @@ class HunyuanConfig(PipelineConfig):
     # DiT
     dit_config: DiTConfig = field(default_factory=HunyuanVideoConfig)
     # VAE
-    vae_config: VAEConfig = field(default_factory=HunyuanVAEConfig)
+    vae_config: VAEConfig = field(
+        default_factory=lambda: HunyuanVAEConfig(parallel_decode_mode="tiled")
+    )
     # Denoising stage
     embedded_cfg_scale: int = 6
     flow_shift: int = 7

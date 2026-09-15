@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
-from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
 
 
 class _FakeProcess:

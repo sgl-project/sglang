@@ -143,11 +143,7 @@ find_latest_image() {
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry.
-  # See amd_ci_start_container.sh for why we don't probe
-  # ${LOCAL_DOCKER_REGISTRY} with `docker manifest inspect --insecure` from
-  # the runner pod's network namespace; the actual local-registry pull
-  # happens at the call site below via the docker daemon on the host.
+  # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -225,19 +221,9 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   fi
 else
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
+  # Temporarily bypass the shared local registry while concurrent CI pulls
+  # saturate it. Keep using the authenticated, retried public-registry path.
+  retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
 CACHE_HOST=/home/runner/sglang-data
