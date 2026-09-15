@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -16,8 +17,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
+    LayerSplitDSV4NPUTokenToKVPool,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -416,6 +421,9 @@ class CompressorAscendBackendMixin:
             return
         compressor(x, forward_batch)
 
+    # The NPU fused compressor writes c4/indexer payloads identically.
+    forward_indexer_compressor = forward_core_compressor
+
     def forward_compress(
         self,
         compressor,
@@ -584,23 +592,33 @@ class CompressorAscendBackendMixin:
             return
 
         if fused_fp8_indexer_write:
-            if loc is None:
-                raise RuntimeError(
-                    "DSV4 A5 fused indexer epilog needs a slot mapping, but "
-                    f"loc is None (mode={forward_batch.forward_mode}, "
-                    f"ratio={compressor.ratio}). Writing nothing here would "
-                    "leave the indexer KV cache stale."
+            ls_pool = self._layersplit_pool()
+            owned = ls_pool is None or ls_pool.is_layer_owned(compressor.layer_id)
+            if owned:
+                if loc is None:
+                    raise RuntimeError(
+                        "DSV4 A5 fused indexer epilog needs a slot mapping, but "
+                        f"loc is None (mode={forward_batch.forward_mode}, "
+                        f"ratio={compressor.ratio}). Writing nothing here would "
+                        "leave the indexer KV cache stale."
+                    )
+                torch.ops.custom.indexer_compress_epilog(
+                    indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
+                        compressor.layer_id, True
+                    ),
+                    indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                        compressor.layer_id, True
+                    ),
+                    x=kv,
+                    slot_mapping=loc.to(torch.int32),
                 )
-            torch.ops.custom.indexer_compress_epilog(
-                indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
-                    compressor.layer_id, True
-                ),
-                indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
-                    compressor.layer_id, True
-                ),
-                x=kv,
-                slot_mapping=loc.to(torch.int32),
-            )
+            if ls_pool is not None:
+                # A non-owner must not scatter raw slot ids into its compact
+                # staging rows. Both ranks still launch the owner transfer so
+                # the attn_cp_group collectives stay paired.
+                ls_pool.refresh_remote_copies(
+                    compressor.layer_id, ("index_k", "index_scale")
+                )
             return
 
         self.token_to_kv_pool.set_compress_buffer(
@@ -617,17 +635,31 @@ class C4IndexerAscendBackendMixin:
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
+    def _layersplit_pool(self) -> Optional[LayerSplitDSV4NPUTokenToKVPool]:
+        """The pool under cache layer split, else None (plain pool)."""
+        pool = self.token_to_kv_pool
+        return pool if isinstance(pool, LayerSplitDSV4NPUTokenToKVPool) else None
+
+    def _ls_page_table(self, family: str, layer_id: int, table):
+        """Layer-split pools may serve a compact remote copy: remap the table."""
+        pool = self._layersplit_pool()
+        if pool is None or table is None:
+            return table
+        return pool.page_table_for_read(family, layer_id, table)
+
     def _forward_prepare(
         self,
         c4_indexer,
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -647,6 +679,7 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         q_lora_ready,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.hardware_backend.npu.utils import (
             get_indexer_weight_stream,
@@ -661,7 +694,8 @@ class C4IndexerAscendBackendMixin:
         stream_w.wait_stream(cur)
 
         # route-KV write on cur; ordered before the topk read by cur's program order.
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
@@ -794,7 +828,7 @@ class C4IndexerAscendBackendMixin:
         self, c4_indexer, q_lora: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
 
-        positions = forward_batch.positions
+        positions = self._cp_local_positions(forward_batch)
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
@@ -848,7 +882,9 @@ class C4IndexerAscendBackendMixin:
             key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
-            block_table=fm.c4_page_table,
+            block_table=self._ls_page_table(
+                "index_k", c4_indexer.layer_id, fm.c4_page_table
+            ),
             layout_query="TND",
             layout_key="PA_BSND",
             weights=weights.to(q_scale.dtype),
@@ -877,23 +913,48 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert not skip_compressor, (
-            "skip_compressor=True is not supported on the NPU indexer path"
-        )
+        # skip_compressor=True is the CP full-metadata protocol: the compressor
+        # already ran via forward_indexer_compressor.
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
+        # CP path runs the compressor separately under full metadata.
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
-                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+                c4_indexer, x, q_lora, forward_batch, q_lora_ready, skip_compressor
             )
         else:
-            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+            q, weights = self._forward_prepare(
+                c4_indexer, x, q_lora, forward_batch, skip_compressor
+            )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+
+    def _cp_local_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-rank positions under CP-v2 (the batch keeps full-length ones)."""
+        local = getattr(forward_batch, "dsv4_cp_local_positions", None)
+        return local if local is not None else forward_batch.positions
 
 
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
+    _DSV4_CP_LOCAL_FIELDS = (
+        "actual_seq_lengths_q",
+        "actual_seq_lengths_q_pa",
+        "actual_seq_lengths_kv",
+        "block_tables",
+        "swa_page_table",
+        "c4_page_table",
+        "c128_page_table",
+        "kernel_metadata",
+        "c4_topk_indices",
+        "positions_cmp_padding_c4",
+        "positions_cmp_padding_c128",
+        "c4_loc",
+        "c128_loc",
+        "start_pos",
+        "seqused",
+    )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1027,6 +1088,194 @@ class DeepseekV4AscendAttnBackend(
             page_index_aligned_size=128,
         )
         return ori_sparse_indices
+
+    def _reset_layersplit_staging(self) -> None:
+        """Drop the previous forward's layer-split compact plan.
+
+        begin_forward_staging only runs on the CP-extend path below, so any
+        other forward reading this pool must not reuse that plan's row map.
+        """
+        pool = self._layersplit_pool()
+        if pool is not None:
+            pool.reset_forward_staging()
+
+    def prepare_dsv4_cp_metadata(self, forward_batch: ForwardBatch) -> None:
+        if getattr(forward_batch, "dsv4_cp_metadata_prepared", False):
+            return
+        if getattr(forward_batch, "attn_cp_metadata", None) is None:
+            return
+        if not forward_batch.forward_mode.is_context_parallel_extend():
+            self._reset_layersplit_staging()
+            return
+        if forward_batch.forward_mode.is_target_verify():
+            self._reset_layersplit_staging()
+            return
+
+        # CP-v2 only: the runner builds attn_cp_metadata and registers the
+        # strategy; legacy dsa_prefill_cp_mode flows never reach here.
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.cp_size <= 1:
+            self._reset_layersplit_staging()
+            return
+
+        fm = self.forward_metadata
+        global_positions = forward_batch.positions
+        if global_positions is None:
+            return
+
+        device = global_positions.device
+        num_tokens = int(global_positions.shape[0])
+        local_idx = strategy.local_q_indices(num_tokens, forward_batch).to(
+            device=device, dtype=torch.long
+        )
+        if local_idx.numel() > 0:
+            # Same bound the runner uses to shard model inputs (x[:total_seq_lens]).
+            shard_bound = int(
+                getattr(forward_batch.attn_cp_metadata, "total_seq_lens", num_tokens)
+            )
+            local_idx = local_idx[local_idx < shard_bound]
+        local_positions = global_positions.index_select(0, local_idx)
+        # Sharded model inputs are padded to per_rank_actual_token; pad rows get
+        # position 0 so per-token metadata matches the sharded q length.
+        from sglang.srt.layers.cp.padding import pad_local_rows
+
+        local_positions = pad_local_rows(
+            local_positions, forward_batch.attn_cp_metadata, dim=0
+        )
+
+        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_lens is None:
+            # gpu_only batches leave *_cpu unset; the device tensor carries the
+            # authoritative per-request extend lengths.
+            extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if extend_seq_lens is not None:
+                extend_lens = extend_seq_lens.cpu().tolist()
+            else:
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is not None:
+                    extend_lens = seq_lens_cpu.tolist()
+                else:
+                    extend_lens = [num_tokens]
+        extend_lens = [int(x) for x in extend_lens]
+        real_num_tokens = min(sum(extend_lens), num_tokens)
+
+        batch_ids_parts = []
+        for batch_id, length in enumerate(extend_lens):
+            if length <= 0:
+                continue
+            batch_ids_parts.append(
+                torch.full((length,), batch_id, dtype=torch.long, device=device)
+            )
+        if batch_ids_parts:
+            batch_ids = torch.cat(batch_ids_parts, dim=0)
+        else:
+            batch_ids = torch.empty(0, dtype=torch.long, device=device)
+        if batch_ids.shape[0] < num_tokens:
+            pad_len = num_tokens - batch_ids.shape[0]
+            batch_ids = torch.cat(
+                [batch_ids, torch.zeros(pad_len, dtype=torch.long, device=device)],
+                dim=0,
+            )
+        elif batch_ids.shape[0] > num_tokens:
+            batch_ids = batch_ids[:num_tokens]
+
+        local_batch_ids = batch_ids.index_select(0, local_idx)
+        valid_rows = local_idx < real_num_tokens
+        # Pad rows reuse request 0's page table (in-bounds) and stay invalid.
+        pad_rows = local_positions.shape[0] - local_batch_ids.shape[0]
+        if pad_rows > 0:
+            local_batch_ids = torch.cat(
+                [local_batch_ids, local_batch_ids.new_zeros(pad_rows)]
+            )
+            valid_rows = torch.cat([valid_rows, valid_rows.new_zeros(pad_rows)])
+        seqused_kv = torch.where(
+            valid_rows,
+            local_positions.to(torch.int32) + 1,
+            torch.ones_like(local_positions, dtype=torch.int32),
+        ).clamp(min=1)
+
+        full_fields = {
+            field: getattr(fm, field, None) for field in self._DSV4_CP_LOCAL_FIELDS
+        }
+        setattr(fm, "dsv4_cp_full_fields", full_fields)
+
+        def _select_rows(table: Optional[torch.Tensor]):
+            if table is None:
+                return None
+            if local_batch_ids.numel() == 0:
+                return table.new_empty((0, *table.shape[1:]))
+            return table.index_select(0, local_batch_ids)
+
+        fm.block_tables = _select_rows(full_fields["block_tables"])
+        fm.swa_page_table = _select_rows(full_fields["swa_page_table"])
+        if self._dsv4_has_c4:
+            fm.c4_page_table = _select_rows(full_fields["c4_page_table"])
+        if self._dsv4_has_c128:
+            fm.c128_page_table = _select_rows(full_fields["c128_page_table"])
+
+        # Layer split plans on the FULL-batch tables (identical on both CP
+        # ranks) so the active-page plan stays symmetric at zero-token ranks.
+        pool = self._layersplit_pool()
+        if pool is not None:
+            pool.begin_forward_staging(
+                {
+                    "swa": full_fields["swa_page_table"],
+                    "c4": full_fields["c4_page_table"],
+                    "c128": full_fields["c128_page_table"],
+                }
+            )
+
+        local_t = int(local_positions.shape[0])
+        fm.actual_seq_lengths_q = torch.arange(
+            1, local_t + 1, dtype=torch.int32, device=device
+        )
+        fm.actual_seq_lengths_q_pa = torch.arange(
+            0, local_t + 1, dtype=torch.int32, device=device
+        )
+        fm.actual_seq_lengths_kv = seqused_kv
+        fm.kernel_metadata = self._kernel_metadata_from_parts(
+            bs=local_t,
+            actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
+            actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
+            block_tables=fm.block_tables,
+            max_seqlen_q=1,
+            is_nextn=False,
+        )
+        if self._dsv4_has_c4:
+            fm.c4_topk_indices = torch.full(
+                (local_t, self._dsv4_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        forward_batch.dsv4_cp_metadata_prepared = True
+        forward_batch.dsv4_cp_global_positions = global_positions
+        forward_batch.dsv4_cp_local_positions = local_positions
+
+    @contextmanager
+    def use_dsv4_cp_full_metadata(self, forward_batch: ForwardBatch):
+        fm = self.forward_metadata
+        full_fields = getattr(fm, "dsv4_cp_full_fields", None)
+        if not full_fields:
+            yield
+            return
+
+        local_fields = {
+            field: getattr(fm, field, None) for field in self._DSV4_CP_LOCAL_FIELDS
+        }
+        previous_positions = getattr(forward_batch, "positions", None)
+        try:
+            for field, value in full_fields.items():
+                setattr(fm, field, value)
+            global_positions = getattr(forward_batch, "dsv4_cp_global_positions", None)
+            if global_positions is not None:
+                forward_batch.positions = global_positions
+            yield
+        finally:
+            for field, value in local_fields.items():
+                setattr(fm, field, value)
+            forward_batch.positions = previous_positions
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
         device = self.device
@@ -1643,6 +1892,9 @@ class DeepseekV4AscendAttnBackend(
         self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        # A non-CP forward never reaches prepare_dsv4_cp_metadata, so drop the
+        # previous CP-extend's compact plan before any non-owned-layer read.
+        self._reset_layersplit_staging()
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
 
@@ -1906,7 +2158,9 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=self._ls_page_table(
+                "swa", layer.layer_id, fm.swa_page_table
+            ),
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
@@ -1951,7 +2205,11 @@ class DeepseekV4AscendAttnBackend(
 
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
-        cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        cmp_block_table = self._ls_page_table(
+            f"c{compress_ratio}",
+            layer.layer_id,
+            getattr(fm, f"c{compress_ratio}_page_table"),
+        )
         expected_cmp_page_size = (
             ori_page_size // 4
             if compress_ratio == 4
@@ -1975,7 +2233,9 @@ class DeepseekV4AscendAttnBackend(
             layout_kv="PA_ND",
             q=q,
             ori_kv=ori_kv,
-            ori_block_table=fm.swa_page_table,
+            ori_block_table=self._ls_page_table(
+                "swa", layer.layer_id, fm.swa_page_table
+            ),
             sinks=attn_sink,
             metadata=metadata,
             softmax_scale=layer.scaling,
