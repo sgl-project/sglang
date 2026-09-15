@@ -48,6 +48,7 @@ class TestFP4MethodGate(unittest.TestCase):
 
     def test_arch35_uses_ascend_runner_method(self):
         config = Fp8Config(is_fp4_experts=True)
+        config.is_dsv4_fp4_experts = True
         layer = FusedMoE.__new__(FusedMoE)
 
         with (
