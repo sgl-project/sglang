@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=506, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=441, stage="base-c", runner_config="8-gpu-h20")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4
@@ -203,7 +203,9 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
     Mooncake already owns the broad disaggregation functional matrix in
     test_disaggregation_basic.py. This class intentionally mirrors only the
     subset that proves NIXL can launch, transfer KV, serve a request, return
-    logprobs, and keep all workers alive.
+    logprobs, keep all workers alive, and preserve accuracy across the
+    transfer. All of it shares one server pair -- the checks differ only in
+    what they send, not in how the servers are configured.
     """
 
     @classmethod
@@ -255,21 +257,6 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
 
         self.assertEqual(len(output_logprobs), completion_tokens)
         self.assertGreater(len(input_logprobs), 0)
-
-
-@unittest.skipUnless(
-    _HAS_CONFIGURED_NIXL_BACKEND,
-    "NIXL with the configured backend is required for this test.",
-)
-class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        _require_configured_nixl_backend()
-        _clear_disagg_failure_env()
-        super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
-        configure_nixl_pd_backend(cls)
-        cls.launch_all()
 
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
