@@ -1239,6 +1239,9 @@ class SchedulerDisaggregationPrefillMixin:
         if req.pending_bootstrap:
             return
 
+        if not req.disagg_kv_sender.supports_cached_prefix_early_send():
+            return
+
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = (
             req.early_send_prefix_end
