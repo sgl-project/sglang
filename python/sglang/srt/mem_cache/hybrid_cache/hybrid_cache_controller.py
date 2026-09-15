@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import (
+    STORAGE_BACKUP_MAX_ATTEMPTS,
     CacheOperation,
 )
 from sglang.srt.managers.cache_controller import (
@@ -679,7 +680,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         return
 
-    def _page_backup(self, operation):
+    def _page_backup(self, operation) -> bool:
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -696,7 +697,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
-            super()._page_backup(operation)
+            return super()._page_backup(operation)
         else:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:
@@ -717,6 +718,7 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+            return sidecar_ok
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -752,7 +754,16 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                success = self._page_backup(operation)
+                if not success:
+                    operation.backup_failed = True
+                    logger.error(
+                        "Storage backup operation %s failed after %d attempts; "
+                        "completed_tokens=%d.",
+                        operation.id,
+                        STORAGE_BACKUP_MAX_ATTEMPTS,
+                        operation.completed_tokens,
+                    )
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue

@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
 
+# A failed host-to-storage batch is retried a bounded number of times before
+# the operation is explicitly marked as failed. Retrying forever could pin host
+# pages indefinitely when the storage backend is permanently out of space.
+STORAGE_BACKUP_MAX_ATTEMPTS = 3
+
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
@@ -228,6 +233,9 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        # True only after a terminal host-to-storage write failure. The ack
+        # consumer must not treat a partial backup as a fully persisted span.
+        self.backup_failed = False
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -1280,7 +1288,7 @@ class HiCacheController:
         )
 
     # Backup batch by batch
-    def _page_backup(self, operation):
+    def _page_backup(self, operation) -> bool:
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1291,16 +1299,29 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
-            if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+            success = False
+            for attempt in range(1, STORAGE_BACKUP_MAX_ATTEMPTS + 1):
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
                 )
-                break
+                if success:
+                    break
+                logger.warning(
+                    "Write page to storage: %d pages failed (attempt %d/%d).",
+                    len(batch_hashes),
+                    attempt,
+                    STORAGE_BACKUP_MAX_ATTEMPTS,
+                )
+
+            if not success:
+                operation.backup_failed = True
+                return False
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+
+        return True
 
     def backup_thread_func(self):
         """
@@ -1313,7 +1334,16 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    success = self._page_backup(operation)
+                    if not success:
+                        operation.backup_failed = True
+                        logger.error(
+                            "Storage backup operation %s failed after %d attempts; "
+                            "completed_tokens=%d.",
+                            operation.id,
+                            STORAGE_BACKUP_MAX_ATTEMPTS,
+                            operation.completed_tokens,
+                        )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

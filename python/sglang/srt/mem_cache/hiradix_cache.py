@@ -681,6 +681,11 @@ class HiRadixCache(RadixCache):
                 if entry is not None:
                     entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
+                    if operation.backup_failed:
+                        self.storage_metrics_collector.log_backup_failed_tokens(
+                            len(operation.hash_value) * self.page_size
+                            - operation.completed_tokens
+                        )
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )

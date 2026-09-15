@@ -1962,6 +1962,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.backup_failed_tokens_total = Counter(
+            name="sglang:hicache_backup_failed_tokens_total",
+            documentation="Requested backup tokens that were not persisted to "
+            "L3 storage after all retries failed. A partial prefix may still "
+            "produce a shorter storage hit, but the operation is explicitly "
+            "marked as failed rather than treated as fully persisted.",
+            labelnames=labels.keys(),
+        )
+
         self.prefetch_aux_alloc_failed_tokens_total = Counter(
             name="sglang:hicache_prefetch_aux_alloc_failed_tokens_total",
             documentation="Prefetch tokens abandoned because an aux pool "
@@ -2044,6 +2053,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_backup_failed_tokens(self, failed_tokens: int):
+        if failed_tokens > 0:
+            self.backup_failed_tokens_total.labels(**self.labels).inc(failed_tokens)
 
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
