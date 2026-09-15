@@ -99,6 +99,309 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
 - **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
 
+### 3.3 Ascend NPU Deployment
+
+Kimi-K2.6 can also be deployed on the **Ascend A3 Series** (e.g., Atlas 800I A3) with the W4A8 INT8 quantized checkpoint and an EAGLE3 draft model for speculative decoding. Two deployment shapes are supported:
+
+- **1×A3, PD co-located** — a single 8-card node serving prefill and decode together, tuned for low latency (reference TPOT ≈ 20 ms on 3.5k+1.5k).
+- **2×A3, PD disaggregated** — one prefill node plus one decode node behind the SGLang router, tuned for long-context throughput (reference TPOT ≈ 100 ms on 64k+1.5k).
+
+<Note>
+On the A3 Series each card has 2 dies and SGLang counts devices per die, so an 8-card node uses `--tp-size 16` (see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware)). For driver/CANN setup, the container image, and model weight download, follow the [Kimi-K2.6 Ascend Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6). The full tuning matrix (including 2-node PD-mixed and prefix-cache variants) lives in [Kimi-K2.6 Ascend Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6).
+</Note>
+
+<Tabs>
+  <Tab title="1×A3 · PD Co-located (Low Latency)">
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the W4A8 model weights directory
+#   DRAFT_MODEL_PATH: path to the EAGLE3 draft model weights directory
+#   HCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME: host network interface (e.g. eth0)
+# ============================================================
+
+MODEL_PATH=/path/to/Kimi-K2.6-w4a8
+DRAFT_MODEL_PATH=/path/to/kimi-k2.6-eagle3
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export DEEPEP_HCCL_BUFFSIZE=1200
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --dtype bfloat16 \
+    --tp-size 16 \
+    --mem-fraction-static 0.865 \
+    --max-running-requests 80 \
+    --chunked-prefill-size 32768 \
+    --context-length 6144 \
+    --max-prefill-tokens 65536 \
+    --enable-multimodal \
+    --mm-attention-backend ascend_attn \
+    --sampling-backend ascend \
+    --enable-dp-attention \
+    --dp-size 16 \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --cuda-graph-bs-decode 1 2 3 4 5 \
+    --disable-radix-cache \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant \
+    --prefill-delayer-max-delay-passes 200 \
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
+```
+
+Startup takes several minutes (126 weight shards plus CUDA-graph capture); the server is ready when the log prints `The server is fired up and ready to roll!`. Verify with a chat request:
+
+```bash Command
+curl http://127.0.0.1:6688/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"$MODEL_PATH\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"What is 17 + 25?\"}],
+    \"max_tokens\": 256
+  }"
+```
+
+Benchmark (random dataset, 3.5k input / 1.5k output, concurrency 64):
+
+```bash Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 64 \
+    --num-prompts 256 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --random-range-ratio 1 \
+    --warmup-requests 0 \
+    --seed 1
+```
+
+<Warning>
+**Device OOM under burst load on custom builds.** The command above is tuned for the reference container image, in which `--mem-fraction-static 0.865` leaves only ~2.7 GB free per die after startup. On self-built environments whose kernels reserve more workspace, a 64-way concurrent burst can exhaust that headroom and crash a scheduler (allocation failure inside `deep_ep` dispatch / `AtbRingMLA`). If this happens, lower `--mem-fraction-static` (e.g. `0.85`; the minimum viable value for this model is ~0.828) and re-run.
+</Warning>
+
+<Info>
+In offline environments, pass `--tokenizer <local model path>` and `--dataset-path <local ShareGPT json>` to `bench_serving` so it does not try to download them; note that some SGLang versions no longer accept the legacy `--max-attempts` flag. End-to-end accuracy can be verified against the running server with EvalScope (e.g. `--datasets gsm8k`) — see [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+</Info>
+
+  </Tab>
+  <Tab title="2×A3 · PD Disaggregated (High Throughput)">
+
+This shape runs the prefill role on one A3 node and the decode role on a second A3 node, with the SGLang router dispatching requests. Run the shared setup on **both** nodes first:
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH / DRAFT_MODEL_PATH: paths to the model weights directories
+#   <your prefill ip> / <your decode ip>: IP addresses of the two nodes
+#   HCCL_SOCKET_IFNAME / GLOO_SOCKET_IFNAME: host network interface (e.g. eth0)
+# ============================================================
+
+MODEL_PATH=/path/to/Kimi-K2.6-w4a8
+DRAFT_MODEL_PATH=/path/to/kimi-k2.6-eagle3
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=60
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24670"
+```
+
+<Note>
+Cross-node KV transfer uses the `ascend` transfer backend, which requires the `memfabric_hybrid` package on both nodes (`pip install memfabric_hybrid`; it is already included in the reference container image). `ASCEND_MF_STORE_URL` must point at the prefill node and be reachable from the decode node. Source the CANN environment in every shell that starts a server or the router.
+</Note>
+
+<Warning>
+**Transfer engine initialization fails with `Failed to determine driver version` in minimal containers.** `memfabric_hybrid` locates the driver through `/etc/ascend_install.info` (fallback: `/usr/local/Ascend`) and reads `<driver path>/driver/version.info`. Container setups that mount only `driver/include` and `driver/lib64` lack this file, so the engine cannot start. Create `/usr/local/Ascend/driver/version.info` with the driver version reported by `npu-smi info`, e.g.:
+
+```bash Command
+printf 'Version=26.1.1\nInnerversion=V100R001C23SPC005B219\n' | tee /usr/local/Ascend/driver/version.info
+```
+
+`Innerversion` must be a driver release known to your `memfabric_hybrid` build; `V100R001C23SPC005B219` is accepted by 1.1.x–1.2.0.
+</Warning>
+
+**1. Start the prefill node** (`<your prefill ip>`):
+
+```bash Command
+export DEEPEP_HCCL_BUFFSIZE=1800
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=<network-interface>
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --disaggregation-mode prefill \
+    --host <your prefill ip> --port 8000 \
+    --disaggregation-bootstrap-port 8998 \
+    --node-rank 0 \
+    --quantization modelslim \
+    --dtype bfloat16 \
+    --disaggregation-transfer-backend ascend \
+    --nnodes 1 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --disable-radix-cache \
+    --cuda-graph-backend-decode=disabled \
+    --cuda-graph-backend-prefill=disabled \
+    --mem-fraction-static 0.78 \
+    --max-running-requests 1 \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --chunked-prefill-size 16384 \
+    --prefill-max-requests 1 \
+    --max-prefill-tokens 65536 \
+    --enable-multimodal \
+    --mm-attention-backend ascend_attn \
+    --sampling-backend ascend \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
+```
+
+**2. Start the decode node** (`<your decode ip>`):
+
+```bash Command
+export DEEPEP_HCCL_BUFFSIZE=1200
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=<network-interface>
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_NPU_USE_MLAPO=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --disaggregation-mode decode \
+    --host <your decode ip> --port 8001 \
+    --quantization modelslim \
+    --dtype bfloat16 \
+    --disaggregation-transfer-backend ascend \
+    --nnodes 1 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --mem-fraction-static 0.82 \
+    --max-running-requests 16 \
+    --enable-dp-attention \
+    --dp-size 1 \
+    --enable-dp-lm-head \
+    --disable-radix-cache \
+    --enable-multimodal \
+    --mm-attention-backend ascend_attn \
+    --sampling-backend ascend \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --cuda-graph-bs-decode 16 \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --speculative-draft-model-quantization unquant
+```
+
+**3. Start the router** (on either node, or a separate CPU host):
+
+```bash Command
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill http://<your prefill ip>:8000 8998 \
+    --decode http://<your decode ip>:8001 \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --policy cache_aware
+```
+
+Benchmark against the router (random dataset, 64k input / 1.5k output, long-context throughput):
+
+```bash Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --num-prompts 1 \
+    --request-rate inf \
+    --random-input-len 64000 \
+    --random-output-len 1500 \
+    --random-range-ratio 1 \
+    --seed 1
+```
+
+<Info>
+In offline environments, add `--tokenizer $MODEL_PATH` and `--dataset-path <local ShareGPT json>` so the benchmark client does not try to download them. Some SGLang versions no longer accept the legacy `--max-attempts` flag.
+</Info>
+
+<Info>
+A single-script variant that starts both roles and auto-detects the local node's role from its IP address is available in [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms), which also covers the 128k-context and 90%-prefix-cache variants.
+</Info>
+
+  </Tab>
+</Tabs>
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
