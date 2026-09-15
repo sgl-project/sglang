@@ -1002,16 +1002,22 @@ class HiCacheController:
         otherwise ``module_name='hicache'`` is filtered out -> TraceNullContext).
         Either way the op carries ``(trace_ctx, trace_id, span_id)``:
 
-        * tracing on + hicache enabled -> the real root's ``trace_id``/``span_id``
-          are forwarded to Mooncake, whose hop-A/hop-B spans link under that
-          *real* hicache root span (plan.md scenario 2).
+        * tracing on + hicache enabled -> ``trace_req_start`` also creates the
+          per-storage-thread child span (``TraceReqContext.thread_context.
+          thread_span``) under the root; we forward THAT thread span's
+          ``trace_id``/``span_id`` to Mooncake, so its hop-A/hop-B link under
+          the rank's thread span instead of directly under the root (plan.md
+          scenario 2). The thread span belongs to the op's owning storage
+          thread (init moved to the storage thread, see commit a0785d3).
         * otherwise (tracing off / 'hicache' not in modules) -> TraceNullContext +
           None ids; Mooncake still correlates by deriving a stable *virtual*
           root from the per-thread caller_id/caller_role it receives via
           request_context (plan.md scenario 1).
 
-        See plan.md §3-§6. ``parent_span_id`` is intentionally not extracted
-        (the root span has no parent).
+        See plan.md §3-§6. ``parent_span_id`` is intentionally not extracted:
+        the forwarded ``span_id`` (the thread span) is what Mooncake uses as
+        the remote parent; its own parent (the hicache root) is internal and
+        not exposed. ``trace_id`` is identical for the root and thread span.
         """
         trace_ctx = TraceReqContext(
             rid=str(rid), role=role, module_name="hicache"
@@ -1020,7 +1026,11 @@ class HiCacheController:
         span_id: Optional[str] = None
         if trace_ctx.tracing_enable:
             trace_ctx.trace_req_start()
-            span_context = trace_ctx.root_span.get_span_context()
+            # The per-storage-thread child span (root -> thread span) is created
+            # synchronously inside trace_req_start via __create_thread_context.
+            # Forward its context so Mooncake's hop-A/hop-B nest under the rank's
+            # thread span, not directly under the root (plan.md §10).
+            span_context = trace_ctx.thread_context.thread_span.get_span_context()
             trace_id = format(span_context.trace_id, "032x")
             span_id = format(span_context.span_id, "016x")
         else:
@@ -1048,9 +1058,12 @@ class HiCacheController:
         Always-on (independent of tracing): ``caller_id``/``caller_role`` from
         the *running storage thread's* registration (``Prefetch`` on the prefetch
         threads, ``Backup`` on the backup thread). Prefetch additionally carries
-        ``request_id``. When the hicache root span was exported, also the root's
-        ``trace_id``/``span_id`` (parent_span_id is intentionally empty: the root
-        span has no parent). None/empty fields are omitted so Mooncake keeps the
+        ``request_id``. When the hicache root span was exported, also the
+        ``trace_id``/``span_id`` of its per-storage-thread child (root -> thread
+        span -> Mooncake hop-A; see ``_init_op_trace``). ``parent_span_id`` is
+        intentionally empty: the forwarded ``span_id`` (the thread span) is what
+        Mooncake uses as the remote parent, and its own parent (the root) is
+        internal. None/empty fields are omitted so Mooncake keeps the
         prior per-thread state. The controller fills this from the storage
         threads, so ``get_thread_caller_info`` reads the storage thread's identity
         (plan.md §7.4 / §5).
