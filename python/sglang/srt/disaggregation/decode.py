@@ -129,6 +129,57 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _resolve_kv_failure(
+    kv_receiver: CommonKVReceiver,
+    fallback_message: str,
+    gloo_group: Optional[ProcessGroup] = None,
+) -> Tuple[str, bool, int]:
+    """Resolve one failure payload and select the best details across TP ranks."""
+    try:
+        kv_receiver.failure_exception()
+    except Exception as error:
+        is_propagated = getattr(error, "is_from_another_rank", False)
+        status_code = getattr(error, "status_code", None)
+        if status_code is not None:
+            local_payload = (
+                getattr(error, "failure_reason", str(error)),
+                is_propagated,
+                status_code,
+            )
+        else:
+            local_payload = (
+                f"{fallback_message} with exception {error}",
+                is_propagated,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+    else:
+        local_payload = (
+            fallback_message,
+            False,
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+    if gloo_group is None or torch.distributed.get_world_size(group=gloo_group) <= 1:
+        return local_payload
+
+    gathered_payloads = [None] * torch.distributed.get_world_size(group=gloo_group)
+    torch.distributed.all_gather_object(
+        gathered_payloads,
+        local_payload,
+        group=gloo_group,
+    )
+    concrete_payloads = [payload for payload in gathered_payloads if not payload[1]]
+    best_payload = next(
+        (
+            payload
+            for payload in concrete_payloads
+            if payload[2] != HTTPStatus.INTERNAL_SERVER_ERROR
+        ),
+        concrete_payloads[0] if concrete_payloads else local_payload,
+    )
+    return best_payload[0], local_payload[1], best_payload[2]
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -919,13 +970,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                is_propagated = False
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                    is_propagated = getattr(e, "is_from_another_rank", False)
+                fallback_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                error_message, is_propagated, status_code = _resolve_kv_failure(
+                    decode_req.kv_receiver,
+                    fallback_message,
+                    self.gloo_group,
+                )
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -934,7 +984,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -2345,12 +2395,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                status_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                    error_message, is_propagated, status_code = _resolve_kv_failure(
+                        decode_req.kv_receiver,
+                        error_message,
+                        self.gloo_group,
+                    )
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2360,7 +2411,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 prepare_abort(
                     decode_req.req,
                     error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=status_code,
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],

@@ -724,12 +724,13 @@ class MoriKVManager(CommonKVManager):
                             "Received malformed status message on decode worker"
                         )
                         continue
-                    room, status, prefill_rank, reason = parsed
+                    room, status, prefill_rank, reason, status_code = parsed
                     self.apply_prefill_status(
                         bootstrap_room=room,
                         status=status,
                         prefill_rank=prefill_rank,
                         failure_reason=reason,
+                        status_code=status_code,
                     )
                 except Exception:
                     logger.exception("Decode status worker failed")

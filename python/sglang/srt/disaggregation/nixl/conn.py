@@ -629,12 +629,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
-                    room, status, prefill_rank, reason = parsed
+                    room, status, prefill_rank, reason, status_code = parsed
                     self.apply_prefill_status(
                         bootstrap_room=room,
                         status=status,
                         prefill_rank=prefill_rank,
                         failure_reason=reason,
+                        status_code=status_code,
                     )
                     continue
                 logger.warning(

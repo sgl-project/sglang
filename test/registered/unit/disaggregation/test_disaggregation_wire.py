@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -29,9 +29,12 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVReceiver,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    KVPoll,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -380,6 +383,238 @@ class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
 
         self.assertTrue(info.is_dummy)
         self.assertEqual(info.decode_prefix_len, 128)
+
+
+class TestMooncakeAbortedRoomLifecycle(unittest.TestCase):
+    def _new_manager(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.request_status = {17: KVPoll.Failed}
+        manager.failure_records = {17: "Input is too long"}
+        manager.failure_status_codes = {17: 400}
+        manager.failure_timestamps = {17: 100.0}
+        manager.prequeue_failed_rooms = {17}
+        manager.prequeue_failure_notified_endpoints = {}
+        manager.failure_lock = threading.Lock()
+        manager._room_state_lock = threading.RLock()
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.required_dst_info_num_table = {17: 1}
+        manager._deferred_ack_targets = {}
+        manager.attn_tp_rank = 0
+        manager.attn_cp_rank = 0
+        manager.pp_rank = 0
+        manager.attn_cp_size = 1
+        manager.pp_size = 1
+        manager.orphan_failed_room_ttl = 10.0
+        manager._orphan_failed_room_cleanup_interval = 0.0
+        manager._next_orphan_failed_room_cleanup_time = 0.0
+        return manager
+
+    def test_failure_waits_for_complete_decode_metadata(self):
+        manager = self._new_manager()
+        manager.send_kv_status_message = Mock()
+
+        self.assertFalse(manager.try_notify_decode_failure_and_clear(17))
+        self.assertIn(17, manager.request_status)
+        manager.send_kv_status_message.assert_not_called()
+
+    def test_failure_notifies_decode_then_clears_room(self):
+        manager = self._new_manager()
+        manager.transfer_infos[17] = {
+            "session": SimpleNamespace(
+                is_dummy=False,
+                endpoint="127.0.0.1",
+                dst_port=8999,
+            )
+        }
+        manager.send_kv_status_message = Mock(return_value={("127.0.0.1", 8999)})
+
+        self.assertTrue(manager.try_notify_decode_failure_and_clear(17))
+
+        manager.send_kv_status_message.assert_called_once_with(
+            targets=[("127.0.0.1", 8999)],
+            bootstrap_room=17,
+            status=KVPoll.Failed,
+            failure_reason="Input is too long",
+            status_code=400,
+        )
+        for table in (
+            manager.request_status,
+            manager.failure_records,
+            manager.failure_status_codes,
+            manager.failure_timestamps,
+            manager.prequeue_failed_rooms,
+            manager.prequeue_failure_notified_endpoints,
+            manager.transfer_infos,
+            manager.required_dst_info_num_table,
+        ):
+            self.assertNotIn(17, table)
+
+    def test_orphan_failure_is_cleaned_after_bootstrap_timeout(self):
+        manager = self._new_manager()
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+            return_value=111.0,
+        ):
+            manager.maybe_cleanup_orphan_failed_rooms()
+
+        self.assertNotIn(17, manager.request_status)
+        self.assertNotIn(17, manager.failure_records)
+
+    def test_periodic_cleanup_ignores_scheduler_owned_failure(self):
+        manager = self._new_manager()
+        manager.prequeue_failed_rooms.clear()
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+            return_value=111.0,
+        ):
+            manager.maybe_cleanup_orphan_failed_rooms()
+
+        self.assertIn(17, manager.request_status)
+        self.assertIn(17, manager.failure_records)
+
+    def test_scheduler_owned_failure_survives_late_metadata(self):
+        manager = self._new_manager()
+        manager.prequeue_failed_rooms.clear()
+        manager.failure_timestamps.clear()
+        manager.maybe_cleanup_orphan_failed_rooms = Mock()
+        manager.resolve_kv_replica_factor = Mock()
+        manager._staging_outstanding = {}
+        manager.server_socket = Mock()
+        manager.server_socket.poll.side_effect = [1, EOFError]
+        manager.server_socket.recv_multipart.return_value = [
+            b"17",
+            b"127.0.0.1",
+            b"8999",
+            b"session",
+            b"",
+            b"0",
+            b"",
+            b"1",
+        ]
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.threading.Thread"
+        ) as thread:
+            manager.start_prefill_thread()
+        bootstrap = thread.call_args.kwargs["target"]
+        with self.assertRaises(EOFError):
+            bootstrap()
+
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = 17
+        sender.conclude_state = None
+        sender.trace_ctx = Mock()
+
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        self.assertIn(17, manager.request_status)
+
+    def test_notification_retry_skips_endpoints_already_notified(self):
+        manager = self._new_manager()
+        manager.required_dst_info_num_table[17] = 2
+        manager.transfer_infos[17] = {
+            "ready": SimpleNamespace(
+                is_dummy=False,
+                endpoint="decode-a",
+                dst_port=8999,
+            ),
+            "retry": SimpleNamespace(
+                is_dummy=False,
+                endpoint="decode-b",
+                dst_port=9000,
+            ),
+        }
+        manager.send_kv_status_message = Mock(
+            side_effect=[
+                {("decode-a", 8999)},
+                {("decode-b", 9000)},
+            ]
+        )
+
+        self.assertFalse(manager.try_notify_decode_failure_and_clear(17))
+        self.assertTrue(manager.try_notify_decode_failure_and_clear(17))
+
+        self.assertEqual(
+            manager.send_kv_status_message.call_args_list[1].kwargs["targets"],
+            [("decode-b", 9000)],
+        )
+        self.assertNotIn(17, manager.request_status)
+
+    def test_notification_failure_is_contained_for_retry(self):
+        manager = self._new_manager()
+        manager._send_multipart_locked = Mock(
+            side_effect=RuntimeError("decode endpoint unavailable")
+        )
+
+        notified = manager.send_kv_status_message(
+            targets=[("127.0.0.1", 8999)],
+            bootstrap_room=17,
+            status=KVPoll.Failed,
+            failure_reason="Input is too long",
+            status_code=400,
+        )
+
+        self.assertEqual(notified, set())
+        self.assertIn(17, manager.request_status)
+
+    def test_status_wire_round_trip_and_legacy_compatibility(self):
+        manager = self._new_manager()
+
+        message = manager._encode_kv_status_message(
+            bootstrap_room=17,
+            status=KVPoll.Failed,
+            failure_reason="Input is too long",
+            status_code=400,
+        )
+
+        self.assertEqual(
+            manager.parse_kv_status_message(message),
+            (17, KVPoll.Failed, 0, "Input is too long", 400),
+        )
+        self.assertEqual(
+            manager.parse_kv_status_message([b"17", b"0", b"0"]),
+            (17, KVPoll.Failed, 0, None, None),
+        )
+
+    def test_untyped_failure_replaces_previous_http_status(self):
+        manager = self._new_manager()
+
+        manager.record_failure(17, "Transport failed")
+
+        self.assertEqual(manager.failure_records[17], "Transport failed")
+        self.assertNotIn(17, manager.failure_status_codes)
+
+    def test_sender_abort_preserves_prequeue_failure_details(self):
+        manager = self._new_manager()
+        sender = object.__new__(MooncakeKVSender)
+        sender.bootstrap_room = 17
+        sender.kv_mgr = manager
+        sender.trace_ctx = Mock()
+
+        sender.abort()
+
+        self.assertEqual(manager.failure_records[17], "Input is too long")
+        self.assertEqual(manager.failure_status_codes[17], 400)
+
+    def test_receiver_failure_exception_carries_http_status(self):
+        manager = self._new_manager()
+        manager.required_prefill_response_num_table = {}
+        manager.prefill_response_tracker = {}
+        manager.addr_to_rooms_tracker = {"prefill": {17}}
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 17
+        receiver.bootstrap_addr = "prefill"
+        receiver.kv_mgr = manager
+        receiver.conclude_state = KVPoll.Failed
+
+        with self.assertRaises(KVTransferError) as raised:
+            receiver.failure_exception()
+
+        self.assertEqual(raised.exception.failure_reason, "Input is too long")
+        self.assertEqual(raised.exception.status_code, 400)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
