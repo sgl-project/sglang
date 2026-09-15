@@ -15,7 +15,7 @@ from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 @pytest.fixture(scope="module")
