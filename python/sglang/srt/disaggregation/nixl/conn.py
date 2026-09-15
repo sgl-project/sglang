@@ -44,6 +44,8 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    ensure_uniform_slot_counts,
+    kv_region_slot_counts,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -504,6 +506,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self._num_slots_src = (
                     self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
                 )
+                slot_counts = kv_region_slot_counts(self.kv_args)
+                if len(slot_counts) > 1:
+                    logger.warning(
+                        "NIXL PD transfer: registered KV regions have non-uniform "
+                        "slot counts %s. Equal-TP/MLA homogeneous-memory sends use "
+                        "the address-based path instead of prepped transfers; "
+                        "mixed-memory and heterogeneous-TP transfers are refused "
+                        "at peer registration.",
+                        sorted(slot_counts),
+                    )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
@@ -826,6 +838,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         interleave num_groups per token, peers select via head_group_idx.
         prefill_tp > decode_tp: num_groups=1. Dst dlist is per-peer.
         """
+        ensure_uniform_slot_counts(
+            self.kv_args, "NIXL heterogeneous-TP prepped transfer"
+        )
         decode_tp_size = decode_kv_args.decode_tp_size
         dst_kv_item_len = decode_kv_args.dst_kv_item_len
         prefill_tp_size = self.attn_tp_size
@@ -975,6 +990,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         mem_segments: List[_KVXferMemSegment],
     ):
+        ensure_uniform_slot_counts(self.kv_args, "NIXL mixed-memory prepped transfer")
         prepared_segments = []
         for seg in mem_segments:
             src_key = (seg.start, seg.end, seg.src_mem_kind)
@@ -1089,6 +1105,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
 
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
+            if len(kv_region_slot_counts(self.kv_args)) > 1:
+                # Prepped sends index the dlist as region * _num_slots_src + page,
+                # but the dlist holds each region's real slot count, so every region
+                # after the first mismatch drifts. The address-based send_kvcache path
+                # derives each region's addresses from its own pointer and item length.
+                return
             # Build the shared src dlist on the first equal-TP/MLA peer; later
             # peers reuse it. Skipped entirely on heterogeneous-TP-only setups.
             if "" not in self.prep_handles:
@@ -1655,14 +1677,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    item_lens[layer_id],
+                    item_lens[layer_id],  # K item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    item_lens[layer_id],
+                    item_lens[layers_current_pp_stage + layer_id],  # V item length
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]

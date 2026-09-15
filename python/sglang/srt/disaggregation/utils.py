@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -41,6 +42,8 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
         DSV4NPUTokenToKVPool,
     )
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -1600,6 +1603,43 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def kv_region_slot_counts(kv_args: KVArgs) -> set[int]:
+    return {
+        data_len // item_len
+        for data_len, item_len in zip(
+            kv_args.kv_data_lens,
+            kv_args.kv_item_lens,
+            strict=True,
+        )
+    }
+
+
+def ensure_uniform_slot_counts(kv_args: KVArgs, path: str) -> None:
+    distinct = sorted(kv_region_slot_counts(kv_args))
+    if len(distinct) > 1:
+        raise RuntimeError(
+            f"PD transfer: {path} requires uniform per-region KV slot counts "
+            f"(kv_data_lens // kv_item_lens); got {distinct}"
+        )
+
+
+def log_kv_registration_summary(kv_args: KVArgs, role: str) -> None:
+    item_lens = kv_args.kv_item_lens
+    logger.info(
+        "PD KV registration (%s): kv_entries=%d slot_counts=%s "
+        "item_lens_min_max=%s kv_layer_ids=%d state_types=%s aux_entries=%d "
+        "aux_item_lens=%s",
+        role,
+        len(kv_args.kv_data_ptrs),
+        sorted(kv_region_slot_counts(kv_args)),
+        (min(item_lens), max(item_lens)) if item_lens else None,
+        len(kv_args.kv_layer_ids),
+        [state_type.value for state_type in kv_args.state_types],
+        len(kv_args.aux_data_ptrs),
+        kv_args.aux_item_lens,
+    )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
