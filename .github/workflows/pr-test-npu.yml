@@ -493,7 +493,6 @@ jobs:
     uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
-      recommendations_file: recommended_pytest_paths.txt
       recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
 
   # ==================== Coverage Assembly & Upload ==================== #

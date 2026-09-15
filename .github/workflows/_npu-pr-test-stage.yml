@@ -306,7 +306,7 @@ jobs:
             $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
 
       - name: Upload test logs
-        if: always() && inputs.use_coverage_runner != 'true' && inputs.upload_test_logs == true
+        if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
         uses: actions/upload-artifact@v7
         with:
           name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}

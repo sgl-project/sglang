@@ -9,15 +9,11 @@ on:
         type: string
         required: true
         description: 'Glob pattern for test log artifacts (e.g. selected-test-logs-*)'
-      recommendations_file:
-        type: string
-        required: true
-        description: 'Path to recommendations txt file committed in the repo (priority 2)'
       recommendations_content:
         type: string
         required: false
         default: ''
-        description: 'Content of recommendations from upstream job output (priority 1)'
+        description: 'Content of recommendations from upstream job output'
 
 defaults:
   run:
@@ -32,12 +28,11 @@ jobs:
       - name: Checkout sglang repo
         uses: actions/checkout@v4
 
-      # ----- Step 1: Locate recommendations (priority: output > committed file) -----
+      # ----- Step 1: Locate recommendations -----
       - name: Locate recommendations file
         id: locate-recs
         run: |
           mkdir -p ./test-logs
-          COMMITTED_REC="${{ inputs.recommendations_file }}"
 
           if [ -n "${{ inputs.recommendations_content }}" ]; then
             echo "has_recommendations=true" >> $GITHUB_OUTPUT
@@ -46,14 +41,6 @@ jobs:
             echo "RECS_FILE=./test-logs/_recommended.txt" >> $GITHUB_ENV
             echo "RECS_SOURCE=output" >> $GITHUB_ENV
             COUNT=$(wc -l < ./test-logs/_recommended.txt)
-            echo "Recommendations count: ${COUNT}"
-          elif [ -f "${COMMITTED_REC}" ]; then
-            echo "has_recommendations=true" >> $GITHUB_OUTPUT
-            echo "Using committed recommendations: ${COMMITTED_REC}"
-            echo "${COMMITTED_REC}" > ./test-logs/_recommended.txt
-            echo "RECS_FILE=${COMMITTED_REC}" >> $GITHUB_ENV
-            echo "RECS_SOURCE=committed" >> $GITHUB_ENV
-            COUNT=$(wc -l < "${COMMITTED_REC}")
             echo "Recommendations count: ${COUNT}"
           else
             echo "has_recommendations=false" >> $GITHUB_OUTPUT
