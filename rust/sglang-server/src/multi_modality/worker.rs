@@ -9,7 +9,6 @@ use super::result_store::{
 use crate::message::config::MmSpec;
 use crate::message::ids::Rid;
 use crate::message::request::{MmRequest, MmWorkItem};
-use crate::tokenizer_manager::tokenizer::TextTokenizer;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::runtime::Runnable;
 
@@ -55,13 +54,11 @@ pub struct MmProcessOutput {
 
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
-/// request-scoped Python objects.
+/// request-scoped Python objects. The work item arrives tokenized (the FSM
+/// runs `Tokenizing` before `Encoding` for a text prompt), so a processor
+/// never tokenizes: it expands placeholders in ids.
 pub trait MmProcessor: Send + Sync {
-    fn process(
-        &self,
-        work: MmWorkItem,
-        tokenizer: Option<&dyn TextTokenizer>,
-    ) -> Result<MmProcessOutput, String>;
+    fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String>;
 }
 
 struct QwenMmProcessor {
@@ -79,18 +76,9 @@ impl QwenMmProcessor {
 }
 
 impl MmProcessor for QwenMmProcessor {
-    fn process(
-        &self,
-        work: MmWorkItem,
-        tokenizer: Option<&dyn TextTokenizer>,
-    ) -> Result<MmProcessOutput, String> {
+    fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String> {
         let input = super::payload::to_mm_input(work)?;
-        let output = sglang_mm::driver::process(self.family.as_ref(), input, |text| {
-            let tokenizer = tokenizer.ok_or_else(|| {
-                "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
-            })?;
-            tokenizer.encode(text).map_err(|error| error.to_string())
-        })?;
+        let output = sglang_mm::driver::process(self.family.as_ref(), input)?;
         let drain = sglang_mm::qwen_vl::pack_output(output)?;
         let features = if self.feature_shm {
             park_features_in_shm(&drain.features, &drain.grids)
@@ -114,42 +102,27 @@ impl MmProcessor for QwenMmProcessor {
 /// Shared state of the multimodal path, built once at worker startup.
 pub struct MmContext {
     pub processor: Arc<dyn MmProcessor>,
-    /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
-    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
     pub results: MmResultStore,
 }
 
 impl MmContext {
-    pub fn new(
-        spec: MmSpec,
-        tokenizer: Option<Arc<dyn TextTokenizer>>,
-        results: MmResultStore,
-    ) -> Result<Self, String> {
+    pub fn new(spec: MmSpec, results: MmResultStore) -> Result<Self, String> {
         Ok(Self {
             processor: Arc::new(QwenMmProcessor::new(spec)?),
-            tokenizer,
             results,
         })
     }
 
-    pub fn with_processor(
-        processor: Arc<dyn MmProcessor>,
-        tokenizer: Option<Arc<dyn TextTokenizer>>,
-        results: MmResultStore,
-    ) -> Self {
-        Self {
-            processor,
-            tokenizer,
-            results,
-        }
+    pub fn with_processor(processor: Arc<dyn MmProcessor>, results: MmResultStore) -> Self {
+        Self { processor, results }
     }
 }
 
-/// Run the pipeline for one request. `Ok` returns the final expanded ids, the
-/// buffers already parked; `Err` rejects the request back to the client.
+/// Run the processor for one request. `Ok` returns the final expanded ids,
+/// the buffers already parked; `Err` rejects the request back to the client.
 fn process(ctx: &MmContext, rid: &Rid, mut work: MmWorkItem) -> Result<Vec<i32>, String> {
     let caller_hashes = std::mem::take(&mut work.mm_hashes);
-    let mut output = ctx.processor.process(work, ctx.tokenizer.as_deref())?;
+    let mut output = ctx.processor.process(work)?;
     match &mut output.result {
         MmEncodedEntry::Qwen(entry) => apply_caller_hashes(entry.hashes.iter_mut(), &caller_hashes),
         MmEncodedEntry::External(entry) => {
@@ -174,9 +147,6 @@ pub struct MmWiring {
     /// Back-channel for the workers' `MmEncoded` / `MmFailed` into the
     /// to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the tokenizer pool (`None` under
-    /// `skip_tokenizer_init`).
-    pub tokenizer: Option<Arc<dyn TextTokenizer>>,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
@@ -234,14 +204,9 @@ mod tests {
     }
 
     impl MmProcessor for ExternalProcessor {
-        fn process(
-            &self,
-            work: MmWorkItem,
-            tokenizer: Option<&dyn TextTokenizer>,
-        ) -> Result<MmProcessOutput, String> {
-            assert!(tokenizer.is_none());
+        fn process(&self, work: MmWorkItem) -> Result<MmProcessOutput, String> {
             Ok(MmProcessOutput {
-                input_ids: work.input_ids.unwrap_or_default(),
+                input_ids: work.input_ids,
                 result: MmEncodedEntry::External(ExternalMmEncodedEntry {
                     items: vec![ExternalMmItem {
                         modality: MmModality::Image,
@@ -266,10 +231,10 @@ mod tests {
             shape: vec![1],
             offsets: vec![(1, 1)],
         };
-        let ctx = MmContext::with_processor(Arc::new(processor), None, results.clone());
+        let ctx = MmContext::with_processor(Arc::new(processor), results.clone());
         let rid = Rid::from_client("external");
         let work = MmWorkItem {
-            input_ids: Some(vec![1, 2]),
+            input_ids: vec![1, 2],
             mm_hashes: vec!["2a".to_owned()],
             ..Default::default()
         };
@@ -292,10 +257,10 @@ mod tests {
         ] {
             let results = MmResultStore::default();
             let processor = ExternalProcessor { shape, offsets };
-            let ctx = MmContext::with_processor(Arc::new(processor), None, results.clone());
+            let ctx = MmContext::with_processor(Arc::new(processor), results.clone());
             let rid = Rid::from_client("invalid");
             let work = MmWorkItem {
-                input_ids: Some(vec![1, 2]),
+                input_ids: vec![1, 2],
                 ..Default::default()
             };
             assert!(process(&ctx, &rid, work).is_err());

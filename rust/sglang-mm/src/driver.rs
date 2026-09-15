@@ -25,8 +25,10 @@ pub enum ImageSource {
 /// Typed multimodal request input. The server's message layer owns the wire
 /// format and parses its payload into this before calling [`process`].
 pub struct MmInput {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
+    /// The tokenized prompt with its placeholders still unexpanded — the
+    /// client's own ids or the tokenizer pool's. Tokenization is not this
+    /// pipeline's job: the layout step only needs ids.
+    pub input_ids: Vec<i32>,
     pub images: Vec<ImageSource>,
 }
 
@@ -73,11 +75,10 @@ fn add_media_bytes(total: u64, next: usize) -> Result<u64, String> {
 /// to the client — including inputs merely outside the pipeline's scope
 /// (video/audio, precomputed features, undecodable images), since there is
 /// no Python fallback path.
-pub fn process(
-    family: &dyn MmFamilyProcessor,
-    input: MmInput,
-    tokenize: impl FnOnce(&str) -> Result<Vec<i32>, String>,
-) -> Result<Output, String> {
+pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output, String> {
+    if input.input_ids.is_empty() {
+        return Err("multimodal request without input_ids".into());
+    }
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
@@ -108,16 +109,7 @@ pub fn process(
             Ok((item, hash))
         })?;
 
-    let input_ids = match input.input_ids {
-        Some(input_ids) if !input_ids.is_empty() => input_ids,
-        _ => {
-            let text = input
-                .text
-                .as_deref()
-                .ok_or("multimodal request without text or input_ids")?;
-            tokenize(text)?
-        }
-    };
+    let input_ids = input.input_ids;
     let geometries = processed
         .iter()
         .map(|(item, _)| item.geometry.clone())
@@ -161,11 +153,10 @@ mod tests {
     fn processes_typed_image_request() {
         let family = pipeline_from_spec(SPEC).unwrap();
         let input = MmInput {
-            text: None,
-            input_ids: Some(vec![7, 1, 8]),
+            input_ids: vec![7, 1, 8],
             images: vec![ImageSource::Bytes(png(8, 8))],
         };
-        let out = process(family.as_ref(), input, |_| Err("no tokenizer".into())).unwrap();
+        let out = process(family.as_ref(), input).unwrap();
         // 8x8, factor 4 → grid [1, 4, 4] → 16 patches / merge² = 4 tokens.
         assert_eq!(out.input_ids, vec![7, 1, 1, 1, 1, 8]);
         assert_eq!(out.offsets, vec![(1, 4)]);
@@ -211,15 +202,14 @@ mod tests {
 
         let family = pipeline_from_spec(SPEC).unwrap();
         let input = MmInput {
-            text: None,
-            input_ids: Some(vec![7, 1, 1, 1, 8]),
+            input_ids: vec![7, 1, 1, 1, 8],
             images: vec![
                 ImageSource::String(format!("http://{addr}/img.png")),
                 ImageSource::String(format!("file://{}", path.display())),
                 ImageSource::String(path.display().to_string()),
             ],
         };
-        let out = process(family.as_ref(), input, |_| unreachable!()).unwrap();
+        let out = process(family.as_ref(), input).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
@@ -234,15 +224,12 @@ mod tests {
     fn per_request_caps_enforced() {
         let family = pipeline_from_spec(SPEC).unwrap();
         let too_many = MmInput {
-            text: None,
-            input_ids: Some(vec![1]),
+            input_ids: vec![1],
             images: (0..=MAX_ITEMS_PER_REQUEST)
                 .map(|_| ImageSource::Bytes(vec![]))
                 .collect(),
         };
-        let err = process(family.as_ref(), too_many, |_| unreachable!())
-            .err()
-            .unwrap();
+        let err = process(family.as_ref(), too_many).err().unwrap();
         assert!(err.contains("media items"), "{err}");
 
         let err = add_media_bytes(MAX_REQUEST_BYTES / 2, (MAX_REQUEST_BYTES / 2 + 1) as usize)
@@ -254,22 +241,16 @@ mod tests {
     fn image_free_and_mismatched_requests_rejected() {
         let family = pipeline_from_spec(SPEC).unwrap();
         let no_images = MmInput {
-            text: None,
-            input_ids: Some(vec![7, 1]),
+            input_ids: vec![7, 1],
             images: vec![],
         };
-        let err = process(family.as_ref(), no_images, |_| unreachable!())
-            .err()
-            .unwrap();
+        let err = process(family.as_ref(), no_images).err().unwrap();
         assert!(err.contains("image sources"));
         let no_placeholder = MmInput {
-            text: None,
-            input_ids: Some(vec![7, 8]),
+            input_ids: vec![7, 8],
             images: vec![ImageSource::Bytes(png(8, 8))],
         };
-        let err = process(family.as_ref(), no_placeholder, |_| unreachable!())
-            .err()
-            .unwrap();
+        let err = process(family.as_ref(), no_placeholder).err().unwrap();
         assert!(err.contains("placeholder"));
     }
 }

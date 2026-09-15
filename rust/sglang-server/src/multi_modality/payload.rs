@@ -16,8 +16,9 @@ use crate::message::request::{MmWorkItem, ProcessorExtensions};
 /// prefetched on the async API layer; data URLs and bare base64 are decoded on
 /// the MM worker.
 pub struct ResolvedMediaWork {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
+    /// The prompt ids with placeholders unexpanded — always present, the
+    /// tokenizer pool having run first for a text prompt.
+    pub input_ids: Vec<i32>,
     pub images: Vec<Bytes>,
     pub videos: Vec<Bytes>,
     pub audios: Vec<Bytes>,
@@ -36,7 +37,6 @@ fn resolve_media_work_with_budget(
     max_request_bytes: u64,
 ) -> Result<ResolvedMediaWork, String> {
     let MmWorkItem {
-        text,
         input_ids,
         image_data,
         video_data,
@@ -54,7 +54,6 @@ fn resolve_media_work_with_budget(
         return Err("media prefetch produced more payloads than the request consumes".into());
     }
     Ok(ResolvedMediaWork {
-        text,
         input_ids,
         images,
         videos,
@@ -117,7 +116,6 @@ pub fn io_sources(items: &[MmItem]) -> Vec<String> {
 /// never a fetch.
 pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
     let MmWorkItem {
-        text,
         input_ids,
         image_data,
         video_data,
@@ -140,11 +138,7 @@ pub fn to_mm_input(work: MmWorkItem) -> Result<MmInput, String> {
     if images.is_empty() {
         return Err("no raw image sources in mm input".into());
     }
-    Ok(MmInput {
-        text,
-        input_ids,
-        images,
-    })
+    Ok(MmInput { input_ids, images })
 }
 
 fn image_source(
@@ -177,7 +171,7 @@ mod tests {
 
     fn image_work(image_data: Vec<MmItem>) -> MmWorkItem {
         MmWorkItem {
-            text: Some("prompt".into()),
+            input_ids: vec![7, 1, 8],
             image_data,
             ..Default::default()
         }

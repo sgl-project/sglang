@@ -186,7 +186,8 @@ impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
             // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
+            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating,
+            // or → Encoding for a multimodal prompt; the state's `then` says which).
             let event = {
                 let RequestKind::Generate(g) = &mut req.kind else {
                     tracing::error!("tokenizer pool received a non-generate request");
@@ -233,7 +234,7 @@ mod tests {
     use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
-    use crate::utils::fsm::RequestState;
+    use crate::utils::fsm::{AfterTokenize, RequestState};
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs
@@ -267,7 +268,9 @@ mod tests {
         req_tx
             .send(Request {
                 rid: "1".into(),
-                state: RequestState::Tokenizing,
+                state: RequestState::Tokenizing {
+                    then: AfterTokenize::PreSend,
+                },
                 sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
@@ -327,7 +330,9 @@ mod tests {
             req_tx
                 .send(Request {
                     rid: "1".into(),
-                    state: RequestState::Tokenizing,
+                    state: RequestState::Tokenizing {
+                        then: AfterTokenize::PreSend,
+                    },
                     sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),

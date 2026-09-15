@@ -504,17 +504,13 @@ mod python {
                 PyImageSource::Bytes(b) => crate::driver::ImageSource::Bytes(b),
             })
             .collect();
-        let input = crate::driver::MmInput {
-            text: None,
-            input_ids,
-            images,
-        };
+        let input_ids = input_ids
+            .ok_or_else(|| PyValueError::new_err("native parity API requires input_ids"))?;
+        let input = crate::driver::MmInput { input_ids, images };
         let packed = py
             .detach(move || {
                 let family = crate::registry::pipeline_from_spec(&spec_json)?;
-                let output = crate::driver::process(family.as_ref(), input, |_| {
-                    Err("native parity API requires input_ids".into())
-                })?;
+                let output = crate::driver::process(family.as_ref(), input)?;
                 pack_output(output)
             })
             .map_err(PyValueError::new_err)?;

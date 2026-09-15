@@ -73,7 +73,6 @@ impl Runtime {
     ) -> Result<(), String> {
         let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
             spec,
-            self.mm_wiring.tokenizer.clone(),
             self.mm_results.clone(),
         )?);
         self.spawn_mm_pool(workers, ctx);
@@ -87,7 +86,6 @@ impl Runtime {
     ) {
         let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
             processor,
-            self.mm_wiring.tokenizer.clone(),
             self.mm_results.clone(),
         ));
         self.spawn_mm_pool(workers, ctx);
@@ -179,8 +177,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
-    // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
-    // worker path (which encodes the placeholder-expanded prompt itself).
+    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
+    // never tokenize: a multimodal text prompt passes through the pool first.
     let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
@@ -343,7 +341,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
-            tokenizer: text_tokenizer,
         },
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),

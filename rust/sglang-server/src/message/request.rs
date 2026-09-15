@@ -563,8 +563,10 @@ pub struct MmRequest {
 /// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
+    /// The prompt ids with placeholders unexpanded. Always present by the
+    /// time a request reaches `Encoding`: the client's own, or the tokenizer
+    /// pool's (`Tokenizing { then: Encode }` runs first for a text prompt).
+    pub input_ids: Vec<i32>,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
@@ -731,13 +733,12 @@ impl GenerateRequest {
         })
     }
 
-    /// Carve out the MM worker's inputs: `text` is cloned (the scheduler header
-    /// still needs it), `input_ids` is taken (the expanded ids replace it), and
-    /// the mm values move wholesale.
+    /// Carve out the MM worker's inputs: `input_ids` is taken (the expanded
+    /// ids replace it) and the mm values move wholesale. `text` stays — the
+    /// scheduler header still needs it, and the worker does not.
     pub fn take_mm_work(&mut self) -> MmWorkItem {
         let mut work = MmWorkItem {
-            text: self.text.clone(),
-            input_ids: self.input_ids.take(),
+            input_ids: self.input_ids.take().unwrap_or_default(),
             ..Default::default()
         };
         if let Some(m) = self.mm.as_deref_mut() {
@@ -1216,20 +1217,28 @@ mod tests {
         }
     }
 
-    /// `take_mm_work` clones `text` (the scheduler header still needs it) and
-    /// moves everything the worker owns out of the request.
+    /// `take_mm_work` takes `input_ids` (the expanded ids replace them) and
+    /// moves everything the worker owns out of the request. `text` is not part
+    /// of the work item: a text prompt reaches `Encoding` already tokenized.
     #[test]
     fn mm_work_item_takes_owned_fields() {
         let (mut ps, _) =
-            requests(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
+            requests(r#"{"input_ids": [7, 1, 8], "image_data": ["u1", "u2"], "audio_data": "a"}"#)
+                .unwrap();
         let work = ps[0].take_mm_work();
-        assert_eq!(work.text.as_deref(), Some("hi"));
-        assert!(work.input_ids.is_none());
+        assert_eq!(work.input_ids, vec![7, 1, 8]);
         assert_eq!(work.image_data.len(), 2);
         assert!(work.video_data.is_empty());
         assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
-        // Moved out, not cloned; `text` survives for the header.
+        // Moved out, not cloned.
+        assert!(ps[0].input_ids.is_none());
         assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
+
+        // A text prompt keeps its text for the scheduler header; the worker
+        // gets whatever ids the tokenizer pool filled in.
+        let (mut ps, _) = requests(r#"{"text": "hi", "image_data": "u"}"#).unwrap();
+        ps[0].input_ids = Some(vec![9]);
+        assert_eq!(ps[0].take_mm_work().input_ids, vec![9]);
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 

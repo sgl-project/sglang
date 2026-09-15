@@ -198,7 +198,10 @@ impl Intake {
                             // The Rust MM pipeline produces the final input_ids,
                             // so it wins even over a pre-tokenized prompt (which
                             // still needs placeholder expansion) — the same
-                            // precedence as the Python TokenizerManager.
+                            // precedence as the Python TokenizerManager. The MM
+                            // worker expands placeholders in ids only, so the
+                            // route is Tokenizing → Encoding; a prompt that
+                            // already has ids skips the pool hop, not the state.
                             Ok(()) if self.mm.enabled && g.has_multimodal() => {
                                 Ok(ValidationOutcome::HasMultimodal)
                             }
@@ -214,7 +217,8 @@ impl Intake {
                             let _ = req.state.apply(Event::Error(e)); // → Failed
                         }
                         Ok(o) => {
-                            // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.
+                            // AlreadyTokenized → PreSendValidating; NeedsTokenize
+                            // and HasMultimodal → Tokenizing (then PreSend / Encode).
                             let _ = req.state.apply(Event::Validated(o));
                         }
                     }
@@ -254,9 +258,18 @@ impl Intake {
                     return;
                 }
                 // Hand off to the tokenizer pool; it returns the request as a
-                // `Tokenized` event (PreSendValidating, or Failed on error).
-                // Doesn't loop.
-                RequestState::Tokenizing => {
+                // `Tokenized` event (`then`: PreSendValidating or Encoding — or
+                // Failed on error). Doesn't loop — except for a prompt that
+                // already carries ids (a pre-tokenized multimodal request), which
+                // has nothing for the pool: apply `TokenizeDone` here and keep
+                // driving, so the state walks the same fixed order without the hop.
+                RequestState::Tokenizing { .. } => {
+                    if let RequestKind::Generate(g) = &req.kind
+                        && g.already_tokenized()
+                    {
+                        let _ = req.state.apply(Event::TokenizeDone);
+                        continue;
+                    }
                     if let Err(err) = self.senders.tokenizer_tx.send(req) {
                         // Pool gone (workers exited); flume hands the request back.
                         let mut req = err.into_inner();

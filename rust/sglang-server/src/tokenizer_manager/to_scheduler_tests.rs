@@ -5,7 +5,7 @@ use crate::message::request::GenerateRequest;
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
-use crate::utils::fsm::RequestState;
+use crate::utils::fsm::{AfterTokenize, RequestState};
 use tokio::sync::mpsc;
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —
@@ -761,8 +761,8 @@ fn tokenize_pool_gone_deregisters() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
-/// Build a generate request carrying an image. The parked entry and the
-/// `MmEncoded` resume path agree on identity via the rid string.
+/// Build a generate request carrying an image and a text prompt. The parked
+/// entry and the `MmEncoded` resume path agree on identity via the rid string.
 fn mm_generate_req(rid: &str) -> Request {
     let (tx, _rx) = mpsc::channel(8);
     Request {
@@ -783,13 +783,62 @@ fn mm_generate_req(rid: &str) -> Request {
     }
 }
 
+/// The same request with client-supplied ids: passes `Tokenizing` without a
+/// pool hop (intake applies `TokenizeDone` itself) and parks in `Encoding`.
+fn mm_pretokenized_req(rid: &str) -> Request {
+    let mut req = mm_generate_req(rid);
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = Some(vec![7, 1, 8]);
+    }
+    req
+}
+
+/// An intake whose tokenizer receiver is returned rather than dropped, for
+/// the tests that watch a request enter the pool. The detok receiver is
+/// returned too: dropped, registration fails and nothing reaches the pool.
+fn make_intake_with_tokenizer(
+    mm_enabled: bool,
+) -> (
+    Intake,
+    flume::Receiver<Request>,
+    flume::Receiver<MmRequest>,
+    ToSchedulerRx,
+    flume::Receiver<DetokMsg>,
+) {
+    let (tok_tx, tok_rx) = flume::unbounded();
+    let (detok_tx, detok_rx) = flume::unbounded();
+    let senders = Senders {
+        tok_manager_tx: flume::unbounded().0,
+        abort_tx: flume::unbounded().0,
+        tokenizer_tx: tok_tx,
+        detokenizer_tx: vec![detok_tx],
+    };
+    let (to_scheduler_tx, consumer) = to_scheduler(16);
+    let (_tm_tx, tm_rx) = flume::unbounded();
+    let (mm_tx, mm_rx) = flume::unbounded();
+    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+    std::mem::forget(abort_tx);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let intake = Intake::new(
+        tm_rx,
+        abort_rx,
+        senders,
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(mm_tx, mm_enabled),
+        sd_rx,
+    );
+    (intake, tok_rx, mm_rx, consumer, detok_rx)
+}
+
 /// An abort while the request is parked for MM cancels it: the pending
 /// entry is removed, the worker's late result is dropped, and its parked
 /// result-store entry is purged — no scheduler work runs for a dead client.
 #[test]
 fn abort_cancels_parked_mm_request() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-gone"));
+    intake.drive(mm_pretokenized_req("mm-gone"));
     mm_rx.try_recv().expect("parked to mm pool");
 
     // The worker parks its result, as it always does before MmEncoded.
@@ -818,19 +867,22 @@ fn abort_cancels_parked_mm_request() {
     assert!(intake.mm.results.take("mm-gone").is_none(), "entry purged");
 }
 
-/// A multimodal request parks in `Encoding` (submitted to the mm worker
-/// pool, not the tokenizer pool, not the ring) until `MmEncoded` resumes
-/// it → ring.
+/// A pre-tokenized multimodal request parks in `Encoding` (submitted to the
+/// mm worker pool, not the tokenizer pool, not the ring) until `MmEncoded`
+/// resumes it → ring.
 #[test]
 fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-1"));
+    intake.drive(mm_pretokenized_req("mm-1"));
 
     // Submitted to the mm pool with the typed work item; nothing on the ring yet.
     let sub = mm_rx.try_recv().expect("mm pool must receive the request");
     assert_eq!(sub.rid.as_str(), "mm-1");
-    assert_eq!(sub.work.text.as_deref(), Some("<image> hi"));
-    assert!(sub.work.input_ids.is_none(), "no client input_ids");
+    assert_eq!(
+        sub.work.input_ids,
+        vec![7, 1, 8],
+        "the client's ids, unexpanded"
+    );
     assert_eq!(
         sub.work.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
@@ -848,11 +900,68 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     );
 }
 
+/// A multimodal *text* prompt visits the tokenizer pool first
+/// (`Tokenizing { then: Encode }`), then parks in `Encoding` carrying the
+/// pool's ids — the MM worker never sees text. `MmEncoded` then resumes it → ring.
+#[test]
+fn mm_text_prompt_tokenizes_then_encodes() {
+    let (mut intake, tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    intake.drive(mm_generate_req("mm-t"));
+
+    // In the pool, not the mm channel, not the ring.
+    let mut req = tok_rx
+        .try_recv()
+        .expect("text prompt must go to the tokenizer pool");
+    assert!(
+        matches!(
+            req.state,
+            RequestState::Tokenizing {
+                then: AfterTokenize::Encode
+            }
+        ),
+        "{:?}",
+        req.state
+    );
+    assert!(
+        mm_rx.try_recv().is_err(),
+        "nothing submitted to the mm pool yet"
+    );
+    assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+
+    // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.input_ids = Some(vec![7, 1, 8]);
+    }
+    req.state.apply(Event::TokenizeDone).unwrap();
+    assert!(matches!(req.state, RequestState::Encoding));
+    intake.drive(req);
+
+    let sub = mm_rx
+        .try_recv()
+        .expect("mm pool must receive the tokenized request");
+    assert_eq!(sub.rid.as_str(), "mm-t");
+    assert_eq!(
+        sub.work.input_ids,
+        vec![7, 1, 8],
+        "the pool's ids, unexpanded"
+    );
+    assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
+
+    intake.on_mm_encoded("mm-t".to_string().into(), vec![7, 1, 1, 1, 1, 8]);
+    let batch = consumer.drain(16);
+    assert_eq!(batch.headers.len(), 1);
+    assert_eq!(
+        batch.lengths,
+        vec![6],
+        "expanded ids ride the columnar cell"
+    );
+}
+
 /// A worker failure rejects the parked request (deregister, no ring push).
 #[test]
 fn mm_failure_rejects_parked_request() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-    intake.drive(mm_generate_req("mm-2"));
+    intake.drive(mm_pretokenized_req("mm-2"));
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })),
         "registered before parking",
@@ -872,39 +981,24 @@ fn mm_failure_rejects_parked_request() {
 /// TokenizerManager behavior when `mm_processor is None`.
 #[test]
 fn mm_fields_ignored_when_disabled() {
-    let (tok_tx, tok_rx) = flume::unbounded();
-    let (detok_tx, _detok_rx) = flume::unbounded();
-    let senders = Senders {
-        tok_manager_tx: flume::unbounded().0,
-        abort_tx: flume::unbounded().0,
-        tokenizer_tx: tok_tx,
-        detokenizer_tx: vec![detok_tx],
-    };
-    let (to_scheduler_tx, _consumer) = to_scheduler(16);
-    let (_tm_tx, tm_rx) = flume::unbounded();
-    let (mm_tx, mm_rx) = flume::unbounded();
-    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-    std::mem::forget(abort_tx);
-    let (sd_tx, sd_rx) = flume::unbounded::<()>();
-    std::mem::forget(sd_tx);
-    let mut intake = Intake::new(
-        tm_rx,
-        abort_rx,
-        senders,
-        to_scheduler_tx,
-        test_limits(),
-        test_mm(mm_tx, false),
-        sd_rx,
-    );
+    let (mut intake, tok_rx, mm_rx, _consumer, _detok_rx) = make_intake_with_tokenizer(false);
 
     intake.drive(mm_generate_req("mm-3"));
     assert!(
         mm_rx.try_recv().is_err(),
         "mm disabled: nothing submitted to the mm channel",
     );
+    let req = tok_rx
+        .try_recv()
+        .expect("request must fall through to plain tokenization");
     assert!(
-        tok_rx.try_recv().is_ok(),
-        "request must fall through to plain tokenization",
+        matches!(
+            req.state,
+            RequestState::Tokenizing {
+                then: AfterTokenize::PreSend
+            }
+        ),
+        "plain text: the pool return goes straight to the pre-send checks"
     );
 }
 
