@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -303,6 +304,33 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+_FUSED_KDA_PROJECTION_GROUPS = ("fused_qkvbfg_a_proj", "fused_fg_b_proj")
+
+
+def _fused_qkvbfg_is_unquantized(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    if quant_config is None:
+        return True
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    # GLM-5.3-Flash lists every KDA projection in modules_to_not_convert.
+    mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
+    # is_layer_skipped raises on a fused group whose shards disagree.
+    for group in _FUSED_KDA_PROJECTION_GROUPS:
+        for name in mapping[group]:
+            probe = LinearBase(
+                input_size=1,
+                output_size=1,
+                quant_config=quant_config,
+                prefix=f"{prefix}.{name}",
+            )
+            if not isinstance(probe.quant_method, UnquantizedLinearMethod):
+                return False
+    return True
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -337,7 +365,9 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = head_shard_size == self.tp_size and (
+            _fused_qkvbfg_is_unquantized(quant_config=quant_config, prefix=prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -351,7 +381,8 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # Not every quantizer maps the fused name back to the constituents.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
@@ -359,13 +390,12 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_heads // head_shard_size,
                 2 * self.head_dim,
             ]
-            fused_dtype = (
-                getattr(config, "dtype", None)
-                or getattr(config, "torch_dtype", None)
-                or torch.get_default_dtype()
-            )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                batch=2,
+                input_size=self.head_dim,
+                output_size=projection_size,
+                # The loader can override the dtype the checkpoint declares.
+                dtype=self.fused_qkvbfg_a_proj.params_dtype,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
