@@ -768,8 +768,10 @@ ChatCompletionMessageParam = Union[
 class Function(BaseModel):
     """Function descriptions."""
 
-    description: Optional[str] = Field(default=None, examples=[None])
+    # Declaration order is the order model_dump() feeds the chat template,
+    # so it must match OpenAI's: name, description, parameters, strict.
     name: str
+    description: Optional[str] = Field(default=None, examples=[None])
     parameters: Optional[object] = None
     strict: bool = False
     defer_loading: Optional[bool] = None
