@@ -24,6 +24,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -38,6 +39,8 @@ from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +63,14 @@ class StorageOperation(BaseStorageOperation):
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
-        request_id: str,
+        handle: CacheRequestHandle,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
-        self.request_id = request_id
+        self.handle = handle
+        self.request_id = handle.rid
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
@@ -541,14 +545,14 @@ class HybridCacheController(BaseHiCacheController):
 
     def prefetch(
         self,
-        request_id: str,
+        handle: CacheRequestHandle,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
-            request_id,
+            handle,
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
@@ -576,7 +580,7 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        hash_value = self.get_hash_str(
+        hash_value = get_storage_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
