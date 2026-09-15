@@ -1046,7 +1046,7 @@ void fp8_per_tensor_scaled_mm_kernel_impl(
             /*   Btmp      */ Btmp + nb_offset * BLOCK_N * K,
             /*   Ctmp      */ Ctmp,
             /*   scale     */ scale2,
-            /*   bias      */ bias + nb_start,
+            /*   bias      */ has_bias ? bias + nb_start : nullptr,
             /*   M         */ mb_size,
             /*   N         */ nb_size,
             /*   K         */ K,
@@ -1111,14 +1111,10 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg,
     bool do_unpack) {
-  if (bias != nullptr) {
-    tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, true>(
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, has_bias>(
         A, B, C, Btmp, Ctmp, scale2, bias, M, N, K, lda, ldb, ldc, brg, do_unpack);
-    return;
-  }
-
-  tinygemm_kernel2<scalar_t, at::Float8_e4m3fn, false>(
-      A, B, C, Btmp, Ctmp, scale2, nullptr, M, N, K, lda, ldb, ldc, brg, do_unpack);
+  });
 }
 
 template <typename scalar_t>
