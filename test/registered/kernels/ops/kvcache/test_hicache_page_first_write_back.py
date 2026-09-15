@@ -15,9 +15,15 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import can_use_write_back_jit_kernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host import common as pool_host_common
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    _cuda_host_unregister,
+    _resolve_device_accessible_ptr_fn,
+    alloc_with_host_register,
     alloc_with_pin_memory,
+    make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -267,8 +273,49 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     _run_mla(element_dim, page_count)
 
 
+@pytest.mark.skipif(
+    is_hip(),
+    reason="ROCm maps registered host memory at a distinct device address.",
+)
+def test_registered_mmap_kernel_ptr_table_fallback_matches_device_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sglang-kernel predating ``get_device_accessible_ptr`` makes
+    ``make_kernel_ptr_table`` fall back to raw host addresses. That fallback is
+    only sound while CUDA maps registered host memory at the host address itself,
+    so the two tables must agree.
+    """
+    if _resolve_device_accessible_ptr_fn() is None:
+        pytest.skip(
+            "installed sglang-kernel has no get_device_accessible_ptr; "
+            "build it from python/sglang/kernels/aot to run this test"
+        )
+
+    buffer = alloc_with_host_register(
+        (PAGE_SIZE * 4, 128),
+        torch.bfloat16,
+        "cpu",
+        True,
+        HostTensorAllocator(),
+    )
+    try:
+        aliased = make_kernel_ptr_table([buffer], DEVICE, host_memory_registered=True)
+        monkeypatch.setattr(
+            pool_host_common, "_resolve_device_accessible_ptr_fn", lambda: None
+        )
+        raw = make_kernel_ptr_table([buffer], DEVICE, host_memory_registered=True)
+        assert torch.equal(aliased, raw)
+    finally:
+        _cuda_host_unregister(buffer)
+
+
 def test_registered_mmap_pointer_domains_and_all_layer_transfer() -> None:
-    from sgl_kernel.kvcacheio import get_device_accessible_ptr
+    get_device_accessible_ptr = _resolve_device_accessible_ptr_fn()
+    if get_device_accessible_ptr is None:
+        pytest.skip(
+            "installed sglang-kernel has no get_device_accessible_ptr; "
+            "build it from python/sglang/kernels/aot to run this test"
+        )
 
     device_pool = MLATokenToKVPool(
         size=PAGE_SIZE * 4,

@@ -11,8 +11,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
@@ -253,24 +256,29 @@ def alloc_with_pin_memory(
 
 @lru_cache(maxsize=1)
 def _resolve_device_accessible_ptr_fn():
-    """Return the AOT helper mapping a registered host tensor to its device alias.
-
-    Returns None when the installed sglang-kernel wheel predates the op, so a
-    source tree newer than its pinned wheel keeps working: callers then fall
-    back to the raw CPU address, which is what kernels used before the op
-    existed and is device-accessible wherever the registered host mapping is
-    address-identical (every supported NVIDIA GPU).
-    """
     try:
         from sgl_kernel.kvcacheio import get_device_accessible_ptr
     except ImportError:
+        get_device_accessible_ptr = None
+    else:
+        if not hasattr(torch.ops.sgl_kernel, "get_device_accessible_ptr"):
+            get_device_accessible_ptr = None
+
+    if get_device_accessible_ptr is None:
+        # HIP maps registered host memory at a device address distinct from the
+        # host one, so there is no valid fallback; CUDA's UVA makes the two equal.
+        if _is_hip:
+            raise ImportError(
+                "sgl_kernel.kvcacheio.get_device_accessible_ptr is missing from the "
+                "installed sglang-kernel. It is required on ROCm, where registered "
+                "host memory carries a distinct device address. Rebuild sglang-kernel "
+                "from python/sglang/kernels/aot (setup_rocm.py)."
+            )
         logger.warning(
-            "sgl_kernel.kvcacheio.get_device_accessible_ptr is unavailable in the "
-            "installed sglang-kernel wheel. Falling back to raw host addresses for "
-            "kernel pointer tables. On devices whose registered host mapping uses a "
-            "distinct device address (e.g. MI355X), upgrade sglang-kernel."
+            "sgl_kernel.kvcacheio.get_device_accessible_ptr is missing from the "
+            "installed sglang-kernel; using raw host addresses for kernel pointer "
+            "tables. Build sglang-kernel from python/sglang/kernels/aot to enable it."
         )
-        return None
     return get_device_accessible_ptr
 
 
