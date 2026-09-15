@@ -1,4 +1,5 @@
-from contextlib import nullcontext
+import weakref
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -317,6 +318,240 @@ def test_receiver_orders_source_handoffs_on_its_stage_process_group():
         receiver.receive()
     assert events == [[[0]], [[0]], "handoff", [[0, 1]], [[0, 1]], [[0, 1]], [[0, 1]]]
     barrier.assert_called_once_with(group=receiver._pg)
+
+
+def _concurrent_pp_receivers(*, fp8=True, layers_per_stage=(1, 1)):
+    model = _model() if fp8 else _bf16_moe_tp_model()
+    template = model.model.layers[0]
+    model.model.layers = torch.nn.ModuleList(
+        [deepcopy(template) for _ in range(sum(layers_per_stage))]
+    )
+    base_manifest = _manifest() if fp8 else _bf16_moe_tp_manifest()
+    receivers = []
+    layer = 0
+    for stage, count in enumerate(layers_per_stage):
+        manifest = deepcopy(base_manifest)
+        manifest["pp_rank"] = stage
+        manifest["entries"] = []
+        for _ in range(count):
+            entries = deepcopy(base_manifest["entries"])
+            for entry in entries:
+                entry["pp_rank"] = stage
+                for field in ("name", "pair_id"):
+                    if field in entry:
+                        entry[field] = entry[field].replace(
+                            "layers.0.", f"layers.{layer}."
+                        )
+                entry["destination"]["parameter"] = entry["destination"][
+                    "parameter"
+                ].replace("layers.0.", f"layers.{layer}.")
+            manifest["entries"].extend(entries)
+            layer += 1
+        receiver = _receiver(
+            manifest, model=model, topology=_TOPOLOGY if fp8 else _MOE_TP_TOPOLOGY
+        )
+        receiver.comm_ptr = 101 + stage
+        receiver._pg = object()
+        receiver.stream = Mock()
+        receiver._entries = receiver._validate_manifest(4)
+        receivers.append(receiver)
+    return model, receivers
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_concurrent_pp_receives_interleave_streams_and_keep_buffers_alive(fp8):
+    model, receivers = _concurrent_pp_receivers(fp8=fp8, layers_per_stage=(1, 2))
+    events = []
+    pending = {receiver.comm_ptr: [] for receiver in receivers}
+    active_stream = None
+    update = 0
+
+    @contextmanager
+    def stream_context(stream):
+        nonlocal active_stream
+        # A suspended stage must exit its CUDA stream context before yielding.
+        assert active_stream is None
+        active_stream = stream
+        try:
+            yield
+        finally:
+            active_stream = None
+
+    def drain(receiver):
+        assert active_stream is None
+        events.append(("sync", receiver.comm_ptr))
+        for callback in pending[receiver.comm_ptr]:
+            callback()
+        pending[receiver.comm_ptr].clear()
+
+    def transfer(source, destination, comm_ptr, stream, **kwargs):
+        assert active_stream is stream
+        events.append(("enqueue", comm_ptr))
+        reference = weakref.ref(destination)
+
+        def complete():
+            tensor = reference()
+            assert (
+                tensor is not None
+            ), "receive buffer released before its stream completed"
+            tensor.fill_(comm_ptr - 100 + update)
+
+        pending[comm_ptr].append(complete)
+
+    for receiver in receivers:
+        receiver.stream.synchronize.side_effect = lambda receiver=receiver: drain(
+            receiver
+        )
+        destination_impl = receiver._destination
+
+        def destination(entry, shape, receiver=receiver, impl=destination_impl):
+            tensor, copy_back = impl(entry, shape)
+            if copy_back is None:
+                return tensor, None
+
+            def enqueue_copy():
+                assert active_stream is receiver.stream
+                pending[receiver.comm_ptr].append(copy_back)
+
+            return tensor, enqueue_copy
+
+        receiver._destination = destination
+
+    m2n = Mock()
+    # Do not use Mock call recording here: it would itself retain destinations
+    # and hide a premature release by the receiver.
+    m2n.reshard = transfer
+    with (
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", side_effect=stream_context),
+    ):
+        for update in (0, 2):
+            events.clear()
+            NcclM2NReceiver.receive_many(receivers)
+            assert events[:3] == [("enqueue", 101), ("enqueue", 102), ("sync", 101)]
+            per_layer = 6 if fp8 else 3
+            assert [comm for kind, comm in events if kind == "enqueue"] == (
+                [101, 102] * per_layer + [102] * per_layer
+            )
+            assert all(not work for work in pending.values())
+            for layer, stage in enumerate((0, 1, 1)):
+                for parameter in model.model.layers[layer].mlp.experts.parameters():
+                    assert torch.all(parameter.float() == stage + 1 + update)
+
+
+def test_concurrent_pp_handoffs_use_only_their_own_stage_group():
+    _, receivers = _concurrent_pp_receivers()
+    events = []
+    for index, receiver in enumerate(receivers):
+        # Stagger the handoffs: PP0 changes source mesh after its first pair,
+        # PP1 after its second. Neither handoff may use the other stage's group.
+        for entry in receiver.manifest["entries"][: 2 * (index + 1)]:
+            source = entry["source"]
+            source["mesh"] = [[0]]
+            source["local_shape"][0] *= 2
+            source["names_by_rank"] = {
+                "0": [
+                    name for names in source["names_by_rank"].values() for name in names
+                ]
+            }
+        receiver._entries = receiver._validate_manifest(4)
+    m2n = Mock()
+    m2n.reshard.side_effect = lambda src, dst, comm, stream, **kw: events.append(
+        ("receive", comm, kw["src_mesh"])
+    )
+    with (
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+        patch(
+            "torch.distributed.barrier",
+            side_effect=lambda group: events.append(("handoff", group)),
+        ),
+    ):
+        NcclM2NReceiver.receive_many(receivers)
+    expected = []
+    for entry in range(6):
+        for stage, receiver in enumerate(receivers):
+            handoff = 2 * (stage + 1)
+            if entry == handoff:
+                expected.append(("handoff", receiver._pg))
+            expected.append(
+                ("receive", receiver.comm_ptr, [[0]] if entry < handoff else [[0, 1]])
+            )
+    assert events == expected
+
+
+def test_concurrent_receive_failure_drains_all_streams_before_releasing_buffers():
+    _, receivers = _concurrent_pp_receivers()
+    references = []
+    drains = []
+
+    def transfer(source, destination, *args, **kwargs):
+        references.append(weakref.ref(destination))
+
+    def drain(index):
+        assert len(references) == 2
+        assert all(reference() is not None for reference in references)
+        drains.append(index)
+        if index == 0:
+            raise RuntimeError("secondary drain failure")
+
+    for index, receiver in enumerate(receivers):
+        receiver.stream.synchronize.side_effect = lambda index=index: drain(index)
+    destination_impl = receivers[1]._destination
+
+    def failing_destination(entry, shape):
+        tensor, _ = destination_impl(entry, shape)
+
+        def fail():
+            raise RuntimeError("injected copy failure")
+
+        return tensor, fail
+
+    receivers[1]._destination = failing_destination
+    m2n = Mock()
+    m2n.reshard = transfer
+    with (
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+        pytest.raises(RuntimeError, match="injected copy failure"),
+    ):
+        NcclM2NReceiver.receive_many(receivers)
+    assert drains == [0, 1]
+    assert references[0]() is not None
+    with pytest.raises(RuntimeError, match="destroyed before retrying"):
+        receivers[0]._prepare_receive()
+    # The failed receiver retains its buffer through a failed teardown too.
+    with patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n):
+        receivers[0].stream.synchronize.side_effect = RuntimeError("drain failed again")
+        with pytest.raises(RuntimeError, match="drain failed again"):
+            receivers[0].destroy()
+        assert references[0]() is not None
+        receivers[0].stream.synchronize.side_effect = None
+        receivers[0].destroy()
+    assert receivers[0]._failed_receive_buffers is None
+    assert receivers[0].comm_ptr is None
+
+
+@pytest.mark.parametrize("conflict", ["communicator", "stage", "parameter", "model"])
+def test_concurrent_receive_rejects_unsafe_batches_before_launch(conflict):
+    _, receivers = _concurrent_pp_receivers()
+    if conflict == "communicator":
+        receivers[1].comm_ptr = receivers[0].comm_ptr
+    elif conflict == "stage":
+        receivers[1].manifest["pp_rank"] = 0
+    elif conflict == "parameter":
+        receivers[1].manifest["entries"] = receivers[0].manifest["entries"]
+    else:
+        receivers[1].model = _model()
+    for receiver in receivers:
+        receiver._prepare_receive = Mock()
+    with pytest.raises(ValueError):
+        NcclM2NReceiver.receive_many(receivers)
+    for receiver in receivers:
+        receiver._prepare_receive.assert_not_called()
 
 
 def test_pp_receivers_keep_separate_communicators_and_destination_storage_across_updates():

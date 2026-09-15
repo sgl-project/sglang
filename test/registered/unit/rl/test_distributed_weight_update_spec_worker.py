@@ -184,6 +184,93 @@ def test_m2n_receive_forces_post_load_even_after_residual_broadcast():
     target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
 
 
+def test_concurrent_m2n_waves_finalize_once_after_residual_updates():
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=None,
+    )
+    for groups in (["pp0", "pp1"], ["pp2", "pp3"]):
+        req = _distributed_req(selector="target")
+        req.load_format = "nccl_m2n"
+        req.group_name = groups[0]
+        req.m2n_group_names = groups
+        assert manager.update_weights_from_distributed(req).success
+        target_runner.end_weight_update.assert_not_called()
+    assert target_runner.receive_weights_from_m2n_groups.call_args_list == [
+        call(["pp0", "pp1"]),
+        call(["pp2", "pp3"]),
+    ]
+    target_runner.receive_weights_from_m2n.assert_not_called()
+    # The residual path still follows the entire bulk update and finalizes once.
+    assert manager.update_weights_from_distributed(_distributed_req()).success
+    with patch("torch.distributed.barrier"):
+        assert manager.end_weight_update(EndWeightUpdateReqInput()).success
+    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
+
+
+@pytest.mark.parametrize("groups", [None, ["pp0", "pp1"]])
+def test_concurrent_m2n_groups_survive_scheduler_ipc(groups):
+    import msgspec
+
+    req = _distributed_req()
+    req.m2n_group_names = groups
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(req), type=type(req))
+    assert decoded.m2n_group_names == groups
+    assert decoded.group_name == req.group_name
+    assert decoded.flush_cache is False
+    # Fields are positional on the wire; older single-group messages should
+    # decode with the appended field's default, not shift existing fields.
+    legacy = msgspec.msgpack.decode(msgspec.msgpack.encode(req))[:-1]
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(legacy), type=type(req))
+    assert decoded.m2n_group_names is None
+    assert decoded.selector == req.selector
+
+
+@pytest.mark.parametrize("groups", [[], ["wrong-first-group"]])
+def test_concurrent_m2n_rejects_malformed_request_before_receive(groups):
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(model_runner=target_runner), draft_worker=None
+    )
+    req = _distributed_req()
+    req.load_format = "nccl_m2n"
+    req.m2n_group_names = groups
+    output = manager.update_weights_from_distributed(req)
+    assert not output.success
+    target_runner.receive_weights_from_m2n_groups.assert_not_called()
+
+
+def test_concurrent_m2n_request_cannot_fall_through_to_broadcast():
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(model_runner=target_runner), draft_worker=None
+    )
+    req = _distributed_req()
+    req.m2n_group_names = [req.group_name, "pp1"]
+    assert not manager.update_weights_from_distributed(req).success
+    target_runner.receive_weights_from_distributed.assert_not_called()
+
+
+def test_model_runner_resolves_complete_m2n_wave_before_receiving():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    receivers = {"pp0": Mock(), "pp1": Mock()}
+    runner = SimpleNamespace(_m2n_receivers=receivers)
+    with patch(
+        "sglang.srt.weight_sync.nccl_m2n.NcclM2NReceiver.receive_many"
+    ) as receive:
+        for groups in ([], ["pp0", "pp0"], ["pp0", "missing"]):
+            with pytest.raises((ValueError, RuntimeError)):
+                ModelRunner.receive_weights_from_m2n_groups(runner, groups)
+            receive.assert_not_called()
+        ModelRunner.receive_weights_from_m2n_groups(runner, ["pp0", "pp1"])
+        receive.assert_called_once_with([receivers["pp0"], receivers["pp1"]])
+
+
 def test_m2n_group_initialization_rejects_a_draft_runner():
     tp_worker = Mock()
     tp_worker.init_weights_update_group.return_value = (True, "Success")
