@@ -91,7 +91,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile-by-stage",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=False,
         help="Whether to profile prefill and decode separately",
     )
@@ -103,35 +102,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cpu",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=True,
         help="Whether to profile CPU activity",
     )
     parser.add_argument(
         "--gpu",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=True,
         help="Whether to profile GPU activity",
     )
     parser.add_argument(
         "--mem",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=False,
         help="Whether to profile memory usage (https://pytorch.org/memory_viz)",
     )
     parser.add_argument(
         "--rpd",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=False,
         help="Whether to use ROCM rpd profiler (https://github.com/ROCm/rocmProfileData)",
     )
     parser.add_argument(
         "--merge-profiles",
         action=argparse.BooleanOptionalAction,
-        type=bool,
         default=False,
         help="Whether to merge profiles from all ranks into a single trace file",
     )
