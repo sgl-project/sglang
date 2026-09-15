@@ -820,8 +820,14 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
-    def _kernel_num_heads(self, num_tokens: int) -> int:
+    def _kernel_num_heads(self, num_tokens: int, attn_backend=None) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        if not getattr(attn_backend, "pads_tp_q_heads", True):
+            # The trtllm-gen sparse kernel takes per-rank head counts natively
+            # (verified bit-identical h=16 vs padded h=64), so it opts out of
+            # the FlashMLA {64, 128} head padding entirely.
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -1073,7 +1079,20 @@ class MQALayer(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
-            q_out = torch.empty_like(q)
+            # The trtllm-gen backend consumes q as e4m3: have the fused
+            # kernel store fp8 directly (bit-identical to a bf16 store
+            # followed by .to(float8_e4m3fn)) instead of paying a separate
+            # per-layer cast pass. Paths that pass a preallocated bf16
+            # q_out (TP head padding) keep the backend-side cast.
+            fp8_out = getattr(self, "_q_fp8_out", None)
+            if fp8_out is None:
+                fp8_out = bool(getattr(get_attn_backend(), "trtllm_attn", False))
+                self._q_fp8_out = fp8_out
+            q_out = torch.empty(
+                q.shape,
+                dtype=torch.float8_e4m3fn if fp8_out else q.dtype,
+                device=q.device,
+            )
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -1198,6 +1217,13 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is consumed on stream_kv (a stream it was not allocated on),
+        # so its reference must outlive the stream join above: dropping it
+        # right after the fork lets the caching allocator hand its block to a
+        # later allocation with no cross-stream dependency edge, and under
+        # CUDA graph capture the recorded overwrite races the side-stream KV
+        # store on replay (silently garbage KV; see the TP bs=1 collapse).
         del qkv_a
 
         return q
@@ -1799,7 +1825,7 @@ class MQALayer(MqaAttentionBase):
                 k_rope = rope_pool.new_empty((x.shape[0], rope_pool.shape[-1]))
             kernel_num_heads = self.n_local_heads
         else:
-            kernel_num_heads = self._kernel_num_heads(x.shape[0])
+            kernel_num_heads = self._kernel_num_heads(x.shape[0], attn_backend)
             if kernel_num_heads != self.n_local_heads:
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
@@ -1892,8 +1918,11 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                # Attention emits bf16 regardless of q's dtype (q may be e4m3
+                # on the trtllm fused-q path); don't derive o's dtype from q.
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    dtype=torch.bfloat16,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
