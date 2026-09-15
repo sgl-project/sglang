@@ -187,7 +187,17 @@ cargo test -p sglang-parity
 cargo doc -p sglang-parity --no-deps
 ```
 
-CPU tests cover the comparison rules, SSE framing, API reconstruction, and managed
-runner failure paths. Integration tests use lightweight local services; the
-default suite against a real model is a separate acceptance run. Follow the
-repository contribution guide and run `pre-commit run --all-files` before submitting.
+The CPU tests exercise separate contracts:
+
+| Location | Contract |
+| --- | --- |
+| `src/compare.rs`, `src/sse.rs` | Exact comparison and SSE framing, independent of any API. |
+| `suites/native_generate/tests.rs` | Valid native responses reconstruct correctly; malformed responses fail with useful diagnostics. |
+| `src/process.rs` | Managed server configuration, readiness, cancellation, and cleanup. |
+| `tests/harness.rs` | Real HTTP capture, repeatability and parity verdicts, equivalence groups, exit codes, and artifacts. |
+
+Parser fixtures are inputs to unit tests, while integration tests use lightweight
+local services. These tests check whether the checker can accept valid results and
+detect deliberate faults. The default suite against a real model is a separate
+acceptance run that compares the actual Python and Rust implementations. Follow
+the repository contribution guide and run `pre-commit run --all-files` before submitting.

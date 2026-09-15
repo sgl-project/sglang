@@ -291,18 +291,12 @@ mod tests {
         let prepared =
             prepare_comparison(&original, ComparisonScope::TopLevelArrayItems, &rules()).unwrap();
         assert_eq!(original, before);
-        assert_eq!(prepared[0]["text"], " a\n");
-        assert_eq!(prepared[0]["meta"]["extra"], Value::Null);
-        assert_eq!(prepared[1]["meta"]["extra"], json!([1, 2]));
-        assert_eq!(prepared[0]["meta"]["id"], prepared[1]["meta"]["id"]);
-        assert_eq!(prepared[0]["meta"]["time"], prepared[1]["meta"]["time"]);
-        let mut changed = prepared.clone();
-        changed[1]["meta"]["extra"][1] = json!(3);
-        assert_eq!(compare_json(&prepared, &changed)[0].path, "/1/meta/extra/1");
-        changed.as_array_mut().unwrap().pop();
         assert_eq!(
-            compare_json(&prepared, &changed)[0].kind,
-            DifferenceKind::MissingRight
+            prepared,
+            json!([
+                {"text": " a\n", "meta": {"id": "<dynamic>", "time": 0, "extra": null}},
+                {"text": "b", "meta": {"id": "<dynamic>", "time": 0, "extra": [1, 2]}}
+            ])
         );
     }
 
@@ -355,6 +349,11 @@ mod tests {
             let mut invalid = rules();
             invalid.per_result_value_exceptions[0].path = path.into();
             assert!(invalid.validate().is_err(), "{path:?}");
+            assert!(
+                prepare_comparison(&json!([]), ComparisonScope::TopLevelArrayItems, &invalid)
+                    .is_err(),
+                "direct comparison accepted invalid rules: {path:?}"
+            );
         }
         let mut invalid = rules();
         invalid

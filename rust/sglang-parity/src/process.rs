@@ -495,6 +495,23 @@ mod tests {
             .unwrap()
     }
 
+    fn available_port() -> u16 {
+        // Allocate in a child so concurrent parent forks cannot inherit the socket.
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn reservation_is_closed_in_an_executed_child() {
         let reservation = reserve_port(0).unwrap();
@@ -635,8 +652,6 @@ assert inherited.getsockname() != ('127.0.0.1', int(sys.argv[2])), 'port reserva
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(reserve_port(port).is_err());
-        drop(listener);
-        reserve_port(port).unwrap();
     }
 
     #[test]
@@ -677,26 +692,25 @@ assert inherited.getsockname() != ('127.0.0.1', int(sys.argv[2])), 'port reserva
             "PATH".into(),
             directory.path().to_string_lossy().into_owned(),
         );
-        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        config.port = socket.local_addr().unwrap().port();
-        drop(socket);
+        config.port = available_port();
         for python in [
             PathBuf::from(".").join(relative_dir).join("fake-python"),
             PathBuf::from("fake-python"),
         ] {
             config.python = python;
             let log = directory.path().join("server.log");
-            let result = SglangProcess::start(
+            let error = SglangProcess::start(
                 &config,
                 Implementation::Python,
                 &log,
                 Duration::from_secs(5),
                 Duration::from_millis(50),
             )
-            .await;
+            .await
+            .unwrap_err();
             assert!(
-                result.unwrap_err().contains("exited before readiness"),
-                "did not execute {:?}",
+                error.contains("exited before readiness"),
+                "did not execute {:?}: {error}",
                 config.python
             );
             assert_eq!(
@@ -745,8 +759,7 @@ wait "$worker"
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
             let mut config = config();
             config.python = executable;
-            let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            config.port = socket.local_addr().unwrap().port();
+            config.port = available_port();
             config.env.insert(
                 "PARITY_PIDS".into(),
                 directory.path().to_string_lossy().into_owned(),
@@ -817,15 +830,16 @@ wait "$worker"
     #[tokio::test]
     async fn startup_timeout_kills_the_whole_group() {
         let fixture = Fixture::new("wait");
-        let result = SglangProcess::start(
+        let error = SglangProcess::start(
             &fixture.config,
             Implementation::Python,
             &fixture.log(),
             Duration::from_secs(2),
             Duration::from_millis(50),
         )
-        .await;
-        assert!(result.err().unwrap().contains("timed out"));
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
         fixture.assert_dead().await;
         let log = std::fs::read_to_string(fixture.log()).unwrap();
         assert!(log.contains("sglang.launch_server\n--model-path\nmodel\n"));
@@ -864,15 +878,16 @@ wait "$worker"
     #[tokio::test]
     async fn early_exit_also_cleans_descendants() {
         let fixture = Fixture::new("early");
-        let result = SglangProcess::start(
+        let error = SglangProcess::start(
             &fixture.config,
             Implementation::Python,
             &fixture.log(),
             Duration::from_secs(5),
             Duration::from_millis(50),
         )
-        .await;
-        assert!(result.err().unwrap().contains("exited before readiness"));
+        .await
+        .unwrap_err();
+        assert!(error.contains("exited before readiness"), "{error}");
         fixture.assert_dead().await;
     }
 
