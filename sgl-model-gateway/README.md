@@ -756,6 +756,7 @@ Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`
 | Router | `smg_router_*` | Requests by model/endpoint, latency, errors, upstream responses |
 | Inference | `smg_router_ttft/tpot/tokens_*` | Time to first token, time per output token, token counts (gRPC) |
 | Worker | `smg_worker_*` | Pool size, active connections, health checks, selection events |
+| Cache-aware policy | `smg_cache_aware_*` | Routing branch taken, prefix match rate, per-worker tree footprint |
 | Circuit Breaker | `smg_worker_cb_*` | State (closed/open/half-open), transitions, outcomes |
 | Retry | `smg_worker_retries_*` | Retry attempts, exhausted retries, backoff duration |
 | Discovery | `smg_discovery_*` | K8s registrations, sync duration, workers discovered |
@@ -768,6 +769,12 @@ Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`
 - `smg_router_tokens_total` - Total input/output tokens by model
 - `smg_router_generation_duration_seconds` - End-to-end generation time
 - `smg_worker_cb_state` - Circuit breaker state gauge (0=closed, 1=open, 2=half-open)
+- `smg_cache_aware_policy_branch_total` - Which arm of the cache-aware policy ran, by `branch`
+- `smg_cache_aware_match_rate` - Best-prefix match rate (0..1) per decision, by `branch`
+- `smg_cache_aware_matched_chars_total` / `smg_cache_aware_input_chars_total` - Aggregate prefix
+  reuse rate, as `rate(matched) / rate(input)`. Prefer this over the mean of
+  `smg_cache_aware_match_rate`, which weights a short prompt the same as a long one.
+- `smg_cache_aware_tree_chars` - Approximate per-worker cache footprint in characters
 
 **Duration Buckets:**
 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 15s, 30s, 45s, 60s, 90s, 120s, 180s, 240s
