@@ -9,6 +9,8 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -479,6 +481,12 @@ class StreamingSession(BasePrefixCache):
             return
         self.inner.cache_unfinished_req(req, **kwargs)
 
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        self.inner.finish(handle, outcome)
+
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        self.inner.release_aborted_request(handle)
+
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
@@ -736,16 +744,18 @@ class StreamingSession(BasePrefixCache):
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
-        return self.inner.pop_prefetch_loaded_span(req_id)
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(handle)
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
-        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+        self.inner.finish_storage_prefetch_admission(handle, fulfilled_tokens, reason)
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
-        self.inner.discard_storage_prefetch_accounting(req_id)
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
+        self.inner.discard_storage_prefetch_accounting(handle)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()

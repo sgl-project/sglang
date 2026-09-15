@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _UnifiedBackupIntent,
@@ -19,7 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
@@ -237,7 +238,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             storage_start=0,
         )
         host_indices = torch.arange(4, dtype=torch.int64)
-        req_id = "sidecar-prefetch"
+        req_id = CacheRequestHandle("sidecar-prefetch", 0)
 
         cache = MagicMock()
         cache.page_size = 2
@@ -263,7 +264,7 @@ class TestBufferModeSidecar(unittest.TestCase):
 
         self.assertTrue(
             pipeline.stage_completed_prefetch(
-                req_id=req_id,
+                request=req_id,
                 num_tokens=len(host_indices),
                 hash_value=["page-0", "page-1"],
             )

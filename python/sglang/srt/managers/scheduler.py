@@ -279,6 +279,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -309,7 +310,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -973,10 +973,11 @@ class Scheduler(
             initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
-        config_to_check = getattr(
-            self.model_config.hf_config, "text_config", self.model_config.hf_config
-        )
+        config_to_check = self.model_config.hf_config
+        if hasattr(self.model_config.hf_config, "text_config"):
+            config_to_check = self.model_config.hf_config.text_config
+        elif hasattr(self.model_config, "hf_text_config"):
+            config_to_check = self.model_config.hf_text_config
 
         # Different MoE architectures expose the per-token expert count under
         # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
@@ -1107,16 +1108,28 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
-        with torch.get_device_module(model_runner.device).stream(
+        device_module = torch.get_device_module(model_runner.device)
+        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
+        forward_stream = (
             model_runner.forward_stream
-        ):
+            if self.enable_overlap or self.ps.pp_size > 1 or use_mlx()
+            else self.schedule_stream
+        )
+        with device_module.stream(forward_stream):
             if self.draft_worker is None:
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
-            model_runner.post_capture_resize_kv_pool()
+            model_runner.post_capture_resize_kv_pool(
+                draft_runners=(
+                    self.draft_worker._draft_model_runners()
+                    if self.draft_worker is not None
+                    else ()
+                )
+            )
             self.kv_cache_allocation_time += time.perf_counter() - tic
 
         if get_model().is_startup_weight_load_overlap:
@@ -1277,7 +1290,7 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
-        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -1503,6 +1516,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1549,6 +1563,7 @@ class Scheduler(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
+                max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
@@ -1839,7 +1854,6 @@ class Scheduler(
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
-        Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
         # Engine init (graph capture, warmups) is done; from here on any
@@ -1854,10 +1868,9 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif is_cuda() or _is_hip:
+        elif (is_cuda() or _is_hip) and (self.enable_overlap or self.ps.pp_size > 1):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
@@ -2812,6 +2825,8 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        if recv_req.bootstrap_port is None:
+            recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
             recv_req.session_id is not None and self.enable_session_radix_cache
@@ -2823,10 +2838,6 @@ class Scheduler(
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
-
-            if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
-                recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
@@ -2918,6 +2929,7 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                disagg_mode=self.disaggregation_mode,
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -2990,30 +3002,29 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if (
-            req.return_sampling_mask
-            and self.disaggregation_mode != DisaggregationMode.NULL
-            and not self.disagg_metadata_buffers.enable_sampling_mask
-        ):
-            error_msg = (
-                "return_sampling_mask with disaggregation requires "
-                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
-            error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
+        if req.return_sampling_mask:
+            if (
+                self.disaggregation_mode != DisaggregationMode.NULL
+                and not self.disagg_metadata_buffers.enable_sampling_mask
+            ):
+                self._reject_sampling_mask_request(
+                    req,
+                    "return_sampling_mask requires "
+                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
+                    "decode servers when using disaggregated serving.",
+                )
+                return
+            top_k = req.sampling_params.top_k
+            sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
+                error_msg = (
+                    "return_sampling_mask requires top_k=1 for greedy sampling "
+                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+                    f"{top_k}. Lower top_k or increase "
+                    "--sampling-mask-max-tokens."
+                )
+                self._reject_sampling_mask_request(req, error_msg)
+                return
 
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
@@ -3022,9 +3033,7 @@ class Scheduler(
             error_msg = (
                 "return_sampling_mask is not supported with speculative decoding."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
@@ -3034,9 +3043,7 @@ class Scheduler(
                 "return_sampling_mask is not supported with the ascend "
                 "sampling backend."
             )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            self._reject_sampling_mask_request(req, error_msg)
             return
 
         # Handle multimodal inputs
@@ -3229,7 +3236,7 @@ class Scheduler(
                     else None
                 )
                 tree_cache.prefetch_from_storage(
-                    req.rid,
+                    req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
                     tree_cache.get_last_hash_value(last_host_node),
@@ -3249,7 +3256,7 @@ class Scheduler(
             return
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
         for req in self.waiting_queue:
-            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+            if self.tree_cache.pop_storage_prefetch_miss(req.cache_request_handle):
                 req.storage_prefetch_retry_pending = True
                 req.storage_prefetch_retry_wait_polls = 0
             if (
@@ -3294,6 +3301,13 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
+    def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
+        """Return a sampling-mask validation error without running the model."""
+        logger.error(f"{error_msg}, {req.rid=}")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
@@ -3320,14 +3334,9 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, rid: str) -> None:
+    def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if (
-            self.enable_hierarchical_cache
-            or self.enable_hicache_storage
-            or self.enable_unified_cache_external_linker
-        ):
-            self.tree_cache.release_aborted_request(rid)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def _abort_queued_request_cache_state(self, req: Req) -> None:
         abort_queued_req = getattr(self.tree_cache, "abort_queued_req", None)
@@ -3360,7 +3369,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req.rid)
+                self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3575,7 +3584,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req.rid)
+        self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3973,14 +3982,16 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(
+                    req.cache_request_handle
+                )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
-                    req.rid
+                    req.cache_request_handle
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
@@ -4004,7 +4015,7 @@ class Scheduler(
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
                 held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
-                    req.rid, len(req.prefix_indices)
+                    req.cache_request_handle, len(req.prefix_indices)
                 )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
@@ -5321,7 +5332,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req.rid)
+            self._release_aborted_request(req)
             self._abort_queued_request_cache_state(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5358,7 +5369,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                self._release_aborted_request(req.rid)
+                self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
@@ -5378,7 +5389,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req.rid)
+                    self._release_aborted_request(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
