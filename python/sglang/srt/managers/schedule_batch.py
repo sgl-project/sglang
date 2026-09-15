@@ -1632,6 +1632,15 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.is_dllm():
+            # Appended masks and a partial prompt/output block are not reusable
+            # KV: bidirectional attention depends on the rest of that block.
+            # Bound the lookup by real tokens, even if another cached prompt
+            # happens to contain the same token IDs as our synthetic masks.
+            block_size = self.dllm_config.block_size
+            committed_len = len(self.origin_input_ids) + len(self.output_ids)
+            max_prefix_len = min(max_prefix_len, committed_len)
+            max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
