@@ -284,6 +284,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
+    _backend_can_run_prefill_cuda_graph = None
+
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
             backend = get_exec().graph.cuda_graph_config.prefill.backend
@@ -292,6 +294,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"graph backend; got '{backend}'."
             )
         super().__init__(model_runner)
+        self._backend_can_run_prefill_cuda_graph = getattr(
+            model_runner.attn_backend, "can_run_prefill_cuda_graph", None
+        )
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -1239,10 +1244,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 is None
             ):
                 return False
-        # A backend may keep batches its captured metadata cannot describe eager.
-        backend_can_run = getattr(
-            self.model_runner.attn_backend, "can_run_prefill_cuda_graph", None
-        )
+        backend_can_run = self._backend_can_run_prefill_cuda_graph
         if backend_can_run is not None and not backend_can_run(forward_batch):
             return False
         # Multi-req replay is supported by body-capture backends via the
