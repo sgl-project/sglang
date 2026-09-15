@@ -196,14 +196,16 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
-        padded_x[:local_logical_len] = x[:local_logical_len]
-
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             gathered = x.new_empty((self.cp_size * physical_rank_len, *x.shape[1:]))
-        attn_cp_all_gather_into_tensor(gathered, padded_x.contiguous())
+
+        send_slice = gathered[
+            self.cp_rank * physical_rank_len : (self.cp_rank + 1) * physical_rank_len
+        ]
+        send_slice[:local_logical_len] = x[:local_logical_len]
+        attn_cp_all_gather_into_tensor(gathered, send_slice)
 
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
