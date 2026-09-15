@@ -17,7 +17,7 @@ sub-pools of one `UnifiedKVPool`, and the tri-pool variant that adds mamba state
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
+    install_move_gate,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages
@@ -320,6 +321,46 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Page-level physical->virtual table of the full sub-pool."""
         return self.full_attn_allocator.physical_to_virtual
 
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual TOKEN ids -> full-sub-pool PHYSICAL token ids for the PD
+        transfer engine.
+
+        PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
+        `UnifiedMHATokenToKVPool.get_contiguous_buf_infos`). Without this
+        override the base identity would put VIRTUAL ids on the wire, which
+        address real bytes and so corrupt silently rather than fail.
+        """
+        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Virtual TOKEN ids -> swa-sub-pool PHYSICAL token ids.
+
+        The SWA counterpart of the above. `translate_loc_from_full_to_swa`
+        cannot serve here: it returns KERNEL-FACING ids (the physical page
+        scaled by the sub-pool's per-page block count), which index the
+        per-layer views, whereas the SWA state component is registered as whole
+        page envelopes and addressed by physical page.
+        """
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def _move_gate_targets(self):
+        """Every member a compaction gate must cover. A subclass that adds an
+        end overrides THIS, and every gate widens with it."""
+        return (self.full_attn_allocator, self.swa_attn_allocator)
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="disagg_move_gate",
+            gate=gate,
+            feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
+        )
+
     def translate_kv_loc_for_kernel(
         self,
         loc: torch.Tensor,
@@ -374,6 +415,52 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
             return v_tokens
 
+    def _extend_in_virtual_space(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the full side's paged extend and report which virtual PAGES it
+        newly took. Returns (virtual TOKEN ids, new virtual PAGE ids), or None
+        when the joint capacity check cannot fund the allocation.
+
+        Both extend entries share this; they differ only in which of those pages
+        the sliding-window side then binds.
+        """
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        need_tokens = num_new_pages * self.page_size
+        if need_tokens > self.available_size():
+            if not _relieve_for_alloc(self, need_tokens):
+                return None
+
+        # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
+        # its view after the slice is consumed.
+        fa = self.full_attn_allocator
+        new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+
+        out_indices = fa.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            num_new_pages=num_new_pages,
+        )
+        assert out_indices is not None, (
+            "UnifiedSWA: full.alloc_extend returned None after joint pre-check "
+            "passed — internal-state inconsistency"
+        )
+        return out_indices, new_virtual_pages
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -386,35 +473,73 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Paged extend; returns virtual TOKEN ids. The same virtual page maps to
         full- and swa-physical, so swa binds exactly what the full kernel consumed."""
         with record_function("UnifiedSWAAlloc.alloc_extend"):
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-            need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
-                if not _relieve_for_alloc(self, need_tokens):
-                    return None
-
-            # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
-            # its view after the slice is consumed.
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_extend(
+            extended = self._extend_in_virtual_space(
                 prefix_lens,
                 prefix_lens_cpu,
                 seq_lens,
                 seq_lens_cpu,
                 last_loc,
                 extend_num_tokens,
-                num_new_pages=num_new_pages,
             )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_extend: full.alloc_extend returned None "
-                "after joint pre-check passed — internal-state inconsistency"
-            )
+            if extended is None:
+                return None
+            out_indices, new_virtual_pages = extended
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            return out_indices  # virtual TOKEN ids
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Decode-node prealloc: full KV for the whole sequence, sliding-window
+        KV for the live window tail only.
+
+        The static composite allocates the two sides independently and records
+        a full->swa index mapping. That is not representable here: the two
+        sides SHARE one virtual id space (a virtual page names a full-physical
+        page and, if bound, a swa-physical one), which is why
+        `set_full_to_swa_mapping` is a no-op on this allocator and
+        `translate_loc_from_full_to_swa` derives the swa id from the virtual id
+        instead of a table. Running the static body would call `alloc_extend`
+        on the swa sub-allocator, which asserts it is not the id owner.
+
+        The tail is expressed by binding swa for the TAIL's virtual pages only.
+        A new page left unbound has no swa-physical page, which reads as the
+        sink and is skipped by `free`'s `swa_v2p_page > 0` mask -- exactly the
+        out-of-window state the ratchet produces via `free_swa`.
+
+        Admission is priced at the FULL side's page count, as plain
+        `alloc_extend` is: pessimistic when the tail is short, but it reuses
+        the composite's audited joint capacity path, and the bytes actually
+        held still follow the tail.
+        """
+        assert len(prefix_lens_cpu) == 1
+        assert 0 <= swa_tail_len <= extend_num_tokens
+        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            extended = self._extend_in_virtual_space(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
+            if extended is None:
+                return None
+            out_indices, new_virtual_pages = extended
+            if swa_tail_len > 0 and new_virtual_pages.numel() > 0:
+                tail_pages = torch.unique(out_indices[-swa_tail_len:] // self.page_size)
+                # Only NEW pages need binding; a tail page carried in from the
+                # prefix is already bound on the swa side.
+                to_bind = new_virtual_pages[torch.isin(new_virtual_pages, tail_pages)]
+                if to_bind.numel() > 0:
+                    self.swa_attn_allocator.alloc_with_virtual(to_bind)
             return out_indices  # virtual TOKEN ids
 
     def alloc_decode(
@@ -769,16 +894,9 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         binary search; the order matches the alloc path (full takes the high band).
         """
         fa, sa = self.full_attn_allocator, self.swa_attn_allocator
-        e_f, e_s = fa.entry_bytes_per_page, sa.entry_bytes_per_page
+        e_f = fa.entry_bytes_per_page
         # full is grow-down: its chain gap IS the high band.
         b_high = fa._current_gap_bytes()
-        if sa._is_frontier_transparent():
-            b_low = 0
-        else:
-            b_low = max(
-                0,
-                sa._byte_low_frontier() - sa._chain_high_frontier_below_bytes(),
-            )
         h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
         h_s = sa._hole_pages()
         r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
@@ -818,6 +936,16 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             else:
                 hi_n = mid - 1
         return lo_n * self.page_size
+
+    def _move_gate_targets(self):
+        """All three members. The mamba end compacts independently and its slot
+        envelopes move as `StateType.MAMBA`, so leaving it out of a gate would
+        let a conv/SSM slot relocate under an in-flight transfer."""
+        return (
+            self.full_attn_allocator,
+            self.swa_attn_allocator,
+            self.mamba_allocator,
+        )
 
     def _flush_targets(self):
         """All three members, float FIRST: its zero-copy boundary absorption must

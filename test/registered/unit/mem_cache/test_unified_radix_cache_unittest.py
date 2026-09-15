@@ -30,6 +30,8 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     EvictParams,
     InitLoadBackParams,
@@ -899,7 +901,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
         controller = FakeCacheController()
         cache.cache_controller = controller
-        cache.prefetch_from_storage("req", cache.root_node_handle(), tokens)
+        cache.prefetch_from_storage(
+            CacheRequestHandle("req", 0), cache.root_node_handle(), tokens
+        )
 
         _, storage_key, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
@@ -954,7 +958,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         )
         self.assertEqual(len(match.device_indices), len(prefix_tokens) - 1)
 
-        req_id = "bigram-anchor"
+        req_id = CacheRequestHandle("bigram-anchor", 0)
         prefetch_key = RadixKey(
             array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
             extra_key=extra_key,
@@ -3193,7 +3197,8 @@ class UnifiedRadixCacheSuite:
         if prefix_len is None:
             prefix_len = f.matched_len
         req = mock.Mock()
-        req.rid = req_id
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
         req.extra_key = extra_key
         req.cache_salt = cache_salt
         if prefix_indices is not None:
@@ -3315,7 +3320,7 @@ class UnifiedRadixCacheSuite:
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
-        req_id = "l3-prefetch-req"
+        req_id = CacheRequestHandle("l3-prefetch-req", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -3387,7 +3392,7 @@ class UnifiedRadixCacheSuite:
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
-        req_id = "abort-req"
+        req_id = CacheRequestHandle("abort-req", 0)
 
         cc = cons.cache_controller
         kv_pool_available_size_before = cc.mem_pool_host.get_pool(
@@ -3449,7 +3454,7 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(op.pool_transfers_done)
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
         self.assertEqual(swa_release_q.qsize(), 0)
-        cons.release_aborted_request(req_id)
+        cons.finish(req_id, CacheRequestOutcome.ABORT)
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
         self.assertEqual(swa_release_q.qsize(), 0)
 
@@ -3542,7 +3547,7 @@ class UnifiedRadixCacheSuite:
             storage_dir=storage_dir,
             prefetch_threshold=1,
         )
-        req_id = "abort-req"
+        req_id = CacheRequestHandle("abort-req", 0)
 
         cc = cons.cache_controller
         kv_pool_available_size_before = cc.mem_pool_host.get_pool(
@@ -3594,7 +3599,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(swa_release_q.qsize(), 0)
 
         # --- Act: abort without committing the prefetch. ---
-        cons.release_aborted_request(req_id)
+        cons.finish(req_id, CacheRequestOutcome.ABORT)
 
         self.assertTrue(op.pool_transfers_done)
         self.assertGreater(swa_release_q.qsize(), 0)
@@ -3815,7 +3820,7 @@ class UnifiedRadixCacheSuite:
         dev_avail0 = cons.token_to_kv_pool_allocator.available_size()
         stats = cons._prefetch_outcome_stats
 
-        req_id = "buffer-read-roundtrip"
+        req_id = CacheRequestHandle("buffer-read-roundtrip", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -3865,7 +3870,8 @@ class UnifiedRadixCacheSuite:
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
-        req.rid = req_id
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
@@ -3954,7 +3960,7 @@ class UnifiedRadixCacheSuite:
             ),
             len(seq),
         )
-        root_req = "salted-root-prefetch"
+        root_req = CacheRequestHandle("salted-root-prefetch", 0)
         cons.prefetch_from_storage(
             root_req,
             cons.root_node_handle(),
@@ -4021,7 +4027,7 @@ class UnifiedRadixCacheSuite:
         )
         anchor = prefix_match.last_device_node
         lock_ref = _device_lock_ref(cons2, anchor, ComponentType.FULL)
-        anchored_req = "salted-mid-tree-prefetch"
+        anchored_req = CacheRequestHandle("salted-mid-tree-prefetch", 0)
         cons2.prefetch_from_storage(
             anchored_req,
             anchor,
@@ -4080,7 +4086,7 @@ class UnifiedRadixCacheSuite:
         stats = cons._prefetch_outcome_stats
 
         # Query BEFORE any producer wrote the span: full miss -> revoked.
-        req_id = "early-query-miss"
+        req_id = CacheRequestHandle("early-query-miss", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4112,7 +4118,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cons.pop_prefetch_loaded_tokens(req_id), len(seq))
 
         # Unserved markers must not leak: abort cleanup ...
-        aborted_rid = "aborted-miss"
+        aborted_rid = CacheRequestHandle("aborted-miss", 0)
         cons.prefetch_from_storage(
             aborted_rid,
             cons.root_node_handle(),
@@ -4125,15 +4131,21 @@ class UnifiedRadixCacheSuite:
             lambda: cons.check_prefetch_progress(aborted_rid),
             "aborted-rid miss did not resolve",
         )
-        cons.release_aborted_request(aborted_rid)
+        cons.finish(aborted_rid, CacheRequestOutcome.ABORT)
         self.assertFalse(cons.pop_storage_prefetch_miss(aborted_rid))
 
         # A fully-device-matched (empty-suffix) decline also arms the retry:
         # the device match can evict while the request waits in the queue.
         cons.prefetch_from_storage(
-            "fully-matched", cons.root_node_handle(), array("q", []), None, None
+            CacheRequestHandle("fully-matched", 0),
+            cons.root_node_handle(),
+            array("q", []),
+            None,
+            None,
         )
-        self.assertTrue(cons.pop_storage_prefetch_miss("fully-matched"))
+        self.assertTrue(
+            cons.pop_storage_prefetch_miss(CacheRequestHandle("fully-matched", 0))
+        )
         cons.sanity_check()
 
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
@@ -4192,7 +4204,7 @@ class UnifiedRadixCacheSuite:
 
         cons, cons_alloc, _ = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
-        req_id = "buffer-swa-admission-oom"
+        req_id = CacheRequestHandle("buffer-swa-admission-oom", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4226,7 +4238,8 @@ class UnifiedRadixCacheSuite:
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
-        req.rid = req_id
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
         req.extra_key = None
         req.cache_salt = None
         req.last_node = cons.root_node_handle()
@@ -4297,7 +4310,7 @@ class UnifiedRadixCacheSuite:
         cons.storage_metrics_collector = mock.Mock()
         avail0 = self._host_avail_sizes(cons)
 
-        req_id = "sibling-publish"
+        req_id = CacheRequestHandle("sibling-publish", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4371,7 +4384,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(masked.full_kv_hit_length, len(seq), "live FULL not resident")
 
         avail0 = self._host_avail_sizes(cons)
-        req_id = "masked-overlap"
+        req_id = CacheRequestHandle("masked-overlap", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4414,7 +4427,7 @@ class UnifiedRadixCacheSuite:
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
 
-        req_id = "post-check-overlap"
+        req_id = CacheRequestHandle("post-check-overlap", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4439,7 +4452,8 @@ class UnifiedRadixCacheSuite:
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
-        req.rid = req_id
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
         req.extra_key = None
         req.cache_salt = None
         req.prefix_indices = torch.zeros(
@@ -4482,7 +4496,7 @@ class UnifiedRadixCacheSuite:
         self._init_buffer_hicache(cons, storage_dir)
         avail0 = self._host_avail_sizes(cons)
 
-        req_id = "growth-trim"
+        req_id = CacheRequestHandle("growth-trim", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4551,7 +4565,7 @@ class UnifiedRadixCacheSuite:
         self._init_buffer_hicache(cons, storage_dir)
         avail0 = self._host_avail_sizes(cons)
 
-        req_id = "covered-hold"
+        req_id = CacheRequestHandle("covered-hold", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4597,7 +4611,7 @@ class UnifiedRadixCacheSuite:
         avail0 = self._host_avail_sizes(cons)
         stats = cons._prefetch_outcome_stats
 
-        req_id = "covered-at-commit"
+        req_id = CacheRequestHandle("covered-at-commit", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
@@ -4648,9 +4662,13 @@ class UnifiedRadixCacheSuite:
         cons, _, _ = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
         cons.prefetch_from_storage(
-            "short-req", cons.root_node_handle(), array("q", seq), None, None
+            CacheRequestHandle("short-req", 0),
+            cons.root_node_handle(),
+            array("q", seq),
+            None,
+            None,
         )
-        self._run_prefetch_to_completion(cons, "short-req")
+        self._run_prefetch_to_completion(cons, CacheRequestHandle("short-req", 0))
         cons.drain_storage_control_queues()
         mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(len(mc.device_indices), len(seq))
@@ -4671,7 +4689,7 @@ class UnifiedRadixCacheSuite:
             self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
             m = cons2.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
             cons2.prefetch_from_storage(
-                "subwin-req",
+                CacheRequestHandle("subwin-req", 0),
                 m.last_device_node,
                 array("q", seq_ab[len(seq_a) :]),
                 cons2.get_last_hash_value(m.last_device_node),
@@ -4681,8 +4699,10 @@ class UnifiedRadixCacheSuite:
             self._pump_hicache_until(
                 cons2,
                 lambda: (
-                    cons2.check_prefetch_progress("subwin-req")
-                    and cons2.buffer_pipeline.has_staged("subwin-req")
+                    cons2.check_prefetch_progress(CacheRequestHandle("subwin-req", 0))
+                    and cons2.buffer_pipeline.has_staged(
+                        CacheRequestHandle("subwin-req", 0)
+                    )
                 ),
                 "sub-window prefetch did not stage",
             )
@@ -4690,13 +4710,15 @@ class UnifiedRadixCacheSuite:
                 any(
                     t.name == PoolName.SWA
                     for t in cons2.buffer_pipeline.staged_prefetches[
-                        "subwin-req"
+                        CacheRequestHandle("subwin-req", 0)
                     ].aux_xfers
                 ),
                 "sub-window fetch degraded to KV-only",
             )
             spliced = self._consume_staged_prefetch(
-                cons2, "subwin-req", prefix_indices=m.device_indices
+                cons2,
+                CacheRequestHandle("subwin-req", 0),
+                prefix_indices=m.device_indices,
             )
             self.assertEqual(int(spliced.numel()), len(seq_ab) - len(seq_a))
             self.assertEqual(
@@ -4719,9 +4741,13 @@ class UnifiedRadixCacheSuite:
         self._init_buffer_hicache(cons3, storage_dir)
         avail3 = self._host_avail_sizes(cons3)
         cons3.prefetch_from_storage(
-            "partial-req", cons3.root_node_handle(), array("q", full), None, None
+            CacheRequestHandle("partial-req", 0),
+            cons3.root_node_handle(),
+            array("q", full),
+            None,
+            None,
         )
-        self._run_prefetch_to_completion(cons3, "partial-req")
+        self._run_prefetch_to_completion(cons3, CacheRequestHandle("partial-req", 0))
         cons3.drain_storage_control_queues()
         self.assertEqual(
             len(
@@ -4817,7 +4843,7 @@ class UnifiedRadixCacheSuite:
         # Baseline (single rank) must actually adopt SWA, else the TP assertions
         # below would be vacuous -> skip.
         base = self._l3_consumer(storage_dir)
-        self._consume_prefetch(base, seq, "base")
+        self._consume_prefetch(base, seq, CacheRequestHandle("base", 0))
         if not self._swa_host_on_path(base, seq):
             self.skipTest("fixture does not exercise SWA L3 prefetch")
         return storage_dir, seq
@@ -4833,7 +4859,7 @@ class UnifiedRadixCacheSuite:
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
-        self._consume_prefetch(cons, seq, "drop")
+        self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(m.host_hit_length, 0)
@@ -4853,7 +4879,7 @@ class UnifiedRadixCacheSuite:
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
-        self._consume_prefetch(cons, seq, "keep")
+        self._consume_prefetch(cons, seq, CacheRequestHandle("keep", 0))
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         self.assertEqual(m.host_hit_length, len(seq))
@@ -4875,7 +4901,7 @@ class UnifiedRadixCacheSuite:
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
         avail_before = cons.swa_kv_pool_host.available_size()
-        self._consume_prefetch(cons, seq, "drop")
+        self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         self.assertEqual(
             cons.match_prefix(
@@ -9003,10 +9029,11 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         insert_result.host_insert_dropped = False
         cache.tree_core.insert_host.return_value = insert_result
         operation = mock.MagicMock()
+        operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
         cache.ongoing_prefetch = {
-            operation.request_id: (
+            operation.handle: (
                 7,
                 list(range(8)),
                 list(range(100, 108)),
@@ -9041,7 +9068,11 @@ class TestPrefetchCommitOrdering(CustomTestCase):
 
         cache._handle_prefetch_result = _handle_prefetch_result
 
-        self.assertTrue(UnifiedRadixCache.check_prefetch_progress(cache, "req"))
+        self.assertTrue(
+            UnifiedRadixCache.check_prefetch_progress(
+                cache, CacheRequestHandle("req", 0)
+            )
+        )
 
         self.assertEqual([c[0] for c in order.mock_calls], ["apply", "commit", "apply"])
         self.assertEqual(applied[0], [walk_action])
@@ -9182,8 +9213,9 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             },
         )
         anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
-        req_id = "drop-all-resources"
-        operation.request_id = req_id
+        req_id = CacheRequestHandle("drop-all-resources", 0)
+        operation.handle = req_id
+        operation.request_id = req_id.rid
         cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
             parent_id,
             prefetch_key,
@@ -9496,7 +9528,7 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
     instead of gambling the read; cap_skip over budget (checked before the
     match walk)."""
 
-    _REQ = "req-1"
+    _REQ = CacheRequestHandle("req-1", 0)
     _PREFIX = list(range(100, 100 + 8))
 
     def _make_pipeline(self, cache, cap_tokens=10_000):
@@ -9534,6 +9566,43 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         self.assertEqual(pipeline.try_lock_anchor(self._REQ), "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+
+    def test_storage_cleanup_releases_buffer_prefetch_anchor(self):
+        cache = self._make_cache(live_match_len=len(self._PREFIX))
+        pipeline = self._make_pipeline(cache)
+        cache.buffer_pipeline = pipeline
+        self.assertEqual(pipeline.try_lock_anchor(self._REQ), "locked")
+        host_indices = torch.arange(4)
+        cache.ongoing_prefetch = {
+            self._REQ: _OngoingPrefetch(
+                anchor_node_id=99,
+                prefetch_key=RadixKey(array("q", range(16))),
+                host_indices=host_indices,
+                operation=mock.Mock(),
+                anchor_lock_params=None,
+                comp_xfers={},
+            )
+        }
+        cache.ongoing_backup = {}
+        cache.host_memory_mode = "buffer_only"
+        cache._prefetch_occupied_span.side_effect = lambda key, indices: (
+            UnifiedRadixCache._prefetch_occupied_span(cache, key, indices)
+        )
+        controller = cache.cache_controller
+        controller.terminate_prefetch.return_value = (4, None)
+        controller.prefetch_tokens_occupied = 12
+
+        StorageAttachment(cache)._release_pending_storage_ops()
+
+        self.assertEqual(cache.ongoing_prefetch, {})
+        self.assertEqual(pipeline.anchor_locks, {})
+        self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+        self.assertNotIn(self._REQ, pipeline._prefetch_prefix_ctx)
+        cache.dec_lock_ref.assert_called_once_with(
+            99, cache.inc_lock_ref.return_value.to_dec_params.return_value
+        )
+        cache.dec_host_lock_ref.assert_not_called()
+        self.assertEqual(controller.prefetch_tokens_occupied, 8)
 
     def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
