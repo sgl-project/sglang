@@ -1,0 +1,42 @@
+[
+  {
+    "path": "profile-kernels/deepep_prefill/4311e380b494_277432_20260915162953809_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "bca645d860fba5e16855965fb4a9ed46714ad401aadcf8384f44497d34c4fbc8",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/deepep_prefill/4311e380b494_277431_20260915162953808_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "50c3011bba74d8267b5de2853319c2412be7b7dfde79c6fe775f6a5b23ecf041",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/deepep_decode/4311e380b494_279755_20260915163035280_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "382594f332bb3e2940f219c11e94177d0fbd641156609c4f30a6e6b827a269ab",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/deepep_decode/4311e380b494_279756_20260915163035280_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "6a79627adb12ce66bb37e2fc6951cde0ca7daabf0ae9f0a3f2e2716a61ef4be1",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/none_prefill/4311e380b494_272411_20260915162830829_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "6109330f197a13a405d943e7db82bc45c12d6444bab0da945b241018473f91d9",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/none_prefill/4311e380b494_272412_20260915162830829_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "4b6ff3aba06263195317f5dfbbe52c0fd03091f9a25d9ed110aeb59d4e35a267",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/none_decode/4311e380b494_274721_20260915162911861_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "4ffd5a7c9d484651cf74d104b4bd6d73de962caee1030b1dfa41a94b55c4dcf6",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  },
+  {
+    "path": "profile-kernels/none_decode/4311e380b494_274722_20260915162911861_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "original_sha256": "9d67f6a9ddd1a4b9889fa137b02e898676f55977790ecfa985e9fdb840262580",
+    "normalization": "CRLF line endings converted to LF; CSV fields unchanged"
+  }
+]

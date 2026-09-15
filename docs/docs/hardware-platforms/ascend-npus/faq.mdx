@@ -303,3 +303,74 @@ Docker images for Ascend NPU are available in two types:
   if you need the latest features or bug fixes that have not yet been included in a stable release.
 
 If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
+
+## 9. DeepEP fails with `aclnnDispatchLayout ... not in libopapi.so`
+
+### Error message
+
+```text highlight=1
+RuntimeError: aclnnDispatchLayout or aclnnDispatchLayoutGetWorkspaceSize not in libopapi.so, or libopapi.so not found.
+```
+
+### Cause
+
+DeepEP ships its own custom operator package. `aclnnDispatchLayout` lives in
+`deep_ep/vendors/hwcomputing/op_api/lib/libcust_opapi.so`, not in the `libopapi.so` that comes with
+CANN, so CANN cannot resolve it unless the vendor directory is registered. This affects both the
+normal and the low-latency path: the normal path fails when `get_dispatch_layout` is called, and the
+low-latency path may abort with SIGSEGV instead of a readable error.
+
+### Solution
+
+Point `ASCEND_CUSTOM_OPP_PATH` at the DeepEP vendor directory before launching. Adjust the Python
+path to match your environment:
+
+```bash
+export ASCEND_CUSTOM_OPP_PATH=$(python3 -c "import deep_ep, os; print(os.path.join(os.path.dirname(deep_ep.__file__), 'vendors', 'hwcomputing'))")
+```
+
+## 10. DeepEP assertion failures when the per-rank token count grows
+
+### Error message
+
+```text highlight=1,4
+Failed: Assertion error ... deep_ep.cpp:102 error message or error code is 'topk_idx.size(0) <= round * per_round_tokens'
+```
+
+```text
+Failed: Assertion error ... deep_ep.cpp:793 error message or error code is 'num_max_dispatch_tokens_per_rank >= x.size(0)'
+```
+
+### Cause
+
+The two phases have separate per-rank token limits. In the affected DeepEP builds:
+
+- **Prefill (normal path)** is bounded by `DEEPEP_NORMAL_LONG_SEQ_ROUND × DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`,
+  which defaults to `1 × 8192`. Any single forward carrying more than 8192 tokens per rank trips the
+  first assertion.
+- **Decode (low-latency path)** is bounded by `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`,
+  which defaults to `128`, and trips the second assertion.
+
+### Solution
+
+Raise the corresponding limit and enable long-sequence processing for Prefill:
+
+```bash
+# Prefill: configure round capacity; hardware and buffer limits still apply
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=8
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=8192
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+
+# Decode: raise the per-rank dispatch limit
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512
+```
+
+Communication buffer capacity must also cover the local token count and routed expert load.
+An insufficient buffer can cause `CamMoeDispatchNormal do tiling failed, ret is -1`.
+Check the buffer requirements for the installed DeepEP version, device generation and mode;
+increasing the token assertion limit alone does not establish that a workload is supported.
+
+These buffer and capacity settings can affect memory use and latency. Keep them fixed within a
+comparison and record them with the hardware and DeepEP version. In a TP versus EP benchmark,
+compare the same global token workload: replicated TP inputs and token-sharded EP inputs do not
+have the same per-rank token count.
