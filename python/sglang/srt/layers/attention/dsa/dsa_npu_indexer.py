@@ -16,7 +16,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
@@ -135,6 +135,13 @@ def _build_indexer_query_shard(
     start, rows, num_real, cum_query_lens, key_lens = plan_indexer_query_shard(
         prefix_lens, extend_lens, parallel.attn_tp_size, parallel.attn_tp_rank
     )
+    if parallel.attn_tp_rank == 0:
+        # The switch is an env var and /server_info cannot show it, so this line
+        # is the evidence that a run was sharded at all.
+        print_info_once(
+            "DSA indexer query sharding is active: prefill indexer queries split "
+            f"across attn_tp_size={parallel.attn_tp_size}"
+        )
     device = forward_batch.seq_lens.device
     return _IndexerQueryShard(
         start=start,
