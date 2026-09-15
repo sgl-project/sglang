@@ -455,7 +455,7 @@ class _DeepEPDispatcherImplBase:
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.MXFP8: {
-                "use_fp8": True,
+                "use_fp8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.NVFP4: {
@@ -475,14 +475,6 @@ class _DeepEPDispatcherImplBase:
         config = config_map[self.deepep_output_dtype]
         self.use_fp8 = config["use_fp8"]
         self.use_nvfp4 = config["use_nvfp4"]
-        # A5 DeepEP distinguishes block-scaled MXFP8 from the legacy NPU
-        # ``use_fp8`` path (which produces INT8).  Keep the legacy flags for
-        # existing modes and opt into MXFP8 through the explicit API.
-        self.quant_mode = (
-            "mx_fp8_e4m3"
-            if self.deepep_output_dtype == DispatcherOutputDtype.MXFP8
-            else None
-        )
 
         # Handle environment variables
         if _is_npu:
@@ -866,11 +858,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(quant_mode=self.quant_mode)
-                    if self.quant_mode is not None
-                    else {}
-                ),
                 **fp8_deepgemm_scale_opts,
             )
         )
