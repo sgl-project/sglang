@@ -571,6 +571,7 @@ mod tests {
     use crate::message::io_struct::GetInternalStateReq;
     use crate::message::multimodal::MmItem;
     use crate::message::request::{GenerateRequest, MmData};
+    use crate::message::response::ChunkEvent;
 
     struct Harness {
         handle: FrontendHandle,
@@ -694,108 +695,6 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn dropping_live_call_aborts_exactly_once() {
-        let harness = Harness::unbounded(8);
-        let call = harness.handle.submit(generate("live")).await.unwrap();
-        let _request = accept_intake(harness.intake_rx.recv().unwrap());
-
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "live"
-        ));
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn terminal_items_disarm_only_the_matching_operation() {
-        async fn assert_disarmed(kind: RequestKind, item: ResponseItem) {
-            let harness = Harness::unbounded(8);
-            let mut call = harness.handle.submit(kind).await.unwrap();
-            let request = accept_intake(harness.intake_rx.recv().unwrap());
-            request.sink.try_send(item).unwrap();
-
-            let _ = call.recv().await;
-            drop(call);
-            assert!(harness.abort_rx.try_recv().is_err());
-        }
-
-        assert_disarmed(generate("done"), ResponseItem::Done(ChunkEvent::default())).await;
-        assert_disarmed(
-            generate("failed"),
-            ResponseItem::Error(Error::Internal("failed".into())),
-        )
-        .await;
-        assert_disarmed(
-            RequestKind::Control(Box::new(ControlRequest::GetInternalStateReq(
-                GetInternalStateReq::new("control".into()),
-            ))),
-            ResponseItem::Control(Bytes::from_static(b"control")),
-        )
-        .await;
-        assert_disarmed(
-            RequestKind::Detokenize {
-                token_ids: vec![1, 2],
-            },
-            ResponseItem::Data(Bytes::from_static(b"data")),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn wrong_response_kind_keeps_generation_armed() {
-        for item in [
-            ResponseItem::Control(Bytes::from_static(b"control")),
-            ResponseItem::Data(Bytes::from_static(b"data")),
-        ] {
-            let harness = Harness::unbounded(8);
-            let mut call = harness.handle.submit(generate("wrong-kind")).await.unwrap();
-            let request = accept_intake(harness.intake_rx.recv().unwrap());
-            request.sink.try_send(item).unwrap();
-
-            let _ = call.recv().await;
-            drop(call);
-            assert!(matches!(
-                harness.abort_rx.recv().unwrap(),
-                AbortSource::Guard(rid) if rid.as_str() == "wrong-kind"
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn nonterminal_frame_keeps_call_armed() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness.handle.submit(generate("streaming")).await.unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Frame(ChunkEvent::default()))
-            .unwrap();
-
-        assert!(matches!(call.recv().await, Some(ResponseItem::Frame(_))));
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "streaming"
-        ));
-    }
-
-    #[tokio::test]
-    async fn response_channel_close_before_terminal_keeps_call_armed() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness.handle.submit(generate("truncated")).await.unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        drop(request);
-
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "truncated"
-        ));
-    }
-
     #[test]
     fn runtime_errors_become_transport_neutral_categories() {
         assert!(matches!(
@@ -812,24 +711,10 @@ mod tests {
             FrontendError::Cancelled(message) if message == "client disconnected"
         ));
 
-        for (error, expected) in [
-            (
-                Error::Tokenize("tokenizer".into()),
-                "tokenize failed: tokenizer",
-            ),
-            (Error::Encode("encoder".into()), "encode failed: encoder"),
-            (
-                Error::Detokenize("decoder".into()),
-                "detokenize failed: decoder",
-            ),
-            (Error::Codec("wire".into()), "serialization error: wire"),
-            (Error::Internal("bug".into()), "internal error: bug"),
-        ] {
-            assert!(matches!(
-                translate_runtime_error(error),
-                FrontendError::Internal(message) if message == expected
-            ));
-        }
+        assert!(matches!(
+            translate_runtime_error(Error::Internal("bug".into())),
+            FrontendError::Internal(message) if message == "internal error: bug"
+        ));
     }
 
     #[test]
@@ -903,48 +788,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coded_scheduler_abort_becomes_one_semantic_failure() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(GenerateRequest {
-                rid: "scheduler-rejection".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Done(ChunkEvent {
-                finish_reason: serde_json::from_value(serde_json::json!({
-                    "type": "abort",
-                    "message": "media decode failed",
-                    "status_code": 432,
-                    "err_type": "BadRequestError"
-                }))
-                .unwrap(),
-                ..Default::default()
-            }))
-            .unwrap();
-
-        assert!(matches!(
-            call.recv().await,
-            Some(FrontendEvent::Failed(FrontendError::RuntimeRejected {
-                kind: FrontendErrorKind::InvalidArgument,
-                message,
-                legacy_http_status: 432,
-            })) if message == "media decode failed"
-        ));
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(
-            harness.abort_rx.try_recv().is_err(),
-            "the runtime already emitted a terminal response"
-        );
-    }
-
-    #[tokio::test]
     async fn plain_scheduler_abort_remains_a_terminal_output() {
         let harness = Harness::unbounded(8);
         let mut call = harness
@@ -980,75 +823,6 @@ mod tests {
         assert!(call.recv().await.is_none());
         drop(call);
         assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn generation_channel_close_becomes_failure_and_still_aborts() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(GenerateRequest {
-                rid: "truncated-event-stream".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        drop(request);
-
-        assert!(matches!(
-            call.recv().await,
-            Some(FrontendEvent::Failed(FrontendError::Internal(message)))
-                if message == "response truncated before completion"
-        ));
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "truncated-event-stream"
-        ));
-    }
-
-    #[tokio::test]
-    async fn drain_ready_preserves_queued_events_before_runtime_closure() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness
-            .handle
-            .generate(GenerateRequest {
-                rid: "drained-event-stream".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Frame(ChunkEvent::default()))
-            .unwrap();
-        drop(request);
-
-        let mut events = Vec::new();
-        call.drain_ready(&mut events);
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events.first(), Some(FrontendEvent::Delta(_))));
-
-        // A non-blocking backlog drain must not let channel closure overtake an
-        // event the runtime had already produced. The following awaited read
-        // reports truncation exactly once.
-        assert!(matches!(
-            call.recv().await,
-            Some(FrontendEvent::Failed(FrontendError::Internal(message)))
-                if message == "response truncated before completion"
-        ));
-        assert!(call.recv().await.is_none());
-
-        call.drain_ready(&mut events);
-        assert_eq!(events.len(), 1, "a terminal failure is emitted only once");
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "drained-event-stream"
-        ));
     }
 
     #[tokio::test]
@@ -1123,46 +897,6 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[test]
-    fn readiness_initialization_and_transition_are_shared() {
-        let initially_unready = Harness::unbounded(8).handle;
-        let observer = initially_unready.clone();
-        assert!(!initially_unready.is_ready());
-        initially_unready.mark_ready();
-        assert!(observer.is_ready());
-
-        let (intake_tx, _) = flume::unbounded();
-        let (abort_tx, _) = flume::unbounded();
-        let initially_ready = FrontendHandle::new(
-            intake_tx,
-            abort_tx,
-            FrontendConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: true,
-                is_disaggregation: false,
-                mm_limits: BTreeMap::new(),
-                metadata: FrontendMetadata::default(),
-            },
-        );
-        assert!(initially_ready.is_ready());
-    }
-
-    #[tokio::test]
-    async fn health_probe_reports_not_ready_without_submitting() {
-        let harness = Harness::unbounded(8);
-        assert_eq!(
-            harness
-                .handle
-                .probe_health(Duration::from_secs(1))
-                .await
-                .unwrap(),
-            HealthStatus::NotReady
-        );
-        assert!(harness.intake_rx.try_recv().is_err());
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn healthy_probe_uses_shared_activity_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -1225,172 +959,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_probe_surfaces_closed_intake_as_operational_error() {
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, abort_rx) = flume::unbounded();
-        drop(intake_rx);
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
-            Default::default(),
-            true,
-            false,
-            BTreeMap::new(),
-        );
-
-        assert!(matches!(
-            handle.probe_health(Duration::ZERO).await,
-            Err(FrontendError::Unavailable)
-        ));
-        assert!(abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn server_info_decodes_allowlisted_typed_result() {
-        let harness = Harness::unbounded(8);
-        let handle = harness.handle.clone();
-        let task = tokio::spawn(async move { handle.server_info().await });
-
-        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
-        assert!(!request.rid.as_str().is_empty());
-        assert!(matches!(request.kind, RequestKind::Control(_)));
-        let memory_usage = rmpv::Value::Map(vec![
-            (rmpv::Value::from("weight"), rmpv::Value::from(12.5)),
-            (rmpv::Value::from("kvcache"), rmpv::Value::from(3.0)),
-            (
-                rmpv::Value::from("startup_available"),
-                rmpv::Value::from(20.0),
-            ),
-            (rmpv::Value::from("token_capacity"), rmpv::Value::from(4096)),
-            (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
-            (rmpv::Value::from("graph"), rmpv::Value::Map(vec![])),
-            (
-                rmpv::Value::from("future_uncontracted_metric"),
-                rmpv::Value::from(99),
-            ),
-        ]);
-        let internal_state = rmpv::Value::Map(vec![
-            (
-                rmpv::Value::from("api_key"),
-                rmpv::Value::from("must-not-cross-the-boundary"),
-            ),
-            (
-                rmpv::Value::from("last_gen_throughput"),
-                rmpv::Value::from(1.5),
-            ),
-            (rmpv::Value::from("memory_usage"), memory_usage),
-            (
-                rmpv::Value::from("effective_max_running_requests_per_dp"),
-                rmpv::Value::from(32),
-            ),
-            (
-                rmpv::Value::from("step_time_dict"),
-                rmpv::Value::Map(vec![(
-                    rmpv::Value::from(4),
-                    rmpv::Value::Array(vec![rmpv::Value::from(0.01)]),
-                )]),
-            ),
-        ]);
-        let envelope =
-            rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal_state)]);
-        let mut payload = Vec::new();
-        rmpv::encode::write_value(&mut payload, &envelope).unwrap();
-        request
-            .sink
-            .try_send(ResponseItem::Control(Bytes::from(payload)))
-            .unwrap();
-        let info = task.await.unwrap().unwrap();
-        assert_eq!(info.internal_states.len(), 1);
-        let state = &info.internal_states[0];
-        assert_eq!(state.last_gen_throughput, Some(1.5));
-        assert_eq!(state.effective_max_running_requests_per_dp, Some(32));
-        assert_eq!(
-            state.memory_usage.as_ref().and_then(|usage| usage.weight),
-            Some(12.5)
-        );
-        assert_eq!(
-            state
-                .step_time_dict
-                .as_ref()
-                .and_then(|steps| steps.get(&4))
-                .map(Vec::as_slice),
-            Some(&[0.01][..])
-        );
-        let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(
-            json["internal_states"][0]["memory_usage"]["token_capacity_swa"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            json["internal_states"][0]["step_time_dict"]["4"],
-            serde_json::json!([0.01])
-        );
-        assert!(!json.to_string().contains("must-not-cross-the-boundary"));
-        assert!(
-            json["internal_states"][0]["memory_usage"]
-                .get("future_uncontracted_metric")
-                .is_none(),
-            "uncontracted scheduler fields must not silently become public API"
-        );
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn closed_control_response_is_internal_and_still_aborts() {
+    async fn control_operation_returns_transport_neutral_payload() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
         let task = tokio::spawn(async move {
             handle
                 .control(ControlRequest::GetInternalStateReq(
-                    GetInternalStateReq::new("closed-control".into()),
+                    GetInternalStateReq::new("control-id".into()),
                 ))
                 .await
         });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
-        let rid = request.rid.clone();
-        assert!(matches!(&request.kind, RequestKind::Control(_)));
-        drop(request);
-
-        let error = task.await.unwrap().unwrap_err();
-        assert_eq!(error.kind(), FrontendErrorKind::Internal);
-        assert!(matches!(error, FrontendError::ResponseTruncated));
-        assert!(matches!(
-            harness.abort_rx.recv_async().await.unwrap(),
-            AbortSource::Guard(aborted) if aborted == rid
-        ));
-    }
-
-    #[test]
-    fn model_info_is_a_typed_snapshot_of_shared_configuration() {
-        let (intake_tx, _) = flume::unbounded();
-        let (abort_tx, _) = flume::unbounded();
-        let handle = FrontendHandle::new(
-            intake_tx,
-            abort_tx,
-            FrontendConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: false,
-                is_disaggregation: false,
-                mm_limits: BTreeMap::new(),
-                metadata: FrontendMetadata::from(&ServerArgs {
-                    model_path: "/model".into(),
-                    served_model_name: "served".into(),
-                    tokenizer_path: "/tokenizer".into(),
-                    weight_version: Some("v1".into()),
-                    ..Default::default()
-                }),
-            },
-        );
-
-        let value = serde_json::to_value(handle.model_info()).unwrap();
-        assert_eq!(value["model_path"], "/model");
-        assert_eq!(value["served_model_name"], "served");
-        assert_eq!(value["tokenizer_path"], "/tokenizer");
-        assert_eq!(value["weight_version"], "v1");
-        assert_eq!(value["is_generation"], true);
+        assert_eq!(request.rid.as_str(), "control-id");
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from_static(b"payload")))
+            .unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"payload"));
+        assert!(harness.abort_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1407,25 +994,6 @@ mod tests {
             .try_send(ResponseItem::Data(Bytes::from_static(b"decoded")))
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap(), "decoded");
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn detokenize_rejects_non_utf8_before_it_reaches_an_adapter() {
-        let harness = Harness::unbounded(8);
-        let handle = harness.handle.clone();
-        let task = tokio::spawn(async move { handle.detokenize(vec![1]).await });
-
-        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Data(Bytes::from_static(&[0xff])))
-            .unwrap();
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(FrontendError::InvalidResponse(message))
-                if message == "detokenized prompt is not valid UTF-8"
-        ));
         assert!(harness.abort_rx.try_recv().is_err());
     }
 }

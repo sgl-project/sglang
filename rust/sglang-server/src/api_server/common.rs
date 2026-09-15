@@ -237,9 +237,20 @@ mod tests {
             ),
             (
                 rmpv::Value::from("memory_usage"),
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
+                    (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+                    (
+                        rmpv::Value::from("future_uncontracted_metric"),
+                        rmpv::Value::from(99),
+                    ),
+                ]),
+            ),
+            (
+                rmpv::Value::from("step_time_dict"),
                 rmpv::Value::Map(vec![(
-                    rmpv::Value::from("token_capacity"),
-                    rmpv::Value::from(8192),
+                    rmpv::Value::from(4),
+                    rmpv::Value::Array(vec![rmpv::Value::from(0.01)]),
                 )]),
             ),
         ]);
@@ -265,7 +276,21 @@ mod tests {
             body["internal_states"][0]["memory_usage"]["token_capacity"],
             8192
         );
+        assert_eq!(
+            body["internal_states"][0]["memory_usage"]["token_capacity_swa"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body["internal_states"][0]["step_time_dict"]["4"],
+            serde_json::json!([0.01])
+        );
         assert!(!body.to_string().contains("must-not-leak"));
+        assert!(
+            body["internal_states"][0]["memory_usage"]
+                .get("future_uncontracted_metric")
+                .is_none(),
+            "uncontracted scheduler fields must not silently become public API"
+        );
         assert!(abort_rx.try_recv().is_err());
     }
 

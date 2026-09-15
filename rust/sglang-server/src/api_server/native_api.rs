@@ -484,21 +484,6 @@ mod tests {
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn frontend(startup_ready: bool) -> crate::frontend::FrontendHandle {
-        crate::frontend::FrontendHandle::new(
-            flume::unbounded().0,
-            flume::unbounded().0,
-            crate::frontend::FrontendConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready,
-                is_disaggregation: false,
-                mm_limits: Default::default(),
-                metadata: crate::frontend::FrontendMetadata::default(),
-            },
-        )
-    }
-
     fn frame(rid: u64, text: &str) -> ResponseItem {
         ResponseItem::Frame(ChunkEvent {
             rid: Rid::from(rid.to_string()),
@@ -557,6 +542,7 @@ mod tests {
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    metadata: crate::frontend::FrontendMetadata::default(),
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
