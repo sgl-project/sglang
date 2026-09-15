@@ -154,6 +154,8 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    dsv41_spec_layout: Optional[dict] = None
+
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
         "Failed to get kvcache from prefill instance, it might be dead"
