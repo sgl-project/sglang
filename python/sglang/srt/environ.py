@@ -869,6 +869,10 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Assert, once per layer, that the aiter fused routing preamble produces the same
+    # MoE output as the stage-by-stage chain before trusting any measurement of it.
+    # Runs both paths, so it is for gating and debugging, not for serving.
+    SGLANG_AITER_FUSED_ROUTER_VERIFY = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

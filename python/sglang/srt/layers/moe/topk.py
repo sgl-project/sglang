@@ -269,6 +269,33 @@ class TopKConfig:
 # -------------------------------- TopKOutput ---------------------------------------
 
 
+_AITER_BYPASS_LOGGED: list = []
+
+
+def _aiter_fused_router_bypass(
+    topk_config: TopKConfig, hidden_dim: int, num_experts: int
+) -> bool:
+    """Whether the installed aiter can route this MoE itself, so top-k is skipped here.
+
+    Imported lazily: `moe_runner.aiter` imports this module, and the aiter package is
+    absent on non-ROCm builds.
+    """
+    try:
+        from sglang.srt.layers.moe.moe_runner.aiter import fused_router_can_bypass_topk
+    except ImportError:
+        return False
+    decision = fused_router_can_bypass_topk(topk_config, hidden_dim, num_experts)
+    if not _AITER_BYPASS_LOGGED:
+        _AITER_BYPASS_LOGGED.append(decision)
+        logger.info(
+            "aiter fused router: top-k bypass %s (hidden_dim=%d, experts=%d)",
+            "ENABLED" if decision else "not taken",
+            hidden_dim,
+            num_experts,
+        )
+    return decision
+
+
 class TopKOutputChecker:
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
@@ -655,6 +682,18 @@ class TopK(BaseFusedOp):
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
+            output_format = TopKOutputFormat.BYPASSED
+        elif _aiter_fused_router_bypass(
+            self.topk_config, hidden_states.shape[-1], router_logits.shape[-1]
+        ):
+            # The aiter build carries a fused routing preamble that does the selection
+            # itself, so computing it here would be paid twice. The runner falls back
+            # via `to_standard()` if the per-call check refuses, which is why this gate
+            # only reads static configuration -- the answer must not differ between
+            # CUDA-graph capture and replay. In particular the validated token-count
+            # envelope is enforced in the runner, not here: `to_standard()` runs the
+            # same `select_experts` this branch would have run, so a refusal above the
+            # bound costs the ordinary path and nothing more.
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
