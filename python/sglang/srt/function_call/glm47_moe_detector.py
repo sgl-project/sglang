@@ -260,14 +260,23 @@ def parse_arguments(
     """
     # Strategy 1: Direct JSON parsing
     try:
-        return _coerce_numeric_string(json.loads(json_value), arg_type), True
+        parsed_value = json.loads(json_value)
+        # A string-typed parameter whose JSON value is not a string at all
+        # (an unquoted numeric id like 123 or 1_234) must not be coerced to
+        # an int: keep the raw text the model emitted.
+        if arg_type == "string" and not isinstance(parsed_value, str):
+            return json_value, True
+        return _coerce_numeric_string(parsed_value, arg_type), True
     except (json.JSONDecodeError, ValueError):
         pass
 
     # Strategy 2: Unescape and parse
     try:
         wrapped = json.loads('{"tmp": "' + json_value + '"}')
-        return _coerce_numeric_string(json.loads(wrapped["tmp"]), arg_type), True
+        parsed_value = json.loads(wrapped["tmp"])
+        if arg_type == "string" and not isinstance(parsed_value, str):
+            return json_value, True
+        return _coerce_numeric_string(parsed_value, arg_type), True
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
