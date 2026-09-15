@@ -16,6 +16,7 @@ from flexkv.integration.sglang.connector import (
     FlexKVHostReleaseShim,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -77,6 +78,13 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     only restores request-owned slots; the normal cache_finished_req path then
     inserts those slots with the same component semantics as fresh prefill.
     """
+
+    # FlexKV mounts one SWA slot per radix node, so a turn contributes a single
+    # snapshot at its end. A later request whose prefix stops mid-turn finds no
+    # SWA there, and a full-KV hit without one is dropped whole. Storing every N
+    # pages of prefill puts snapshots on a grid instead; 0 keeps turn-end only.
+    # Declared here so __getattr__ never forwards it to the inner cache.
+    _swa_grid_tokens: int = 0
 
     def __init__(
         self,
@@ -154,6 +162,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._pending_store_launches: dict[str, _PendingStoreLaunch] = {}
         self._pending_store_copies: dict[str, _PendingStoreCopy] = {}
         self._node_lock = threading.Lock()
+
+        self._swa_grid_tokens = envs.SGLANG_FLEXKV_SWA_GRID_PAGES.get() * self.page_size
 
     def reset(self) -> None:
         # Mapping copies may still be staged outside the connector. Wait for
@@ -475,15 +485,37 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, **kwargs) -> None:
         self._validate_restore_lease(req)
         self._apply_restore_swa_boundary(req)
+        chunked = kwargs.get("chunked", False)
+        grid_tokens = self._swa_grid_tokens
+        # Prefix length as of the previous chunk boundary; the inner insert
+        # below advances it to this chunk's end.
+        prev_protected_len = (
+            req.kv.cache_protected_len if chunked and grid_tokens > 0 else 0
+        )
         self._inner_cache.cache_unfinished_req(req, **kwargs)
         self._commit_restore(req)
 
-        # A chunk boundary is not a reusable request boundary and its state may
-        # still be changing. The non-chunked call marks prefill completion, when
-        # DSv4's SWA/compress state exactly describes the prompt prefix.
-        if kwargs.get("chunked", False):
+        if chunked:
+            if grid_tokens > 0:
+                self._store_grid_point(req, prev_protected_len, grid_tokens)
             return
         self._store_prefix(req, list(req.get_fill_ids()))
+
+    def _store_grid_point(
+        self, req: Req, prev_protected_len: int, grid_tokens: int
+    ) -> None:
+        """Store at a chunk boundary when the prefix crosses a grid multiple.
+
+        The store must follow the inner insert: only then is this chunk's SWA
+        page under ``cache_protected_len``, which ``Req.kv.swa_dead_lo`` makes a
+        floor for window eviction, so the page the D2H reads cannot be freed
+        beneath it.
+        """
+        fill_ids = list(req.get_fill_ids())
+        aligned_length = len(fill_ids) // self.page_size * self.page_size
+        if aligned_length // grid_tokens == prev_protected_len // grid_tokens:
+            return
+        self._store_prefix(req, fill_ids)
 
     def _store_prefix(self, req: Req, token_ids: Sequence[int]) -> None:
         """Store a page-aligned prefix and its exact SWA/state snapshot."""

@@ -741,6 +741,11 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # FlexKV mounts one SWA snapshot per radix node, so a turn offloads exactly
+    # one. Also store every N pages of prefill so mid-turn prefixes find a
+    # snapshot; 0 keeps the turn-end-only behavior. Each grid point costs one
+    # host SWA pool slot.
+    SGLANG_FLEXKV_SWA_GRID_PAGES = EnvInt(0)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
