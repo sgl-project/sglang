@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
+from sglang.srt.layers.dcp import SupportsDecodeContextParallelMetadata
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
@@ -296,8 +297,12 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.ps.attn_dcp_size > 1
+                and not forward_batch.forward_mode.is_target_verify()
+                and isinstance(
+                    model_runner.model, SupportsDecodeContextParallelMetadata
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
