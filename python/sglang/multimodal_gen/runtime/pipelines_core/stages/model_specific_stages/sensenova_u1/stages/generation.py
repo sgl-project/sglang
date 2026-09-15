@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     DEFAULT_TIMESTEP_SHIFT,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
     SENSENOVA_U1_RESOLUTION_ALIGNMENT,
+    _flatten_rgba_to_rgb,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
@@ -48,14 +49,6 @@ def _auto_input_max_pixels(num_images: int) -> int:
         return DEFAULT_INPUT_MAX_PIXELS
     total_budget = full_resolution_image_budget * DEFAULT_INPUT_MAX_PIXELS
     return max(MIN_INPUT_MAX_PIXELS, total_budget // num_images)
-
-
-def _flatten_rgba_to_rgb(image: Image.Image) -> Image.Image:
-    if image.mode != "RGBA":
-        return image.convert("RGB")
-    background = Image.new("RGB", image.size, (255, 255, 255))
-    background.paste(image, mask=image.split()[3])
-    return background
 
 
 def _resize_input_to_budget(
@@ -104,7 +97,7 @@ def _image_input_to_list(image_input: Any) -> list[Image.Image]:
         if isinstance(item, Image.Image):
             images.append(item)
         else:
-            images.append(load_image(str(item)))
+            images.append(load_image(str(item), convert_method=_flatten_rgba_to_rgb))
     return images
 
 

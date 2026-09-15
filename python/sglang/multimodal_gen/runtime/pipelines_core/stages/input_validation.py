@@ -175,6 +175,18 @@ class InputValidationStage(PipelineStage):
             torch.Generator(device_str).manual_seed(seed) for seed in seeds
         ]
 
+    @staticmethod
+    def _load_condition_image(path: str, server_args: ServerArgs):
+        loader = getattr(server_args.pipeline_config, "load_condition_image", None)
+        if callable(loader):
+            return loader(path)
+        convert_method = getattr(
+            server_args.pipeline_config, "condition_image_convert_method", None
+        )
+        if callable(convert_method):
+            return load_image(path, convert_method=convert_method())
+        return load_image(path)
+
     def preprocess_condition_image(
         self,
         batch: Req,
@@ -433,7 +445,7 @@ class InputValidationStage(PipelineStage):
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = self._load_condition_image(path, server_args)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -447,7 +459,7 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self._load_condition_image(batch.image_path, server_args)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,

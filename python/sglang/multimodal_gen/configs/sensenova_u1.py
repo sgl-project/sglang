@@ -4,6 +4,8 @@
 import json
 import os
 
+from PIL import Image
+
 SENSENOVA_U1_REQUEST_EXTRA_KEY = "sensenova_u1"
 
 SENSENOVA_U1_MODEL_IDS = {
@@ -27,6 +29,14 @@ DEFAULT_ENABLE_TIMESTEP_SHIFT = True
 DEFAULT_CFG_INTERVAL = (0.0, 1.0)
 DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
+
+
+def _flatten_rgba_to_rgb(image: Image.Image) -> Image.Image:
+    if image.mode != "RGBA":
+        return image.convert("RGB")
+    background = Image.new("RGB", image.size, (255, 255, 255))
+    background.paste(image, mask=image.split()[3])
+    return background
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:

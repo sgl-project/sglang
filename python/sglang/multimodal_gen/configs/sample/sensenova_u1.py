@@ -21,6 +21,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
 _PUBLIC_OVERRIDE_FIELDS = {
     "prompt",
     "prompt_path",
+    "image_path",
     "height",
     "width",
     "num_inference_steps",

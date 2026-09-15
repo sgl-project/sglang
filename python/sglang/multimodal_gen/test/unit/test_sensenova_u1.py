@@ -597,6 +597,7 @@ def test_sensenova_u1_rejects_video_frame_count():
 def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     args = SimpleNamespace(
         prompt="hello",
+        image_path="image_google.png",
         width=2304,
         height=4096,
         guidance_scale=4.5,
@@ -610,6 +611,7 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
 
     assert cli_args["prompt"] == "hello"
+    assert cli_args["image_path"] == "image_google.png"
     assert cli_args["width"] == 2304
     assert cli_args["height"] == 4096
     assert cli_args["guidance_scale"] == 4.5
@@ -618,6 +620,37 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
     assert "think_mode" not in cli_args
+
+
+def test_sensenova_u1_input_validation_loads_rgba_with_white_background(tmp_path):
+    image_path = tmp_path / "transparent.png"
+    image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+    image.putpixel((1, 0), (255, 0, 0, 255))
+    image.save(image_path)
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=2048,
+        height=2048,
+        seed=7,
+    )
+    batch = Req(
+        sampling_params=sampling,
+        extra=sampling.build_request_extra(),
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(),
+        enable_cfg_parallel=False,
+    )
+
+    InputValidationStage().forward(batch, server_args)
+
+    assert isinstance(batch.condition_image, list)
+    assert len(batch.condition_image) == 1
+    loaded = batch.condition_image[0]
+    assert loaded.mode == "RGB"
+    assert loaded.getpixel((0, 0)) == (255, 255, 255)
+    assert loaded.getpixel((1, 0)) == (255, 0, 0)
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():

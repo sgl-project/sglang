@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.sensenova_u1 import _flatten_rgba_to_rgb
 
 
 def _is_runtime_option_requested(value) -> bool:
@@ -87,6 +88,9 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     def prepare_calculated_size(self, image):
         del image
         return None
+
+    def condition_image_convert_method(self):
+        return _flatten_rgba_to_rgb
 
     def supports_dynamic_batching(self):
         return False
