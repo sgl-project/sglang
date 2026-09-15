@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Transactional orchestration of snapshot create and restore.
+"""Transactional orchestration of snapshot create/restore/inspect.
 
 The controller is the only place that knows the order of the steps; the
 process, CRIU, cuda-checkpoint and artifact-file operations belong to
@@ -15,6 +15,7 @@ import msgspec
 from sglang.srt.engine_snapshot import control
 from sglang.srt.engine_snapshot.errors import (
     SnapshotCompatibilityError,
+    SnapshotError,
     SnapshotRuntimeFailure,
     SnapshotUsageError,
     error_detail,
@@ -29,6 +30,7 @@ from sglang.srt.engine_snapshot.manifest import (
     locked,
     publish_manifest,
     record_failure,
+    validate_artifact_path,
     validate_identity,
 )
 from sglang.srt.engine_snapshot.runtime import SnapshotRuntime
@@ -153,23 +155,23 @@ def _assemble_manifest(
     )
 
 
-def create_snapshot(output, server_argv, timeout=600, runtime=None):
+def create_snapshot(artifact, server_argv, timeout=600, runtime=None):
     """Initialize an engine, checkpoint it and publish the artifact."""
     runtime = runtime or SnapshotRuntime()
     launch_environment = dict(os.environ)
     validate_server_args(server_argv)
-    artifact_path = Path(os.path.abspath(output))
+    artifact_path = Path(os.path.abspath(artifact))
     runtime.preflight("create", artifact_path)
     stdio = runtime.stdio_resources()
     try:
         artifact_path.mkdir(mode=0o700)
     except FileExistsError as error:
         raise SnapshotUsageError(
-            f"snapshot output directory already exists: {artifact_path}"
+            f"snapshot artifact directory already exists: {artifact_path}"
         ) from error
     except FileNotFoundError as error:
         raise SnapshotUsageError(
-            f"snapshot output parent directory does not exist: {artifact_path.parent}"
+            f"snapshot artifact parent directory does not exist: {artifact_path.parent}"
         ) from error
     with locked(artifact_path):
         for directory in _ARTIFACT_SUBDIRS:
@@ -225,8 +227,8 @@ def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
             raise SnapshotCompatibilityError(
                 f"snapshot has no {control.CONTROL_DIRNAME} directory: {artifact_path}"
             )
-        effective_host = host or manifest.host
-        effective_port = port or manifest.port
+        effective_host = manifest.host if host is None else host
+        effective_port = manifest.port if port is None else port
         control.clear_handshake(control_dir)
         runtime.verify_restorable(manifest, effective_host, effective_port)
         root_pid = None
@@ -249,3 +251,40 @@ def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
                     + "; ".join(failures)
                 ) from error
             raise
+
+
+def inspect_snapshot(artifact, runtime=None):
+    """Report what an artifact claims and whether this host could restore it.
+
+    Read-only: nothing is written and no lock is taken, so an operator can look
+    at an artifact while a create or restore is running.
+    """
+    runtime = runtime or SnapshotRuntime()
+    artifact_path = Path(os.path.abspath(artifact))
+    validate_artifact_path(artifact_path)
+    manifest = load_manifest(artifact_path)
+    checks = {
+        "identity": _identity_check(runtime, manifest),
+        "occupied_pids": runtime.occupied_pids(manifest.pids),
+        "listen_address": _listen_check(runtime, manifest.host, manifest.port),
+    }
+    return manifest, checks
+
+
+def _identity_check(runtime, manifest):
+    try:
+        validate_identity(
+            manifest.identity,
+            runtime.current_identity(manifest.model_path, manifest.identity.gpu_uuid),
+        )
+    except SnapshotError as error:
+        return str(error)
+    return "match"
+
+
+def _listen_check(runtime, host, port):
+    try:
+        runtime.check_port_free(host, port)
+    except SnapshotUsageError as error:
+        return str(error)
+    return "free"
