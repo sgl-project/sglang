@@ -238,3 +238,11 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
 
 
 EntryClass = [DeepseekV4ForCausalLMNextN]
+
+
+# DSV4_FP4_PROJ: the MTP head runs its own forward (it does not call
+# DeepseekV4ForCausalLM.forward), so it needs its own forward-mode publisher.
+from sglang.srt.layers.quantization import dsv4_fp4_proj as _dsv4_fp4_proj  # noqa: E402
+
+_dsv4_fp4_proj.install()
+_dsv4_fp4_proj.install_model_hook(DeepseekV4ForCausalLMNextN)
