@@ -277,6 +277,35 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
 
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        # set_kv_buffer's routing over a [bs, width] loc: the caller bundles the
+        # pre-translated SWA loc for window layers, the pool never translates.
+        loc_2d, swa_loc_2d, _ = unwrap_write_loc(loc_info)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        if is_swa_layer:
+            assert swa_loc_2d is not None
+            loc_2d = swa_loc_2d
+        pool.set_kv_buffer_prefix_valid(
+            None,
+            loc_2d,
+            commit_lens,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id_pool,
+        )
+
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
