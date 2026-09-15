@@ -340,12 +340,4 @@ def device_uses_allocator(device: Union[str, torch.device]) -> bool:
 
     npu/musa allocate with torch.empty(pin_memory=True) and never see it.
     """
-    key = (
-        device.type
-        if isinstance(device, torch.device)
-        else str(device).split(":", 1)[0]
-    )
-    return (
-        ALLOC_MEMORY_FUNCS.get(key, alloc_with_host_register)
-        is alloc_with_host_register
-    )
+    return ALLOC_MEMORY_FUNCS[device] is alloc_with_host_register

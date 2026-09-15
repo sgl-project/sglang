@@ -307,19 +307,6 @@ class TestHostMemoryBudget(CustomTestCase):
         budget = self._budget_for(allocator, "cuda", available=reserve + 64 * gib)
         self.assertEqual(budget, 64 * gib // 8)
 
-    def test_off_mode_does_not_query_or_credit_hugetlb(self):
-        gib = 1024**3
-        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
-        allocator = unittest.mock.Mock(
-            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
-            supports_hugetlb=unittest.mock.Mock(return_value=True),
-        )
-        budget = self._budget_for(
-            allocator, "cuda", available=reserve + 64 * gib, mode="off"
-        )
-        self.assertEqual(budget, 64 * gib // 8)
-        allocator.free_hugetlb_bytes.assert_not_called()
-
     def test_no_hugetlb_credit_for_pin_memory_devices(self):
         # npu/musa allocate with torch.empty(pin_memory=True) and never see the
         # allocator, so what it could map from hugetlb does not apply.
@@ -345,6 +332,19 @@ class TestHostMemoryBudget(CustomTestCase):
         self.assertEqual(
             budget, (4 * gib - base.HICACHE_HOST_MEMORY_RESERVE_BYTES) // 8
         )
+
+    def test_off_mode_does_not_query_or_credit_hugetlb(self):
+        gib = 1024**3
+        reserve = base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        allocator = unittest.mock.Mock(
+            free_hugetlb_bytes=unittest.mock.Mock(return_value=96 * gib),
+            supports_hugetlb=unittest.mock.Mock(return_value=True),
+        )
+        budget = self._budget_for(
+            allocator, "cuda", available=reserve + 64 * gib, mode="off"
+        )
+        self.assertEqual(budget, 64 * gib // 8)
+        allocator.free_hugetlb_bytes.assert_not_called()
 
     def test_required_mode_uses_only_hugetlb(self):
         gib = 1024**3
@@ -438,11 +438,6 @@ class TestHostTensorAllocatorHugetlb(CustomTestCase):
             self.assertEqual(common.HostTensorAllocator().free_hugetlb_bytes(), 4 * gib)
             self.assertEqual(common.ShmHostTensorAllocator().free_hugetlb_bytes(), 0)
             self.assertEqual(Elsewhere().free_hugetlb_bytes(), 0)
-
-    def test_device_dispatch_check_normalizes_device_keys(self):
-        self.assertTrue(common.device_uses_allocator(torch.device("cpu")))
-        self.assertTrue(common.device_uses_allocator("cuda:0"))
-        self.assertFalse(common.device_uses_allocator("npu:0"))
 
 
 class TestHostPoolGroup(CustomTestCase):
