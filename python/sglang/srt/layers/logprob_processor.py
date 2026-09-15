@@ -717,12 +717,11 @@ def get_token_ids_logprobs_batch_optimized(
     batch_size = len(token_ids_logprobs)
     device = logprobs.device
 
-    # Step 1: Calculate lengths for each request, treating None as empty list
-    # Example: [[1, 3], [2], [0, 2, 4]] -> token_lengths = tensor([2, 1, 3])
-    token_lengths = torch.tensor(
-        [len(token_ids or []) for token_ids in token_ids_logprobs], device=device
-    )
-    total_tokens = int(token_lengths.sum().item())  # 2 + 1 + 3 = 6
+    # Work in CPU-land first: [[1, 3], [2], [0, 2, 4]]
+    #   -> lengths  = [2, 1, 3]
+    #   -> flat_ids = [1, 3, 2, 0, 2, 4]
+    lengths = [len(token_ids or []) for token_ids in token_ids_logprobs]
+    total_tokens = sum(lengths)  # 2 + 1 + 3 = 6
 
     # Handle edge case where no tokens are requested
     if total_tokens == 0:
@@ -730,33 +729,30 @@ def get_token_ids_logprobs_batch_optimized(
             [] for _ in token_ids_logprobs
         ]
 
-    # Step 2: Build flattened indices using torch operations
-    # Example: row_indices = [0, 0, 1, 2, 2, 2] (batch indices repeated by their lengths)
-    row_indices = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), token_lengths
-    )
-    # Example: col_indices = [1, 3, 2, 0, 2, 4] (flattened token IDs from all requests)
-    col_indices = torch.tensor(
-        [
-            token_id
-            for token_ids in token_ids_logprobs
-            for token_id in (token_ids or [])
-        ],
-        device=device,
-        dtype=torch.long,
-    )
+    flat_token_ids = [
+        token_id for token_ids in token_ids_logprobs for token_id in (token_ids or [])
+    ]
 
-    # Step 3: Single vectorized gather operation
+    # Build the gather indices. ``row_indices`` is built on CPU before the
+    # transfer: running repeat_interleave with a device-resident count tensor
+    # forces a sync to materialize the output buffer size, so the counts stay
+    # on the host.
+    # Example: col_indices = [1, 3, 2, 0, 2, 4], row_indices = [0, 0, 1, 2, 2, 2]
+    col_indices = torch.tensor(flat_token_ids, dtype=torch.long, device=device)
+    row_indices = torch.repeat_interleave(
+        torch.arange(batch_size), torch.tensor(lengths, dtype=torch.long)
+    ).to(device)
+
+    # Single vectorized gather operation
     # Example: logprobs[row_indices, col_indices] -> [-2.1, -3.0, -2.2, -2.0, -1.4, -1.6]
     gathered_logprobs = logprobs[row_indices, col_indices]
 
-    # Step 4: Split results back per request using torch operations
-    # Example: split tensor [6] into chunks of sizes [2, 1, 3] -> [tensor(2), tensor(1), tensor(3)]
-    split_logprobs = torch.split_with_sizes(
-        gathered_logprobs, token_lengths.tolist(), dim=0
-    )
+    # Split results back per request. Passing the Python ``lengths`` list
+    # directly avoids a ``.tolist()`` device->host sync.
+    # Example: split tensor [6] into chunks of sizes [2, 1, 3]
+    split_logprobs = torch.split_with_sizes(gathered_logprobs, lengths, dim=0)
 
-    # Step 5: Format output to match expected return structure
+    # Format output to match expected return structure
     # Example: Convert split tensors back to list format with proper empty handling
     # i=0: [1,3] -> append split_logprobs[0] and [1,3]
     # i=1: [2] -> append split_logprobs[1] and [2]

@@ -254,6 +254,35 @@ def validate_input_length(
     return None
 
 
+def batch_convert_tensors_to_lists(tensors: List) -> List:
+    """Batch-convert a list of device tensors to a list of Python lists.
+
+    Calling ``.tolist()`` on each tensor individually forces one device->host
+    sync per tensor, i.e. N syncs for a batch of size N. Concatenating first
+    means a single ``.tolist()`` (one sync), after which the flat result is
+    split back into per-tensor lists.
+
+    Args:
+        tensors: List of tensors (or already-converted lists).
+
+    Returns:
+        List of Python lists. The input is returned unchanged when it is empty
+        or already converted.
+    """
+    if not tensors or not isinstance(tensors[0], torch.Tensor):
+        return tensors
+
+    lengths = [t.numel() for t in tensors]
+    all_values = torch.cat(tensors).tolist()
+
+    result = []
+    offset = 0
+    for length in lengths:
+        result.append(all_values[offset : offset + length])
+        offset += length
+    return result
+
+
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     """Build the tensor payload needed to reconstruct PP output processing state."""
 

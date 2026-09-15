@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
+from sglang.srt.managers.utils import batch_convert_tensors_to_lists
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -535,9 +536,11 @@ class SchedulerBatchResultProcessor:
                     x.tolist() for x in logits_output.next_token_top_logprobs_idx
                 ]
             if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+                logits_output.next_token_token_ids_logprobs_val = (
+                    batch_convert_tensors_to_lists(
+                        logits_output.next_token_token_ids_logprobs_val
+                    )
+                )
 
     def _apply_prefill_logprobs(
         self,
@@ -1109,9 +1112,11 @@ class SchedulerBatchResultProcessor:
                 ]
 
             if logits_output.next_token_token_ids_logprobs_val:
-                logits_output.next_token_token_ids_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
-                ]
+                logits_output.next_token_token_ids_logprobs_val = (
+                    batch_convert_tensors_to_lists(
+                        logits_output.next_token_token_ids_logprobs_val
+                    )
+                )
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
