@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.mem_cache.swa_radix_cache import TreeNode as SWATreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
@@ -9,12 +10,24 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext
 
 
-def get_all_node_hit_counts(ctx: ScriptedContext) -> Dict[int, int]:
-    return _collect_node_attr(ctx, lambda node: node.hit_count)
+def get_all_node_hit_counts(ctx: ScriptedContext) -> dict[int, int]:
+    tree_cache = ctx.scheduler.tree_cache
+    core = getattr(tree_cache, "tree_core", None)
+    return {
+        node if core is not None else node.id: (
+            core.get_node_hit_count(node) if core is not None else node.hit_count
+        )
+        for node in iter_node_handles(tree_cache)
+    }
 
 
-def get_all_node_lock_refs(ctx: ScriptedContext) -> Dict[int, int]:
-    return _collect_node_attr(ctx, _node_lock_ref)
+def get_all_node_lock_refs(ctx: ScriptedContext) -> dict[int, int]:
+    tree_cache = ctx.scheduler.tree_cache
+    core = getattr(tree_cache, "tree_core", None)
+    return {
+        node if core is not None else node.id: get_node_lock_ref(tree_cache, node)
+        for node in iter_node_handles(tree_cache)
+    }
 
 
 def _node_lock_ref(node: Any) -> int:
@@ -25,37 +38,34 @@ def _node_lock_ref(node: Any) -> int:
     return node.lock_ref
 
 
-def resolve_node(tree_cache: Any, node_handle: Any) -> Any:
-    """Resolve whatever a req or match result carries into a tree node.
-
-    ``UnifiedRadixCache`` hands out NodeIds (ints); every other cache hands out
-    the node object itself. Returns None when the handle no longer maps to a
-    live node, which only happens once the node has been freed -- and a freed
-    node holds no locks.
-    """
-    resolve = getattr(tree_cache, "resolve_node_handle", None)
-    if resolve is None:
-        return node_handle
-    try:
-        return resolve(node_handle)
-    except KeyError:
-        return None
+def get_node_lock_ref(tree_cache: Any, node_handle: Any) -> int:
+    """Read locks through the cache's native handle, including stale handles."""
+    if node_handle is None:
+        return 0
+    core = getattr(tree_cache, "tree_core", None)
+    if core is not None:
+        if not core.contains_node(node_handle):
+            return 0
+        return sum(
+            core.get_component_device_lock_ref(node_handle, component)
+            for component in tree_cache.tree_components
+        )
+    return _node_lock_ref(node_handle)
 
 
-def to_node_handle(tree_cache: Any, node: Any) -> Any:
-    """Inverse of `resolve_node`: what the tree_cache lock APIs accept."""
-    if isinstance(node, UnifiedTreeNode):
-        return node.id
-    return node
-
-
-def _collect_node_attr(
-    ctx: ScriptedContext, get_value: Callable[[Any], int]
-) -> Dict[int, int]:
-    values: Dict[int, int] = {}
-    stack = list(ctx.scheduler.tree_cache.root_node.children.values())
+def iter_node_handles(tree_cache: Any) -> Iterator[Any]:
+    """Walk non-root nodes as IDs for unified caches or native legacy nodes."""
+    core = getattr(tree_cache, "tree_core", None)
+    stack = (
+        list(core.get_child_node_ids(core.root_node_handle()))
+        if core is not None
+        else list(tree_cache.root_node.children.values())
+    )
     while stack:
         node = stack.pop()
-        values[node.id] = get_value(node)
-        stack.extend(node.children.values())
-    return values
+        yield node
+        stack.extend(
+            core.get_child_node_ids(node)
+            if core is not None
+            else node.children.values()
+        )
