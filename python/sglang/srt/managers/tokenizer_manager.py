@@ -2074,7 +2074,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if obj.load_format is None:
             obj.load_format = self.config_value("load_format")
-        logger.info("Start update_weights. Load format=%s", obj.load_format)
+        logger.info(
+            "Start update_weights. Load format=%s model_loader_extra_config=%s "
+            "rebuild_model=%s",
+            obj.load_format,
+            obj.model_loader_extra_config,
+            obj.rebuild_model,
+        )
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
@@ -2135,12 +2141,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             resolved[name] = getattr(self, name)
         return resolved
 
-    def _update_model_path_info(self, model_path: str, load_format: str):
+    def _update_model_path_info(
+        self,
+        model_path: str,
+        load_format: str,
+        model_loader_extra_config: Optional[Union[str, Dict[str, Any]]] = None,
+    ):
         # These two stay on the manager: the readback reads them from here,
         # and a bag write would not reach the other processes anyway.
         self.served_model_name = model_path
         self.model_path = model_path
-        self.record_config_updates("tokenizer.update_weights", load_format=load_format)
+        updates = {"load_format": load_format}
+        if model_loader_extra_config is not None:
+            updates["model_loader_extra_config"] = model_loader_extra_config
+        self.record_config_updates("tokenizer.update_weights", **updates)
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
@@ -2153,14 +2167,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if expected_workers == 1:
             result = await self.model_update_result
             if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                self._update_model_path_info(
+                    obj.model_path, obj.load_format, obj.model_loader_extra_config
+                )
             return result.success, result.message, result.num_paused_requests
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                self._update_model_path_info(
+                    obj.model_path, obj.load_format, obj.model_loader_extra_config
+                )
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
