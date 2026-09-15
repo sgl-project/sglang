@@ -12,9 +12,10 @@ use std::sync::Arc;
 /// An existing local file (or anything with a filesystem-path shape) is
 /// loaded directly via `Tokenizer::from_file`. Otherwise `source` is treated
 /// as a HuggingFace repo id and its `tokenizer.json` is downloaded (once, at
-/// startup) into the HF cache, honoring `HF_TOKEN` / `HF_HOME` /
-/// `HF_HUB_OFFLINE`. `dynamo_tokenizers` itself has no HF-download path, so
-/// the fetch is done here via `hf-hub`.
+/// startup) into the HF cache. `hf-hub` resolves `HF_TOKEN`, `HF_TOKEN_PATH`,
+/// `HF_HOME`, `HF_HUB_CACHE`, and `HF_ENDPOINT`. Cached files are used without
+/// contacting the Hub; `HF_HUB_OFFLINE` is not interpreted. Downloads happen
+/// here, before passing a local path to `dynamo_tokenizers`.
 pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
     if Path::new(source).is_file() || looks_like_path(source) {
         return Tokenizer::from_file(source)
@@ -44,9 +45,7 @@ fn looks_like_path(source: &str) -> bool {
 }
 
 /// Download `tokenizer.json` for a HuggingFace repo id and return the cached
-/// local path, adding an actionable error context. The actual fetch (blocking
-/// `ureq`, `from_env` so `HF_TOKEN` / `HF_HOME` / endpoint overrides apply)
-/// lives in [`download_repo_file`].
+/// local path, adding an actionable error context.
 fn download_tokenizer_json(repo_id: &str) -> Result<std::path::PathBuf> {
     download_repo_file(repo_id, "tokenizer.json").with_context(|| {
         format!(
@@ -57,32 +56,70 @@ fn download_tokenizer_json(repo_id: &str) -> Result<std::path::PathBuf> {
     })
 }
 
-/// Download `file` from a HuggingFace repo id and return the cached local path.
+/// Build the shared client for downloads and repository listings.
+fn hub_client() -> Result<hf_hub::HFClientSync> {
+    use hf_hub::HFClient;
+
+    let mut builder = HFClient::builder();
+    // Match hf-hub's implicit-auth opt-out before applying an explicit override.
+    if !std::env::var("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_ok_and(|v| !v.is_empty()) {
+        match std::env::var("HF_TOKEN") {
+            Ok(token) if !token.is_empty() => builder = builder.token(normalize_hf_token(&token)?),
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("HF_TOKEN is not valid UTF-8"),
+            _ => {} // hf-hub resolves the token file when HF_TOKEN is unset or empty.
+        }
+    }
+    builder
+        .build_sync()
+        .context("initialize HuggingFace Hub client")
+}
+
+/// Download a repo file, using an existing cached copy before contacting the Hub.
 fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
-    use hf_hub::api::sync::ApiBuilder;
-    let api = ApiBuilder::from_env()
-        .build()
-        .context("initialize HuggingFace Hub client")?;
-    api.model(repo_id.to_string())
-        .get(file)
-        .with_context(|| format!("download {file} for HuggingFace repo {repo_id:?}"))
+    use hf_hub::{split_id, HFError};
+
+    let api = hub_client()?;
+    let (owner, name) = split_id(repo_id);
+    let repo = api.model(owner, name);
+    // Preserve 0.4's cache-first `get`: 1.0 otherwise revalidates with the Hub.
+    let cached = repo
+        .download_file()
+        .filename(file)
+        .local_files_only(true)
+        .send();
+    match cached {
+        Err(HFError::LocalEntryNotFound { .. }) => repo.download_file().filename(file).send(),
+        result => result,
+    }
+    .with_context(|| format!("download {file} for HuggingFace repo {repo_id:?}"))
+}
+
+fn normalize_hf_token(token: &str) -> Result<&str> {
+    let token = token.trim();
+    anyhow::ensure!(
+        !token.is_empty() && token.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+        "HF_TOKEN is blank or contains invalid bytes; provide a valid token or unset it to use a token file"
+    );
+    // hf-hub 1.0 neither trims env tokens nor reports invalid header values.
+    // Reject them without including the credential in an error or log message.
+    Ok(token)
 }
 
 /// List the files an HF repo ships. `None` (with a warning) when the listing
 /// fails, e.g. offline with a warm cache; the caller then attempts each
 /// download individually, which is cache-first.
 fn list_repo_files(repo_id: &str) -> Option<std::collections::HashSet<String>> {
-    use hf_hub::api::sync::ApiBuilder;
-    let listing = ApiBuilder::from_env()
-        .build()
-        .context("initialize HuggingFace Hub client")
-        .and_then(|api| {
-            api.model(repo_id.to_string())
-                .info()
-                .context("list repo files")
-        });
+    let (owner, name) = hf_hub::split_id(repo_id);
+    let listing = hub_client().and_then(|api| {
+        api.model(owner, name)
+            .info()
+            .send()
+            .context("list repo files")
+    });
     match listing {
-        Ok(info) => Some(info.siblings.into_iter().map(|s| s.rfilename).collect()),
+        Ok(info) => info
+            .siblings
+            .map(|files| files.into_iter().map(|s| s.rfilename).collect()),
         Err(e) => {
             tracing::warn!(repo = %repo_id, error = %format!("{e:#}"),
                 "could not list HuggingFace repo files; trying sibling downloads individually");
@@ -227,5 +264,33 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+}
+
+#[cfg(test)]
+mod hf_token_tests {
+    use super::normalize_hf_token;
+
+    #[test]
+    fn trims_valid_tokens() {
+        for token in ["hf_example", "  hf_example\n", "\thf_example\r\n"] {
+            assert_eq!(normalize_hf_token(token).unwrap(), "hf_example");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tokens_without_echoing_them() {
+        for token in [
+            "",
+            " \n\t",
+            "hf_secret\nvalue",
+            "hf_secret value",
+            "hf_secret\u{7f}",
+            "hf_é_secret",
+        ] {
+            let error = normalize_hf_token(token).unwrap_err().to_string();
+            assert!(error.contains("HF_TOKEN"));
+            assert!(!error.contains("secret"));
+        }
     }
 }

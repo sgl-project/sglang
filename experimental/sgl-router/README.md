@@ -22,7 +22,13 @@ The router is configured entirely through CLI flags (run
 `--model-id` is required, along with exactly one discovery backend.
 `--tokenizer-path` is optional: give it a local `tokenizer.json` path or a
 HuggingFace repo id, and when omitted the router downloads the tokenizer
-for `--model-id` from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`).
+for `--model-id` from HuggingFace. Authentication uses `HF_TOKEN`, then the
+file at `HF_TOKEN_PATH`, then `$HF_HOME/token`. Surrounding whitespace in
+`HF_TOKEN` is trimmed; a whitespace-only, non-UTF-8, or malformed value reports
+an error without logging the token. An unset or empty value allows token-file
+fallback. `HF_HUB_DISABLE_IMPLICIT_TOKEN` disables ambient credentials.
+`HF_ENDPOINT`, `HF_HOME`, and `HF_HUB_CACHE` configure the Hub and cache.
+Downloads use cached files first; `HF_HUB_OFFLINE` is not interpreted.
 
 Static worker list:
 
