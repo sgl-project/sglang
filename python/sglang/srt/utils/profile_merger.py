@@ -83,11 +83,11 @@ class ProfileMerger:
 
     def _discover_trace_files(self) -> List[str]:
         """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
-        patterns = [f"{self.profile_id}*.trace.json.gz"]
+        patterns = [f"{glob.escape(self.profile_id)}*.trace.json.gz"]
 
         trace_files = []
         for pattern in patterns:
-            search_pattern = os.path.join(self.output_dir, pattern)
+            search_pattern = os.path.join(glob.escape(self.output_dir), pattern)
             trace_files.extend(glob.glob(search_pattern))
 
         trace_files = [
