@@ -273,6 +273,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.dllm_uses_input_embeds = (
+            self.is_dllm and self.dllm_config.requires_separate_context_encoding
+        )
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
@@ -309,6 +312,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        if self.dllm_uses_input_embeds:
+            max_requests = min(
+                self.dllm_config.max_running_requests, max(self.capture_bs)
+            )
+            self.capture_bs = sorted(
+                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
+            )
+            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -1171,8 +1182,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                     )
                 if (
-                    self.model_runner.spec_algorithm.is_dflash_family()
-                    and self.model_runner.is_draft_worker
+                    (
+                        self.dllm_uses_input_embeds
+                        or (
+                            self.model_runner.spec_algorithm.is_dflash_family()
+                            and self.model_runner.is_draft_worker
+                        )
+                    )
                     and "input_embeds" in inspect.signature(forward).parameters
                     and not hasattr(self.model_runner.model, "forward_embed")
                 ):
@@ -1236,6 +1252,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if self.dllm_uses_input_embeds and forward_batch.input_embeds is None:
+            raise ValueError(
+                "Diffusion graph replay requires prepared input embeddings"
+            )
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -1265,8 +1285,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
                 not is_ragged
-                and self.model_runner.spec_algorithm.is_dflash_family()
-                and self.model_runner.is_draft_worker
+                and (
+                    self.dllm_uses_input_embeds
+                    or (
+                        self.model_runner.spec_algorithm.is_dflash_family()
+                        and self.model_runner.is_draft_worker
+                    )
+                )
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
@@ -1322,8 +1347,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             not is_ragged
-            and self.model_runner.spec_algorithm.is_dflash_family()
-            and self.model_runner.is_draft_worker
+            and (
+                self.dllm_uses_input_embeds
+                or (
+                    self.model_runner.spec_algorithm.is_dflash_family()
+                    and self.model_runner.is_draft_worker
+                )
+            )
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)

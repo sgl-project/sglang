@@ -1,0 +1,924 @@
+{
+  "date_utc": "2026-09-09",
+  "model": "diffusiongemma-26B-A4B-it",
+  "base_revision": "db272201a2dbd72e5699e443240a851f1313ad45",
+  "runtime_revisions": {
+    "sglang_rebased": "50e97752fcafa964eb444abaf2dbbb2d8da5c6da",
+    "sglang_fdfo": "b49ecee249eb1ccff380d3ceab6bde5df3104dd1",
+    "sglang_sync": "b49ecee249eb1ccff380d3ceab6bde5df3104dd1",
+    "vllm_028": "v0.28.0"
+  },
+  "software": {
+    "sglang": {
+      "torch": "2.13.0+cu130",
+      "transformers": "5.12.1",
+      "triton": "3.7.1",
+      "flashinfer-python": "0.6.17",
+      "numpy": "2.3.5",
+      "aiohttp": "3.14.3"
+    },
+    "vllm": {
+      "vllm": "0.28.0",
+      "torch": "2.13.0+cu130",
+      "transformers": "5.14.1",
+      "triton": "3.7.1",
+      "flashinfer-python": "0.6.16.post3",
+      "numpy": "2.3.5",
+      "aiohttp": "3.14.3"
+    }
+  },
+  "workload": {
+    "input_lengths": [
+      128,
+      2048
+    ],
+    "output_length": 256,
+    "concurrencies": [
+      1,
+      4,
+      8
+    ],
+    "warmups": 3,
+    "trials": 15,
+    "max_denoising_steps": 48,
+    "stability_threshold": 1,
+    "confidence_threshold": 0.0,
+    "t_min": 0.4,
+    "t_max": 0.8,
+    "entropy_bound": 0.1,
+    "ignore_eos": true,
+    "tensor_parallel_size": 2,
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "context_length": 4096,
+    "max_running_requests": 16,
+    "memory_fraction": 0.65,
+    "prefix_caching": false
+  },
+  "hardware": "index, name, uuid, driver_version, power.limit [W], clocks.max.sm [MHz], clocks.max.memory [MHz]\n0, NVIDIA H200, GPU-9f2f19d5-9073-9273-802b-d7728c33f564, 580.105.08, 700.00 W, 1980 MHz, 3201 MHz\n1, NVIDIA H200, GPU-20b747de-6d4e-5478-af70-65510034a957, 580.105.08, 700.00 W, 1980 MHz, 3201 MHz\n",
+  "configuration_sha256": {
+    "config.json": "13b11d2fe87302cc2332c64eb9eb4ac305d9b8a123ffe9c5cb5b1920fc70c506",
+    "generation_config.json": "99334f763c3dbe8b161aeaca1c150a05344299fda2d2e4a0e1d342c744461200",
+    "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "tokenizer_config.json": "a284d1243b62be31faa9c13e1c28cece940c4abaa7bd9ad87b94f61b40687200"
+  },
+  "reference_generation_config": {
+    "max_new_tokens": 256,
+    "pad_token_id": 0,
+    "eos_token_id": [
+      1,
+      106,
+      50
+    ],
+    "transformers_version": "5.14.1",
+    "confidence_threshold": 0.0,
+    "max_denoising_steps": 48,
+    "sampler_config": {
+      "_cls_name": "EntropyBoundSamplerConfig",
+      "entropy_bound": 0.1
+    },
+    "stability_threshold": 1,
+    "t_max": 0.8,
+    "t_min": 0.4
+  },
+  "launches": {
+    "sglang_rebased": {
+      "command": [
+        "/usr/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "MODEL_CHECKPOINT",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "31400",
+        "--tp-size",
+        "2",
+        "--context-length",
+        "4096",
+        "--max-running-requests",
+        "16",
+        "--mem-fraction-static",
+        "0.65",
+        "--dllm-algorithm",
+        "Gemma4Renoise",
+        "--dllm-algorithm-config",
+        "ARTIFACTS/fixed48-no-convergence.yaml",
+        "--trust-remote-code",
+        "--cuda-graph-config",
+        "{\"decode\":{\"bs\":[1,2,4,8,16]}}",
+        "--random-seed",
+        "42"
+      ],
+      "environment": {
+        "PYTHONPATH": "ARTIFACTS/final-baseline/python",
+        "OMP_NUM_THREADS": "1",
+        "TRITON_CACHE_DIR": "ARTIFACTS/triton-cache",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "HF_HUB_OFFLINE": "1",
+        "TORCHINDUCTOR_CACHE_DIR": "ARTIFACTS/inductor-cache",
+        "VLLM_CACHE_ROOT": "ARTIFACTS/vllm-cache"
+      },
+      "cwd": "SGLANG_CHECKOUT",
+      "source_revision": "50e97752fcafa964eb444abaf2dbbb2d8da5c6da"
+    },
+    "sglang_fdfo": {
+      "command": [
+        "/usr/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "MODEL_CHECKPOINT",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "31400",
+        "--tp-size",
+        "2",
+        "--context-length",
+        "4096",
+        "--max-running-requests",
+        "16",
+        "--mem-fraction-static",
+        "0.65",
+        "--dllm-algorithm",
+        "Gemma4Renoise",
+        "--dllm-algorithm-config",
+        "ARTIFACTS/fixed48-no-convergence.yaml",
+        "--trust-remote-code",
+        "--cuda-graph-config",
+        "{\"decode\":{\"bs\":[1,2,4,8,16]}}",
+        "--random-seed",
+        "42",
+        "--enable-torch-compile",
+        "--torch-compile-max-bs",
+        "8"
+      ],
+      "environment": {
+        "PYTHONPATH": "SGLANG_CHECKOUT/python",
+        "OMP_NUM_THREADS": "1",
+        "TRITON_CACHE_DIR": "ARTIFACTS/triton-cache",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "HF_HUB_OFFLINE": "1",
+        "TORCHINDUCTOR_CACHE_DIR": "ARTIFACTS/inductor-cache",
+        "VLLM_CACHE_ROOT": "ARTIFACTS/vllm-cache"
+      },
+      "source_revision": "b49ecee249eb1ccff380d3ceab6bde5df3104dd1"
+    },
+    "sglang_sync": {
+      "command": [
+        "/usr/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "MODEL_CHECKPOINT",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "31400",
+        "--tp-size",
+        "2",
+        "--context-length",
+        "4096",
+        "--max-running-requests",
+        "16",
+        "--mem-fraction-static",
+        "0.65",
+        "--dllm-algorithm",
+        "Gemma4Renoise",
+        "--dllm-algorithm-config",
+        "ARTIFACTS/fixed48-no-convergence.yaml",
+        "--trust-remote-code",
+        "--cuda-graph-config",
+        "{\"decode\":{\"bs\":[1,2,4,8,16]}}",
+        "--random-seed",
+        "42",
+        "--no-dllm-fdfo",
+        "--enable-torch-compile",
+        "--torch-compile-max-bs",
+        "8"
+      ],
+      "environment": {
+        "PYTHONPATH": "SGLANG_CHECKOUT/python",
+        "OMP_NUM_THREADS": "1",
+        "TRITON_CACHE_DIR": "ARTIFACTS/triton-cache",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "HF_HUB_OFFLINE": "1",
+        "TORCHINDUCTOR_CACHE_DIR": "ARTIFACTS/inductor-cache",
+        "VLLM_CACHE_ROOT": "ARTIFACTS/vllm-cache"
+      },
+      "source_revision": "b49ecee249eb1ccff380d3ceab6bde5df3104dd1"
+    },
+    "vllm_028": {
+      "command": [
+        "vllm",
+        "serve",
+        "MODEL_CHECKPOINT",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "31400",
+        "--tensor-parallel-size",
+        "2",
+        "--max-model-len",
+        "4096",
+        "--max-num-seqs",
+        "16",
+        "--max-num-batched-tokens",
+        "16384",
+        "--gpu-memory-utilization",
+        "0.65",
+        "--diffusion-config",
+        "{\"canvas_length\": 256, \"max_denoising_steps\": 48}",
+        "--seed",
+        "42",
+        "--trust-remote-code",
+        "--compilation-config",
+        "{\"cudagraph_capture_sizes\":[256,512,1024,2048,4096]}",
+        "--dtype",
+        "bfloat16",
+        "--no-enable-prefix-caching",
+        "--no-enable-chunked-prefill",
+        "--generation-config",
+        "ARTIFACTS/fixed48-generation"
+      ],
+      "environment": {
+        "OMP_NUM_THREADS": "1",
+        "TRITON_CACHE_DIR": "ARTIFACTS/triton-cache",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "HF_HUB_OFFLINE": "1",
+        "TORCHINDUCTOR_CACHE_DIR": "ARTIFACTS/inductor-cache",
+        "VLLM_CACHE_ROOT": "ARTIFACTS/vllm-clean-cache",
+        "VLLM_PLUGINS": ""
+      },
+      "source_revision": "v0.28.0"
+    }
+  },
+  "baseline_reproduction": {
+    "start_revision": "687bc5d2fe",
+    "cherry_pick": [
+      "58046d6e4f",
+      "b49ecee249"
+    ]
+  },
+  "measurement_order": [
+    "sglang_fdfo",
+    "sglang_sync",
+    "sglang_rebased",
+    "vllm_028"
+  ],
+  "prompt_hashes_identical_across_runtimes": true,
+  "interpretation": "Fixed-work canvas latency, not adaptive generation speed or useful-text throughput. Closed batches of requests, synthetic library prompts. Latest released vLLM checked on this date; no claim about unreleased main.",
+  "excluded": "Earlier runs with raw prompts, an incorrect diffusion graph mask, or ignored vLLM generation overrides are excluded.",
+  "results": [
+    {
+      "input_tokens": 128,
+      "canvas_tokens": 256,
+      "concurrency": 1,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 2.6844127662479877,
+          "median_bootstrap_95pct_s": [
+            2.680594742298126,
+            2.6870959103107452
+          ],
+          "measured_wall_s": [
+            2.682020016014576,
+            2.6989263352006674,
+            2.6849744264036417,
+            2.68240088224411,
+            2.683578420430422,
+            2.686664531007409,
+            2.6789157390594482,
+            2.6792696081101894,
+            2.6870959103107452,
+            2.6844127662479877,
+            2.6763254459947348,
+            2.680594742298126,
+            2.6932051945477724,
+            2.6941478829830885,
+            2.692521370947361
+          ],
+          "median_request_s": 2.684329880401492
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 0.8098108880221844,
+          "median_bootstrap_95pct_s": [
+            0.8075880371034145,
+            0.8113907240331173
+          ],
+          "measured_wall_s": [
+            0.8110839184373617,
+            0.8060570526868105,
+            0.8086943440139294,
+            0.8112991619855165,
+            0.8130999095737934,
+            0.809177178889513,
+            0.8098108880221844,
+            0.8113907240331173,
+            0.8075880371034145,
+            0.8151672333478928,
+            0.8057791646569967,
+            0.8079698383808136,
+            0.8125509582459927,
+            0.8036057818681002,
+            0.8109665960073471
+          ],
+          "median_request_s": 0.809739962220192
+        },
+        "sglang_sync": {
+          "median_wall_s": 0.740996491163969,
+          "median_bootstrap_95pct_s": [
+            0.7375124357640743,
+            0.7416393365710974
+          ],
+          "measured_wall_s": [
+            0.7463172525167465,
+            0.7415088843554258,
+            0.740996491163969,
+            0.7427713256329298,
+            0.7404703795909882,
+            0.7475571967661381,
+            0.7416393365710974,
+            0.7399249169975519,
+            0.7417729496955872,
+            0.7412303779274225,
+            0.732829974964261,
+            0.7348155323415995,
+            0.7375124357640743,
+            0.7396133001893759,
+            0.7347152456641197
+          ],
+          "median_request_s": 0.7409234642982483
+        },
+        "vllm_028": {
+          "median_wall_s": 0.5689124912023544,
+          "median_bootstrap_95pct_s": [
+            0.5682337787002325,
+            0.5691080465912819
+          ],
+          "measured_wall_s": [
+            0.5689269881695509,
+            0.5696633420884609,
+            0.5697374977171421,
+            0.568228367716074,
+            0.5688486117869616,
+            0.5717216245830059,
+            0.5691080465912819,
+            0.5676402598619461,
+            0.5689124912023544,
+            0.5689789447933435,
+            0.5692937392741442,
+            0.5663851257413626,
+            0.5671468302607536,
+            0.5685101896524429,
+            0.5682337787002325
+          ],
+          "median_request_s": 0.5688223037868738
+        }
+      },
+      "fdfo_speedup_over_rebase": 3.314863761345784
+    },
+    {
+      "input_tokens": 128,
+      "canvas_tokens": 256,
+      "concurrency": 4,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 3.2129524871706963,
+          "median_bootstrap_95pct_s": [
+            3.211318464949727,
+            3.2154091335833073
+          ],
+          "measured_wall_s": [
+            3.176455046981573,
+            3.1855750996619463,
+            3.167770253494382,
+            3.15832176245749,
+            3.2124033477157354,
+            3.2124879974871874,
+            3.211318464949727,
+            3.228462364524603,
+            3.2155156955122948,
+            3.2154091335833073,
+            3.228655280545354,
+            3.21313913539052,
+            3.2129524871706963,
+            3.2168081160634756,
+            3.2143086846917868
+          ],
+          "median_request_s": 3.2125804163515568
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 1.5213301684707403,
+          "median_bootstrap_95pct_s": [
+            1.5190122332423925,
+            1.523479837924242
+          ],
+          "measured_wall_s": [
+            1.5234471689909697,
+            1.5190784707665443,
+            1.5183101184666157,
+            1.5332460291683674,
+            1.5182728432118893,
+            1.5190122332423925,
+            1.5215062256902456,
+            1.5213301684707403,
+            1.522154450416565,
+            1.5211343504488468,
+            1.523479837924242,
+            1.5184716787189245,
+            1.5245998427271843,
+            1.5260931923985481,
+            1.520729312673211
+          ],
+          "median_request_s": 1.5209330469369888
+        },
+        "sglang_sync": {
+          "median_wall_s": 1.4093546606600285,
+          "median_bootstrap_95pct_s": [
+            1.4083506688475609,
+            1.4103550463914871
+          ],
+          "measured_wall_s": [
+            1.40964075922966,
+            1.4054790567606688,
+            1.4081110823899508,
+            1.4115800522267818,
+            1.4126218762248755,
+            1.410125695168972,
+            1.4083506688475609,
+            1.410091144964099,
+            1.4072878826409578,
+            1.408911095932126,
+            1.4076441526412964,
+            1.4088060352951288,
+            1.4116192739456892,
+            1.4103550463914871,
+            1.4093546606600285
+          ],
+          "median_request_s": 1.4090125085785985
+        },
+        "vllm_028": {
+          "median_wall_s": 1.2810117471963167,
+          "median_bootstrap_95pct_s": [
+            1.2652635760605335,
+            1.2817454803735018
+          ],
+          "measured_wall_s": [
+            1.2626985497772694,
+            1.2649163082242012,
+            1.265065411105752,
+            1.2652635760605335,
+            1.2809952776879072,
+            1.2816146351397038,
+            1.2827020045369864,
+            1.2820251379162073,
+            1.278781235218048,
+            1.2810393497347832,
+            1.280937584117055,
+            1.2817454803735018,
+            1.2822329588234425,
+            1.2810117471963167,
+            1.2818889822810888
+          ],
+          "median_request_s": 1.2806501165032387
+        }
+      },
+      "fdfo_speedup_over_rebase": 2.1119363526461816
+    },
+    {
+      "input_tokens": 128,
+      "canvas_tokens": 256,
+      "concurrency": 8,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 3.7822323366999626,
+          "median_bootstrap_95pct_s": [
+            3.779084399342537,
+            3.7855572439730167
+          ],
+          "measured_wall_s": [
+            3.784705175086856,
+            3.7875301521271467,
+            3.7794160954654217,
+            3.780821481719613,
+            3.7846830263733864,
+            3.779084399342537,
+            3.790750799700618,
+            3.781897235661745,
+            3.7855572439730167,
+            3.7875569574534893,
+            3.7822323366999626,
+            3.7714691646397114,
+            3.77795821800828,
+            3.773310225456953,
+            3.790231943130493
+          ],
+          "median_request_s": 3.7815613904967904
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 2.560790840536356,
+          "median_bootstrap_95pct_s": [
+            2.559645975008607,
+            2.5624339319765568
+          ],
+          "measured_wall_s": [
+            2.5606336649507284,
+            2.5586962401866913,
+            2.565187305212021,
+            2.5632951594889164,
+            2.560790840536356,
+            2.5614466220140457,
+            2.5611868277192116,
+            2.559976913034916,
+            2.558323558419943,
+            2.558772398158908,
+            2.5612039379775524,
+            2.5624339319765568,
+            2.559645975008607,
+            2.557500494644046,
+            2.5632350835949183
+          ],
+          "median_request_s": 2.5601233150810003
+        },
+        "sglang_sync": {
+          "median_wall_s": 2.4548407196998596,
+          "median_bootstrap_95pct_s": [
+            2.4523708447813988,
+            2.4586243331432343
+          ],
+          "measured_wall_s": [
+            2.4548407196998596,
+            2.4549860041588545,
+            2.4634245336055756,
+            2.4523708447813988,
+            2.4529673289507627,
+            2.451299013569951,
+            2.4536847043782473,
+            2.4586243331432343,
+            2.460212828591466,
+            2.45162065140903,
+            2.448380211368203,
+            2.454823900014162,
+            2.461469257250428,
+            2.457509657368064,
+            2.4583687614649534
+          ],
+          "median_request_s": 2.454243774525821
+        },
+        "vllm_028": {
+          "median_wall_s": 2.2262940872460604,
+          "median_bootstrap_95pct_s": [
+            2.224675554782152,
+            2.228307720273733
+          ],
+          "measured_wall_s": [
+            2.224539967253804,
+            2.224826607853174,
+            2.228307720273733,
+            2.2316597048193216,
+            2.2282737735658884,
+            2.2320429794490337,
+            2.2228785790503025,
+            2.22551928833127,
+            2.2262940872460604,
+            2.2269007079303265,
+            2.224675554782152,
+            2.226176518946886,
+            2.228065801784396,
+            2.21981212310493,
+            2.2292486391961575
+          ],
+          "median_request_s": 2.2256380235776305
+        }
+      },
+      "fdfo_speedup_over_rebase": 1.4769782353281835
+    },
+    {
+      "input_tokens": 2048,
+      "canvas_tokens": 256,
+      "concurrency": 1,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 2.7022881731390953,
+          "median_bootstrap_95pct_s": [
+            2.69880435988307,
+            2.7114914767444134
+          ],
+          "measured_wall_s": [
+            2.727636704221368,
+            2.7016340997070074,
+            2.7022881731390953,
+            2.731876380741596,
+            2.7072355560958385,
+            2.6988484524190426,
+            2.704974053427577,
+            2.716869506984949,
+            2.697313856333494,
+            2.6977322567254305,
+            2.69880435988307,
+            2.710863122716546,
+            2.6948792412877083,
+            2.6973958145827055,
+            2.7114914767444134
+          ],
+          "median_request_s": 2.7020912803709507
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 0.9826200902462006,
+          "median_bootstrap_95pct_s": [
+            0.9787294305860996,
+            0.9878814723342657
+          ],
+          "measured_wall_s": [
+            0.9802869632840157,
+            0.9801801461726427,
+            0.9813849683851004,
+            0.9753497708588839,
+            0.9878814723342657,
+            0.9786959942430258,
+            0.9855893068015575,
+            0.9826200902462006,
+            0.9926175493746996,
+            0.9840438645333052,
+            0.9787294305860996,
+            0.9755272474139929,
+            1.0024702195078135,
+            0.9879438579082489,
+            0.9918559081852436
+          ],
+          "median_request_s": 0.982433570548892
+        },
+        "sglang_sync": {
+          "median_wall_s": 0.9146060552448034,
+          "median_bootstrap_95pct_s": [
+            0.9088899418711662,
+            0.9161834642291069
+          ],
+          "measured_wall_s": [
+            0.9160856697708368,
+            0.9194157421588898,
+            0.9078298509120941,
+            0.9161834642291069,
+            0.9078072868287563,
+            0.9161522891372442,
+            0.9073715358972549,
+            0.9088899418711662,
+            0.9226173833012581,
+            0.9154695440083742,
+            0.9135068748146296,
+            0.9255473352968693,
+            0.9133201409131289,
+            0.9146060552448034,
+            0.9129314832389355
+          ],
+          "median_request_s": 0.9144246056675911
+        },
+        "vllm_028": {
+          "median_wall_s": 0.6122985612601042,
+          "median_bootstrap_95pct_s": [
+            0.6113443095237017,
+            0.6135129313915968
+          ],
+          "measured_wall_s": [
+            0.6141084637492895,
+            0.6119103487581015,
+            0.6136192884296179,
+            0.6122985612601042,
+            0.6135129313915968,
+            0.6137105375528336,
+            0.6111735757440329,
+            0.6101885810494423,
+            0.6121293343603611,
+            0.6127444673329592,
+            0.6113443095237017,
+            0.6114656645804644,
+            0.6132564526051283,
+            0.6138830371201038,
+            0.6108697298914194
+          ],
+          "median_request_s": 0.6121184565126896
+        }
+      },
+      "fdfo_speedup_over_rebase": 2.7500843916818583
+    },
+    {
+      "input_tokens": 2048,
+      "canvas_tokens": 256,
+      "concurrency": 4,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 3.242768855765462,
+          "median_bootstrap_95pct_s": [
+            3.2334332447499037,
+            3.255585612729192
+          ],
+          "measured_wall_s": [
+            3.2578474171459675,
+            3.242768855765462,
+            3.257623704150319,
+            3.255585612729192,
+            3.2531473841518164,
+            3.26352633908391,
+            3.2330325972288847,
+            3.2344912998378277,
+            3.2334332447499037,
+            3.244931522756815,
+            3.2302559297531843,
+            3.2367474641650915,
+            3.2360824439674616,
+            3.227557396516204,
+            3.2549502849578857
+          ],
+          "median_request_s": 3.241962739266455
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 1.8428572565317154,
+          "median_bootstrap_95pct_s": [
+            1.838598269969225,
+            1.84457353875041
+          ],
+          "measured_wall_s": [
+            1.8414463233202696,
+            1.8354861009866,
+            1.8378769494593143,
+            1.8421917222440243,
+            1.8428572565317154,
+            1.8429693803191185,
+            1.845365684479475,
+            1.8385302312672138,
+            1.8446470443159342,
+            1.8461374044418335,
+            1.8433777876198292,
+            1.8428548444062471,
+            1.838598269969225,
+            1.8436220847070217,
+            1.84457353875041
+          ],
+          "median_request_s": 1.8419964546337724
+        },
+        "sglang_sync": {
+          "median_wall_s": 1.72730746679008,
+          "median_bootstrap_95pct_s": [
+            1.726352907717228,
+            1.7286061141639948
+          ],
+          "measured_wall_s": [
+            1.72730746679008,
+            1.726352907717228,
+            1.7254958916455507,
+            1.7265637833625078,
+            1.7297268770635128,
+            1.72506851144135,
+            1.7295314762741327,
+            1.728035381063819,
+            1.727998737245798,
+            1.7228009216487408,
+            1.7277003321796656,
+            1.7286061141639948,
+            1.72699692286551,
+            1.7301083840429783,
+            1.7231730204075575
+          ],
+          "median_request_s": 1.7265436388552189
+        },
+        "vllm_028": {
+          "median_wall_s": 1.4301874302327633,
+          "median_bootstrap_95pct_s": [
+            1.4279509652405977,
+            1.4313572254031897
+          ],
+          "measured_wall_s": [
+            1.430609356611967,
+            1.42841543443501,
+            1.4336299952119589,
+            1.4261481314897537,
+            1.4307871088385582,
+            1.4285705722868443,
+            1.432019293308258,
+            1.4274725876748562,
+            1.4301874302327633,
+            1.4277620743960142,
+            1.431775201112032,
+            1.4275856595486403,
+            1.4279509652405977,
+            1.4331576190888882,
+            1.4313572254031897
+          ],
+          "median_request_s": 1.4294094955548644
+        }
+      },
+      "fdfo_speedup_over_rebase": 1.759641906214918
+    },
+    {
+      "input_tokens": 2048,
+      "canvas_tokens": 256,
+      "concurrency": 8,
+      "runtimes": {
+        "sglang_rebased": {
+          "median_wall_s": 4.055516164749861,
+          "median_bootstrap_95pct_s": [
+            4.051536574959755,
+            4.059960063546896
+          ],
+          "measured_wall_s": [
+            4.046020608395338,
+            4.0506491754204035,
+            4.059042485430837,
+            4.051536574959755,
+            4.064968960359693,
+            4.049132572486997,
+            4.054440833628178,
+            4.055725922808051,
+            4.031901953741908,
+            4.055516164749861,
+            4.061723912134767,
+            4.066461877897382,
+            4.060776693746448,
+            4.052277412265539,
+            4.059960063546896
+          ],
+          "median_request_s": 4.016094276681542
+        },
+        "sglang_fdfo": {
+          "median_wall_s": 3.260062128305435,
+          "median_bootstrap_95pct_s": [
+            3.2589612435549498,
+            3.2613313030451536
+          ],
+          "measured_wall_s": [
+            3.2613313030451536,
+            3.2621600441634655,
+            3.260062128305435,
+            3.257136346772313,
+            3.259025886654854,
+            3.2589612435549498,
+            3.259654324501753,
+            3.2582520935684443,
+            3.258866399526596,
+            3.2649816423654556,
+            3.264740763232112,
+            3.2625336535274982,
+            3.2606428284198046,
+            3.260663565248251,
+            3.2582879159599543
+          ],
+          "median_request_s": 3.2424846244975924
+        },
+        "sglang_sync": {
+          "median_wall_s": 3.422055322676897,
+          "median_bootstrap_95pct_s": [
+            3.4194831866770983,
+            3.423704646527767
+          ],
+          "measured_wall_s": [
+            3.4161231759935617,
+            3.42453914321959,
+            3.4180026166141033,
+            3.423780605196953,
+            3.423704646527767,
+            3.4204232953488827,
+            3.4194831866770983,
+            3.4207068998366594,
+            3.422055322676897,
+            3.4236318357288837,
+            3.4203349985182285,
+            3.4147345051169395,
+            3.424567310139537,
+            3.422630850225687,
+            3.4222774486988783
+          ],
+          "median_request_s": 2.635040228255093
+        },
+        "vllm_028": {
+          "median_wall_s": 2.51292766071856,
+          "median_bootstrap_95pct_s": [
+            2.5120746921747923,
+            2.513314777985215
+          ],
+          "measured_wall_s": [
+            2.50573387183249,
+            2.505737353116274,
+            2.512893471866846,
+            2.51292766071856,
+            2.513079036027193,
+            2.5138481110334396,
+            2.504500137642026,
+            2.5145100988447666,
+            2.5129904616624117,
+            2.511021953076124,
+            2.513717796653509,
+            2.513314777985215,
+            2.5120746921747923,
+            2.5126662980765104,
+            2.513256473466754
+          ],
+          "median_request_s": 2.511437315493822
+        }
+      },
+      "fdfo_speedup_over_rebase": 1.243999655570337
+    }
+  ]
+}
