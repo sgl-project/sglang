@@ -12,7 +12,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        _processor.image_size = 640
+        _processor.image_size = 768
         _processor.ocr2_mode = (
             str(
                 getattr(getattr(hf_config, "vision_config", None), "model_name", "")
