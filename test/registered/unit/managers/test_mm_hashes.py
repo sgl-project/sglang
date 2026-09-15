@@ -13,15 +13,24 @@ the e2e serve tests; this file pins the unit-level invariants the wiring
 relies on.
 """
 
+import asyncio
+import pickle
+import threading
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.mm_utils import hash_feature
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     _compute_pad_value,
 )
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,6 +119,161 @@ class TestMmHashesContract(CustomTestCase):
 
         self.assertEqual(item.hash, 0xBBBB)
         self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+
+
+class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCase):
+    def setUp(self):
+        self.executor = MultimodalHashExecutor(max_workers=1)
+        self.addCleanup(self.executor.shutdown)
+
+    async def test_cpu_hashes_match_scheduler_and_survive_pickle(self):
+        """Offloading must preserve the prefix-cache identity for every CPU layout."""
+        features = [
+            torch.arange(24).reshape(4, 6).t(),
+            torch.arange(8, dtype=torch.bfloat16),
+            np.arange(24).reshape(4, 6)[:, ::2],
+            [torch.arange(3), [torch.arange(7), torch.arange(2)]],
+        ]
+        for feature in features:
+            for field in ("feature", "precomputed_embeddings"):
+                with self.subTest(type=type(feature), field=field):
+                    expected = MultimodalDataItem(
+                        modality=Modality.IMAGE, **{field: feature}
+                    )
+                    expected.set_pad_value()
+                    item = MultimodalDataItem(
+                        modality=Modality.IMAGE, **{field: feature}
+                    )
+                    await self.executor.set_pad_values([item])
+                    received = pickle.loads(pickle.dumps(item))
+                    with patch(
+                        "sglang.srt.managers.mm_utils.hash_feature",
+                        side_effect=AssertionError("scheduler rehashed a feature"),
+                    ):
+                        received.set_pad_value()
+                    self.assertEqual(
+                        (received.hash, received.pad_value),
+                        (expected.hash, expected.pad_value),
+                    )
+
+    async def test_overrides_and_device_features_stay_on_caller_thread(self):
+        caller_thread = threading.get_ident()
+        overridden = MultimodalDataItem(modality=Modality.IMAGE, hash=1234)
+        padded = MultimodalDataItem(modality=Modality.IMAGE, hash=99, pad_value=1)
+        device_item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=torch.empty(1, device="meta")
+        )
+
+        def device_hash(feature):
+            self.assertEqual(threading.get_ident(), caller_thread)
+            self.assertIs(feature, device_item.feature)
+            return 42
+
+        with patch("sglang.srt.managers.mm_utils.hash_feature", device_hash):
+            await self.executor.set_pad_values([overridden, padded, device_item])
+        self.assertEqual(overridden.hash, 1234)
+        self.assertEqual((padded.hash, padded.pad_value), (99, 1))
+        self.assertEqual(device_item.hash, 42)
+
+    async def test_precomputed_identity_survives_msgpack_router_hops(self):
+        from array import array
+
+        from sglang.srt.managers.io_struct import (
+            TokenizedEmbeddingReqInput,
+            msgpack_decode,
+            msgpack_encode,
+        )
+        from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(8))
+        await self.executor.set_pad_values([item])
+        request = TokenizedEmbeddingReqInput(
+            rid="hash-roundtrip",
+            input_text="",
+            input_ids=array("q", [1]),
+            mm_inputs=MultimodalProcessorOutput(mm_items=[item]),
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+        )
+        for _ in range(2):
+            request = msgpack_decode(msgpack_encode(request))
+        received = request.mm_inputs.mm_items[0]
+        with patch(
+            "sglang.srt.managers.mm_utils.hash_feature",
+            side_effect=AssertionError("scheduler must reuse frontend hash"),
+        ):
+            received.set_pad_value()
+        self.assertEqual(
+            (received.hash, received.pad_value), (item.hash, item.pad_value)
+        )
+
+    async def test_skip_hash_preserves_existing_semantics(self):
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+        with (
+            envs.SGLANG_MM_SKIP_COMPUTE_HASH.override(True),
+            patch(
+                "sglang.srt.managers.mm_utils.hash_feature",
+                side_effect=AssertionError("skip mode read a feature"),
+            ),
+        ):
+            await self.executor.set_pad_values([item])
+        self.assertIsNotNone(item.pad_value)
+
+    async def test_cancelled_native_reader_keeps_capacity_until_finished(self):
+        """Repeated cancellation cannot admit another reader or free its input."""
+        started = asyncio.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        loop = asyncio.get_running_loop()
+        first = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+        second = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.zeros(4))
+        reads = []
+
+        def blocking_hash(feature):
+            reads.append(feature)
+            if feature is first.feature:
+                loop.call_soon_threadsafe(started.set)
+                if not release.wait(5):
+                    raise TimeoutError("test did not release hash worker")
+            return hash_feature(feature)
+
+        with patch("sglang.srt.managers.mm_utils.hash_feature", blocking_hash):
+            task = asyncio.create_task(self.executor.set_pad_values([first]))
+            await asyncio.wait_for(started.wait(), 3)
+            # Reaching here while the hash blocks also proves loop responsiveness.
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            queued = asyncio.create_task(self.executor.set_pad_values([second]))
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertEqual(len(reads), 1)
+            queued.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertIsNone(second.hash)
+            await self.executor.set_pad_values([second])
+        self.assertEqual(len(reads), 2)
+        self.assertIsNotNone(second.hash)
+
+    async def test_error_releases_capacity_and_shutdown_rejects_new_work(self):
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+        with patch(
+            "sglang.srt.managers.mm_utils.hash_feature",
+            side_effect=ValueError("invalid feature"),
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid feature"):
+                await self.executor.set_pad_values([item])
+        await asyncio.wait_for(self.executor.set_pad_values([item]), 3)
+        self.executor.shutdown()
+        self.executor.shutdown()
+        item.hash = item.pad_value = None
+        with self.assertRaisesRegex(RuntimeError, "shutdown"):
+            await self.executor.set_pad_values([item])
 
 
 if __name__ == "__main__":
