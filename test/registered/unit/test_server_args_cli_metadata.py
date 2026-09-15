@@ -66,6 +66,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "routing_key",
             ],
         )
 
