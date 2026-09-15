@@ -79,7 +79,7 @@ class AscendKVManager(MooncakeKVManager):
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
 
     def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
-        # The common DCP packer is CUDA-only. Ascend uses the unpacked path.
+        # The common DCP packer is CUDA-only. npu uses the unpacked path.
         self._dcp_pack_buffers = []
 
     def get_mla_kv_ptrs_with_pp(
