@@ -29,7 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
@@ -1055,24 +1055,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else (input_text or input_ids)
             )
 
-            if (
-                not get_disagg().language_only
-                or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
-            ):
-                if get_disagg().language_only:
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        request_obj=obj,
-                        mm_processor=self.mm_processor,
-                        prompt=mm_processor_input,
-                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                    )
-                    _reject_missing_dispatched_encoder_embedding(obj, mm_inputs)
-                if mm_inputs is None:
+            with self._mm_frontend_stage("preprocess"):
+                if (
+                    not get_disagg().language_only
+                    or get_disagg().encoder_transfer_backend == "zmq_to_tokenizer"
+                ):
                     if get_disagg().language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            request_obj=obj,
+                            mm_processor=self.mm_processor,
+                            prompt=mm_processor_input,
+                            need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                         )
+                        _reject_missing_dispatched_encoder_embedding(obj, mm_inputs)
+                    if mm_inputs is None:
+                        if get_disagg().language_only:
+                            logger.warning(
+                                "Encoder embedding not available, "
+                                "falling back to local mm processing"
+                            )
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=mm_processor_input,
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
+                elif (
+                    get_disagg().language_only
+                    and get_disagg().encoder_transfer_backend
+                    in ["zmq_to_scheduler", "mooncake"]
+                    and not obj.need_wait_for_mm_inputs
+                ):
+                    # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
+                    # to encoder (e.g., only one image), process locally like non-language_only mode
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
@@ -1080,21 +1096,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
-            elif (
-                get_disagg().language_only
-                and get_disagg().encoder_transfer_backend
-                in ["zmq_to_scheduler", "mooncake"]
-                and not obj.need_wait_for_mm_inputs
-            ):
-                # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+
+            if self.enable_metrics and mm_inputs:
+                self.metrics_collector.mm_frontend.observe_inputs(mm_inputs)
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
@@ -1138,9 +1142,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and mm_inputs
                 and mm_inputs.mm_items
             ):
-                for item in mm_inputs.mm_items:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
+                with self._mm_frontend_stage("hash"):
+                    for item in mm_inputs.mm_items:
+                        if isinstance(item, MultimodalDataItem):
+                            item.set_pad_value()
         else:
             mm_inputs = None
 
@@ -1148,6 +1153,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    def _mm_frontend_stage(self, stage: str):
+        if self.enable_metrics:
+            return self.metrics_collector.mm_frontend.record(stage)
+        return nullcontext()
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -1590,29 +1600,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
-        prepared_mm_items = []
-        dispatched = False
-        try:
-            prepared_mm_items = (
-                await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
-                    (tokenized_obj.mm_inputs,)
+        with (
+            self._mm_frontend_stage("dispatch")
+            if tokenized_obj.mm_inputs
+            else nullcontext()
+        ):
+            prepared_mm_items = []
+            dispatched = False
+            try:
+                prepared_mm_items = (
+                    await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
+                        (tokenized_obj.mm_inputs,)
+                    )
                 )
-            )
-            tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(tokenized_obj)
-            time_stats = tokenized_obj.time_stats
-            tokenized_obj.wrap_pickle_fields()
-            self._dispatch_to_scheduler(tokenized_obj)
-            self._mark_state_dispatched(tokenized_obj.rid)
-            dispatched = True
-            dispatch_ready = self.encoder_dispatch_ready.pop(tokenized_obj.rid, None)
-            if dispatch_ready is not None:
-                dispatch_ready.set()
-            tokenized_obj.time_stats = time_stats
-            tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
-        finally:
-            if not dispatched:
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                tokenized_obj.time_stats.set_api_server_dispatch_time()
+                tokenized_obj = wrap_shm_features(tokenized_obj)
+                time_stats = tokenized_obj.time_stats
+                tokenized_obj.wrap_pickle_fields()
+                self._dispatch_to_scheduler(tokenized_obj)
+                self._mark_state_dispatched(tokenized_obj.rid)
+                dispatched = True
+                dispatch_ready = self.encoder_dispatch_ready.pop(
+                    tokenized_obj.rid, None
+                )
+                if dispatch_ready is not None:
+                    dispatch_ready.set()
+                tokenized_obj.time_stats = time_stats
+                tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+            finally:
+                if not dispatched:
+                    self.cuda_vmm_feature_transport.cancel_for_dispatch(
+                        prepared_mm_items
+                    )
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
@@ -1631,35 +1650,43 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
-        prepared_mm_items = []
-        dispatched = False
-        try:
-            prepared_mm_items = (
-                await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
-                    tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+        with ExitStack() as stages:
+            for tokenized_obj in tokenized_objs:
+                if tokenized_obj.mm_inputs:
+                    stages.enter_context(self._mm_frontend_stage("dispatch"))
+            prepared_mm_items = []
+            dispatched = False
+            try:
+                prepared_mm_items = (
+                    await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
+                        tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+                    )
                 )
-            )
 
-            set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-            time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-            for tokenized_obj in tokenized_objs:
-                tokenized_obj.wrap_pickle_fields()
+                set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+                time_stats = [
+                    tokenized_obj.time_stats for tokenized_obj in tokenized_objs
+                ]
+                for tokenized_obj in tokenized_objs:
+                    tokenized_obj.wrap_pickle_fields()
 
-            if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
-                batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
-            else:
-                batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
+                if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
+                    batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
+                else:
+                    batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-            self._dispatch_to_scheduler(batch_req)
-            for tokenized_obj in tokenized_objs:
-                self._mark_state_dispatched(tokenized_obj.rid)
-            dispatched = True
-            for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
-                tokenized_obj.time_stats = time_stat
-            set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
-        finally:
-            if not dispatched:
-                self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
+                self._dispatch_to_scheduler(batch_req)
+                for tokenized_obj in tokenized_objs:
+                    self._mark_state_dispatched(tokenized_obj.rid)
+                dispatched = True
+                for tokenized_obj, time_stat in zip(tokenized_objs, time_stats):
+                    tokenized_obj.time_stats = time_stat
+                set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
+            finally:
+                if not dispatched:
+                    self.cuda_vmm_feature_transport.cancel_for_dispatch(
+                        prepared_mm_items
+                    )
 
     def _coalesce_streaming_chunks(
         self,
