@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -623,7 +624,11 @@ class BaseRunner(ABC):
             spec_algorithm=mr.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            # Refreshed at replay only under expert parallelism; otherwise hand
+            # out None like the eager batch so routing sees no stale count.
+            num_token_non_padded=(
+                buffers.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
