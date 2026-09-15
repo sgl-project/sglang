@@ -72,8 +72,10 @@ fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
 }
@@ -473,8 +475,10 @@ fn host_drive_is_a_noop_without_host_leaves() {
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
+        swa_branching_seqlen: None,
         chunked: false,
         priority: 0,
+        session_id: None,
         track_adopted_ranges: false,
     });
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());

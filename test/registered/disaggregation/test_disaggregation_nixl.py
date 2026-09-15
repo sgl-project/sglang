@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=506, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=350, stage="base-c", runner_config="8-gpu-h20")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4
@@ -198,12 +198,8 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
     "NIXL with the configured backend is required for this test.",
 )
 class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
-    """Small NIXL PD E2E coverage.
-
-    Mooncake already owns the broad disaggregation functional matrix in
-    test_disaggregation_basic.py. This class intentionally mirrors only the
-    subset that proves NIXL can launch, transfer KV, serve a request, return
-    logprobs, and keep all workers alive.
+    """Mooncake owns the broad disaggregation functional matrix in
+    test_disaggregation_basic.py; this is the NIXL-only subset.
     """
 
     @classmethod
@@ -256,21 +252,6 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         self.assertEqual(len(output_logprobs), completion_tokens)
         self.assertGreater(len(input_logprobs), 0)
 
-
-@unittest.skipUnless(
-    _HAS_CONFIGURED_NIXL_BACKEND,
-    "NIXL with the configured backend is required for this test.",
-)
-class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        _require_configured_nixl_backend()
-        _clear_disagg_failure_env()
-        super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
-        configure_nixl_pd_backend(cls)
-        cls.launch_all()
-
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
@@ -305,7 +286,10 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
     def setUpClass(cls):
         _require_configured_nixl_backend()
         super().setUpClass()
-        os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.05"
+        # 0.2, not the mooncake twin's 0.05: this test never inspects the eval
+        # result, so the rate alone decides how much of the failure path runs;
+        # over 50 requests 0.05 would leave an 8% chance of exercising none.
+        os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.2"
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
@@ -321,12 +305,12 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
             eval_name="gsm8k",
             api="completion",
             max_tokens=512,
-            num_examples=200,
+            num_examples=50,
             num_threads=128,
         )
 
-        # Match TestDisaggregationMooncakeFailure: inject many transfer failures
-        # and tolerate eval/request errors as long as workers remain healthy.
+        # Tolerate eval/request errors; the gate is that workers stay healthy
+        # after the injected transfer failures, not the score itself.
         try:
             metrics = run_eval(args)
             print(f"Evaluation metrics: {metrics}")

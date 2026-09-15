@@ -110,7 +110,10 @@ class TestUnifiedRadixTreeInt8MambaCheckpointE2E(TestInt8MambaCheckpointE2E):
                 cls.base_url,
                 timeout=cls.timeout,
                 other_args=cls.other_args,
-                env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+                env={
+                    "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                },
             )
 
     @classmethod

@@ -43,6 +43,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -60,12 +63,35 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_ple_table import (
+    allocate_ple_host_table,
+    make_ple_file_prefetcher,
+    make_ple_file_rss_trimmer,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _ple_table_is_fp8(
+    config: Qwen4ExpTextConfig,
+    quant_config: Optional[QuantizationConfig],
+    prefix: str,
+) -> bool:
+    """fp8 PLE shards: declared by config, an fp8 checkpoint, or a ModelOpt
+    MIXED_PRECISION entry for the ngram table (nvidia/*-Flash-Next-NVFP4)."""
+    if config.ple_embedding_dtype == "float8_e4m3fn":
+        return True
+    if quant_config is None:
+        return False
+    if quant_config.get_name() == "fp8":
+        return True
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        return quant_config.resolve_quant_algo(prefix) == "FP8"
+    return False
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -423,6 +449,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding_dim: int,
         ple_layer_index: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -479,13 +506,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
+        ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         self.ngram_embedding = VocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim_per_ngram,
             params_dtype=(
                 torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
                 else torch.bfloat16
             ),
             output_dtype=torch.bfloat16,
@@ -739,7 +766,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from pinned host memory.
+    """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -764,7 +791,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         "num_added_embeddings_per_partition",
     )
 
-    def __init__(self, embedding: VocabParallelEmbedding) -> None:
+    def __init__(
+        self,
+        embedding: VocabParallelEmbedding,
+        *,
+        backend: str = "pinned",
+        table_dir: Optional[str] = None,
+    ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
@@ -786,15 +819,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        cpu_weight = nn.Parameter(
-            torch.empty(
-                source_weight.shape,
-                dtype=source_weight.dtype,
-                device="cpu",
-                pin_memory=True,
+        host_table = allocate_ple_host_table(
+            shape=source_weight.shape,
+            dtype=source_weight.dtype,
+            backend=backend,
+            table_dir=table_dir,
+            # Each TP rank holds a different vocabulary shard of the same shape.
+            tag=(
+                f"rows{self.shard_indices.org_vocab_start_index}"
+                f"-{self.shard_indices.org_vocab_end_index}"
             ),
-            requires_grad=False,
         )
+        # Only the file backend has anything to prefetch (rows live on storage).
+        self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        # ... and only it needs its resident set bounded: a fault maps a whole
+        # folio, so the mapping would otherwise creep towards the full table.
+        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
+        cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
@@ -837,6 +878,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            if self._file_prefetcher is not None:
+                self._file_prefetcher.enqueue(
+                    flat_ids,
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
+                )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
@@ -881,10 +928,13 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embed_dim,
             ple_layer_index=ple_layer_index,
             quant_config=quant_config,
+            prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
         if config.ple_offload_embedding:
             self.ple_embedding.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                self.ple_embedding.ngram_embedding
+                self.ple_embedding.ngram_embedding,
+                backend=getattr(config, "ple_offload_backend", "pinned"),
+                table_dir=getattr(config, "ple_offload_dir", None),
             )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (

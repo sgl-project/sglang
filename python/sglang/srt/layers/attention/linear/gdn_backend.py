@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -48,6 +49,117 @@ _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get(
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
+
+
+class GDNMISMetadata(msgspec.Struct, frozen=True):
+    query_token_indices: torch.Tensor
+    query_cu_seqlens: torch.Tensor
+    query_seq_lens_cpu: list[int]
+    query_request_indices: torch.Tensor
+    item_token_indices: torch.Tensor
+    item_cu_seqlens: torch.Tensor
+    item_seq_lens_cpu: list[int]
+    item_request_indices: torch.Tensor
+
+
+def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
+    """Build compact query/item segments from request-local MIS delimiters."""
+    if not forward_batch.is_prefill_only:
+        raise ValueError("GDN MIS is only supported for prefill-only requests")
+
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if isinstance(prefix_lens, torch.Tensor):
+        prefix_lens = prefix_lens.tolist()
+    if any(int(prefix_len) != 0 for prefix_len in prefix_lens):
+        raise ValueError("GDN MIS does not support cached prefixes")
+
+    seq_lens = forward_batch.extend_seq_lens_cpu
+    if isinstance(seq_lens, torch.Tensor):
+        seq_lens = seq_lens.tolist()
+    seq_lens = [int(seq_len) for seq_len in seq_lens]
+    delimiter_indices = forward_batch.multi_item_delimiter_indices
+    if delimiter_indices is None or len(delimiter_indices) != len(seq_lens):
+        raise ValueError("GDN MIS requires delimiter indices for every request")
+    if sum(seq_lens) > forward_batch.input_ids.numel():
+        raise ValueError("GDN MIS sequence lengths exceed the input tokens")
+
+    query_token_indices: list[int] = []
+    query_seq_lens_cpu: list[int] = []
+    query_request_indices: list[int] = []
+    item_token_indices: list[int] = []
+    item_seq_lens_cpu: list[int] = []
+    item_request_indices: list[int] = []
+
+    request_start = 0
+    for request_idx, (seq_len, request_delimiters) in enumerate(
+        zip(seq_lens, delimiter_indices)
+    ):
+        delimiters = [int(index) for index in request_delimiters.tolist()]
+        if len(delimiters) < 2:
+            raise ValueError("GDN MIS requires at least two delimiters per request")
+        if any(
+            current >= following
+            for current, following in zip(delimiters, delimiters[1:])
+        ):
+            raise ValueError("GDN MIS delimiter indices must be strictly increasing")
+        if delimiters[0] < 0 or delimiters[-1] >= seq_len:
+            raise ValueError("GDN MIS delimiter index is outside the request")
+        if delimiters[-1] != seq_len - 1:
+            raise ValueError("GDN MIS final delimiter must be the last request token")
+
+        query_len = delimiters[0]
+        if query_len > 0:
+            query_token_indices.extend(range(request_start, request_start + query_len))
+            query_seq_lens_cpu.append(query_len)
+            query_request_indices.append(request_idx)
+
+        branch_ends = delimiters[1:] + [seq_len]
+        for branch_start, branch_end in zip(delimiters, branch_ends):
+            branch_len = branch_end - branch_start
+            item_token_indices.extend(
+                range(request_start + branch_start, request_start + branch_end)
+            )
+            item_seq_lens_cpu.append(branch_len)
+            item_request_indices.append(request_idx)
+
+        request_start += seq_len
+
+    device = forward_batch.input_ids.device
+
+    def _indices(values: list[int], dtype: torch.dtype) -> torch.Tensor:
+        return torch.tensor(values, dtype=dtype, device=device)
+
+    def _cu_seqlens(lengths: list[int]) -> torch.Tensor:
+        result = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+        if lengths:
+            result[1:] = torch.tensor(lengths, dtype=torch.int32, device=device).cumsum(
+                dim=0
+            )
+        return result
+
+    return GDNMISMetadata(
+        query_token_indices=_indices(query_token_indices, torch.int64),
+        query_cu_seqlens=_cu_seqlens(query_seq_lens_cpu),
+        query_seq_lens_cpu=query_seq_lens_cpu,
+        query_request_indices=_indices(query_request_indices, torch.int64),
+        item_token_indices=_indices(item_token_indices, torch.int64),
+        item_cu_seqlens=_cu_seqlens(item_seq_lens_cpu),
+        item_seq_lens_cpu=item_seq_lens_cpu,
+        item_request_indices=_indices(item_request_indices, torch.int64),
+    )
+
+
+def validate_gdn_mis_backend(prefill_backend: LinearAttnKernelBackend) -> None:
+    if not get_exec().features.enable_mis:
+        return
+    if not prefill_backend.is_triton():
+        raise ValueError(
+            "GDN multi-item scoring requires the Triton linear-attention prefill "
+            "backend. Set --linear-attn-prefill-backend triton."
+        )
+    if get_memory().enable_page_major_kv_layout:
+        raise ValueError("GDN multi-item scoring does not support page-major layout")
+
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -391,10 +503,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
     needs_cpu_seq_lens: bool = False
+    supports_mis: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
+        self.enable_mis = get_exec().features.enable_mis
+        self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -404,6 +519,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
@@ -418,6 +534,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self.mis_metadata = None
+        if forward_batch.multi_item_delimiter_indices is not None:
+            if not self.enable_mis:
+                raise ValueError("GDN MIS metadata requires --enable-mis")
+            self.mis_metadata = build_gdn_mis_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -710,6 +831,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        if self.mis_metadata is not None:
+            if is_target_verify:
+                raise ValueError("GDN MIS does not support target verify")
+            return self._forward_extend_mis(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -922,6 +1055,138 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _forward_extend_mis(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        metadata = self.mis_metadata
+        assert metadata is not None
+
+        conv_states[cache_indices] = 0
+        ssm_states[cache_indices] = 0
+        output = mixed_qkv.new_zeros(
+            1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
+        )
+
+        if metadata.query_token_indices.numel() > 0:
+            query_cache_indices = cache_indices[metadata.query_request_indices]
+            query_output = self._forward_mis_segments(
+                layer=layer,
+                mixed_qkv=mixed_qkv[metadata.query_token_indices],
+                a=a[metadata.query_token_indices],
+                b=b[metadata.query_token_indices],
+                conv_states=conv_states,
+                conv_cache_indices=query_cache_indices,
+                has_initial_states=torch.zeros(
+                    len(metadata.query_seq_lens_cpu),
+                    dtype=torch.bool,
+                    device=mixed_qkv.device,
+                ),
+                query_start_loc=metadata.query_cu_seqlens,
+                seq_lens_cpu=metadata.query_seq_lens_cpu,
+                ssm_states=ssm_states,
+                ssm_cache_indices=query_cache_indices,
+                inplace_update=True,
+            )
+            output[:, metadata.query_token_indices] = query_output
+
+        item_ssm_indices = cache_indices[metadata.item_request_indices]
+        item_conv_states = conv_states[item_ssm_indices]
+        item_conv_indices = torch.arange(
+            item_ssm_indices.shape[0],
+            dtype=cache_indices.dtype,
+            device=cache_indices.device,
+        )
+        item_output = self._forward_mis_segments(
+            layer=layer,
+            mixed_qkv=mixed_qkv[metadata.item_token_indices],
+            a=a[metadata.item_token_indices],
+            b=b[metadata.item_token_indices],
+            conv_states=item_conv_states,
+            conv_cache_indices=item_conv_indices,
+            has_initial_states=torch.ones(
+                len(metadata.item_seq_lens_cpu),
+                dtype=torch.bool,
+                device=mixed_qkv.device,
+            ),
+            query_start_loc=metadata.item_cu_seqlens,
+            seq_lens_cpu=metadata.item_seq_lens_cpu,
+            ssm_states=ssm_states,
+            ssm_cache_indices=item_ssm_indices,
+            inplace_update=False,
+        )
+        output[:, metadata.item_token_indices] = item_output
+        return output
+
+    def _forward_mis_segments(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_cache_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: list[int],
+        ssm_states: torch.Tensor,
+        ssm_cache_indices: torch.Tensor,
+        inplace_update: bool,
+    ) -> torch.Tensor:
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states,
+            cache_indices=conv_cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+        ).transpose(0, 1)
+
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+            )
+            num_tokens = mixed_qkv.shape[0]
+            query = query.view(1, num_tokens, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, num_tokens, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, num_tokens, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        output, _, _ = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=ssm_cache_indices,
+            query_start_loc=query_start_loc,
+            inplace_update=inplace_update,
+        )
+        return output
 
     def _replayssm_fold_target_verify(
         self,

@@ -33,6 +33,8 @@ import tempfile
 import unittest
 import unittest.mock
 
+import msgspec
+import msgspec.structs
 import torch
 
 from sglang.srt.arg_groups.overrides import (
@@ -270,7 +272,7 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         the one of those that a shared mutable could corrupt.
         """
         out = {}
-        for field in dataclasses.fields(server_args):
+        for field in msgspec.structs.fields(server_args):
             if field.name in _NOT_COMPARABLE:
                 continue
             # The resolution result, not the field: a declaration-only resolver
@@ -517,7 +519,7 @@ class TestALateDeclarationKeepsTheResolution(_RestoresProcessState, CustomTestCa
         record arrives resolved, and a copy would throw that away.
         """
         parent = self._resolved()
-        bare = dataclasses.replace(parent, dist_init_addr="1.2.3.4:5000")
+        bare = msgspec.structs.replace(parent, dist_init_addr="1.2.3.4:5000")
         self.assertFalse(
             getattr(bare, "_resolution_finished", False),
             "a bare replace carried the flag; then this test proves nothing",
@@ -528,7 +530,7 @@ class TestALateDeclarationKeepsTheResolution(_RestoresProcessState, CustomTestCa
                 resolution_result(parent, field.name),
                 resolution_result(bare, field.name),
             )
-            for field in dataclasses.fields(parent)
+            for field in msgspec.structs.fields(parent)
             if field.name not in ("dist_init_addr", "random_seed")
             and repr(resolution_result(parent, field.name))
             != repr(resolution_result(bare, field.name))

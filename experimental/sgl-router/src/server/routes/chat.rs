@@ -1,27 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{PolicyKind, SessionAffinityMode};
+use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::admission::{
-    resolve_cache_candidates, resolve_decode, resolve_prefill, resolve_prefill_admitted,
-    CandidateDomain, CandidateRange, DecisionReason,
-};
-use crate::policies::buckets::BucketRequest;
-use crate::policies::decode::{
-    build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
-};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{
-    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
-    SelectionContext,
+use crate::policies::selection::{
+    select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
+use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens};
+use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PolicySelectionFailureReason, RequestOutcome, StaleRequestOutcome,
-    WorkerModeLabel,
+    classify_stream_end, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -30,7 +23,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -58,63 +50,9 @@ const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Return the low-cardinality reason for the final Prefill decision.
-fn prefill_policy_reason(
-    policy: PolicyKind,
-    proposal: ProposalKind,
-    decision: DecisionReason,
-    has_session_id: bool,
-    affinity_lookup_enabled: bool,
-) -> &'static str {
-    match policy {
-        PolicyKind::SessionAware => match (proposal, decision) {
-            (ProposalKind::SessionAffinity, DecisionReason::Primary) => "session_primary",
-            (ProposalKind::SessionAffinity, DecisionReason::BackupPrimaryAdmission) => {
-                "session_admission_backup"
-            }
-            (ProposalKind::SessionAffinity, DecisionReason::BackupPressureGuard) => {
-                "session_pressure_backup"
-            }
-            (ProposalKind::SessionAffinity, DecisionReason::RangeFallback) => {
-                "session_range_fallback"
-            }
-            (_, DecisionReason::CapacityFallbackPowerOfTwo) => "capacity_fallback_power_of_two",
-            (_, DecisionReason::RangeFallback) => "range_fallback",
-            (_, _) if !affinity_lookup_enabled => "range_fallback",
-            (_, _) if !has_session_id => "no_session",
-            (ProposalKind::PowerOfTwo, _) => "assigned",
-            _ => "primary",
-        },
-        PolicyKind::CacheAware => match (proposal, decision) {
-            (_, DecisionReason::CacheCandidate)
-            | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
-            (_, DecisionReason::Primary) => "no_cache_candidate",
-            (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
-            (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
-            (_, DecisionReason::RangeFallback) => "no_cache_candidate_range_fallback",
-            (_, DecisionReason::CapacityFallbackPowerOfTwo) => {
-                "no_cache_candidate_capacity_fallback_power_of_two"
-            }
-        },
-        _ => match decision {
-            DecisionReason::Primary => "primary",
-            DecisionReason::CacheCandidate => "cache_candidate",
-            DecisionReason::BackupPrimaryAdmission => "admission_backup",
-            DecisionReason::BackupPressureGuard => "pressure_backup",
-            DecisionReason::RangeFallback => "range_fallback",
-            DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
-        },
-    }
-}
-
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
-/// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
-/// layer; axum's `Bytes` extractor enforces it and returns 413
-/// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+/// Maximum buffered chat-completions body (32MiB). Sized for base64 multimodal inputs;
+/// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
+pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -145,13 +83,6 @@ impl RequestProbe {
     fn requested_max_output_tokens(&self) -> Option<u64> {
         self.max_completion_tokens.or(self.max_tokens)
     }
-}
-
-/// Project the peak sequence length without integer wraparound.
-fn projected_decode_kv_tokens(input_tokens: u64, max_output_tokens: Option<u64>) -> u64 {
-    max_output_tokens.map_or(input_tokens, |output_tokens| {
-        input_tokens.saturating_add(output_tokens)
-    })
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -349,266 +280,35 @@ pub async fn chat_completions(
         .and_then(|config| headers.get(config.session_id_header.as_str()))
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
-    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
-    let prefill_bucket_request = BucketRequest {
-        input_tokens: request_input_tokens,
-        expected_peak_sequence_tokens: None,
-        ttft_slo_ms,
-        tps_slo,
-    };
-    let configured_session_affinity_mode = ctx
+    // `select_prefill_worker` reduces this to `Bucket` when Bucket
+    // partitioning is off.
+    let session_affinity_mode = ctx
         .config
         .model
         .affinity
         .as_ref()
         .map(|config| config.session_affinity_mode)
         .unwrap_or(SessionAffinityMode::Bucket);
-    // Without Bucket partitioning all modes reduce to the single global domain.
-    let session_affinity_mode = if ctx.bucket_selector.is_enabled() {
-        configured_session_affinity_mode
-    } else {
-        SessionAffinityMode::Bucket
-    };
-    let use_global_affinity_probe = ctx.bucket_selector.is_enabled()
-        && policy.is_bucket_affinity_policy()
-        && session_affinity_mode != SessionAffinityMode::Bucket;
-    let worker = {
-        let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
-        let select_prefill_in_domain = |domain: &CandidateDomain,
-                                        affinity_lookup_enabled: bool,
-                                        affinity_assignment_enabled: bool,
-                                        allow_capacity_fallback: bool|
-         -> Option<Arc<Worker>> {
-            let candidate_range = domain.prefill_range()?;
-            let mut selection_ctx =
-                SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-                    .with_session_id(session_id)
-                    .with_candidate_range_id(candidate_range.id)
-                    .with_input_tokens(request_input_tokens)
-                    .with_request_tokens(
-                        request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-                    )
-                    .with_external_prefix(external_prefix.as_ref());
-            if let Some(snapshot) = load_snapshot.as_ref() {
-                selection_ctx = selection_ctx.with_load_snapshot(snapshot);
-            }
-            let selection_ctx = if !affinity_lookup_enabled {
-                selection_ctx.without_affinity_lookup()
-            } else if !affinity_assignment_enabled {
-                selection_ctx.without_affinity_assignment()
-            } else {
-                selection_ctx
-            };
-            let Some(PrefillProposal::Pair(proposal)) =
-                policy.propose_prefill(candidate_range.workers, &selection_ctx)
-            else {
-                // Domain retries are ordinary pair proposals.
-                return None;
-            };
-            if policy.uses_shared_prefill_admission() {
-                let snapshot = load_snapshot
-                    .as_ref()
-                    .expect("shared prefill admission requires a load snapshot");
-                let decision = if allow_capacity_fallback {
-                    resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
-                } else {
-                    resolve_prefill_admitted(
-                        &candidate_range,
-                        &proposal,
-                        request_input_tokens,
-                        snapshot,
-                    )
-                };
-                let Some(decision) = decision else {
-                    selection_failure_reason
-                        .set(PolicySelectionFailureReason::PrefillAdmissionExhausted);
-                    return None;
-                };
-                let reason = prefill_policy_reason(
-                    ctx.config.model.policy,
-                    proposal.kind,
-                    decision.reason,
-                    session_id.is_some_and(|value| !value.is_empty()),
-                    affinity_lookup_enabled,
-                );
-                policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
-                ctx.metrics
-                    .record_policy_decision(&ctx.config.model.policy.to_string(), reason);
-                tracing::debug!(
-                    model = %model_str,
-                    policy = ?proposal.kind,
-                    range = %decision.candidate_range_id,
-                    primary = %decision.primary.url,
-                    backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
-                    selected = %decision.selected.url,
-                    reason = ?decision.reason,
-                    load_snapshot_version = decision.load_snapshot_version,
-                    "prefill policy decision",
-                );
-                Some(decision.selected)
-            } else {
-                tracing::debug!(
-                    model = %model_str,
-                    policy = ?proposal.kind,
-                    range = %candidate_range.id,
-                    selected = %proposal.primary.url,
-                    "prefill policy decision without shared admission",
-                );
-                Some(proposal.primary)
-            }
-        };
-        let select_prefill_domains =
-            |domains: &[CandidateDomain],
-             affinity_lookup_enabled: bool,
-             affinity_assignment_enabled: bool| {
-                domains
-                    .iter()
-                    .find_map(|domain| {
-                        select_prefill_in_domain(
-                            domain,
-                            affinity_lookup_enabled,
-                            affinity_assignment_enabled,
-                            false,
-                        )
-                    })
-                    .or_else(|| {
-                        domains.iter().find_map(|domain| {
-                            select_prefill_in_domain(
-                                domain,
-                                affinity_lookup_enabled,
-                                affinity_assignment_enabled,
-                                true,
-                            )
-                        })
-                    })
-            };
-
-        // Cache-Aware resolves one bounded global candidate set and returns a final winner.
-        let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
-            .then(|| {
-                let snapshot = load_snapshot.as_ref()?;
-                let global_range = CandidateRange::global(&workers);
-                let cache_ctx =
-                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-                        .with_session_id(session_id)
-                        .with_candidate_range_id(global_range.id)
-                        .with_input_tokens(request_input_tokens)
-                        .with_request_tokens(
-                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-                        )
-                        .with_external_prefix(external_prefix.as_ref())
-                        .with_load_snapshot(snapshot)
-                        .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
-                let PrefillProposal::CacheCandidates(proposal) =
-                    policy.propose_prefill(global_range.workers, &cache_ctx)?
-                else {
-                    return None;
-                };
-                let bounded_candidate_count = proposal.candidates.len();
-                let cache_decision =
-                    resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
-                ctx.metrics.record_cache_admission_evaluations(
-                    cache_decision.admission_evaluated_candidates,
-                );
-                ctx.metrics.record_cache_admission_rejections(
-                    cache_decision.admission_rejected_candidates,
-                );
-                ctx.metrics.record_cache_pressure_guard(
-                    cache_decision.pressure_guard_compared_pairs,
-                    cache_decision.pressure_guard_overrides,
-                );
-                ctx.metrics
-                    .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
-                let Some(decision) = cache_decision.decision else {
-                    selection_failure_reason
-                        .set(PolicySelectionFailureReason::CacheCandidatesExhausted);
-                    return None;
-                };
-                let selected_candidate = proposal
-                    .candidates
-                    .iter()
-                    .find(|candidate| candidate.worker.id == decision.selected.id)?;
-                tracing::debug!(
-                    model = %model_str,
-                    policy = ?ProposalKind::CacheAffinity,
-                    range = %decision.candidate_range_id,
-                    selected = %decision.selected.url,
-                    cache_candidates = bounded_candidate_count,
-                    input_tokens = request_input_tokens,
-                    matched_prefix_tokens = selected_candidate.matched_prefix_tokens,
-                    uncached_tokens = selected_candidate.uncached_tokens,
-                    reason = ?decision.reason,
-                    load_snapshot_version = decision.load_snapshot_version,
-                    prefill_pressure_source = cache_decision.prefill_pressure_source,
-                    "cache candidate winner",
-                );
-                ctx.metrics
-                    .record_policy_decision("cache_aware", "cache_candidate");
-                Some(decision.selected)
-            })
-            .flatten();
-
-        let global_affinity_probe = use_global_affinity_probe
-            .then(|| {
-                let snapshot = load_snapshot.as_ref()?;
-                let global_range = CandidateRange::global(&workers);
-                let probe_ctx =
-                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-                        .with_session_id(session_id)
-                        .with_candidate_range_id(global_range.id)
-                        .with_input_tokens(request_input_tokens)
-                        .with_request_tokens(
-                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-                        )
-                        .with_external_prefix(external_prefix.as_ref())
-                        .with_load_snapshot(snapshot)
-                        .without_affinity_assignment();
-                policy.propose(global_range.workers, &probe_ctx)
-            })
-            .flatten();
-        // A new or stale session may create its first assignment in the target Bucket.
-        let global_affinity_missed = global_affinity_probe
-            .as_ref()
-            .is_some_and(|proposal| !matches!(proposal.kind, ProposalKind::SessionAffinity));
-        let global_affinity_worker = global_affinity_probe
-            .and_then(|proposal| {
-                matches!(proposal.kind, ProposalKind::SessionAffinity).then_some(proposal.primary)
-            })
-            .and_then(|primary| {
-                ctx.bucket_selector.prefill_affinity_domain(
-                    &workers,
-                    &primary,
-                    prefill_bucket_request,
-                )
-            })
-            // Rebuild the backup inside the primary's own Bucket.
-            .and_then(|domain| select_prefill_in_domain(&domain, true, false, false));
-        cache_winner
-            .or_else(|| {
-                // Materialize normal domains only when Cache-Aware has no winner.
-                let prefill_domains = ctx
-                    .bucket_selector
-                    .prefill_domains(&workers, prefill_bucket_request);
-                if ctx.config.model.policy == PolicyKind::CacheAware {
-                    // Cache miss or failure retries ordered domains with ordinary P2.
-                    return select_prefill_domains(&prefill_domains, false, false);
-                }
-                global_affinity_worker.or_else(|| match session_affinity_mode {
-                    SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
-                        select_prefill_domains(&prefill_domains, true, true)
-                    }
-                    SessionAffinityMode::GlobalPreserve => {
-                        select_prefill_domains(&prefill_domains, false, false)
-                    }
-                    SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
-                        select_prefill_domains(&prefill_domains, true, true)
-                    }
-                })
-            })
-            .ok_or_else(|| {
-                policy_selection_failed(&ctx, &model_str, selection_failure_reason.get())
-            })?
-    };
+    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
+    let worker = select_prefill_worker(&PrefillSelectionInputs {
+        policy: policy.as_ref(),
+        policy_kind: ctx.config.model.policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        metrics: ctx.metrics.as_ref(),
+        model_id: &model_id,
+        body: Some(&body),
+        routing_key,
+        session_id,
+        request_input_tokens,
+        request_tokens: request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        external_prefix: external_prefix.as_ref(),
+        load_snapshot: load_snapshot.as_ref(),
+        workers: &workers,
+        ttft_slo_ms,
+        tps_slo,
+        session_affinity_mode,
+    })
+    .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
     // Decode selection starts after Final P.
     //
@@ -628,61 +328,23 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             },
         })?;
-        let request_kv_tokens =
-            projected_decode_kv_tokens(request_input_tokens, requested_max_output_tokens);
-        let expected_peak_sequence_tokens = requested_max_output_tokens.map(|_| request_kv_tokens);
-        let decode_domains = ctx.bucket_selector.decode_domains(
-            &decode_workers,
-            BucketRequest {
-                input_tokens: request_input_tokens,
-                expected_peak_sequence_tokens,
+        Some(
+            select_decode_peer(&DecodeSelectionInputs {
+                decode_policy_kind: ctx.config.model.decode_policy,
+                bucket_selector: ctx.bucket_selector.as_ref(),
+                model_id: &model_id,
+                prefill_url: &worker.url,
+                decode_workers: &decode_workers,
+                request_input_tokens,
+                requested_max_output_tokens,
                 ttft_slo_ms,
                 tps_slo,
-            },
-        );
-        let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
-        let select_decode_in_domain =
-            |decode_domain: &CandidateDomain, allow_capacity_fallback: bool| {
-                let snapshot = load_snapshot.as_ref()?;
-                let decode_ctx = DecodeSelectionContext::new()
-                    .with_load_snapshot(snapshot)
-                    .with_prefill_url(&worker.url);
-                let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
-                let decode_decision = if allow_capacity_fallback {
-                    resolve_decode_with_capacity_fallback(
-                        decode_domain,
-                        &decode_proposal,
-                        request_kv_tokens,
-                        snapshot,
-                    )
-                } else {
-                    resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)
-                }?;
-                tracing::debug!(
-                    model = %model_str,
-                    policy = ?ctx.config.model.decode_policy,
-                    range = %decode_decision.candidate_range_id,
-                    primary = %decode_decision.primary.url,
-                    backup = ?decode_decision.backup.as_ref().map(|worker| worker.url.as_str()),
-                    selected = %decode_decision.selected.url,
-                    reason = ?decode_decision.reason,
-                    load_snapshot_version = decode_decision.load_snapshot_version,
-                    "decode policy decision",
-                );
-                Some(decode_decision.selected)
-            };
-        decode_domains
-            .iter()
-            .find_map(|domain| select_decode_in_domain(domain, false))
-            .or_else(|| {
-                decode_domains
-                    .iter()
-                    .find_map(|domain| select_decode_in_domain(domain, true))
+                load_snapshot: load_snapshot.as_ref(),
             })
             .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
                 model: model_str.clone(),
-            })
-            .map(Some)?
+            })?,
+        )
     } else {
         None
     };
@@ -767,6 +429,16 @@ pub async fn chat_completions(
         metrics: Arc::clone(&ctx.metrics),
         model: metrics_model.clone(),
         start,
+    };
+
+    // Classifies a 2xx stream after its headers are committed. Takes the
+    // streaming worker's URL (Final D in PD mode).
+    let make_stream_end_hook = |worker_url: String| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |end| {
+            metrics.record_stream_outcome(&worker_url, &model, classify_stream_end(end));
+        })
     };
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
@@ -909,6 +581,7 @@ pub async fn chat_completions(
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
+                Some(make_stream_end_hook(decode_worker.url.clone())),
             );
             tokio::select! {
                 biased;
@@ -944,6 +617,7 @@ pub async fn chat_completions(
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
+            Some(make_stream_end_hook(worker.url.clone())),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -1490,87 +1164,6 @@ mod tests {
         assert!(!should_tokenize_request(false, false, false));
     }
 
-    #[test]
-    fn session_reason_distinguishes_hit_assignment_and_keyless_fallback() {
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::SessionAware,
-                ProposalKind::SessionAffinity,
-                DecisionReason::Primary,
-                true,
-                true,
-            ),
-            "session_primary"
-        );
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::SessionAware,
-                ProposalKind::PowerOfTwo,
-                DecisionReason::Primary,
-                true,
-                true,
-            ),
-            "assigned"
-        );
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::SessionAware,
-                ProposalKind::PowerOfTwo,
-                DecisionReason::Primary,
-                false,
-                true,
-            ),
-            "no_session"
-        );
-    }
-
-    #[test]
-    fn session_reason_preserves_admission_and_pressure_escapes() {
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::SessionAware,
-                ProposalKind::SessionAffinity,
-                DecisionReason::BackupPrimaryAdmission,
-                true,
-                true,
-            ),
-            "session_admission_backup"
-        );
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::SessionAware,
-                ProposalKind::SessionAffinity,
-                DecisionReason::BackupPressureGuard,
-                true,
-                true,
-            ),
-            "session_pressure_backup"
-        );
-    }
-
-    #[test]
-    fn cache_no_winner_p2_is_distinct_from_cache_candidate() {
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::CacheAware,
-                ProposalKind::PowerOfTwo,
-                DecisionReason::Primary,
-                false,
-                false,
-            ),
-            "no_cache_candidate"
-        );
-        assert_eq!(
-            prefill_policy_reason(
-                PolicyKind::CacheAware,
-                ProposalKind::CacheAffinity,
-                DecisionReason::Primary,
-                false,
-                true,
-            ),
-            "cache_candidate"
-        );
-    }
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
     /// with the top bit set would wrap negative on the engine side.
@@ -1857,13 +1450,6 @@ mod tests {
             parse_probe(&body).unwrap().requested_max_output_tokens(),
             Some(256)
         );
-    }
-
-    #[test]
-    fn decode_kv_projection_includes_the_explicit_output_budget() {
-        assert_eq!(projected_decode_kv_tokens(1_024, Some(512)), 1_536);
-        assert_eq!(projected_decode_kv_tokens(1_024, None), 1_024);
-        assert_eq!(projected_decode_kv_tokens(u64::MAX - 1, Some(8)), u64::MAX);
     }
 
     #[test]

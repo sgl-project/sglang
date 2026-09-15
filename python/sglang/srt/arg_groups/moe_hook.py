@@ -26,7 +26,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,110 @@ def handle_moe_kernel_config(server_args: Any):
         )
 
 
+def handle_flashinfer_a2a_dispatch_type(server_args: Any):
+    cfg = resolving_view(server_args)
+    cli_dispatch_type = cfg.flashinfer_a2a_dispatch_type
+    nvfp4_dispatch_env_is_set = envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+
+    if nvfp4_dispatch_env_is_set:
+        raise ValueError(
+            "SGLANG_MOE_NVFP4_DISPATCH cannot be set together with "
+            "--flashinfer-a2a-dispatch-type."
+        )
+
+    dispatch_type = cli_dispatch_type or "auto"
+
+    supports_nvfp4_dispatch = (
+        cfg.quantization == "modelopt_fp4"
+        or model_config_of(server_args).nvfp4_moe_meta is not None
+    )
+    if dispatch_type == "auto":
+        if cfg.quantization == "mxfp8":
+            dispatch_type = "mxfp8"
+        elif supports_nvfp4_dispatch:
+            dispatch_type = "nvfp4"
+        else:
+            dispatch_type = "bf16"
+
+    if dispatch_type == "mxfp8":
+        if cfg.quantization != "mxfp8":
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type mxfp8 requires --quantization mxfp8."
+            )
+        if cfg.moe_runner_backend != "flashinfer_trtllm_routed":
+            raise ValueError(
+                "--flashinfer-a2a-dispatch-type mxfp8 requires "
+                "--moe-runner-backend flashinfer_trtllm_routed."
+            )
+    elif dispatch_type == "nvfp4" and not supports_nvfp4_dispatch:
+        raise ValueError(
+            "--flashinfer-a2a-dispatch-type nvfp4 requires NVFP4/"
+            "modelopt-FP4 quantization or hybrid NVFP4 MoE metadata."
+        )
+
+    declare_resolution(
+        server_args,
+        "_handle_flashinfer_a2a_dispatch_type",
+        flashinfer_a2a_dispatch_type=dispatch_type,
+    )
+
+
+def validate_flashinfer_megamoe_envs() -> None:
+    combine_dtype = envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+    if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
+            f"'bf16', 'mxfp8', or 'nvfp4', got {combine_dtype!r}."
+        )
+    if (
+        combine_dtype != "bf16"
+        and envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+    ):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE="
+            f"{combine_dtype!r} is incompatible with "
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
+        )
+
+
+def validate_flashinfer_megamoe_model(server_args: Any) -> None:
+    model_config = model_config_of(server_args)
+    architectures = model_config.hf_config.architectures or []
+    validated_architectures = (
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+    )
+    if not any(
+        architecture in validated_architectures for architecture in architectures
+    ):
+        raise ValueError(
+            "FlashInfer MegaMOE is not validated for model architectures "
+            f"{architectures}. Supported architectures: "
+            f"{sorted(validated_architectures)}."
+        )
+
+    quantization = resolved_view(server_args).quantization
+    supports_megamoe_quantization = (
+        quantization in ("mxfp8", "modelopt_fp4")
+        or model_config.is_fp4_experts
+        or model_config.nvfp4_moe_meta is not None
+    )
+    if not supports_megamoe_quantization:
+        raise ValueError(
+            "FlashInfer MegaMOE currently supports only MXFP8, ModelOpt "
+            "NVFP4, FP4-expert, or hybrid NVFP4 MoE checkpoints; got "
+            f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
+            "are not supported."
+        )
+
+
 def handle_a2a_moe(server_args: Any):
     # The backend overrides and the ep_size=tp_size adjustments moved to
     # the resolution pipeline (arg_groups/overrides.py:
@@ -148,6 +252,38 @@ def handle_a2a_moe(server_args: Any):
             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
         )
         logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
+
+    if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
+        None,
+        "auto",
+    ):
+        raise ValueError(
+            "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
+        )
+
+    if a2a_backend == "flashinfer_megamoe":
+        validate_flashinfer_megamoe_model(server_args)
+        validate_flashinfer_megamoe_envs()
+        assert cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size, (
+            "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+        )
+        if resolved_view(server_args).moe_runner_backend == "auto":
+            declare_resolution(
+                server_args, "_handle_a2a_moe", moe_runner_backend="flashinfer_megamoe"
+            )
+        assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
+            "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+        )
+        if not is_sm100_supported():
+            raise ValueError(
+                "FlashInfer MegaMOE currently requires an SM100-family "
+                "CUDA device for all supported quantization formats."
+            )
+        logger.info(
+            "FlashInfer MegaMOE is enabled. The expert parallel size is "
+            "adjusted to be the same as the tensor parallel size[%s].",
+            cfg.tp_size,
+        )
 
     if a2a_backend == "deepep":
         if cfg.moe_runner_backend == "flashinfer_cutedsl":
@@ -260,7 +396,7 @@ def handle_a2a_moe(server_args: Any):
             moe_a2a_backend="none",
         )
 
-    if cfg.moe_a2a_backend == "flashinfer":
+    if a2a_now == "flashinfer":
         assert (
             resolved_view(server_args).enable_dp_attention
             and cfg.dp_size == cfg.tp_size
@@ -273,20 +409,44 @@ def handle_a2a_moe(server_args: Any):
             resolved_view(server_args).moe_runner_backend == "flashinfer_cutedsl"
             and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
         )
-        if use_cutedsl_w4a16:
-            if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
-                raise ValueError(
-                    "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
-                    "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
-                )
-        elif not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-            resolved_view(server_args).quantization == "modelopt_fp4"
-            or model_config_of(server_args).nvfp4_moe_meta is not None
-        ):
-            envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
-            logger.warning(
-                "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+        if use_cutedsl_w4a16 and envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+            raise ValueError(
+                "CuTe DSL NVFP4 W4A16 requires BF16 FlashInfer MoE "
+                "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
             )
+        if cfg.flashinfer_a2a_dispatch_type is None:
+            if (
+                not use_cutedsl_w4a16
+                and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+                and (
+                    resolved_view(server_args).quantization == "modelopt_fp4"
+                    or model_config_of(server_args).nvfp4_moe_meta is not None
+                )
+            ):
+                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
+                logger.warning(
+                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
+                )
+        else:
+            if resolved_view(server_args).moe_runner_backend == "flashinfer_trtllm":
+                declare_resolution(
+                    server_args,
+                    "_handle_a2a_moe",
+                    moe_runner_backend="flashinfer_trtllm_routed",
+                )
+                logger.warning(
+                    "Flashinfer MoE A2A is enabled with flashinfer_trtllm. "
+                    "Using flashinfer_trtllm_routed because A2A dispatch "
+                    "provides top-k ids and weights."
+                )
+            if use_cutedsl_w4a16 and cfg.flashinfer_a2a_dispatch_type in (
+                "auto",
+                "nvfp4",
+            ):
+                raise ValueError(
+                    "CuTe DSL NVFP4 W4A16 requires --flashinfer-a2a-dispatch-type bf16."
+                )
+            handle_flashinfer_a2a_dispatch_type(server_args)
         assert resolved_view(server_args).moe_runner_backend in [
             "flashinfer_cutlass",
             "flashinfer_cutedsl",
