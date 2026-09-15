@@ -293,11 +293,11 @@ def _lighter_valid_num_frames(server_args: ServerArgs, num_frames: int) -> int:
     halved count is walked down until it is a fixed point of the contract.
     """
     halved = _halve_num_frames(server_args, num_frames)
-    adjust = getattr(server_args.pipeline_config, "adjust_num_frames", None)
+    adjust = server_args.pipeline_config.adjust_num_frames
+    if halved < adjust(1, log_adjustment=False):
+        return num_frames
     for candidate in range(halved, 0, -1):
-        adjusted = adjust(candidate) if callable(adjust) else candidate
-        if not isinstance(adjusted, int) or isinstance(adjusted, bool):
-            adjusted = candidate
+        adjusted = adjust(candidate, log_adjustment=False)
         if adjusted == candidate:
             return candidate if candidate < num_frames else num_frames
     return num_frames

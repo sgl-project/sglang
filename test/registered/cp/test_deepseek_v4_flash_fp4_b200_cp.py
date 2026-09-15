@@ -2,7 +2,7 @@
 
 Balanced recipe (TP=4, DeepEP, EAGLE) plus --attn-cp-size=4 with the
 DSA prefill-CP interleave strategy. Split out of
-models_e2e/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
+e2e/models/test_deepseek_v4_flash_fp4_b200.py so the `cp` group covers
 all context-parallel tests.
 
 Registry: extra-b-test-4-gpu-b200 (label-gated extra CI, 4x B200)
@@ -203,7 +203,7 @@ class TestDSV4FlashFP4B200_CP_DSpark(
     GSM8KMixin,
     CustomTestCase,
 ):
-    """DSPARK speculation + prefill CP (interleave, CP_V2, attn_cp=tp)."""
+    """DSPARK speculation + prefill CP (interleave, CP, attn_cp=tp)."""
 
     gsm8k_accuracy_thres = 0.90
 

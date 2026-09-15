@@ -33,6 +33,30 @@ utilities, and common action-policy helpers. Model packages may call these
 helpers. Keep ownership in shared runtime folders unless the code is truly
 architecture-specific.
 
+## Place helpers with their owners
+
+Use the narrowest existing owner before adding a utility module:
+
+| Scope | Location |
+| --- | --- |
+| Used by one file, or specific to one operation | A private helper in the consuming file; inline short one-off expressions |
+| Shared within a domain | A purpose-named module in that domain, such as `runtime/realtime/video.py` or `runtime/layers/attention/mask_strategy.py` |
+| Shared across domains, without model or pipeline semantics | An existing focused module under `runtime/utils/`, such as `argparse.py`, `process.py`, or `precision.py` |
+
+Do not create a top-level `utils/` package or grow a catch-all `utils.py` or
+`common.py`. Split large mixed-responsibility files along ownership boundaries,
+not arbitrary line counts. A helper folder is warranted only when several
+cohesive modules need it, not for a single function or hypothetical reuse.
+
+Model code must not import pipeline stages. Put contracts shared by models and
+stages in a lower-level domain module; for example, realtime cache keys belong
+under `runtime/realtime/`. Keep GPU initialization, monkey patches, and model
+loading out of generic utility imports.
+
+When moving internal helpers, update all callers, tests, and cookbook examples
+together. Preserve documented registration and serving entry points; do not
+add re-export chains just to retain obsolete internal utility paths.
+
 ## Out-of-Tree Models and Pipelines
 
 An installed package can register native component models and a pipeline

@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -59,6 +61,12 @@ class _RecordingDraftBackend:
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def _build_runner(self, backend):
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)

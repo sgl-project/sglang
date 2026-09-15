@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -77,7 +78,7 @@ class _TokenToKVPool:
             extra_key_buffer if extra_key_buffer is not None else swa_key_buffer
         )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.swa_window_size = page_size
+        self.swa_page_size = page_size
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
@@ -85,11 +86,18 @@ class _TokenToKVPool:
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
         _ = layer_id
-        return self.swa_window_size
+        return self.swa_page_size
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
         _ = layer_id
         return self._extra_key_buffer
+
+    def get_swa_key_layout(self) -> KVLayout:
+        return KVLayout.V4
+
+    def get_extra_key_layout(self, layer_id: int) -> KVLayout:
+        _ = layer_id
+        return KVLayout.V4
 
 
 def _sm90_available() -> bool:

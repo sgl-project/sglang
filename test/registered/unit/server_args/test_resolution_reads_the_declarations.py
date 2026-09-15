@@ -22,9 +22,11 @@ the two scopes it can derive exactly.
 """
 
 import ast
-import dataclasses
 import pathlib
 import re
+
+import msgspec
+import msgspec.structs
 
 import sglang
 from sglang.srt.server_args import ServerArgs
@@ -34,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
-_FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
+_FIELDS = frozenset(field.name for field in msgspec.structs.fields(ServerArgs))
 
 # Names a config travels under. `args` is included because the platform hooks
 # use it; a false positive would be a function taking an argparse Namespace and
@@ -86,8 +88,7 @@ def _field_reads(fn, holders):
 _DECLARERS = frozenset(
     {
         "declare_resolution",
-        "declare_late_resolution",
-        "declare_direct_writes",
+        "record_foreign_defaults",
     }
 )
 
@@ -271,7 +272,7 @@ def _record_aliases(function):
                 aliases.add(target.id)
         elif (
             isinstance(func, ast.Attribute)
-            and func.attr in ("from_cli_args", "replace_resolved")
+            and func.attr == "from_cli_args"
             and isinstance(func.value, ast.Name)
             and func.value.id == "ServerArgs"
         ):
@@ -472,8 +473,9 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         )
         members = _record_members()
         # The floor is here to catch the scan collapsing, not to pin the
-        # class's size.
-        self.assertGreater(len(members), 15, f"only {len(members)} members were found")
+        # class's size -- it drops as derived members move to their namespaces
+        # and become declarations rather than methods on the record.
+        self.assertGreater(len(members), 10, f"only {len(members)} members were found")
         offenders = []
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}

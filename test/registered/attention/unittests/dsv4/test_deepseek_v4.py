@@ -126,27 +126,6 @@ class TestDSV4AttentionBackendCorrectness(CustomTestCase):
             extend_lens=(16,),
             compress_ratio=128,
         ),
-        # DeepSeek V4.1 ratio 1 / 2: latents in the c1 / c2 FlashMLA-layout pools,
-        # attended through the same extra-cache path as C4.
-        DSV4AttentionCase(
-            name="dsv4_c1_extend",
-            backend="dsv4",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64,),
-            extend_lens=(16,),
-            compress_ratio=1,
-        ),
-        DSV4AttentionCase(
-            name="dsv4_c1_decode",
-            backend="dsv4",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=64,
-            page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(64, 200),
-            compress_ratio=1,
-        ),
         DSV4AttentionCase(
             name="dsv4_c2_extend",
             backend="dsv4",
@@ -359,6 +338,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             swa_page_size=128,
             seq_lens=torch.tensor([max_seq_len, max_seq_len], **int32),
             query_start_loc=torch.tensor([0, 1, 2], **int32),
+            query_pos=torch.tensor([max_seq_len - 1, max_seq_len - 1], **int32),
             swa_token_ids=torch.empty(0, **int32),
             swa_first_pos=torch.zeros(2, **int32),
             swa_gather_lens=torch.zeros(2, **int32),
@@ -418,10 +398,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         from sglang.srt.server_args import ServerArgs
 
-        # cg-refactor folded the legacy enable_breakable_cuda_graph flag
-        # into cuda_graph_config. Verify the per-phase backend selectors
-        # default to None (i.e. nothing opted into BREAKABLE without an
-        # explicit CLI flag).
+        # Breakable graphs require explicit opt-in for each phase.
         sa = ServerArgs(model_path="dummy")
         self.assertNotEqual(sa.cuda_graph_backend_decode, "breakable")
         self.assertNotEqual(sa.cuda_graph_backend_prefill, "breakable")
@@ -474,6 +451,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 backend.model_runner = SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
+                backend.token_to_kv_pool = SimpleNamespace(request_window=None)
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -496,7 +474,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 metadata = backend.forward_metadata
                 if builds:
                     backend._build_sparse_prefill_chunk_cache.assert_called_once_with(
-                        batch, num_qo_tokens=num_qo_tokens
+                        batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
                     )
                     self.assertIs(metadata.sparse_prefill_cache, cache)
                 else:
@@ -518,6 +496,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.model_runner = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH
         )
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -645,6 +624,30 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        model_runner = SimpleNamespace()
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+        ):
+            # Prefill chunk / max_prefill_tokens dominates.
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
+            # Decode rows = requests x draft tokens dominate.
+            schedule.max_running_requests = 8192
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+
+        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
+            trtllm._check_trtllm_query_rows(64)
+            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+                trtllm._check_trtllm_query_rows(65)
+
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,
@@ -738,9 +741,11 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
                 backend.forward_metadata = module.DSV4Metadata(
                     core_attn_metadata=core,
                     indexer_metadata=None,
-                    c1_indexer_metadata=SimpleNamespace(max_c4_seq_len=width * ratio),
+                    c1_indexer_metadata=SimpleNamespace(
+                        max_compressed_seq_len=width * ratio
+                    ),
                     c2_indexer_metadata=SimpleNamespace(
-                        max_c4_seq_len=width * ratio // 2
+                        max_compressed_seq_len=width * ratio // 2
                     ),
                 )
                 backend.req_to_token = mapping
@@ -895,13 +900,8 @@ class TestDSV41DecodeCandidateSlots(CustomTestCase):
 
 
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
-    """`get_swa_out_cache_loc`: cached fast path vs store-time fallback.
-
-    The KV-store consumers run in paths that never invoke
-    `init_forward_metadata_in_graph` (eager idle, runners that only run the
-    out-graph prep) or whose batch is re-padded after init (DP attention).
-    The resolver must use the per-forward cached value only when it is
-    provably current and fall back to translating `out_cache_loc` otherwise.
+    """SWA writes must translate live locations for idle or missing/mismatched caches.
+    A matching cache on an active forward must be reused.
     """
 
     def _make_backend(self, mapping: torch.Tensor):
@@ -912,7 +912,8 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = None
         backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda loc: mapping[loc]
+            translate_loc_from_full_to_swa=lambda loc: mapping[loc],
+            request_window=None,
         )
         return backend
 

@@ -7,6 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
+from operator import attrgetter
 from typing import Any, ClassVar
 
 import numpy as np
@@ -35,13 +36,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
-from sglang.multimodal_gen.utils import (
+from sglang.multimodal_gen.runtime.utils.argparse import (
     FlexibleArgumentParser,
     StoreBoolean,
-    shallow_asdict,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 
 logger = init_logger(__name__)
 
@@ -236,11 +236,15 @@ class PipelineConfig:
     # dtype resident so lossless requests never consume pre-rounded weights.
     vae_decode_precision_high: str | None = None
     vae_tiling: bool = True
+    vae_slicing: bool = False
+    vae_sp: bool = True
+
+    # Diffusion Decoder configuration
     # Bounds the attention grid the diffusion decoder's stages see, which is
     # what makes a full-length decode tractable.
     diffusion_decoder_tiling: bool = True
-    vae_slicing: bool = False
-    vae_sp: bool = True
+    # Splits those tiles across the decode-parallel ranks.
+    diffusion_decoder_parallel_tiling: bool = True
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -380,7 +384,7 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         return num_frames
 
     # tokenize the prompt
@@ -866,6 +870,19 @@ class PipelineConfig:
             help="Enable tiling for the LTX-2.5 diffusion decoder",
         )
         parser.add_argument(
+            f"--{prefix_with_dot}diffusion-decoder-parallel-tiling",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}diffusion_decoder_parallel_tiling",
+            default=PipelineConfig.diffusion_decoder_parallel_tiling,
+            help=(
+                "Split the LTX-2.5 diffusion decoder's tiles across the "
+                "decode-parallel ranks (TP/SP/PP/CFG within a replica). "
+                "Requires --diffusion-decoder-tiling, since the tiles it "
+                "splits only exist on that path; inert otherwise, and at a "
+                "single rank"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix_with_dot}vae-slicing",
             action=StoreBoolean,
             dest=f"{prefix_with_dot.replace('-', '_')}vae_slicing",
@@ -1137,7 +1154,7 @@ class PipelineConfig:
             )
 
     def dump_to_json(self, file_path: str):
-        output_dict = shallow_asdict(self)
+        output_dict = {f.name: attrgetter(f.name)(self) for f in fields(self)}
         del_keys = []
         for key, value in output_dict.items():
             if isinstance(value, ModelConfig):

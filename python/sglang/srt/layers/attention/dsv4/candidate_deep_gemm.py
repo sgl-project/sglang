@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,7 +13,6 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_bf16_small,
     topk_transform_paged_v2,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMetadata,
     IndexerInputs,
@@ -179,11 +177,8 @@ class DeepGemmCandidateIndexer:
         assert block_size == CANDIDATE_BLOCK_SIZE, block_size
         self.topk_blocks = topk_blocks
         self.block_size = block_size
-        self.alt_stream = None
+        self.alt_stream = torch.cuda.Stream()
         self.need_wait = False
-        # TODO: maybe lower this priority
-        if envs.SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP.get():
-            self.alt_stream = torch.cuda.Stream()
 
     def publish_decode(
         self,
@@ -196,38 +191,32 @@ class DeepGemmCandidateIndexer:
         the same logits and DeepGEMM's schedule for it; the backend stores the
         table on the forward metadata."""
         metadata = inputs.metadata
-        seq_lens = metadata.c4_seq_lens.reshape(-1)
+        seq_lens = metadata.compressed_seq_lens.reshape(-1)
         logits = fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
-            metadata.c4_seq_lens,
+            metadata.compressed_seq_lens,
             metadata.page_table,
             metadata.deep_gemm_metadata,
-            metadata.max_c4_seq_len,
+            metadata.max_compressed_seq_len,
         )
-        if self.alt_stream is not None:
-            self.alt_stream.wait_stream(torch.cuda.current_stream())
-            # the level-one chain reads `logits` on the side stream while the main
-            # stream moves on: keep the allocator from handing its memory to a
-            # later main-stream allocation before those reads ran
-            logits.record_stream(self.alt_stream)
-            self.need_wait = True
-            stream_ctx = torch.cuda.stream(self.alt_stream)
-        else:
-            stream_ctx = contextlib.nullcontext()
+        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        # The block-selection chain reads logits after the main stream moves on.
+        logits.record_stream(self.alt_stream)
+        self.need_wait = True
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         topk_transform_paged_v2(
             logits,
             seq_lens,
             metadata.page_table,
             page_indices,
-            metadata.c4_page_size,
+            metadata.compressed_page_size,
             metadata.topk_metadata,
             out_raw_indices=raw_indices,
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
-        with stream_ctx:
+        with torch.cuda.stream(self.alt_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
             blocks = amax_topk_blocks(logits, seq_lens, nblocks, self.topk_blocks)
             # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
@@ -235,13 +224,13 @@ class DeepGemmCandidateIndexer:
                 blocks,
                 seq_lens,
                 metadata.page_table,
-                metadata.c4_page_size,
+                metadata.compressed_page_size,
             )
             schedule = build_sparse_indexer_schedule(
                 blocks,
                 seq_lens,
                 metadata.page_table,
-                metadata.c4_page_size,
+                metadata.compressed_page_size,
                 inputs.q_fp4.dtype,
                 inputs.request_ids,
             )
@@ -276,7 +265,7 @@ class DeepGemmCandidateIndexer:
         given)."""
         assert raw_indices is None
         table = candidate_metadata
-        if self.alt_stream is not None and self.need_wait:
+        if self.need_wait:
             self.need_wait = False
             torch.cuda.current_stream().wait_stream(self.alt_stream)
         logits = self.scores(table, inputs)

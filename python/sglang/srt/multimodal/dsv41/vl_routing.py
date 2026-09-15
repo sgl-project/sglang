@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
+    StandardTopKOutputPacked,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
 )
@@ -31,6 +32,20 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
         )
     if is_cuda():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        # Same admission as _fused_gate_emits_packed_ids on the text path: only
+        # flashinfer_mxfp4 consumes the packed form, and nothing may rewrite ids
+        # or weights after the router -- which rules out the shared-expert slots
+        # that _scale_fused_shared_weights rescales below.
+        packed_topk = None
+        if (
+            num_fused_shared_experts == 0
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+        ):
+            packed_topk = torch.empty(
+                (logits.shape[0], config.top_k), dtype=torch.int32, device=logits.device
+            )
 
         weights, indices = moe_fused_gate(
             logits,
@@ -46,12 +61,15 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             routed_scaling_factor=config.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=config.apply_routed_scaling_factor_on_output,
             num_token_non_padded=num_token_non_padded,
+            packed_out=packed_topk,
         )
         weights = _scale_fused_shared_weights(
             weights,
             num_fused_shared_experts,
             config.fused_shared_experts_scaling_factor,
         )
+        if packed_topk is not None:
+            return StandardTopKOutputPacked(weights, indices, logits, packed_topk)
         return StandardTopKOutput(weights, indices, logits)
     scores = F.softplus(logits.float()).sqrt()
     if input_ids is None:
