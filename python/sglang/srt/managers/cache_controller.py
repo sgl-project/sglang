@@ -234,6 +234,10 @@ class StorageOperation:
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
         self.all_hash_values: Optional[List[str]] = None
+        # Legal storage-prefix endpoints, in pages, before cross-rank sync.
+        # None preserves legacy hit-length behavior for backends that do not
+        # report candidates; an empty list means no endpoint is restorable.
+        self.restorable_prefix_pages: Optional[List[int]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
@@ -1216,6 +1220,41 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _sync_storage_hit_count(self, operation, storage_hit_count: int) -> int:
+        restorable = operation.restorable_prefix_pages
+        # Keep the collective identical for plain KV and hybrid controllers:
+        # different pipeline stages may have different auxiliary pools. A
+        # terminated operation still participates with a zero hit count.
+        hit_info = torch.tensor(
+            [storage_hit_count, int(restorable is None)], dtype=torch.int
+        )
+        self._all_reduce(
+            hit_info, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        common_hit_count, all_legacy = hit_info.tolist()
+        if common_hit_count == 0 or all_legacy:
+            return common_hit_count
+
+        # A per-rank maximum is not sufficient for sparse trailing pools:
+        # min(max({1, 3}), max({1, 2})) == 2 is illegal on the first rank.
+        # Size every rank's mask from the synchronized upper bound, then
+        # intersect legal endpoints across the same TP/CP/PP groups.
+        max_pages = common_hit_count // self.page_size
+        if restorable is None:
+            # Preserve the previous contiguous-prefix assumption where the
+            # backend does not provide the optional endpoint metadata.
+            mask = torch.ones(max_pages + 1, dtype=torch.int)
+        else:
+            mask = torch.zeros(max_pages + 1, dtype=torch.int)
+            mask[0] = 1
+            candidates = [page for page in restorable if 0 < page <= max_pages]
+            if candidates:
+                mask[candidates] = 1
+        self._all_reduce(
+            mask, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+        )
+        return int(torch.nonzero(mask, as_tuple=True)[0][-1]) * self.page_size
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1229,15 +1268,9 @@ class HiCacheController:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._sync_storage_hit_count(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
