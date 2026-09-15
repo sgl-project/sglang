@@ -927,9 +927,14 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
-        self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
-        )
+        if envs.SGLANG_DSV41_ENGRAM_MOONCAKE_CONFIG.get():
+            from sglang.srt.layers.engram_mooncake import MooncakeEngramEmbedding
+
+            self.embed = MooncakeEngramEmbedding(layout, layer_id)
+        else:
+            self.embed = EngramEmbedding(
+                layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
             n_hash_cols * layout.head_dim,
