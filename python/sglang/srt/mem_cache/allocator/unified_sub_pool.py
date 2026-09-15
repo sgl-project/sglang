@@ -386,8 +386,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._free_phys_pages: torch.Tensor = torch.empty(
             0, dtype=torch.int64, device=device
         )
-        # ONE entry per BATCH, keyed by Event: `cpu_list` drives the Set update
-        # (no sync); `gpu_tensor` is kept alive so drain cats it without an H2D.
+        # One entry per event accumulates all pending batches; `cpu_list` updates
+        # the Set without sync; the retained GPU tensor avoids an H2D at drain.
         self._pending_reuse: Dict[
             torch.cuda.Event,
             Tuple[List[int], torch.Tensor],
@@ -1664,8 +1664,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def _drain_pending_reuse(self, *, urgent: bool) -> None:
         """Move ready `_pending_reuse` entries back into `_free_phys_pages`.
         Urgent uses `stream.wait_event` on unfired events -- a stream-side
-        dependency, not a host block. ONE dict entry per BATCH, keyed by Event;
-        no watermark / `live_page_count` change.
+        dependency, not a host block. One entry per event accumulates all pending
+        batches; no watermark / `live_page_count` change.
         """
         self._stats_n_drain_calls += 1
         if not self._pending_reuse:
@@ -1992,13 +1992,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.physical_to_virtual[dst_pages_t] = v_moveds_t
             self.physical_to_virtual.index_fill_(0, src_pages_t, -1)
             self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
-            # Src disposition -- ONE entry per batch. `src_pages_t` is reused as the
-            # `_pending_reuse` GPU tensor (no second H2D at drain).
+            # Keep every batch associated with a pending forward event. Reuse
+            # page tensors at drain without another host-to-device transfer.
             event_fired = latest_event is None or latest_event.query()
             if event_fired:
                 released_fired.append(src_pages_t)
             else:
                 srcs_copy: List[int] = list(srcs)  # caller mutates `srcs`
+                previous = self._pending_reuse.get(latest_event)
+                if previous is not None:
+                    previous_srcs, previous_pages = previous
+                    srcs_copy = previous_srcs + srcs_copy
+                    src_pages_t = torch.cat([previous_pages, src_pages_t])
                 self._pending_reuse[latest_event] = (srcs_copy, src_pages_t)
                 self._pending_reuse_pages_cpu.update(srcs_copy)
 
