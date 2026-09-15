@@ -137,6 +137,27 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
     return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
 
 
+def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Undo AITER ``shuffle_weight(..., layout=(16, 16))`` for FP8 weights."""
+    if weight.element_size() != 1:
+        raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
+
+    shape = weight.shape
+    n, k = shape[-2:]
+    if n % 16 != 0 or k % 32 != 0:
+        raise ValueError(
+            "AITER (16, 16) FP8 layout requires N % 16 == 0 and K % 32 == 0, "
+            f"got shape {tuple(shape)}"
+        )
+
+    return (
+        weight.reshape(-1, n // 16, k // 32, 2, 16, 16)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .reshape(shape)
+    )
+
+
 def materialize_bpreshuffle_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
@@ -1838,6 +1859,15 @@ def _apply_fallback_scaled_mm(
     return output.to(dtype=input_dtype)
 
 
+def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
+    # aiter's CK gemm_a8w8_bpreshuffle instances are GemmSpecialization::Default
+    # (pre-shuffled weights are never N-padded) with NPerBlock=64, so any N that
+    # is not a multiple of 64 raises "This GEMM is not supported!". Measured on
+    # gfx950 for M=16384/N=32/K=4096, torch._scaled_mm rowwise runs that shape in
+    # 14us against 90us for the cktile instance that does accept it.
+    return _use_aiter and output_size % 64 == 0
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2048,7 +2078,10 @@ def apply_fp8_linear(
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
-        if _use_aiter:
+        # Must agree with the load-time predicate that decides whether the
+        # weight was pre-shuffled; an unshuffled weight through the aiter path
+        # (or a shuffled one through torch._scaled_mm) silently returns garbage.
+        if use_aiter_bpreshuffle_gemm(weight.shape[1]):
             # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
             # XQ -> input tensor, shape = (m, k)
             # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf

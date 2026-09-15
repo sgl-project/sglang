@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    map_request_outputs,
     materialize_output_sample,
     post_process_sample,
     save_outputs,
@@ -80,6 +81,10 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+from sglang.multimodal_gen.runtime.realtime.video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -90,17 +95,13 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
-)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     DiffStage,
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
@@ -1196,9 +1197,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if not self.is_output_rank or output_batch.output is None:
             return
-        if len(output_batch.output) != len(reqs):
+        output_requests = map_request_outputs(reqs)
+        if len(output_batch.output) != len(output_requests):
             raise RuntimeError(
-                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+                f"Expected {len(output_requests)} grouped outputs, got {len(output_batch.output)}"
             )
 
         first_req = reqs[0]
@@ -1207,7 +1209,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
