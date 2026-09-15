@@ -1630,6 +1630,15 @@ class KVCacheConfigurator:
             pool_kwargs["index_buf_size"] = (
                 max_total_num_tokens + self.pool_page_size
             ) * _dcp_size
+            logger.info(
+                "DCP (dcp_size=%d): the DSA index-K cache is replicated over the "
+                "virtual loc space and sized for %d slots per rank (dcp_size x the "
+                "%d-token MLA pool); MLA KV itself is striped 1/dcp. Budget this "
+                "when tuning --mem-fraction-static for long contexts.",
+                _dcp_size,
+                pool_kwargs["index_buf_size"],
+                max_total_num_tokens,
+            )
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

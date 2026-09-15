@@ -2009,6 +2009,16 @@ def _wq_dsa_dcp_validation(view: Any) -> dict:
             problems.append(f"{attr}={val!r} (need 'flashmla_kv')")
     if get_dsa_index_kpool(hf_config) > 1:
         problems.append("index_kpool > 1 (tail-token owner filtering not implemented)")
+    # The a2a / LSE merge splits attention heads across the DCP ranks and
+    # asserts num_heads % dcp_size at the first decode; reject it at config time
+    # instead. (Page alignment needs no check: the DCP allocator widens its page
+    # to page_size * dcp_size, so every run start is owner-aligned for any
+    # dcp_size.) Only power-of-two dcp_size has been validated.
+    num_heads = getattr(hf_config, "num_attention_heads", None)
+    if num_heads is not None and num_heads % view.dcp_size != 0:
+        problems.append(
+            f"num_attention_heads={num_heads} is not divisible by dcp_size={view.dcp_size}"
+        )
     for attr, label in (
         ("enable_hierarchical_cache", "--enable-hierarchical-cache (HiCache)"),
         ("enable_lmcache", "--enable-lmcache"),
