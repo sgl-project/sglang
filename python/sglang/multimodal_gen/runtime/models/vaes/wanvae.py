@@ -56,13 +56,22 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_cuda():
     try:
-        from sglang.kernels.ops.diffusion import cat_pad_channels_last_3d, dup_up3d_add
+        from sglang.kernels.ops.diffusion import (
+            can_use_conv_bias_epilogue,
+            cat_pad_channels_last_3d,
+            conv_bias_epilogue,
+            dup_up3d_add,
+        )
     except ImportError:  # pragma: no cover
         cat_pad_channels_last_3d = None
         dup_up3d_add = None
+        conv_bias_epilogue = None
+        can_use_conv_bias_epilogue = None
 else:
     cat_pad_channels_last_3d = None
     dup_up3d_add = None
+    conv_bias_epilogue = None
+    can_use_conv_bias_epilogue = None
 
 CACHE_T = 2
 
@@ -115,8 +124,13 @@ def _run_cached_causal_conv(
     x: torch.Tensor,
     cache_list: list,
     idx: int,
+    residual: torch.Tensor | None = None,
+    skip_bias: bool = False,
 ) -> torch.Tensor:
     """Run one causal conv, consuming and refreshing its feature-cache slot.
+
+    ``residual`` / ``skip_bias`` are forwarded to the conv epilogue (see
+    ``WanCausalConv3d.forward``).
 
     Fast path (bit-exact with the aten chain, pure data movement plus zero
     fill): build the conv input (cache frames + hidden state + padding)
@@ -139,7 +153,7 @@ def _run_cached_causal_conv(
         pair = cat_pad_channels_last_3d(x, payload, conv._padding, keep_cache_t=CACHE_T)
         if pair is not None:
             inp, cache_list[idx] = pair
-            return nn.Conv3d.forward(conv, inp)
+            return conv._conv_with_epilogue(inp, residual, skip_bias)
     # Original aten path (bit-identical bookkeeping).
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < 2 and payload is not None:
@@ -153,7 +167,7 @@ def _run_cached_causal_conv(
             [torch.zeros_like(cache_x).to(cache_x.device), cache_x],
             dim=2,
         )
-    out = conv(x) if payload is None else conv(x, payload)
+    out = conv(x, payload, residual=residual, skip_bias=skip_bias)
     cache_list[idx] = cache_x
     return out
 
@@ -292,7 +306,40 @@ class WanCausalConv3d(nn.Conv3d):
         )
         self.padding = (0, 0, 0)
 
-    def forward(self, x, cache_x=None):
+    def _conv_with_epilogue(self, inp, residual=None, skip_bias=False):
+        """Convolution plus its bias epilogue.
+
+        PyTorch's cuDNN conv adds the bias as a separate broadcast ``add_``
+        kernel after ``cudnn_convolution``; on channels_last_3d outputs that
+        add is unvectorised and, in this decoder, costs about as much as the
+        residual add that usually follows. So run the conv without bias and
+        apply the bias in one fused Triton pass that reproduces aten's
+        arithmetic exactly (fp32 add, one rounding), optionally together with
+        the residual (``x.dtype(x.dtype(conv + bias) + residual)``, the two
+        roundings of the eager ``conv(x) + h`` chain). ``skip_bias`` returns
+        the raw conv output so a following fused norm can absorb the bias.
+        Falls back to the aten ops with identical arithmetic.
+        """
+        bias = self.bias
+        if skip_bias or bias is None:
+            out = self._conv_forward(inp, self.weight, None if skip_bias else bias)
+            return out if residual is None else out + residual
+        if (
+            conv_bias_epilogue is not None
+            and not torch.compiler.is_compiling()
+            and inp.is_cuda
+        ):
+            out = self._conv_forward(inp, self.weight, None)
+            if can_use_conv_bias_epilogue(out, bias, residual):
+                return conv_bias_epilogue(out, bias, residual)
+            # Same ops aten runs inside conv3d: bias cast to the activation
+            # dtype (autocast), fp32 add, one rounding.
+            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+        else:
+            out = self._conv_forward(inp, self.weight, bias)
+        return out if residual is None else out + residual
+
+    def forward(self, x, cache_x=None, *, residual=None, skip_bias=False):
         padding = list(self._padding)
         if (
             any(padding)
@@ -304,13 +351,13 @@ class WanCausalConv3d(nn.Conv3d):
         ):
             inp = cat_pad_channels_last_3d(x, cache_x, padding)
             if inp is not None:
-                return super().forward(inp)
+                return self._conv_with_epilogue(inp, residual, skip_bias)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = (
             x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
         )  # casting needed if amp isn't supported
         x = match_conv3d_input_format(x, self.weight)
-        return super().forward(x)
+        return self._conv_with_epilogue(x, residual, skip_bias)
 
 
 class WanRMS_norm(nn.Module):
@@ -334,7 +381,11 @@ class WanRMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
-    def forward(self, x):
+    def forward(self, x, conv_bias=None):
+        if conv_bias is not None:
+            # A preceding conv deferred its bias here (see
+            # ``WanCausalConv3d._conv_with_epilogue``); same aten add.
+            x = x + conv_bias.to(x.dtype).view(1, -1, 1, 1, 1)
         return (
             F.normalize(x, dim=(1 if self.channel_first else -1))
             * self.scale
@@ -448,37 +499,42 @@ def residual_block_forward(self, x):
     x = self.norm1(x)
     x = self.nonlinearity(x)
 
+    # conv1's bias is deferred into norm2 (fused RMSNorm+SiLU absorbs it in
+    # the same pass; the eager norm adds it first with the same arithmetic).
+    defer_bias = self.conv1.bias is not None
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        x = _run_cached_causal_conv(self.conv1, x, _feat_cache, idx)
+        x = _run_cached_causal_conv(
+            self.conv1, x, _feat_cache, idx, skip_bias=defer_bias
+        )
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv1(x)
+        x = self.conv1(x, skip_bias=defer_bias)
 
     # Second normalization and activation
-    x = self.norm2(x)
+    x = self.norm2(x, conv_bias=self.conv1.bias if defer_bias else None)
     x = self.nonlinearity(x)
 
     # Dropout
     x = self.dropout(x)
 
+    # conv2's bias and the residual add are one epilogue pass (bit-exact with
+    # the eager ``conv2(x) + h`` chain).
     _feat_cache = feat_cache.get()
     _feat_idx = feat_idx.get()
     if _feat_cache is not None:
         idx = _feat_idx
-        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx)
+        x = _run_cached_causal_conv(self.conv2, x, _feat_cache, idx, residual=h)
         _feat_idx += 1
         feat_cache.set(_feat_cache)
         feat_idx.set(_feat_idx)
     else:
-        x = self.conv2(x)
-
-    # Add residual connection
-    return x + h
+        x = self.conv2(x, residual=h)
+    return x
 
 
 def attention_block_forward(self, x):
