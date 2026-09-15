@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
+import json
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -154,6 +156,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_model,
     get_parallel,
     get_platform,
 )
@@ -234,6 +237,55 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _checkpoint_has_fp8_wo_a(model_path: str) -> bool:
+    """whether the on-disk checkpoint actually stores ``*.wo_a`` as FP8.
+
+    Some DeepSeek V4 checkpoints (e.g. DeepSeek-V4-Flash-FP8) keep ``wo_a`` in
+    BF16 even though every other projection is FP8-quantized, so
+    ``_FP8_WO_A_GEMM`` must not be applied to ``wo_a`` unconditionally.
+
+    Only local directories are inspected (metadata-only, via safetensors
+    headers); anything else (HF repo id, remote URL) keeps the historical
+    "assume FP8" behavior so non-local loading is unaffected.
+    """
+    if not os.path.isdir(model_path):
+        return True
+
+    from safetensors import safe_open
+
+    def _first_wo_a_is_fp8(shard_path: str, names: Iterable[str]) -> Optional[bool]:
+        with safe_open(shard_path, framework="pt", device="cpu") as sf:
+            for name in names:
+                if name.endswith(".wo_a.weight"):
+                    return sf.get_slice(name).get_dtype() != "BF16"
+        return None
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        for name, shard in weight_map.items():
+            if not name.endswith(".wo_a.weight"):
+                continue
+            result = _first_wo_a_is_fp8(os.path.join(model_path, shard), [name])
+            if result is not None:
+                return result
+        return True
+
+    for entry in sorted(os.listdir(model_path)):
+        if not entry.endswith(".safetensors"):
+            continue
+        with safe_open(
+            os.path.join(model_path, entry), framework="pt", device="cpu"
+        ) as sf:
+            result = _first_wo_a_is_fp8(os.path.join(model_path, entry), sf.keys())
+        if result is not None:
+            return result
+    return True
+
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -681,6 +733,14 @@ class MqaAttentionBase(nn.Module):
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
         fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
+        # Some DeepSeek V4 checkpoints (e.g. DeepSeek-V4-Flash-FP8) keep `wo_a`
+        # in BF16 even though every other projection is FP8-quantized. Only run
+        # the FP8 wo_a path when the on-disk weight really is FP8, so a BF16
+        # wo_a is built and executed in BF16 instead of crashing at weight load
+        # / deep_gemm.
+        if fp8 and not _checkpoint_has_fp8_wo_a(get_model().model_path):
+            fp8 = False
+        self.wo_a_is_fp8 = fp8
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -2565,10 +2625,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        # DWDP keeps every token on-rank (self.mlp runs the MoE with no cross-rank
+        # combine), so the DP-attn gather/scatter around the MoE must be skipped --
+        # under SGLANG_SCHEDULER_SKIP_ALL_GATHER the global DP buffer /
+        # global_num_tokens_gpu are never populated, so gathering here reads a
+        # None cumsum / an unsized buffer.
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
+            and get_parallel().dwdp_size <= 1
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
@@ -3232,7 +3298,11 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if (
+            get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+            and get_parallel().dwdp_size <= 1
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -3246,6 +3316,10 @@ class DeepseekV4Model(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
+            # DWDP (and non-dp-attn) keep every token on-rank: no cross-rank
+            # gather, so the global token ids are just the local ids. Under
+            # SGLANG_SCHEDULER_SKIP_ALL_GATHER the global DP buffer / global_num_tokens
+            # are never populated, so gathering here would crash on a None cumsum.
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
@@ -3497,6 +3571,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             ]
         for layer in layers:
             attn = layer.self_attn
+            if not attn.wo_a_is_fp8:
+                # BF16 wo_a (e.g. DeepSeek-V4-Flash-FP8) has no weight_scale_inv.
+                continue
             G = attn.n_local_groups
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
@@ -3760,6 +3837,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for name, loaded_weight in weights:
                 if (
                     _FP8_WO_A_GEMM
+                    and _checkpoint_has_fp8_wo_a(get_model().model_path)
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):

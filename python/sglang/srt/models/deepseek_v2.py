@@ -705,9 +705,13 @@ class DeepseekV2MoE(nn.Module):
             and not _uses_per_rank_shared_slots
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # Disable TP for shared experts for A2A/FP4 allgather paths, or when
+            # Disable TP for shared experts for A2A/FP4
+            # allgather paths, or when
             # explicitly requested for DSV4 checkpoints whose shared scales are
-            # not divisible by the global TP size.
+            # not divisible by the global TP size. Under DWDP every rank holds a
+            # full replica of the shared expert (moe_dense_tp_size=1, no
+            # cross-rank reduce), so it must run TP1 too -- otherwise the shared
+            # weight is sharded but never all-reduced, silently corrupting output.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_pplx()
@@ -720,6 +724,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or get_parallel().dwdp_size > 1
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(
