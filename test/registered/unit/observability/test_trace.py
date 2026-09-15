@@ -3,8 +3,9 @@
 import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import threading
 import unittest
@@ -561,6 +562,234 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         # __del__ calls abort
         ctx.__del__()
         self.assertIsNone(ctx.thread_context)
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestMergedAsyncTracing(CustomTestCase):
+    """Exercise the wire protocol and real OTel replay without an exporter process."""
+
+    def setUp(self):
+        import pickle
+        from types import SimpleNamespace
+
+        import sglang.srt.observability.req_time_stats as rts
+        import sglang.srt.observability.trace_async as async_mod
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        if not async_mod._zmq_available:
+            self.skipTest("pyzmq not installed")
+        self.async_mod = async_mod
+        self.rts = rts
+        self.namespace = SimpleNamespace
+        self.messages = []
+        self.spans = InMemorySpanExporter()
+        self.provider = TracerProvider(id_generator=mod.TraceCustomIdGenerator())
+        self.provider.add_span_processor(SimpleSpanProcessor(self.spans))
+        self.addCleanup(self.provider.shutdown)
+        self.contexts = {}
+        self.callers = []
+        self.exporter = async_mod._TraceExporterProcess("unused", "test", "unused")
+
+        # Serialize at the transport boundary so later buffer mutations cannot
+        # accidentally make an in-memory fake pass where ZMQ would fail.
+        def send_pyobj(message, flags):
+            self.assertEqual(flags, async_mod.zmq.NOBLOCK)
+            self.messages.append(pickle.loads(pickle.dumps(message)))
+
+        self.socket = SimpleNamespace(send_pyobj=send_pyobj)
+        patches = [
+            patch.object(async_mod, "is_async_tracing_available", return_value=True),
+            patch.object(rts, "is_async_tracing_available", return_value=True),
+            patch.object(async_mod, "_get_zmq_socket", return_value=self.socket),
+            patch.object(mod, "opentelemetry_initialized", True),
+            patch.object(mod, "global_trace_modules", None),
+            patch.object(mod, "get_global_trace_level", return_value=3),
+            patch.object(mod, "tracer", self.provider.get_tracer("merged-test")),
+            patch.object(mod, "threads_info", {}),
+            patch.dict(os.environ, {"SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD": "10000"}),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        pid = threading.get_native_id()
+        mod.threads_info[pid] = TraceThreadInfo("test-host", pid, "scheduler", 0, 0, 0)
+        self.addCleanup(self._close_contexts)
+
+    def _close_contexts(self):
+        for ctx, _ in self.contexts.values():
+            ctx.abort(ts=10000)
+        self.contexts.clear()
+        for ctx in self.callers:
+            if ctx.tracing_enable and ctx.root_span is not None:
+                ctx.root_span.end(end_time=10000)
+                ctx.root_span = None
+
+    def _new_context(self, rid="same-request"):
+        ctx = self.async_mod.TraceReqContextAsync(rid=rid)
+        self.callers.append(ctx)
+        return ctx
+
+    def _replay(self, message):
+        args = (
+            message,
+            self.contexts,
+            mod.threads_info,
+            mod.TraceCustomIdGenerator,
+            TraceReqContext,
+            TraceSliceContext,
+            TraceEvent,
+        )
+        if message["action"] == "multi_batch":
+            self.exporter._replay_multi_batch(*args)
+        else:
+            self.exporter._replay_batch(*args)
+
+    def test_batch_flush_preserves_context_identity_and_pending_ops(self):
+        """Same-rid contexts stay separate; duplicate request references cannot resend ops."""
+        a, b = self._new_context(), self._new_context()
+        with patch.object(
+            self.async_mod, "is_async_tracing_available", return_value=False
+        ):
+            disabled = self._new_context()
+        a.trace_event("first", level=1, ts=100)
+        req = lambda ctx: self.namespace(time_stats=self.namespace(trace_ctx=ctx))
+        reqs = [
+            req(a),
+            object(),
+            req(TraceNullContext()),
+            req(b),
+            req(a),
+            req(disabled),
+            self.namespace(time_stats=None),
+        ]
+        self.rts.flush_trace_batch(reqs)
+        self.assertEqual(len(self.messages), 1)
+        first = self.messages[0]
+        self.assertEqual(first["action"], "multi_batch")
+        self.assertEqual(
+            [x["context_id"] for x in first["batches"]], [a._context_id, b._context_id]
+        )
+        self.assertEqual(
+            [op["type"] for op in first["batches"][0]["operations"]], ["init", "event"]
+        )
+        self.assertEqual(a._operations, [])
+        self.assertEqual(b._operations, [])
+        self.rts.flush_trace_batch(reqs)
+        self.assertEqual(len(self.messages), 1)
+        a.trace_event("next-step", level=1, ts=200)
+        a.flush()
+        self.assertEqual(len(self.messages), 2)
+        self.assertEqual(self.messages[1]["action"], "batch")
+        self.assertEqual(
+            [op["name"] for op in self.messages[1]["operations"]], ["next-step"]
+        )
+        self.assertEqual(first["batches"][0]["operations"][-1]["name"], "first")
+
+    def test_replay_preserves_spans_across_scheduler_steps(self):
+        """Merging must preserve IDs, parents, timestamps and events across flushes."""
+        callers = [self._new_context(), self._new_context()]
+        expected = []
+        for i, ctx in enumerate(callers):
+            ctx.trace_req_start(ts=100)
+            root_id = ctx.root_span.get_span_context().span_id
+            ctx.trace_slice_start(f"prefill-{i}", level=1, ts=200)
+            expected.append((root_id, ctx._span_id_stack[-1]))
+        self.async_mod.flush_trace_contexts_merged(callers)
+        self._replay(self.messages[-1])
+        self.assertEqual(len(self.contexts), 2)
+        for i, ctx in enumerate(callers):
+            ctx.trace_event(f"scheduled-{i}", level=1, ts=250, attrs={"tokens": 16 + i})
+            ctx.trace_slice_end(f"prefill-{i}", level=1, ts=300, attrs={"batch": i})
+        self.async_mod.flush_trace_contexts_merged(callers)
+        self._replay(self.messages[-1])
+        spans = {s.name: s for s in self.spans.get_finished_spans()}
+        for i, (root_id, span_id) in enumerate(expected):
+            span = spans[f"prefill-{i}"]
+            self.assertEqual(span.context.span_id, span_id)
+            thread_span = self.contexts[callers[i]._context_id][
+                0
+            ].thread_context.thread_span
+            self.assertEqual(
+                span.parent.span_id, thread_span.get_span_context().span_id
+            )
+            self.assertEqual(thread_span.parent.span_id, root_id)
+            self.assertEqual((span.start_time, span.end_time), (200, 300))
+            self.assertEqual(span.attributes["batch"], i)
+            self.assertEqual(
+                [(e.name, e.timestamp, e.attributes["tokens"]) for e in span.events],
+                [(f"scheduled-{i}", 250, 16 + i)],
+            )
+        for ctx in callers:
+            ctx.trace_req_finish(ts=400)
+            self._replay(self.messages[-1])
+        self.assertEqual(self.contexts, {})
+
+    def test_bad_sub_batch_does_not_block_other_requests(self):
+        """A replay failure must not discard valid contexts later in the merged message."""
+        for i in range(2):
+            ctx = self._new_context(rid=f"request-{i}")
+            ctx.trace_req_start(ts=100)
+            ctx.trace_slice_start(f"prefill-{i}", level=1, ts=200)
+            ctx.trace_slice_end(f"prefill-{i}", level=1, ts=300)
+        self.async_mod.flush_trace_contexts_merged(self.callers)
+        message = self.messages[-1]
+        message["batches"].insert(1, {"rid": "malformed", "operations": []})
+        with self.assertLogs(self.async_mod.logger, level="ERROR"):
+            self._replay(message)
+        self.assertEqual(len(self.contexts), 2)
+        self.assertEqual(
+            {s.name for s in self.spans.get_finished_spans()},
+            {"prefill-0", "prefill-1"},
+        )
+
+    def test_failed_send_drops_detached_ops_without_resending_them(self):
+        """Best-effort transport drops a failed step, but preserves the next step."""
+        for failure in (None, self.async_mod.zmq.Again(), RuntimeError("closed")):
+            with self.subTest(failure=type(failure).__name__):
+                a, b = self._new_context(), self._new_context()
+
+                def fail_send(message, flags):
+                    raise failure
+
+                socket = (
+                    None if failure is None else self.namespace(send_pyobj=fail_send)
+                )
+                with patch.object(
+                    self.async_mod, "_get_zmq_socket", return_value=socket
+                ):
+                    self.async_mod.flush_trace_contexts_merged([a, b])
+                self.assertEqual((a._operations, b._operations), ([], []))
+                a.trace_event("after-drop", level=1, ts=200)
+                self.async_mod.flush_trace_contexts_merged([a, b])
+                batches = self.messages[-1]["batches"]
+                self.assertEqual(len(batches), 1)
+                self.assertEqual(
+                    [op["name"] for op in batches[0]["operations"]], ["after-drop"]
+                )
+
+    def test_unavailable_async_tracing_does_not_iterate_batch(self):
+        """Sync-only tracing must not pay per-request batch traversal overhead."""
+
+        class UnvisitedBatch(list):
+            def __iter__(self):
+                raise AssertionError("Traversed batch without async tracing")
+
+        with patch.object(self.rts, "is_async_tracing_available", return_value=False):
+            self.rts.flush_trace_batch(UnvisitedBatch([object()]))
+        self.assertEqual(self.messages, [])
+
+    def test_disabled_batch_flush_keeps_buffered_operations(self):
+        ctx = self._new_context()
+        req = self.namespace(time_stats=self.namespace(trace_ctx=ctx))
+        before = list(ctx._operations)
+        with patch.object(self.rts, "get_global_tracing_enabled", return_value=False):
+            self.rts.flush_trace_batch([req])
+        self.rts.flush_trace_batch(None)
+        self.assertEqual(ctx._operations, before)
+        self.assertEqual(self.messages, [])
 
 
 if __name__ == "__main__":
