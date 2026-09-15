@@ -153,7 +153,7 @@ __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, 
       } else {
         src = p.pre_prev + static_cast<int64_t>(row) * kHc;  // parts other than 5 are unused
       }
-      __builtin_amdgcn_global_load_lds(src, coef_stage + a * 1024, 16, 0, 0);
+      __builtin_amdgcn_global_load_lds(const_cast<float*>(src), coef_stage + a * 1024, 16, 0, 0);
     }
   }
 }
@@ -190,7 +190,8 @@ issue_prefetch(const Params& p, int slice, int row_of_lane, int chunk_of_lane, l
     base += col0 + 8 * chunk_of_lane;
 #pragma unroll
     for (int a = 0; a < 2; ++a) {
-      __builtin_amdgcn_global_load_lds(base + 32 * a, stage_wave + t * kStageTileBytes + a * 1024, 16, 0, 0);
+      __builtin_amdgcn_global_load_lds(
+          const_cast<uint16_t*>(base + 32 * a), stage_wave + t * kStageTileBytes + a * 1024, 16, 0, 0);
     }
   }
 }
