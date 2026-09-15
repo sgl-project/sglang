@@ -15,14 +15,24 @@ This is the end-to-end half of that fix. Every other test of the tier logic
 synthesises the event sequence; here a real engine produces it, which is the
 only way to catch the tag going missing anywhere along
 ``hiradix_cache -> kv_events -> ZMQ -> subscriber -> pump -> tree``, and the
-only way to check the payoff — that a repeat still routes to the worker
-holding the prefix — rather than just the tree state behind it.
+only way to check the payoff — that a repeat is still served from the tier
+that holds it — rather than just the tree state behind it.
 
 Two workers, so the routing assertion has somewhere else to go wrong: with a
 tier-blind tree the owner is forgotten the moment its device copy is evicted
 and the repeat falls through to min-load, a coin flip. Asserting the tree
 state alone would need only one worker, but it is a strictly weaker claim and
-this test establishes it on the way (see the ``_drive_until`` predicate).
+this test establishes it on the way (see ``_sole_device_owner``).
+
+The payoff is read off the engine's own per-tier accounting rather than off
+the tree: ``return_cached_tokens_details`` makes each response carry
+``sglext.cached_tokens_details``, the split of the cached prompt tokens by the
+tier that served them. ``host > 0`` is the claim in the test's name, and it is
+the form a tier-blind tree cannot also satisfy — while a prefix is still on
+device, forgetting the host tier costs nothing and the repeat comes home
+anyway, so a routing-only assertion passes either way. The tree metrics stay
+in the assertions because the router seeing the tier stream is what this file
+uniquely covers; the engine's split is what makes the check non-vacuous.
 
 The engine is launched with a deliberately tiny device KV pool
 (``--max-total-tokens``) so a handful of requests forces real device eviction
@@ -164,7 +174,14 @@ def _tier_summary(text: str) -> str:
     )
 
 
-def _chat(router_url: str, model_id: str, prompt: str, max_tokens: int = 8) -> None:
+def _chat(router_url: str, model_id: str, prompt: str, max_tokens: int = 8) -> dict:
+    """Send one non-streaming chat request and return the parsed body.
+
+    ``return_cached_tokens_details`` asks the engine for the per-tier split of
+    the prompt tokens it served from cache. It survives the trip in both
+    directions: the router forwards the request body rather than reserializing
+    it from a typed struct, and proxies a non-streaming response verbatim.
+    """
     resp = httpx.post(
         f"{router_url}/v1/chat/completions",
         json={
@@ -173,10 +190,25 @@ def _chat(router_url: str, model_id: str, prompt: str, max_tokens: int = 8) -> N
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "stream": False,
+            "return_cached_tokens_details": True,
         },
         timeout=240.0,
     )
     assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _cached_tiers(body: dict) -> dict[str, int]:
+    """The engine's split of the cached prompt tokens by serving tier, as
+    ``{"device": N, "host": M}``.
+
+    Empty when the prompt hit nothing — the engine omits the block entirely
+    rather than reporting zeroes, so "absent" and "no cache hit" are the same
+    observation here. The non-integer members (``storage_backend``) are
+    dropped so callers can compare values without type-checking each one.
+    """
+    details = (body.get("sglext") or {}).get("cached_tokens_details") or {}
+    return {k: v for k, v in details.items() if isinstance(v, int)}
 
 
 # Words per prompt. Each `tag<i>` word costs several tokens, so this lands
@@ -214,55 +246,71 @@ def _chat_and_attribute(
     model_id: str,
     prompt: str,
     worker_urls: list[str],
-) -> dict[str, int]:
-    """Send one request and report which worker it landed on, as the
-    per-worker change in successful dispatches.
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Send one request and report where it landed and what served it: the
+    per-worker change in successful dispatches, and the response's per-tier
+    cached-token split.
 
     The counter is booked as the router finishes the response, which can trail
     the client's own completion, so wait for the dispatch to be attributed
     rather than scraping once and reading zeroes everywhere.
     """
     before = _success_counts(_scrape(router_url))
-    _chat(router_url, model_id, prompt)
+    body = _chat(router_url, model_id, prompt)
 
     def _deltas() -> dict[str, int] | None:
         after = _success_counts(_scrape(router_url))
         deltas = {url: after.get(url, 0) - before.get(url, 0) for url in worker_urls}
         return deltas if sum(deltas.values()) >= 1 else None
 
-    return _wait_until(
+    deltas = _wait_until(
         _deltas, timeout=30.0, what="the dispatch to be counted against a worker"
     )
+    return deltas, _cached_tiers(body)
 
 
-def _drive_until(
+# Filler requests between two probes of the primed prefix. A probe prefills
+# that prefix again, which makes it the most recently used entry on its
+# worker, so the next probe only means something once enough filler has since
+# passed through to turn the WHOLE device pool over. At PROMPT_WORDS the
+# filler runs to order 1k tokens each, so this comfortably exceeds
+# DEVICE_KV_TOKENS.
+FILLERS_PER_PROBE = 8
+# Probe cycles before giving up.
+MAX_PROBE_CYCLES = 5
+
+
+def _drive_until_host_served(
     router_url: str,
     model_id: str,
-    predicate,
+    primed: str,
     *,
-    prefix: str,
-    max_requests: int = 40,
-    what: str,
-):
-    """Push distinct long prompts through the tiny device pool until
-    `predicate(scrape_text)` holds.
+    worker_urls: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Apply device pressure until a repeat of `primed` comes back served from
+    the host tier, and report that probe's (dispatch deltas, tier split).
 
     Driven by the observed effect rather than a fixed request count: how many
     requests it takes to turn the device tier over depends on the tokenizer,
     the page size and how the scheduler batches, none of which this test
     should be asserting. A fixed count is either flaky or needlessly slow.
+
+    The probe carries the assertion, so it cannot be a passive read — asking
+    whether the prefix is served from host is also what puts it back on
+    device. Hence the filler burst between cycles: a probe that re-warmed the
+    prefix must not be the reason the next one finds it on device.
     """
-    for i in range(max_requests):
-        text = _scrape(router_url)
-        if predicate(text):
-            return text
-        _chat(router_url, model_id, _long_prompt(f"{prefix}{i}"))
-    # The events are asynchronous, so give the pump a moment after the last
-    # request before declaring failure.
-    return _wait_until(
-        lambda: (lambda t: t if predicate(t) else None)(_scrape(router_url)),
-        timeout=60.0,
-        what=what,
+    tiers: dict[str, int] = {}
+    for cycle in range(MAX_PROBE_CYCLES):
+        for i in range(FILLERS_PER_PROBE):
+            _chat(router_url, model_id, _long_prompt(f"evict{cycle}-{i}"))
+        deltas, tiers = _chat_and_attribute(router_url, model_id, primed, worker_urls)
+        if tiers.get("host", 0) > 0:
+            return deltas, tiers
+    raise AssertionError(
+        f"no repeat of the primed prefix was served from the host tier after "
+        f"{MAX_PROBE_CYCLES} eviction cycles of {FILLERS_PER_PROBE} requests; "
+        f"last tier split={tiers}; router state: {_tier_summary(_scrape(router_url))}"
     )
 
 
@@ -339,34 +387,30 @@ def test_repeat_returns_to_the_host_tier_owner(
             # end of the test can fail: routing that never honoured the tree at
             # all, versus a tree that forgot the owner once its device copy
             # went.
-            deltas = _chat_and_attribute(
+            deltas, tiers = _chat_and_attribute(
                 router.base_url, spec["model"], primed, worker_urls
             )
             assert deltas.get(owner, 0) == 1, (
                 "repeat of a device-resident prefix did not return to its "
-                f"owner {owner}; per-worker deltas={deltas}"
+                f"owner {owner}; per-worker deltas={deltas}, tier split={tiers}"
             )
 
-            # Turn the device tier over until the owner's copy is demoted:
-            # gone from device, still held on host.
-            _drive_until(
+            # Turn the device tier over until a repeat of the primed prefix
+            # is actually served back from host. Driving on the probe rather
+            # than on tree occupancy is what keeps the final assertion honest:
+            # the per-worker tier gauges are aggregates over everything a
+            # worker holds, so filler traffic alone can satisfy any inequality
+            # between them while the primed prefix sits untouched on device.
+            deltas, tiers = _drive_until_host_served(
                 router.base_url,
                 spec["model"],
-                lambda t: (
-                    _events(t, "block_removed", "GPU") > 0
-                    and _tree_blocks(t, "host", worker_url=owner)
-                    > _tree_blocks(t, "device", worker_url=owner)
-                ),
-                prefix="evict",
-                what=(
-                    "the owner to hold more host-tier than device-tier blocks. "
-                    "Not `device == 0`: the owner keeps taking a share of the "
-                    "filler traffic, so its device set never empties"
-                ),
+                primed,
+                worker_urls=worker_urls,
             )
 
             text = _scrape(router.base_url)
             print(f"[{write_policy}] after eviction: {_tier_summary(text)}")
+            print(f"[{write_policy}] repeat served from: {tiers}")
 
             # The engine really did back blocks up to host. Without this the
             # test proves nothing: a fleet with no L2 traffic cannot exercise
@@ -382,12 +426,12 @@ def test_repeat_returns_to_the_host_tier_owner(
                 _sum_where(text, "sgl_router_kv_tree_accounting_errors_total") == 0
             ), "tree occupancy accounting contradicted itself"
 
-            deltas = _chat_and_attribute(
-                router.base_url, spec["model"], primed, worker_urls
-            )
+            # `_drive_until_host_served` has already established that the
+            # host tier served the repeat; this pins down that it was the
+            # owner's host tier, which is the routing half of the claim.
             assert deltas.get(owner, 0) == 1, (
                 "repeat of a host-resident prefix did not return to its owner "
-                f"{owner}; per-worker deltas={deltas}"
+                f"{owner}; per-worker deltas={deltas}, tier split={tiers}"
             )
     finally:
         gpu_allocator.release(gpus)
