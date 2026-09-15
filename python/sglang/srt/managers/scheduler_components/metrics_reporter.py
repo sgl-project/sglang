@@ -78,6 +78,89 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+# Open per-request ITL windows retained before the oldest is evicted. Only
+# requests that vanish without a finished() sighting can accumulate here, and
+# max_running_requests keeps the legitimate live set two orders of magnitude
+# below this.
+_MAX_OPEN_REQ_WINDOWS = 4096
+
+
+def _step_clock_mode(batch: ScheduleBatch) -> str:
+    """Bucket a forward as prefill / decode / idle for step-time accounting.
+
+    An EXTEND batch with no prefill_stats is decode work that
+    maybe_convert_decode_to_extend dressed up to keep a heterogeneous dp step
+    mode-homogeneous, so it is charged to decode rather than prefill.
+    """
+    if batch.forward_mode.is_idle():
+        return "idle"
+    if batch.forward_mode.is_extend() and batch.prefill_stats is not None:
+        return "prefill"
+    if batch.forward_mode.is_extend():
+        return "decode"
+    return "decode"
+
+
+@dataclasses.dataclass
+class StepClock:
+    """Cumulative GPU time over timed forwards, split by forward mode.
+
+    Advanced exactly once per forward, where that forward's CUDA events are
+    read. Per-request prefill/decode attribution is then differences of these
+    running totals taken at a request's first and last output token, so no
+    per-step history has to be retained to answer "how much prefill ran while
+    this request was decoding".
+    """
+
+    decode_ms: float = 0.0
+    prefill_ms: float = 0.0
+    idle_ms: float = 0.0
+    cache_read_ms: float = 0.0
+    n_decode: int = 0
+    n_prefill: int = 0
+    n_idle: int = 0
+
+    def advance(self, mode: str, step_ms: float, cache_read_ms: float) -> None:
+        if mode == "prefill":
+            self.prefill_ms += step_ms
+            self.n_prefill += 1
+        elif mode == "idle":
+            self.idle_ms += step_ms
+            self.n_idle += 1
+        else:
+            self.decode_ms += step_ms
+            self.n_decode += 1
+        self.cache_read_ms += cache_read_ms
+
+
+@dataclasses.dataclass
+class ReqStepWindow:
+    """StepClock reading taken when a request emitted its first output token."""
+
+    first_step: int
+    decode_ms: float
+    prefill_ms: float
+    idle_ms: float
+    cache_read_ms: float
+    n_decode: int
+    n_prefill: int
+    n_idle: int
+    decode_steps_present: int = 0
+
+    @classmethod
+    def open(cls, first_step: int, clock: StepClock) -> "ReqStepWindow":
+        return cls(
+            first_step=first_step,
+            decode_ms=clock.decode_ms,
+            prefill_ms=clock.prefill_ms,
+            idle_ms=clock.idle_ms,
+            cache_read_ms=clock.cache_read_ms,
+            n_decode=clock.n_decode,
+            n_prefill=clock.n_prefill,
+            n_idle=clock.n_idle,
+        )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -578,7 +661,7 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
-    def _step_time_suffix(self, batch_iter) -> str:
+    def _step_time_suffix(self, batch_iter, mode: str) -> str:
         """Return ', step time (ms): X.XXX' for the forward whose CUDA events
         were recorded under batch_iter (see Scheduler._step_events), or '' if
         unavailable. Consumes the stored events. The end event is already
@@ -596,6 +679,10 @@ class SchedulerMetricsReporter:
         transfer sizes or bandwidth -- so `step time - cache_read time` is the
         forward's compute time. A zero means the copy stream fully hid the load
         behind compute, not that no load happened.
+
+        ``mode`` buckets this forward on the scheduler's StepClock. This is the
+        one place a step's elapsed time is read, so it is also the one place the
+        clock can advance exactly once per forward.
         """
         evts = self.scheduler._step_events.pop(batch_iter, None)
         pairs = self.scheduler._cache_read_events.pop(batch_iter, None)
@@ -608,7 +695,9 @@ class SchedulerMetricsReporter:
             return ""
         start_evt, end_evt = evts
         end_evt.synchronize()
-        suffix = f", step time (ms): {start_evt.elapsed_time(end_evt):.3f}"
+        step_ms = start_evt.elapsed_time(end_evt)
+        suffix = f", step time (ms): {step_ms:.3f}"
+        stall_ms = 0.0
         if pairs is not None:
             if pairs:
                 # end_evt.synchronize() above already covers these -- every pair
@@ -621,6 +710,7 @@ class SchedulerMetricsReporter:
             suffix += f", cache_read time (ms): {stall_ms:.3f}"
             if collector is not None:
                 collector.recycle(pairs)
+        self.scheduler._step_clock.advance(mode, step_ms, stall_ms)
         return suffix
 
     def log_unreported_step_time(self, batch: Optional[ScheduleBatch]) -> None:
@@ -662,7 +752,7 @@ class SchedulerMetricsReporter:
                 collector.recycle(pairs)
             return
 
-        suffix = self._step_time_suffix(batch.forward_iter)
+        suffix = self._step_time_suffix(batch.forward_iter, _step_clock_mode(batch))
         if not suffix:
             # Already consumed by the prefill/decode reporter -- the normal case.
             return
@@ -678,6 +768,98 @@ class SchedulerMetricsReporter:
         logger.info(
             f"{label}, step_idx: {batch.forward_iter}, "
             f"#running-req: {len(batch.reqs)}{suffix}"
+        )
+
+    def record_request_step_accounting(self, batch: Optional[ScheduleBatch]) -> None:
+        """Attribute engine step time to the requests that were waiting on it.
+
+        Called once per forward from Scheduler.process_batch_result, after the
+        batch result has been processed and after the step clock has taken this
+        forward in (whichever reporter path read the events did that first).
+
+        For each request this snapshots the clock when its first output token
+        lands and emits the differences when it finishes, so the reported window
+        is first output token -> last output token: exactly the span AIPerf
+        divides by ``OSL - 1`` to get inter-token latency. The prefill term in
+        that window is other requests' prefill chunks, scheduled on this rank
+        while this request was waiting for its next decode step.
+        """
+        if not self.scheduler.server_args.enable_step_time_logging:
+            return
+        if batch is None or batch.forward_iter is None:
+            return
+        # Ranks that do not log never emit a record, so never open a window.
+        # Their clock still advances wherever they happen to read step events;
+        # nothing reads it.
+        if not self.is_stats_logging_rank:
+            return
+
+        windows = self.scheduler._req_step_windows
+        is_decode_step = _step_clock_mode(batch) == "decode"
+
+        for req in batch.reqs:
+            if not req.output_ids:
+                # Middle of a chunked prefill, or an embedding request: no first
+                # token yet, so there is no ITL window to open.
+                continue
+            window = windows.get(req.rid)
+            if window is None:
+                if req.finished():
+                    # Either a one-token response, or a finished request
+                    # lingering one extra forward under overlap scheduling.
+                    # Neither has an inter-token interval to attribute.
+                    continue
+                # Opening on this forward rather than the next one puts the
+                # first-token forward itself outside the window, which is where
+                # TTFT ends and ITL begins.
+                windows[req.rid] = ReqStepWindow.open(
+                    batch.forward_iter, self.scheduler._step_clock
+                )
+                continue
+            if is_decode_step and not req.is_retracted:
+                window.decode_steps_present += 1
+            if req.finished():
+                self._log_request_step_accounting(req, window, batch.forward_iter)
+                windows.pop(req.rid, None)
+
+        # A request aborted mid-flight never reaches finished() in a batch seen
+        # here, so bound the table instead of letting it grow for the life of
+        # the server. max_running_requests holds the live set far below this
+        # cap, so eviction only ever reaches leaked entries.
+        while len(windows) > _MAX_OPEN_REQ_WINDOWS:
+            windows.pop(next(iter(windows)))
+
+    def _log_request_step_accounting(
+        self, req, window: "ReqStepWindow", last_step: int
+    ) -> None:
+        clock = self.scheduler._step_clock
+        decode_ms = clock.decode_ms - window.decode_ms
+        prefill_ms = clock.prefill_ms - window.prefill_ms
+        idle_ms = clock.idle_ms - window.idle_ms
+        cache_read_ms = clock.cache_read_ms - window.cache_read_ms
+
+        # Wall clock over the same window, from the engine's own stamps. Its
+        # excess over decode+prefill+idle is everything the CUDA events cannot
+        # see: scheduler CPU between forwards, the IPC hop to the detokenizer,
+        # and any interval where the GPU had nothing queued.
+        stats = req.time_stats
+        wall_ms = 0.0
+        if stats.completion_time > 0 and stats.prefill_finished_time > 0:
+            wall_ms = (stats.completion_time - stats.prefill_finished_time) * 1e3
+
+        logger.info(
+            f"Req step accounting, rid: {req.rid}, "
+            f"first_step: {window.first_step}, last_step: {last_step}, "
+            f"isl: {len(req.origin_input_ids)}, osl: {len(req.output_ids)}, "
+            f"decode_steps: {clock.n_decode - window.n_decode}, "
+            f"decode_steps_present: {window.decode_steps_present}, "
+            f"prefill_steps: {clock.n_prefill - window.n_prefill}, "
+            f"idle_steps: {clock.n_idle - window.n_idle}, "
+            f"decode time (ms): {decode_ms:.3f}, "
+            f"prefill time (ms): {prefill_ms:.3f}, "
+            f"idle time (ms): {idle_ms:.3f}, "
+            f"cache_read time (ms): {cache_read_ms:.3f}, "
+            f"wall time (ms): {wall_ms:.3f}"
         )
 
     def report_prefill_stats(
@@ -760,7 +942,7 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.scheduler.server_args.enable_step_time_logging:
-            msg += self._step_time_suffix(batch_iter)
+            msg += self._step_time_suffix(batch_iter, "prefill")
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -1025,7 +1207,7 @@ class SchedulerMetricsReporter:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.scheduler.server_args.enable_step_time_logging:
-            msg += self._step_time_suffix(batch_iter)
+            msg += self._step_time_suffix(batch_iter, "decode")
 
         if self.is_stats_logging_rank:
             logger.info(msg)

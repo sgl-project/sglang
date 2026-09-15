@@ -250,7 +250,9 @@ from sglang.srt.managers.scheduler_components.memory_usage import (
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
+    ReqStepWindow,
     SchedulerMetricsReporter,
+    StepClock,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
@@ -1227,6 +1229,13 @@ class Scheduler(
         # Built lazily in run_batch -- self.device_module is assigned later in
         # __init__ than this block.
         self._cache_read_collector: Optional[CacheReadStallCollector] = None
+        # Running totals of forward time by mode, advanced as each forward's
+        # events are read, plus the per-request snapshots taken against them.
+        # Together these answer, for one request, how much of the wall time
+        # between its first and last output token the engine spent decoding
+        # versus prefilling somebody else's prompt.
+        self._step_clock = StepClock()
+        self._req_step_windows: Dict[str, ReqStepWindow] = {}
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -4502,6 +4511,9 @@ class Scheduler(
         # Runs after the per-mode dispatch above, so it only fires for forwards
         # that no report_{prefill,decode}_stats call claimed.
         self.metrics_reporter.log_unreported_step_time(batch)
+        # Runs after that, so the step clock has already taken this forward in
+        # whichever of the two paths read its events.
+        self.metrics_reporter.record_request_step_accounting(batch)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
