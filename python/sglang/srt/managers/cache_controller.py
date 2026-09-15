@@ -1469,10 +1469,8 @@ class HiCacheController:
                     # forwards them to Mooncake (plan.md §6/§8.1).
                     self._init_op_trace(operation, rid=operation.id, role="Backup")
                     self._page_backup(operation)
-                # Retire the op's hicache root span once the backup op completes
-                # (ack_backup point); no-op on skipped ranks (no span created);
-                # bypassed paths fall back to __del__.
-                self._finish_op_trace(operation)
+                    self._finish_op_trace(operation)
+                # Every rank acks for TP/PP sync, even the skipped ones.
                 self.ack_backup_queue.put(operation)
 
             except Empty:
