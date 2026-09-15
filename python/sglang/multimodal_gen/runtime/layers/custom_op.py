@@ -68,6 +68,9 @@ class CustomOp(nn.Module):
         # PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
     def dispatch_forward(self) -> Callable:
         if _is_cuda:
             return self.forward_cuda
