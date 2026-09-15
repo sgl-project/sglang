@@ -8,6 +8,7 @@
 
 import logging
 import os
+import re
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -136,6 +137,10 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+# `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
+# key FusedMoE.make_expert_params_mapping entries match on.
+_EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
@@ -3174,6 +3179,11 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Scanning expert_params_mapping (num_experts * 3 entries) for every
+        # checkpoint tensor is O(num_experts) per tensor; with 896 experts and
+        # ~500k expert tensors that is a minute of pure string matching. Key
+        # the mapping by its `experts.<id>.<proj>.` fragment instead.
+        expert_params_lookup = {entry[1]: entry for entry in expert_params_mapping}
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
@@ -3258,27 +3268,28 @@ class KimiK3LinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for idx, (param_name, weight_name, expert_id, shard_id) in enumerate(
-                    expert_params_mapping
-                ):
-                    if weight_name not in name:
-                        continue
+                expert_match = _EXPERT_WEIGHT_NAME.search(name)
+                expert_entry = (
+                    expert_params_lookup.get(expert_match.group(0))
+                    if expert_match
+                    else None
+                )
+                if expert_entry is not None:
+                    param_name, weight_name, expert_id, shard_id = expert_entry
                     name = name.replace(weight_name, param_name)
                     # Skip experts of layers outside a truncated config (e.g.
                     # num_hidden_layers override), mirroring the non-expert
                     # `name not in params_dict` guard below.
-                    if name not in params_dict:
-                        break
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        expert_id=expert_id,
-                        shard_id=shard_id,
-                    )
-                    break
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            expert_id=expert_id,
+                            shard_id=shard_id,
+                        )
                 else:
                     if (
                         name.endswith(".bias")
