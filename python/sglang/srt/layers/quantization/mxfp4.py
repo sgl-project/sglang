@@ -382,6 +382,15 @@ class Mxfp4Config(QuantizationConfig):
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
+    _MARLIN_CHECKPOINT_PARAMETER_NAMES = (
+        "w13_weight",
+        "w13_weight_scale",
+        "w13_weight_bias",
+        "w2_weight",
+        "w2_weight_scale",
+        "w2_weight_bias",
+    )
+
     def __init__(
         self,
         prefix: str,
@@ -614,6 +623,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
+        if self.use_marlin and not self.use_mega_moe:
+            layer._mxfp4_marlin_checkpoint_parameter_specs = {
+                name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
+                for name in self._marlin_parameter_names(layer)
+            }
+            layer._mxfp4_marlin_reload_in_place = False
+
+    def _marlin_parameter_names(self, layer):
+        # the biases only exist when the checkpoint carries them
+        return [
+            name
+            for name in self._MARLIN_CHECKPOINT_PARAMETER_NAMES
+            if hasattr(layer, name)
+        ]
+
+    def restore_weights_before_loading(self, layer):
+        if not (self.use_marlin and not self.use_mega_moe):
+            return
+
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            _view_tensor_storage,
+        )
+
+        specs = layer._mxfp4_marlin_checkpoint_parameter_specs
+        runtime_specs = layer._mxfp4_marlin_runtime_parameter_specs
+        for name in self._marlin_parameter_names(layer):
+            shape, dtype = specs[name]
+            param = getattr(layer, name)
+            current_spec = (tuple(param.shape), param.dtype)
+            if current_spec not in ((shape, dtype), runtime_specs[name]):
+                raise ValueError(
+                    f"Unexpected MXFP4 Marlin parameter state for {name}: "
+                    f"shape={param.shape}, dtype={param.dtype}."
+                )
+            # the loader fills only the unpadded slice, so the padding must start at zero
+            param.data = _view_tensor_storage(param.data, shape, dtype)
+            param.data.zero_()
+        layer._mxfp4_marlin_reload_in_place = True
+
     def process_weights_after_loading(self, layer):
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
@@ -635,11 +683,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "Current MXFP4 MoE layer is not supported by Marlin."
                 )
 
+            reuse_parameter_storage = layer._mxfp4_marlin_reload_in_place
             if self.moe_runner_config.gemm1_alpha is not None and getattr(
                 self.moe_runner_config, "gate_up_interleaved", True
             ):
-                deinterleave_moe_mxfp4_w13_for_marlin(layer)
-            prepare_moe_mxfp4_layer_for_marlin(layer)
+                deinterleave_moe_mxfp4_w13_for_marlin(
+                    layer, reuse_parameter_storage=reuse_parameter_storage
+                )
+            prepare_moe_mxfp4_layer_for_marlin(
+                layer, reuse_parameter_storage=reuse_parameter_storage
+            )
+            runtime_specs = {
+                name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype)
+                for name in self._marlin_parameter_names(layer)
+            }
+            if reuse_parameter_storage:
+                if runtime_specs != layer._mxfp4_marlin_runtime_parameter_specs:
+                    raise ValueError(
+                        "MXFP4 Marlin in-place reload changed the runtime layout: "
+                        f"{runtime_specs} vs {layer._mxfp4_marlin_runtime_parameter_specs}."
+                    )
+            else:
+                layer._mxfp4_marlin_runtime_parameter_specs = runtime_specs
+            layer._mxfp4_marlin_reload_in_place = False
             layer._mxfp4_backend = "marlin"
             return
 
