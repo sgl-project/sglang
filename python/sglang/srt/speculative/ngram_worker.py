@@ -99,6 +99,10 @@ class NGRAMWorker(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
+        self.max_match_depth: int = max(
+            self.max_trie_depth,
+            get_spec().speculative_ngram_max_sam_match_depth,
+        )
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.topk = get_spec().speculative_eagle_topk
         self.speculative_num_steps = get_spec().speculative_num_steps
@@ -118,6 +122,7 @@ class NGRAMWorker(BaseSpecWorker):
             match_type=get_spec().speculative_ngram_match_type,
             capacity=get_spec().speculative_ngram_capacity,
             max_trie_depth=get_spec().speculative_ngram_max_trie_depth,
+            max_sam_match_depth=get_spec().speculative_ngram_max_sam_match_depth,
             draft_token_num=get_spec().speculative_num_draft_tokens,
             external_sam_budget=get_spec().speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=get_spec().speculative_ngram_external_corpus_max_tokens,
@@ -254,13 +259,14 @@ class NGRAMWorker(BaseSpecWorker):
 
         # Accept-independent prep, hoisted above the blocking .cpu() below.
         req_ids = [req.rid for req in batch.reqs]
-        # Only the last max_trie_depth tokens can match; the ids are
-        # array.array, so list() the tails for list concat below.
+        # Trie and SAM cap their own matches independently. Preserve enough
+        # context for both; the ids are array.array, so list() the tails for
+        # list concat below.
         input_tails = [
-            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+            list(req.origin_input_ids[-self.max_match_depth :]) for req in batch.reqs
         ]
         output_tails = [
-            list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+            list(req.output_ids[-self.max_match_depth :]) for req in batch.reqs
         ]
         base_lens = [
             len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
@@ -296,7 +302,7 @@ class NGRAMWorker(BaseSpecWorker):
             check_token = self._efficient_concat_last_n(
                 input_tails[i],
                 output_tails[i] + prev_tokens,
-                self.max_trie_depth,
+                self.max_match_depth,
             )
             batch_tokens.append(check_token)
             total_lens.append(base_lens[i] + len(prev_tokens))
