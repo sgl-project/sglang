@@ -216,7 +216,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        if IS_KDA or not DISABLE_STATE_UPDATE:
+            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        else:
+            b_beta = tl.sigmoid(b_b).to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
