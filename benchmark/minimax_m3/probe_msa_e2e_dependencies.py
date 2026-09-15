@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import tomllib
 from importlib import metadata
 from pathlib import Path
 
@@ -30,7 +31,6 @@ REQUIRED_TP4_SM103_ROUTES = {
     },
     "direct_m16_decode.bf16_paged": {"decode_m16_bf16_paged"},
 }
-REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
 REQUIRED_TORCH_VERSION = "2.13.0"
 REQUIRED_DEEP_GEMM_VERSION = "0.1.5.post3"
 REQUIRED_TVM_FFI_VERSION = "0.1.11"
@@ -53,6 +53,22 @@ def git(source: Path, *args: str) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def required_sglang_kernel_version(repo: Path) -> str:
+    """Read the exact kernel wheel pin from the checkout under validation."""
+    pyproject = repo / "python" / "pyproject.toml"
+    project = tomllib.loads(pyproject.read_text())["project"]
+    versions = [
+        requirement.removeprefix("sglang-kernel==")
+        for requirement in project.get("dependencies", [])
+        if requirement.startswith("sglang-kernel==")
+    ]
+    if len(versions) != 1 or not versions[0]:
+        raise RuntimeError(
+            f"expected one exact sglang-kernel pin in {pyproject}, got {versions}"
+        )
+    return versions[0]
 
 
 def resolve_checkpoint(model: str) -> Path:
@@ -332,10 +348,11 @@ def probe_sglang(repo: Path, expected_tvm_ffi_version: str) -> dict:
             f"({expected_package})"
         )
     kernel_version = metadata.version("sglang-kernel")
-    if kernel_version != REQUIRED_SGLANG_KERNEL_VERSION:
+    required_kernel_version = required_sglang_kernel_version(repo)
+    if kernel_version != required_kernel_version:
         raise RuntimeError(
             f"sglang-kernel is {kernel_version}, expected "
-            f"{REQUIRED_SGLANG_KERNEL_VERSION}"
+            f"{required_kernel_version}"
         )
     torch = importlib.import_module("torch")
     torch_version = torch.__version__.split("+", 1)[0]

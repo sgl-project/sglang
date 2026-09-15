@@ -15,6 +15,7 @@ from precompile_fmha_sm100 import runtime_variants
 from probe_msa_e2e_dependencies import (
     REQUIRED_TP4_SM103_ROUTES,
     probe_blackwell_msa_route_manifest,
+    required_sglang_kernel_version,
 )
 from run_msa_formal_v2 import (
     repetitions_for_mode,
@@ -70,6 +71,25 @@ class MSAFormalV2Test(unittest.TestCase):
         path = root / "csrc" / "blackwell_msa" / "route_manifest.json"
         self.write_json(path, manifest)
         return path
+
+    def test_sglang_kernel_version_comes_from_checkout_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pyproject = root / "python" / "pyproject.toml"
+            pyproject.parent.mkdir(parents=True)
+            pyproject.write_text(
+                '[project]\ndependencies = ["torch", "sglang-kernel==0.4.7"]\n'
+            )
+            self.assertEqual(required_sglang_kernel_version(root), "0.4.7")
+
+    def test_sglang_kernel_version_requires_one_exact_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pyproject = root / "python" / "pyproject.toml"
+            pyproject.parent.mkdir(parents=True)
+            pyproject.write_text('[project]\ndependencies = ["sglang-kernel>=0.4.7"]\n')
+            with self.assertRaisesRegex(RuntimeError, "one exact sglang-kernel pin"):
+                required_sglang_kernel_version(root)
 
     def test_route_manifest_covers_tp4_gb300_source_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -170,9 +190,9 @@ class MSAFormalV2Test(unittest.TestCase):
             row["id"] for row in receipt["test_results"] if row.get("status") == "pass"
         }
         self.assertEqual(receipt["status"], "pass")
-        self.assertEqual(receipt["test_count"], 88)
-        self.assertEqual(len(receipt["test_results"]), 88)
-        self.assertEqual(len(passed), 88)
+        self.assertEqual(receipt["test_count"], 89)
+        self.assertEqual(len(receipt["test_results"]), 89)
+        self.assertEqual(len(passed), 89)
         self.assertTrue(required <= passed, sorted(required - passed))
 
 
