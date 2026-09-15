@@ -2,11 +2,11 @@
 
 Benchmark: AIPerf `inferencex-agentx-mvp` (393 SemiAnalysis coding-agent traces, seed 42), SemiAnalysis AIPerf fork at InferenceX's pinned commit 754356e9 with InferenceX/ATOM's client flags (idle cap 300 s, trajectory start 0.25-0.75, 10 warmup requests per lane), TP4 on 4 GPUs. Score = total token throughput (prompt tokens incl. cache hits + completion) per second / 4. Hardware here is MI350X (gfx950, 288 GB, ROCm 7.2.4); ATOM's published figures are MI355X.
 
-## Results (tok/s per GPU; 3600 s runs except the 1800 s real c=1/8 and forced c=1 points)
+## Results (tok/s per GPU; 3600 s runs except the 1800 s real c=1/8 points)
 
 | c | SGLang real acceptance | SGLang forced acceptance (ATOM parity) | ATOM published (forced) |
 |---:|---:|---:|---:|
-| 1 | 3,565 | 4,194 | 4,845 |
+| 1 | 3,565 | 4,425 | 4,845 |
 | 8 | 11,021 | 13,029 | 14,047 |
 | 24 | 34,785 | 38,457 | 39,680 |
 | 32 | 39,083 | 43,956 | 42,476 |
