@@ -13,10 +13,11 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -189,22 +190,6 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
-class DataType(Enum):
-    IMAGE = auto()
-    VIDEO = auto()
-    MESH = auto()
-    ACTION = auto()
-
-    def get_default_extension(self) -> str:
-        if self == DataType.IMAGE:
-            return "png"
-        if self == DataType.VIDEO:
-            return "mp4"
-        if self == DataType.ACTION:
-            return "json"
-        return "glb"
-
-
 @dataclass
 class SamplingParams:
     """
@@ -222,6 +207,8 @@ class SamplingParams:
     """
 
     data_type: DataType = DataType.VIDEO
+    # Included in the dynamic batching signature and retained by replace/pickle.
+    task_type: ModelTaskType | str | None = None
 
     request_id: str | None = field(default=None, metadata={"batch_sig_exclude": True})
 
@@ -732,13 +719,13 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
         if task_type.is_action_gen():
             return
 
         if task_type.requires_image_input():
             # requires image input
-            if self.image_path is None:
+            if not self.image_path:
                 raise ValueError(
                     f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
@@ -749,6 +736,34 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {task_type.name} models."
                 )
+
+        if task_type.requires_video_input() and not self.video_path:
+            raise ValueError(f"Task {task_type.name} requires a 'video_path' input")
+        # Legacy pipelines retain their model-owned video conditioning checks.
+        # Explicit multi-task declarations use the standard per-task contract.
+        if (
+            self.video_path
+            and (
+                getattr(pipeline_config, "supported_task_types", None) is not None
+                or (
+                    hasattr(pipeline_config, "get_supported_task_types")
+                    and len(pipeline_config.get_supported_task_types()) > 1
+                )
+            )
+            and not task_type.accepts_video_input()
+        ):
+            raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+    def resolve_task_type(self, pipeline_config) -> ModelTaskType:
+        resolver = getattr(pipeline_config, "resolve_task_type", None)
+        if resolver is None:
+            # Compatibility with integrations that supply a lightweight config.
+            return ModelTaskType.parse(self.task_type or pipeline_config.task_type)
+        return resolver(
+            self.task_type,
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+        )
 
     def _adjust(
         self,
@@ -761,7 +776,8 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
-        task_type = pipeline_config.task_type
+        task_type = self.resolve_task_type(pipeline_config)
+        self.task_type = task_type
         self.data_type = task_type.data_type()
 
         self._adjust_output_path(server_args)
@@ -864,7 +880,7 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if self.resolve_task_type(pipeline_config).is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -1007,6 +1023,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        add_argument(
+            "--task-type",
+            type=str,
+            help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
+        )
         # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
         add_argument("--auto-duration", action="store_true")

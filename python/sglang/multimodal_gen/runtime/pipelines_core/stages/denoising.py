@@ -59,6 +59,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
     resolve_skip_softmax_params,
 )
+from sglang.multimodal_gen.configs.task_type import get_request_task_type
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
@@ -1615,9 +1616,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
-            assert not server_args.pipeline_config.task_type == ModelTaskType.TI2V, (
-                "image latents should not be provided for TI2V task"
-            )
+            assert (
+                get_request_task_type(batch, server_args.pipeline_config)
+                != ModelTaskType.TI2V
+            ), "image latents should not be provided for TI2V task"
             latent_model_input = torch.cat(
                 [latent_model_input, batch.image_latent], dim=1
             ).to(ctx.target_dtype)
