@@ -258,6 +258,10 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+          # Append the image tag so the persisted logs/output identify the image
+          # (e.g. a3 CANN 9.0.0 vs 9.1.0 vs a5) that produced the result.
+          image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
+          workflow_name="${workflow_name}--${image_label}"
 
           # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
