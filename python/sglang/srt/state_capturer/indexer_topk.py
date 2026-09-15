@@ -129,11 +129,13 @@ def _create_indexer_capturer_raw(
 ) -> Optional[IndexerTopkCapturer]:
     if not enable:
         return None
-    if num_indexer_layers == 0:
+    if num_indexer_layers <= 0:
         logger.warning("No indexer layers found, IndexerTopkCapturer disabled")
         return None
-    if index_topk == 0:
-        logger.warning("Invalid index_topk = 0, IndexerTopkCapturer disabled")
+    if index_topk <= 0:
+        logger.warning(
+            "Invalid index_topk=%s, IndexerTopkCapturer disabled", index_topk
+        )
         return None
     return IndexerTopkCapturer(
         num_tokens=num_tokens,
