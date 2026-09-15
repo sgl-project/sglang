@@ -2,12 +2,13 @@
 //! scheduler drain.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use sglang_mm::pipeline::Tensor;
 
-use super::shm::{ShmSegment, shm_name};
+use crate::utils::shm::ShmSegment;
 
 /// The built-in Qwen drain shape.
 pub struct QwenMmEncodedEntry {
@@ -123,6 +124,14 @@ impl MmResultStore {
     }
 }
 
+/// Unique segment names: the pid separates server restarts (a crash can leak
+/// segments under the old pid), the counter separates results within one.
+fn shm_name(item: usize) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sglmm-{}-{n}-{item}", std::process::id())
+}
+
 /// Split the flat feature buffer per item (`t*h*w` rows per grid) and park each
 /// slice in its own segment. Any shm failure (`/dev/shm` full, odd shape) falls
 /// back to inline, as Python's `_wrap_shm_or_inline` does: degrade to the slow
@@ -155,8 +164,8 @@ pub(super) fn park_features_in_shm(features: &[f32], grids: &[[u32; 3]]) -> Feat
 
 #[cfg(test)]
 mod tests {
-    use super::super::shm::shm_path;
     use super::*;
+    use crate::utils::shm::shm_path;
 
     /// Per-item slicing follows the grid row counts, so Python's
     /// `(rows, feature_dim)` reshape of a segment sees only its own item.
@@ -169,7 +178,7 @@ mod tests {
             panic!("expected shm store");
         };
         assert_eq!(segments.len(), 2);
-        let read = |seg: &ShmSegment| -> Vec<u8> { std::fs::read(shm_path(&seg.name)).unwrap() };
+        let read = |seg: &ShmSegment| -> Vec<u8> { std::fs::read(shm_path(seg.name())).unwrap() };
         assert_eq!(
             read(&segments[0]),
             bytemuck::cast_slice::<f32, u8>(&features[..12])
