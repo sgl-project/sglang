@@ -123,10 +123,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         """
         if not is_in_ci():
             return cls.rdma_devices
-        devices = get_rdma_devices_for_gpus(gpu_indices)
-        if not devices:
-            return cls.rdma_devices
-        return ["--disaggregation-ib-device", devices]
+        return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
     # Subclasses can set these to customize server args
     extra_prefill_args = []
@@ -356,111 +353,37 @@ def _get_available_ib_devices():
     return devices if devices else None
 
 
-def get_rdma_devices_args():
+def get_rdma_devices_args(gpu_indices=None) -> str:
+    """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
+
+    The absolute id picks the NIC: a decode server pinned with `--base-gpu-id 4`
+    must not be mapped back onto the first NICs, which on a two-socket node sit
+    across the boundary from its GPUs. Without `gpu_indices` the ids come from
+    CUDA_VISIBLE_DEVICES, and with neither the pair is spread across the node so
+    a caller that cannot name its GPUs still gets two distinct NICs.
+    """
+
     def _parse_list_env(var_name: str):
         val = os.getenv(var_name)
-        if not val:
-            return None
-        items = [x.strip() for x in val.split(",") if x.strip()]
+        items = [x.strip() for x in (val or "").split(",") if x.strip()]
         return items or None
 
-    def _pick_default_pair(rdma_all_devices):
-        return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
-
-    # Priority: env var > auto-detect > hardcoded fallback
     rdma_all_devices = (
         _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
         or _get_available_ib_devices()
         or [f"mlx5_roce{i}" for i in range(8)]
     )
-    logger.warning("Resolved rdma_all_devices=%s", rdma_all_devices)
-
     n_rdma = len(rdma_all_devices)
 
-    # 1. Get visible GPU indices
-    cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
-    if not cuda_visible_devices:
-        warnings.warn("CUDA_VISIBLE_DEVICES is not set. Using default RDMA devices.")
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
+    if gpu_indices is None:
+        gpu_indices = _parse_list_env("CUDA_VISIBLE_DEVICES") or []
     try:
-        # Convert to list of integers (handling possible spaces and empty strings)
-        gpu_indices = [
-            int(idx.strip()) for idx in cuda_visible_devices.split(",") if idx.strip()
-        ]
-        if not gpu_indices or len(gpu_indices) > 4:
-            return ",".join(_pick_default_pair(rdma_all_devices))
+        gpu_indices = sorted({int(g) for g in gpu_indices})
     except ValueError:
-        warnings.warn(f"Invalid CUDA_VISIBLE_DEVICES format: {cuda_visible_devices}")
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
-    # 2. Calculate base RDMA index group (each group of 4 GPUs uses consecutive devices)
-    base_rdma_group = (min(gpu_indices) // 4) * 4
-    for gpu_idx in gpu_indices:
-        if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
-            warnings.warn(
-                f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group + 3}"
-            )
-
-    # 3. Generate RDMA device names
-    # Detect total GPUs on the node (not just visible ones)
-    try:
-        import torch
-
-        total_gpus = torch.cuda.device_count()
-    except Exception:
-        total_gpus = 8  # Fallback to common 8-GPU setup
-
-    # Handle edge cases
-    if total_gpus == 0:
-        total_gpus = 8
-    if n_rdma > total_gpus:
-        logger.warning(
-            "More RDMA devices (%d) than GPUs (%d), using first and middle device",
-            n_rdma,
-            total_gpus,
-        )
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
-    # Calculate how many GPUs share each RDMA device
-    gpus_per_rdma = max(1, total_gpus // n_rdma)
-    logger.warning(
-        "GPU-to-RDMA mapping: total_gpus=%d, n_rdma=%d, gpus_per_rdma=%d",
-        total_gpus,
-        n_rdma,
-        gpus_per_rdma,
-    )
-
-    rdma_devices = []
-    base_gpu = min(gpu_indices)
-    for gpu_idx in gpu_indices:
-        nic_index = min((gpu_idx - base_gpu) // gpus_per_rdma, n_rdma - 1)
-        rdma_devices.append(rdma_all_devices[nic_index])
-
-    if not rdma_devices:
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
-    # Deduplicate while preserving order
-    return ",".join(dict.fromkeys(rdma_devices))
-
-
-def get_rdma_devices_for_gpus(gpu_indices) -> str:
-    """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
-
-    `get_rdma_devices_args` normalizes ids to their group base, so a decode
-    server pinned with `--base-gpu-id 4` maps back onto the first NICs and
-    crosses the socket boundary; the absolute id keeps each side on its own
-    NUMA node's NICs.
-    """
-    rdma_all_devices = (
-        _parse_rdma_device_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
-        or _get_available_ib_devices()
-        or [f"mlx5_roce{i}" for i in range(8)]
-    )
-    gpu_indices = sorted({int(g) for g in gpu_indices})
-    if not gpu_indices or not rdma_all_devices:
-        return ""
+        warnings.warn(f"Invalid GPU indices: {gpu_indices}")
+        gpu_indices = []
+    if not gpu_indices:
+        return ",".join([rdma_all_devices[0], rdma_all_devices[n_rdma // 2]])
 
     try:
         import torch
@@ -468,32 +391,21 @@ def get_rdma_devices_for_gpus(gpu_indices) -> str:
         total_gpus = torch.cuda.device_count()
     except Exception:
         total_gpus = 0
-    if total_gpus <= 0:
-        total_gpus = max(8, gpu_indices[-1] + 1)
+    total_gpus = total_gpus or max(8, gpu_indices[-1] + 1)
 
-    n_rdma = len(rdma_all_devices)
     gpus_per_rdma = max(1, total_gpus // n_rdma)
     devices = [
         rdma_all_devices[min(gpu // gpus_per_rdma, n_rdma - 1)] for gpu in gpu_indices
     ]
     resolved = ",".join(dict.fromkeys(devices))
     logger.warning(
-        "RDMA for gpus=%s: total_gpus=%d n_rdma=%d gpus_per_rdma=%d -> %s",
+        "RDMA for gpus=%s: total_gpus=%d n_rdma=%d -> %s",
         gpu_indices,
         total_gpus,
         n_rdma,
-        gpus_per_rdma,
         resolved,
     )
     return resolved
-
-
-def _parse_rdma_device_list_env(var_name: str):
-    val = os.getenv(var_name)
-    if not val:
-        return None
-    items = [x.strip() for x in val.split(",") if x.strip()]
-    return items or None
 
 
 _IB_SYSFS = "/sys/class/infiniband"
