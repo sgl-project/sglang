@@ -36,7 +36,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                 for num_tokens in (256, 11673, 11674, 16384, 32768):
                     with (
                         patch(
-                            "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_v2_active",
+                            "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
                             return_value=cp_active,
                         ),
                         patch(
@@ -83,7 +83,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
         runner = SimpleNamespace(
             can_replay_locally=lambda **kwargs: True,
             _has_inactive_dp_rank=lambda batch: False,
-            enable_cp_v2_bcg_capture=True,
+            enable_cp_bcg_capture=True,
             enable_lora=False,
         )
         batch = SimpleNamespace(
@@ -122,7 +122,7 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
             )
             with (
                 patch(
-                    "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_v2_active",
+                    "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
                     return_value=True,
                 ),
                 patch(
