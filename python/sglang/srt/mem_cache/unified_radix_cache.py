@@ -1942,7 +1942,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
-    @rank_consensus(same_params=["req_id", "len(new_input_tokens)"])
+    @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
         request: CacheRequestHandle,
