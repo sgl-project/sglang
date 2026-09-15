@@ -196,6 +196,10 @@ class Memory:
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    enable_linker_mla_dedup: A[
+        bool,
+        "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
