@@ -2383,6 +2383,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
+    # Rank-consistent EAGLE draft replay gate. Keep it separate so missing
+    # draft-only state does not disable target verification or draft extend.
+    can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     tbo_split_seq_index: Optional[int] = None
@@ -2436,6 +2439,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    # The draft model can use a different MoE A2A backend than the target.
+    draft_global_num_tokens: Optional[List[int]] = None
+    draft_global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
@@ -3695,6 +3701,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
