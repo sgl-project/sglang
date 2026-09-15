@@ -1699,7 +1699,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             "activation scales or BF16 dispatch output, but the dispatch "
             f"output carried {hidden_states.dtype} without scales."
         )
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "situ")
 
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
