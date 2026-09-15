@@ -1808,10 +1808,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ie = layer_kwargs.get("input_embeds")
                 if ie is None and ie_idx is not None and len(args) > ie_idx:
                     ie = args[ie_idx]
-                if ie is not None:
-                    self.buffer_registry.get_slot("input_embeds").slice_for(
-                        1, static_num_tokens
-                    )[: ie.shape[0]].copy_(ie)
+                if ie is None:
+                    # Otherwise the graph replays the previous batch's embeddings.
+                    input_ids = args[0] if args else layer_kwargs["input_ids"]
+                    ie = self.model_runner.model.get_input_embeddings()(input_ids)
+                self.buffer_registry.get_slot("input_embeds").slice_for(
+                    1, static_num_tokens
+                )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
