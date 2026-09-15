@@ -1,0 +1,172 @@
+name: Close Stale PRs
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only, do not close'
+        type: boolean
+        default: true
+      rules:
+        description: 'Subset of: wip,quota,stale'
+        default: 'wip,quota,stale'
+      max_actions:
+        description: 'Max PRs closed per run'
+        default: '32'
+
+concurrency:
+  group: close-stale-prs
+  cancel-in-progress: false
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  close-stale-prs:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const WIP_DAYS = 21;
+            const QUOTA = 5;
+            const QUOTA_IDLE = 7;
+            const STALE_DAYS = 90;
+
+            const KEEP_LABELS = new Set(['high priority', 'keep-open', 'good first issue']);
+            const WIP_MARKER = /^\s*\[?\s*(wip|do[ _-]?not[ _-]?merge|dnm|draft)\s*\]?/i;
+
+            // Scheduled runs always act; only manual runs can be dry.
+            const DRY = context.eventName !== 'schedule'
+              && String(process.env.DRY_RUN) !== 'false';
+            const RULES = new Set(process.env.RULES.split(',').map(s => s.trim()));
+            const MAX = parseInt(process.env.MAX_ACTIONS, 10);
+
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const idle = ts => Math.floor((Date.now() - new Date(ts)) / 86400000);
+
+            const perms = new Map();
+            async function hasWrite(login) {
+              if (!perms.has(login)) {
+                let ok = false;
+                try {
+                  const r = await github.rest.repos.getCollaboratorPermissionLevel(
+                    { owner, repo, username: login });
+                  ok = ['admin', 'maintain', 'write'].includes(r.data.permission);
+                } catch (e) {}
+                perms.set(login, ok);
+              }
+              return perms.get(login);
+            }
+
+            // Search would cap at 1000 results and truncate a 4000+ PR backlog.
+            const prs = await github.paginate(github.rest.pulls.list,
+              { owner, repo, state: 'open', sort: 'updated', direction: 'asc', per_page: 100 });
+
+            const counts = new Map();
+            const freshest = new Map();
+            for (const pr of prs) {
+              const l = pr.user.login;
+              counts.set(l, (counts.get(l) || 0) + 1);
+              freshest.set(l, Math.min(freshest.get(l) ?? Infinity, idle(pr.updated_at)));
+            }
+            const overQuota = new Set();
+            if (RULES.has('quota')) {
+              for (const [l, n] of counts) {
+                if (n > QUOTA && freshest.get(l) >= QUOTA_IDLE && !(await hasWrite(l))) {
+                  overQuota.add(l);
+                }
+              }
+            }
+
+            function classify(pr) {
+              const d = idle(pr.updated_at);
+              const n = counts.get(pr.user.login);
+              if (overQuota.has(pr.user.login)) {
+                return { rule: 'quota', short: `quota: ${n} open PRs`,
+                  reason: `you have ${n} PRs open and none updated in ${QUOTA_IDLE} days,`
+                        + ` over our soft cap of ${QUOTA} for idle PRs` };
+              }
+              if (RULES.has('wip') && (WIP_MARKER.test(pr.title) || pr.draft) && d > WIP_DAYS) {
+                const w = WIP_MARKER.test(pr.title) ? 'marked WIP' : 'still a draft';
+                return { rule: 'wip', short: `${w}, ${d}d`,
+                  reason: `it is ${w} and has not been updated in ${d} days` };
+              }
+              if (RULES.has('stale') && d > STALE_DAYS) {
+                return { rule: 'stale', short: `stale, ${d}d`,
+                  reason: `it has had no updates in ${d} days` };
+              }
+              return null;
+            }
+
+            function body(pr, v) {
+              return [
+                `Thanks @${pr.user.login}. Closing this because ${v.reason}.`,
+                '',
+                v.rule === 'quota'
+                  ? 'Reopen the two or three you most want reviewed - a short active set'
+                    + ' moves faster than a long idle one.'
+                  : 'Reopen it if the work is still relevant.',
+                '',
+                'Some directories moved recently, so an older branch may need retargeting:',
+                '`sgl-kernel/` -> `python/sglang/kernels/aot/`, `python/sglang/jit_kernel/`',
+                '-> `python/sglang/kernels/jit/`, `docs/` -> `docs/docs/` (`.mdx`),',
+                '`bench_serving.py` -> `benchmark/serving.py`, `test/srt/` -> `test/registered/`.',
+              ].join('\n');
+            }
+
+            const closed = [];
+            let approved = 0;
+            for (const pr of prs) {
+              if (closed.length >= MAX) break;
+              if (pr.labels.some(l => KEEP_LABELS.has(l.name))) continue;
+              if (await hasWrite(pr.user.login)) continue;
+              const v = classify(pr);
+              if (!v) continue;
+
+              // An approving review means it is blocked on us, not the author.
+              const revs = await github.paginate(github.rest.pulls.listReviews,
+                { owner, repo, pull_number: pr.number, per_page: 100 });
+              if (revs.some(r => r.state === 'APPROVED')) { approved++; continue; }
+
+              if (!DRY) {
+                await github.rest.issues.createComment(
+                  { owner, repo, issue_number: pr.number, body: body(pr, v) });
+                await github.rest.pulls.update(
+                  { owner, repo, pull_number: pr.number, state: 'closed' });
+              }
+              closed.push({ pr, ...v });
+              core.info(`${DRY ? 'would close' : 'closed'} #${pr.number} [${v.rule}]`);
+            }
+
+            const tally = {};
+            for (const c of closed) tally[c.rule] = (tally[c.rule] || 0) + 1;
+            core.summary.addHeading(DRY ? 'Stale PR sweep (dry run)' : 'Stale PR sweep', 2);
+            core.summary.addRaw(
+              `Scanned ${prs.length}. ${DRY ? 'Would close' : 'Closed'} ${closed.length}`
+              + `${closed.length >= MAX ? ` (capped at ${MAX})` : ''}: `
+              + `${Object.entries(tally).map(([k, v]) => `${k}=${v}`).join(', ') || 'none'}. `
+              + `Left open despite matching: ${approved} (approved).\n\n`);
+            if (closed.length) {
+              core.summary.addTable([
+                ['reason', 'author', 'title', 'link'].map(data => ({ data, header: true })),
+                ...closed.map(c => [c.short, `@${c.pr.user.login}`,
+                  c.pr.title.slice(0, 80), `<a href="${c.pr.html_url}">#${c.pr.number}</a>`]),
+              ]);
+              if (!DRY) {
+                core.summary.addRaw('\nUndo this run:\n');
+                core.summary.addCodeBlock(
+                  `for n in ${closed.map(c => c.pr.number).join(' ')}; do`
+                  + ` gh pr reopen $n --repo ${owner}/${repo}; done`, 'bash');
+              }
+            }
+            await core.summary.write();
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          RULES: ${{ inputs.rules || vars.STALE_RULES || 'wip,quota,stale' }}
+          MAX_ACTIONS: ${{ inputs.max_actions || vars.STALE_MAX_ACTIONS || '32' }}

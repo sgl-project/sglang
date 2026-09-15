@@ -5,7 +5,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,7 +21,7 @@ _MOCK_MODEL_SERVER_ARGS_NO_CANARY: list[str] = [
     "dummy",
     "--sampling-backend",
     "token_oracle",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
 ]
 
 

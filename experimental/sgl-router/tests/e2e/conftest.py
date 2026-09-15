@@ -2,7 +2,7 @@
 
 Two flavors of fixtures coexist here:
 
-  1. **Session-scoped smoke fixtures** (``sglang_server`` + ``router``) —
+  1. **Session-scoped sanity fixtures** (``sglang_server`` + ``router``) —
      launch ONE SGLang worker + ONE router on fixed ports for the whole
      test session. Used by the lightweight ``test_chat_smoke.py`` /
      ``test_tokenize_smoke.py`` files. These are the cheap "did the
@@ -174,7 +174,7 @@ def build_smoke_router_args(
     tokenizer_path: str,
     sglang_url: str,
 ) -> list[str]:
-    """Build the sgl-router CLI flags the smoke ``router`` fixture launches.
+    """Build the sgl-router CLI flags the single-worker ``router`` fixture launches.
 
     Static single-worker discovery (``--worker-urls``) pointed at the one
     SGLang worker, serving exactly one model.

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -21,16 +21,15 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 if _is_hip:
-    from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
+    from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
 
 
-class DeepseekMLARocmForwardMixin:
-
+class DeepseekMLAFusedRopeRocmForwardMixin:
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
@@ -173,6 +172,7 @@ class DeepseekMLARocmForwardMixin:
         k_input,
         forward_batch,
         zero_allocator,
+        gate=None,
     ):
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -224,6 +224,8 @@ class DeepseekMLARocmForwardMixin:
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output

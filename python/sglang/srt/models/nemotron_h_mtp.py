@@ -21,15 +21,13 @@ from sglang.srt.configs import NemotronHConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -41,7 +39,8 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -74,8 +73,8 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_attention_tp_rank() if _dp_attn else None,
-                tp_size=get_attention_tp_size() if _dp_attn else None,
+                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
+                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -106,7 +105,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 
@@ -148,6 +147,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         self.prev_layer_is_attn = layer_idx > 0 and is_attn_layer(
             _pat[(layer_idx - 1) % len(_pat)]
         )
+        self.layer_communicator.is_last_layer = True
 
         if has_start_projections:
             self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -159,8 +159,8 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_attention_tp_rank() if _dp_attn else None,
-                tp_size=get_attention_tp_size() if _dp_attn else None,
+                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
+                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -191,7 +191,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
             if is_dp_attention_enabled():
-                hidden_states = get_attention_tp_group().all_gather(
+                hidden_states = get_parallel().attn_tp_group.all_gather(
                     hidden_states, dim=-1
                 )
 
@@ -233,9 +233,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", 1)
-        assert (
-            self.num_mtp_layers == 1
-        ), "Only one MTP layer is supported for NemotronH-MTP"
+        assert self.num_mtp_layers == 1, (
+            "Only one MTP layer is supported for NemotronH-MTP"
+        )
 
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
@@ -282,21 +282,36 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.embed_tokens is not None
-        ), "embed_tokens not initialized - must be shared from target model"
+        assert self.embed_tokens is not None, (
+            "embed_tokens not initialized - must be shared from target model"
+        )
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                assert inputs_embeds is not None
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                inputs_embeds[last_indices] = self.get_input_embeddings(
+                    input_ids[last_indices]
+                )
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings(input_ids)
 
+        hidden_states = forward_batch.spec_info.hidden_states
         residual = None
 
         for i in range(self.pattern_len):
@@ -310,6 +325,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
 
 class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+    hf_to_sglang_mapper = NemotronHForCausalLM.hf_to_sglang_mapper | WeightsMapper(
+        orig_to_new_prefix={"language_model.mtp.": "mtp."}
+    )
+
     def __init__(
         self,
         config: NemotronHConfig,
@@ -320,6 +339,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         config = config.get_mtp_config()
         self.config = config
         self.quant_config = quant_config
+        self._owns_lm_head = False
         # Required for parent's load_weights
         self.pp_group = get_pp_group()
 
@@ -340,7 +360,7 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
             self.config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -354,11 +374,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = forward_batch.spec_info.hidden_states
-
         hidden_states = self.model(
             input_ids,
-            hidden_states,
+            positions,
             forward_batch,
             input_embeds,
         )
@@ -369,7 +387,58 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        super().load_weights(weights, is_mtp=True)
+        has_mtp_layers = False
+        has_target_layers = False
+        head_weights = set()
+
+        def normalized_weights():
+            nonlocal has_mtp_layers, has_target_layers
+            for name, weight in weights:
+                name = name.removeprefix("language_model.")
+                has_mtp_layers |= name.startswith("mtp.layers.")
+                has_target_layers |= name.startswith(
+                    ("backbone.layers.", "model.layers.")
+                )
+                if name.startswith("lm_head."):
+                    head_weights.add(name)
+                yield name, weight
+
+        # Inspect names while streaming: buffering a full target checkpoint here
+        # would double its host-memory footprint during embedded MTP loading.
+        super().load_weights(normalized_weights(), is_mtp=True)
+        self._owns_lm_head = bool(
+            has_mtp_layers and not has_target_layers and head_weights
+        )
+        if self._owns_lm_head:
+            expected = {
+                name
+                for name, _ in self.named_parameters()
+                if name.startswith("lm_head.")
+            }
+            if "lm_head.input_scale" in expected and isinstance(
+                self.lm_head.quant_method, ModelOptNvFp4A16LinearMethod
+            ):
+                # NVFP4A16 accepts this loader placeholder but never uses it.
+                expected.remove("lm_head.input_scale")
+            missing = (expected | {"lm_head.weight"}) - head_weights
+            if missing:
+                raise ValueError(
+                    f"Incomplete standalone MTP lm_head: missing {sorted(missing)}"
+                )
+
+    def set_embed_and_head(self, embed, head):
+        if not self._owns_lm_head:
+            return super().set_embed_and_head(embed, head)
+        # Standalone MTP checkpoints can supply a differently quantized head.
+        # Share only the input embeddings; retain the entire loaded head module.
+        self.model.embed_tokens.weight = embed
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:
+        if self.config.tie_word_embeddings or self._owns_lm_head:
+            return
+        self.lm_head = target_lm_head
 
 
 EntryClass = [NemotronHForCausalLMMTP]

@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=165, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
@@ -52,9 +52,9 @@ def test_update_weights_from_tensor(tp_size):
     torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
-    assert (
-        memory_after <= memory_before + 1024
-    ), f"Memory leak detected: {memory_after - memory_before} bytes"
+    assert memory_after <= memory_before + 1024, (
+        f"Memory leak detected: {memory_after - memory_before} bytes"
+    )
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
@@ -96,9 +96,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_custom(self):
-        custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
-        )
+        custom_loader_name = "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct"
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             custom_weight_loader=[custom_loader_name],
@@ -285,9 +283,9 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
 
 def _check_param(engine, param_name, expect_values):
     actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-    assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.002
-    ), f"{actual_values=}"
+    assert torch.allclose(actual_values, torch.tensor(expect_values), atol=0.002), (
+        f"{actual_values=}"
+    )
 
 
 if __name__ == "__main__":

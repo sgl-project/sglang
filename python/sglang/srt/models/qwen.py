@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -41,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -73,8 +73,7 @@ class QWenMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -99,7 +98,7 @@ class QWenAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
+        tensor_model_parallel_world_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tensor_model_parallel_world_size == 0
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
@@ -337,7 +336,10 @@ class QWenLMHeadModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                temp_name = name.replace(weight_name, param_name)
+                if temp_name not in params_dict:
+                    continue
+                name = temp_name
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -348,6 +350,9 @@ class QWenLMHeadModel(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip visual encoder weights (e.g. Qwen-VL-Chat transformer.visual.*)
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

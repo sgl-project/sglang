@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 # CI registration
 register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-small")
+# Backend-specific: the span assertions require PREFILL_FORWARD/DECODE_FORWARD
+# to be emitted from the scheduler forward path, which ROCm reaches through its
+# own attention backend and graph replay.
 register_amd_ci(est_time=113, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -551,6 +554,40 @@ class TestTraceEngine(CustomTestCase):
             )
         finally:
             engine.shutdown()
+
+
+class TestTraceServerAsync(TestTraceServer):
+    """Async tracing variant — same server setup with SGLANG_TRACE_ASYNC=1."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.collector = LightweightOtlpCollector()
+        cls.collector.start()
+        time.sleep(0.2)
+
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-trace",
+                "--otlp-traces-endpoint",
+                "127.0.0.1:4317",
+            ],
+            env={"SGLANG_TRACE_ASYNC": "1"},
+        )
+
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
+        assert response.status_code == 200
+
+        cls.collector.clear()
+
+    # Only run trace_level_3 — the most comprehensive check.
+    test_trace_level_0 = None
+    test_trace_level_1 = None
+    test_trace_level_2 = None
+    test_batch_request = None
+    test_parallel_sample = None
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
@@ -31,11 +31,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
-    from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
+    from sglang.kernels.ops.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 
 class QuarkW8A8FP8MoE(QuarkMoEScheme):
-
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.is_static_input_scheme: bool = False
         self.input_qscheme = None
@@ -135,9 +134,9 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
 
         # INPUT_SCALES
         if self.is_static_input_scheme:
-            assert (
-                self.input_qscheme == "per_tensor"
-            ), "Only per-tensor quantization is supported for static input scales"
+            assert self.input_qscheme == "per_tensor", (
+                "Only per-tensor quantization is supported for static input scales"
+            )
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )

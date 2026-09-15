@@ -3,50 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/models/vision.py
 
-from abc import ABC, abstractmethod
-from typing import Generic, TypeVar
-
 import torch
-from transformers import PretrainedConfig
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-_C = TypeVar("_C", bound=PretrainedConfig)
-
-
-class VisionEncoderInfo(ABC, Generic[_C]):
-
-    def __init__(self, vision_config: _C) -> None:
-        super().__init__()
-
-        self.vision_config = vision_config
-
-    @abstractmethod
-    def get_num_image_tokens(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_max_image_tokens(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_image_size(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_patch_size(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_patch_grid_length(self) -> int:
-        raise NotImplementedError
 
 
 def resolve_visual_encoder_outputs(

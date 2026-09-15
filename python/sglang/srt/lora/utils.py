@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -6,6 +7,29 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+logger = logging.getLogger(__name__)
+
+
+def warn_if_adapter_targets_embeddings(
+    lora_name: str,
+    embedding_layer_names: Iterable[str],
+    speculative_algorithm: Optional[str],
+) -> None:
+    """Warn once when an adapter carries embedding weights under EAGLE spec."""
+    if speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        return
+    modules = sorted(embedding_layer_names)
+    if not modules:
+        return
+    logger.warning(
+        "LoRA adapter '%s' targets embedding modules (%s) while EAGLE-family "
+        "speculative decoding is enabled. The shared draft consumes their "
+        "base weights, so those deltas do not influence drafting and may "
+        "reduce the accept rate. Outputs are unaffected.",
+        lora_name,
+        ", ".join(modules),
+    )
 
 
 @dataclass
@@ -124,91 +148,114 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
+        return get_default_hidden_dim(
+            module_name, config, layer_idx, lora_added_vocab_size
         )
-        if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
-            )
-        elif module_name == "o_proj":
-            o_head_dim = getattr(config, "v_head_dim", None) or head_dim
-            return (
-                o_head_dim * config.num_attention_heads,
-                config.hidden_size,
-            )
-        elif module_name == "gate_up_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
-            return config.hidden_size, inter * 2
-        elif module_name == "down_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
-            return inter, config.hidden_size
-        elif module_name == "fused_qkv_a_proj_with_mqa":
-            q_lora_rank = getattr(config, "q_lora_rank", None) or 0
-            kv_lora_rank = config.kv_lora_rank
-            qk_rope_head_dim = config.qk_rope_head_dim
-            return (
-                config.hidden_size,
-                q_lora_rank + kv_lora_rank + qk_rope_head_dim,
-            )
-        elif module_name == "q_b_proj":
+
+
+def get_default_hidden_dim(
+    module_name: str,
+    config: AutoConfig,
+    layer_idx: int,
+    lora_added_vocab_size: int = 0,
+) -> Tuple[int]:
+    """
+    Config-driven LoRA input/output dims for a module, assuming uniform
+    attention geometry across layers.
+
+    This is the fallback used when a model does not define ``get_hidden_dim``.
+    Models with per-layer geometry (e.g. Laguna's per-layer attention head
+    counts) should define ``get_hidden_dim`` on the model class, override the
+    layer-dependent modules there, and delegate the rest back to this helper
+    rather than re-deriving every branch.
+    """
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    if module_name == "qkv_proj":
+        return config.hidden_size, head_dim * (
+            config.num_attention_heads + config.num_key_value_heads * 2
+        )
+    elif module_name == "o_proj":
+        o_head_dim = getattr(config, "v_head_dim", None) or head_dim
+        return (
+            o_head_dim * config.num_attention_heads,
+            config.hidden_size,
+        )
+    elif module_name == "gate_up_proj":
+        inter = config.intermediate_size
+        first_k = getattr(config, "first_k_dense_replace", None)
+        moe_freq = getattr(config, "moe_layer_freq", 1)
+        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+            moe_inter = getattr(config, "moe_intermediate_size", None)
+            n_shared = getattr(config, "n_shared_experts", None)
+            if moe_inter is not None and n_shared is not None:
+                inter = moe_inter * n_shared
+        return config.hidden_size, inter * 2
+    elif module_name == "down_proj":
+        inter = config.intermediate_size
+        first_k = getattr(config, "first_k_dense_replace", None)
+        moe_freq = getattr(config, "moe_layer_freq", 1)
+        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+            moe_inter = getattr(config, "moe_intermediate_size", None)
+            n_shared = getattr(config, "n_shared_experts", None)
+            if moe_inter is not None and n_shared is not None:
+                inter = moe_inter * n_shared
+        return inter, config.hidden_size
+    elif module_name == "fused_qkv_a_proj_with_mqa":
+        q_lora_rank = getattr(config, "q_lora_rank", None) or 0
+        kv_lora_rank = config.kv_lora_rank
+        qk_rope_head_dim = config.qk_rope_head_dim
+        return (
+            config.hidden_size,
+            q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+        )
+    elif module_name == "q_b_proj":
+        return (
+            config.q_lora_rank,
+            config.num_attention_heads
+            * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+        )
+    elif module_name == "kv_b_proj":
+        return (
+            config.kv_lora_rank,
+            config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+        )
+    elif module_name in DSA_INDEXER_LORA_NAMES:
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_head_dim,
+            get_dsa_index_n_heads,
+        )
+
+        if module_name == "indexer.wq_b":
             return (
                 config.q_lora_rank,
-                config.num_attention_heads
-                * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+                get_dsa_index_n_heads(config) * get_dsa_index_head_dim(config),
             )
-        elif module_name == "kv_b_proj":
-            return (
-                config.kv_lora_rank,
-                config.num_attention_heads
-                * (config.qk_nope_head_dim + config.v_head_dim),
-            )
-        elif module_name == "gate_up_proj_moe":
-            moe_inter = (
-                getattr(config, "moe_intermediate_size", None)
-                or config.intermediate_size
-            )
-            return config.hidden_size, moe_inter * 2
-        elif module_name == "down_proj_moe":
-            moe_inter = (
-                getattr(config, "moe_intermediate_size", None)
-                or config.intermediate_size
-            )
-            return moe_inter, config.hidden_size
-        elif module_name == "embed_tokens":
-            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.vocab_size + lora_added_vocab_size, config.hidden_size
-        elif module_name == "lm_head":
-            # For lm_head: input is hidden_size, output is vocab_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.hidden_size, config.vocab_size + lora_added_vocab_size
-        else:
-            raise NotImplementedError(
-                "get_hidden_dim not implemented for " + module_name
-            )
+        elif module_name == "indexer.wk":
+            return config.hidden_size, get_dsa_index_head_dim(config)
+        else:  # indexer.weights_proj
+            return config.hidden_size, get_dsa_index_n_heads(config)
+    elif module_name == "gate_up_proj_moe":
+        moe_inter = (
+            getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+        )
+        return config.hidden_size, moe_inter * 2
+    elif module_name == "down_proj_moe":
+        moe_inter = (
+            getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+        )
+        return moe_inter, config.hidden_size
+    elif module_name == "embed_tokens":
+        # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
+        # if contain extra tokens will be added; otherwise is 0.
+        return config.vocab_size + lora_added_vocab_size, config.hidden_size
+    elif module_name == "lm_head":
+        # For lm_head: input is hidden_size, output is vocab_size
+        # if contain extra tokens will be added; otherwise is 0.
+        return config.hidden_size, config.vocab_size + lora_added_vocab_size
+    else:
+        raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
 
 def get_normalized_target_modules(
@@ -248,6 +295,12 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        # DSA indexer projections are qualified with their parent module name
+        # because the bare leaf names collide with unrelated modules in other
+        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
+        "wq_b": "indexer.wq_b",
+        "wk": "indexer.wk",
+        "weights_proj": "indexer.weights_proj",
     }
 
     result = set()
@@ -272,6 +325,7 @@ def get_stacked_multiply(
         "in_proj_qkvz": 4,  # GDN packed input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "gate_up_proj_shared_moe": 2,
         "in_proj": 2,
         "fused_qkv_a_proj_with_mqa": 2,
     }
@@ -301,19 +355,50 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "o_proj",
+    "out_proj",
+    "down_proj",
+    "down_proj_moe",
+    "down_proj_shared_moe",
+    "wo_ud",
+]
+DSA_INDEXER_LORA_NAMES = frozenset(
+    {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
+)
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    *DSA_INDEXER_LORA_NAMES,
 ]
+# Attention-projection LoRA modules shard on the attention-TP group, which
+# under `--enable-dp-attention` is `attn_tp_size = tp_size // dp_size` rather
+# than the outer TP size. in_proj / in_proj_qkvz (linear-attention hybrids)
+# belong here too: their layers are built on the attn-TP group (mamba.py and
+# qwen3_5.py take tp_size/tp_rank from attn_tp when dp attention is enabled).
+ATTN_TP_LORA_MODULE_NAMES = frozenset(
+    {
+        "qkv_proj",
+        "qkvr",
+        "q_b_proj",
+        "kv_b_proj",
+        "o_proj",
+        "out_proj",
+        "wo_ud",
+        "in_proj",
+        "in_proj_qkvz",
+    }
+)
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
 _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
         "qkv_proj",
+        "qkvr",
         "o_proj",
+        "wo_ud",
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
@@ -328,6 +413,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "q_b_proj",
         "kv_b_proj",
     }
+    | DSA_INDEXER_LORA_NAMES
 )
 
 
@@ -347,6 +433,9 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
     )
 
     raw_names: set = set()
+    dsa_indexer_leaf_names = {
+        target_name.split(".")[-1] for target_name in DSA_INDEXER_LORA_NAMES
+    }
     for name, module in model.named_modules():
         if isinstance(module, FusedMoE):
             raw_names.add("gate_up_proj")
@@ -356,7 +445,18 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
         elif isinstance(module, VocabParallelEmbedding):
             raw_names.add("embed_tokens")
         elif isinstance(module, LinearBase):
-            raw_names.add(name.split(".")[-1])
+            parts = name.split(".")
+            leaf_name = parts[-1]
+            parent_qualified_name = ".".join(parts[-2:])
+            if parent_qualified_name in DSA_INDEXER_LORA_NAMES:
+                raw_names.add(parent_qualified_name)
+            elif leaf_name in dsa_indexer_leaf_names:
+                # Bare DSA indexer leaf names are ambiguous across model
+                # families. Only auto-detect them when the actual module path
+                # proves they are under an `indexer` parent.
+                continue
+            else:
+                raw_names.add(leaf_name)
 
     normalized = get_normalized_target_modules(raw_names)
     result = normalized & _KNOWN_LORA_TARGET_MODULES
@@ -387,6 +487,19 @@ def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
     if shard_indices is not None:
         return shard_indices.num_org_elements
     return output_dim
+
+
+def get_batch_token_counts(forward_batch: ForwardBatch) -> Tuple[int, int]:
+    """(total tokens, max tokens per request) for LoRA segment math."""
+    mode = forward_batch.forward_mode
+    if mode.is_decode():
+        return forward_batch.batch_size, 1
+    if mode.is_target_verify():
+        num_tokens_per_req = forward_batch.spec_info.draft_token_num
+        return forward_batch.batch_size * num_tokens_per_req, num_tokens_per_req
+    if mode.is_extend():
+        return forward_batch.extend_num_tokens, max(forward_batch.extend_seq_lens_cpu)
+    raise ValueError(f"Unsupported forward mode: {mode}")
 
 
 def generate_sequence_lengths(
@@ -504,8 +617,8 @@ def build_lm_head_pass_segments(
     """
     Precompute per-pass segment info for lm_head LoRA logprobs processing.
 
-    When LogitsProcessor uses chunked logprobs processing
-    (process_input_logprobs_by_chunk), pruned hidden states are split into
+    When InputLogprobProcessor uses chunked logprobs processing
+    (_forward_by_chunk), pruned hidden states are split into
     fixed-size passes.  Each pass needs its own segmentation
     (weight_indices, seg_lens) so that lm_head LoRA operates on the
     correct adapter assignments per pass.

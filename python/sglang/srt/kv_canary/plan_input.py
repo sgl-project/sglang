@@ -41,6 +41,10 @@ class PlanInput:
     extend_seq_lens: torch.Tensor
     req_to_verify_expected_tokens_valid_lens: torch.Tensor
 
+    @staticmethod
+    def allocation_bytes(bs_capacity: int) -> int:
+        return 4 * bs_capacity * torch.int64.itemsize
+
     def zero_(self) -> None:
         self.req_pool_indices.zero_()
         self.prefix_lens.zero_()
@@ -118,7 +122,7 @@ def _extract_prefix_lens_and_extend_seq_lens(
         out_prefix_lens.copy_(forward_batch.seq_lens[:bs].to(torch.int64))
         out_extend_seq_lens.fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
-        # Evidence: EagleDraftWorkerBase.prepare_for_draft_extend bumps
+        # Evidence: eagle_worker_common.prepare_for_draft_extend bumps
         # seq_lens by num_draft_tokens. FlashAttentionBackend.init_forward_metadata reads the
         # draft-extend-v2 query length from spec_info.extend_seq_lens_tensor when available.
         # CUDA-graph replay passes extend_seq_lens but omits extend_prefix_lens, so derive the

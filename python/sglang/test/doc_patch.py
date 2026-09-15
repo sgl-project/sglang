@@ -52,7 +52,7 @@ def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
         f"--max-running-requests {DEFAULT_MAX_RUNNING_REQUESTS} "
         f"--max-total-tokens {DEFAULT_MAX_TOTAL_TOKENS} "
         f"--disable-cuda-graph "
-        f"--cuda-graph-max-bs 4"
+        f"--cuda-graph-max-bs-decode 4"
     )
 
     full_command = f"{command} --port {port} {extra_flags}"

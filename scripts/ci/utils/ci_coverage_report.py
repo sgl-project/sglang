@@ -32,11 +32,11 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # the report -- if the assert below fires, add the new backend name here in
 # the right display slot. Order isn't alphabetical: CUDA/AMD/NPU/CPU lead
 # (highest test volume historically), then accelerators that have been
-# wired into the registry more recently (XPU, MUSA).
-BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA")
-assert set(BACKEND_DISPLAY_ORDER) == {
-    b.name for b in HWBackend
-}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+# wired into the registry more recently (XPU, MUSA, MLX).
+BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
+assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
+    "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+)
 
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage
@@ -64,9 +64,48 @@ _MM_GEN_SUBDIR_BACKENDS = {
     "server/musa": ("MUSA",),
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
-    "unit": ("CUDA",),
+    # unit/ are portable CPU-style unit tests. The `unit` suite also runs on
+    # ROCm (both 7.0.0 and 7.2.0), as a step of multimodal-gen-test-1-gpu-amd
+    # part 0, so they are AMD-covered too, not CUDA-only.
+    "unit": ("CUDA", "AMD"),
     "cli": ("CUDA",),
     "manual": ("CUDA",),
+    # Standalone server/CLI single-file tests (restructured out of server/).
+    # Run on CUDA CI; AMD parity for these standalone files is TBD, so
+    # CUDA-only for now (previously matched no rule and were dropped entirely).
+    "single_test_file": ("CUDA",),
+    "single_test_file/component_accuracy": ("CUDA",),
+    # Nested unit suites are enabled on AMD incrementally, per file (only the
+    # files that pass on ROCm as-is; see _MM_GEN_FILE_BACKENDS below and
+    # gpu_cases _AMD_READY_NESTED_UNIT_TESTS). The subdir default stays the
+    # pre-existing CUDA tag for files not yet enabled on AMD (follow-up PRs
+    # move each file to AMD as it lands).
+    "unit/realtime": ("CUDA",),
+    "unit/sana_wm": ("CUDA",),
+    "unit/progressive_resolution": ("CUDA",),
+    # musa-named unit layer kernels.
+    "unit/musa/layers": ("MUSA",),
+}
+
+# Per-file backend overrides (checked before the subdir rule). Used to enable
+# individual nested unit/ files on AMD incrementally, as each is verified to
+# pass on ROCm. The CUDA lane does not collect these nested files (see
+# gpu_cases._discover_unit_tests), so they are AMD-only here.
+_MM_GEN_FILE_BACKENDS = {
+    "unit/realtime/test_causal_denoising.py": ("AMD",),
+    "unit/realtime/test_output_materialization.py": ("AMD",),
+    "unit/realtime/test_realtime_consistency_harness.py": ("AMD",),
+    "unit/realtime/test_realtime_control_signals.py": ("AMD",),
+    "unit/realtime/test_realtime_output_transport.py": ("AMD",),
+    "unit/realtime/test_realtime_vae.py": ("AMD",),
+    "unit/sana_wm/test_streaming_cached.py": ("AMD",),
+    "unit/sana_wm/test_streaming_stage.py": ("AMD",),
+    "unit/sana_wm/test_streaming_vae.py": ("AMD",),
+    # Enabled with small test-harness stub fixes.
+    "unit/progressive_resolution/test_progressive.py": ("AMD",),
+    "unit/sana_wm/test_streaming_realtime_path.py": ("AMD",),
+    # Stub gap already fixed upstream; only needs enabling here.
+    "unit/realtime/test_lingbot_causal_denoising.py": ("AMD",),
 }
 
 # Filenames that match `test_*.py` by convention but contain no real tests
@@ -132,11 +171,14 @@ def collect_multimodal_gen_tests(
         stem_tokens = set(filename_only[:-3].split("_"))
         nightly = "nightly" in stem_tokens
 
-        backends: tuple[str, ...] = ()
-        for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
-            if token in stem_tokens:
-                backends = override
-                break
+        # Precedence: explicit per-file override, then filename token, then
+        # the subdir default.
+        backends: tuple[str, ...] = _MM_GEN_FILE_BACKENDS.get(rel.as_posix(), ())
+        if not backends:
+            for token, override in _MM_GEN_FILENAME_BACKEND_TOKENS.items():
+                if token in stem_tokens:
+                    backends = override
+                    break
         if not backends:
             backends = _MM_GEN_SUBDIR_BACKENDS.get(subdir, ())
 

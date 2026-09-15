@@ -12,6 +12,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pprint
 from collections import Counter
@@ -22,7 +23,10 @@ from typing import Any, Optional, Sequence, Union
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -35,7 +39,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-from sglang.multimodal_gen.utils import align_to
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
@@ -43,16 +46,21 @@ logger = init_logger(__name__)
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 
+def _align_to(value: int, alignment: int) -> int:
+    return int(math.ceil(value / alignment) * alignment)
+
+
 @dataclass
 class BatchMetricsWindow:
     """Counters accumulated between dynamic batching metric logs.
 
-    `total_capacity` uses each dispatch's effective admission cap, so
-    utilization reflects model/config limits instead of only the user max.
+    `total_outputs` and `total_capacity` use output slots, so utilization
+    reflects model/config limits even when one request asks for many outputs.
     """
 
     dispatches: int = 0
     total_requests: int = 0
+    total_outputs: int = 0
     total_capacity: int = 0
     merged_dispatches: int = 0
     full_dispatches: int = 0
@@ -85,6 +93,7 @@ class Req:
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
+    preprocessed_video: torch.Tensor | None = None
 
     output_file_ext: str | None = None
     # Primary encoder embeddings
@@ -102,6 +111,10 @@ class Req:
 
     pooled_embeds: list[torch.Tensor] = field(default_factory=list)
     neg_pooled_embeds: list[torch.Tensor] = field(default_factory=list)
+
+    # GLM-Image autoregressive prior tokens
+    prior_token_id: torch.Tensor | None = None
+    prior_token_image_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Additional text-related parameters
     max_sequence_length: int | None = None
@@ -135,6 +148,9 @@ class Req:
 
     # Audio Parameters
     generate_audio: bool = True
+
+    # Action Latents (Cosmos3 action-conditioned generation)
+    action_latents: torch.Tensor | None = None
 
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
@@ -198,6 +214,7 @@ class Req:
 
     # stage logging
     metrics: Optional[RequestMetrics] = None
+    usage: dict[str, Any] | None = None
 
     # tracing context (TraceReqContext or TraceNullContext)
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
@@ -215,6 +232,7 @@ class Req:
     realtime_output_pacing: bool = False
     realtime_causal_sink_size: int | None = None
     realtime_causal_kv_cache_num_frames: int | None = None
+    realtime_causal_kv_sample_tokens: int | None = None
     # return websocket-friendly raw RGB frame bytes instead of rwa tensors
     return_raw_frames: bool = False
 
@@ -315,9 +333,11 @@ class Req:
     @property
     def resolution_key(self) -> str | None:
         """Return the batching config resolution key, e.g. "1024x1024"."""
-        if self.width is None or self.height is None:
+        width = getattr(self, "width", None)
+        height = getattr(self, "height", None)
+        if width is None or height is None:
             return None
-        return f"{int(self.width)}x{int(self.height)}"
+        return f"{int(width)}x{int(height)}"
 
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
@@ -325,6 +345,7 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
+        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
@@ -332,8 +353,43 @@ class Req:
         req.set_as_warmup(warmup_steps)
         return req
 
+    def record_stage_iterations(
+        self,
+        measured_iterations: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        """Record a stage loop against its full default-request work.
+
+        Most stages declare the count as a formula of the step count
+        (``PipelineStage.default_workload_iterations``) and never call this.
+        It is for loops whose length is only known inside them (chunked or
+        block-wise schedules); ``target_iterations`` defaults to scaling the
+        measured count from the probe's steps to the default workload's.
+        """
+        if not self.is_warmup or self.metrics is None:
+            return
+        measured = max(1, int(measured_iterations))
+        if target_iterations is None:
+            measured_request_steps = max(1, int(self.num_inference_steps))
+            target_request_steps = int(
+                self.extra.get(
+                    "warmup_target_num_inference_steps", measured_request_steps
+                )
+            )
+            target_iterations = (
+                measured * max(1, target_request_steps) + measured_request_steps - 1
+            ) // measured_request_steps
+        self.metrics.record_stage_iterations(measured, target_iterations)
+
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            self.do_classifier_free_guidance = False
+            if self.negative_prompt_embeds is None:
+                self.negative_prompt_embeds = []
+            self.metrics = RequestMetrics(request_id=self.request_id)
+            return
+
         # Prefer true_cfg_scale when it is explicitly provided.
         cfg_scale = (
             self.true_cfg_scale
@@ -355,13 +411,29 @@ class Req:
     def log(self, server_args: ServerArgs):
         if self.is_warmup or self.suppress_logs:
             return
+        if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:
+            if not logger.isEnabledFor(logging.DEBUG):
+                return
+            logger.debug(
+                "VLA request: prompt=%s seed=%s steps=%s outputs=%s action=%sx%s "
+                "save_output=%s",
+                _sanitize_for_logging(self.prompt, key_hint="prompt"),
+                self.seed,
+                self.num_inference_steps,
+                self.num_outputs_per_prompt,
+                getattr(self, "action_horizon", None),
+                getattr(self, "action_dim", None),
+                self.save_output,
+            )
+            return
+
         # TODO: in some cases (e.g., TI2I), height and weight might be undecided at this moment
         if self.height:
-            target_height = align_to(self.height, 16)
+            target_height = _align_to(self.height, 16)
         else:
             target_height = -1
         if self.width:
-            target_width = align_to(self.width, 16)
+            target_width = _align_to(self.width, 16)
         else:
             target_width = -1
 
@@ -414,6 +486,10 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    action_pred: torch.Tensor | None = None
+    action_mode: str | None = None
+    action_domain_id: int | None = None
+    action_raw_action_dim: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
@@ -428,6 +504,7 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+    usage: dict[str, Any] | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None

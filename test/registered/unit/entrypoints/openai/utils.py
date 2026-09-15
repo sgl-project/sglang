@@ -20,11 +20,15 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import asyncio
 import json
 from typing import AsyncIterator
 from unittest.mock import Mock
 
+from sglang.srt.entrypoints.openai.protocol import RequestResponseMetadata
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
@@ -38,12 +42,17 @@ if torch is not None:
 
 
 class MockTokenizerManager:
+    # The model id the cases address; /v1/responses validates ``model`` against it.
+    SERVED_MODEL_NAME = "x"
+
     def __init__(self, *, is_multimodal: bool = False):
         self.model_config = Mock(is_multimodal=is_multimodal, context_len=4096)
         self.model_config.get_default_sampling_params.return_value = {}
         self.model_config.hf_config = Mock(
             model_type="llama", architectures=["LlamaForCausalLM"]
         )
+        self.served_model_name = self.SERVED_MODEL_NAME
+        self.lora_registry = None
         self.server_args = Mock(
             enable_cache_report=False,
             reasoning_parser=None,
@@ -52,6 +61,9 @@ class MockTokenizerManager:
             tool_call_parser=None,
             incremental_streaming_output=False,
         )
+        # Stands in for the context's resolved leaves: an override replaces the
+        # field's one live value, the seed stays on server_args.
+        self._config_overrides = {}
         self.tokenizer = Mock()
         self.tokenizer.encode.return_value = [1, 2, 3]
         self.tokenizer.chat_template = None
@@ -59,6 +71,12 @@ class MockTokenizerManager:
         self.num_reserved_tokens = 0
         self.generate_request = Mock()
         self.create_abort_task = Mock()
+
+    def config_value(self, name: str):
+        """The value in effect for one config field."""
+        if name in self._config_overrides:
+            return self._config_overrides[name]
+        return getattr(self.server_args, name)
 
 
 class MockTemplateManager:
@@ -68,9 +86,15 @@ class MockTemplateManager:
         self.completion_template_name = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+    """The serving layer reads its config from the bags, so the fixture
+    publishes one. Idempotent: a caller that already published keeps its own,
+    which is how a test states a value the default record does not carry."""
+    if not get_context().is_config_namespace_published("serving"):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
     return OpenAIServingResponses(
         MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
     )
@@ -107,3 +131,52 @@ def find_completed_event(events: list[str]) -> dict:
         if lines and lines[0] == "event: response.completed":
             return json.loads(lines[1][len("data: ") :])
     raise AssertionError("response.completed event missing from stream")
+
+
+def engine_chunk(text, completion_tokens=1, *, finish=False):
+    return {
+        "text": text,
+        "meta_info": {
+            "id": "rid",
+            "prompt_tokens": 5,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "finish_reason": {"type": "stop"} if finish else None,
+        },
+    }
+
+
+class StreamFixture:
+    """Drives ``responses_stream_generator_non_harmony`` over a chunk list."""
+
+    def __init__(self, serving, request, *, require_reasoning=False):
+        self.serving = serving
+        self.request = request
+        self.require_reasoning = require_reasoning
+        self.request_metadata = RequestResponseMetadata(request_id=request.request_id)
+
+    def run(self, chunks) -> list[str]:
+        async def gen():
+            for ch in chunks:
+                yield ch
+
+        async def collect():
+            return await collect_stream_events(
+                self.serving.responses_stream_generator_non_harmony(
+                    self.request,
+                    sampling_params={},
+                    result_generator=gen(),
+                    model_name="x",
+                    tokenizer=Mock(),
+                    request_metadata=self.request_metadata,
+                    require_reasoning=self.require_reasoning,
+                )
+            )
+
+        return asyncio.run(collect())
+
+    def run_seq(self, chunks) -> list[tuple]:
+        """``run`` plus (event type, payload) pairing, the common assertion shape."""
+        events = self.run(chunks)
+        return list(zip(event_types(events), event_payloads(events)))

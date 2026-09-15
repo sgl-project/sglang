@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -24,6 +23,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -203,7 +203,6 @@ class MoeWNA16Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod()
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
-
             if self.linear_quant_method == "gptq":
                 if self.use_marlin:
                     return GPTQMarlinConfig.from_config(
@@ -386,9 +385,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
@@ -455,7 +454,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 return
 
             device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 

@@ -40,7 +40,7 @@ class BaseTestGptOss(CustomTestCase):
         }[(model_variant, quantization)]
 
         if model_variant == "20b":
-            other_args += ["--cuda-graph-max-bs", "600"]
+            other_args += ["--cuda-graph-max-bs-decode", "600"]
         # Respect SGLANG_USE_AITER if already set, otherwise default to "0" for HIP
         if _is_hip and "SGLANG_USE_AITER" not in os.environ:
             os.environ["SGLANG_USE_AITER"] = "0"
@@ -129,11 +129,12 @@ class BaseTestGptOss(CustomTestCase):
             num_examples=198,
             # use enough threads to allow parallelism
             num_threads=198,
+            # sgl-eval's gpqa defaults to n_repeats=8.
+            repeat=1,
             # TODO 4k is still not enough, we need e.g. 64k token, but that is super slow
             # otherwise a lot of questions are not answered
             max_tokens=4096,
-            # simple-evals by default use 0.5 and is better than 0.0 temperature
-            # but here for reproducibility, we use 0.1
+            # Arbitrary; non-zero so a tier is not scored on one greedy path.
             temperature=0.1,
             reasoning_effort=reasoning_effort,
         )

@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import is_hip, mxfp_supported
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -70,7 +70,7 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 95  # gfx95x, Note: mxfp_supported() is a better check
+        return 95  # gfx95x, Note: is_gfx95_supported() is a better check
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -165,7 +165,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
         - Packed uint8 (2 FP4 values per byte)
         - E8M0 scales (one per 32-element block)
         """
-        if not mxfp_supported():
+        if not is_gfx95_supported():
             platform = "unknown"
             if _is_hip:
                 try:
@@ -185,8 +185,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         if any(fn is None for fn in (dynamic_mxfp4_quant, shuffle_weight, gemm_a4w4)):
             raise RuntimeError(
-                "aiter MXFP4 kernels not available. "
-                "Install aiter with MXFP4 support."
+                "aiter MXFP4 kernels not available. Install aiter with MXFP4 support."
             )
 
         weight_data = layer.weight.data
@@ -217,7 +216,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if not mxfp_supported():
+        if not is_gfx95_supported():
             raise RuntimeError(
                 "MXFP4 inference requires ROCm and MI350+ (gfx95x). "
                 "Current platform not supported."

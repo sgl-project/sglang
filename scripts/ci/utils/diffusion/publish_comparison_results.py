@@ -1,7 +1,7 @@
-"""Publish diffusion comparison results to sgl-project/ci-data repo.
+"""Publish SGLang-Diffusion nightly benchmark results to sgl-project/ci-data-diffusion repo.
 
 Pushes comparison-results.json, dashboard.md, and chart PNG files to the
-ci-data repository for historical tracking. Chart PNGs are stored under
+ci-data-diffusion repository for historical tracking. Chart PNGs are stored under
 diffusion-comparisons/charts/ so they can be referenced via
 raw.githubusercontent URLs in the dashboard markdown (GitHub Step Summary
 blocks data: URIs).
@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -31,6 +32,7 @@ if __package__:
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
+        make_github_request,
         update_branch_ref,
         verify_token_permissions,
     )
@@ -44,13 +46,14 @@ else:
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
+        make_github_request,
         update_branch_ref,
         verify_token_permissions,
     )
 
 # Repository configuration
 REPO_OWNER = "sgl-project"
-REPO_NAME = "ci-data"
+REPO_NAME = "ci-data-diffusion"
 BRANCH = "main"
 STORAGE_PREFIX = "diffusion-comparisons"
 
@@ -76,12 +79,53 @@ def _collect_chart_files(charts_dir: str) -> list[tuple[str, bytes]]:
     return files
 
 
+def _build_run_index(run_target: str, token: str, keep: int = 90) -> bytes:
+    """List the published run files and return an index.json body.
+
+    The site cannot discover these files itself: listing the directory needs
+    the contents API, whose anonymous 60/hour budget is shared per egress IP,
+    so viewers behind a shared proxy get permanent 403s. Publishing a stable
+    index alongside the runs lets the page read everything from
+    raw.githubusercontent.com instead, which is CORS-enabled and unmetered.
+    """
+    names = {os.path.basename(run_target)}
+    try:
+        branch_sha = get_branch_sha(REPO_OWNER, REPO_NAME, BRANCH, token)
+        tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, branch_sha, token)
+        url = (
+            f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+            f"/git/trees/{tree_sha}?recursive=1"
+        )
+        tree = json.loads(make_github_request(url, token))
+        for item in tree.get("tree", []):
+            path = item.get("path", "")
+            base = os.path.basename(path)
+            if (
+                path.startswith(f"{STORAGE_PREFIX}/")
+                and "/" not in path[len(STORAGE_PREFIX) + 1 :]
+                and base.endswith(".json")
+                and base != "index.json"
+            ):
+                names.add(base)
+    except Exception as exc:  # an index is a convenience, never a publish blocker
+        print(f"Warning: could not list existing runs for the index ({exc})")
+
+    # filenames start with the UTC date, so lexical order is chronological
+    recent = sorted(names, reverse=True)[:keep]
+    body = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "prefix": STORAGE_PREFIX,
+        "runs": recent,
+    }
+    return json.dumps(body, indent=2).encode() + b"\n"
+
+
 def publish_comparison(
     results_path: str,
     dashboard_path: str | None = None,
     charts_dir: str | None = None,
 ) -> None:
-    """Publish comparison results, dashboard, and charts to ci-data repo."""
+    """Publish comparison results, dashboard, and charts to ci-data-diffusion repo."""
     token = os.environ.get("GH_PAT_FOR_NIGHTLY_CI_DATA") or os.environ.get(
         "GITHUB_TOKEN"
     )
@@ -109,6 +153,11 @@ def publish_comparison(
     results_target = f"{STORAGE_PREFIX}/{date_prefix}_{run_id}.json"
     with open(results_path, "rb") as f:
         files_to_upload.append((results_target, f.read()))
+
+    # Stable index so the site can enumerate runs without the contents API
+    files_to_upload.append(
+        (f"{STORAGE_PREFIX}/index.json", _build_run_index(results_target, token))
+    )
 
     # Dashboard markdown: always overwrite latest
     if dashboard_path and os.path.exists(dashboard_path):
@@ -196,7 +245,7 @@ def publish_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Publish diffusion comparison results to ci-data"
+        description="Publish SGLang-Diffusion nightly benchmark results to ci-data-diffusion"
     )
     parser.add_argument(
         "--results",

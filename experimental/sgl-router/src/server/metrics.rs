@@ -18,11 +18,12 @@
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
-//! | `sgl_router_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
+//! | `sgl_router_requests_total` | Counter | `route`, `method` |
+//! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
+//! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
-//! | `sgl_router_responses_total` | Counter | `status_code` |
-//! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
+//! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -31,6 +32,14 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_cache_admission_evaluated_total` | Counter | — |
+//! | `sgl_router_cache_admission_rejected_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
+//! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
+//! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -40,26 +49,42 @@
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
+use crate::config::PolicyKind;
+use crate::proxy::sse::StreamEnd;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Chosen to
-/// span 0 → ~1k blocks: blocks are 32–64 tokens each, and our `MAX_CHAT_BODY_BYTES`
-/// cap (1 MiB ≈ 250 k tokens) implies an upper bound around 4–8 k blocks for
-/// a maximum-length context. The `+Inf` bucket catches everything beyond
-/// 1000.
-const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
-    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0,
-];
-
 /// Histogram bucket upper bounds (seconds) for
-/// `sgl_router_request_duration_seconds` and `sgl_router_ttft_seconds`.
-/// Standard latency ladder spanning 5 ms → 30 s; the `+Inf` bucket catches
-/// anything slower (a request that outlives the upstream's own timeouts).
+/// `sgl_router_request_duration_seconds`. Standard latency ladder spanning
+/// 5 ms → 30 s; the `+Inf` bucket catches anything slower (a request that
+/// outlives the upstream's own timeouts).
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for `sgl_router_ttft_seconds`.
+///
+/// From 0.1 s up these edges are IDENTICAL to the SGLang engine's
+/// `sglang:time_to_first_token_seconds` histogram (defined in
+/// `python/sglang/srt/observability/metrics_collector.py`). Matching edges is
+/// what makes a `histogram_quantile` comparison between the router and the
+/// engine meaningful: the quantile interpolates within the same bucket on both
+/// sides, so `quantile(router) - quantile(engine)` reflects real router
+/// overhead rather than grid skew. With mismatched grids the two interpolations
+/// run on different bucket widths and the difference can even go negative — the
+/// router P50 reading *below* the engine P50 despite the router sitting in
+/// front of it.
+///
+/// The four sub-100 ms edges have no engine counterpart (the engine's first
+/// bucket is `[0, 0.1]`, so it cannot resolve a sub-100 ms TTFT at all). They
+/// are router-only headroom: harmless for the comparison (they sit below the
+/// engine's range) while letting the router resolve a genuinely fast TTFT.
+const TTFT_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
+    0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
+    400.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -77,6 +102,39 @@ impl RequestOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Final outcome of a 2xx SSE stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Stream ended without errors.
+    Ok,
+    /// The engine sent a `data: {"error"...}` SSE event.
+    StreamErrorEvent,
+    /// The upstream byte stream failed.
+    UpstreamError,
+    /// The client disconnected before the stream finished.
+    ClientDisconnect,
+}
+
+pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
+    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
+        (false, _, _) => StreamOutcome::UpstreamError,
+        (_, true, _) => StreamOutcome::StreamErrorEvent,
+        (_, _, true) => StreamOutcome::ClientDisconnect,
+        _ => StreamOutcome::Ok,
+    }
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::StreamErrorEvent => "stream_error_event",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientDisconnect => "client_disconnect",
         }
     }
 }
@@ -158,6 +216,23 @@ impl StaleRequestOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PolicySelectionFailureReason {
+    PrefillAdmissionExhausted,
+    CacheCandidatesExhausted,
+    ProposalEmpty,
+}
+
+impl PolicySelectionFailureReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefillAdmissionExhausted => "prefill_admission_exhausted",
+            Self::CacheCandidatesExhausted => "cache_candidates_exhausted",
+            Self::ProposalEmpty => "proposal_empty",
+        }
+    }
+}
+
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
 pub enum ActiveLoadKind {
@@ -178,19 +253,34 @@ impl ActiveLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
-    requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
+    // Edge counters (recorded at the app.rs middleware): intake at entry,
+    // responses at exit. `requests_total - responses_total` = received but
+    // never answered, which `worker_requests_total` (post-dispatch) can't see.
+    requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
+    responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
+    // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
+    // dispatch, so blind to pre-dispatch drops; kept per-worker for the
+    // routing-convergence tests.
+    worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
     // function of `model_id` here — a redundant label. Per-worker `mode` lives
-    // on `requests_total` / the worker gauges instead.
+    // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
-    responses_total: Mutex<HashMap<u16, Arc<AtomicU64>>>,
-    overlap_blocks: Mutex<HashMap<String, Histogram>>,
+    stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    cache_admission_evaluated_total: AtomicU64,
+    cache_admission_rejected_total: AtomicU64,
+    cache_pressure_guard_compared_total: AtomicU64,
+    cache_pressure_guard_override_total: AtomicU64,
+    cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -198,6 +288,30 @@ struct RequestKey {
     worker_url: String,
     model_id: String,
     mode: &'static str,
+    outcome: &'static str,
+}
+
+/// Labels for the edge `requests_total` (intake) counter. `route` is the matched
+/// template (small fixed set), so cardinality is bounded.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeKey {
+    route: String,
+    method: String,
+}
+
+/// Labels for the edge `responses_total` counter: `EdgeKey` + final HTTP status.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeResponseKey {
+    route: String,
+    method: String,
+    status_code: u16,
+}
+
+/// Labels for `sgl_router_stream_outcome_total`.
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+struct StreamOutcomeKey {
+    worker_url: String,
+    model_id: String,
     outcome: &'static str,
 }
 
@@ -224,12 +338,16 @@ struct ActiveLoadKey {
     kind: &'static str,
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct PolicyDecisionKey {
+    policy: String,
+    reason: String,
+}
+
 #[derive(Debug)]
 struct Histogram {
-    /// Bucket upper bounds this histogram observes against (e.g.
-    /// [`OVERLAP_BLOCKS_BUCKETS`] or [`REQUEST_DURATION_BUCKETS`]). Held
-    /// per-instance so a single `Histogram` type backs metrics with
-    /// different bucket ladders.
+    /// Bucket upper bounds this histogram observes against. Held per-instance
+    /// so a single `Histogram` type backs metrics with different bucket ladders.
     bounds: &'static [f64],
     /// One counter per boundary in `bounds`, plus one for `+Inf`. Buckets
     /// are cumulative on render but stored as non-cumulative counts here.
@@ -276,8 +394,25 @@ impl MetricsRegistry {
         Arc::new(Self::default())
     }
 
-    /// Bump `sgl_router_requests_total` for the given worker / model / mode / outcome.
-    pub fn record_request(
+    /// Bump the edge intake counter `requests_total{route,method}`. Called at the
+    /// middleware before worker pick, so it sees pre-dispatch drops.
+    pub fn record_ingress(&self, route: &str, method: &str) {
+        let key = EdgeKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+        };
+        let mut guard = self.requests_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `worker_requests_total`. Recorded after dispatch — see `record_ingress`
+    /// for true intake.
+    pub fn record_worker_request(
         &self,
         worker_url: &str,
         model_id: &str,
@@ -290,22 +425,13 @@ impl MetricsRegistry {
             mode: mode.as_str(),
             outcome: outcome.as_str(),
         };
-        let mut guard = self.requests_total.lock();
+        let mut guard = self.worker_requests_total.lock();
         let counter = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Observe an overlap-blocks count for `sgl_router_overlap_blocks`.
-    pub fn observe_overlap_blocks(&self, model_id: &str, blocks: u64) {
-        let mut guard = self.overlap_blocks.lock();
-        let hist = guard
-            .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(OVERLAP_BLOCKS_BUCKETS));
-        hist.observe(blocks as f64);
     }
 
     /// Observe end-to-end request latency (seconds) for
@@ -332,8 +458,9 @@ impl MetricsRegistry {
     /// the interval from request receipt to the first response chunk arriving
     /// from the upstream worker. Recorded only for successful *streaming*
     /// responses; non-streaming "first token" equals total latency, which
-    /// `sgl_router_request_duration_seconds` already captures. Shares the
-    /// latency bucket ladder ([`REQUEST_DURATION_BUCKETS`]).
+    /// `sgl_router_request_duration_seconds` already captures. Uses
+    /// [`TTFT_BUCKETS`], whose edges align with the engine's TTFT histogram so
+    /// the two are directly comparable in `histogram_quantile`.
     pub fn observe_ttft(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -342,18 +469,38 @@ impl MetricsRegistry {
         let mut guard = self.ttft_seconds.lock();
         let hist = guard
             .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS));
+            .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
     }
 
-    /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Cardinality is bounded by the small set of
-    /// status codes the router returns (2xx success, 4xx client, 5xx
-    /// upstream/proxy, 504 stale-cancel).
-    pub fn record_response(&self, status_code: u16) {
+    /// Record the final outcome of a 2xx stream.
+    pub fn record_stream_outcome(&self, worker_url: &str, model_id: &str, outcome: StreamOutcome) {
+        let key = StreamOutcomeKey {
+            worker_url: worker_url.to_owned(),
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let counter = self
+            .stream_outcome_total
+            .lock()
+            .entry(key)
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the edge counter `responses_total{route,method,status_code}`. Called
+    /// at the middleware, so it captures every outcome — incl. early-exit
+    /// 400/413/503 that the old per-handler site skipped.
+    pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
+        let key = EdgeResponseKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+            status_code,
+        };
         let mut guard = self.responses_total.lock();
         let counter = guard
-            .entry(status_code)
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -409,6 +556,92 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the final Prefill policy decision.
+    pub fn record_policy_decision(&self, policy: &str, reason: &str) {
+        let key = PolicyDecisionKey {
+            policy: policy.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let mut guard = self.policy_decisions_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_policy_selection_failure(
+        &self,
+        policy: PolicyKind,
+        reason: PolicySelectionFailureReason,
+    ) {
+        let key = PolicyDecisionKey {
+            policy: policy.to_string(),
+            reason: reason.as_str().to_owned(),
+        };
+        let mut guard = self.policy_selection_failures_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cache-Aware candidates evaluated by hard admission.
+    pub fn record_cache_admission_evaluations(&self, count: u64) {
+        self.cache_admission_evaluated_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Cache-Aware candidates rejected by hard admission.
+    pub fn record_cache_admission_rejections(&self, count: u64) {
+        self.cache_admission_rejected_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Pressure-guard pairs compared and overridden with complete monitor data.
+    pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
+        self.cache_pressure_guard_compared_total
+            .fetch_add(compared, Ordering::Relaxed);
+        self.cache_pressure_guard_override_total
+            .fetch_add(overrides, Ordering::Relaxed);
+    }
+
+    /// Load source used for a Cache-Aware decision. Benchmarks reject
+    /// `router_local` results to verify that monitor data affected selection.
+    pub fn record_cache_monitor_decision(&self, source: &'static str) {
+        let mut guard = self.cache_monitor_decisions_total.lock();
+        let counter = guard
+            .entry(source)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
+    ///
+    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
+    /// router's chat encoder failed: a chat request (`messages`) on a model with
+    /// a chat encoder that did not yield engine-equivalent ids. That request
+    /// silently fell back to engine-side tokenization, defeating the offload —
+    /// the actionable "offload broken" signal. It stays at ~0 in healthy
+    /// operation and climbs only on a real tokenizer problem; successful
+    /// forwards and expected omissions (tools / multimodal / thinking, whose
+    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
+    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    pub fn record_ingress_tokenize_error(&self, model_id: &str) {
+        let mut guard = self.ingress_tokenize_errors_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render the registry as a Prometheus 0.0.4 exposition-format string
     /// with no live worker snapshot. The per-worker gauges emit only their
     /// HELP/TYPE headers and a zeroed pool-size series. Production scrapes
@@ -424,12 +657,33 @@ impl MetricsRegistry {
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
 
-        // requests_total
+        // requests_total — edge intake (every request, counted before dispatch)
         out.push_str(
-            "# HELP sgl_router_requests_total Total chat-completions requests dispatched to a worker.\n",
+            "# HELP sgl_router_requests_total Total requests received at the router HTTP edge, counted before worker dispatch (true intake).\n",
         );
         out.push_str("# TYPE sgl_router_requests_total counter\n");
         let guard = self.requests_total.lock();
+        let mut entries: Vec<(&EdgeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.route, &a.0.method).cmp(&(&b.0.route, &b.0.method)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_requests_total{{route=\"{}\",method=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // worker_requests_total — per-worker dispatch outcomes (formerly requests_total)
+        out.push_str(
+            "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_requests_total counter\n");
+        let guard = self.worker_requests_total.lock();
         // Sort for stable output — easier for tests.
         let mut entries: Vec<(&RequestKey, u64)> = guard
             .iter()
@@ -445,7 +699,7 @@ impl MetricsRegistry {
         });
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
+                "sgl_router_worker_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
                 escape_label(&key.worker_url),
                 escape_label(&key.model_id),
                 key.mode,
@@ -490,37 +744,51 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // responses_total
-        out.push_str(
-            "# HELP sgl_router_responses_total Chat-completions responses returned to clients, by HTTP status code (recorded after worker dispatch).\n",
-        );
-        out.push_str("# TYPE sgl_router_responses_total counter\n");
-        let guard = self.responses_total.lock();
-        let mut entries: Vec<(u16, u64)> = guard
+        // Final outcomes observed after a 2xx stream's headers are committed.
+        out.push_str("# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n");
+        out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
+        let guard = self.stream_outcome_total.lock();
+        let mut entries: Vec<(&StreamOutcomeKey, u64)> = guard
             .iter()
-            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by_key(|e| e.0);
-        for (status_code, value) in entries {
+        entries.sort();
+        for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_responses_total{{status_code=\"{}\"}} {}\n",
-                status_code, value,
+                "sgl_router_stream_outcome_total{{worker_url=\"{}\",model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                escape_label(&key.model_id),
+                key.outcome,
+                value,
             ));
         }
         drop(guard);
 
-        // overlap_blocks histogram
+        // responses_total — edge, by route/method/status (incl. early-exit 400/413/503)
         out.push_str(
-            "# HELP sgl_router_overlap_blocks Overlap-block count observed at cache-aware-zmq policy selection.\n",
+            "# HELP sgl_router_responses_total Responses returned at the router HTTP edge, by route, method and HTTP status code.\n",
         );
-        out.push_str("# TYPE sgl_router_overlap_blocks histogram\n");
-        let guard = self.overlap_blocks.lock();
-        let mut models: Vec<&String> = guard.keys().collect();
-        models.sort();
-        for model_id in models {
-            let hist = guard.get(model_id).unwrap();
-            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
-            render_histogram(&mut out, "sgl_router_overlap_blocks", &label_body, hist);
+        out.push_str("# TYPE sgl_router_responses_total counter\n");
+        let guard = self.responses_total.lock();
+        let mut entries: Vec<(&EdgeResponseKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| {
+            (&a.0.route, &a.0.method, a.0.status_code).cmp(&(
+                &b.0.route,
+                &b.0.method,
+                b.0.status_code,
+            ))
+        });
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_responses_total{{route=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                key.status_code,
+                value,
+            ));
         }
         drop(guard);
 
@@ -662,6 +930,120 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // policy_decisions_total
+        out.push_str(
+            "# HELP sgl_router_policy_decisions_total Final Prefill policy decisions by policy and bounded reason.\n",
+        );
+        out.push_str("# TYPE sgl_router_policy_decisions_total counter\n");
+        let guard = self.policy_decisions_total.lock();
+        let mut entries: Vec<(&PolicyDecisionKey, u64)> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.policy, &a.0.reason).cmp(&(&b.0.policy, &b.0.reason)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_policy_decisions_total{{policy=\"{}\",reason=\"{}\"}} {}\n",
+                escape_label(&key.policy),
+                escape_label(&key.reason),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // policy_selection_failures_total
+        out.push_str(
+            "# HELP sgl_router_policy_selection_failures_total Failed Prefill policy selections by policy and bounded reason.\n",
+        );
+        out.push_str("# TYPE sgl_router_policy_selection_failures_total counter\n");
+        let guard = self.policy_selection_failures_total.lock();
+        let mut entries: Vec<(&PolicyDecisionKey, u64)> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.policy, &a.0.reason).cmp(&(&b.0.policy, &b.0.reason)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_policy_selection_failures_total{{policy=\"{}\",reason=\"{}\"}} {}\n",
+                escape_label(&key.policy),
+                escape_label(&key.reason),
+                value,
+            ));
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_cache_admission_evaluated_total Cache-Aware candidates evaluated by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_evaluated_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_evaluated_total {}\n",
+            self.cache_admission_evaluated_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_admission_rejected_total Cache-Aware candidates rejected by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_rejected_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_rejected_total {}\n",
+            self.cache_admission_rejected_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_compared_total Complete fresh Cache-Aware candidate pairs evaluated by the pressure guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_compared_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_compared_total {}\n",
+            self.cache_pressure_guard_compared_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_override_total Pressure-guard comparisons whose outcome differs from cache/work ordering without the guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_override_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_override_total {}\n",
+            self.cache_pressure_guard_override_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_monitor_decisions_total Cache-Aware candidate resolutions by actual load source.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_monitor_decisions_total counter\n");
+        let guard = self.cache_monitor_decisions_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(source, value)| (source, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| *entry.0);
+        for (source, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_monitor_decisions_total{{source=\"{}\"}} {}\n",
+                source, value,
+            ));
+        }
+        drop(guard);
+
+        // ingress_tokenize_errors_total
+        out.push_str(
+            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+        );
+        out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
+        let guard = self.ingress_tokenize_errors_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -709,6 +1091,13 @@ fn escape_label(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn assert_metric_line(output: &str, expected: &str) {
+        assert!(
+            output.lines().any(|line| line == expected),
+            "missing metric line `{expected}`; got:\n{output}"
+        );
+    }
+
     #[test]
     fn empty_registry_renders_only_help_lines() {
         let reg = MetricsRegistry::new();
@@ -718,7 +1107,6 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_request_duration_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
-        assert!(out.contains("# TYPE sgl_router_overlap_blocks histogram"));
         assert!(out.contains("# TYPE sgl_router_active_load gauge"));
         assert!(out.contains("# TYPE sgl_router_workers gauge"));
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
@@ -727,6 +1115,8 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_policy_decisions_total counter"));
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -821,21 +1211,116 @@ mod tests {
             out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.05"} 1"#),
             "expected le=0.05 bucket = 1; got:\n{out}",
         );
-        // le=0.25 is cumulative over both observations.
-        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.25"} 2"#));
+        // le=0.2 (an engine-aligned edge) is cumulative over both observations.
+        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
     }
 
     #[test]
-    fn record_response_counts_by_status_code() {
+    fn ttft_buckets_align_with_engine_grid() {
+        // The engine's `sglang:time_to_first_token_seconds` edges from 0.1 s up.
+        // These MUST all appear verbatim in the router's TTFT histogram, else a
+        // `histogram_quantile` comparison silently interpolates on mismatched
+        // grids. The sub-100 ms head (0.005..0.05) is router-only and not
+        // asserted here.
         let reg = MetricsRegistry::new();
-        reg.record_response(200);
-        reg.record_response(200);
-        reg.record_response(502);
-        reg.record_response(504);
+        reg.observe_ttft("m", 0.5);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="200"} 2"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="502"} 1"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="504"} 1"#));
+        for le in [
+            "0.1", "0.2", "0.4", "0.6", "0.8", "1", "2", "4", "6", "8", "10", "20", "40", "60",
+            "80", "100", "200", "400",
+        ] {
+            assert!(
+                out.contains(&format!(
+                    r#"sgl_router_ttft_seconds_bucket{{model_id="m",le="{le}"}}"#
+                )),
+                "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
+            );
+        }
+    }
+
+    #[test]
+    fn stream_outcome_precedence() {
+        use StreamOutcome::*;
+
+        for (transport_ok, saw_error_event, client_disconnect, expected) in [
+            (false, false, false, UpstreamError),
+            (false, false, true, UpstreamError),
+            (false, true, false, UpstreamError),
+            (false, true, true, UpstreamError),
+            (true, false, false, Ok),
+            (true, false, true, ClientDisconnect),
+            (true, true, false, StreamErrorEvent),
+            (true, true, true, StreamErrorEvent),
+        ] {
+            let end = StreamEnd {
+                transport_ok,
+                saw_error_event,
+                client_disconnect,
+            };
+            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn record_stream_outcome_emits_labelled_counter_lines() {
+        let reg = MetricsRegistry::new();
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        let out = reg.render();
+        for expected in [
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+        ] {
+            assert_metric_line(&out, expected);
+        }
+    }
+
+    #[test]
+    fn stream_outcome_absent_until_recorded() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_stream_outcome_total counter"));
+        assert!(
+            !out.contains("sgl_router_stream_outcome_total{"),
+            "no series until an outcome is recorded; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn record_response_counts_by_route_method_status_code() {
+        let reg = MetricsRegistry::new();
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 502);
+        reg.record_response("/v1/chat/completions", "POST", 504);
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="502"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="504"} 1"#
+        ));
+    }
+
+    #[test]
+    fn record_ingress_counts_by_route_method() {
+        let reg = MetricsRegistry::new();
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/models", "GET");
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 2"#
+        ));
+        assert!(out.contains(r#"sgl_router_requests_total{route="/v1/models",method="GET"} 1"#));
     }
 
     #[test]
@@ -889,15 +1374,15 @@ mod tests {
     }
 
     #[test]
-    fn record_request_emits_labelled_counter_line() {
+    fn record_worker_request_emits_labelled_counter_line() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
             RequestOutcome::Success,
         );
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
@@ -905,30 +1390,8 @@ mod tests {
         );
         let out = reg.render();
         assert!(
-            out.contains(r#"sgl_router_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
+            out.contains(r#"sgl_router_worker_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
             "render did not include the expected counter line; got:\n{out}",
-        );
-    }
-
-    #[test]
-    fn observe_overlap_blocks_writes_buckets_and_count() {
-        let reg = MetricsRegistry::new();
-        reg.observe_overlap_blocks("tiny", 3);
-        reg.observe_overlap_blocks("tiny", 9);
-        reg.observe_overlap_blocks("tiny", 50);
-        let out = reg.render();
-        // 3 observations -> count=3, sum=62
-        assert!(out.contains(r#"sgl_router_overlap_blocks_count{model_id="tiny"} 3"#));
-        assert!(out.contains(r#"sgl_router_overlap_blocks_sum{model_id="tiny"} 62"#));
-        // The le=64 bucket is cumulative: 3 is <=4, 9 is <=16, 50 is <=64.
-        assert!(
-            out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="64"} 3"#),
-            "bucket le=64 should be 3 (cumulative); got:\n{out}",
-        );
-        // The le=4 bucket should include only the 3.
-        assert!(
-            out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="tiny",le="4"} 1"#),
-            "bucket le=4 should be 1; got:\n{out}",
         );
     }
 
@@ -987,9 +1450,101 @@ mod tests {
     }
 
     #[test]
+    fn policy_decisions_are_keyed_by_policy_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("session_aware", "session_primary");
+        reg.record_policy_decision("cache_aware", "cache_candidate");
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_decisions_total{policy="session_aware",reason="session_primary"} 2"#
+        ));
+    }
+
+    #[test]
+    fn policy_selection_failures_are_keyed_by_policy_and_reason() {
+        let reg = MetricsRegistry::new();
+        reg.record_policy_selection_failure(
+            PolicyKind::SessionAware,
+            PolicySelectionFailureReason::PrefillAdmissionExhausted,
+        );
+        reg.record_policy_selection_failure(
+            PolicyKind::CacheAware,
+            PolicySelectionFailureReason::CacheCandidatesExhausted,
+        );
+        reg.record_policy_selection_failure(
+            PolicyKind::RoundRobin,
+            PolicySelectionFailureReason::ProposalEmpty,
+        );
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="session_aware",reason="prefill_admission_exhausted"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="cache_aware",reason="cache_candidates_exhausted"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_policy_selection_failures_total{policy="round_robin",reason="proposal_empty"} 1"#
+        ));
+    }
+
+    #[test]
+    fn cache_monitor_and_guard_counters_are_exposed() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_monitor_decision("estimated_prefill_queue_ms");
+        reg.record_cache_admission_evaluations(3);
+        reg.record_cache_admission_rejections(2);
+        reg.record_cache_pressure_guard(3, 1);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_monitor_decisions_total{source="estimated_prefill_queue_ms"} 1"#
+        ));
+        assert!(out.contains("sgl_router_cache_admission_evaluated_total 3"));
+        assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
+    }
+
+    #[test]
+    fn ingress_tokenize_error_counter_increments_per_model() {
+        let reg = MetricsRegistry::new();
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("other");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="tiny"} 2"#),
+            "expected tiny=2; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
+            "expected other=1; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn ingress_tokenize_error_absent_until_recorded() {
+        // Healthy operation never calls the recorder, so no per-model series
+        // should exist — only the HELP/TYPE headers.
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        assert!(
+            !out.contains("sgl_router_ingress_tokenize_errors_total{"),
+            "no per-model series until an error is recorded; got:\n{out}",
+        );
+    }
+
+    #[test]
     fn label_values_escape_quotes_and_backslashes() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             r#"http://"weird":30000"#,
             r"back\slash",
             WorkerModeLabel::Plain,
@@ -1004,16 +1559,5 @@ mod tests {
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
         );
-    }
-
-    #[test]
-    fn histogram_plus_inf_bucket_catches_overflow() {
-        let reg = MetricsRegistry::new();
-        // 1001 is just above the last finite bucket (1000); it should land
-        // in +Inf only.
-        reg.observe_overlap_blocks("m", 1001);
-        let out = reg.render();
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="1000"} 0"#));
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
     }
 }

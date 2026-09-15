@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,10 +10,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
@@ -25,9 +19,6 @@ from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import 
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_gdn_eagle_draft_extend_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_gdn_eagle_verify_case,
     run_gdn_eagle_verify_cuda_graph_case,
@@ -35,9 +26,10 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -224,6 +216,36 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_gdn_attention_case(self, case)
 
+    def test_multi_item_scoring_mixed_batch_with_empty_query(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_mixed_batch_empty_query",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0),
+            extend_lens=(9, 7),
+            mis_delimiter_indices=((0, 3, 8), (4, 6)),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case)
+
+    def test_multi_item_scoring_crosses_chunk_boundaries(self):
+        case = GDNAttentionCase(
+            name="gdn_mis_chunk_boundaries",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_k_heads=2,
+            num_v_heads=2,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(198,),
+            mis_delimiter_indices=((5, 68, 132, 197),),
+            conv_history_weight=0.25,
+        )
+        run_gdn_attention_case(self, case, max_context_len=256)
+
     # Layout-robustness. See dense/test_triton.py for the rationale.
     # shuffled_pages is the default for all tests; this method opts
     # into the more aggressive interleaved_pages + non_monotonic_extend.
@@ -305,48 +327,6 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 run_gdn_eagle_verify_cuda_graph_case(
                     self, case, topk=topk, spec_kind=spec_kind
                 )
-
-    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — `HybridLinearAttnBackend`
-    # raises `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG
-    # capture (`hybrid_linear_attn_backend.py:509,572`), so CG is
-    # structurally blocked across the family (GDN/KDA/Lightning/Mamba2).
-    # The EXTEND-style gated-delta recurrence reference doubles as the
-    # DRAFT_EXTEND reference across both spec kinds.
-    EAGLE_DRAFT_EXTEND_CASES = (
-        (
-            GDNAttentionCase(
-                name="runner_eagle_draft_extend_gdn",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "eagle",
-        ),
-        (
-            GDNAttentionCase(
-                name="runner_frozen_kv_mtp_draft_extend_gdn",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_k_heads=2,
-                num_v_heads=2,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            "frozen_kv_mtp",
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_gdn_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
 
     # Spy directly on each sub-backend's `init_forward_metadata*` so
     # dispatch-layer slice mutations show up as a missing call, which

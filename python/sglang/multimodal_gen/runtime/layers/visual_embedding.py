@@ -22,9 +22,7 @@ from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
 )
 
-from sglang.jit_kernel.timestep_embedding import (
-    timestep_embedding as timestep_embedding_cuda,
-)
+from sglang.kernels.ops.diffusion import timestep_embedding as timestep_embedding_cuda
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -260,9 +258,9 @@ class TimestepEmbedder(nn.Module):
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).to(self.mlp.fc_in.weight.dtype)
         if timestep_seq_len is not None:
-            assert (
-                t_freq.shape[0] % timestep_seq_len == 0
-            ), "timestep length is not divisible by timestep_seq_len"
+            assert t_freq.shape[0] % timestep_seq_len == 0, (
+                "timestep length is not divisible by timestep_seq_len"
+            )
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.unflatten(0, (batch_size, timestep_seq_len))
         # t_freq = t_freq.to(self.mlp.fc_in.weight.dtype)

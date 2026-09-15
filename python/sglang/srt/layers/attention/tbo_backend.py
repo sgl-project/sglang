@@ -1,11 +1,17 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from sglang.srt.batch_overlap import two_batch_overlap
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -17,6 +23,10 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.kv_index_translator = primary.kv_index_translator
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            primary, "extend_dummy_seqs_capped_by_req_pool", False
+        )
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -25,14 +35,30 @@ class TboAttnBackend(AttentionBackend):
             children=[creator() for _ in range(2)],
         )
 
+    def _children_use_cuda_graph(self) -> bool:
+        """Whether the TBO child backends participate in CUDA-graph capture/replay.
+
+        Some models only run TBO in eager prefill and keep their graph-captured
+        modes (decode / target-verify) NON-TBO on the primary backend. For those,
+        the children must NOT be driven through the cuda-graph paths: doing so
+        rebuilds their per-step metadata on every replay even though the captured
+        graph never uses them. For DeepSeek-V4 that metadata build (compressor /
+        indexer) leaks ROCm HSA resources across the 2 children -> eventual
+        HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager prefill TBO (init_forward_metadata)
+        is unaffected; only the *_graph paths are gated.
+        """
+        return getattr(self.primary, "tbo_supports_cuda_graph", True)
+
     def init_forward_metadata_out_graph(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         self.primary.init_forward_metadata_out_graph(
             forward_batch=forward_batch, in_capture=in_capture
         )
+        if not self._children_use_cuda_graph():
+            return
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -95,8 +121,15 @@ class TboAttnBackend(AttentionBackend):
                 forward_batch=child_fb_view, in_capture=False
             )
 
-    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in (self.primary, *self.children)
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)
+        if not self._children_use_cuda_graph():
+            return
         tbo_children = getattr(forward_batch, "tbo_children", None)
         if tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -107,7 +140,7 @@ class TboAttnBackend(AttentionBackend):
                         forward_batch=forward_batch_child
                     )
 
-    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         if forward_batch.tbo_children is not None:
             for child, forward_batch_child in zip(
@@ -118,17 +151,23 @@ class TboAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
+        if not self._children_use_cuda_graph():
+            return
         for item in self.children:
             # TODO for children, maybe can provide *smaller* max_bs to optimize
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):
         self.primary.on_after_cuda_graph_warmup()
+        if not self._children_use_cuda_graph():
+            return
         for child in self.children:
             child.on_after_cuda_graph_warmup()
 
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
+        if not self._children_use_cuda_graph():
+            return ans
         for child in self.children:
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
@@ -142,8 +181,27 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        # Needs an explicit override: the base declares this as a property, so
+        # normal lookup succeeds with None and __getattr__ below never runs.
+        return self.primary.verify_mask
+
+    def __getattr__(self, name):
+        # Delegate backend-specific attributes/methods not explicitly wrapped
+        # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which
+        # the model calls directly via get_attn_backend()) to the primary
+        # full-batch backend. Inside TBO the per-child backend is resolved
+        # directly from the forward context, so this path only serves the
+        # non-overlapped forward (warmup / decode / TBO-ineligible batches).
+        # NOTE: __getattr__ runs only when normal lookup fails; guard `primary`
+        # to avoid infinite recursion before __init__ sets it.
+        if name == "primary":
+            raise AttributeError(name)
+        return getattr(self.primary, name)
 
 
 def _build_tbo_child_replay_fb_view(
@@ -162,9 +220,9 @@ def _build_tbo_child_replay_fb_view(
     capture-time buffers are sliced per child, spec_info is split, and
     seq_lens_sum is recomputed from the sliced ``seq_lens_cpu``.
     """
-    assert (
-        getattr(fb_view, "encoder_lens", None) is None
-    ), "TBO replay split does not support encoder_lens yet"
+    assert getattr(fb_view, "encoder_lens", None) is None, (
+        "TBO replay split does not support encoder_lens yet"
+    )
     spec_info = getattr(fb_view, "spec_info", None)
     if spec_info is not None:
         start_seq = seq_slice.start or 0

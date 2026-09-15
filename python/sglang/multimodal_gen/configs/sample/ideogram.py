@@ -26,6 +26,18 @@ IDEOGRAM4_PRESETS: dict[str, dict[str, object]] = {
         "mu": 0.5,
         "std": 1.75,
     },
+    "V4_FAST_20": {
+        "num_steps": 20,
+        "guidance_schedule": (1.0,) * 20,
+        "mu": 0.0,
+        "std": 1.75,
+    },
+    "V4_INSTANT_8": {
+        "num_steps": 8,
+        "guidance_schedule": (1.0,) * 8,
+        "mu": 0.0,
+        "std": 1.75,
+    },
 }
 
 
@@ -40,6 +52,10 @@ class Ideogram4SamplingParams(SamplingParams):
     num_inference_steps: int | None = None
     guidance_scale: float | None = None
     preset: str = "V4_DEFAULT_20"
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"preset"})
 
     def __post_init__(self) -> None:
         if self.preset not in IDEOGRAM4_PRESETS:
@@ -76,3 +92,13 @@ class Ideogram4SamplingParams(SamplingParams):
         self.num_inference_steps = preset_steps
         self.guidance_scale = float(preset_cfg["guidance_schedule"][-1])
         super().__post_init__()
+
+
+@dataclass
+class Ideogram4FastSamplingParams(Ideogram4SamplingParams):
+    preset: str = "V4_FAST_20"
+
+
+@dataclass
+class Ideogram4InstantSamplingParams(Ideogram4SamplingParams):
+    preset: str = "V4_INSTANT_8"

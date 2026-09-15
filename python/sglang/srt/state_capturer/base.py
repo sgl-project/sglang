@@ -5,9 +5,18 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    _cuda_host_unregister,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
@@ -52,18 +61,30 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
-        self.buffer = torch.zeros(
+    def __init__(
+        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+    ):
+        alloc = ALLOC_MEMORY_FUNCS[device]
+        self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
+            allocator=HostTensorAllocator(),
         )
+        self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
         self.name = name
         self._log_allocation()
+
+    def destroy(self):
+        if self.buffer is None:
+            return
+        if _is_cuda or _is_hip:
+            _cuda_host_unregister(self.buffer)
+        self.buffer = None
 
     def get_buffer_size_bytes(self):
         return get_tensor_size_bytes(self.buffer)
@@ -79,17 +100,19 @@ class BaseHostCache:
 @dataclasses.dataclass
 class TopkCaptureOutput:
     """Holds GPU tensors captured during forward for overlap scheduling.
-    Call copy_to_cpu() inside forward stream (before copy_done.record()),
-    then finalize() after copy_done.synchronize().
+    map_device_tensors() D2H-copies them before copy_done.record() (may run on
+    the dedicated result-copy stream); finalize() runs after copy_done.synchronize().
     """
 
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
     host_cache: BaseHostCache
 
-    def copy_to_cpu(self):
-        self.out_cache_loc = self.out_cache_loc.to("cpu", non_blocking=True)
-        self.topk = self.topk.to("cpu", non_blocking=True)
+    def map_device_tensors(self, fn):
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
+        self.out_cache_loc = fn(self.out_cache_loc)
+        self.topk = fn(self.topk)
 
     def finalize(self):
         self.host_cache.buffer[self.out_cache_loc] = self.topk
@@ -113,7 +136,9 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(
+            num_tokens, num_layers, topk_size, name=name, device=device
+        )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,
@@ -124,6 +149,9 @@ class BaseTopkCapturer:
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
+
+    def destroy(self):
+        self.host_cache.destroy()
 
     def _get_local_slice(
         self,
@@ -174,9 +202,10 @@ class BaseTopkCapturer:
             forward_batch, can_run_graph, cuda_graph_batch
         )
         if no_copy_to_cpu:
+            # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
-                topk=slice_gpu,
+                out_cache_loc=forward_batch.out_cache_loc.clone(),
+                topk=slice_gpu.clone(),
                 host_cache=self.host_cache,
             )
         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()

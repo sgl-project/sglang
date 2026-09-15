@@ -1,4 +1,4 @@
-"""Stage-a basic sanity: small-but-broad server smoke that downstream
+"""Stage-a basic sanity: small-but-broad server coverage that downstream
 stages depend on. Multiple sanity-kit mixins driving one shared server,
 covering protocol, decode correctness, scheduler stress, occupancy, and
 hellaswag accuracy."""
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=160, stage="base-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=97, stage="base-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=160, suite="stage-a-test-1-gpu-small-amd")
 
 
@@ -48,7 +48,7 @@ class TestBasicSanity(
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",

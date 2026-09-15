@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
-register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -101,6 +101,34 @@ class TestBatchInvariantOps(CustomTestCase):
             f"{test_name}: diff_range must be 0 in batch-invariant mode, got {diff_range} for {dtype}",
         )
 
+    def test_deepgemm_random_bf16_batch_invariance(self):
+        if not batch_invariant_ops.ENABLE_JIT_DEEPGEMM:
+            self.skipTest("DeepGEMM is unavailable on this device")
+
+        deep_gemm = batch_invariant_ops.deep_gemm
+        get_deterministic = getattr(deep_gemm, "get_deterministic_algorithms", None)
+        original_mode = get_deterministic() if get_deterministic else None
+        modes = (False, True) if get_deterministic else (None,)
+        generator = torch.Generator(device=device_type).manual_seed(42)
+        a = torch.randn(257, 4096, dtype=torch.bfloat16, generator=generator)
+        b = torch.randn(4096, 4096, dtype=torch.bfloat16, generator=generator).T
+        try:
+            for mode in modes:
+                if mode is not None:
+                    deep_gemm.use_deterministic_algorithms(mode)
+                with self.subTest(deterministic=mode):
+                    ref = batch_invariant_ops._matmul_persistent_deepgemm(a[:1], b)
+                    for batch_size in (16, 64, 257):
+                        out = batch_invariant_ops._matmul_persistent_deepgemm(
+                            a[:batch_size], b
+                        )
+                        torch.testing.assert_close(out[:1], ref, rtol=0, atol=0)
+                    if get_deterministic:
+                        self.assertEqual(get_deterministic(), mode)
+        finally:
+            if original_mode is not None:
+                deep_gemm.use_deterministic_algorithms(original_mode)
+
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""
         test_cases = [
@@ -157,21 +185,6 @@ class TestBatchInvariantOps(CustomTestCase):
                                 iters=5, M=M, K=K, N=N, dtype=dtype
                             )
                             self._assert_batch_invariant_results(difflist, dtype, name)
-
-    def test_without_batch_invariant_mode(self):
-        """
-        Test that without batch-invariant mode, results may differ.
-        This test demonstrates the difference batch-invariant mode makes.
-        """
-        M, K, N = 32, 128, 1024
-        dtype = torch.float32
-
-        # Run without batch-invariant mode
-        with set_batch_invariant_mode(False):
-            difflist = self._run_multiple_iterations(
-                iters=5, M=M, K=K, N=N, dtype=dtype
-            )
-            print(f"Without batch-invariant mode, we get diffs: {difflist}")
 
     def _test_bmm_batch_invariance(self, B, M, K, N, dtype):
         """

@@ -124,11 +124,54 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+        """ReplaySSM spec-verify scratch bytes across all layers.
+
+        GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
+        rings. KDA keeps its raw-input fold window and d/k rings.
+        """
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        conv_b = self.dtype.conv.itemsize
+        fp32_b = 4
+        if self.is_kda:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # rawv
+                + h_k * record_len * k_dim * conv_b  # rawk
+                + hv * record_len * fp32_b  # beta
+                + hv * record_len * k_dim * fp32_b  # vector g
+                + hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # k
+            )
+        else:
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # d
+                + h_k * record_len * k_dim * conv_b  # normalized k
+                + hv * record_len * fp32_b  # scalar g
+            )
+            if self.dtype.conv != torch.float32:
+                per_layer += (
+                    hv * record_len * v_dim * conv_b  # d low part
+                    + h_k * record_len * k_dim * conv_b  # normalized-k low part
+                )
+        return per_layer * len(self.layers)
+
+    @property
+    def is_kda(self) -> bool:
+        """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
+        the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
+        per-K) and the gate-generic decode kernel's ``IS_KDA`` path."""
+        return False
+
 
 @dataclass(kw_only=True, frozen=True)
 class Mamba2StateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
+
+    # Conv tuples read (dim, K-1) — the window axis is last, which the
+    # deduplicated conv-intermediate layout requires.
+    disable_conv_window_dedup: bool = False
 
     intermediate_size: int
     conv_dim: int
@@ -137,6 +180,16 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    # Number of key/group heads after TP sharding (== runtime `H` the packed
+    # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
+    # buffer (k_cache) to size/stride exactly like the kernel expects.
+    num_k_heads_per_tp: int = 1
+    # Full (unsharded) conv sub-block dims, e.g. GDN's [key_dim, key_dim,
+    # value_dim] for conv_state == cat([query, key, value]). Each sub-block is
+    # head-sharded INDEPENDENTLY across attn-TP, so PD transfer across different
+    # attn_tp_size must slice per sub-block. None when the single contiguous
+    # slice already matches the layout (e.g. standard Mamba2 conv order differs).
+    conv_shard_groups: Optional[List[int]] = None
 
     @staticmethod
     def create(
@@ -148,7 +201,18 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        conv_shard_groups: Optional[List[int]] = None,
     ) -> "Mamba2StateShape":
+        # The q/k projections are sharded by `num_k_heads // tp` heads (the
+        # ORIGINAL n_groups, before the conv head-shard extension below), so the
+        # runtime `H` the packed kernels see equals divide(n_groups, tp). Only
+        # meaningful (and only consumed) for the GDN ReplaySSM path, which
+        # requires evenly divisible heads; fall back to ceil-div otherwise.
+        num_k_heads_per_tp = (
+            divide(n_groups, tp_world_size)
+            if n_groups % tp_world_size == 0
+            else -(-n_groups // tp_world_size)
+        )
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
         if n_groups % tp_world_size != 0:
@@ -174,6 +238,55 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            num_k_heads_per_tp=num_k_heads_per_tp,
+            conv_shard_groups=conv_shard_groups,
+        )
+
+    @staticmethod
+    def create_full_rank(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "Mamba2StateShape":
+        """State shape for a full-rank (``head_dim == 1``) selective-scan mixer.
+
+        This is the layout used by Mamba-1 mixers (e.g. Falcon-Mamba,
+        state-spaces Mamba).
+
+        Two things differ from Mamba-2 (:meth:`create`):
+
+        - The causal conv is applied over ``intermediate_size`` ONLY. In Mamba-1
+          the ``B``/``C`` selection matrices are produced by ``x_proj`` *after*
+          the conv, so (unlike Mamba-2) they are not part of the conv input and
+          ``conv_dim == intermediate_size``.
+        - The SSM ``A`` matrix / state is full-rank per channel with shape
+          ``(intermediate_size, state_size)``. We express this on the Mamba-2
+          head layout as ``num_heads = intermediate_size`` and ``head_dim = 1``
+          (``n_groups`` implicitly 1, ``B``/``C`` shared across channels) so the
+          shared Mamba2 attention backend, memory pool, and
+          ``selective_state_update`` kernel drive it unchanged.
+        """
+        assert intermediate_size % tp_world_size == 0, (
+            f"Mamba-1 intermediate_size ({intermediate_size}) must be divisible "
+            f"by tp_world_size ({tp_world_size})"
+        )
+        conv_dim = intermediate_size
+        conv_state_shape = (divide(conv_dim, tp_world_size), conv_kernel - 1)
+        # (num_heads // tp, head_dim, state_size) with head_dim == 1.
+        temporal_state_shape = (divide(intermediate_size, tp_world_size), 1, state_size)
+        return Mamba2StateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            conv_dim=conv_dim,
+            ssm_state_size=state_size,
+            num_heads=intermediate_size,
+            head_dim=1,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+            num_k_heads_per_tp=1,
         )
 
 
@@ -187,12 +300,25 @@ class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]
 
+    # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
+    # along the dim axis, so the dedup conv-intermediate layout must stay off.
+    disable_conv_window_dedup: bool = True
+    # Per-slot conv tensors are [K-1, sharded_channels], unlike the usual
+    # [sharded_channels, K-1] layout.
+    conv_slice_axis: int = 1
+
     num_heads: int
     head_dim: int
     num_k_heads: int
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Full q/k/v dimensions. Each block is TP-sharded independently.
+    conv_shard_groups: Optional[List[int]] = None
+    # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
+    # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
+    # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
+    num_k_heads_per_tp: int = 1
 
     @staticmethod
     def create(
@@ -209,6 +335,11 @@ class KimiLinearStateShape:
             num_k_heads = num_heads
         if head_k_dim is None:
             head_k_dim = head_dim
+        num_k_heads_per_tp = (
+            divide(num_k_heads, tp_world_size)
+            if num_k_heads % tp_world_size == 0
+            else -(-num_k_heads // tp_world_size)
+        )
 
         proj_size = num_heads * head_dim
         proj_k_size = num_k_heads * head_k_dim
@@ -231,9 +362,15 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            conv_shard_groups=[proj_size, proj_k_size, proj_k_size],
+            num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
 
 @dataclass(kw_only=True, frozen=True)
 class KimiLinearCacheParams(BaseLinearStateParams):
     shape: KimiLinearStateShape
+
+    @property
+    def is_kda(self) -> bool:
+        return True

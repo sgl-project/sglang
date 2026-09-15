@@ -152,6 +152,10 @@ class AlwaysHitShapeEnv:
 
     def __init__(self) -> None:
         self.guards: list[Any] = []
+        # Newer torch Inductor reads ``shape_env.var_to_hint_override`` during
+        # compilation; provide an empty mapping so this dummy shape env stays
+        # compatible across torch versions (older torch never accesses it).
+        self.var_to_hint_override: dict[Any, Any] = {}
 
     def evaluate_guards_expression(self, *args, **kwargs):
         return True
@@ -252,9 +256,7 @@ class InductorAdaptor(CompilerInterface):
                             break
                 return inductor_compiled_graph
 
-            hijacked_compile_fx_inner = (
-                torch._inductor.compile_fx.compile_fx_inner
-            )  # noqa
+            hijacked_compile_fx_inner = torch._inductor.compile_fx.compile_fx_inner  # noqa
         elif torch_release >= (2, 6):
             # function renamed in 2.6
             original_load_name = None

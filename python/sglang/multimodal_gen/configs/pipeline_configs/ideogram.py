@@ -3,7 +3,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DistilledDiTConfig,
+    Ideogram4DiTConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.ideogram import (
     Ideogram4TextEncoderConfig,
 )
@@ -300,3 +303,8 @@ class Ideogram4PipelineConfig(ImagePipelineConfig):
         grid_h = batch.height // patch
         grid_w = batch.width // patch
         return (batch_size, grid_h * grid_w, self.dit_config.arch_config.in_channels)
+
+
+@dataclass
+class Ideogram4DistilledPipelineConfig(Ideogram4PipelineConfig):
+    dit_config: DiTConfig = field(default_factory=Ideogram4DistilledDiTConfig)

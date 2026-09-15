@@ -24,7 +24,11 @@ from einops import rearrange
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -50,7 +54,6 @@ logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -82,7 +85,6 @@ class Ernie4_5_VisionMLP(nn.Module):
 
 
 class Ernie4_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -123,6 +125,7 @@ class Ernie4_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -131,6 +134,7 @@ class Ernie4_5_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -139,7 +143,6 @@ class Ernie4_5_VisionBlock(nn.Module):
 
 
 class Ernie4_5_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -346,7 +349,6 @@ class VariableResolutionResamplerModel(nn.Module):
 
 
 class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.inv_freq = 1.0 / theta ** (
@@ -362,7 +364,6 @@ class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: PretrainedConfig,
@@ -481,6 +482,9 @@ class Ernie4_5_VisionTransformer(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         # transformers
         x = x.unsqueeze(1)
@@ -490,6 +494,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
             )
 
         final_output = self.ln(x)
@@ -705,9 +710,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
         self._set_visual_token_mask(input_ids, forward_batch)
 
-        assert (
-            input_ids.numel() == positions.shape[-1]
-        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        assert input_ids.numel() == positions.shape[-1], (
+            f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

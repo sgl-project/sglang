@@ -4,13 +4,36 @@ Loaded on demand by the `cookbook-add-model` skill. **Rare** — adding a model
 cookbook is data-only and never needs this. The current 7 built-in axes
 (`attention`, `moe`, `parsers`, `speculative`, `pdDisagg`, `hicache`,
 `hisparse`) already cover the SGLang feature surface most cookbooks need.
-(MegaMoE is not its own axis — it lives inside `moe` as a backend option +
-a `megamoeQuant` sub-select.) Only add a new axis if a real cookbook needs it
-and the feature does not fit any existing axis. Touches `_playground.jsx` only.
-One routine trigger: the `cookbook-migrate-model` skill requires every legacy
-control to survive as a dimension or a Playground axis — a legacy feature no
-built-in axis covers (e.g. Nemotron3's "KV Cache DType" radio) lands here
-first, as its own engine PR ahead of the migration PR.
+
+**Model-specific features are config DATA, not engine code.** The axis
+handlers read options / flags / env / gating straight from
+`config.playgroundFeatures`, so a model-specific feature is added as data on
+an existing axis with NO engine edit — MegaMoE W4A4 is not its own axis, it's
+config data on `moe` (a `megamoe` backend option + a `megamoeQuant`
+sub-select). Reach for this file ONLY when a feature's *shape* — its
+title + the flag family it strips + its option/state model — is something no
+existing axis can express.
+
+**When you do extend, build a GENERIC primitive, never a model-named handler.**
+The right unit is a reusable shape (e.g. "a titled single-select that strips a
+configurable flag family and splices the picked option's flags" — exactly the
+`speculative` handler's shape, minus its hardcoded title + `--speculative-*`
+strip list). Parameterize title, strip-prefixes, and options from config so
+the next model of that shape is pure config. Do NOT add a `kvcache` /
+`<model-feature>` handler that hardcodes one model's flag — that's the
+model-specific-code-in-the-engine anti-pattern this architecture exists to
+avoid. (Precedent: Nemotron3's "KV Cache DType" and Qwen3's mamba-cache select
+are the SAME single-select shape → one generic primitive serves both, then
+both are config.)
+
+**A new axis is backward-compatible — zero churn on existing configs.** The
+runtime is opt-in per key: the apply/render loop does `const fc =
+pgFeatures[axisId]; if (!fc) continue;`, so any config that doesn't declare
+the key never sees the axis. And a model-specific axis does NOT join the
+opt-out "general axes ship on every cookbook" set (that set is an authoring
+convention for NEW configs, not a runtime default) — so review-pr won't flag
+existing pages for lacking it, and you never touch a merged config. Only the
+models that expose the control declare it. Touches `_playground.jsx` only.
 
 For the per-model config/cells/MDX reference see [authoring-reference.md](authoring-reference.md).
 
@@ -20,12 +43,15 @@ For the per-model config/cells/MDX reference see [authoring-reference.md](author
 
 Before touching the engine, confirm:
 
-- The feature is a STABLE part of the SGLang CLI surface (will appear in
-  multiple cookbooks, not one-off).
-- The feature cannot be expressed as a new option inside an existing axis
-  (e.g. a new MoE backend belongs in `moe.backend.options`, not a new
-  axis).
-- The feature has a clean strip-prefix → emit-flag pattern.
+- The feature cannot be expressed as data on an existing axis (a new MoE
+  backend belongs in `moe.backend.options`; a new parser in `parsers.items`;
+  a new spec preset in `speculative.options`). This is the common case —
+  most "new features" are new options, not new shapes.
+- The *shape* is genuinely new (state model + strip pattern), AND you are
+  adding it as a GENERIC config-parameterized axis (title / strip-prefixes /
+  options all from config), not a one-model handler. If you'd hardcode a
+  specific flag like `--kv-cache-dtype`, stop — generalize the shape instead.
+- The shape has a clean strip-prefix → emit-flag pattern.
 
 If unsure, add it as data first (in one cookbook's config under an
 existing axis) before promoting it to a built-in axis.

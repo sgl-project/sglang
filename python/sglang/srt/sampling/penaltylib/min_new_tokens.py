@@ -25,13 +25,20 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
             sequences=[
                 torch.tensor(
-                    data=(
-                        list(
+                    data=[
+                        token_id
+                        for token_id in (
                             (req.sampling_params.stop_token_ids or set())
+                            | (req.eos_token_ids or set())
                             | (req.tokenizer.additional_stop_token_ids or set())
-                            | {req.tokenizer.eos_token_id}
+                            | (
+                                {req.tokenizer.eos_token_id}
+                                if req.tokenizer.eos_token_id is not None
+                                else set()
+                            )
                         )
-                    ),
+                        if token_id is not None
+                    ],
                     dtype=torch.int64,
                     device=self.orchestrator.device,
                 )
@@ -53,9 +60,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 fill_value=float("-inf"),
                 device=self.orchestrator.device,
             ),
-        )[
-            :, : self.orchestrator.vocab_size
-        ]
+        )[:, : self.orchestrator.vocab_size]
 
         self.len_output_tokens = torch.zeros(
             size=(len(self.orchestrator.reqs()), 1),
@@ -67,8 +72,11 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens += 1
 
     def _apply(self, logits: torch.Tensor):
-        mask = (self.len_output_tokens < self.min_new_tokens).expand_as(logits)
-        logits[mask] += self.stop_token_penalties[mask]
+        # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
+        # device-to-host sync every decode step; torch.where is a plain
+        # elementwise select with no sync (and no -inf*0=nan).
+        mask = self.len_output_tokens < self.min_new_tokens
+        logits.add_(torch.where(mask, self.stop_token_penalties, 0.0))
 
     def _filter(self, keep_indices: torch.Tensor):
         self.min_new_tokens = self.min_new_tokens[keep_indices]

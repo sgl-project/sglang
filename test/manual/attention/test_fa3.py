@@ -45,7 +45,7 @@ if OFFLINE_MODE:
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "8",
     "--attention-backend",
     "fa3",
@@ -144,7 +144,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE3",
@@ -178,7 +178,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE3",
@@ -210,7 +210,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE",
@@ -242,7 +242,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE",
