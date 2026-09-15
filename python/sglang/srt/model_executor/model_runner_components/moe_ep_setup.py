@@ -73,6 +73,50 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
+def maybe_prebuild_deepep_v2_buffers(*, model, decode_cuda_graph_runner) -> None:
+    """Prebuild deepep_v2 buffers unless a captured decode graph already built them.
+
+    A captured decode graph already ran a dispatch that built the ElasticBuffer;
+    an EagerRunner means no capture happened, so prebuild is still needed.
+    """
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+    decode_runner_captured = decode_cuda_graph_runner is not None and not isinstance(
+        decode_cuda_graph_runner, EagerRunner
+    )
+    if decode_runner_captured:
+        return
+    prebuild_deepep_v2_buffers(model=model)
+
+
+def prebuild_deepep_v2_buffers(*, model) -> None:
+    """Build every deepep_v2 dispatcher's ElasticBuffer at deployment time.
+
+    No-op unless the a2a backend is deepep_v2. The per-rank cap is validated in
+    validate_deepep_v2_dispatch_token_budget at server-args time.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    num_prebuilt = 0
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        dispatcher = module.dispatcher
+        if not isinstance(dispatcher, DeepEPv2Dispatcher):
+            continue
+        dispatcher.prebuild()
+        num_prebuilt += 1
+    if num_prebuilt:
+        log_info_on_rank0(
+            logger, f"Prebuilt {num_prebuilt} DeepEP-V2 ElasticBuffer(s) at startup."
+        )
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.distributed import get_moe_ep_group

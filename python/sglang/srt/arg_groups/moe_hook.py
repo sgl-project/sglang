@@ -557,6 +557,13 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
+        # A per-DP chunk only scatters across attn-TP (and attn-CP) ranks when
+        # DP-attention or CP is on; otherwise each EP rank dispatches the full
+        # chunk. attn_tp_size mirrors derive_attention_widths (tp / attn_dp / cp).
+        if view.enable_dp_attention or view.attn_cp_size > 1:
+            attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+            attn_tp_size = max(1, view.tp_size // attn_dp_size // view.attn_cp_size)
+            prefill_tokens = -(-prefill_tokens // attn_tp_size)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "
@@ -617,6 +624,8 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         "DeepseekV3ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
     )
     if architecture not in validated_architectures:
         raise ValueError(
