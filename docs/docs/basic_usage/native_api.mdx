@@ -11,7 +11,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/health`
 - `/health_generate`
 - `/flush_cache`
-- `/update_weights`
+- `/update_weights_from_disk`
 - `/encode`(embedding model)
 - `/v1/rerank`(cross encoder rerank model)
 - `/v1/score`(decoder-only scoring)
@@ -124,7 +124,7 @@ print_highlight(response.text)
 
 ## Flush Cache
 
-Flush the radix cache. It will be automatically triggered when the model weights are updated by the `/update_weights` API.
+Flush the radix cache. It will be automatically triggered when the model weights are updated by the `/update_weights_from_disk` API.
 
 Parameters:
 - `timeout` (query, float, default `0`, unit: seconds): Wait time for idle state before flushing. `0` means fail fast if not idle. When HiCache async operations are in-flight, a non-zero timeout allows the server to wait until idle before flushing, avoiding unnecessary 400 errors.
