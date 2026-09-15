@@ -14,7 +14,7 @@ ATOM = {1: (4845, 256.5), 2: (5050, 257.6), 8: (14047, 198.8), 10: (16756, 188.6
 # SGLang result dirs per series and concurrency (SemiAnalysis client, ATOM flags, MI350X)
 SGLANG = {
     "SGLang · forced acceptance": {1: "aiperf_l3_lossy_c1|aiperf_l2_lossy_c1", 8: "best:aiperf_l3_lossy_c8|aiperf_l2_lossy_c8",
-                                  24: "best:aiperf_l2_lossy_c24|aiperf_v13_lossy_SAclient_c24", 32: "best:aiperf_l2_lossy_c32|aiperf_v13_lossy_SAclient_c32"},
+                                  24: "best:aiperf_l4_lossy_c24|aiperf_l2_lossy_c24|aiperf_v13_lossy_SAclient_c24", 32: "best:aiperf_l2_lossy_c32|aiperf_v13_lossy_SAclient_c32"},
 }
 
 def load_point(d):
