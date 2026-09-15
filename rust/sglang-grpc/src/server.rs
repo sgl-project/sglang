@@ -11,7 +11,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
-use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
+use crate::bridge::{PyBridge, ResponseChunk, ServerInfo, TerminalError};
 use crate::proto;
 use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
@@ -212,6 +212,15 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
         .get("status_code")
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(default)
+}
+
+fn build_server_info_response(info: ServerInfo) -> proto::GetServerInfoResponse {
+    proto::GetServerInfoResponse {
+        json_info: info.json_info,
+        hicache: info
+            .hicache_host_total_tokens
+            .map(|host_total_tokens| proto::HiCacheInfo { host_total_tokens }),
+    }
 }
 
 #[tonic::async_trait]
@@ -594,7 +603,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::GetServerInfoRequest>,
     ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        let json_info = tokio::task::spawn_blocking({
+        let info = tokio::task::spawn_blocking({
             let bridge = self.bridge.clone();
             move || bridge.get_server_info()
         })
@@ -602,7 +611,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
         .map_err(|e| pyerr_to_status(e, "Failed to get server info"))?;
 
-        Ok(Response::new(proto::GetServerInfoResponse { json_info }))
+        Ok(Response::new(build_server_info_response(info)))
     }
 
     async fn list_models(
