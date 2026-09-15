@@ -741,6 +741,55 @@ def eagle_sample(
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
 
+    if logits_output.compact_verify_sharded:
+        from sglang.srt.speculative.compact_verify.config import sampling_supported
+        from sglang.srt.speculative.compact_verify.engine import (
+            runtime_supported,
+        )
+        from sglang.srt.speculative.compact_verify.engine import (
+            sample as compact_sample,
+        )
+
+        q = verify_input.draft_probs
+        width = verify_input.draft_token_num
+        if (
+            sampling_supported(verify_input, batch, grammar_mask)
+            and 1024 <= next_token_logits.shape[0] <= 4096
+            and next_token_logits.shape[0] % 16 == 0
+            and q is not None
+            and q.dtype == torch.float32
+            and q.shape == (bs, width - 1, 154880)
+            and q.is_contiguous()
+            and runtime_supported()
+            and SIMULATE_ACC_LEN < 0
+        ):
+            candidates = verify_input.draft_token.reshape(bs, width)
+            coins, final_coins = _verify_coins(
+                sampling_info=sampling_info,
+                seq_lens=batch.seq_lens,
+                draft_token_num=width,
+                candidates=candidates,
+                device=device,
+            )
+            result = compact_sample(
+                next_token_logits,
+                q,
+                candidates,
+                coins,
+                final_coins,
+                verify_input.retrieve_index,
+            )
+            if result is None:
+                raise RuntimeError(
+                    "compact verifier eligibility changed after random coins were drawn"
+                )
+            return result
+        # Unsupported request features keep the original verifier, including
+        # its original RNG consumption and full logits for requested logprobs.
+        next_token_logits = get_tp_group().all_gather(next_token_logits, dim=-1).float()
+        logits_output.next_token_logits = next_token_logits
+        logits_output.compact_verify_sharded = False
+
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     # Apply penalty

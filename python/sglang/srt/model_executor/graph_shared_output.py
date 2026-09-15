@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 class GraphSharedOutput:
     """``(max_rows, vocab)`` logits buffer, shared by every cuda-graph runner."""
 
-    _process_shared: Optional[GraphSharedOutput] = None
+    _process_shared: GraphSharedOutput | None = None
 
     def __init__(
         self,
@@ -26,12 +26,13 @@ class GraphSharedOutput:
     ) -> None:
         self.device = torch.device(device)
         self.max_rows = max_rows
-        self._logits_buffers: Dict[int, torch.Tensor] = {}
+        self._logits_buffers: dict[int, torch.Tensor] = {}
+        self._compact_logits_buffer = None
 
     @classmethod
     def create_for_model_runner(
         cls, model_runner: ModelRunner
-    ) -> Optional[GraphSharedOutput]:
+    ) -> GraphSharedOutput | None:
         cuda_graph_config = get_exec().graph.cuda_graph_config
         if cuda_graph_config is None:
             return None
@@ -45,6 +46,11 @@ class GraphSharedOutput:
             return None
 
         device = torch.device(model_runner.device)
+        from sglang.srt.speculative.compact_verify.config import sharded_graph_output
+
+        if sharded_graph_output(model_runner):
+            # Do not enlarge the draft runner's full-vocab pool to target R.
+            return cls(device=device, max_rows=max_rows)
         shared = cls._process_shared
         if (
             shared is not None
@@ -67,3 +73,11 @@ class GraphSharedOutput:
             )
             self._logits_buffers[vocab_size] = buffer
         return buffer[:rows]
+
+    def get_compact_logits_buffer(self, *, rows: int) -> torch.Tensor:
+        assert rows <= self.max_rows
+        if self._compact_logits_buffer is None:
+            self._compact_logits_buffer = torch.zeros(
+                (self.max_rows, 38720), device=self.device, dtype=torch.bfloat16
+            )
+        return self._compact_logits_buffer[:rows]
