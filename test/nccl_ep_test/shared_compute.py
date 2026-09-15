@@ -3,7 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-from .triton_compute import _gemm_cpu
+from .triton_compute import _gemm_cpu, _quantize_rows_cpu
 
 
 def make_shared_mlp(*, shared_experts=2, hidden=2048, intermediate=128, fp8=True):
@@ -66,3 +66,67 @@ def shared_reference(mlp, x):
     if second.weight.dtype == torch.float8_e4m3fn:
         return _gemm_cpu(active, second.weight.cpu(), second.weight_scale_inv.cpu())
     return (active.float() @ second.weight.cpu().float().T).bfloat16().float()
+
+
+def expected_output(batch, rank, quant, shared, scale, *, compute_backend="cpu"):
+    """CPU routing/weighting with CPU or independent unpadded Triton experts.
+
+    The Triton variant never calls the EP adapter or uses its receive buffers.
+    Structured inputs can land on BF16/FP8 midpoints; CPU arithmetic is also
+    reported, but cannot universally reproduce that amplified device rounding.
+    """
+    if compute_backend not in ("cpu", "triton"):
+        raise ValueError(compute_backend)
+    x = batch.tokens[rank]
+    active = (batch.expert_ids[rank] >= 0).any(-1)
+    result = torch.zeros_like(x, dtype=torch.float32)
+    if not active.any():
+        return result
+    # NCCL post-quantization, adapter dequantization, then Triton quantization.
+    wire = _quantize_rows_cpu(x.bfloat16()).bfloat16()
+    for expert in range(batch.num_experts):
+        if compute_backend == "cpu":
+            first = _gemm_cpu(
+                wire, quant.w13_weight[expert].cpu(), quant.w13_scale[expert].cpu()
+            )
+            gate, up = first.chunk(2, -1)
+            intermediate = (F.silu(gate) * up).bfloat16()
+            out = _gemm_cpu(
+                intermediate,
+                quant.w2_weight[expert].cpu(),
+                quant.w2_scale[expert].cpu(),
+            )
+        else:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                fused_experts_impl,
+            )
+
+            out = (
+                fused_experts_impl(
+                    wire.cuda(),
+                    quant.w13_weight[expert : expert + 1],
+                    quant.w2_weight[expert : expert + 1],
+                    torch.ones(len(x), 1, device="cuda"),
+                    torch.zeros(len(x), 1, device="cuda", dtype=torch.int32),
+                    use_fp8_w8a8=True,
+                    w1_scale=quant.w13_scale[expert : expert + 1],
+                    w2_scale=quant.w2_scale[expert : expert + 1],
+                    block_shape=[128, 128],
+                    no_combine=True,
+                )
+                .view(len(x), -1)
+                .cpu()
+                .float()
+            )
+        factor = torch.where(
+            batch.expert_ids[rank] == expert, batch.weights[rank], 0
+        ).sum(-1)
+        result += out * factor[:, None]
+    shared_output = (
+        shared_reference(shared, x)
+        if compute_backend == "cpu"
+        else shared(x.cuda()).cpu().float()
+    )
+    result = result.bfloat16().float() * scale + shared_output
+    result[~active] = 0
+    return result.bfloat16().float()

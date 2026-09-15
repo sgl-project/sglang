@@ -143,8 +143,8 @@ def test_shared_and_routed_compute_through_dispatcher_and_graph():
 
     from nccl_ep_test.fake_ep import dispatcher_environment
     from nccl_ep_test.oracle import RoutingBatch
-    from nccl_ep_test.pair_followups import expected_output
     from nccl_ep_test.runner_inputs import SyntheticDecodeRunner, input_batch
+    from nccl_ep_test.shared_compute import expected_output
     from nccl_ep_test.triton_compute import make_compute_fixture
 
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
