@@ -60,7 +60,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(url: String) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(url, config())
+}
+
+fn build_ctx_with_config(url: String, cfg: Config) -> Arc<AppContext> {
     // The handler tokenizes via the AppContext's registry (which carries the V4
     // encoder); the RoundRobin policy itself needs no tokenizer.
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -193,4 +196,114 @@ async fn successful_forward_does_not_emit_ingress_tokenize_error() {
         !m.contains("sgl_router_ingress_tokenize_errors_total{"),
         "healthy forwards (and expected omissions) must not emit the error counter; got:\n{m}",
     );
+}
+
+/// History that dynamo-render rewrites stays intact for engine-side tokenization.
+#[tokio::test]
+async fn reasoning_history_preserves_messages_without_forwarding_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"}).to_string(),
+    ).unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = tokenizer.to_str().unwrap().to_owned();
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let mut request = json!({"model": MODEL, "messages": [
+        {"role":"user", "content":"hi"},
+        {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+        {"role":"user", "content":"next"}
+    ]});
+    assert!(!ctx
+        .tokenizers
+        .encode_chat(MODEL, &request)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        send(Arc::clone(&ctx), request.clone()).await,
+        StatusCode::OK
+    );
+    let body = captured(&mock);
+    assert_eq!(body["messages"], request["messages"]);
+    assert!(body.get("input_ids").is_none());
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
+
+    request["messages"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_content");
+    assert_eq!(send(ctx, request).await, StatusCode::OK);
+    assert!(captured(&mock).get("input_ids").is_some());
+}
+
+/// Strict-template rewrites are used for routing only; the engine gets the original turns.
+#[tokio::test]
+async fn role_rewrites_preserve_messages_without_forwarding_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    let template = concat!(
+        "{%- set ns = namespace(prev='') -%}",
+        "{%- for m in messages -%}",
+        "{%- if m.role == 'system' and not loop.first -%}",
+        "{{ raise_exception('System message must be first.') }}",
+        "{%- endif -%}",
+        "{%- if m.role == 'user' and ns.prev == 'user' -%}",
+        "{{ raise_exception('Conversation roles must alternate.') }}",
+        "{%- endif -%}",
+        "{{ m.role }}:{{ m.content }};",
+        "{%- set ns.prev = m.role -%}",
+        "{%- endfor -%}"
+    );
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": template, "sp_model_kwargs": {"enable_sampling": false}})
+            .to_string(),
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = tokenizer.to_str().unwrap().to_owned();
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    for roles in [
+        vec!["user", "user"],
+        vec!["system", "system", "user"],
+        vec!["user", "assistant", "system", "user"],
+    ] {
+        let messages: Vec<_> = roles
+            .iter()
+            .map(|role| json!({"role": role, "content": "text"}))
+            .collect();
+        let request = json!({"model": MODEL, "messages": messages});
+        assert!(!ctx
+            .tokenizers
+            .encode_chat(MODEL, &request)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let body = captured(&mock);
+        assert_eq!(body["messages"], request["messages"]);
+        assert!(body.get("input_ids").is_none(), "{roles:?}");
+    }
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
+    let request = json!({"model": MODEL, "messages": [
+        {"role": "system", "content": "instructions"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "next"}
+    ]});
+    assert_eq!(send(ctx, request).await, StatusCode::OK);
+    assert!(captured(&mock).get("input_ids").is_some());
 }

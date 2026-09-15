@@ -237,7 +237,7 @@ pub async fn chat_completions(
     // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * `has_chat_formatter` → a chat request on this model yields
+    //   * `has_chat_formatter` -> a chat request on this model yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
@@ -1292,51 +1292,29 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Whether the router's `input_ids` may be forwarded for this request.
+/// Forward generated IDs only for request shapes verified against the engine.
+/// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
-/// We forward only when the engine, fed `input_ids`, would have produced the
-/// SAME prompt the router tokenized. When `input_ids` is present the engine
-/// uses it verbatim and ignores everything that would otherwise steer its
-/// `messages`-side tokenization (only stop tokens / tool-call constraint are
-/// still taken from `messages`). So any request field that changes that
-/// tokenization but which the router's chat formatter does not replicate makes
-/// the forwarded ids wrong. This predicate is conservative by construction —
-/// any such signal returns `false` and the engine tokenizes from `messages`
-/// (always correct).
+/// Exclude requests that may render differently with dynamo-render:
+/// - Non-leading system turns or consecutive users, which strict templates rewrite.
+/// - Historical `reasoning_content`, which may be injected into message content.
+/// - Tools and tool-call history, which the engine merges and normalizes
+///   before rendering.
+/// - Non-string or missing content, which the engine flattens or blanks.
+/// - Template overrides, kwargs, reasoning controls, or task selection.
+/// - Assistant continuations, whose final turn the engine handles separately.
 ///
-/// Replicated-and-safe: plain text `messages` with a string `content`.
-/// Not replicated → omit:
-///   * `tools` / `functions` — the formatter doesn't render tool schemas.
-///   * non-string or missing `content` (arrays, `null`): the engine normalizes
-///     these before rendering; the router's formatter renders them verbatim.
-///   * `chat_template` — an OpenAI-compatible per-request template override
-///     (e.g. vLLM); the router renders with the model's default template, so a
-///     custom one would diverge. (SGLang ignores it today, but block it so the
-///     offload stays correct across engines / future versions.)
-///   * `chat_template_kwargs` (carries `enable_thinking`/`thinking`),
-///     `reasoning` / `reasoning_effort`, `task` — thinking/mode toggles the
-///     formatter renders in the engine's default mode only.
-///   * `continue_final_message: true`, or a trailing `assistant` message — the
-///     engine rewrites/strips the final assistant turn; the formatter renders it
-///     verbatim.
-///
-/// NOTE: the router's chat formatter renders in the engine's default
-/// (non-thinking) mode. Current sglang derives thinking from the request
-/// (`chat_template_kwargs`), which this guard already omits, so a plain request
-/// the router rendered matches the engine. The only way to diverge is an engine
-/// build that applies a non-default thinking mode the router can't observe from
-/// the request — the same router↔engine tokenization-parity assumption that
-/// cache-aware routing already depends on. The same assumption covers
-/// `add_special_tokens`: the router renders specials via the chat template, which
-/// matches the engine on tokenizers that auto-add them (the common case); a
-/// tokenizer that does not would diverge by a leading special, again undetectable
-/// from the request.
+/// Matching model files and engine defaults are still required. Worker template
+/// overrides and default kwargs cannot be inferred from the request.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
-    if request_has_tools(value) || request_has_non_text_content(value) {
+    if request_has_tools(value)
+        || request_has_non_text_content(value)
+        || request_has_reasoning_content(value)
+        || request_has_role_rewrites(value)
+    {
         return false;
     }
-    // Fields that steer the engine's template tokenization but which the
-    // router's formatter does not thread through.
+    // Request controls whose rendering has not been verified against the engine.
     for key in [
         "chat_template",
         "chat_template_kwargs",
@@ -1392,23 +1370,61 @@ fn last_message_is_assistant(value: &serde_json::Value) -> bool {
         == Some("assistant")
 }
 
-/// Whether the request carries tool / function definitions. The router's chat
-/// formatter renders only `messages`, so its `input_ids` would omit the tool
-/// schemas the engine's template injects into the prompt — the caller must let
-/// the engine tokenize these itself.
+/// Tool schemas and tool-call history require engine normalization before
+/// rendering: the engine merges message-level `tools` into the template's tools
+/// and parses `tool_calls` arguments; dynamo-render does neither the same way.
 fn request_has_tools(value: &serde_json::Value) -> bool {
-    let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
-            serde_json::Value::Array(a) => !a.is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        })
+    let nonempty = |v: &serde_json::Value| match v {
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
     };
-    nonempty("tools") || nonempty("functions")
+    if ["tools", "functions"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(nonempty))
+    {
+        return true;
+    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    || ["tools", "tool_calls", "function_call"]
+                        .iter()
+                        .any(|key| message.get(key).is_some_and(nonempty))
+            })
+        })
+}
+
+/// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
+fn request_has_reasoning_content(value: &serde_json::Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null())
+            })
+        })
+}
+
+/// Message orders dynamo-render may rewrite for strict templates.
+fn request_has_role_rewrites(value: &serde_json::Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().skip(1).any(|m| m["role"] == "system")
+        || messages
+            .windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user")
 }
 
 /// Detect non-string or missing content, which requires engine tokenization:
-/// the engine normalizes arrays and nulls differently from the router's formatter.
+/// the engine normalizes arrays and nulls differently from dynamo-render.
 fn request_has_non_text_content(value: &serde_json::Value) -> bool {
     value
         .get("messages")
@@ -1668,8 +1684,8 @@ mod tests {
         );
     }
 
-    /// Tool / function requests are detected so the caller omits `input_ids`
-    /// (the router's formatter doesn't render tools).
+    /// Tool schemas and tool-call history are detected so the caller omits
+    /// `input_ids`; empty lists and nulls are not tools.
     #[test]
     fn request_has_tools_detects_tools_and_functions() {
         assert!(request_has_tools(
@@ -1680,6 +1696,14 @@ mod tests {
         ));
         assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
         assert!(!request_has_tools(&serde_json::json!({"messages":[]})));
+        for message in [
+            serde_json::json!({"role":"system","content":"s","tools":[{"type":"function"}]}),
+            serde_json::json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}),
+        ] {
+            assert!(request_has_tools(
+                &serde_json::json!({"messages":[message]})
+            ));
+        }
     }
 
     /// Arrays, nulls, and missing content block `input_ids` forwarding.
@@ -1711,6 +1735,47 @@ mod tests {
         assert!(input_ids_safe_to_forward(&serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}]
         })));
+    }
+
+    #[test]
+    fn reasoning_history_is_an_expected_forwarding_omission() {
+        let mut value = serde_json::json!({"messages": [
+            {"role":"user", "content":"hi"},
+            {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+            {"role":"user", "content":"next"}
+        ]});
+        assert!(!input_ids_safe_to_forward(&value));
+        assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        value["messages"][1]["reasoning_content"] = serde_json::Value::Null;
+        assert!(input_ids_safe_to_forward(&value));
+        value["messages"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        assert!(input_ids_safe_to_forward(&value));
+    }
+
+    #[test]
+    fn role_rewrites_are_expected_forwarding_omissions() {
+        for roles in [
+            vec!["user", "user"],
+            vec!["system", "system", "user"],
+            vec!["user", "assistant", "system", "user"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| serde_json::json!({"role": role, "content": "text"}))
+                .collect();
+            let value = serde_json::json!({"messages": messages});
+            assert!(!input_ids_safe_to_forward(&value), "{roles:?}");
+            assert!(!ingress_tokenize_offload_failed(true, Some(&value), None));
+        }
+        assert!(input_ids_safe_to_forward(&serde_json::json!({"messages": [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]})));
     }
 
     /// Every field the engine honors on the `messages` path but which the
@@ -1820,7 +1885,7 @@ mod tests {
         ));
     }
 
-    /// Non-chat-formatter models never expected the offload → not a failure even
+    /// Non-chat-formatter models never expected the offload -> not a failure even
     /// with no tokens.
     #[test]
     fn offload_failed_false_without_chat_formatter() {
@@ -1828,7 +1893,7 @@ mod tests {
         assert!(!ingress_tokenize_offload_failed(false, Some(&value), None));
     }
 
-    /// A non-chat (no `messages`) request on a chat-formatter model — e.g.
+    /// A non-chat (no `messages`) request on a chat-formatter model, e.g.
     /// `/v1/completions` `prompt` — never expected the chat-encode offload, so
     /// the absence of engine-equivalent ids is not a failure.
     #[test]
