@@ -1467,7 +1467,7 @@ class ModelRunner:
 
     def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
         """Return the model layers used by prefill CUDA graph execution."""
-        return compute_attention_and_moe_layers(layer_model)
+        return compute_attention_and_moe_layers(layer_model, model=self.model)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None

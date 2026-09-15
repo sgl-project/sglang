@@ -30,7 +30,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
 from sglang.srt.utils import add_prefix
 
@@ -141,6 +144,7 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         mtp_layer_found = False
         mtp_weight_patterns = [
             f"mtp_block.{self.mtp_layer_id}",
@@ -167,13 +171,15 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

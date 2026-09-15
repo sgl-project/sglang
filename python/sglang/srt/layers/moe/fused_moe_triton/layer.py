@@ -65,6 +65,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4_humming_moe import (
+    bind_moe_quantization_config,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -449,6 +452,7 @@ class FusedMoE(torch.nn.Module):
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            bind_moe_quantization_config(gpu_method, quant_config, prefix)
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if self.quant_method is None and quant_config is not None:
@@ -459,6 +463,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+            bind_moe_quantization_config(self.quant_method, quant_config, prefix)
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(

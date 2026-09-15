@@ -257,7 +257,13 @@ def get_dynamic_override(
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
 ) -> Union[Dict, int, bool, None]:
-    for pattern, pattern_dict in config.dynamic.items():
+    return config.match_layer(
+        layer_name, _match_dynamic_override, config.dynamic, key, default_value
+    )
+
+
+def _match_dynamic_override(layer_name, dynamic, key, default_value):
+    for pattern, pattern_dict in dynamic.items():
         # Negative match: matched modules are excluded from quantized init
         if pattern.startswith("-:"):
             if re.match(pattern.removeprefix("-:"), layer_name):

@@ -80,9 +80,10 @@ def make_humming_deepep_input_schema(
     return HummingInputSchema(a_dtype="float8e4m3", input_scale_group_size=128)
 
 
-def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
+def prepare_humming_moe_layer(
+    layer: FusedMoE, quant_config: dict, *, input_quant_config: dict
+):
     weight_schema = BaseWeightSchema.from_config(quant_config)
-    input_quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get() or {}
     if humming_is_layer_skipped(input_quant_config, layer.layer_name):
         input_schema = HummingInputSchema()
     else:

@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.model_loader.weight_utils import get_checkpoint_name_mapper
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import add_prefix
 
@@ -72,7 +73,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             inter_size = config.intermediate_size
 
         self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -312,6 +317,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
@@ -348,9 +354,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param_name = f"model.{name}" if name not in params_dict else name
-                if param_name in params_dict:
-                    param = params_dict[param_name]
+                param_name = (
+                    f"model.{name}"
+                    if map_weight_name(name) not in params_dict
+                    else name
+                )
+                registered_param_name = map_weight_name(param_name)
+                if registered_param_name in params_dict:
+                    param = params_dict[registered_param_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -358,9 +369,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 break
             else:
                 # Handle regular parameters
-                param_name = name if name in params_dict else f"model.{name}"
-                if param_name in params_dict:
-                    param = params_dict[param_name]
+                param_name = (
+                    name if map_weight_name(name) in params_dict else f"model.{name}"
+                )
+                registered_param_name = map_weight_name(param_name)
+                if registered_param_name in params_dict:
+                    param = params_dict[registered_param_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

@@ -47,7 +47,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -573,6 +576,7 @@ class MossVLVisionModel(nn.Module):
         return x
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("attn.qkv.", "attn.q.", "q"),
             ("attn.qkv.", "attn.k.", "k"),
@@ -586,15 +590,18 @@ class MossVLVisionModel(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -1672,6 +1679,7 @@ class MossVLForConditionalGeneration(nn.Module):
     # ---- Weight Loading ----
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1709,11 +1717,15 @@ class MossVLForConditionalGeneration(nn.Module):
                     if weight_name not in name:
                         continue
                     mapped_name = name.replace(weight_name, param_name)
-                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    if (
+                        mapped_name.endswith(".bias")
+                        and map_weight_name(mapped_name) not in params_dict
+                    ):
                         handled = True
                         break
-                    if mapped_name in params_dict:
-                        param = params_dict[mapped_name]
+                    registered_mapped_name = map_weight_name(mapped_name)
+                    if registered_mapped_name in params_dict:
+                        param = params_dict[registered_mapped_name]
                         param.weight_loader(param, loaded_weight, shard_id)
                         handled = True
                     break
@@ -1721,11 +1733,12 @@ class MossVLForConditionalGeneration(nn.Module):
             if handled:
                 continue
 
-            if name.endswith(".bias") and name not in params_dict:
+            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                 continue
 
-            if name in params_dict:
-                param = params_dict[name]
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:

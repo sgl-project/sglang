@@ -16,7 +16,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -118,6 +121,7 @@ class MiMoMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -137,7 +141,10 @@ class MiMoMTP(nn.Module):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
+            if (
+                name.startswith("model.vision_tower")
+                and map_weight_name(name) not in params_dict
+            ):
                 continue
             name = self.map_model_name_to_mtp_param_name(name)
 
@@ -148,15 +155,16 @@ class MiMoMTP(nn.Module):
                     break
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 if "mtp_block" not in name and (
                     "embed_tokens" not in name
@@ -167,7 +175,8 @@ class MiMoMTP(nn.Module):
                     and "final_layernorm" not in name
                 ):
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

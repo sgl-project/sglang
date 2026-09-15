@@ -52,7 +52,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.utils import get_default_hidden_dim
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
@@ -727,6 +730,7 @@ class LagunaForCausalLM(nn.Module):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -783,11 +787,15 @@ class LagunaForCausalLM(nn.Module):
                 if "mlp.experts." in name:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
+                if (
+                    name_mapped.endswith(".bias")
+                    and map_weight_name(name_mapped) not in params_dict
+                ):
                     continue
-                if name_mapped not in params_dict:
+                registered_name_mapped = map_weight_name(name_mapped)
+                if registered_name_mapped not in params_dict:
                     continue
-                param = params_dict[name_mapped]
+                param = params_dict[registered_name_mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
                 matched_stacked = True
                 break
@@ -799,9 +807,10 @@ class LagunaForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                if name_mapped not in params_dict:
+                registered_name_mapped = map_weight_name(name_mapped)
+                if registered_name_mapped not in params_dict:
                     continue
-                param = params_dict[name_mapped]
+                param = params_dict[registered_name_mapped]
                 param.weight_loader(
                     param,
                     loaded_weight,
@@ -816,9 +825,10 @@ class LagunaForCausalLM(nn.Module):
             if matched_expert:
                 continue
 
-            if name.endswith(".bias") and name not in params_dict:
+            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                 continue
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 if ".g_proj." in name:
                     raise RuntimeError(
                         f"Checkpoint provides gate weight {name!r} but the model built no "
@@ -827,7 +837,7 @@ class LagunaForCausalLM(nn.Module):
                     )
                 logger.warning("Parameter %s not found in params_dict", name)
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

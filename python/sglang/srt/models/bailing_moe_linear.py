@@ -55,7 +55,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
@@ -1380,12 +1383,15 @@ class BailingMoELinearForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
     ) -> Set[str]:
+        map_weight_name = get_checkpoint_name_mapper(self)
+
         def load_linear_attn_weight(
             name: str, loaded_weight: torch.Tensor, self
         ) -> None:
             if is_pp_missing_parameter(name, self):
                 return
-            param = params_dict[name]
+            registered_name = map_weight_name(name)
+            param = params_dict[registered_name]
             weight_loader = getattr(
                 param, "weight_loader", BailingMoELinearAttention.weight_direct_load
             )
@@ -1476,14 +1482,15 @@ class BailingMoELinearForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1494,11 +1501,12 @@ class BailingMoELinearForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1509,7 +1517,10 @@ class BailingMoELinearForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
                     if "slope" in name:
                         continue
@@ -1554,9 +1565,10 @@ class BailingMoELinearForCausalLM(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
-                            if param_name not in params_dict:
+                            registered_param_name = map_weight_name(param_name)
+                            if registered_param_name not in params_dict:
                                 continue
-                            param = params_dict[param_name]
+                            param = params_dict[registered_param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -1565,9 +1577,11 @@ class BailingMoELinearForCausalLM(nn.Module):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-                        if name not in params_dict:
+                        registered_name = map_weight_name(name)
+                        if registered_name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
-                            if name not in params_dict:
+                            registered_name = map_weight_name(name)
+                            if registered_name not in params_dict:
                                 continue
                         if is_pp_missing_parameter(name, self):
                             continue
@@ -1577,15 +1591,18 @@ class BailingMoELinearForCausalLM(nn.Module):
                             and is_linear_layer(layer_idx, self.model.layer_group_size)
                         ):
                             load_linear_attn_weight(name, loaded_weight, self)
-                            loaded_params.add(name)
+                            registered_name = map_weight_name(name)
+                            loaded_params.add(registered_name)
                             continue
 
-                        param = params_dict[name]
+                        registered_name = map_weight_name(name)
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         return loaded_params

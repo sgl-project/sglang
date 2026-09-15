@@ -26,6 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import get_checkpoint_name_mapper
 from sglang.srt.models import mixtral
 from sglang.srt.models.granite import build_attention_sinks, granite_layer_attn_params
 from sglang.srt.models.utils import WeightsMapper
@@ -501,6 +502,7 @@ class GraniteMoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = granitemoe_split_expert_weights(
             self.hf_to_sglang_mapper.apply(weights)
         )
@@ -509,7 +511,9 @@ class GraniteMoeForCausalLM(nn.Module):
             expert_params_mapping=self._split_expert_params_mapping(),
             params_dict=dict(self.named_parameters()),
         )
-        mixtral.MixtralForCausalLM.load_weights(self, weights)
+        mixtral.MixtralForCausalLM.load_weights(
+            self, ((map_weight_name(name), weight) for name, weight in weights)
+        )
 
 
 class GraniteMoeSharedForCausalLM(GraniteMoeForCausalLM):

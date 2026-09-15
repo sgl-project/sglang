@@ -329,8 +329,11 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.exclude_modules,
+                self.packed_modules_mapping,
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
@@ -367,6 +370,9 @@ class ModelOptQuantConfig(QuantizationConfig):
             self.exclude_modules = list(dict.fromkeys(expanded))
 
     def is_layer_excluded(self, prefix: str) -> bool:
+        return self.match_layer(prefix, self._is_layer_excluded)
+
+    def _is_layer_excluded(self, prefix: str) -> bool:
         """Check if a layer should be excluded from quantization.
 
         Handles:
@@ -953,6 +959,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             )
 
     def _resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        return self.match_layer(prefix, self._lookup_quant_algo)
+
+    def _lookup_quant_algo(self, prefix: str) -> Optional[str]:
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:
                 return self.quantized_layers[candidate]["quant_algo"].upper()
@@ -1023,8 +1032,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         quant_algo = self._resolve_quant_algo(prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.exclude_modules,
+                self.packed_modules_mapping,
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
@@ -1044,8 +1056,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.
         if isinstance(layer, VocabParallelEmbedding):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.exclude_modules,
+                self.packed_modules_mapping,
             ) or self.is_layer_excluded(prefix):
                 return None
             if quant_algo == "NVFP4":

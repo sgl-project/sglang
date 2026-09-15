@@ -102,8 +102,9 @@ class Mxfp4W4A4Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
+            if self.match_layer(
                 prefix,
+                is_layer_skipped,
                 self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):

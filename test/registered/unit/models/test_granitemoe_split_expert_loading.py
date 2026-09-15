@@ -14,14 +14,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+from torch import nn
 
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.models.granitemoe import (
+    GraniteMoeDecoderLayer,
+    GraniteMoeSharedForCausalLM,
+    GraniteMoeSWAForCausalLM,
     _is_packed_expert,
     granitemoe_load_split_experts,
 )
+from sglang.srt.models.mixtral import logger as mixtral_logger
 from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 4
@@ -172,6 +179,50 @@ class TestGraniteMoeLoadSplitExperts(CustomTestCase):
         with self.assertRaises(ValueError) as ctx:
             _run(weights)
         self.assertIn("unmatched MoE expert tensor", str(ctx.exception))
+
+
+class TestGraniteSharedWeightLoading(CustomTestCase):
+    def test_shared_projections_load_legacy_and_registered_names(self):
+        for model_cls in (GraniteMoeSharedForCausalLM, GraniteMoeSWAForCausalLM):
+            with self.subTest(model=model_cls.__name__):
+                model = model_cls.__new__(model_cls)
+                nn.Module.__init__(model)
+                model.config = SimpleNamespace(num_local_experts=2)
+                model.model = nn.Module()
+                model.model.start_layer, model.model.end_layer = 0, 1
+                layer = GraniteMoeDecoderLayer.__new__(GraniteMoeDecoderLayer)
+                nn.Module.__init__(layer)
+                layer.shared_mlp = nn.Module()
+                layer.shared_mlp.input_linear = nn.Linear(4, 12, bias=False)
+                layer.shared_mlp.output_linear = nn.Linear(6, 4, bias=False)
+                model.model.layers = nn.ModuleList([layer])
+                pointers = {n: p.data_ptr() for n, p in model.named_parameters()}
+
+                for member, value in (("shared_mlp", 2.0), ("shared_mlp", 4.0)):
+                    weights = [
+                        (
+                            f"model.layers.0.{member}.input_linear.weight",
+                            torch.full((12, 4), value),
+                        ),
+                        (
+                            f"model.layers.0.{member}.output_linear.weight",
+                            torch.full((4, 6), value + 1),
+                        ),
+                    ]
+                    for param in model.parameters():
+                        param.data.fill_(-1)
+                    with patch.object(mixtral_logger, "warning") as warning:
+                        model.load_weights(iter(weights))
+                    warning.assert_not_called()
+                    torch.testing.assert_close(
+                        layer.shared_mlp.input_linear.weight, weights[0][1]
+                    )
+                    torch.testing.assert_close(
+                        layer.shared_mlp.output_linear.weight, weights[1][1]
+                    )
+                    self.assertEqual(
+                        pointers, {n: p.data_ptr() for n, p in model.named_parameters()}
+                    )
 
 
 class TestIsPackedExpert(CustomTestCase):

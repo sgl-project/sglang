@@ -22,21 +22,33 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
 class PersimmonMLP(nn.Module):
     def __init__(
-        self, config: PersimmonConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: PersimmonConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dense_h_to_4h = ColumnParallelLinear(
-            config.hidden_size, config.intermediate_size, quant_config=quant_config
+            config.hidden_size,
+            config.intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_h_to_4h", prefix),
         )
         self.dense_4h_to_h = RowParallelLinear(
-            config.intermediate_size, config.hidden_size, quant_config=quant_config
+            config.intermediate_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_4h_to_h", prefix),
         )
         self.act = get_act_fn(config.hidden_act)
 
@@ -157,7 +169,9 @@ class PersimmonDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PersimmonMLP(config, quant_config=quant_config)
+        self.mlp = PersimmonMLP(
+            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
@@ -297,16 +311,18 @@ class PersimmonForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 if name == "lm_head.weight":
                     continue
                 print(f"Warning: weight {name} not found in model.")
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             if "query_key_value" in name:
                 output_dim = getattr(param, "output_dim", None)
                 if output_dim is not None:

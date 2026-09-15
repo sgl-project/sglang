@@ -125,7 +125,9 @@ class GGUFConfig(QuantizationConfig):
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_gguf, self.modules_to_not_convert
+            ):
                 return UnquantizedLinearMethod()
             if _is_npu:
                 return GGUFLinearAscendMethod(self)

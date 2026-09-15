@@ -141,19 +141,25 @@ class AWQConfig(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if self.match_layer(
+                    prefix, is_layer_skipped_awq, self.modules_to_not_convert
+                ):
                     return UnquantizedLinearMethod()
                 layer.scheme = self.get_linear_scheme(layer)
                 return AWQLinearMethod(self)
             elif isinstance(layer, FusedMoE):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if self.match_layer(
+                    prefix, is_layer_skipped_awq, self.modules_to_not_convert
+                ):
                     return None
                 layer.scheme = self.get_moe_scheme(layer)
                 return AWQMoEMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_awq, self.modules_to_not_convert
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
@@ -190,12 +196,16 @@ class AWQCPUConfig(AWQConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_awq, self.modules_to_not_convert
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_awq, self.modules_to_not_convert
+            ):
                 return None
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
@@ -362,7 +372,9 @@ class AWQMarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_awq, self.modules_to_not_convert
+            ):
                 return UnquantizedLinearMethod()
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
@@ -370,13 +382,15 @@ class AWQMarlinConfig(QuantizationConfig):
                     "Layer '%s' is not supported by AWQMarlin. Falling back to unoptimized AWQ kernels.",  # noqa: E501
                     prefix,
                 )
-                return AWQConfig.from_config(self.full_config).get_quant_method(
-                    layer, prefix
+                return self.delegate(
+                    AWQConfig.from_config(self.full_config), layer, prefix
                 )
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if self.match_layer(
+                prefix, is_layer_skipped_awq, self.modules_to_not_convert
+            ):
                 return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -385,8 +399,8 @@ class AWQMarlinConfig(QuantizationConfig):
                     f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
                     "Falling back to Moe WNA16 kernels."
                 )
-                return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-                    layer, prefix
+                return self.delegate(
+                    MoeWNA16Config.from_config(self.full_config), layer, prefix
                 )
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)

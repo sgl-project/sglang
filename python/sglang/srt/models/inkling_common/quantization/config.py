@@ -107,6 +107,9 @@ class InklingQuantizationConfigBase:
         ) == (4, 3)
 
     def exclude_layer(self, prefix: str) -> bool:
+        return self.match_layer(prefix, self._exclude_layer)
+
+    def _exclude_layer(self, prefix: str) -> bool:
         if len(self.exclude_modules) == 0:
             return False
         return any(

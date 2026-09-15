@@ -23,7 +23,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -99,7 +102,10 @@ class PhiAttention(nn.Module):
 
 class PhiMLP(nn.Module):
     def __init__(
-        self, config: PhiConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: PhiConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -110,11 +116,13 @@ class PhiMLP(nn.Module):
             config.hidden_size,
             n_inner,
             quant_config=quant_config,
+            prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
             n_inner,
             config.hidden_size,
             quant_config=quant_config,
+            prefix=add_prefix("fc2", prefix),
         )
         self.act = get_act_fn(config.hidden_act)
 
@@ -143,7 +151,7 @@ class PhiLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PhiMLP(config, quant_config)
+        self.mlp = PhiMLP(config, quant_config, prefix=add_prefix("mlp", prefix))
 
     def forward(
         self,
@@ -276,8 +284,9 @@ class PhiForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
-        weights = dict(weights)
+        weights = dict((map_weight_name(name), weight) for name, weight in weights)
         loaded_keys = set()
 
         for name, param in params_dict.items():

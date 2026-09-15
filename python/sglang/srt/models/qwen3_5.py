@@ -86,6 +86,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -1880,6 +1881,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1925,29 +1927,32 @@ class Qwen3_5ForCausalLM(nn.Module):
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
     @classmethod
@@ -1969,6 +1974,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2022,9 +2028,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             shard_id: str,
             num_experts: int,
         ):
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 return False
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
@@ -2080,13 +2087,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2131,10 +2142,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        param = params_dict[registered_name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
@@ -2154,18 +2166,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
         return loaded_params
 
@@ -2235,6 +2252,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2289,14 +2307,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2308,12 +2327,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2327,7 +2347,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         param_lm_head, "weight_loader", default_weight_loader
                     )
                     weight_loader(param_lm_head, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -2405,6 +2426,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2495,9 +2517,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_id: str,
             num_experts: int,
         ):
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 return False
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
@@ -2574,13 +2597,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2629,11 +2656,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             )
                         elif self.enable_shared_expert_fusion:
                             # shared experts should be loaded to experts.w13_weight and experts.w2_weight
-                            param = params_dict[name_mapped]
+                            registered_name_mapped = map_weight_name(name_mapped)
+                            param = params_dict[registered_name_mapped]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            param = params_dict[name_mapped]
+                            param = params_dict[registered_name_mapped]
                             if f"{num_experts}.gate_up_proj" in name:
                                 # split into w1 and w3
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -2667,10 +2695,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         # Skip loading extra parameters for GPTQ models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        param = params_dict[registered_name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
@@ -2695,18 +2724,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {

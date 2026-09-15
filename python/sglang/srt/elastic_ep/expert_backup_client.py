@@ -14,6 +14,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
+from sglang.srt.model_loader.weight_utils import get_checkpoint_name_mapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -94,7 +95,9 @@ class ExpertBackupClient:
 
         self.transfer_engine = get_mooncake_transfer_engine()
 
-        self.params_dict = dict(self._get_model().named_parameters())
+        model = self._get_model()
+        self.map_weight_name = get_checkpoint_name_mapper(model)
+        self.params_dict = dict(model.named_parameters())
         for name, param in self.params_dict.items():
             param_data = param.data
             ret_value = self.transfer_engine.engine.register_memory(
@@ -137,6 +140,7 @@ class ExpertBackupClient:
                     raise RuntimeError(f"Unknown weight name {weight_name}")
 
                 name = name.replace(f"experts.{expert_id}.{weight_name}.", param_name)
+                name = self.map_weight_name(name)
                 weight_param = self.params_dict[name]
 
                 physical_expert_ids = (

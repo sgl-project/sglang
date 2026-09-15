@@ -42,7 +42,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -335,16 +338,18 @@ class VariableResolutionResamplerModel(nn.Module):
         return x
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -730,6 +735,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -766,14 +772,17 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
 
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("mlp.experts." in name) and map_weight_name(
+                    name
+                ) not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -823,11 +832,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    ) and map_weight_name(name) not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -857,11 +867,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    ) and map_weight_name(name) not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

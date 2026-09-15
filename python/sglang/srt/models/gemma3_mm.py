@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
@@ -427,6 +428,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -445,7 +447,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 causal_loaded_params = Gemma3ForCausalLM.load_weights(
                     self, [(name, loaded_weight)]
                 )
-                loaded_params.update(causal_loaded_params)
+                loaded_params.update(
+                    {map_weight_name(name) for name in (causal_loaded_params)}
+                )
                 continue
             else:
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -453,9 +457,13 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
                     break
@@ -464,18 +472,23 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                         # adapt to VisionAttention
                         name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                     # Skip loading extra bias for GPTQ models
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
                     # Remapping the name of FP8 kv-scale
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                registered_name = map_weight_name(name)
+                loaded_params.add(registered_name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             pass

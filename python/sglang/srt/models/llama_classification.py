@@ -26,7 +26,10 @@ from sglang.srt.layers.pooler import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 from sglang.srt.utils import add_prefix
 
@@ -73,11 +76,13 @@ class LlamaForClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if "classification_head" in name:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             elif "lm_head" in name:

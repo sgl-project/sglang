@@ -16,7 +16,10 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.runtime_context import get_mm, get_parallel
@@ -110,6 +113,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        map_weight_name = get_checkpoint_name_mapper(self)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -210,12 +214,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -232,11 +237,12 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         # Expert weight not on this rank, will be skipped below
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -256,13 +262,17 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

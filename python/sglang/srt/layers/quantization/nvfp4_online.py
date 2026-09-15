@@ -139,21 +139,30 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.exclude_modules,
+                self.packed_modules_mapping,
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
         if isinstance(layer, FusedMoE):
-            source_layer_ignored = is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
+            source_layer_ignored = self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.exclude_modules,
+                self.packed_modules_mapping,
             ) or self.is_layer_excluded(prefix)
             if source_layer_ignored and not self.use_per_token_activation:
                 return None
-            if is_layer_skipped(
-                prefix, self.fp4_ignored_layers, self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.fp4_ignored_layers,
+                self.packed_modules_mapping,
             ):
                 if self.is_checkpoint_fp8_serialized and not source_layer_ignored:
                     return Fp8MoEMethod(self)

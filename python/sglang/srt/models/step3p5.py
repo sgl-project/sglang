@@ -45,7 +45,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
@@ -887,6 +890,8 @@ class Step3p5ForCausalLM(nn.Module):
         # so we must safely skip them (or load them only when a corresponding
         # nextn model is implemented).
 
+        map_weight_name = get_checkpoint_name_mapper(self)
+
         def _get_layer_id_from_weight_name(weight_name: str) -> Optional[int]:
             # Expected format: "model.layers.<id>...."
             parts = weight_name.split(".")
@@ -965,32 +970,35 @@ class Step3p5ForCausalLM(nn.Module):
                 if "gate." not in name and "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     # Extra / unsupported weights (e.g. nextn) should not crash loading.
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 break
             else:
                 if "moe" not in name or "router_bias" in name:
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    loaded_params.add(registered_name)
                 else:
                     if "gate." in name:
-                        if name not in params_dict:
+                        registered_name = map_weight_name(name)
+                        if registered_name not in params_dict:
                             continue
-                        param = params_dict[name]
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight)
-                        loaded_params.add(name)
+                        loaded_params.add(registered_name)
                         continue
 
                     for mapping in expert_params_mapping:
@@ -1002,9 +1010,12 @@ class Step3p5ForCausalLM(nn.Module):
                         part_name = weight_name.split(".")[-2]
                         fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
-                        if actual_param_name not in params_dict:
+                        registered_actual_param_name = map_weight_name(
+                            actual_param_name
+                        )
+                        if registered_actual_param_name not in params_dict:
                             continue
-                        param = params_dict[actual_param_name]
+                        param = params_dict[registered_actual_param_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -1013,7 +1024,7 @@ class Step3p5ForCausalLM(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                        loaded_params.add(actual_param_name)
+                        loaded_params.add(registered_actual_param_name)
 
         # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
         # are computed in process_weights_after_loading, not loaded from checkpoint.

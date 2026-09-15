@@ -45,7 +45,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
@@ -472,6 +475,7 @@ class LlavaBaseForCausalLM(nn.Module):
         # Load clip vision model by cfg['mm_vision_tower']:
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
+        map_weight_name = get_checkpoint_name_mapper(self)
         vision_path = self.config.mm_vision_tower
         device = next(self.language_model.parameters()).device
         if "clip" in vision_path:
@@ -523,7 +527,8 @@ class LlavaBaseForCausalLM(nn.Module):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:
@@ -859,6 +864,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
+        map_weight_name = get_checkpoint_name_mapper(self)
         if (
             self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"
@@ -882,7 +888,8 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
                     getattr(self, part).load_weights([(name, loaded_weight)])
                     break
             else:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

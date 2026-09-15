@@ -38,7 +38,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.runtime_context import get_parallel
@@ -344,6 +347,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
@@ -352,13 +356,15 @@ class Ernie4_5_ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -372,6 +378,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -395,10 +402,13 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("mlp.experts." in name) and map_weight_name(
+                    name
+                ) not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -408,8 +418,9 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -424,8 +435,9 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                         )
                     break
                 else:
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

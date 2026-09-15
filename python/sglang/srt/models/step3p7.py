@@ -17,7 +17,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -157,6 +160,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
         self.language_model.set_embed_and_head(embed, head)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = list(weights)
 
         vision_weights = []
@@ -185,9 +189,10 @@ class Step3p7ForConditionalGeneration(nn.Module):
         # Load vision tower weights
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in vision_weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

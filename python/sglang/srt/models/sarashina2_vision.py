@@ -29,7 +29,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
 from sglang.srt.utils import add_prefix
@@ -174,6 +177,7 @@ class Sarashina2VisionForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
+        map_weight_name = get_checkpoint_name_mapper(self)
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
@@ -187,13 +191,14 @@ class Sarashina2VisionForCausalLM(nn.Module):
             # Map visual attention weights: qkv -> qkv_proj
             if ".attn.qkv." in name:
                 mapped_name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
-                if mapped_name in params_dict:
-                    param = params_dict[mapped_name]
+                registered_mapped_name = map_weight_name(mapped_name)
+                if registered_mapped_name in params_dict:
+                    param = params_dict[registered_mapped_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(mapped_name)
+                    loaded_params.add(registered_mapped_name)
                     continue
 
             # Handle Llama attention weights - need to fuse q, k, v into qkv
@@ -226,41 +231,44 @@ class Sarashina2VisionForCausalLM(nn.Module):
                 continue
 
             # Direct mapping for other weights
-            if name in params_dict:
-                param = params_dict[name]
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
 
         # Fuse QKV weights for Llama attention layers
         for base, weights_dict in qkv_weights.items():
             if "q" in weights_dict and "k" in weights_dict and "v" in weights_dict:
                 qkv_name = f"{base}.qkv_proj.weight"
-                if qkv_name in params_dict:
+                registered_qkv_name = map_weight_name(qkv_name)
+                if registered_qkv_name in params_dict:
                     # Concatenate q, k, v weights
                     q, k, v = weights_dict["q"], weights_dict["k"], weights_dict["v"]
                     qkv = torch.cat([q, k, v], dim=0)
-                    param = params_dict[qkv_name]
+                    param = params_dict[registered_qkv_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, qkv)
-                    loaded_params.add(qkv_name)
+                    loaded_params.add(registered_qkv_name)
 
         # Fuse gate and up weights for Llama MLP layers
         for base, weights_dict in gate_up_weights.items():
             if "gate" in weights_dict and "up" in weights_dict:
                 gate_up_name = f"{base}.gate_up_proj.weight"
-                if gate_up_name in params_dict:
+                registered_gate_up_name = map_weight_name(gate_up_name)
+                if registered_gate_up_name in params_dict:
                     # Concatenate gate and up weights
                     gate, up = weights_dict["gate"], weights_dict["up"]
                     gate_up = torch.cat([gate, up], dim=0)
-                    param = params_dict[gate_up_name]
+                    param = params_dict[registered_gate_up_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, gate_up)
-                    loaded_params.add(gate_up_name)
+                    loaded_params.add(registered_gate_up_name)
 
 
 # Register the model

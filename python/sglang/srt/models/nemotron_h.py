@@ -78,6 +78,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
     replace_prefix,
     replace_substrings,
@@ -1184,6 +1185,7 @@ class NemotronHForCausalLM(nn.Module):
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
         #   using non-gated MoE
+        map_weight_name = get_checkpoint_name_mapper(self)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="up_proj",
             ckpt_down_proj_name="down_proj",
@@ -1225,7 +1227,8 @@ class NemotronHForCausalLM(nn.Module):
                 continue
 
             if "scale" in name:
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
@@ -1254,11 +1257,12 @@ class NemotronHForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1270,9 +1274,10 @@ class NemotronHForCausalLM(nn.Module):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
-                    if name_mapped not in params_dict:
+                    registered_name_mapped = map_weight_name(name_mapped)
+                    if registered_name_mapped not in params_dict:
                         continue
-                    param = params_dict[name_mapped]
+                    param = params_dict[registered_name_mapped]
                     param.weight_loader(
                         param,
                         loaded_weight,
@@ -1286,10 +1291,14 @@ class NemotronHForCausalLM(nn.Module):
                     if is_expert_weight:
                         continue
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

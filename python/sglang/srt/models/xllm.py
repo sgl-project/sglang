@@ -81,7 +81,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -1768,6 +1771,7 @@ class XllmForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = self.stacked_params_mapping
         expert_params_mapping = self.expert_params_mapping
         strict_checkpoint = getattr(self.config, "model_type", None) in (
@@ -1824,7 +1828,7 @@ class XllmForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     if strict_checkpoint:
                         raise RuntimeError(
                             "xLLM-family checkpoint weight did not resolve to "
@@ -1832,7 +1836,8 @@ class XllmForCausalLM(nn.Module):
                             f"checkpoint={checkpoint_name!r}, mapped={name!r}"
                         )
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     if strict_checkpoint:
                         raise RuntimeError(
                             "xLLM-family checkpoint weight did not resolve to "
@@ -1841,7 +1846,7 @@ class XllmForCausalLM(nn.Module):
                         )
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1851,7 +1856,8 @@ class XllmForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1864,7 +1870,10 @@ class XllmForCausalLM(nn.Module):
                 else:
                     if is_pipeline_missing_weight(name):
                         continue
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         if strict_checkpoint:
                             raise RuntimeError(
                                 "xLLM-family checkpoint weight did not resolve "
@@ -1872,7 +1881,8 @@ class XllmForCausalLM(nn.Module):
                                 f"checkpoint={checkpoint_name!r}, mapped={name!r}"
                             )
                         continue
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         if strict_checkpoint:
                             raise RuntimeError(
                                 "xLLM-family checkpoint weight did not resolve "
@@ -1881,7 +1891,7 @@ class XllmForCausalLM(nn.Module):
                             )
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

@@ -9,7 +9,10 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.qwen3_moe import Qwen3MoeAttention, Qwen3MoeDecoderLayer
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
@@ -211,6 +214,7 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
     def _load_fope_weights(self, name: str, loaded_weight: torch.Tensor, params_dict):
         """load fope weights"""
+        map_weight_name = get_checkpoint_name_mapper(self)
         attn_tp_size = get_parallel().attn_tp_size
         attn_tp_rank = get_parallel().attn_tp_rank
 
@@ -224,8 +228,9 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
         # rotary_emb is shared cross layers
         param_name = name.replace(".rotary_emb.", ".layers.0.self_attn.rotary_emb.")
-        assert param_name in params_dict
-        param = params_dict[param_name]
+        registered_param_name = map_weight_name(param_name)
+        assert registered_param_name in params_dict
+        param = params_dict[registered_param_name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
 

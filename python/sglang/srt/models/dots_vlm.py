@@ -31,7 +31,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 from .dots_vlm_vit import DotsVisionTransformer
@@ -98,6 +101,7 @@ class DotsVLMForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
+        map_weight_name = get_checkpoint_name_mapper(self)
         weights = list(weights)
 
         # Separate vision tower weights and language model weights
@@ -117,9 +121,10 @@ class DotsVLMForCausalLM(nn.Module):
             vision_state_dict = dict(vision_weights)
             params_dict = dict(self.named_parameters(remove_duplicate=False))
             for name, loaded_weight in vision_state_dict.items():
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     raise ValueError(f"Weight {name} not found in params_dict")
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
                 weight_loader(param, loaded_weight)

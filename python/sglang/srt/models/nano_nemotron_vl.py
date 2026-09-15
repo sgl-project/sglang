@@ -36,7 +36,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
@@ -363,6 +366,7 @@ class NemotronH_Nano_VL_V2(EVS):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         adapter_dict = dict(self.mlp1.named_parameters())
 
         def is_llm(name: str) -> bool:
@@ -383,7 +387,8 @@ class NemotronH_Nano_VL_V2(EVS):
                     yield (".".join(name.split(".")[1:]), w)
                 elif is_adapter_weights((name, w)):
                     trimmed_name = ".".join(name.split(".")[1:])
-                    param = adapter_dict[trimmed_name]
+                    registered_trimmed_name = map_weight_name(trimmed_name)
+                    param = adapter_dict[registered_trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_vision_weights(name):
@@ -433,6 +438,7 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         return self.vision_final_layernorm(features)
 
     def _load_extra_weight(self, name: str, weight: torch.Tensor) -> None:
+        map_weight_name = get_checkpoint_name_mapper(self)
         prefix = "vision_projector.vision_final_layernorm."
         if not name.startswith(prefix):
             raise ValueError(f"Unexpected Nemotron-H Omni weight: {name}")
@@ -440,9 +446,10 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
             raise ValueError(f"Unexpected vision projector weight: {name}")
         parameter_name = name.removeprefix(prefix)
         parameters = dict(self.vision_final_layernorm.named_parameters())
-        if parameter_name not in parameters:
+        registered_parameter_name = map_weight_name(parameter_name)
+        if registered_parameter_name not in parameters:
             raise ValueError(f"Unexpected vision projector weight: {name}")
-        parameter = parameters[parameter_name]
+        parameter = parameters[registered_parameter_name]
         default_weight_loader(parameter, weight)
 
     @classmethod

@@ -379,8 +379,9 @@ class QuarkConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
-        if should_ignore_layer(
+        if self.match_layer(
             prefix,
+            should_ignore_layer,
             ignore=self.exclude_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
@@ -786,6 +787,10 @@ class QuarkConfig(QuantizationConfig):
         self, layer_name: str, module: torch.nn.Module
     ) -> dict[str, Any]:
 
+        return self.match_layer(layer_name, self._find_config, module)
+
+    def _find_config(self, layer_name: str, module: torch.nn.Module) -> dict[str, Any]:
+
         proj_name = layer_name.split(".")[-1]
         if proj_name in self.packed_modules_mapping:
             shard_proj_names = self.packed_modules_mapping[proj_name]
@@ -796,8 +801,7 @@ class QuarkConfig(QuantizationConfig):
                 for shard_proj_name in shard_proj_names
             ]
             shard_configs = [
-                self._find_matched_config(shard_name, module)
-                for shard_name in shard_names
+                self._find_config(shard_name, module) for shard_name in shard_names
             ]
             if not all(
                 deep_compare(q_config, shard_configs[0]) for q_config in shard_configs

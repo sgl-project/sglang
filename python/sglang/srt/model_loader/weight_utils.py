@@ -1584,6 +1584,59 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
+def get_module_checkpoint_name_mapping(module: torch.nn.Module) -> dict[str, str]:
+    """Read one module's explicit member declarations, including its mixins."""
+    mapping = {}
+    for cls in reversed(type(module).__mro__):
+        mapping.update(vars(cls).get("checkpoint_name_mapping", {}))
+    mapping.update(vars(module).get("checkpoint_name_mapping", {}))
+    return mapping
+
+
+def get_checkpoint_name_mapper(
+    model: torch.nn.Module, *, recurse: bool = True
+) -> Callable[[str], str]:
+    """Compose model-declared checkpoint member names into registered paths.
+
+    A module may declare ``checkpoint_name_mapping = {external: registered}``
+    for its immediate members. Rules are scoped to that module and applied
+    from outermost to innermost; undeclared components pass through unchanged.
+    This does not inspect parameter keys or invent aliases. Build it once at
+    the loading boundary, after the model has registered its modules.
+    """
+    rules = {}
+    modules = model.named_modules(remove_duplicate=False) if recurse else [("", model)]
+    for prefix, module in modules:
+        for external, registered in get_module_checkpoint_name_mapping(module).items():
+            rules[(prefix, external)] = registered
+
+    def map_name(name: str) -> str:
+        parts = []
+        for component in name.split("."):
+            parts.append(rules.get((".".join(parts), component), component))
+        return ".".join(parts)
+
+    return map_name
+
+
+def map_state_dict_names(state, map_name: Callable[[str], str]):
+    """Map checkpoint keys and module metadata before strict state loading."""
+
+    def map_items(items):
+        result = collections.OrderedDict()
+        for name, value in items:
+            target = map_name(name)
+            if target in result:
+                raise ValueError(f"Duplicate state_dict destination: {target}")
+            result[target] = value
+        return result
+
+    result = map_items(state.items())
+    if hasattr(state, "_metadata"):
+        result._metadata = map_items(state._metadata.items())
+    return result
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:

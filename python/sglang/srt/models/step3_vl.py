@@ -55,7 +55,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -922,6 +925,7 @@ class Step3VLForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", 0),
@@ -972,7 +976,8 @@ class Step3VLForConditionalGeneration(nn.Module):
                     part_name = weight_name.split(".")[-2]
                     fake_weight_name = name.replace(part_name, weight_name[:-1])
                     actual_param_name = name.replace(part_name + ".", param_name)
-                    param = params_dict[actual_param_name]
+                    registered_actual_param_name = map_weight_name(actual_param_name)
+                    param = params_dict[registered_actual_param_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -990,26 +995,29 @@ class Step3VLForConditionalGeneration(nn.Module):
                 if "gate." not in name and "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 break
             else:
                 if "moe" not in name:
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    loaded_params.add(registered_name)
                 else:
                     if "gate." in name:
                         name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
+                        registered_name = map_weight_name(name)
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight)
-                        loaded_params.add(name)
+                        loaded_params.add(registered_name)
                         continue
 
                     for mapping in expert_params_mapping:
@@ -1021,7 +1029,10 @@ class Step3VLForConditionalGeneration(nn.Module):
                         part_name = weight_name.split(".")[-2]
                         fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
-                        param = params_dict[actual_param_name]
+                        registered_actual_param_name = map_weight_name(
+                            actual_param_name
+                        )
+                        param = params_dict[registered_actual_param_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -1030,7 +1041,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                        loaded_params.add(actual_param_name)
+                        loaded_params.add(registered_actual_param_name)
                         # Don't break here, because this 'loaded_weight' includes all the weights for this layer
 
     @classmethod

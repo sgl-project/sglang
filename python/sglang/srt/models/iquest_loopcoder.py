@@ -35,7 +35,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.llama import LlamaMLP as LoopCoderMLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
@@ -439,6 +442,7 @@ class IQuestLoopCoderForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -460,8 +464,9 @@ class IQuestLoopCoderForCausalLM(nn.Module):
                 else:
                     continue
 
-                if sglang_name in params_dict:
-                    param = params_dict[sglang_name]
+                registered_sglang_name = map_weight_name(sglang_name)
+                if registered_sglang_name in params_dict:
+                    param = params_dict[registered_sglang_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -473,10 +478,11 @@ class IQuestLoopCoderForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name in params_dict:
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict:
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -484,10 +490,11 @@ class IQuestLoopCoderForCausalLM(nn.Module):
                 break
             else:
                 # Handle regular parameters
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name in params_dict:
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict:
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

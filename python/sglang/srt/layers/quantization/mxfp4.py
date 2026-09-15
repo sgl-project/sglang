@@ -344,8 +344,9 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, LinearBase):
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
+            if self.ignored_layers and self.match_layer(
+                prefix,
+                is_layer_skipped,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):

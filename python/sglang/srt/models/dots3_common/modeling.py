@@ -108,7 +108,10 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
@@ -2173,6 +2176,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         extra_params_mapping=None,
     ):
 
+        map_weight_name = get_checkpoint_name_mapper(self)
         if is_nextn:
             num_nextn_layers = self.config.num_nextn_predict_layers
             # compatible with old design: when the main model has only 1 layer,
@@ -2262,9 +2266,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 and g_proj_name in cached_a_proj
             ):
                 return False
-            if param_name not in params_dict:
+            registered_param_name = map_weight_name(param_name)
+            if registered_param_name not in params_dict:
                 raise ValueError(f"{param_name} not found in params_dict.")
-            param = params_dict[param_name]
+            param = params_dict[registered_param_name]
             target_dim = param.shape[cat_dim] if param.dim() > cat_dim else None
             is_scale = param_name.endswith(".weight_scale_inv")
             q_a_proj_weight = cached_a_proj[q_a_proj_name]
@@ -2376,7 +2381,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                             name = name.replace(
                                 matched_prefix, "model.shared_head.head"
                             )
-                            param = params_dict.get(name)
+                            registered_name = map_weight_name(name)
+                            param = params_dict.get(registered_name)
                             if param is None:
                                 continue
                             weight_loader = _get_param_weight_loader(param)
@@ -2425,13 +2431,19 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
+                    if ("mlp.experts." in name) and map_weight_name(
+                        name
+                    ) not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     futures.append(
                         executor.submit(weight_loader, param, loaded_weight, shard_id)
@@ -2443,7 +2455,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
+                        registered_name = map_weight_name(name)
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         futures.append(
                             executor.submit(
@@ -2458,7 +2471,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
+                        if (
+                            name.endswith(".bias")
+                            and map_weight_name(name) not in params_dict
+                        ):
                             continue
                         # Skip loading embed_tokens if not first rank in pipeline parallelism
                         if ".embed_tokens." in name and not self.pp_group.is_first_rank:
@@ -2523,7 +2539,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
+                            ) and map_weight_name(name) not in params_dict:
                                 # modelopt attn kv scale is named differently
                                 for scale in ["k_scale", "v_scale"]:
                                     if scale in name:
@@ -2531,13 +2547,14 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            if name not in params_dict:
+                            registered_name = map_weight_name(name)
+                            if registered_name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[registered_name]
                             weight_loader = _get_param_weight_loader(param)
                             futures.append(
                                 executor.submit(weight_loader, param, loaded_weight)

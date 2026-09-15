@@ -140,6 +140,36 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    _checkpoint_names = None
+
+    def register_checkpoint_names(self, module: nn.Module, prefix: str) -> None:
+        """Bind declared child names before constructing quantized children."""
+        from sglang.srt.model_loader.quantization_config import CheckpointNames
+        from sglang.srt.model_loader.weight_utils import (
+            get_module_checkpoint_name_mapping,
+        )
+
+        if self._checkpoint_names is None:
+            self._checkpoint_names = CheckpointNames()
+        for external, registered in get_module_checkpoint_name_mapping(module).items():
+            self._checkpoint_names.add(prefix, external, registered)
+
+    def match_layer(self, name, matcher, /, *args, **kwargs):
+        """Query source metadata; module and method prefixes stay registered names."""
+        if self._checkpoint_names is not None:
+            name = self._checkpoint_names.checkpoint_name(name)
+        return matcher(name, *args, **kwargs)
+
+    def delegate(self, config: QuantizationConfig, layer: nn.Module, prefix: str):
+        """Select a method from a child config using the same model declarations."""
+        config._checkpoint_names = self._checkpoint_names
+        return config.get_quant_method(layer, prefix)
+
+    def checkpoint_metadata(self, source):
+        from sglang.srt.model_loader.quantization_config import CheckpointMetadata
+
+        return CheckpointMetadata(source, self)
+
     weight_block_size: Optional[List[int]] = None
 
     def __init__(self):

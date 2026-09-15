@@ -54,6 +54,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
@@ -866,6 +867,7 @@ class MuseGlimmerForCausalLM(nn.Module):
         self.model.layers_to_capture = list(layer_ids)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -908,19 +910,21 @@ class MuseGlimmerForCausalLM(nn.Module):
                 if "output_gate_proj" in name:
                     continue
                 mapped = name.replace(weight_name, param_name)
-                if mapped not in params_dict:
+                registered_mapped = map_weight_name(mapped)
+                if registered_mapped not in params_dict:
                     continue
-                param = params_dict[mapped]
+                param = params_dict[registered_mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
                 loaded += 1
                 break
             else:
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(
                         "Muse Glimmer: unexpected checkpoint weight %s", name
                     )
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded += 1

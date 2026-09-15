@@ -111,6 +111,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    get_checkpoint_name_mapper,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
@@ -1408,11 +1409,14 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         Flow: Reset params → Restore attributes → Quantize in iterator → Load → Copy back
         """
+        map_weight_name = get_checkpoint_name_mapper(model)
         logger.info("[QuantizedRL] Reload: Updating weights with FP8 quantization")
 
         weights_list = list(weights)
         updated_param_names, is_last_update = (
-            QuantizedRLModelLoader._get_updated_params(weights_list, model)
+            QuantizedRLModelLoader._get_updated_params(
+                weights_list, model, map_weight_name=map_weight_name
+            )
         )
 
         # Save current FP8 parameter data pointers
@@ -1488,6 +1492,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         # Copy back to original FP8 memory locations and update scales
         all_params = dict(model.named_parameters())
+        quantized_scales = {
+            map_weight_name(name): scale for name, scale in quantized_scales.items()
+        }
 
         for name in updated_param_names:
             if name not in all_params or name not in current_param_data:
@@ -1539,7 +1546,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return updated_param_names, is_last_update
 
     @staticmethod
-    def _get_updated_params(weights_list, model):
+    def _get_updated_params(weights_list, model, *, map_weight_name):
         """Identify which parameters need updating from incoming weights."""
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -1588,6 +1595,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
                     name = name.replace(weight_name, param_name)
+                    name = map_weight_name(name)
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     updated_params.add(name)
@@ -1595,6 +1603,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     break
 
             if not mapped:
+                name = map_weight_name(name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name in params_dict:
@@ -3000,6 +3009,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             yield weight_name, processed_weight
 
     def _load_weights(self, model_config: ModelConfig, model: nn.Module) -> None:
+        map_weight_name = get_checkpoint_name_mapper(model)
         if not hasattr(model, "load_weights"):
             raise AttributeError(
                 "The required method 'load_weights' is not defined in class"
@@ -3094,6 +3104,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     r"attn.qkv.", r"attn.qkv_proj."
                 )
 
+            quant_param_name = map_weight_name(quant_param_name)
             if quant_param_name not in param_dict:
                 raise ValueError(
                     f"Parameter {quant_param_name} not found in the model."

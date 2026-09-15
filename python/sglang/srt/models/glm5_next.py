@@ -73,6 +73,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
@@ -1366,6 +1367,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        map_weight_name = get_checkpoint_name_mapper(self)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1493,15 +1495,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         ".qkv_proj",
                         ".qkv_conv1d",
                     }
-                    and candidate not in params_dict
+                    and map_weight_name(candidate) not in params_dict
                 ):
                     continue
                 name = candidate
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1513,9 +1516,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -1528,7 +1532,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 else:
                     if is_expert_weight:
                         continue
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
                     if fuse_qkv_a_proj and (
@@ -1564,8 +1571,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
-                            if target in params_dict:
-                                param = params_dict[target]
+                            registered_target = map_weight_name(target)
+                            if registered_target in params_dict:
+                                param = params_dict[registered_target]
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
@@ -1574,13 +1582,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
 
                     if name.endswith(".A_log") and loaded_weight.dim() == 1:
                         loaded_weight = loaded_weight.view(1, 1, -1, 1)
 
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

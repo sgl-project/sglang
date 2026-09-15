@@ -377,8 +377,11 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
             if is_npu() and self.use_mxfp8:
@@ -389,8 +392,11 @@ class Fp8Config(QuantizationConfig):
                 return NPUMXFP8LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped(
-                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            if self.match_layer(
+                prefix,
+                is_layer_skipped,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe

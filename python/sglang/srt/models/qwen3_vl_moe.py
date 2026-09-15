@@ -28,7 +28,10 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_exec
@@ -212,6 +215,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return bool(self._lora_pattern_moe.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -289,16 +293,20 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
                 # [TODO] Skip layers that are on other devices (check if sglang has a similar function)
                 # if is_pp_missing_parameter(name, self):
                 #     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -346,10 +354,11 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        param = params_dict[registered_name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
@@ -373,17 +382,21 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
                     # Skip loading mm/language parameters
                     if (
                         self.config.encoder_only or self.config.language_only
-                    ) and name not in params_dict:
+                    ) and map_weight_name(name) not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

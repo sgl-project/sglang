@@ -10,7 +10,10 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    get_checkpoint_name_mapper,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import (
@@ -409,8 +412,10 @@ class WeightUpdater:
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    map_weight_name = get_checkpoint_name_mapper(model)
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
+        name = map_weight_name(name)
         default_weight_loader(params_dict[name], tensor)
 
 

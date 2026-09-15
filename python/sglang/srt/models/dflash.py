@@ -33,6 +33,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    get_checkpoint_name_mapper,
     sharded_weight_loader,
 )
 from sglang.srt.models.utils import apply_qk_norm
@@ -765,6 +766,7 @@ class DFlashDraftModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        map_weight_name = get_checkpoint_name_mapper(self)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -784,18 +786,24 @@ class DFlashDraftModel(nn.Module):
         }
 
         def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
                 return name
             if name.startswith("model."):
                 stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
+                registered_stripped_name = map_weight_name(stripped_name)
+                if registered_stripped_name in params_dict:
                     return stripped_name
             else:
                 prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
+                registered_prefixed_name = map_weight_name(prefixed_name)
+                if registered_prefixed_name in params_dict:
                     return prefixed_name
             aliased_name = _VENDOR_ENCODER_ALIASES.get(name)
-            if aliased_name is not None and aliased_name in params_dict:
+            if (
+                aliased_name is not None
+                and map_weight_name(aliased_name) in params_dict
+            ):
                 return aliased_name
             return None
 
@@ -815,17 +823,19 @@ class DFlashDraftModel(nn.Module):
                 resolved_name = resolve_param_name(mapped_name)
                 if resolved_name is None:
                     continue
-                param = params_dict[resolved_name]
+                registered_resolved_name = map_weight_name(resolved_name)
+                param = params_dict[registered_resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(resolved_name)
+                loaded_params.add(registered_resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
-                param = params_dict[resolved_name]
+                registered_resolved_name = map_weight_name(resolved_name)
+                param = params_dict[registered_resolved_name]
                 if resolved_name.endswith("fc.weight"):
                     if self.is_nemotron_35_draft:
                         expected_shape = (
@@ -863,7 +873,7 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(resolved_name)
+                loaded_params.add(registered_resolved_name)
 
         if self.projector_type == "domino":
             required = {

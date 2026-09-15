@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Module, Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0
 
@@ -13,6 +14,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 logger = logging.getLogger(__name__)
+
+
+def bind_moe_quantization_config(method, config, prefix: str):
+    """Resolve Humming input policy before weight creation or KT wrapping."""
+    if not isinstance(method, Mxfp4HummingMoEMethod) or config is None:
+        return
+    from sglang.srt.layers.quantization.humming_utils import humming_is_layer_skipped
+
+    policy = method.input_quant_config
+    if not policy:
+        return
+    skipped = config.match_layer(
+        prefix, lambda name: humming_is_layer_skipped(policy, name)
+    )
+    method.input_quant_config = (
+        {}
+        if skipped
+        else {
+            key: value
+            for key, value in policy.items()
+            if key
+            not in ("ignored_layers", "ignore", "modules_to_not_convert", "dynamic")
+        }
+    )
 
 
 class Mxfp4HummingMoEMethod:
@@ -29,6 +54,9 @@ class Mxfp4HummingMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self.input_quant_config = (
+            envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get() or {}
+        ).copy()
 
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
@@ -87,7 +115,11 @@ class Mxfp4HummingMoEMethod:
         del layer.w13_weight_scale_inv
         del layer.w2_weight_scale_inv
 
-        prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
+        prepare_humming_moe_layer(
+            layer,
+            {"quant_method": "mxfp4"},
+            input_quant_config=self.input_quant_config,
+        )
         layer._dsv4_mxfp4_backend = "humming"
 
     def apply(
