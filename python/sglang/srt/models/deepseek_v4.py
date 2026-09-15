@@ -2111,26 +2111,6 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
-        fuse_attention_inverse_rope = (
-            self.is_dsv41
-            # The breakable-graph wrapper owns a padded output buffer and
-            # does not forward the fused inverse-RoPE arguments.
-            and not is_in_breakable_cuda_graph()
-            and 0 < x.shape[0] <= 8
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            )
-            and getattr(attn_backend, "small_paged_attention_enabled", False)
-            and not getattr(attn_backend, "trtllm_attn", True)
-            and not is_unified_kv_triton()
-            and not (self.wo_a_fp8 and _wo_a_fp8_mxscale_fused_invrope is not None)
-        )
-        attention_kwargs = (
-            {"inverse_rope": (self.freqs_cis, positions)}
-            if fuse_attention_inverse_rope
-            else {}
-        )
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -2168,7 +2148,6 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
-                    **attention_kwargs,
                 )
             o = o[:, tp_slice, :]
         if (
@@ -2203,7 +2182,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif not fuse_attention_inverse_rope:
+            else:
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,

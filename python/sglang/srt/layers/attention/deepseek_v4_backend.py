@@ -1210,12 +1210,6 @@ class DeepseekV4AttnBackend(
         # Two-level low-ratio indexer, decided here for the model's block budget
         # (dsv4/candidate_indexer.py).
         cfg = model_runner.model_config.hf_text_config
-        self.small_paged_attention_enabled = (
-            getattr(cfg, "model_type", None) in ("deepseek_v41", "deepseek_v41_text")
-            and self.device.type == "cuda"
-            and torch.version.cuda is not None
-            and torch.cuda.get_device_capability(self.device)[0] == 10
-        )
         self.candidate_indexer = make_candidate_indexer(
             getattr(cfg, "candidate_topk_blocks", 0),
             getattr(cfg, "candidate_block_size", 0),
@@ -3763,7 +3757,6 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
-        inverse_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -3854,64 +3847,6 @@ class DeepseekV4AttnBackend(
                 extra_indices = extra_indices.unsqueeze(1)
 
             assert attn_sink is not None
-
-            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-                is_in_breakable_cuda_graph,
-            )
-
-            if (
-                not is_in_breakable_cuda_graph()
-                and getattr(self, "small_paged_attention_enabled", False)
-                and (
-                    forward_batch.forward_mode.is_decode()
-                    or forward_batch.forward_mode.is_target_verify()
-                )
-                and q.dtype == torch.bfloat16
-                and q.ndim == 4
-                and q.shape[1] == 1
-                and 0 < q.shape[0] <= 8
-                and layer.tp_q_head_num == 16
-                and self.head_dim_v == 512
-                and self.softmax_scale == 512**-0.5
-                and swa_k_cache.dtype in (torch.uint8, torch.float8_e4m3fn)
-                and swa_k_cache.shape[-1] == 584
-                and swa_page_indices.shape[-1] <= 192
-                and swa_topk_lengths is not None
-                and (
-                    extra_k_cache is None
-                    or (
-                        extra_k_cache.dtype in (torch.uint8, torch.float8_e4m3fn)
-                        and extra_k_cache.shape[-1] == 584
-                        and extra_indices.shape[-1] <= 1024
-                        and extra_topk_lengths is not None
-                    )
-                )
-            ):
-                from sglang.srt.batch_invariant_ops import (
-                    is_batch_invariant_mode_enabled,
-                )
-
-                if not (
-                    is_batch_invariant_mode_enabled()
-                    or get_exec().deterministic.enable_deterministic_inference
-                ):
-                    from sglang.kernels.ops.attention.dsv4.small_paged_attention import (
-                        small_paged_attention,
-                    )
-
-                    # The model consumes only these 16 TP-local heads. Avoid
-                    # computing the 48 padding heads required by FlashMLA.
-                    return small_paged_attention(
-                        q,
-                        swa_k_cache,
-                        swa_page_indices,
-                        swa_topk_lengths,
-                        attn_sink,
-                        extra_k_cache,
-                        extra_indices,
-                        extra_topk_lengths,
-                        inverse_rope=inverse_rope,
-                    )
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
@@ -4017,19 +3952,6 @@ class DeepseekV4AttnBackend(
                 )[0]
 
             o = o.squeeze(1)
-            if inverse_rope is not None:
-                from sglang.kernels.ops.attention.dsv4.elementwise import (
-                    fused_rope_inplace,
-                )
-
-                freqs_cis, positions = inverse_rope
-                fused_rope_inplace(
-                    o[:, : layer.tp_q_head_num, -64:],
-                    None,
-                    freqs_cis,
-                    positions=positions,
-                    inverse=True,
-                )
             return o
 
         raise NotImplementedError("ragged attention")
