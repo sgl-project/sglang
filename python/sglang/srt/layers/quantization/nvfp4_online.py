@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
@@ -31,13 +32,14 @@ logger = logging.getLogger(__name__)
 
 
 class NvFp4OnlineConfig(ModelOptQuantConfig):
-    """Load-time NVFP4 with online per-token FP32 activation scales.
+    """Load-time NVFP4 expert weights with online activation handling.
 
-    `--quantization nvfp4_online` exclusively means online per-token FP32
-    activation scaling. Use `modelopt_fp4` for per-tensor FP32 activation scales
-    or serialized NVFP4 checkpoints. This path converts BF16/FP16/FP8 MoE expert
-    weights as they load; dense layers retain their source precision or
-    quantization.
+    `--quantization nvfp4_online` uses per-token FP32 activation scales by
+    default. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
+    and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
+    for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
+    This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
+    layers retain their source precision or quantization.
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -208,13 +210,19 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             else layer_prefix
         )
         if quant_config.use_per_token_activation and not (
-            self.enable_flashinfer_trtllm_moe or self._is_cutedsl_v2_standard
+            self.enable_flashinfer_trtllm_moe
+            or self._is_cutedsl_v2_standard
+            or (
+                get_moe_runner_backend().is_flashinfer_megamoe()
+                and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            )
         ):
             raise ValueError(
-                "--quantization nvfp4_online requires online per-token FP32 "
-                "activation scales and supports flashinfer_trtllm, "
+                "--quantization nvfp4_online supports flashinfer_trtllm, "
                 "flashinfer_trtllm_routed, or flashinfer_cutedsl with no A2A "
-                "or FlashInfer A2A. Use --quantization modelopt_fp4 for "
+                "or FlashInfer A2A, or flashinfer_megamoe with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1. "
+                "Use --quantization modelopt_fp4 for "
                 "per-tensor FP32 activation scales."
             )
 
