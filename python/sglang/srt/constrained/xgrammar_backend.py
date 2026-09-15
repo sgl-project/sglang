@@ -71,7 +71,6 @@ def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
 
 
 class XGrammarGrammar(BaseGrammarObject):
-
     def __init__(
         self,
         matcher: GrammarMatcher,

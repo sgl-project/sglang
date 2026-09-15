@@ -41,13 +41,27 @@ def get_dcp_lens(
     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
 
 
+def maybe_dcp_kernel_indices(
+    indices: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> torch.Tensor:
+    """Widened logical slots -> this rank's physical rows.
+
+    Owner rule: slot % dcp_size == dcp_rank, row = slot // dcp_size. The run
+    starts page-aligned, so a strided view selects the owned slots without a mask.
+    """
+    if dcp_size == 1:
+        return indices
+    return indices[dcp_rank::dcp_size] // dcp_size
+
+
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
+    """Keep this rank's share of a read-index tensor, still WIDENED.
+
+    Selection only; the caller collapses via translate_dcp_read_ids.
+    """
     parallel = get_parallel()
     if parallel.dcp_enabled:
-        kv_indices = (
-            kv_indices[kv_indices % parallel.dcp_size == parallel.dcp_rank]
-            // parallel.dcp_size
-        )
+        kv_indices = kv_indices[kv_indices % parallel.dcp_size == parallel.dcp_rank]
     return kv_indices
 
 
@@ -67,7 +81,7 @@ def filter_dcp_local_chunk_kv_indices(
         first = (parallel.dcp_rank - start) % dcp_size
         parts.append(kv_indices[offset + first : offset + length : dcp_size])
         offset += length
-    return torch.cat(parts) // dcp_size
+    return torch.cat(parts)
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):

@@ -129,7 +129,6 @@ def get_numa_nic_mapping() -> Dict[int, List[str]]:
 
 
 class HiCacheSiMM(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
@@ -239,7 +238,7 @@ class HiCacheSiMM(HiCacheStorage):
         if not all(got_block.as_ref()[: len(warmup_key)] == warmup_tensor):
             logger.warning(f"SiMM client warmup key {warmup_key} data wrong")
         logger.info(
-            f"finish SiMM client warm up, cost {(time.perf_counter_ns() - start_time)/1000:.2f} us"
+            f"finish SiMM client warm up, cost {(time.perf_counter_ns() - start_time) / 1000:.2f} us"
         )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -334,7 +333,7 @@ class HiCacheSiMM(HiCacheStorage):
         if self.config.enable_profile:
             logger.info(
                 f"SiMM batch_get_v1 {len(keys)} keys, total size: {total_size / 1024**2} MiB, \
-                    using {(t2 - t1)/1000} us, Throughput: {total_size / 1024**3 / ((t2 - t1) / 1000**3):.2f} GiB/s"
+                    using {(t2 - t1) / 1000} us, Throughput: {total_size / 1024**3 / ((t2 - t1) / 1000**3):.2f} GiB/s"
             )
         return self._batch_postprocess(get_results, is_set_operate=False)
 
@@ -355,7 +354,7 @@ class HiCacheSiMM(HiCacheStorage):
         t2 = time.perf_counter_ns()
         if self.config.enable_profile:
             logger.info(
-                f"SiMM batch exists {len(keys)} keys, using {(t2 - t1)/1000} us"
+                f"SiMM batch exists {len(keys)} keys, using {(t2 - t1) / 1000} us"
             )
 
         set_keys = []
@@ -385,7 +384,7 @@ class HiCacheSiMM(HiCacheStorage):
         if self.config.enable_profile:
             logger.info(
                 f"SiMM batch_put_v1 {len(keys)} keys, total size: {total_size / 1024**2} MiB, \
-                    using {(t3 - t2)/1000} us, Throughput: {total_size / 1024**3 / ((t3 - t2) / 1000**3):.2f} GiB/s"
+                    using {(t3 - t2) / 1000} us, Throughput: {total_size / 1024**3 / ((t3 - t2) / 1000**3):.2f} GiB/s"
             )
 
         return self._batch_postprocess(set_results, is_set_operate=True)
@@ -511,7 +510,7 @@ class HiCacheSiMM(HiCacheStorage):
         t2 = time.perf_counter_ns()
         if self.config.enable_profile:
             logger.info(
-                f"SiMM batch exists {len(keys)} keys, using {(t2 - t1)/1000} us"
+                f"SiMM batch exists {len(keys)} keys, using {(t2 - t1) / 1000} us"
             )
         for i in range(len(query_keys)):
             if not exist_result[i]:

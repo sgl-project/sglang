@@ -160,9 +160,6 @@ class EncoderTensorParallelMixin:
     _encoder_tp_group: GroupCoordinator | None = None
     checkpoint_quantization_backend = "diffusion"
     packed_modules_mapping: dict[str, list[str]] = {}
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -196,9 +193,6 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
-    # Some encoders own checkpoint quantization end to end because their weight
-    # states or sharding contract cannot use the generic loader lifecycle.
-    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",

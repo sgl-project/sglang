@@ -3,7 +3,7 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
@@ -27,6 +27,8 @@ const MAX_STOP_REGEX_LEN: usize = 256;
 /// Most `stop_regex` patterns accepted per request. Python's `re` cache holds 512
 /// (`re._MAXCACHE`), so past that every pattern recompiles on every decode step.
 const MAX_STOP_REGEX_COUNT: usize = 32;
+const REQUEST_REASONING_END_TOKEN_IDS_KEY: &str = "__sglang_reasoning_end_token_ids";
+const MAX_REQUEST_REASONING_END_TOKEN_IDS: usize = 32;
 
 /// JSON values accepted by Python's `CustomParamValue`: a scalar, a list of
 /// scalars, or a string-keyed object whose values are scalars.
@@ -233,6 +235,11 @@ pub struct SamplingParams {
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
     #[serde(skip_deserializing)]
     pub is_normalized: bool,
+    /// API fields present in the request object. Serde defaults erase this
+    /// distinction, but preferred sampling parameters must not overwrite an
+    /// explicit request value, including an explicit default or null.
+    #[serde(skip)]
+    pub(crate) explicit_fields: BTreeSet<String>,
 }
 
 /// The `/generate` body's `sampling_params`: one object (broadcast to every
@@ -263,17 +270,76 @@ impl<'de> Deserialize<'de> for SamplingParamsInput {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                SamplingParams::deserialize(MapAccessDeserializer::new(map))
+                let value = serde_json::Value::deserialize(MapAccessDeserializer::new(map))?;
+                sampling_params_from_value(value)
                     .map(|p| SamplingParamsInput::One(Box::new(p)))
+                    .map_err(serde::de::Error::custom)
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
+                let values =
+                    Vec::<serde_json::Value>::deserialize(SeqAccessDeserializer::new(seq))?;
+                values
+                    .into_iter()
+                    .map(sampling_params_from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(SamplingParamsInput::Many)
+                    .map_err(serde::de::Error::custom)
             }
         }
 
         deserializer.deserialize_any(InputVisitor)
     }
+}
+
+fn sampling_params_from_value(value: serde_json::Value) -> Result<SamplingParams, String> {
+    let explicit_fields = value
+        .as_object()
+        .ok_or_else(|| "sampling_params must be an object".to_string())?
+        .keys()
+        .cloned()
+        .collect();
+    let mut params: SamplingParams = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    params.explicit_fields = explicit_fields;
+    Ok(params)
+}
+
+impl SamplingParamsInput {
+    /// Merge launch-time preferred params beneath request params. A request key
+    /// wins even when it explicitly carries the type's default or null.
+    pub fn apply_preferred(&mut self, preferred: &serde_json::Value) -> Result<(), String> {
+        match self {
+            Self::One(params) => apply_preferred_to_one(params, preferred),
+            Self::Many(params) => params
+                .iter_mut()
+                .try_for_each(|params| apply_preferred_to_one(params, preferred)),
+        }
+    }
+
+    pub fn from_preferred(preferred: &serde_json::Value) -> Result<Self, String> {
+        sampling_params_from_value(preferred.clone()).map(|params| Self::One(Box::new(params)))
+    }
+}
+
+fn apply_preferred_to_one(
+    params: &mut SamplingParams,
+    preferred: &serde_json::Value,
+) -> Result<(), String> {
+    let mut merged = preferred
+        .as_object()
+        .ok_or_else(|| "preferred_sampling_params must be a JSON object".to_string())?
+        .clone();
+    let request_value = serde_json::to_value(&*params).map_err(|e| e.to_string())?;
+    let request = request_value
+        .as_object()
+        .ok_or_else(|| "SamplingParams did not serialize as an object".to_string())?;
+    for field in &params.explicit_fields {
+        if let Some(value) = request.get(field) {
+            merged.insert(field.clone(), value.clone());
+        }
+    }
+    *params = sampling_params_from_value(serde_json::Value::Object(merged))?;
+    Ok(())
 }
 
 impl Default for SamplingParams {
@@ -314,6 +380,7 @@ impl Default for SamplingParams {
             stop_str_max_len: 0,
             stop_regex_max_len: 0,
             is_normalized: false,
+            explicit_fields: BTreeSet::new(),
         }
     }
 }
@@ -515,6 +582,38 @@ impl SamplingParams {
                     return Err(bad(format!(
                         "logit_bias must have keys in [0, {}], got {token_id}",
                         vocab_size - 1
+                    )));
+                }
+            }
+        }
+        if let Some(value) = self
+            .custom_params
+            .as_ref()
+            .and_then(|params| params.get(REQUEST_REASONING_END_TOKEN_IDS_KEY))
+        {
+            let CustomParamValue::List(token_ids) = value else {
+                return Err(bad(
+                    "request reasoning end token IDs must be a list of integers".into(),
+                ));
+            };
+            if token_ids.is_empty() || token_ids.len() > MAX_REQUEST_REASONING_END_TOKEN_IDS {
+                return Err(bad(format!(
+                    "request reasoning end token IDs must contain 1 to \
+                     {MAX_REQUEST_REASONING_END_TOKEN_IDS} integers"
+                )));
+            }
+            for token_id in token_ids {
+                let in_vocab = match token_id {
+                    JsonScalar::Signed(token_id) => {
+                        *token_id >= 0 && (*token_id as u64) < vocab_size
+                    }
+                    JsonScalar::Unsigned(token_id) => *token_id < vocab_size,
+                    _ => false,
+                };
+                if !in_vocab {
+                    return Err(bad(format!(
+                        "request reasoning end token IDs must be integers in [0, {})",
+                        vocab_size
                     )));
                 }
             }
@@ -992,6 +1091,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_reasoning_end_token_ids_are_bounded_integers() {
+        let valid = norm(r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[17,18]}}"#);
+        assert!(valid.custom_params.is_some());
+
+        for body in [
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[-1]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[true]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":[32000]}}"#,
+            r#"{"custom_params":{"__sglang_reasoning_end_token_ids":"17"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SamplingParams>(body)
+                    .unwrap()
+                    .normalize(false, 32_000)
+                    .is_err()
+            );
+        }
+    }
+
     /// `skip_tokenizer_init` has no tokenizer, so the text-matching stop features
     /// and `min_new_tokens` (needs eos_token_id) are 400s, not silent no-ops.
     /// Mirrors Python `raise_if_tokenizer_required`.
@@ -1084,5 +1204,36 @@ mod tests {
         let json = serde_json::json!({ "stop": stops }).to_string();
         let err = norm_err(&json).to_string();
         assert!(err.contains("at most"), "{err}");
+    }
+
+    #[test]
+    fn preferred_params_fill_only_omitted_request_fields() {
+        let preferred = serde_json::json!({
+            "temperature": 0.25,
+            "top_p": 0.75,
+            "max_new_tokens": 4096
+        });
+        let mut input: SamplingParamsInput =
+            serde_json::from_str(r#"{"temperature": 1.0, "top_p": null}"#).unwrap();
+        input.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::One(params) = input else {
+            panic!("expected scalar params")
+        };
+        assert_eq!(params.temperature, 1.0, "explicit default wins");
+        assert_eq!(params.top_p, 1.0, "explicit null keeps the type default");
+        assert_eq!(params.max_new_tokens, Some(4096), "omitted uses preferred");
+    }
+
+    #[test]
+    fn preferred_params_apply_to_every_batched_object() {
+        let preferred = serde_json::json!({"temperature": 0.25, "top_p": 0.75});
+        let mut input: SamplingParamsInput =
+            serde_json::from_str(r#"[{"temperature": 0.5}, {"top_p": 0.9}]"#).unwrap();
+        input.apply_preferred(&preferred).unwrap();
+        let SamplingParamsInput::Many(params) = input else {
+            panic!("expected batched params")
+        };
+        assert_eq!((params[0].temperature, params[0].top_p), (0.5, 0.75));
+        assert_eq!((params[1].temperature, params[1].top_p), (0.25, 0.9));
     }
 }

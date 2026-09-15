@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -11,9 +10,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=561, stage="base-c", runner_config="4-gpu-gb300")
 
 # Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
 NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 110
@@ -63,7 +63,7 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -126,7 +126,7 @@ class TestFlashinferA2ACutedslStaticFP4(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_generate(self):
         response = requests.post(
@@ -179,7 +179,7 @@ class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k(self):
         args = SimpleNamespace(

@@ -11,7 +11,10 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
-from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    InitLoadBackParams,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -88,6 +91,8 @@ class DecodeHiCachePreallocMixin:
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
 
         return DecodePrefixMatch(
@@ -125,7 +130,7 @@ class DecodeHiCachePreallocMixin:
                 else None
             )
             self.tree_cache.prefetch_from_storage(
-                req.rid,
+                req.cache_request_handle,
                 prefix_match.last_host_node,
                 suffix,
                 last_hash,
@@ -133,8 +138,8 @@ class DecodeHiCachePreallocMixin:
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
             )
-            prefix_match.prefetch_registered = (
-                req.rid in self.tree_cache.ongoing_prefetch
+            prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
+                req.cache_request_handle
             )
         except Exception as e:
             logger.warning(
@@ -182,10 +187,16 @@ class DecodeHiCacheTransferMixin:
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
         ):
-            self.tree_cache.release_aborted_request(decode_req.req.rid)
+            self.tree_cache.finish(
+                decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
+            )
         if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            self.tree_cache.dec_lock_ref(
+                decode_req.hicache_restored_node,
+                decode_req.hicache_restore_lock_receipt,
+            )
             decode_req.hicache_restored_node = None
+            decode_req.hicache_restore_lock_receipt = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
@@ -199,9 +210,9 @@ class DecodeHiCacheTransferMixin:
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
         if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+            if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
@@ -218,6 +229,12 @@ class DecodeHiCacheTransferMixin:
                 req=dr.req,
             )
         )
+        # The rematch repointed req.last_node to feed init_load_back's device
+        # boundary, but the prealloc lock and the receipt on the req still
+        # belong to pm.last_device_node; restore the pairing so any release
+        # before the commit hands over the restored lock hits the right node
+        # (the receipt's anchor makes a mispaired release assert).
+        dr.req.last_node = pm.last_device_node
         # Failback: total coverage < required prefix means device alloc likely failed.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
             logger.warning(
@@ -238,7 +255,9 @@ class DecodeHiCacheTransferMixin:
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
         dr.hicache_restored_node = restored_node
-        self.tree_cache.inc_lock_ref(restored_node)
+        dr.hicache_restore_lock_receipt = self.tree_cache.inc_lock_ref(
+            restored_node
+        ).to_dec_params()
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
@@ -303,7 +322,17 @@ class DecodeHiCacheTransferMixin:
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
 
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        req = decode_req.req
+        restored_node = decode_req.hicache_restored_node
+        restored_lock_receipt = decode_req.hicache_restore_lock_receipt
+        assert restored_node is not None
+        assert restored_lock_receipt is not None
+        # Release preallocation before installing the restored lock receipt.
+        self.tree_cache.dec_lock_ref(
+            prefix_match.last_device_node,
+            req.lock_receipt,
+            skip_swa=req.swa_prefix_lock_released,
+        )
 
         self.tree_cache.req_to_token_pool.write(
             (
@@ -312,7 +341,12 @@ class DecodeHiCacheTransferMixin:
             ),
             decode_req.hicache_restored_kv_indices,
         )
-        decode_req.req.prefix_indices = torch.cat(
+        req.prefix_indices = torch.cat(
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
-        decode_req.req.last_node = decode_req.hicache_restored_node
+        req.last_node = restored_node
+        req.lock_receipt = restored_lock_receipt
+        req.swa_prefix_lock_released = False
+        # Prevent abort cleanup from releasing the transferred lock.
+        decode_req.hicache_restored_node = None
+        decode_req.hicache_restore_lock_receipt = None

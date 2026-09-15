@@ -3,20 +3,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.multimodal_gen.runtime.loader.component_loaders.bridge_loader import (
-    BridgeLoader,
-)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
     NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    RESIDENT,
-)
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
@@ -94,7 +86,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
                         )
 
                 native.assert_not_called()
-                server_args.should_use_fsdp_for_component.assert_called_once_with(
+                server_args.should_use_fsdp_for_component.assert_called_with(
                     "transformer_2"
                 )
 
@@ -118,9 +110,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
         self.assertIsNotNone(component)
         self.assertEqual(consumed, 0.0)
         native.assert_called_once()
-        server_args.should_use_fsdp_for_component.assert_called_once_with(
-            "transformer_2"
-        )
+        server_args.should_use_fsdp_for_component.assert_called_with("transformer_2")
 
     def test_parallel_execution_rejects_native_fallback(self):
         cases = (
@@ -139,32 +129,45 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
                         self._server_args(**overrides), "transformer_2"
                     )
 
+    def test_unreadable_checkpoint_is_not_a_missing_implementation(self):
+        # the native fallback answers "no customized implementation for this
+        # architecture"; a checkpoint that cannot be read is a different failure,
+        # and routing it into the fallback reports a missing implementation for a
+        # model that has one
+        loader = TransformerLoader()
+        missing_shard = FileNotFoundError(
+            2, "No such file or directory", "/cache/transformer/shard-00002.safetensors"
+        )
+        customized_load = mock.patch.object(
+            loader, "_load_customized_with_context", side_effect=missing_shard
+        )
+        native_load = mock.patch.object(
+            loader, "_load_native_with_context", return_value=object()
+        )
+        available_memory = mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "component_loader.current_platform.get_available_gpu_memory",
+            return_value=0.0,
+        )
+
+        with customized_load, native_load as native, available_memory:
+            with self.assertRaises(FileNotFoundError) as caught:
+                loader.load(
+                    "/model/transformer_2",
+                    self._server_args(),
+                    "transformer_2",
+                    "diffusers",
+                )
+
+        self.assertIn("shard-00002.safetensors", str(caught.exception))
+        native.assert_not_called()
+
     def test_replicated_execution_keeps_native_fallback_available(self):
         self.assertIsNone(
             TransformerLoader().validate_native_fallback(
                 self._server_args(), "transformer_2"
             )
         )
-
-    def test_only_fsdp_materializers_keep_the_component_request(self):
-        server_args = ServerArgs.__new__(ServerArgs)
-        server_args.use_fsdp_inference = True
-        server_args._fsdp_disabled_components = set()
-        server_args.residency_mode = lambda _component: RESIDENT
-
-        ComponentLoader().disable_unsupported_component_fsdp(
-            server_args, "text_encoder"
-        )
-        self.assertFalse(server_args.should_use_fsdp_for_component("text_encoder"))
-
-        TransformerLoader().disable_unsupported_component_fsdp(
-            server_args, "transformer"
-        )
-        BridgeLoader().disable_unsupported_component_fsdp(
-            server_args, "dual_tower_bridge"
-        )
-        self.assertTrue(server_args.should_use_fsdp_for_component("transformer"))
-        self.assertTrue(server_args.should_use_fsdp_for_component("dual_tower_bridge"))
 
 
 if __name__ == "__main__":

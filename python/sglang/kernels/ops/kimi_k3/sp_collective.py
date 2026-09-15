@@ -51,10 +51,7 @@ def _device_name(device: torch.device) -> str:
 def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
     path = os.path.join(
         _CONFIG_DIR,
-        (
-            f"world={world_size},H={hidden_size},"
-            f"device_name={_device_name(device)}.json"
-        ),
+        (f"world={world_size},H={hidden_size},device_name={_device_name(device)}.json"),
     )
     if path not in _TABLES:
         if os.path.exists(path):

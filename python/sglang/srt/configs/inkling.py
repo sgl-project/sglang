@@ -104,9 +104,9 @@ class InklingModelConfig(PretrainedConfig):
             mtp_swa_head_dim = swa_head_dim
         if mtp_local_layer_ids:
             local_id_set = set(mtp_local_layer_ids)
-            assert len(local_id_set) == len(
-                mtp_local_layer_ids
-            ), f"mtp_local_layer_ids must be unique: {mtp_local_layer_ids}"
+            assert len(local_id_set) == len(mtp_local_layer_ids), (
+                f"mtp_local_layer_ids must be unique: {mtp_local_layer_ids}"
+            )
             assert all(0 <= i < num_nextn_predict_layers for i in local_id_set), (
                 f"mtp_local_layer_ids must be in [0, {num_nextn_predict_layers}): "
                 f"{mtp_local_layer_ids}"
@@ -231,9 +231,9 @@ class InklingModelConfig(PretrainedConfig):
         if get_exec().comm.enable_scattered_sconv:
             # Scattered sconv: the attn/mlp output sconvs run on the [T, H/P]
             # hidden shard, so their conv-state caches shard with them.
-            assert (
-                self.hidden_size % tp_size == 0
-            ), f"hidden_size {self.hidden_size} not divisible by attn tp {tp_size}"
+            assert self.hidden_size % tp_size == 0, (
+                f"hidden_size {self.hidden_size} not divisible by attn tp {tp_size}"
+            )
             stream_dim = self.hidden_size // tp_size
         conv_len = self.sconv_kernel_size - 1
         shape = InklingConvStateShape(
