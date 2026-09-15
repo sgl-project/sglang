@@ -2289,6 +2289,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             routed_quant_stream=moe_routed_quant_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
+            vl_correction_bias=config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
