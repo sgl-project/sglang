@@ -2494,6 +2494,37 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertIn("<｜Assistant｜>", out)
 
+    def test_dsv4_inline_system_opens_assistant_turn(self):
+        """An inline system block must leave the prompt generation-ready.
+
+        Claude Code ends its message list with a mid-conversation system reminder.
+        """
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        assistant_prefix = (
+            encoding_dsv4.ASSISTANT_SP_TOKEN + encoding_dsv4.thinking_end_token
+        )
+
+        out = encoding_dsv4.encode_messages(
+            [
+                {"role": "user", "content": "What is 2 + 2?"},
+                {"role": "system", "content": "Answer with the number only."},
+            ],
+            thinking_mode="chat",
+        )
+        self.assertTrue(out.endswith(assistant_prefix))
+
+        out = encoding_dsv4.encode_messages(
+            [
+                {"role": "user", "content": "Q1"},
+                {"role": "system", "content": "Be terse."},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "Q2"},
+            ],
+            thinking_mode="chat",
+        )
+        self.assertIn(assistant_prefix + "A1", out)
+
     def test_dsv4_reasoning_effort_profiles(self):
         from sglang.srt.entrypoints.openai import encoding_dsv4
 

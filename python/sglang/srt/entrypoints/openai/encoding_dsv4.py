@@ -1,4 +1,6 @@
 # Adapted from the DeepSeek-V4 release reference implementation.
+# Local change: `render_message` opens the assistant turn for inline `system` blocks as well; the
+# reference opens it for `user`/`developer` messages only.
 """
 DeepSeek-V4 Encoding
 
@@ -463,7 +465,9 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"]:
+    # Local change: a system block renders as bare text with no turn token of its own, so it has
+    # to open the assistant turn too.
+    elif messages[index].get("role") not in ["assistant", "latest_reminder"]:
         # Normal generation: append Assistant + thinking token
         prompt += ASSISTANT_SP_TOKEN
         if not drop_thinking and thinking_mode == "thinking":
