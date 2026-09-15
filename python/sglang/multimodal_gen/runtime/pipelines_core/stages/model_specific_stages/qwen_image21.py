@@ -33,6 +33,9 @@ def collapse_image_slots(hidden, input_ids, image_token_id):
 
 
 class QwenImage21InputValidationStage(InputValidationStage):
+    def load_condition_image(self, image):
+        return load_image(image, convert_method=lambda image: image.convert("RGBA"))
+
     def preprocess_condition_image(
         self, batch, server_args, condition_image_width, condition_image_height
     ):
@@ -60,8 +63,13 @@ class QwenImage21EncodingStage(PipelineStage):
             scheduler,
         )
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        system_message = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
+        ]
         self.drop_idx = len(
-            processor.tokenizer.encode(SYSTEM_TEMPLATE, add_special_tokens=False)
+            processor.apply_chat_template(
+                system_message, tokenize=True, return_dict=False
+            )[0]
         )
 
     def component_uses(self, server_args, stage_name=None):
@@ -107,9 +115,12 @@ class QwenImage21EncodingStage(PipelineStage):
         )
         resized, shapes, conditions = [], [], []
         area = batch.height * batch.width
+        image_mode = "RGBA" if ac.in_channels == 4 else "RGB"
         for image in images:
             if not isinstance(image, Image.Image):
-                image = load_image(image)
+                image = load_image(
+                    image, convert_method=lambda image: image.convert(image_mode)
+                )
             width = max(
                 32, round(math.sqrt(area * image.width / image.height) / 32) * 32
             )
@@ -117,7 +128,9 @@ class QwenImage21EncodingStage(PipelineStage):
                 32, round(math.sqrt(area * image.height / image.width) / 32) * 32
             )
             resized.append(
-                image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+                image.convert(image_mode).resize(
+                    (width, height), Image.Resampling.LANCZOS
+                )
             )
             shapes.append((1, height // 16, width // 16))
         if resized:
@@ -127,7 +140,7 @@ class QwenImage21EncodingStage(PipelineStage):
                 for image in resized:
                     pixels = torch.frombuffer(
                         bytearray(image.tobytes()), dtype=torch.uint8
-                    ).reshape(image.height, image.width, 3)
+                    ).reshape(image.height, image.width, ac.in_channels)
                     pixels = (
                         pixels.permute(2, 0, 1)[None, :, None].to(
                             device=device, dtype=torch.float32

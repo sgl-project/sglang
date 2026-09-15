@@ -48,6 +48,9 @@ class InputValidationStage(PipelineStage):
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
+    def load_condition_image(self, image):
+        return load_image(image)
+
     @staticmethod
     def _calculate_dimensions_from_area(
         max_area: float, aspect_ratio: float, mod_value: int
@@ -384,7 +387,7 @@ class InputValidationStage(PipelineStage):
                     if path.endswith(".mp4"):
                         image = load_video(path)[0]
                     else:
-                        image = load_image(path)
+                        image = self.load_condition_image(path)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -398,7 +401,7 @@ class InputValidationStage(PipelineStage):
                 if batch.image_path.endswith(".mp4"):
                     image = load_video(batch.image_path)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,

@@ -147,8 +147,8 @@ class QwenImage21VAEArchConfig(VAEArchConfig):
         3.8161,
     )
     is_residual: bool = True
-    in_channels: int = 3
-    out_channels: int = 3
+    in_channels: int = 4
+    out_channels: int = 4
     patch_size: int | None = None
     scale_factor_temporal: int = 8
     scale_factor_spatial: int = 8

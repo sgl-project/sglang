@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
@@ -22,7 +23,11 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
     _patchify,
     _unpatchify,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21InputValidationStage,
     collapse_image_slots,
 )
 
@@ -68,7 +73,8 @@ def test_latent_pack_decode_contract():
     )
 
 
-def test_native_vae_roundtrip_shapes_and_checkpoint_names():
+@pytest.mark.parametrize("channels", [3, 4])
+def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels):
     ac = QwenImage21VAEArchConfig(
         base_dim=4,
         decoder_base_dim=4,
@@ -76,18 +82,29 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names():
         dim_mult=(1, 2, 4, 4, 4),
         num_res_blocks=1,
         temperal_downsample=(False, False, False, False),
+        in_channels=channels,
+        out_channels=channels,
     )
     model = AutoencoderKLQwenImage21(
         QwenImage21VAEConfig(arch_config=ac, use_tiling=False)
     ).eval()
     with torch.no_grad():
-        moments = model._encode(torch.randn(1, 3, 1, 32, 64))
+        moments = model._encode(torch.randn(1, channels, 1, 32, 64))
         assert moments.shape == (1, 8, 1, 2, 4)
         output = model._decode(moments[:, :4])
-        assert output.shape == (1, 3, 1, 32, 64)
+        assert output.shape == (1, channels, 1, 32, 64)
     assert model.state_dict()["encoder.conv_in.weight"].ndim == 4
     x = torch.randn(2, 3, 1, 8, 12)
     torch.testing.assert_close(_unpatchify(_patchify(x, 2), 2), x)
+
+
+def test_condition_image_loading_preserves_alpha(tmp_path):
+    path = tmp_path / "condition.png"
+    Image.new("RGBA", (32, 32), (12, 34, 56, 78)).save(path)
+    image = QwenImage21InputValidationStage().load_condition_image(str(path))
+    assert image.mode == "RGBA"
+    assert image.getpixel((0, 0)) == (12, 34, 56, 78)
+    assert InputValidationStage().load_condition_image(str(path)).mode == "RGB"
 
 
 def test_architecture_derived_dimensions():
