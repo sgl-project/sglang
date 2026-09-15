@@ -744,7 +744,7 @@ def _build_inkling_shared_experts(
         dense_kwargs = dict(
             n_shared_experts=n_shared_experts,
             d_model=hidden_size,
-            shared_d_mlp=intermediate_size,
+            shared_d_ffn=intermediate_size,
             layer_id=layer_id,
             prefix=shared_prefix,
             quant_config=quant_config,

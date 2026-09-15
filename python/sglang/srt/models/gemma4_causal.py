@@ -566,11 +566,11 @@ class Gemma4DecoderLayer(nn.Module):
             config, "num_kv_shared_layers", 0
         )
         is_kv_shared_layer = self.layer_id >= first_kv_shared_layer_idx > 0
-        use_double_wide_mlp = (
+        use_double_wide_ffn = (
             getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
         )
         layer_intermediate_size = config.intermediate_size * (
-            2 if use_double_wide_mlp else 1
+            2 if use_double_wide_ffn else 1
         )
 
         self.ffn = Gemma4MLP(

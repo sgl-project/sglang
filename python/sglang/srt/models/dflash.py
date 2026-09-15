@@ -508,9 +508,9 @@ class DFlashDecoderLayer(nn.Module):
             prefix=attention_prefix,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        mlp_prefix = f"{prefix}.ffn" if prefix else ""
+        ffn_prefix = f"{prefix}.ffn" if prefix else ""
         self.ffn = DFlashMLP(
-            config=config, quant_config=quant_config, prefix=mlp_prefix
+            config=config, quant_config=quant_config, prefix=ffn_prefix
         )
 
         self.attention_conv = attention_conv
@@ -550,12 +550,12 @@ class DFlashDecoderLayer(nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
-        mlp_kernel = None
+        ffn_kernel = None
         if self.ffn_conv is not None:
-            hidden_states, mlp_kernel = self.ffn_conv.prepare(hidden_states)
+            hidden_states, ffn_kernel = self.ffn_conv.prepare(hidden_states)
         hidden_states = self.ffn(hidden_states)
-        if mlp_kernel is not None:
-            hidden_states = self.ffn_conv.finish(hidden_states, mlp_kernel)
+        if ffn_kernel is not None:
+            hidden_states = self.ffn_conv.finish(hidden_states, ffn_kernel)
         return hidden_states, residual
 
 

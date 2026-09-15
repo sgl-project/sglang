@@ -86,7 +86,7 @@ patches:
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h[attn_tp:partial] # tp:replicated')"
       - match: |
-          hidden_states, residual = self.layer_communicator.prepare_mlp(
+          hidden_states, residual = self.layer_communicator.prepare_ffn(
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"
@@ -143,7 +143,7 @@ patches:
           )
         append: "dumper.dump('attn_output', hidden_states, dims='t h # tp:replicated')"
       - match: |
-          hidden_states, residual = self.layer_communicator.prepare_mlp(
+          hidden_states, residual = self.layer_communicator.prepare_ffn(
               hidden_states, residual, forward_batch
           )
         append: "dumper.dump('pre_mlp_residual', hidden_states, dims='t h # tp:replicated')"

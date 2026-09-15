@@ -897,8 +897,8 @@ class DeepseekV2MoE(nn.Module):
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
                     self.layer_id,
-                    fwd.fuse_mlp_allreduce,
-                    fwd.mlp_reduce_scatter,
+                    fwd.fuse_ffn_allreduce,
+                    fwd.ffn_reduce_scatter,
                 )
             elif (
                 self.alt_stream is not None
@@ -1598,24 +1598,24 @@ class DeepseekV2MoE(nn.Module):
         return q, s
 
     def op_gate(self, state):
-        if state.hidden_states_mlp_input.shape[0] > 0:
+        if state.hidden_states_ffn_input.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(state.hidden_states_ffn_input)
         else:
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        hidden_states_ffn_input = state.pop("hidden_states_ffn_input")
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+            state.forward_batch.forward_mode, hidden_states_ffn_input
         ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+            state.shared_output = self.shared_experts(hidden_states_ffn_input)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        hidden_states = state.hidden_states_ffn_input
 
         # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
         # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
@@ -1650,7 +1650,7 @@ class DeepseekV2MoE(nn.Module):
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
+                hidden_states=state.hidden_states_ffn_input,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
@@ -1703,7 +1703,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             final_hidden_states *= self.routed_scaling_factor
 
-        state.hidden_states_mlp_output = final_hidden_states
+        state.hidden_states_ffn_output = final_hidden_states
 
 
 class DeepseekV2AttentionMLA(
@@ -2344,17 +2344,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
@@ -2464,18 +2464,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
@@ -2489,25 +2489,25 @@ class DeepseekV2DecoderLayer(nn.Module):
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
-            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+            _ffn_ctx = moe_output_buffer_ctx(hidden_states_orig)
         else:
-            _mlp_ctx = nullcontext()
+            _ffn_ctx = nullcontext()
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=fuse_ffn_allreduce,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
-            with _mlp_ctx:
+            with _ffn_ctx:
                 hidden_states = self.ffn(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
 
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not fuse_mlp_allreduce:
+        if not fuse_ffn_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -2538,9 +2538,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-    def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
+    def op_comm_prepare_ffn(self, state):
+        state.hidden_states_ffn_input, state.residual_after_comm_pre_ffn = (
+            self.layer_communicator.prepare_ffn(
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
@@ -2549,8 +2549,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
+            state.pop("hidden_states_ffn_output"),
+            state.pop("residual_after_comm_pre_ffn"),
             state.forward_batch,
         )
 
@@ -3168,8 +3168,8 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 def dsv2_flashinfer_moe_dual_stream_graph(
     hidden_states: torch.Tensor,
     layer_id: int,
-    fuse_mlp_allreduce: bool,
-    mlp_reduce_scatter: bool,
+    fuse_ffn_allreduce: bool,
+    ffn_reduce_scatter: bool,
 ) -> torch.Tensor:
     forward_context = get_tc_piecewise_forward_context()
     assert forward_context is not None
@@ -3181,8 +3181,8 @@ def dsv2_flashinfer_moe_dual_stream_graph(
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
     with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
+        fuse_ffn_allreduce=fuse_ffn_allreduce,
+        ffn_reduce_scatter=ffn_reduce_scatter,
         flashinfer_trtllm_bypass=True,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)

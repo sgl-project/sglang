@@ -1345,7 +1345,7 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
-    def _prepare_qwen4_exp_mlp(
+    def _prepare_qwen4_exp_ffn(
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -1363,7 +1363,7 @@ class Qwen4ExpLayerExtensionMixin:
     def _qwen4_exp_use_attn_tp_a2a_scatter(self) -> bool:
         return get_parallel().attn_tp_size > 1 and not get_moe_a2a_backend().is_none()
 
-    def _run_qwen4_exp_mlp(
+    def _run_qwen4_exp_ffn(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -1457,10 +1457,10 @@ class Qwen4ExpLinearDecoderLayer(
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
 
-        hidden_states, residual = self._prepare_qwen4_exp_mlp(
+        hidden_states, residual = self._prepare_qwen4_exp_ffn(
             hidden_states, residual, forward_batch
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
+        hidden_states = self._run_qwen4_exp_ffn(hidden_states, forward_batch)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 
 
@@ -1604,10 +1604,10 @@ class Qwen4ExpAttentionDecoderLayer(
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self._prepare_qwen4_exp_mlp(
+        hidden_states, residual = self._prepare_qwen4_exp_ffn(
             hidden_states, residual, forward_batch
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
+        hidden_states = self._run_qwen4_exp_ffn(hidden_states, forward_batch)
         return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
 
 

@@ -1314,16 +1314,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
                 intermediate_size=config.dense_intermediate_size,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
@@ -1390,12 +1390,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )

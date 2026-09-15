@@ -404,7 +404,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
 
         # The parallel block makes attn(norm(x)) and mlp(norm(x)) independent, so
         # the two chains are safe to run concurrently on a second side stream.
-        self.mlp_stream = get_stream("alt_mlp") if is_cuda() else None
+        self.ffn_stream = get_stream("alt_mlp") if is_cuda() else None
 
     def forward(
         self,
@@ -418,15 +418,15 @@ class Cohere2MoeDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if (
-            self.mlp_stream is not None
+            self.ffn_stream is not None
             and get_is_capture_mode()
             and forward_batch.forward_mode.is_decode()
         ):
             # Decode only. A prefill chunk already saturates the GPU, so there the
             # split buys nothing and costs event overhead.
             current_stream = torch.cuda.current_stream()
-            self.mlp_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.mlp_stream):
+            self.ffn_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.ffn_stream):
                 ffn_out = self.ffn(hidden_states)
             attn_out = self.self_attn(
                 positions=positions,
@@ -434,7 +434,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
             # Neither tensor needs record_stream, both stay referenced until here.
-            current_stream.wait_stream(self.mlp_stream)
+            current_stream.wait_stream(self.ffn_stream)
         else:
             attn_out = self.self_attn(
                 positions=positions,

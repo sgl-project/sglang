@@ -464,7 +464,7 @@ class Grok1DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         load_presharded_moe: bool = False,
         load_presharded_attn: bool = False,
-        load_presharded_mlp: bool = False,
+        load_presharded_ffn: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_moe: bool = False,
         prefix: str = "",
@@ -525,7 +525,7 @@ class Grok1DecoderLayer(nn.Module):
                     intermediate_size=config.intermediate_size,
                     quant_config=quant_config,
                     reduce_results=False,
-                    use_presharded_weights=load_presharded_mlp,
+                    use_presharded_weights=load_presharded_ffn,
                     layer_id=layer_id,
                     split_gate_up=split_gate_up,
                 )
@@ -611,14 +611,14 @@ class Grok1DecoderLayer(nn.Module):
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            mlp_result = self.mlp(x)
+            ffn_result = self.mlp(x)
             with torch.cuda.stream(self.alt_stream):
                 moe_result = self.block_sparse_moe(x)
             current_stream.wait_stream(self.alt_stream)
         else:
-            mlp_result = self.mlp(x)
+            ffn_result = self.mlp(x)
             moe_result = self.block_sparse_moe(x)
-        return (mlp_result + moe_result) / 1.4142135623730951
+        return (ffn_result + moe_result) / 1.4142135623730951
 
 
 class Grok1Model(nn.Module):
@@ -629,7 +629,7 @@ class Grok1Model(nn.Module):
         load_presharded_moe: bool = False,
         load_presharded_embedding: bool = False,
         load_presharded_attn: bool = False,
-        load_presharded_mlp: bool = False,
+        load_presharded_ffn: bool = False,
         replicate_embedding: bool = False,
         prefix: str = "",
     ) -> None:
@@ -655,7 +655,7 @@ class Grok1Model(nn.Module):
                     quant_config=quant_config,
                     load_presharded_moe=load_presharded_moe,
                     load_presharded_attn=load_presharded_attn,
-                    load_presharded_mlp=load_presharded_mlp,
+                    load_presharded_ffn=load_presharded_ffn,
                     alt_stream=self.alt_stream,
                 )
                 for i in range(config.num_hidden_layers)
@@ -705,7 +705,7 @@ class Grok1ForCausalLM(nn.Module):
         self.quant_config = quant_config
 
         # Get presharded weights.
-        self.load_presharded_mlp = getattr(config, "load_presharded_mlp", False)
+        self.load_presharded_ffn = getattr(config, "load_presharded_mlp", False)
         self.load_presharded_moe = (
             getattr(config, "load_presharded_moe", True)
             and self.config.num_local_experts > 0
@@ -732,7 +732,7 @@ class Grok1ForCausalLM(nn.Module):
             load_presharded_moe=self.load_presharded_moe,
             load_presharded_embedding=self.load_presharded_embedding,
             load_presharded_attn=self.load_presharded_attn,
-            load_presharded_mlp=self.load_presharded_mlp,
+            load_presharded_ffn=self.load_presharded_ffn,
             replicate_embedding=self.replicate_embedding,
             prefix=add_prefix("model", prefix),
         )

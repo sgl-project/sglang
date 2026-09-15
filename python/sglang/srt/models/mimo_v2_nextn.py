@@ -100,17 +100,17 @@ class MiMoV2MTPLayer(nn.Module):
         is_next_layer_sparse = False
 
         if enable_moe_dense_fully_dp():
-            mlp_tp_rank, mlp_tp_size = 0, 1
+            ffn_tp_rank, ffn_tp_size = 0, 1
         else:
-            mlp_tp_rank, mlp_tp_size = None, None
+            ffn_tp_rank, ffn_tp_size = None, None
         self.ffn = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("ffn", prefix),
-            tp_rank=mlp_tp_rank,
-            tp_size=mlp_tp_size,
+            tp_rank=ffn_tp_rank,
+            tp_size=ffn_tp_size,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
@@ -147,7 +147,7 @@ class MiMoV2MTPLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
         with get_global_expert_distribution_recorder().disable_this_region():

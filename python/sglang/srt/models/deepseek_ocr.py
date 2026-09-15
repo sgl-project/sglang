@@ -381,12 +381,12 @@ class MLPBlock(nn.Module):
     def __init__(
         self,
         embedding_dim: int,
-        mlp_dim: int,
+        ffn_dim: int,
         act: Type[nn.Module] = nn.GELU,
     ) -> None:
         super().__init__()
-        self.lin1 = nn.Linear(embedding_dim, mlp_dim)
-        self.lin2 = nn.Linear(mlp_dim, embedding_dim)
+        self.lin1 = nn.Linear(embedding_dim, ffn_dim)
+        self.lin2 = nn.Linear(ffn_dim, embedding_dim)
         self.act = act()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -614,7 +614,7 @@ class Block(nn.Module):
 
         self.norm2 = norm_layer(dim)
         self.ffn = MLPBlock(
-            embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer
+            embedding_dim=dim, ffn_dim=int(dim * mlp_ratio), act=act_layer
         )
 
         self.window_size = window_size
@@ -999,7 +999,7 @@ def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 
 
-class NoTPFeedForward(nn.Module):
+class NoTPFFN(nn.Module):
     def __init__(
         self,
         cfg,
@@ -1033,7 +1033,7 @@ class NoTPTransformerBlock(nn.Module):
         self.dim = cfg["hidden_size"]
         self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         self.self_attn = NoTPAttention(cfg)
-        self.ffn = NoTPFeedForward(
+        self.ffn = NoTPFFN(
             cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
         )
         self.layer_id = layer_id

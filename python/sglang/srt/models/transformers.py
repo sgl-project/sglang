@@ -1241,7 +1241,7 @@ class MoEMixin:
         num_redundant = get_exec().moe.ep_num_redundant_experts
         ep_size = get_parallel().moe_ep_size
 
-        self.mlp_moe_layers: list[nn.Module] = []
+        self.ffn_moe_layers: list[nn.Module] = []
         self.moe_layers: list[TransformersFusedMoE] = []
         self.num_moe_layers = 0
         self.num_logical_experts = num_experts
@@ -1251,12 +1251,12 @@ class MoEMixin:
         self.num_redundant_experts = num_redundant
 
         def _add_all_reduce(ffn: nn.Module):
-            class MLPWithAllReduce(ffn.__class__):
+            class FFNWithAllReduce(ffn.__class__):
                 def forward(self, *args, **kwargs):
                     output = super().forward(*args, **kwargs)
                     return self.experts.maybe_all_reduce_tensor_model_parallel(output)
 
-            ffn.__class__ = MLPWithAllReduce
+            ffn.__class__ = FFNWithAllReduce
 
         def _recursive_replace(module: nn.Module, prefix: str):
             for child_name, child_module in module.named_children():
@@ -1296,7 +1296,7 @@ class MoEMixin:
                     ffn.experts = fused_experts
                     log_replacement(qual_name, experts, fused_experts)
 
-                    self.mlp_moe_layers.append(ffn)
+                    self.ffn_moe_layers.append(ffn)
                     self.moe_layers.append(fused_experts)
                     self.num_moe_layers += 1
 

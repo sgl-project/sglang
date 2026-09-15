@@ -600,7 +600,7 @@ class GLULinear(nn.Module):
         return self.glu_act(x)
 
 
-class FeedForward(nn.Module):
+class FFN(nn.Module):
     """FeedForward Module.
     For more details see Conformer paper:
         https://arxiv.org/pdf/2005.08100.pdf

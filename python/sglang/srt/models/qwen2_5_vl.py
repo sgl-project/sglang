@@ -387,7 +387,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
-        mlp_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
+        ffn_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
         self.use_data_parallel = use_data_parallel
         self.out_hidden_size = vision_config.out_hidden_size
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
@@ -407,7 +407,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             [
                 Qwen2_5_VisionBlock(
                     dim=hidden_size,
-                    intermediate_dim=mlp_hidden_size,
+                    intermediate_dim=ffn_hidden_size,
                     num_heads=num_heads,
                     head_size=head_dim,
                     hidden_act=vision_config.hidden_act,

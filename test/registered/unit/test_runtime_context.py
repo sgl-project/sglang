@@ -917,9 +917,9 @@ class TestForwardFlags(_IsolatedServerArgs):
                 x = x + 1
             if fwd.is_extend_in_batch:
                 x = x + 2
-            if fwd.fuse_mlp_allreduce:
+            if fwd.fuse_ffn_allreduce:
                 x = x + 4
-            if fwd.mlp_reduce_scatter:
+            if fwd.ffn_reduce_scatter:
                 x = x + 8
             if fwd.flashinfer_trtllm_bypass:
                 x = x + 16
@@ -932,8 +932,8 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 2)
         get_forward().set("is_extend_in_batch", False)
         with get_forward().scoped(
-            fuse_mlp_allreduce=True,
-            mlp_reduce_scatter=True,
+            fuse_ffn_allreduce=True,
+            ffn_reduce_scatter=True,
             flashinfer_trtllm_bypass=True,
         ):
             self.assertEqual(probe(torch.zeros(())).item(), 28)
@@ -1074,30 +1074,30 @@ class TestForwardFlags(_IsolatedServerArgs):
     def test_mlp_comm_forward_flags(self):
         """Decoder-published MLP collective flags: scoped restore + skip helpers."""
         from sglang.srt.layers.moe.utils import (
-            should_skip_mlp_all_reduce,
+            should_skip_ffn_all_reduce,
             should_skip_post_experts_all_reduce,
         )
         from sglang.srt.runtime_context import get_forward
 
         reset_context()
         fwd = get_forward()
-        self.assertFalse(fwd.fuse_mlp_allreduce)
-        self.assertFalse(fwd.mlp_reduce_scatter)
+        self.assertFalse(fwd.fuse_ffn_allreduce)
+        self.assertFalse(fwd.ffn_reduce_scatter)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
-        self.assertFalse(should_skip_mlp_all_reduce())
+        self.assertFalse(should_skip_ffn_all_reduce())
 
-        with fwd.scoped(fuse_mlp_allreduce=True):
-            self.assertTrue(fwd.fuse_mlp_allreduce)
-            self.assertTrue(should_skip_mlp_all_reduce())
+        with fwd.scoped(fuse_ffn_allreduce=True):
+            self.assertTrue(fwd.fuse_ffn_allreduce)
+            self.assertTrue(should_skip_ffn_all_reduce())
             # Fusion alone is enough to skip post-experts AR.
             self.assertTrue(should_skip_post_experts_all_reduce(is_tp_path=True))
-        self.assertFalse(fwd.fuse_mlp_allreduce)
-        self.assertFalse(should_skip_mlp_all_reduce())
+        self.assertFalse(fwd.fuse_ffn_allreduce)
+        self.assertFalse(should_skip_ffn_all_reduce())
 
-        with fwd.scoped(mlp_reduce_scatter=True):
-            self.assertTrue(fwd.mlp_reduce_scatter)
-            self.assertTrue(should_skip_mlp_all_reduce())
-        self.assertFalse(fwd.mlp_reduce_scatter)
+        with fwd.scoped(ffn_reduce_scatter=True):
+            self.assertTrue(fwd.ffn_reduce_scatter)
+            self.assertTrue(should_skip_ffn_all_reduce())
+        self.assertFalse(fwd.ffn_reduce_scatter)
 
         with fwd.scoped(flashinfer_trtllm_bypass=True):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)

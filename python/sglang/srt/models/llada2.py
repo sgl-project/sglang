@@ -640,16 +640,16 @@ class LLaDA2MoeBlock(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = LLaDA2MoeMLP(
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
@@ -685,18 +685,18 @@ class LLaDA2MoeBlock(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with get_forward().scoped(ffn_reduce_scatter=ffn_reduce_scatter):
             hidden_states = self.ffn(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(

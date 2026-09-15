@@ -1023,16 +1023,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with get_forward().scoped(ffn_reduce_scatter=ffn_reduce_scatter):
             hidden_states = self.ffn(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(

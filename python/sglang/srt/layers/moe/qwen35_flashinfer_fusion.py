@@ -253,7 +253,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
             post_residual_addition=post_residual_addition,
         )
 
-    def prepare_mlp(
+    def prepare_ffn(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -271,7 +271,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
                 residual,
                 self.post_attention_layernorm.gemma_weight,
             )
-        return super().prepare_mlp(hidden_states, residual, forward_batch, cache=cache)
+        return super().prepare_ffn(hidden_states, residual, forward_batch, cache=cache)
 
     def should_use_all_reduce_rms_norm(
         self,
@@ -301,7 +301,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
         parallel = get_parallel()
         return (
             self._common_eligible(forward_batch, m)
-            and self.layer_scatter_modes.mlp_mode is not ScatterMode.SCATTERED
+            and self.layer_scatter_modes.ffn_mode is not ScatterMode.SCATTERED
             and parallel.moe_ep_size == 1
         )
 
@@ -319,7 +319,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
             and self._context.tp_size > 1
         )
 
-    def should_fuse_mlp_allreduce_with_next_layer(
+    def should_fuse_ffn_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
         m = (
@@ -331,7 +331,7 @@ class Qwen35FlashInferLayerCommunicator(LayerCommunicator):
             # The Qwen model consumes the final layer's handoff with its final
             # GemmaRMSNorm, so this is intentionally also true for that layer.
             return True
-        return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+        return super().should_fuse_ffn_allreduce_with_next_layer(forward_batch)
 
 
 def prepare_qwen35_flashinfer_fusion(model, model_runner) -> None:

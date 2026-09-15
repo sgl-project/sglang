@@ -404,7 +404,7 @@ class MoonVitEncoderLayer(nn.Module):
         self,
         num_heads: int,
         hidden_dim: int,
-        mlp_dim: int,
+        ffn_dim: int,
         *,
         activation=F.gelu,
         attn_bias: bool = False,
@@ -420,7 +420,7 @@ class MoonVitEncoderLayer(nn.Module):
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn = MLP2(
-            [hidden_dim, mlp_dim, hidden_dim],
+            [hidden_dim, ffn_dim, hidden_dim],
             activation,
             prefix=add_prefix("ffn", prefix),
             use_data_parallel=use_data_parallel,
@@ -658,7 +658,7 @@ class MoonVitPretrainedModel(PreTrainedModel):
             block_cfg={
                 "num_heads": config.num_attention_heads,
                 "hidden_dim": config.hidden_size,
-                "mlp_dim": config.intermediate_size,
+                "ffn_dim": config.intermediate_size,
                 "activation": GELUTanh(),
                 "attn_bias": True,
             },

@@ -190,7 +190,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
         hidden_states = self.ffn(hidden_states)

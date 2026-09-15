@@ -665,7 +665,7 @@ class Gemma3nAudioConformerAttention(nn.Module):
         return audio_encodings_input_to_attn + self.post_norm(audio_encodings)
 
 
-class Gemma3nAudioConformerFeedForward(nn.Module):
+class Gemma3nAudioConformerFFN(nn.Module):
     def __init__(
         self,
         config: Gemma3nAudioConfig,
@@ -799,7 +799,7 @@ class Gemma3nAudioConformerBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        self.ffw_layer_start = Gemma3nAudioConformerFeedForward(
+        self.ffw_layer_start = Gemma3nAudioConformerFFN(
             config, quant_config, prefix=add_prefix("ffw_layer_start", prefix)
         )
         self.attention = Gemma3nAudioConformerAttention(
@@ -808,7 +808,7 @@ class Gemma3nAudioConformerBlock(nn.Module):
         self.lconv1d = Gemma3nAudioConformerLightConv1d(
             config, quant_config, prefix=add_prefix("lconv1d", prefix)
         )
-        self.ffw_layer_end = Gemma3nAudioConformerFeedForward(
+        self.ffw_layer_end = Gemma3nAudioConformerFFN(
             config, quant_config, prefix=add_prefix("ffw_layer_end", prefix)
         )
         self.register_buffer(

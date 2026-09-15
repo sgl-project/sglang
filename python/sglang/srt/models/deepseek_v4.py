@@ -2045,7 +2045,7 @@ class MQALayer(MqaAttentionBase):
 
         Consumes the post-input-norm hidden states produced by
         ``DeepseekV4DecoderLayer.op_mhc_prepare_attn`` and stores the attention
-        output for ``op_mhc_post_attn_pre_mlp``.
+        output for ``op_mhc_post_attn_pre_ffn``.
         """
         state.hidden_states_after_attn = self.forward(
             x=state.pop("hidden_states_after_input_norm"),
@@ -2580,7 +2580,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
         # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
-        # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
+        # MUST tell the MoE to skip it (ffn_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
         _use_reduce_scatterv = (
             _use_tp_moe_gather
@@ -2604,7 +2604,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+        ffn_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
@@ -2658,7 +2658,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with get_forward().scoped(ffn_reduce_scatter=ffn_reduce_scatter):
             hidden_states = self.ffn(
                 hidden_states,
                 forward_batch,
@@ -2676,7 +2676,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
-                # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
+                # MoE-internal all_reduce was skipped (ffn_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
@@ -2688,7 +2688,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # expert outputs AND scatter each rank its own (MAX_LEN-padded)
                 # token chunk in one op (symmetric inverse of the MAX_LEN
                 # all_gather). Correct because the MoE-internal all_reduce was
-                # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
+                # skipped (ffn_reduce_scatter above). dp_reduce_scatter_tensor
                 # routes to the equal-chunk reduce_scatter_tensor here (its
                 # variable-length reduce_scatterv branch is gated by
                 # is_dp_gatherv_active(), which is False under MAX_LEN), which in
@@ -2769,7 +2769,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         )
 
-    def op_mhc_post_attn_pre_mlp(self, state):
+    def op_mhc_post_attn_pre_ffn(self, state):
         # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
         # post-attention layernorm. Produces the 2D MoE input.
         #
@@ -2821,7 +2821,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 state.ffn_residual = ffn_residual
                 state.ffn_post = post
                 state.ffn_comb = comb
-                state.hidden_states_mlp_input = hidden_states
+                state.hidden_states_ffn_input = hidden_states
                 return
 
         hidden_states = self.hc_post(
@@ -2844,12 +2844,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.ffn_residual = ffn_residual
         state.ffn_post = post
         state.ffn_comb = comb
-        state.hidden_states_mlp_input = hidden_states
+        state.hidden_states_ffn_input = hidden_states
 
     def op_mhc_postprocess(self, state):
         # Close the FFN mHC (hc_post) and emit the next layer's input dict.
         hidden_states = self.hc_post(
-            state.pop("hidden_states_mlp_output"),
+            state.pop("hidden_states_ffn_output"),
             state.pop("ffn_residual"),
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
@@ -2884,7 +2884,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Launch the all_gatherv (local hidden -> global buffer) + the input_ids
         # replicate-gather on the shared comm stream; record an event.
         fb = state.forward_batch
-        local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
+        local = state.pop("hidden_states_ffn_input")  # LOCAL [M_local, hidden]
         # Shared-expert-local: compute on LOCAL hidden before the gather; added
         # back after the combine (same as the non-fused forward). Skipped in the
         # global MoE via skip_shared_experts.
@@ -2925,12 +2925,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.pop("gather_keepalive")
 
     def op_moe(self, state):
-        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. mlp_reduce_scatter
+        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. ffn_reduce_scatter
         # skips the MoE-internal all_reduce (we reduce_scatterv in op_combine).
         fb = state.forward_batch
         global_hidden = state.pop("global_hidden")
         global_ids = fb._tbo_global_input_ids
-        with get_forward().scoped(mlp_reduce_scatter=True):
+        with get_forward().scoped(ffn_reduce_scatter=True):
             state.global_expert_out = self.ffn(
                 global_hidden,
                 fb,
@@ -2970,7 +2970,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if shared_local is not None:
             n = hidden.shape[0]
             hidden = hidden + shared_local[:n]
-        state.hidden_states_mlp_output = hidden
+        state.hidden_states_ffn_output = hidden
 
 
 class DeepseekV4Model(nn.Module):

@@ -106,7 +106,7 @@ class Step3p5MLP(nn.Module):
         return output
 
 
-class Step3p5MoEMLP(nn.Module):
+class Step3p5MoEFFN(nn.Module):
     def __init__(
         self,
         config,
@@ -253,16 +253,16 @@ class Step3p5MoEMLP(nn.Module):
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, state.hidden_states_ffn_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            state.router_logits, _ = self.gate(state.hidden_states_ffn_input)
         else:
             state.router_logits = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        hidden_states = state.hidden_states_ffn_input
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -281,7 +281,7 @@ class Step3p5MoEMLP(nn.Module):
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=state.pop("hidden_states_ffn_input"),
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
@@ -315,7 +315,7 @@ class Step3p5MoEMLP(nn.Module):
             )
 
     def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+        state.hidden_states_ffn_output = state.pop("hidden_states_after_combine")
 
 
 class Step3p5Attention(nn.Module):
@@ -529,7 +529,7 @@ class Step3p5DecoderLayer(nn.Module):
         )
         self.use_moe = False
         if self.is_moe_layer:
-            self.moe = Step3p5MoEMLP(
+            self.moe = Step3p5MoEFFN(
                 config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -602,18 +602,18 @@ class Step3p5DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states,
             residual,
             forward_batch,
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
@@ -621,24 +621,24 @@ class Step3p5DecoderLayer(nn.Module):
             # Both share_expert and MoE return unreduced (TP-partial) outputs.
             # Combine them first, then do a single all-reduce — saving one
             # full-TP all-reduce per layer.
-            # Force fuse_mlp_allreduce=True so MoE skips its internal AR.
+            # Force fuse_ffn_allreduce=True so MoE skips its internal AR.
             share_output = self.share_expert(hidden_states)
             with get_forward().scoped(
-                fuse_mlp_allreduce=True,
-                mlp_reduce_scatter=mlp_reduce_scatter,
+                fuse_ffn_allreduce=True,
+                ffn_reduce_scatter=ffn_reduce_scatter,
             ):
                 moe_output = self.moe(hidden_states, forward_batch)
             hidden_states = moe_output + share_output
-            if not fuse_mlp_allreduce and not mlp_reduce_scatter:
+            if not fuse_ffn_allreduce and not ffn_reduce_scatter:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
             hidden_states = self.ffn(hidden_states)
             # Dense MLP uses reduce_results=True, so the output is already
             # all-reduced.  Do NOT set the fusion flag — otherwise the next
             # layer would all-reduce again, multiplying values by world_size.
-            fuse_mlp_allreduce = False
+            fuse_ffn_allreduce = False
 
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(

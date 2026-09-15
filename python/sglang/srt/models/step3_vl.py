@@ -105,7 +105,7 @@ class Step3TextMLP(nn.Module):
         return x
 
 
-class Step3TextMoEMLP(nn.Module):
+class Step3TextMoEFFN(nn.Module):
     # Native
     def __init__(
         self,
@@ -356,7 +356,7 @@ class Step3TextDecoderLayer(nn.Module):
         else:
             self.use_moe = True
             if self.num_fused_shared_experts == 0:
-                self.moe = Step3TextMoEMLP(
+                self.moe = Step3TextMoEFFN(
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
@@ -370,7 +370,7 @@ class Step3TextDecoderLayer(nn.Module):
                     prefix=add_prefix("share_expert", prefix),
                 )
             else:
-                self.moe = Step3TextMoEMLP(
+                self.moe = Step3TextMoEFFN(
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
@@ -383,7 +383,7 @@ class Step3TextDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
-    def moe_mlp_forward(self, hidden_states):
+    def moe_ffn_forward(self, hidden_states):
         if not self.num_fused_shared_experts:
             h = hidden_states.clone()
             hidden_states = self.moe(hidden_states)
@@ -410,11 +410,11 @@ class Step3TextDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
         if self.use_moe:
-            hidden_states = self.moe_mlp_forward(hidden_states)
+            hidden_states = self.moe_ffn_forward(hidden_states)
         else:
             hidden_states = self.ffn(hidden_states)
 

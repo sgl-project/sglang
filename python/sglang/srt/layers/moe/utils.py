@@ -700,15 +700,15 @@ def should_use_dp_reduce_scatterv():
     )
 
 
-def should_skip_mlp_all_reduce() -> bool:
+def should_skip_ffn_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
-    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
-    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
+    True when the decoder published ``fuse_ffn_allreduce`` (next residual+LN
+    absorbs the AR) or ``ffn_reduce_scatter`` (postprocess will reduce-scatter)
     on ``get_forward()``.
     """
     f = get_forward()
-    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+    return f.fuse_ffn_allreduce or f.ffn_reduce_scatter
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
@@ -716,9 +716,9 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     downstream component will fuse, replace, or absorb it.
 
     Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
+      - ``get_forward().fuse_ffn_allreduce``: LayerCommunicator will fuse the
         all-reduce with the next layer's residual all-reduce.
-      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
+      - ``get_forward().ffn_reduce_scatter``: LayerCommunicator's post-attention
         scatter will do reduce-scatter, which would double-reduce on top of
         an all-reduce.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
@@ -737,7 +737,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
-    if should_skip_mlp_all_reduce():
+    if should_skip_ffn_all_reduce():
         return True
     if get_parallel().dwdp_size > 1:
         return True

@@ -140,7 +140,7 @@ class Qwen2VisionBlock(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
+        ffn_hidden_dim = int(dim * mlp_ratio)
 
         self.attn = VisionAttention(
             embed_dim=dim,
@@ -153,7 +153,7 @@ class Qwen2VisionBlock(nn.Module):
         )
         self.ffn = Qwen2VisionMLP(
             dim,
-            mlp_hidden_dim,
+            ffn_hidden_dim,
             act_layer=act_layer,
             quant_config=quant_config,
             prefix=add_prefix("ffn", prefix),

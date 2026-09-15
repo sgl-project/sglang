@@ -526,7 +526,7 @@ class VisionTransformerBlock(nn.Module):
         drop_path: float = 0.0,
         act_layer: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
-        mlp_layer: nn.Module = Mlp,
+        ffn_layer: nn.Module = Mlp,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -544,7 +544,7 @@ class VisionTransformerBlock(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.ffn = mlp_layer(
+        self.ffn = ffn_layer(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
@@ -728,7 +728,7 @@ class VisionTransformer(nn.Module):
         _norm_layer: Optional[LayerType] = None,
         _act_layer: Optional[LayerType] = None,
         block_fn: Type[nn.Module] = VisionTransformerBlock,
-        mlp_layer: Type[nn.Module] = Mlp,
+        ffn_layer: Type[nn.Module] = Mlp,
         ignore_head: bool = False,
     ) -> None:
         """
@@ -835,7 +835,7 @@ class VisionTransformer(nn.Module):
                     drop_path=dpr[i],
                     norm_layer=norm_layer,
                     act_layer=act_layer,
-                    mlp_layer=mlp_layer,
+                    ffn_layer=ffn_layer,
                 )
                 for i in range(depth)
             ]

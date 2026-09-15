@@ -494,20 +494,20 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             "Dense K2Horizon native loading requires explicit rope_parameters"
         )
 
-    mlp_only_layers = getattr(config, "mlp_only_layers", _CONFIG_ATTR_MISSING)
-    if mlp_only_layers is not _CONFIG_ATTR_MISSING:
-        if not isinstance(mlp_only_layers, (list, tuple)) or any(
+    ffn_only_layers = getattr(config, "mlp_only_layers", _CONFIG_ATTR_MISSING)
+    if ffn_only_layers is not _CONFIG_ATTR_MISSING:
+        if not isinstance(ffn_only_layers, (list, tuple)) or any(
             isinstance(layer_id, bool) or not isinstance(layer_id, int)
-            for layer_id in mlp_only_layers
+            for layer_id in ffn_only_layers
         ):
             raise ValueError("K2Horizon mlp_only_layers must be a list of integers")
-        expected_prefix = list(range(len(mlp_only_layers)))
-        if list(mlp_only_layers) != expected_prefix:
+        expected_prefix = list(range(len(ffn_only_layers)))
+        if list(ffn_only_layers) != expected_prefix:
             raise ValueError(
                 "K2Horizon MoVA requires mlp_only_layers to be a contiguous "
-                f"prefix starting at zero, got {list(mlp_only_layers)}"
+                f"prefix starting at zero, got {list(ffn_only_layers)}"
             )
-        if not has_moe_ffn and list(mlp_only_layers) != list(
+        if not has_moe_ffn and list(ffn_only_layers) != list(
             range(config.num_hidden_layers)
         ):
             raise ValueError(
@@ -517,7 +517,7 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             config,
             source_name="mlp_only_layers",
             target_name="num_dense_layers",
-            value=len(mlp_only_layers),
+            value=len(ffn_only_layers),
         )
     elif not has_moe_ffn:
         raise ValueError(
@@ -1459,9 +1459,9 @@ class XllmDecoderLayer(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
         # Determine if this layer is sparse (MoE) or dense
-        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        ffn_only_layers = getattr(config, "mlp_only_layers", [])
         decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-        if (layer_id not in mlp_only_layers) and (
+        if (layer_id not in ffn_only_layers) and (
             config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
         ):
             self.is_layer_sparse = True
@@ -1504,7 +1504,7 @@ class XllmDecoderLayer(nn.Module):
         def _is_sparse(lid):
             if lid < 0 or lid >= config.num_hidden_layers:
                 return False
-            return (lid not in mlp_only_layers) and (
+            return (lid not in ffn_only_layers) and (
                 config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
             )
 
@@ -1528,17 +1528,17 @@ class XllmDecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = XllmMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.input_layernorm = _make_norm(config)
@@ -1571,7 +1571,7 @@ class XllmDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 

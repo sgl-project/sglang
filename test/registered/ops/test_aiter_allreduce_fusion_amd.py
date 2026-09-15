@@ -347,11 +347,11 @@ class TestAiterAllreduceFusionAmd(unittest.TestCase):
         )
 
 
-def _fake_self(*, mlp_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_size=8):
+def _fake_self(*, ffn_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_size=8):
     """Minimal stand-in for a LayerCommunicator with the fields the gate reads."""
     return types.SimpleNamespace(
         _speculative_algo=None,
-        layer_scatter_modes=types.SimpleNamespace(mlp_mode=mlp_mode),
+        layer_scatter_modes=types.SimpleNamespace(ffn_mode=ffn_mode),
         is_last_layer=is_last_layer,
         _context=types.SimpleNamespace(tp_size=tp_size),
     )
@@ -364,7 +364,7 @@ def _fake_forward_batch(batch_size=8):
 class TestAiterAllreduceFusionGate(CustomTestCase):
     """Pure-logic coverage of the aiter all-reduce + RMSNorm fusion gate.
 
-    Covers ``LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer``,
+    Covers ``LayerCommunicator.should_fuse_ffn_allreduce_with_next_layer``,
     specifically the AMD/aiter branch guards that disable the fused path under
     DP attention or an expert-parallel A2A backend (e.g. mori). Without those
     guards the fused custom all-reduce is invoked during CUDA graph capture in
@@ -383,7 +383,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         aiter_enabled=True,
         use_aiter=True,
         tp_world_size=8,
-        mlp_mode=ScatterMode.TP_ATTN_FULL,
+        ffn_mode=ScatterMode.TP_ATTN_FULL,
         is_last_layer=False,
         tp_size=8,
     ):
@@ -434,9 +434,9 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
             )
 
             fake_self = _fake_self(
-                mlp_mode=mlp_mode, is_last_layer=is_last_layer, tp_size=tp_size
+                ffn_mode=ffn_mode, is_last_layer=is_last_layer, tp_size=tp_size
             )
-            return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
+            return LayerCommunicator.should_fuse_ffn_allreduce_with_next_layer(
                 fake_self, _fake_forward_batch()
             )
 

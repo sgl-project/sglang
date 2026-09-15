@@ -1295,7 +1295,7 @@ class ZayaDecoderATTLayer(nn.Module):
         return hidden_states, residual, prev_router_hidden_states
 
 
-class ZayaDecoderMLPLayer(nn.Module):
+class ZayaDecoderFFNLayer(nn.Module):
     """MoE decoder layer: ``res_scale → input_norm → ZayaBlock``."""
 
     def __init__(
@@ -1370,7 +1370,7 @@ def _build_layer(
             quant_config=quant_config,
             prefix=prefix,
         )
-    return ZayaDecoderMLPLayer(
+    return ZayaDecoderFFNLayer(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
