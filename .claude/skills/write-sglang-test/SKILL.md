@@ -10,7 +10,7 @@ This skill covers **how to write and register tests**. For CI pipeline internals
 ## Core Rules
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
-2. **`tearDownClass` must be defensive** — use `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
+2. **`tearDownClass` must shut the server down gracefully** — call `terminate_and_kill_process_tree(cls.process)`, never a bare `kill_process_tree`. SIGKILL alone skips the server's userspace cleanup and leaves its GPU memory charged to the dead process; the next class then OOMs while loading weights. Keep it defensive too: `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
 3. **Place tests in `test/registered/<kind>/<subsystem>/`** — `<kind>` is `unit`, `kernel`, `e2e`, `accuracy`, `perf`, or `stress`; hardware belongs in registrations, not directory names
 4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
 5. **Mock boundaries, not SGLang behavior** — mock slow or external dependencies only when the assertion still checks an observable result, state transition, or error. A test whose evidence is only `assert_called*` mirrors its mock and is not admissible. Launch a real server only when inference results or lifecycle behavior are the contract under test.
@@ -197,7 +197,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -205,6 +204,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=60, suite="base-b-test-1-gpu-small")
@@ -225,7 +225,7 @@ class TestMyFeature(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_basic_functionality(self):
         response = requests.post(
@@ -247,7 +247,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -255,6 +254,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=300, suite="base-b-test-1-gpu-large")
@@ -274,7 +274,7 @@ class TestMyFeaturePerf(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
     def test_latency(self):
         start = time.perf_counter()
@@ -432,11 +432,12 @@ class TestMyFeature(CustomTestCase, MMLUMixin):
 from sglang.test.test_utils import (
     CustomTestCase,              # base class with retry logic
     popen_launch_server,         # launch server subprocess
+    terminate_and_kill_process_tree,    # SIGTERM, then SIGKILL, then wait for
+                                        # the GPU memory to come back
     DEFAULT_URL_FOR_TEST,        # auto-configured base URL
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,  # 600s default
     run_bench_serving,           # benchmark helper (launch + bench)
 )
-from sglang.srt.utils import kill_process_tree  # cleanup server
 ```
 
 ---
@@ -451,7 +452,7 @@ Before submitting a test:
 - [ ] JIT kernel work: test files live in `test/registered/kernel/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
-- [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
+- [ ] `setUpClass` launches server, `tearDownClass` shuts it down with `terminate_and_kill_process_tree` (if server-based)
 - [ ] `tearDownClass` is defensive — uses `hasattr`/null checks before accessing resources that may not have been allocated
 - [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)
