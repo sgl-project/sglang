@@ -23,14 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
-    """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+    """Validate that the active platform supports an MXFP8 KV cache."""
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not get_platform().is_blackwell:
+    if not get_platform().supports_mxfp8_kv_cache():
         raise ValueError(
-            "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
-            "block-scaled operands used by the FA4 MXFP8 attention path."
+            "--kv-cache-dtype mxfp8 requires a platform with MXFP8 KV-cache support."
         )
 
 

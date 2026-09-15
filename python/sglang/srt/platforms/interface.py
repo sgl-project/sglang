@@ -103,6 +103,10 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
+    def supports_mxfp8_kv_cache(self) -> bool:
+        """Whether this platform supports an MXFP8 KV cache."""
+        return self.is_blackwell
+
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
