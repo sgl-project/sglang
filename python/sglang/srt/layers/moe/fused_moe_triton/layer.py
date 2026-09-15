@@ -1183,7 +1183,6 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )
-            and "zero" not in weight_name
             else loaded_weight
         )
 
@@ -1428,7 +1427,7 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
         loaded_weight = (
-            loaded_weight.t().contiguous()
+            loaded_weight.transpose(-2, -1).contiguous()
             if (
                 method.__class__.__name__
                 in [
@@ -1436,7 +1435,6 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )
-            and "zero" not in weight_name
             else loaded_weight
         )
 
