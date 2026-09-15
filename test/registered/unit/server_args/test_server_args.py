@@ -2970,9 +2970,6 @@ class TestGrpcServerArgs(CustomTestCase):
         for changes, message in (
             ({"sidecar": None}, "requires --sidecar"),
             ({"sidecar_scope": "invalid"}, "must be leader or local-telemetry"),
-            ({"sidecar_startup_timeout": 0}, "positive and finite"),
-            ({"sidecar_startup_timeout": float("nan")}, "positive and finite"),
-            ({"sidecar_startup_timeout": float("inf")}, "positive and finite"),
             ({"nnodes": 2}, "require --dist-init-addr"),
             ({"max_ep_size": 8}, "static DP topology"),
         ):

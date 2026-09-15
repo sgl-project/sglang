@@ -359,8 +359,6 @@ def handle_deprecated_args(server_args: Any):
                 "Local sidecars require the Python server with native gRPC; "
                 "SGLANG_RUST_SERVER is not supported."
             )
-        if not (0 < cfg.sidecar_startup_timeout < float("inf")):
-            raise ValueError("--sidecar-startup-timeout must be positive and finite.")
         if cfg.nnodes > 1 and not cfg.dist_init_addr:
             raise ValueError(
                 "Local sidecars on multiple nodes require --dist-init-addr."

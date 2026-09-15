@@ -410,10 +410,10 @@ async def lifespan(fast_api_app: FastAPI):
             if get_serving().sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import (
                     build_sidecar_context,
-                    start_sidecar_async,
+                    start_sidecar,
                 )
 
-                sidecar = await start_sidecar_async(
+                sidecar = start_sidecar(
                     build_sidecar_context(_global_state.local_kv_event_sources)
                 )
 

@@ -1,11 +1,9 @@
 """CPU coverage for local publisher metadata and managed sidecar lifecycle."""
 
-import asyncio
 import atexit
 import dataclasses
 import json
 import os
-import threading
 import time
 import unittest
 from contextlib import ExitStack, nullcontext
@@ -26,9 +24,7 @@ from sglang.srt.entrypoints.sidecar import (
     Sidecar,
     _run_sidecar,
     build_sidecar_context,
-    notify_sidecar_ready,
     start_sidecar,
-    start_sidecar_async,
 )
 from sglang.srt.entrypoints.sidecar_context import (
     LOCAL_KV_EVENT_SOURCES,
@@ -57,7 +53,6 @@ def main(argv):
             subscriber.setsockopt_string(zmq.SUBSCRIBE, source["topic"])
             subscriber.connect(source["endpoint"])
             report.connect(argv[0])
-            notify_sidecar_ready()
             while True:
                 report.send_multipart(subscriber.recv_multipart())
 
@@ -256,11 +251,11 @@ class TestLocalSidecar(unittest.TestCase):
         with get_context().override_server_args(
             sidecar="test_local_sidecar",
             sidecar_args=[report.getsockopt_string(zmq.LAST_ENDPOINT)],
-            sidecar_startup_timeout=60,
         ):
             sidecar = start_sidecar(context)
         self.addCleanup(sidecar.stop)
-        deadline = time.monotonic() + 5
+        # Includes spawned interpreter/provider initialization, without a handshake.
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             publisher.publish(KVEventBatch(ts=time.time(), events=[AllBlocksCleared()]))
             if report.poll(100):
@@ -278,7 +273,7 @@ class TestLocalSidecar(unittest.TestCase):
 
     def test_follower_context_is_installed_before_provider_import(self):
         context = SidecarContext("telemetry", 1, 2, 8, "tcp://leader:5000", [source(4)])
-        writer = MagicMock()
+        provider_main = MagicMock()
 
         def import_provider(name):
             self.assertNotIn(SGLANG_GRPC_ENDPOINT_ENV, os.environ)
@@ -286,7 +281,7 @@ class TestLocalSidecar(unittest.TestCase):
                 json.loads(os.environ[SGLANG_SIDECAR_CONTEXT_ENV]),
                 dataclasses.asdict(context),
             )
-            return SimpleNamespace(main=lambda argv: notify_sidecar_ready())
+            return SimpleNamespace(main=provider_main)
 
         with (
             patch.dict(os.environ, {SGLANG_GRPC_ENDPOINT_ENV: "http://stale:1"}),
@@ -296,103 +291,32 @@ class TestLocalSidecar(unittest.TestCase):
                 import_provider,
             ),
         ):
-            _run_sidecar("provider", [], None, context, writer)
-        writer.send.assert_called_once_with("ready")
-        writer.close.assert_called_once_with()
+            _run_sidecar("provider", [], None, context)
+        provider_main.assert_called_once_with([])
 
-    def test_follower_process_has_no_grpc_endpoint_and_requires_readiness(self):
+    def test_follower_process_receives_context_without_grpc_endpoint(self):
         context = SidecarContext("telemetry", 1, 2, 8, "tcp://leader:5000", [source(4)])
         with (
-            get_context().override_server_args(
-                sidecar="provider", sidecar_startup_timeout=7
-            ),
+            get_context().override_server_args(sidecar="provider"),
             patch("sglang.srt.entrypoints.sidecar.mp.get_context") as mp_context,
             patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
         ):
-            reader, writer = MagicMock(), MagicMock()
-            mp_context.return_value.Pipe.return_value = (reader, writer)
             start_sidecar(context)
         self.assertEqual(
             mp_context.return_value.Process.call_args.kwargs["args"],
-            ("provider", [], None, context, writer),
+            ("provider", [], None, context),
         )
-        self.assertEqual(sidecar_class.call_args.kwargs["ready_reader"], reader)
-        self.assertEqual(sidecar_class.call_args.kwargs["startup_timeout"], 7)
+        self.assertFalse(sidecar_class.call_args.kwargs["allow_clean_exit"])
+        mp_context.return_value.Pipe.assert_not_called()
+        sidecar_class.return_value.start.assert_called_once_with()
 
-    def test_start_waits_for_ready_and_closes_parent_pipe_ends(self):
-        proc = MagicMock(pid=1234)
-        reader, writer = MagicMock(), MagicMock()
-        reader.recv.return_value = "ready"
-        sidecar = Sidecar(proc, "provider", 1, ready_reader=reader, ready_writer=writer)
-        with patch.object(sidecar._watchdog, "start") as watch:
-            sidecar.start()
-        reader.poll.assert_called_once_with(60)
-        writer.close.assert_called_once_with()
-        reader.close.assert_called_once_with()
-        watch.assert_called_once_with()
-
-    def test_timeout_or_early_exit_reaps_child(self):
-        for early_exit in (False, True):
-            with self.subTest(early_exit=early_exit):
-                proc = MagicMock(pid=1234)
-                proc.is_alive.side_effect = [True, False]
-                reader, writer = MagicMock(), MagicMock()
-                reader.poll.return_value = early_exit
-                reader.recv.side_effect = EOFError
-                sidecar = Sidecar(
-                    proc, "provider", 1, ready_reader=reader, ready_writer=writer
-                )
-                with self.assertRaises(RuntimeError if early_exit else TimeoutError):
-                    sidecar.start()
-                proc.terminate.assert_called_once_with()
-                proc.join.assert_called_once_with(timeout=1)
-                reader.close.assert_called_once_with()
-                writer.close.assert_called_once_with()
-                sidecar.stop()  # Cleanup is idempotent.
-                proc.terminate.assert_called_once_with()
-
-    def test_clean_exit_after_ready_is_fatal(self):
+    def test_unexpected_clean_exit_is_fatal(self):
         proc = MagicMock(pid=1234, exitcode=0)
         proc.is_alive.return_value = False
-        sidecar = Sidecar(proc, "provider", 1, ready_reader=MagicMock())
+        sidecar = Sidecar(proc, "provider", 1, allow_clean_exit=False)
         with patch("sglang.srt.utils.watchdog.os.kill") as kill:
             self.assertTrue(sidecar._watchdog._check_processes())
         kill.assert_called_once()
-
-
-class TestAsyncSidecarStartup(unittest.IsolatedAsyncioTestCase):
-    async def test_provider_can_call_back_into_tokenizer_loop(self):
-        loop = asyncio.get_running_loop()
-
-        async def callback():
-            return "metadata"
-
-        def start(context):
-            return asyncio.run_coroutine_threadsafe(callback(), loop).result(timeout=2)
-
-        with patch("sglang.srt.entrypoints.sidecar.start_sidecar", start):
-            self.assertEqual(await start_sidecar_async(), "metadata")
-
-    async def test_cancelled_startup_reclaims_eventual_sidecar(self):
-        loop = asyncio.get_running_loop()
-        started = asyncio.Event()
-        release = threading.Event()
-        sidecar = MagicMock()
-
-        def start(context):
-            loop.call_soon_threadsafe(started.set)
-            if not release.wait(timeout=2):
-                raise TimeoutError("test did not release provider")
-            return sidecar
-
-        with patch("sglang.srt.entrypoints.sidecar.start_sidecar", start):
-            task = asyncio.create_task(start_sidecar_async())
-            await started.wait()
-            task.cancel()
-            release.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-        sidecar.stop.assert_called_once_with()
 
 
 class TestFollowerSidecarLifecycle(unittest.TestCase):
@@ -417,8 +341,8 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
         sidecar.stop.side_effect = lambda: events.append("sidecar-stopped")
 
         def start(context):
-            events.append("sidecar-ready")
-            self.assertEqual(events, ["scheduler-ready", "sidecar-ready"])
+            events.append("sidecar-started")
+            self.assertEqual(events, ["scheduler-ready", "sidecar-started"])
             if start_failure:
                 raise start_failure
             return sidecar
@@ -485,14 +409,14 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
         )
         return launch, result, sidecar, events, health, kill
 
-    def test_blocking_follower_waits_before_health_and_stops_on_exit(self):
+    def test_blocking_follower_starts_sidecar_and_stops_on_exit(self):
         launch, _, sidecar, events, _, _ = self.launch(sources=[source(4)])
         launch()
         self.assertEqual(
             events,
             [
                 "scheduler-ready",
-                "sidecar-ready",
+                "sidecar-started",
                 "health",
                 "blocking",
                 "sidecar-stopped",
@@ -515,7 +439,7 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
                     sources=sources, scope=scope
                 )
                 launch()
-                self.assertNotIn("sidecar-ready", events)
+                self.assertNotIn("sidecar-started", events)
                 sidecar.stop.assert_not_called()
 
     def test_nonblocking_follower_transfers_ownership_to_engine(self):
@@ -527,7 +451,7 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
         returned = launch()
         self.assertIs(returned[3], result)
         self.assertIs(result.sidecar, sidecar)
-        self.assertEqual(events, ["scheduler-ready", "sidecar-ready"])
+        self.assertEqual(events, ["scheduler-ready", "sidecar-started"])
         health.assert_not_called()
         engine = Engine.__new__(Engine)
         engine.tokenizer_manager = None
@@ -538,9 +462,9 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
 
     def test_sidecar_start_failure_reaps_schedulers_before_returning(self):
         launch, _, _, _, health, kill = self.launch(
-            sources=[source(4)], start_failure=TimeoutError("provider not ready")
+            sources=[source(4)], start_failure=OSError("cannot start provider")
         )
-        with self.assertRaisesRegex(TimeoutError, "provider not ready"):
+        with self.assertRaisesRegex(OSError, "cannot start provider"):
             launch()
         health.assert_not_called()
         kill.assert_called_once_with(12345, wait_timeout=60)

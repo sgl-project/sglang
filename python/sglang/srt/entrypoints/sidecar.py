@@ -13,14 +13,12 @@
 """Lifecycle management for full and telemetry-only local sidecars."""
 
 import argparse
-import asyncio
 import dataclasses
 import importlib
 import json
 import logging
 import multiprocessing as mp
 import os
-from multiprocessing.connection import Connection
 
 from sglang.srt.entrypoints.sidecar_context import KvEventSource, SidecarContext
 from sglang.srt.runtime_context import get_parallel, get_serving
@@ -33,21 +31,6 @@ logger = logging.getLogger(__name__)
 SGLANG_GRPC_ENDPOINT_ENV = "SGLANG_GRPC_ENDPOINT"
 SGLANG_SIDECAR_CONTEXT_ENV = "SGLANG_SIDECAR_CONTEXT"
 _DEFAULT_SIDECAR_SHUTDOWN_TIMEOUT = 45.0
-_ready_writer: Connection | None = None
-
-
-def notify_sidecar_ready() -> None:
-    """Called by local-telemetry providers after establishing local subscriptions.
-
-    This acknowledges node-local readiness only. A provider coordinating several
-    nodes must separately gate request registration on the required source set.
-    """
-    global _ready_writer
-    if _ready_writer is None:
-        raise RuntimeError("No pending managed sidecar readiness handshake")
-    _ready_writer.send("ready")
-    _ready_writer.close()
-    _ready_writer = None
 
 
 def build_sidecar_context(sources: list[KvEventSource]) -> SidecarContext | None:
@@ -102,11 +85,8 @@ def _run_sidecar(
     args: list[str],
     endpoint: str | None,
     context: SidecarContext | None = None,
-    ready_writer: Connection | None = None,
 ) -> None:
-    global _ready_writer
     kill_itself_when_parent_died()
-    _ready_writer = ready_writer
     if endpoint is None:
         os.environ.pop(SGLANG_GRPC_ENDPOINT_ENV, None)
     else:
@@ -139,55 +119,20 @@ class Sidecar:
         module_name: str,
         shutdown_timeout: float,
         *,
-        ready_reader: Connection | None = None,
-        ready_writer: Connection | None = None,
-        startup_timeout: float = 60.0,
+        allow_clean_exit: bool = True,
     ):
         self.proc = proc
         self.module_name = module_name
         self.shutdown_timeout = shutdown_timeout
-        self._ready_reader = ready_reader
-        self._ready_writer = ready_writer
-        self._startup_timeout = startup_timeout
         self._stopped = False
         self._watchdog = SubprocessWatchdog(
             processes=[proc],
             process_names=[module_name],
-            allow_clean_exit=ready_reader is None,
+            allow_clean_exit=allow_clean_exit,
         )
 
     def start(self) -> None:
-        try:
-            self.proc.start()
-        except BaseException:
-            self._close_ready_pipe()
-            raise
-        if self._ready_writer is not None:
-            self._ready_writer.close()
-            self._ready_writer = None
-        if self._ready_reader is not None:
-            try:
-                if not self._ready_reader.poll(self._startup_timeout):
-                    raise TimeoutError(
-                        f"Sidecar {self.module_name} did not report ready within "
-                        f"{self._startup_timeout}s; the provider must call "
-                        "notify_sidecar_ready() after subscribing"
-                    )
-                try:
-                    message = self._ready_reader.recv()
-                except EOFError as exc:
-                    raise RuntimeError(
-                        f"Sidecar {self.module_name} exited before reporting ready"
-                    ) from exc
-                if message != "ready":
-                    raise RuntimeError(
-                        f"Invalid sidecar readiness message: {message!r}"
-                    )
-            except BaseException:
-                self.stop()
-                raise
-            finally:
-                self._close_ready_pipe()
+        self.proc.start()
         self._watchdog.start()
         logger.info(
             "Sidecar module %s started pid=%s",
@@ -200,7 +145,6 @@ class Sidecar:
             return
         self._stopped = True
         self._watchdog.stop()
-        self._close_ready_pipe()
         if self.proc.is_alive():
             self.proc.terminate()
             self.proc.join(timeout=self.shutdown_timeout)
@@ -210,13 +154,6 @@ class Sidecar:
         if self.proc.is_alive():
             logger.warning("Sidecar module did not terminate; killing process tree")
             kill_process_tree(self.proc.pid, wait_timeout=self.shutdown_timeout)
-
-    def _close_ready_pipe(self) -> None:
-        for name in ("_ready_reader", "_ready_writer"):
-            connection = getattr(self, name)
-            if connection is not None:
-                connection.close()
-                setattr(self, name, None)
 
 
 def start_sidecar(context: SidecarContext | None = None) -> Sidecar:
@@ -230,15 +167,10 @@ def start_sidecar(context: SidecarContext | None = None) -> Sidecar:
     )
     mp_context = mp.get_context("spawn")
     process_args = (module_name, sidecar_args, endpoint)
-    ready_args = {}
+    lifecycle_args = {}
     if context is not None:
-        reader, writer = mp_context.Pipe(duplex=False)
-        process_args += (context, writer)
-        ready_args = dict(
-            ready_reader=reader,
-            ready_writer=writer,
-            startup_timeout=get_serving().sidecar_startup_timeout,
-        )
+        process_args += (context,)
+        lifecycle_args = dict(allow_clean_exit=False)
     proc = mp_context.Process(
         name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,
@@ -248,20 +180,7 @@ def start_sidecar(context: SidecarContext | None = None) -> Sidecar:
         proc,
         module_name,
         shutdown_timeout=shutdown_timeout,
-        **ready_args,
+        **lifecycle_args,
     )
     sidecar.start()
     return sidecar
-
-
-async def start_sidecar_async(context: SidecarContext | None = None) -> Sidecar:
-    """Keep the tokenizer loop available to a provider's startup gRPC calls."""
-    task = asyncio.create_task(asyncio.to_thread(start_sidecar, context))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # The thread cannot be cancelled. Reclaim its process even when lifespan
-        # is cancelled while the provider is still starting.
-        sidecar = await task
-        await asyncio.to_thread(sidecar.stop)
-        raise

@@ -96,14 +96,10 @@ class Serving(msgspec.Struct):
         Arg(
             help="Where to launch the sidecar. 'leader' keeps the gRPC-only "
             "contract; 'local-telemetry' also launches headless sidecars on nodes "
-            "with local KV-event publishers and requires provider readiness support.",
+            "with local KV-event publishers.",
             choices=["leader", "local-telemetry"],
         ),
     ] = "leader"
-    sidecar_startup_timeout: A[
-        float,
-        "Seconds to wait for provider readiness in local-telemetry mode.",
-    ] = 60.0
     sidecar_args: A[
         Optional[List[str]],
         Arg(

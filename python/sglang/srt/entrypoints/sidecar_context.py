@@ -5,18 +5,18 @@ Version 1 describes a static set of local KV-event publishers.
 
 With ``--sidecar-scope local-telemetry``, the launcher serializes SidecarContext
 as JSON in ``SGLANG_SIDECAR_CONTEXT`` before importing the provider. Providers
-must check ``version``, use only the listed sources, and call
-``sglang.srt.entrypoints.sidecar.notify_sidecar_ready()`` after setting up their
-subscriptions. ``main(argv)`` remains the provider entrypoint.
+must check ``version`` and use only the listed sources. ``main(argv)`` remains
+the provider entrypoint.
 
 ``mode=full`` retains ``SGLANG_GRPC_ENDPOINT``; ``mode=telemetry`` removes it.
 ``dist_init_addr`` is the engine rendezvous address shared by the nodes in one
 multinode instance. Consumers resolve it when correlating nodes and must handle
 worker generations themselves. It is not a Dynamo worker ID.
 
-SGLang waits for local provider readiness and treats an unexpected sidecar exit
-as a node failure. The consumer owns cross-node readiness, attribution, replay
-and recovery; local readiness does not guarantee lossless ZMQ PUB delivery.
+SGLang launches the provider without waiting for its subscriptions and treats
+an unexpected sidecar exit as a node failure. The consumer owns initialization,
+cross-node coordination, attribution, replay and recovery. Process launch does
+not guarantee lossless ZMQ PUB delivery.
 Independent follower-sidecar restarts and live topology changes are unsupported.
 """
 
