@@ -334,9 +334,9 @@ export const Qwen35Deployment = () => {
 
     let modelName;
     if (quantization === 'fp4') {
-      // AMD MI355X uses the MXFP4 checkpoint; Blackwell uses NVFP4-V2.
+      // AMD MI355X uses MXFP4-AttnFP8-V2 (MXFP4 MoE, FP8 attention); Blackwell uses NVFP4-V2.
       modelName = hardware === 'mi355x'
-        ? 'amd/Qwen3.5-397B-A17B-MXFP4'
+        ? 'amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2'
         : 'nvidia/Qwen3.5-397B-A17B-NVFP4-V2';
     } else {
       const suffix = MODEL_SUFFIX[model];
@@ -517,8 +517,8 @@ export const Qwen35Deployment = () => {
           cmd += ' \\\n  --enable-hierarchical-cache';
           cmd += ' \\\n  --hicache-ratio 1.5';
           cmd += ' \\\n  --hicache-write-policy write_through';
-          cmd += ' \\\n  --hicache-io-backend kernel';
-          cmd += ' \\\n  --hicache-mem-layout page_first';
+          cmd += ' \\\n  --hicache-io-backend direct';
+          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
         } else {
           cmd += ' \\\n  --disable-radix-cache';
         }

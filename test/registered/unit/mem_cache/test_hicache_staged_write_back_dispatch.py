@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -264,12 +265,13 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(controller.ack_load_queue[0].node_ids, [7, 7])
 
     def test_short_staged_swa_tail_resolves_device_covered_head(self):
+        handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
         pipeline.release_staged_hold = mock.Mock(return_value=True)
         pipeline.staged_prefetches = {
-            "r": SimpleNamespace(
-                req_id="r",
+            handle: SimpleNamespace(
+                request=handle,
                 key_tokens=list(range(8)),
                 extra_key=None,
                 cache_salt=None,
@@ -288,9 +290,13 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
         }
 
-        self.assertEqual(pipeline.plan_staged_splice("r", device_prefix_len=6), (0, 0))
-        pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with("r", 4)
-        pipeline.release_staged_hold.assert_called_once_with("r", reason="shrunk")
+        self.assertEqual(
+            pipeline.plan_staged_splice(handle, device_prefix_len=6), (0, 0)
+        )
+        pipeline._cache._resolve_storage_prefetch_tokens.assert_called_once_with(
+            handle, 4
+        )
+        pipeline.release_staged_hold.assert_called_once_with(handle, reason="shrunk")
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = mock.Mock()

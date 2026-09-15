@@ -36,6 +36,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRACTION
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     EvictParams,
     InitLoadBackParams,
@@ -99,7 +100,7 @@ class _StagedPrefetch(msgspec.Struct):
     the op-owned host bounce exists (no device state, nothing in the tree).
     """
 
-    req_id: str
+    request: CacheRequestHandle
     key_tokens: list[int]
     extra_key: Optional[str]
     cache_salt: Optional[str]
@@ -117,7 +118,7 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     tree-resident; only the host bounce remains to free.
     """
 
-    req_id: str
+    request: CacheRequestHandle
     num_tokens: int
     occupied_tokens: int
     aux_xfers: list[PoolTransfer]
@@ -272,9 +273,9 @@ class BufferModePipeline:
         # negative ack id).
         self.pending_hit_allocs: deque = deque()
         self._prefetch_prefix_ctx: dict[
-            str, tuple[list[int], Optional[str], Optional[str]]
+            CacheRequestHandle, tuple[list[int], Optional[str], Optional[str]]
         ] = {}
-        self.staged_prefetches: dict[str, _StagedPrefetch] = {}
+        self.staged_prefetches: dict[CacheRequestHandle, _StagedPrefetch] = {}
         self.ongoing_buffer_load_back: dict[int, _OngoingBufferLoadBack] = {}
         # Backup pipeline: FIFO intents awaiting a D2H slot, node ids
         # anywhere in flight (dedupes re-triggers), and a content refcount
@@ -292,8 +293,8 @@ class BufferModePipeline:
         self.write_staged_tokens_ = 0
         self.write_backlog_tokens_ = 0
         self._backlog_cap_hits = 0
-        # rid-keyed anchor locks; released idempotently at every exit.
-        self.anchor_locks: dict[str, _AnchorLock] = {}
+        # Attempt-keyed locks stop stale completions from unlocking retries.
+        self.anchor_locks: dict[CacheRequestHandle, _AnchorLock] = {}
         self.anchor_locked_tokens_ = 0
         self._anchor_lock_cap_skips = 0
 
@@ -743,16 +744,16 @@ class BufferModePipeline:
 
     # ---- load back pipeline (storage -> staging -> device) ----
 
-    def try_lock_anchor(self, req_id: str) -> str:
+    def try_lock_anchor(self, request: CacheRequestHandle) -> str:
         """Pin the staged prefetch's device anchor so eviction cannot
         invalidate the splice, finding it by re-matching the live tree
         (carried node ids go stale via splits and eviction; the walk is
         O(prefix path)). Returns "locked", "no_anchor" (nothing to pin),
         "cap_skip" (over cap; launches unlocked), or "anchor_lost" (splice
         base gone — the caller cancels the storage IO)."""
-        if req_id in self.anchor_locks:
+        if request in self.anchor_locks:
             return "locked"
-        prefix_ctx = self._prefetch_prefix_ctx.get(req_id)
+        prefix_ctx = self._prefetch_prefix_ctx.get(request)
         if not prefix_ctx or not prefix_ctx[0]:
             return "no_anchor"  # root anchor: nothing to pin
         prefix_tokens, extra_key, cache_salt = prefix_ctx
@@ -777,7 +778,7 @@ class BufferModePipeline:
         if cache.tree_core.is_eagle:
             # The suffix owns the boundary token shared with the last matched
             # bigram, so include it when rebuilding the anchor key.
-            info = cache.ongoing_prefetch.get(req_id)
+            info = cache.ongoing_prefetch.get(request)
             if info is None or not info.prefetch_key.token_ids:
                 return "anchor_lost"
             anchor_tokens.append(info.prefetch_key.token_ids[0])
@@ -794,7 +795,7 @@ class BufferModePipeline:
         if len(match.device_indices) < matched_len:
             return "anchor_lost"
         lock_params = cache.inc_lock_ref(match.last_device_node).to_dec_params()
-        self.anchor_locks[req_id] = _AnchorLock(
+        self.anchor_locks[request] = _AnchorLock(
             node_id=match.last_device_node,
             lock_params=lock_params,
             tokens=matched_len,
@@ -802,28 +803,30 @@ class BufferModePipeline:
         self.anchor_locked_tokens_ += matched_len
         return "locked"
 
-    def release_anchor_lock(self, req_id: str) -> None:
+    def release_anchor_lock(self, request: CacheRequestHandle) -> None:
         """Drop a staged prefetch's anchor lock (idempotent; called at every
         consume/drop/abort exit)."""
-        lock = self.anchor_locks.pop(req_id, None)
+        lock = self.anchor_locks.pop(request, None)
         if lock is None:
             return
         self._cache.dec_lock_ref(lock.node_id, lock.lock_params)
         self.anchor_locked_tokens_ -= lock.tokens
         assert self.anchor_locked_tokens_ >= 0, (
             f"anchor-lock accounting corrupted: locked={self.anchor_locked_tokens_} "
-            f"after releasing {req_id}"
+            f"after releasing {request.rid}"
         )
 
-    def staged_span_covered(self, req_id: str, span_tokens: int) -> bool:
+    def staged_span_covered(
+        self, request: CacheRequestHandle, span_tokens: int
+    ) -> bool:
         """True when the live device tree already covers the fetch's whole
         would-be span (prefix + the storage-hit tokens): nothing would be
         left to splice at consumption, so the IO-commit caller cancels
         before the bounce alloc and the storage read."""
-        info = self._cache.ongoing_prefetch.get(req_id)
+        info = self._cache.ongoing_prefetch.get(request)
         if info is None or span_tokens <= 0:
             return False
-        prefix_tokens, _, _ = self._prefetch_prefix_ctx[req_id]
+        prefix_tokens, _, _ = self._prefetch_prefix_ctx[request]
         span_key = info.prefetch_key
         full_tokens = array("q", prefix_tokens)
         full_tokens.extend(span_key[:span_tokens].token_ids)
@@ -838,7 +841,7 @@ class BufferModePipeline:
 
     def set_prefix_ctx(
         self,
-        req_id: str,
+        request: CacheRequestHandle,
         matched_prefix_tokens,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
@@ -846,17 +849,17 @@ class BufferModePipeline:
         """Record the device-matched prefix (and its tree-key namespace) at
         prefetch enqueue; consumed at staging commit to build the full-span
         tree key, and by try_lock_anchor to re-match a stale anchor."""
-        self._prefetch_prefix_ctx[req_id] = (
+        self._prefetch_prefix_ctx[request] = (
             list(matched_prefix_tokens or []),
             extra_key,
             cache_salt,
         )
 
-    def pop_prefix_ctx(self, req_id: str) -> None:
-        self._prefetch_prefix_ctx.pop(req_id, None)
+    def pop_prefix_ctx(self, request: CacheRequestHandle) -> None:
+        self._prefetch_prefix_ctx.pop(request, None)
 
-    def has_staged(self, req_id: str) -> bool:
-        return req_id in self.staged_prefetches
+    def has_staged(self, request: CacheRequestHandle) -> bool:
+        return request in self.staged_prefetches
 
     @staticmethod
     def _occupied_span(host_indices) -> int:
@@ -866,7 +869,7 @@ class BufferModePipeline:
 
     def stage_completed_prefetch(
         self,
-        req_id: str,
+        request: CacheRequestHandle,
         num_tokens: int,
         hash_value: list[str],
     ) -> bool:
@@ -881,9 +884,9 @@ class BufferModePipeline:
             operation,
             _lock_params,
             comp_xfers,
-        ) = cache.ongoing_prefetch.pop(req_id)
+        ) = cache.ongoing_prefetch.pop(request)
         cc = cache.cache_controller
-        prefix_ctx = self._prefetch_prefix_ctx.pop(req_id, None)
+        prefix_ctx = self._prefetch_prefix_ctx.pop(request, None)
         prefix_tokens = prefix_ctx[0] if prefix_ctx is not None else None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         # Component transfers are already present in comp_xfers.  Preserve the
@@ -897,14 +900,14 @@ class BufferModePipeline:
 
         if num_tokens == 0 or prefix_tokens is None:
             # Nothing usable fetched: recompute.
-            cache.discard_storage_prefetch_accounting(req_id)
-            self.release_anchor_lock(req_id)
+            cache.discard_storage_prefetch_accounting(request)
+            self.release_anchor_lock(request)
             cc.append_host_mem_release(
                 host_indices[:num_tokens], extra_pools=aux_xfers or None
             )
             cc.prefetch_tokens_occupied -= self._occupied_span(host_indices)
-            cache.prefetch_loaded_tokens_by_reqid[req_id] = 0
-            cache.prefetch_loaded_storage_start_by_reqid.pop(req_id, None)
+            cache.prefetch_loaded_tokens_by_reqid[request] = 0
+            cache.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             return True
 
         staged_pages = num_tokens // cache.page_size
@@ -916,8 +919,8 @@ class BufferModePipeline:
         cache.storage_existence_cache.add(PoolName.KV, list(staged_hashes))
         occupied_tokens = self._occupied_span(host_indices)
 
-        self.staged_prefetches[req_id] = _StagedPrefetch(
-            req_id=req_id,
+        self.staged_prefetches[request] = _StagedPrefetch(
+            request=request,
             key_tokens=prefix_tokens + list(prefetch_key[:num_tokens].token_ids),
             extra_key=prefetch_key.extra_key,
             cache_salt=prefetch_key.cache_salt,
@@ -929,18 +932,18 @@ class BufferModePipeline:
             hash_values=staged_hashes,
             operation_id=operation.id,
         )
-        cache.prefetch_loaded_tokens_by_reqid[req_id] = num_tokens
-        cache.prefetch_loaded_storage_start_by_reqid[req_id] = operation.storage_start
+        cache.prefetch_loaded_tokens_by_reqid[request] = num_tokens
+        cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
         return True
 
     def plan_staged_splice(
-        self, req_id: str, device_prefix_len: int
+        self, request: CacheRequestHandle, device_prefix_len: int
     ) -> tuple[int, int]:
         """(kv, swa) host-hit tokens consumption will splice given the
         request's live device prefix, so admission charges no phantom
         tokens. Frees a hold that can no longer splice: surfaced as 0 but
         kept, it would leak — the adder only consumes surfaced host hits."""
-        f = self.staged_prefetches.get(req_id)
+        f = self.staged_prefetches.get(request)
         if f is None:
             return 0, 0
         splice_tokens = staged_splice_tokens(f, device_prefix_len)
@@ -949,28 +952,28 @@ class BufferModePipeline:
             logger.info(
                 "HiCache staged prefetch released req=%s matched=%d "
                 "device_prefix=%d tokens=%d",
-                req_id,
+                request.rid,
                 f.matched_len,
                 device_prefix_len,
                 f.num_tokens,
             )
             reason = None if covered_tokens == f.num_tokens else "shrunk"
-            self.release_staged_hold(req_id, reason=reason)
+            self.release_staged_hold(request, reason=reason)
             return 0, 0
-        return splice_tokens, self.staged_prefetch_swa_tokens(req_id)
+        return splice_tokens, self.staged_prefetch_swa_tokens(request)
 
     def _resolve_staged_device_coverage(
         self, f: _StagedPrefetch, device_prefix_len: int
     ) -> int:
         covered_tokens = min(max(device_prefix_len - f.matched_len, 0), f.num_tokens)
-        self._cache._resolve_storage_prefetch_tokens(f.req_id, covered_tokens)
+        self._cache._resolve_storage_prefetch_tokens(f.request, covered_tokens)
         return covered_tokens
 
-    def staged_prefetch_swa_tokens(self, req_id: str) -> int:
+    def staged_prefetch_swa_tokens(self, request: CacheRequestHandle) -> int:
         """SWA device tokens consuming this staged prefetch will allocate (the
         staged trailing window); surfaced as the request's swa_host_hit_length
         so the adder's SWA gate charges the admission-time alloc."""
-        f = self.staged_prefetches.get(req_id)
+        f = self.staged_prefetches.get(request)
         if f is None:
             return 0
         return sum(
@@ -993,17 +996,18 @@ class BufferModePipeline:
         cache = self._cache
         req = params.req
         assert req is not None
+        request = req.cache_request_handle
         empty = cache.tree_core.empty_match_result.device_indices
         unchanged = (empty, req.last_node)
-        f = self.staged_prefetches.pop(req.rid, None)
+        f = self.staged_prefetches.pop(request, None)
         if f is None:
-            self.release_anchor_lock(req.rid)
+            self.release_anchor_lock(request)
             return unchanged
         cc = cache.cache_controller
 
         def _drop(reason: Optional[str]) -> tuple[torch.Tensor, NodeId]:
-            cache._finish_storage_prefetch(req.rid, fulfilled_tokens=0, reason=reason)
-            self.release_anchor_lock(req.rid)
+            cache._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
+            self.release_anchor_lock(request)
             self._free_staging_now(f.host_indices, f.aux_xfers)
             cc.prefetch_tokens_occupied -= f.occupied_tokens
             # Nothing spliced: keep the surfaced host-hit fields truthful.
@@ -1038,7 +1042,7 @@ class BufferModePipeline:
                 f.matched_len,
                 splice_base,
                 f.num_tokens,
-                req.rid in self.anchor_locks,
+                request in self.anchor_locks,
             )
             reason = None if covered_tokens == f.num_tokens else "shrunk"
             return _drop(reason)
@@ -1047,7 +1051,7 @@ class BufferModePipeline:
             f"staged splice trim not page-aligned req={req.rid}: "
             f"matched={f.matched_len} splice_base={splice_base}"
         )
-        cache._resolve_storage_prefetch_tokens(req.rid, trim_tokens)
+        cache._resolve_storage_prefetch_tokens(request, trim_tokens)
 
         key = RadixKey(
             array("q", f.key_tokens),
@@ -1075,7 +1079,7 @@ class BufferModePipeline:
                 len(live.device_indices),
                 live.full_kv_hit_length,
                 f.num_tokens,
-                req.rid in self.anchor_locks,
+                request in self.anchor_locks,
             )
             available_end = min(
                 span_end,
@@ -1083,7 +1087,7 @@ class BufferModePipeline:
                 live.full_kv_hit_length,
             )
             available_overlap = max(0, available_end - splice_base)
-            cache._resolve_storage_prefetch_tokens(req.rid, available_overlap)
+            cache._resolve_storage_prefetch_tokens(request, available_overlap)
             return _drop(None if available_overlap == splice_tokens else "shrunk")
 
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
@@ -1145,7 +1149,7 @@ class BufferModePipeline:
             )
         )
         self.ongoing_buffer_load_back[load_back_id] = _OngoingBufferLoadBack(
-            req_id=f.req_id,
+            request=f.request,
             num_tokens=splice_tokens,
             occupied_tokens=f.occupied_tokens,
             aux_xfers=f.aux_xfers,
@@ -1155,7 +1159,7 @@ class BufferModePipeline:
             hash_values=f.hash_values,
         )
         m = cache.match_prefix(MatchPrefixParams(key=key))
-        self.release_anchor_lock(req.rid)
+        self.release_anchor_lock(request)
         canonical = m.device_indices[splice_base:span_end]
         if len(m.device_indices) < span_end or not torch.equal(
             canonical, device_indices
@@ -1163,7 +1167,7 @@ class BufferModePipeline:
             # Fail-stop: the insert freed or replaced slots the in-flight H2D
             # still targets; continuing risks silent KV corruption.
             raise RuntimeError(
-                f"HiCache buffer load-back ownership violation req={f.req_id}: "
+                f"HiCache buffer load-back ownership violation req={f.request.rid}: "
                 f"insert prefix_len={insert_result.prefix_len} "
                 f"expected={splice_base}, adopted={len(m.device_indices)} "
                 f"span_end={span_end}, canonical_matches_incoming="
@@ -1191,26 +1195,28 @@ class BufferModePipeline:
         cc.prefetch_tokens_occupied -= f.occupied_tokens
         logger.info(
             "HiCache prefetch fill committed req=%s filled=%d occupied=%d locked=%d",
-            f.req_id,
+            f.request.rid,
             f.num_tokens,
             cc.prefetch_tokens_occupied,
             self.anchor_locked_tokens_,
         )
         cache._finish_storage_prefetch(
-            f.req_id, fulfilled_tokens=f.num_tokens, reason=None
+            f.request, fulfilled_tokens=f.num_tokens, reason=None
         )
         return True
 
-    def release_staged_hold(self, rid: str, reason: Optional[str] = None) -> bool:
+    def release_staged_hold(
+        self, request: CacheRequestHandle, reason: Optional[str] = None
+    ) -> bool:
         """Free a staged hold outright — anchor pin, host bounce (KV + aux),
         occupancy grant; nothing device-side exists yet. Called for aborts
         and for holds that can no longer splice. Returns True when a hold
         existed."""
-        self.release_anchor_lock(rid)
-        staged = self.staged_prefetches.pop(rid, None)
+        self.release_anchor_lock(request)
+        staged = self.staged_prefetches.pop(request, None)
         if staged is None:
             return False
-        self._cache._finish_storage_prefetch(rid, fulfilled_tokens=0, reason=reason)
+        self._cache._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
         self._free_staging_now(staged.host_indices, staged.aux_xfers)
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True

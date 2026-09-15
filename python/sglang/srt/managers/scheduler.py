@@ -279,6 +279,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -3111,7 +3112,7 @@ class Scheduler(
                     else None
                 )
                 tree_cache.prefetch_from_storage(
-                    req.rid,
+                    req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
                     tree_cache.get_last_hash_value(last_host_node),
@@ -3131,7 +3132,7 @@ class Scheduler(
             return
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
         for req in self.waiting_queue:
-            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+            if self.tree_cache.pop_storage_prefetch_miss(req.cache_request_handle):
                 req.storage_prefetch_retry_pending = True
                 req.storage_prefetch_retry_wait_polls = 0
             if (
@@ -3208,14 +3209,9 @@ class Scheduler(
             return False
         return True
 
-    def _release_aborted_request(self, rid: str) -> None:
+    def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if (
-            self.enable_hierarchical_cache
-            or self.enable_hicache_storage
-            or self.enable_unified_cache_external_linker
-        ):
-            self.tree_cache.release_aborted_request(rid)
+        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3243,7 +3239,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req.rid)
+                self._release_aborted_request(candidate_req)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3457,7 +3453,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self._release_aborted_request(req.rid)
+        self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
@@ -3855,14 +3851,16 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = self.tree_cache.check_prefetch_progress(
+                    req.cache_request_handle
+                )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
-                    req.rid
+                    req.cache_request_handle
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
@@ -3886,7 +3884,7 @@ class Scheduler(
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
                 held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
-                    req.rid, len(req.prefix_indices)
+                    req.cache_request_handle, len(req.prefix_indices)
                 )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
@@ -5203,7 +5201,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req.rid)
+            self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
@@ -5239,7 +5237,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                self._release_aborted_request(req.rid)
+                self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
@@ -5259,7 +5257,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req.rid)
+                    self._release_aborted_request(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()

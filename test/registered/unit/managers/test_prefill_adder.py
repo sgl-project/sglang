@@ -10,6 +10,7 @@ from sglang.srt.managers.schedule_policy import (
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefResult,
     IncLockRefResult,
 )
@@ -92,6 +93,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
         req.rid = str(rid)
+        req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
         req.prefix_indices = []
         req.full_untruncated_fill_ids = []
@@ -139,7 +141,7 @@ class TestPrefillAdder(CustomTestCase):
         adder._account_prefill_cache_admission(req, prefix_len=12)
 
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
-            "storage-hit",
+            req.cache_request_handle,
             fulfilled_tokens=8,
             reason=None,
         )
@@ -153,7 +155,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         adder._account_prefill_cache_admission(req, prefix_len=0)
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
-            "storage-hit", fulfilled_tokens=0, reason="device_capacity"
+            req.cache_request_handle, fulfilled_tokens=0, reason="device_capacity"
         )
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
@@ -166,7 +168,7 @@ class TestPrefillAdder(CustomTestCase):
         adder._account_prefill_cache_admission(req, prefix_len=8)
 
         self.mock_tree_cache.discard_storage_prefetch_accounting.assert_called_once_with(
-            "retracted-storage-hit"
+            req.cache_request_handle
         )
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_not_called()
 
