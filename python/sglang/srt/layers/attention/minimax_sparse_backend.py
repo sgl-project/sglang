@@ -544,12 +544,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     device=forward_batch.seq_lens.device,
                     dtype=torch.long,
                 )
+                # keep the forward batch's dtypes: a dtype change here costs one cast copy per layer
                 per_query_seq_lens = (
                     (prefix.unsqueeze(1) + offsets.unsqueeze(0))
                     .reshape(-1)
-                    .to(torch.int32)
+                    .to(forward_batch.seq_lens.dtype)
                 )
-                per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+                per_query_req = forward_batch.req_pool_indices.repeat_interleave(
                     int(ndt)
                 )
                 _native_bt = None
