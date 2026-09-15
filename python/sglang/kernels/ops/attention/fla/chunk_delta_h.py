@@ -334,6 +334,140 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_gated_delta_rule_fwd_o_kernel_128(
+    q,
+    k,
+    v,
+    w,
+    gk,
+    A,
+    o,
+    initial_state,
+    initial_state_indices,
+    stride_init_state,
+    cu_seqlens,
+    scale,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_h = i_nh // H, i_nh % H
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    T = eos - bos
+    NT = tl.cdiv(T, BT)
+
+    b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
+    b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
+    stride_qk = H * 128
+    stride_v = H * 128
+    stride_A = H * BT
+    q += (bos * H + i_h) * 128
+    k += (bos * H + i_h) * 128
+    v += (bos * H + i_h) * 128
+    w += (bos * H + i_h) * 128
+    gk += (bos * H + i_h) * 128
+    A += (bos * H + i_h) * BT
+    o += (bos * H + i_h) * 128
+
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    valid_state = index >= 0
+    state = initial_state + index * stride_init_state + i_h * 128 * 128
+    if valid_state:
+        p_h1 = tl.make_block_ptr(
+            state, (128, 128), (128, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+        )
+        p_h2 = tl.make_block_ptr(
+            state, (128, 128), (128, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+        )
+        b_h1 += tl.load(p_h1, boundary_check=(0, 1)).to(tl.float32)
+        b_h2 += tl.load(p_h2, boundary_check=(0, 1)).to(tl.float32)
+
+    causal_mask = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
+    for i_t in range(NT):
+        b_h1_out = b_h1.to(k.dtype.element_ty)
+        b_h2_out = b_h2.to(k.dtype.element_ty)
+        p_q1 = tl.make_block_ptr(
+            q, (T, 128), (stride_qk, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        )
+        p_q2 = tl.make_block_ptr(
+            q, (T, 128), (stride_qk, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+        )
+        p_g1 = tl.make_block_ptr(
+            gk, (T, 128), (stride_qk, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        )
+        p_g2 = tl.make_block_ptr(
+            gk, (T, 128), (stride_qk, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+        )
+        b_q1 = tl.load(p_q1, boundary_check=(0, 1))
+        b_q2 = tl.load(p_q2, boundary_check=(0, 1))
+        b_g1 = tl.load(p_g1, boundary_check=(0, 1))
+        b_g2 = tl.load(p_g2, boundary_check=(0, 1))
+        b_qg1 = (b_q1 * scale * exp2(b_g1)).to(b_q1.dtype)
+        b_qg2 = (b_q2 * scale * exp2(b_g2)).to(b_q2.dtype)
+        b_o = tl.dot(b_qg1, tl.trans(b_h1_out))
+        b_o += tl.dot(b_qg2, tl.trans(b_h2_out))
+
+        p_w1 = tl.make_block_ptr(
+            w, (T, 128), (stride_qk, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        )
+        p_w2 = tl.make_block_ptr(
+            w, (T, 128), (stride_qk, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+        )
+        b_w1 = tl.load(p_w1, boundary_check=(0, 1))
+        b_w2 = tl.load(p_w2, boundary_check=(0, 1))
+        b_v = tl.dot(b_w1, tl.trans(b_h1_out))
+        b_v += tl.dot(b_w2, tl.trans(b_h2_out))
+        p_v = tl.make_block_ptr(
+            v, (T, 128), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+        b_v_out = b_v.to(v.dtype.element_ty)
+
+        p_A = tl.make_block_ptr(
+            A, (T, BT), (stride_A, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+        )
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+        b_A = tl.where(causal_mask, b_A, 0.0).to(b_v_out.dtype)
+        b_o += tl.dot(b_A, b_v_out, allow_tf32=False)
+        p_o = tl.make_block_ptr(
+            o, (T, 128), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+        last_idx = min((i_t + 1) * BT, T) - 1
+        offsets = tl.arange(0, 64)
+        g_last1 = tl.load(gk + last_idx * stride_qk + offsets)
+        g_last2 = tl.load(gk + last_idx * stride_qk + 64 + offsets)
+        b_h1 *= exp2(g_last1)[None, :]
+        b_h2 *= exp2(g_last2)[None, :]
+
+        b_v_update = b_v.to(k.dtype.element_ty)
+        p_k1 = tl.make_block_ptr(
+            k, (128, T), (1, stride_qk), (0, i_t * BT), (64, BT), (0, 1)
+        )
+        p_k2 = tl.make_block_ptr(
+            k, (128, T), (1, stride_qk), (64, i_t * BT), (64, BT), (0, 1)
+        )
+        b_k1 = tl.load(p_k1, boundary_check=(0, 1))
+        b_k2 = tl.load(p_k2, boundary_check=(0, 1))
+        b_h1 += tl.trans(tl.dot(b_k1, b_v_update))
+        b_h2 += tl.trans(tl.dot(b_k2, b_v_update))
+
+    if valid_state:
+        p_h1 = tl.make_block_ptr(
+            state, (128, 128), (128, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+        )
+        p_h2 = tl.make_block_ptr(
+            state, (128, 128), (128, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+        )
+        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+
+
 _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_jit = (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 )
@@ -390,6 +524,90 @@ def _use_gfx950_128_config(
         and is_varlen
         and track_state is None
     )
+
+
+def can_use_fused_kda_state_output(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    gk: torch.Tensor,
+    A: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+    num_chunks: int,
+) -> bool:
+    return (
+        is_gfx95_supported()
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and gk.dtype == torch.float32
+        and A.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and w.is_contiguous()
+        and gk.is_contiguous()
+        and A.is_contiguous()
+        and initial_state is not None
+        and cu_seqlens is not None
+        and len(cu_seqlens) == 2
+        and q.shape[0] == 1
+        and q.shape[-2] in (8, 16)
+        and q.shape[-1] == 128
+        and k.shape == q.shape
+        and v.shape == q.shape
+        and w.shape == q.shape
+        and gk.shape == q.shape
+        and A.shape[:-1] == q.shape[:-1]
+        and A.shape[-1] == 64
+        and 2 <= num_chunks <= 4
+    )
+
+
+def chunk_gated_delta_rule_fwd_o_128(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    gk: torch.Tensor,
+    A: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    bv: int = 16,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    T, H = q.shape[1:3]
+    output = v
+    grid = (triton.cdiv(128, bv), (len(cu_seqlens) - 1) * H)
+    chunk_gated_delta_rule_fwd_o_kernel_128[grid](
+        q=q,
+        k=k,
+        v=v,
+        w=w,
+        gk=gk,
+        A=A,
+        o=output,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        stride_init_state=initial_state.stride(0),
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        T=T,
+        H=H,
+        BT=CHUNK_SIZE,
+        BV=bv,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return output
 
 
 def chunk_gated_delta_rule_fwd_h(
