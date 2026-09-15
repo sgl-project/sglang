@@ -189,11 +189,11 @@ def _assert_mutations_rejected(context):
         assert "weight-cache" in response.text.lower(), (endpoint, response.text)
 
 
-def _weights_checksum(context):
+def _weights_checksum(context, *, timeout=60):
     response = requests.post(
         f"http://127.0.0.1:{context.port}/get_weights_checksum",
         json={"module_names": ["transformer"]},
-        timeout=60,
+        timeout=timeout,
     )
     response.raise_for_status()
     checksum = response.json()["transformer"]

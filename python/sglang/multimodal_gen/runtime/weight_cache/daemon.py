@@ -2,7 +2,7 @@
 """Standalone diffusion weight owner; tensor transport remains owned by SRT.
 
 Run with ``python -m sglang.multimodal_gen.runtime.weight_cache.daemon
---model-path ...``. Initial scope is one resident Wan2.1 1.3B transformer.
+--model-path ...``. Scope is one resident, explicitly admitted native DiT.
 """
 
 import dataclasses
@@ -25,7 +25,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import resolve_pipeline_class
 from sglang.multimodal_gen.runtime.pipelines_core.prepare import prepare_pipeline
 from sglang.multimodal_gen.runtime.server_args import prepare_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.weight_cache.adapters import dit_wan
 from sglang.multimodal_gen.runtime.weight_cache.client import (
     PROTOCOL,
     decode_generation,
@@ -182,7 +181,7 @@ class DiffusionWeightCacheDaemon:
                 rendezvous=NetworkAddress("127.0.0.1", get_free_port()),
                 role="diffusion_weight_cache_daemon",
             )
-            model = dit_wan.load_ordinary(self.prepared.transformer)
+            model = self.prepared.adapter.load_ordinary(self.prepared.transformer)
             self.exporter = CudaIpcExporter(
                 model, max_deliveries=self.args.weight_cache_max_deliveries
             )

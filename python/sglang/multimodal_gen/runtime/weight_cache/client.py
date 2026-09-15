@@ -11,7 +11,6 @@ import time
 import uuid
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.weight_cache.adapters import dit_wan
 from sglang.multimodal_gen.runtime.weight_cache.identity import (
     compatibility_plan,
     locate,
@@ -121,7 +120,7 @@ def materialize_from_cache(prepared, args):
         # Watchdog is live before even requesting any counted send references.
         importer = CudaIpcImporter(generation, manifest)
         guarded = time.perf_counter()
-        model = dit_wan.build_meta(prepared.transformer)
+        model = prepared.adapter.build_meta(prepared.transformer)
         constructed = time.perf_counter()
         request_id = uuid.uuid4().hex
         response = client.request(
@@ -140,7 +139,7 @@ def materialize_from_cache(prepared, args):
         fetched = time.perf_counter()
         importer.receive(delivery, model, request_id=request_id)
         mapped = time.perf_counter()
-        model = dit_wan.finalize_after_import(model)
+        model = prepared.adapter.finalize_after_import(model)
     finalized = time.perf_counter()
     elapsed = finalized - start
     logger.info(

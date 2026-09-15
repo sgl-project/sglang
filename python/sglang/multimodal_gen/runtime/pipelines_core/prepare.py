@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.weight_cache.adapters import dit_wan
+from sglang.multimodal_gen.runtime.weight_cache import adapters
 from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_index
 from sglang.multimodal_gen.runtime.weight_cache.plan import (
     ComponentPlan,
@@ -39,6 +39,11 @@ class PreparedPipeline:
     specs: tuple[ComponentLoadSpec, ...]
     transformer: FrozenTransformerLoad
     execution_plan: PipelineExecutionPlan
+    adapter_id: str
+
+    @property
+    def adapter(self):
+        return adapters.by_id(self.adapter_id)
 
     def apply_config(self, server_args):
         # The resolver already updated this config. Do not discover or update it
@@ -56,21 +61,18 @@ class PreparedPipeline:
 
 
 def prepare_pipeline(pipeline_cls, server_args, *, required=False):
-    """Resolve the migrated Wan slice without constructing a pipeline/module.
+    """Resolve admitted DiTs without constructing a pipeline/module.
 
     This is an explicit preparation context, not an uninitialized fake pipeline
-    instance. Ordinary eligible Wan and cache mode consume the same recipe.
+    instance. Ordinary eligible pipelines and cache mode consume the same recipe.
     Other pipeline/configurations remain on their existing ordinary path.
     """
     if not current_platform.is_cuda():
         if required:
-            raise ValueError("The prepared Wan cache adapter requires CUDA")
+            raise ValueError("The prepared weight-cache adapters require CUDA")
         return None
-    if (
-        pipeline_cls.__name__ != "WanPipeline"
-        or pipeline_cls.__module__
-        != "sglang.multimodal_gen.runtime.pipelines.wan_pipeline"
-    ):
+    adapter = adapters.for_pipeline(pipeline_cls)
+    if adapter is None:
         if required:
             raise ValueError("No prepared weight-cache adapter for this pipeline")
         return None
@@ -82,7 +84,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     ):
         if required:
             raise ValueError(
-                "Unsupported Wan backend/role/subfolder/variant for weight cache"
+                "Unsupported backend/role/subfolder/variant for weight cache"
             )
         return None
     root = Path(
@@ -95,29 +97,34 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     model_index = json.loads((root / "model_index.json").read_text())
     names = tuple(pipeline_cls._required_config_modules)
     if (
-        model_index.get("boundary_ratio") is not None
+        model_index.get("_class_name") != adapter.PIPELINE_NAME
+        or model_index.get("boundary_ratio") is not None
         or "transformer_2" in model_index
         or any(not model_index.get(name) for name in names)
     ):
         if required:
             raise ValueError(
-                "Weight cache supports the single-transformer Wan2.1 pipeline only"
+                "Weight cache requires the admitted single-transformer pipeline"
             )
         return None
     paths = {
-        name: str(
-            prepare_diffusers_component_path_for_loading(
-                server_args.component_paths[name]
+        name: (
+            str(
+                prepare_diffusers_component_path_for_loading(
+                    server_args.component_paths[name]
+                )
             )
+            if name in server_args.component_paths
+            else str(root / name)
         )
-        if name in server_args.component_paths
-        else str(root / name)
         for name in names
     }
     config = json.loads((Path(paths["transformer"]) / "config.json").read_text())
-    if not dit_wan.is_wan_1_3b_config(config):
+    if not adapter.supports_config(config):
         if required:
-            raise ValueError("Weight cache supports Wan2.1 T2V 1.3B only")
+            raise ValueError(
+                f"Weight cache adapter supports {adapter.MODEL_LABEL} only"
+            )
         return None
     args = copy.deepcopy(server_args)
     # Do not recursively include an earlier plan in a frozen recipe.
@@ -146,7 +153,7 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
             "transformer",
             planned_device=torch.device("cuda", local_device_index(args)),
         ).freeze()
-        dit_wan.validate_supported(
+        adapter.validate_supported(
             frozen, pipeline_name=pipeline_cls.__name__, attention=attention
         )
     except (ValueError, TypeError):
@@ -184,9 +191,11 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
                     else ("fa" if spec.module_name == "transformer" else None)
                 ),
                 required and spec.module_name == "transformer",
-                "TransformerLoader.customized"
-                if spec.module_name == "transformer"
-                else "PipelineComponentLoader",
+                (
+                    "TransformerLoader.customized"
+                    if spec.module_name == "transformer"
+                    else "PipelineComponentLoader"
+                ),
             )
         )
     return PreparedPipeline(
@@ -195,4 +204,5 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
         specs,
         frozen,
         PipelineExecutionPlan(pipeline_cls.__name__, tuple(components)),
+        adapter.ADAPTER_ID,
     )

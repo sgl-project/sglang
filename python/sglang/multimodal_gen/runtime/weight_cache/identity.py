@@ -12,9 +12,6 @@ import torch
 
 import sglang
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.weight_cache.adapters.dit_wan import (
-    fingerprint_fields,
-)
 from sglang.multimodal_gen.runtime.weight_cache.placement import local_device_index
 from sglang.multimodal_gen.runtime.weight_cache.plan import (
     CacheCompatibilityPlan,
@@ -144,7 +141,7 @@ def compatibility_plan(prepared, args, *, verify_checkpoint=False):
         pipeline=prepared.pipeline_cls.__name__,
         rank=rank_fields,
         requested=["transformer"],
-        component=fingerprint_fields(prepared.transformer),
+        component=prepared.adapter.fingerprint_fields(prepared.transformer),
         checkpoint=checkpoint_identity(prepared, args, verify=verify_checkpoint),
         environment=environment_identity(args),
     )

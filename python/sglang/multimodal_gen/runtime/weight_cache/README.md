@@ -1,6 +1,7 @@
-# Diffusion weight-cache recovery (initial Wan adapter)
+# Diffusion weight-cache recovery
 
-The initial adapter shares the native Wan2.1 T2V 1.3B transformer: CUDA,
+Two explicit native transformer adapters are supported: Wan2.1 T2V 1.3B and
+the original Qwen-Image (not Edit, Layered or 2512). Both require CUDA,
 single GPU/rank/node, bf16, resident non-FSDP weights, FA attention and eager
 execution. Other components use their ordinary loaders. Unsupported resolved
 configurations and missing/incompatible owners are errors, not disk fallback.
@@ -60,6 +61,11 @@ Storage aliases and exact object ties require a component state manifest on top
 of the existing tensor transport. The component layer does not implement Torch
 CUDA handle creation/reconstruction or a second serializer.
 
+Both adapters reuse the same ordinary loader, meta constructor, common admission
+checks and fingerprint mechanics. Qwen's packed text QKV is imported in its
+ordinary finalized layout. RoPE frequencies, modulation caches and the small
+`timestep_zero` constant are process-local derived state, not shared weights.
+
 ## Lifecycle and current limits
 
 - Launcher preflight consumes no IPC handles. Each worker rechecks the admitted
@@ -94,6 +100,17 @@ graceful drain, stale-file recovery and missing-owner failure:
 pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_1_gpu.py -v -s
 ```
 
+The Qwen acceptance test compares 4/20-step 1024×1024 PNGs byte for byte,
+checks the complete finalized transformer before/after inference, rejects
+mutation APIs and covers both graceful and abrupt owner loss plus restart:
+
+```bash
+pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_qwen_image_1_gpu.py -v -s
+```
+
+Use `SGLANG_WEIGHT_CACHE_QWEN_TEST_MODEL` for a local Qwen snapshot. Its default
+is the pinned original Qwen-Image revision, not an automatically selected variant.
+
 `SGLANG_WEIGHT_CACHE_TEST_MODEL` can point to a local published mirror. The
 default uses a pinned HF revision. Readiness samples and median/p90 for both
 `/liveness` and `/health` are written to the pytest temporary output directory.
@@ -108,11 +125,23 @@ python test/manual/bench_diffusion_weight_cache_startup.py \
   --output-dir /tmp/wan-startup-run
 ```
 
+For Qwen, add `--model-kind qwen-image` and use the original pinned Qwen snapshot.
+This generates images instead of videos and uses 1024×1024 server warmup. The
+Qwen benchmark disables post-warmup automatic residency changes in both arms
+(`SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1`), retaining the same initial automatic
+placement. Otherwise the cache's free-VRAM advantage could change uncached text
+encoder placement and confound the startup comparison. Synthetic warmup itself
+still runs in the `server` arm; this is a controlled-placement measurement.
+Because the owner also remains present in the ordinary arm, this benchmark needs
+VRAM for two resident DiTs plus the uncached components and activations. This
+extra ordinary copy is an A/B measurement requirement, not a cache-client
+deployment requirement.
+
 The output directory must not exist. This runs five ordinary/cache pairs for
 each warmup mode, alternates pair order, keeps an owner present in both modes,
-checks identical resolved placement and byte-exact generated videos, and probes
+checks identical resolved placement and byte-exact generated images/videos, and probes
 both HTTP readiness endpoints every 50 ms. It saves raw samples, per-start logs,
-videos, median/p90 and paired deltas; owner startup is reported separately.
+outputs, median/p90 and paired deltas; owner startup is reported separately.
 This is a warm-file recovery benchmark, without page-cache eviction or artificial
 I/O throttling. It does not assert a speedup merely because a regression limit
 passes. Use an idle GPU/host and do not edit installed Python code during a run.

@@ -1448,6 +1448,7 @@ STANDALONE_FILES = {
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_weight_cache_1_gpu.py",
+        "../single_test_file/test_weight_cache_qwen_image_1_gpu.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1487,6 +1488,7 @@ STANDALONE_FILE_EST_TIMES = {
     },
     "1-gpu": {
         "../single_test_file/test_weight_cache_1_gpu.py": 1200.0,
+        "../single_test_file/test_weight_cache_qwen_image_1_gpu.py": 600.0,
         "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
     "2-gpu": {

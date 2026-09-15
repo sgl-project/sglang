@@ -137,7 +137,6 @@ def test_physical_gpu_compatibility_does_not_include_local_ordinal():
     from sglang.multimodal_gen.runtime.weight_cache import identity
 
     with (
-        patch.object(identity, "fingerprint_fields", return_value={}),
         patch.object(identity, "checkpoint_identity", return_value={}),
         patch.object(identity, "environment_identity", return_value={}),
         patch.object(
@@ -145,7 +144,9 @@ def test_physical_gpu_compatibility_does_not_include_local_ordinal():
         ),
     ):
         prepared = SimpleNamespace(
-            pipeline_cls=SimpleNamespace(__name__="WanPipeline"), transformer=None
+            pipeline_cls=SimpleNamespace(__name__="WanPipeline"),
+            transformer=None,
+            adapter=SimpleNamespace(fingerprint_fields=Mock(return_value={})),
         )
         a = identity.compatibility_plan(
             prepared, SimpleNamespace(gpu_ids=None, base_gpu_id=0)

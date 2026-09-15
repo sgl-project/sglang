@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paired Wan HTTP startup benchmark, separate from functional acceptance.
+"""Paired DiT HTTP startup benchmark, separate from functional acceptance.
 
-Uses the existing HTTP server, owner and video helpers. A warm owner is present
+Uses the existing HTTP server, owner and generation helpers. A warm owner is present
 for BOTH modes, with alternating AB/BA order to reduce drift and the same
 resolved placement. Process-entry through HTTP readiness is measured, including
 imports/preflight; owner cold start is reported separately. No profiler, page
@@ -31,6 +31,9 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _generate,
     _start_owner,
     _stop_owner,
+)
+from sglang.multimodal_gen.test.single_test_file.test_weight_cache_qwen_image_1_gpu import (
+    generate_qwen_image,
 )
 from sglang.srt.utils.network import get_free_port
 
@@ -117,9 +120,15 @@ def run(options):
     root.mkdir(parents=True, exist_ok=False)
     model = str(Path(options.model_path).resolve(strict=True))
     records, references, placements = [], {}, {}
+    qwen = options.model_kind == "qwen-image"
     with tempfile.TemporaryDirectory(prefix="sgl-wc-perf-") as runtime:
         socket_path = Path(runtime) / "owner.sock"
         env = {"SGLANG_DIFFUSION_WEIGHT_CACHE_DIR": runtime, "HF_HUB_OFFLINE": "1"}
+        if qwen:
+            # Sharing changes free VRAM. Do not let warmup calibration turn that
+            # into a different text-encoder placement in the A/B comparison.
+            # Keep normal initial auto placement and synthetic server warmup.
+            env["SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"] = "1"
         with (root / "owner.log").open("w") as log:
             owner_start = time.perf_counter()
             owner = _start_owner(model, socket_path, env, log)
@@ -127,8 +136,14 @@ def run(options):
             try:
                 for warmup in options.warmup:
                     flags = f"--num-gpus 1 --warmup-mode {warmup}"
+                    if qwen:
+                        flags += " --attention-backend fa"
                     if warmup == "server":
-                        flags += " --warmup-resolutions 832x480 --warmup-num-frames 9 --warmup-steps 1"
+                        flags += (
+                            " --warmup-resolutions 1024x1024 --warmup-steps 1"
+                            if qwen
+                            else " --warmup-resolutions 832x480 --warmup-num-frames 9 --warmup-steps 1"
+                        )
                     for pair in range(options.count):
                         order = (
                             ("off", "client") if pair % 2 == 0 else ("client", "off")
@@ -143,10 +158,14 @@ def run(options):
                             )
                             context = manager.start()
                             try:
-                                content, _ = _generate(context, model, name)
+                                if qwen:
+                                    content = generate_qwen_image(context, model, name)
+                                else:
+                                    content, _ = _generate(context, model, name)
                                 digest = hashlib.sha256(content).hexdigest()
                                 assert references.setdefault(warmup, digest) == digest
-                                (root / f"{name}.mp4").write_bytes(content)
+                                extension = "png" if qwen else "mp4"
+                                (root / f"{name}.{extension}").write_bytes(content)
                                 text = context.stdout_file.read_text()
                                 (root / f"{name}.log").write_text(text)
                                 args = json.loads(
@@ -191,8 +210,10 @@ def run(options):
                                 records.append(record)
                                 result = {
                                     "model": model,
+                                    "model_kind": options.model_kind,
                                     "owner_start_seconds": owner_seconds,
                                     "owner_present_for_both_modes": True,
+                                    "post_warmup_auto_residency": not qwen,
                                     "poll_interval_seconds": 0.05,
                                     "storage_condition": "warm file cache, no eviction or throttling",
                                     "placement": placements,
@@ -218,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--count", type=int, default=5)
+    parser.add_argument("--model-kind", choices=("wan", "qwen-image"), default="wan")
     parser.add_argument(
         "--warmup", choices=("off", "server"), nargs="+", default=["off", "server"]
     )
