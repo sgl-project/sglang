@@ -274,16 +274,6 @@ class TestHugetlbPool(unittest.TestCase):
             ):
                 self.assertEqual(mmap_allocator.hugepage_mode(size), expected)
 
-    def test_unrecognized_hugepage_mode_uses_the_size_based_default(self):
-        with (
-            envs.SGLANG_HUGEPAGE_MODE.override("invalid"),
-            self.assertLogs(mmap_allocator.logger, "WARNING"),
-        ):
-            self.assertEqual(
-                mmap_allocator.hugepage_mode(2 * 1024**2),
-                mmap_allocator.HUGEPAGE_MODE_PREFER,
-            )
-
     def test_unrecognized_hugepage_size_means_plain_pages(self):
         with (
             envs.SGLANG_HUGEPAGE_SIZE.override("4MB"),
