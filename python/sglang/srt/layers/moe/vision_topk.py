@@ -1,3 +1,5 @@
+"""Modality-dependent MoE routing for DeepSeek-V4.1."""
+
 import torch
 import torch.nn.functional as F
 
