@@ -1610,6 +1610,9 @@ class Envs:
     # Experimental SM90 MiniMax-M3 Q8KV8 sparse prefill Step-3 provider.
     # Q/K/V and softmax probabilities use FP8 E4M3; accumulation/output stay FP32/BF16.
     SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP3 = EnvBool(False)
+    # Experimental SM90 MiniMax-M3 Q8KV8 sparse prefill Step-1 score provider.
+    # Step 2 remains Triton top-k and Step 3 remains controlled independently above.
+    SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP1 = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.

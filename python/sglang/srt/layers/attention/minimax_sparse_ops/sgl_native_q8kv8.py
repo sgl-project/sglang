@@ -87,6 +87,82 @@ def _validate_q8kv8_contract(
             raise SglNativeQ8KV8UnavailableError(f"{name} must be int32")
 
 
+def sgl_native_q8kv8_sparse_prefill_score(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    slot_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_k: int,
+    block_size_k: int,
+    page_size: int,
+    sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Adapt MiniMax score-only Step 1 to the SM90 native operator."""
+    tensors = {
+        "q": q,
+        "k_cache": k_cache,
+        "req_to_token": req_to_token,
+        "slot_ids": slot_ids,
+        "cu_seqlens": cu_seqlens,
+        "seq_lens": seq_lens,
+        "prefix_lens": prefix_lens,
+    }
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda:
+            raise SglNativeQ8KV8UnavailableError(f"{name} must be on CUDA")
+        if name != "q" and not tensor.is_contiguous():
+            raise SglNativeQ8KV8UnavailableError(f"{name} must be contiguous")
+    if q.stride(-1) != 1:
+        raise SglNativeQ8KV8UnavailableError("q last dimension must be contiguous")
+    if torch.cuda.get_device_capability(q.device)[0] != 9:
+        raise SglNativeQ8KV8UnavailableError("SM90 is required")
+    if q.dtype != torch.float8_e4m3fn or k_cache.dtype != torch.float8_e4m3fn:
+        raise SglNativeQ8KV8UnavailableError("FP8 E4M3 Q and K are required")
+    if q.ndim != 3 or k_cache.ndim != 3:
+        raise SglNativeQ8KV8UnavailableError("q and k_cache must be rank 3")
+    if q.shape[-1] != 128 or k_cache.shape[-1] != 128:
+        raise SglNativeQ8KV8UnavailableError("head_dim=128 is required")
+    if block_size_k != 128:
+        raise SglNativeQ8KV8UnavailableError("block_size_k=128 is required")
+    if q.shape[1] % k_cache.shape[1] != 0:
+        raise SglNativeQ8KV8UnavailableError(
+            "local Q heads must be divisible by local KV heads"
+        )
+    if q.shape[1] // k_cache.shape[1] not in (1, 2, 4, 8, 16):
+        raise SglNativeQ8KV8UnavailableError("unsupported local GQA group size")
+
+    from sglang.kernels.ops.attention.minimax_sparse.prefill.sgl_native_q8kv8 import (
+        SglNativeQ8KV8BuildError,
+    )
+    from sglang.kernels.ops.attention.minimax_sparse.prefill.sgl_native_q8kv8 import (
+        sgl_native_q8kv8_sparse_prefill_score as native_score,
+    )
+
+    try:
+        return native_score(
+            q=q,
+            k_cache=k_cache,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_k=max_seqlen_k,
+            block_size_k=block_size_k,
+            page_size=page_size,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+        )
+    except (SglNativeQ8KV8BuildError, ValueError) as err:
+        raise SglNativeQ8KV8UnavailableError(str(err)) from err
+
+
 def sgl_native_q8kv8_sparse_prefill_main(
     q: torch.Tensor,
     k_cache: torch.Tensor,

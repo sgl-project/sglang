@@ -611,6 +611,28 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
+def m3_sgl_native_q8kv8_enabled(args) -> bool:
+    """Whether MiniMax-M3 can use the native SM90 Q8KV8 Step-3 kernel."""
+    from sglang.srt.environ import envs
+
+    return (
+        args.kv_cache_dtype == "fp8_e4m3"
+        and get_platform().is_sm90
+        and envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP3.get()
+    )
+
+
+def m3_sgl_native_q8kv8_step1_enabled(args) -> bool:
+    """Whether MiniMax-M3 can use the native SM90 Q8KV8 Step-1 score kernel."""
+    from sglang.srt.environ import envs
+
+    return (
+        args.kv_cache_dtype == "fp8_e4m3"
+        and get_platform().is_sm90
+        and envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP1.get()
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.

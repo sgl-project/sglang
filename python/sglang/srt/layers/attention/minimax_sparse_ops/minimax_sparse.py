@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
+    topk_prefill_from_score,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
@@ -91,7 +92,8 @@ def minimax_sparse_prefill(
     score_type: str = "max",
     disable_index_value: bool = False,
     use_msa: bool = False,
-    use_sgl_native_q8kv8: bool = False,
+    use_sgl_native_q8kv8_step1: bool = False,
+    use_sgl_native_q8kv8_step3: bool = False,
     page_size: Optional[int] = None,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
@@ -134,34 +136,82 @@ def minimax_sparse_prefill(
         idx_o = None
         topk_idx = cached_topk_idx
     else:
-        # Step 1: Flash attention with topk index (using index head)
-        idx_o, topk_idx = flash_prefill_with_topk_index(
-            q=idx_q,
-            k_cache=idx_k_cache,
-            v_cache=idx_v_cache,
-            sink=idx_sink,
-            req_to_token=req_to_token,
-            slot_ids=slot_ids,
-            cu_seqlens=cu_seqlens,
-            seq_lens=seq_lens,
-            prefix_lens=prefix_lens,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            block_size_q=block_size_q,
-            block_size_k=block_size_k,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            sm_scale=idx_sm_scale,
-            score_type=score_type,
-            disable_index_value=disable_index_value,
-            cu_seqblocks_q=cu_seqblocks_q,
-            max_seqblock_q=max_seqblock_q,
-            all_seqblock_q=all_seqblock_q,
-            q_scale=idx_q_scale,
-            k_scale=idx_k_scale,
-            v_scale=idx_v_scale,
+        # Step 1: score-only native Q8KV8 MVP. Step 2 remains the existing
+        # Triton top-k kernel. Unsupported contracts retain fused Triton Step 1+2.
+        native_step1 = (
+            use_sgl_native_q8kv8_step1
+            and score_type == "max"
+            and disable_index_value
+            and idx_sink is None
         )
+        if native_step1:
+            from .sgl_native_q8kv8 import (
+                SglNativeQ8KV8UnavailableError,
+                sgl_native_q8kv8_sparse_prefill_score,
+            )
+
+            try:
+                score = sgl_native_q8kv8_sparse_prefill_score(
+                    q=idx_q,
+                    k_cache=idx_k_cache,
+                    req_to_token=req_to_token,
+                    slot_ids=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    max_seqlen_k=max_seqlen_k,
+                    block_size_k=block_size_k,
+                    page_size=page_size if page_size is not None else block_size_k,
+                    sm_scale=idx_sm_scale,
+                    q_scale=idx_q_scale,
+                    k_scale=idx_k_scale,
+                )
+                idx_o = None
+                topk_idx = topk_prefill_from_score(
+                    score=score,
+                    block_size_q=block_size_q,
+                    block_size_k=block_size_k,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqblocks_q=cu_seqblocks_q,
+                    prefix_lens=prefix_lens,
+                    topk=topk,
+                    init_blocks=init_blocks,
+                    local_blocks=local_blocks,
+                    max_seqblock_q=max_seqblock_q,
+                    all_seqblock_q=all_seqblock_q,
+                )
+            except SglNativeQ8KV8UnavailableError as err:
+                _warn_sgl_native_q8kv8_fallback(err)
+                native_step1 = False
+
+        if not native_step1:
+            idx_o, topk_idx = flash_prefill_with_topk_index(
+                q=idx_q,
+                k_cache=idx_k_cache,
+                v_cache=idx_v_cache,
+                sink=idx_sink,
+                req_to_token=req_to_token,
+                slot_ids=slot_ids,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                block_size_q=block_size_q,
+                block_size_k=block_size_k,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                sm_scale=idx_sm_scale,
+                score_type=score_type,
+                disable_index_value=disable_index_value,
+                cu_seqblocks_q=cu_seqblocks_q,
+                max_seqblock_q=max_seqblock_q,
+                all_seqblock_q=all_seqblock_q,
+                q_scale=idx_q_scale,
+                k_scale=idx_k_scale,
+                v_scale=idx_v_scale,
+            )
         # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
         num_idx_heads = idx_q.shape[1]
         num_kv_heads = k_cache.shape[1]
@@ -176,7 +226,7 @@ def minimax_sparse_prefill(
     # Step 3: Sparse attention using topk index (main head). Native providers
     # replace only this step; the indexer and top-k reduction above are unchanged.
     # The native provider does not accept an attention sink.
-    if use_sgl_native_q8kv8 and sink is None:
+    if use_sgl_native_q8kv8_step3 and sink is None:
         from .sgl_native_q8kv8 import (
             SglNativeQ8KV8UnavailableError,
             sgl_native_q8kv8_sparse_prefill_main,

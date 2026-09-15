@@ -26,12 +26,15 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+from sglang.srt.server_args import (
+    m3_fp8_attn_gemm_enabled,
+    m3_sgl_native_q8kv8_enabled,
+    m3_sgl_native_q8kv8_step1_enabled,
+)
 from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_sm90_supported,
 )
 
 if is_npu():
@@ -114,6 +117,23 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
     if q_scale is not None:
         q = q / q_scale
     return q.to(torch.float8_e4m3fn)
+
+
+def _quantize_sgl_native_prefill_queries(
+    q: torch.Tensor,
+    idx_q: torch.Tensor,
+    *,
+    use_step1: bool = True,
+    use_step3: bool = True,
+    disable_index_value: bool,
+    q_scale: Optional[float],
+    idx_q_scale: Optional[float],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if use_step3:
+        q = _quant_q_fp8(q, q_scale)
+    if use_step1 and disable_index_value:
+        idx_q = _quant_q_fp8(idx_q, idx_q_scale)
+    return q, idx_q
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -237,23 +257,42 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         self._msa_dec_meta = None
-        native_q8kv8_requested = (
+        native_q8kv8_step3_requested = (
             not self.is_npu and envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP3.get()
         )
+        native_q8kv8_step1_requested = (
+            not self.is_npu and envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP1.get()
+        )
         self.use_sgl_native_q8kv8 = (
-            native_q8kv8_requested
-            and is_sm90_supported()
+            not self.is_npu
+            and m3_sgl_native_q8kv8_enabled(resolving_view(runner.server_args))
             and not self.fp8_attn_gemm
             and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             and self.block_size_k == 128
             and self.kv_pool.page_size == self.block_size_k
         )
-        if native_q8kv8_requested and not self.use_sgl_native_q8kv8:
+        self.use_sgl_native_q8kv8_step1 = (
+            not self.is_npu
+            and m3_sgl_native_q8kv8_step1_enabled(resolving_view(runner.server_args))
+            and not self.fp8_attn_gemm
+            and self.kv_pool.index_k_pool is not None
+            and self.kv_pool.index_k_pool.dtype == torch.float8_e4m3fn
+            and self.block_size_k == 128
+            and self.kv_pool.page_size == self.block_size_k
+        )
+        if native_q8kv8_step3_requested and not self.use_sgl_native_q8kv8:
             logger.warning(
                 "[MiniMaxSparse] SGL native Q8KV8 requested but unsupported "
                 "(requires SM90, FP8 E4M3 main KV, and "
                 "page_size=block_size_k=128); "
                 "falling back to the existing sparse provider."
+            )
+        if native_q8kv8_step1_requested and not self.use_sgl_native_q8kv8_step1:
+            logger.warning(
+                "[MiniMaxSparse] SGL native Q8KV8 Step 1 requested but unsupported "
+                "(requires SM90, FP8 E4M3 index KV, and "
+                "page_size=block_size_k=128); "
+                "falling back to the Triton index provider."
             )
         if self.use_msa:
             self.num_q_heads = (
@@ -343,6 +382,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
+            f"index_attn={'sgl_native_q8kv8' if self.use_sgl_native_q8kv8_step1 else 'triton'}, "
             f"main_attn={'sgl_native_q8kv8' if self.use_sgl_native_q8kv8 else ('MSA' if self.use_msa else 'triton')}, "
             f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
@@ -1513,8 +1553,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
-            elif self.use_sgl_native_q8kv8:
-                q = _quant_q_fp8(q, layer.q_scale_float)
+            elif self.use_sgl_native_q8kv8 or self.use_sgl_native_q8kv8_step1:
+                q, idx_q = _quantize_sgl_native_prefill_queries(
+                    q,
+                    idx_q,
+                    use_step1=self.use_sgl_native_q8kv8_step1,
+                    use_step3=self.use_sgl_native_q8kv8,
+                    disable_index_value=disable_value,
+                    q_scale=layer.q_scale_float,
+                    idx_q_scale=layer.idx_q_scale_float,
+                )
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -1562,7 +1610,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 score_type=self.score_type,
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
-                use_sgl_native_q8kv8=self.use_sgl_native_q8kv8,
+                use_sgl_native_q8kv8_step1=self.use_sgl_native_q8kv8_step1,
+                use_sgl_native_q8kv8_step3=self.use_sgl_native_q8kv8,
                 page_size=self.page_size,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,

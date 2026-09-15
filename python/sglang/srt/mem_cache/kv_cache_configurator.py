@@ -1787,7 +1787,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+        from sglang.srt.server_args import (
+            m3_fp8_attn_gemm_enabled,
+            m3_sgl_native_q8kv8_step1_enabled,
+        )
 
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
@@ -1795,17 +1798,19 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        server_args = resolving_view(self.server_args)
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
+            # Native Step 1 and fp8 attn-GEMM consume an E4M3 lightning-indexer
+            # cache. Step 3 is independent and must not change the index cache.
             index_dtype=(
                 self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
+                if (
+                    m3_fp8_attn_gemm_enabled(server_args)
+                    or m3_sgl_native_q8kv8_step1_enabled(server_args)
+                )
                 else self.model_dtype
             ),
             head_num=self.model_config.get_num_kv_heads(
