@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.weight_sync.nccl_m2n import NcclM2NReceiver
+from sglang.srt.weight_sync.nccl_m2n import M2NFP8Storage, NcclM2NReceiver
 
 _QUANTIZATION = {
     "quant_method": "fp8",
@@ -640,3 +640,194 @@ def test_prepare_fp8_destinations_repeatedly_restores_canonical_scale_storage():
     assert experts.w13_weight_scale_inv.dtype == torch.float32
     assert experts.w13_weight_scale_inv.shape == (1, 4, 2)
     assert experts.w13_weight_scale_inv.format_ue8m0 is False
+
+
+def _mock_fp8_postprocess(model, *, packed, replace_parameters=False):
+    """Simulate rebinding by quant hooks; this does not test FP8 numerics."""
+    for module in model.modules():
+        for name, param in list(module.named_parameters(recurse=False)):
+            is_scale = name.endswith("_scale_inv")
+            value = param.detach().clone()
+            if packed and is_scale:
+                weight = getattr(module, name.removesuffix("_scale_inv"))
+                rows = weight.shape[-2]
+                words = (weight.shape[-1] // 128 + 3) // 4
+                # Packed DeepGEMM scales use int32 with a padded, transposed
+                # layout. Retain nontrivial strides to catch contiguous rebinds.
+                value = torch.empty(
+                    (weight.shape[0], words, rows + 4),
+                    dtype=torch.int32,
+                    device=param.device,
+                )[:, :, :rows].transpose(1, 2)
+                value.fill_(int(param.flatten()[0].item()))
+            if replace_parameters:
+                replacement = torch.nn.Parameter(value, requires_grad=False)
+                replacement.__dict__.update(param.__dict__)
+                setattr(module, name, replacement)
+                param = replacement
+            else:
+                param.data = value
+            if is_scale:
+                param.format_ue8m0 = packed
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("replace_parameters", [False, True])
+def test_fp8_refits_restore_graph_buffers_after_postprocess(packed, replace_parameters):
+    receiver = _receiver(
+        _moe_tp_manifest(), model=_moe_tp_model(), topology=_MOE_TP_TOPOLOGY
+    )
+    _mock_fp8_postprocess(receiver.model, packed=packed)
+    receiver._params = dict(receiver.model.named_parameters())
+    receiver._entries = receiver._validate_manifest(4)
+    receiver._pg = object()
+    receiver.comm_ptr = 123
+    receiver.stream = Mock()
+    # These references model the pointers/strides captured at model startup.
+    graph_buffers = {
+        name: param.detach() for name, param in receiver.model.named_parameters()
+    }
+    pointers = {name: value.data_ptr() for name, value in graph_buffers.items()}
+    strides = {name: value.stride() for name, value in graph_buffers.items()}
+    if packed:
+        scales = receiver.model.model.layers[0].mlp.experts.w13_weight_scale_inv
+        assert not scales.is_contiguous()
+    m2n = Mock()
+
+    for update in (1, 2):
+        storage = M2NFP8Storage(receiver.model, [receiver.manifest])
+        m2n.reshard.side_effect = lambda source, destination, *args, **kwargs: (
+            destination.fill_(update)
+        )
+        with (
+            patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+            patch("torch.cuda.current_stream"),
+            patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+        ):
+            receiver.receive()
+        _mock_fp8_postprocess(
+            receiver.model, packed=packed, replace_parameters=replace_parameters
+        )
+        storage.restore(receiver.model)
+
+        for name, param in receiver.model.named_parameters():
+            assert param.data_ptr() == pointers[name]
+            assert param.stride() == strides[name]
+            assert torch.all(graph_buffers[name].float() == update)
+            if name.endswith("_scale_inv"):
+                assert param.format_ue8m0 is packed
+                assert param.dtype == (torch.int32 if packed else torch.float32)
+
+
+def test_fp8_storage_covers_all_pp_groups_but_not_residual_parameters():
+    receiver = _receiver()
+    model = receiver.model
+    model.model.layers.append(deepcopy(model.model.layers[0]))
+    second_manifest = deepcopy(receiver.manifest)
+    for entry in second_manifest["entries"]:
+        entry["destination"]["parameter"] = entry["destination"]["parameter"].replace(
+            "layers.0.", "layers.1."
+        )
+    _mock_fp8_postprocess(model, packed=True)
+    model.residual = _parameter((2,), torch.bfloat16)
+    old = {name: param.detach() for name, param in model.named_parameters()}
+    storage = M2NFP8Storage(model, [receiver.manifest, second_manifest])
+    for param in model.parameters():
+        param.data = torch.full_like(param, 2)
+    residual_ptr = model.residual.data_ptr()
+
+    storage.restore(model)
+
+    for name, param in model.named_parameters():
+        if name == "residual":
+            assert param.data_ptr() == residual_ptr != old[name].data_ptr()
+        else:
+            assert param.data_ptr() == old[name].data_ptr()
+            assert torch.all(old[name].float() == 2)
+
+
+@pytest.mark.parametrize("mismatch", ["shape", "dtype", "missing"])
+def test_fp8_storage_rejects_incompatible_postprocess_and_remains_retryable(mismatch):
+    receiver = _receiver()
+    model = receiver.model
+    storage = M2NFP8Storage(model, [receiver.manifest])
+    old = {name: param.detach() for name, param in model.named_parameters()}
+    for param in model.parameters():
+        param.data = torch.full_like(param, 2)
+    experts = model.model.layers[0].mlp.experts
+    scale = experts.w2_weight_scale_inv
+    valid = scale.data
+    if mismatch == "missing":
+        del experts.w2_weight_scale_inv
+    elif mismatch == "shape":
+        scale.data = scale.data.flatten()
+    else:
+        scale.data = scale.data.to(torch.int32)
+
+    with pytest.raises(RuntimeError, match="Cannot resume generation"):
+        storage.restore(model)
+    # Validation must finish before any of the graph buffers is overwritten.
+    assert all(torch.all(value.float() == 0) for value in old.values())
+
+    experts.w2_weight_scale_inv = scale
+    scale.data = valid
+    storage.restore(model)
+    assert all(torch.all(value.float() == 2) for value in old.values())
+
+
+def test_fp8_storage_handles_a_postprocess_view_aliasing_the_original_buffer():
+    receiver = _receiver()
+    storage = M2NFP8Storage(receiver.model, [receiver.manifest])
+    param = receiver.model.model.layers[0].mlp.experts.w2_weight_scale_inv
+    original = param.detach()
+    param.data.copy_(torch.arange(4, dtype=param.dtype).reshape_as(param))
+    param.data = param.data.transpose(1, 2)
+    expected = param.detach().clone()
+
+    storage.restore(receiver.model)
+
+    assert param.data_ptr() == original.data_ptr()
+    assert param.stride() == original.stride()
+    torch.testing.assert_close(original, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+def test_fp8_refit_updates_previously_captured_cuda_graph():
+    receiver = _receiver(
+        _moe_tp_manifest(), model=_moe_tp_model().cuda(), topology=_MOE_TP_TOPOLOGY
+    )
+    model = receiver.model
+    _mock_fp8_postprocess(model, packed=True)
+    experts = model.model.layers[0].mlp.experts
+    output = torch.empty((), device="cuda")
+
+    def read_weights():
+        output.copy_(
+            experts.w13_weight.float().sum()
+            + experts.w13_weight_scale_inv.float().sum()
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            read_weights()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        read_weights()
+
+    for update in (1, 2):
+        storage = M2NFP8Storage(model, [receiver.manifest])
+        receiver._params = dict(model.named_parameters())
+        receiver._entries = receiver._validate_manifest(4)
+        receiver._prepare_fp8_destinations()
+        for param in model.parameters():
+            param.data.fill_(update)
+        _mock_fp8_postprocess(model, packed=True, replace_parameters=True)
+        storage.restore(model)
+        graph.replay()
+        expected = update * (
+            experts.w13_weight.numel() + experts.w13_weight_scale_inv.numel()
+        )
+        assert output.item() == expected

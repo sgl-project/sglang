@@ -60,6 +60,77 @@ def _block_scale_shape(shape: Sequence[int]) -> tuple[int, ...]:
     )
 
 
+class M2NFP8Storage:
+    """Keep graph-visible FP8 buffers alive until an update is finalized.
+
+    The receiver needs canonical tensors while loading, whereas inference may
+    use packed UE8M0 scales. Quantization hooks can also replace Parameters.
+    Hold views of the original inference storage (not copies), then copy the
+    post-processed values back into those exact buffers before generation resumes.
+    This state belongs to the model runner, not a reconnectable communicator.
+    """
+
+    def __init__(
+        self, model: torch.nn.Module, manifests: Sequence[Mapping[str, Any]]
+    ) -> None:
+        names = {
+            entry["destination"]["parameter"]
+            for manifest in manifests
+            for entry in manifest["entries"]
+            if entry.get("tensor_role") in ("weight", "scale")
+        }
+        params = dict(model.named_parameters()) if names else {}
+        self._buffers = {name: params[name].detach() for name in sorted(names)}
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module) -> None:
+        if not self._buffers:
+            return
+        params = dict(model.named_parameters())
+        # Validate every result before copying any buffer. A changed inference
+        # shape/dtype requires graph recapture, not an implicit storage rebind.
+        for name, buffer in self._buffers.items():
+            param = params.get(name)
+            if (
+                param is None
+                or param.shape != buffer.shape
+                or param.dtype != buffer.dtype
+                or param.device != buffer.device
+            ):
+                actual = (
+                    "missing"
+                    if param is None
+                    else (
+                        f"shape={tuple(param.shape)}, dtype={param.dtype}, "
+                        f"device={param.device}"
+                    )
+                )
+                raise RuntimeError(
+                    f"M2N FP8 post-processing changed the inference layout of {name}: "
+                    f"{actual}; expected shape={tuple(buffer.shape)}, "
+                    f"dtype={buffer.dtype}, device={buffer.device}. "
+                    "Cannot resume generation with the captured CUDA graphs."
+                )
+
+        for name, buffer in self._buffers.items():
+            param = params[name]
+            value = param.detach()
+            if (
+                value.data_ptr() != buffer.data_ptr()
+                or value.stride() != buffer.stride()
+            ):
+                if (
+                    value.untyped_storage().data_ptr()
+                    == buffer.untyped_storage().data_ptr()
+                ):
+                    # A hook may return a different view of the same allocation.
+                    value = value.clone()
+                buffer.copy_(value)
+            # Restore the original strides too (packed scales can be strided),
+            # keeping the current Parameter and its post-load attributes intact.
+            param.data = buffer
+
+
 @dataclass(frozen=True)
 class _Layout:
     mesh: list[list[int]]

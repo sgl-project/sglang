@@ -485,6 +485,7 @@ class ModelRunner:
 
         # For weight updates
         self.init_weight_updater()
+        self._m2n_fp8_storage = None
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
