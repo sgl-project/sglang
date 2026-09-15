@@ -237,9 +237,7 @@ class DSANPUIndexerMixin:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
-            pool.set_index_k_scale_buffer(
-                layer_id, forward_batch.out_cache_loc, k_scale
-            )
+            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
