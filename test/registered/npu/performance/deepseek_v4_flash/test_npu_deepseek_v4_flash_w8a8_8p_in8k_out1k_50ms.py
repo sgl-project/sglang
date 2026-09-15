@@ -111,6 +111,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     6,
     8,
     10,
+    --load-balance-method round_robin,
 ]
 
 
