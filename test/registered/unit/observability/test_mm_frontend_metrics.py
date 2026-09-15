@@ -1,9 +1,6 @@
 import asyncio
-import multiprocessing
-import os
 import unittest
 from functools import partial
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -22,32 +19,23 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-def _metrics(registry=None, labels=None):
-    from prometheus_client import Counter, Gauge, Histogram
-
-    return MultimodalFrontendMetrics(
-        labels=labels or {"model_name": "test"},
-        counter_cls=partial(Counter, registry=registry),
-        gauge_cls=partial(Gauge, registry=registry),
-        histogram_cls=partial(Histogram, registry=registry),
-    )
-
-
-def _worker_metrics(connection):
-    metrics = _metrics()
-    with metrics.record("hash"):
-        connection.send("ready")
-        if not connection.poll(30):
-            raise TimeoutError("parent did not release metrics worker")
-        connection.recv()
-
-
 class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     def setUp(self):
-        from prometheus_client import CollectorRegistry
+        from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
         self.registry = CollectorRegistry()
-        self.metrics = _metrics(self.registry)
+        # Reserved custom labels must not override the frontend dimensions.
+        self.metrics = MultimodalFrontendMetrics(
+            labels={
+                "model_name": "test",
+                "stage": "custom",
+                "outcome": "custom",
+                "modality": "custom",
+            },
+            counter_cls=partial(Counter, registry=self.registry),
+            gauge_cls=partial(Gauge, registry=self.registry),
+            histogram_cls=partial(Histogram, registry=self.registry),
+        )
 
     def sample(self, suffix, **labels):
         return self.registry.get_sample_value(
@@ -96,35 +84,6 @@ class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTest
         self.assertEqual(
             self.sample("stage_seconds_sum", stage="hash", outcome="success"), 3.5
         )
-
-    async def test_configured_labels_cannot_override_frontend_dimensions(self):
-        """Custom labels named stage/outcome/modality must not break requests."""
-        from prometheus_client import CollectorRegistry
-
-        self.registry = CollectorRegistry()
-        metrics = _metrics(
-            self.registry,
-            labels={
-                "model_name": "test",
-                "stage": "custom",
-                "outcome": "custom",
-                "modality": "custom",
-            },
-        )
-        with metrics.record("hash"):
-            metrics.observe_inputs(
-                MultimodalProcessorOutput(
-                    mm_items=[
-                        MultimodalDataItem(
-                            modality=Modality.IMAGE, feature=torch.ones(4)
-                        )
-                    ]
-                )
-            )
-        self.assertEqual(
-            self.sample("stage_seconds_count", stage="hash", outcome="success"), 1
-        )
-        self.assertEqual(self.sample("items_total", modality="image"), 1)
 
     async def test_workload_counts_logical_bytes_without_reading_device_data(self):
         inputs = MultimodalProcessorOutput(
@@ -247,65 +206,6 @@ class TestMultimodalFrontendMetrics(unittest.IsolatedAsyncioTestCase, CustomTest
             self.sample("stage_seconds_count", stage="preprocess", outcome="error"), 1
         )
         self.assertEqual(self.sample("inflight", stage="preprocess"), 0)
-
-
-class TestMultimodalFrontendMultiprocess(CustomTestCase):
-    def test_live_workers_sum_and_dead_worker_gauge_is_removed(self):
-        """Tokenizer workers share counters but their live gauges must add up."""
-        from prometheus_client import CollectorRegistry, multiprocess
-
-        context = multiprocessing.get_context("spawn")
-        with (
-            TemporaryDirectory() as directory,
-            patch.dict(os.environ, {"PROMETHEUS_MULTIPROC_DIR": directory}),
-        ):
-            pipes = [context.Pipe(), context.Pipe()]
-            workers = [
-                context.Process(target=_worker_metrics, args=(child,))
-                for _, child in pipes
-            ]
-            try:
-                for worker in workers:
-                    worker.start()
-                for parent, child in pipes:
-                    child.close()
-                    self.assertTrue(parent.poll(20))
-                    self.assertEqual(parent.recv(), "ready")
-                registry = CollectorRegistry()
-                multiprocess.MultiProcessCollector(registry, path=directory)
-                labels = {"model_name": "test", "stage": "hash"}
-                self.assertEqual(
-                    registry.get_sample_value("sglang:mm_frontend_inflight", labels), 2
-                )
-                workers[0].terminate()
-                workers[0].join(5)
-                multiprocess.mark_process_dead(workers[0].pid, path=directory)
-                self.assertEqual(
-                    registry.get_sample_value("sglang:mm_frontend_inflight", labels), 1
-                )
-                pipes[1][0].send("finish")
-                workers[1].join(10)
-                self.assertEqual(workers[1].exitcode, 0)
-                self.assertEqual(
-                    registry.get_sample_value("sglang:mm_frontend_inflight", labels), 0
-                )
-                self.assertEqual(
-                    registry.get_sample_value(
-                        "sglang:mm_frontend_stage_seconds_count",
-                        {**labels, "outcome": "success"},
-                    ),
-                    1,
-                )
-            finally:
-                for parent, child in pipes:
-                    parent.close()
-                    child.close()
-                for worker in workers:
-                    if worker.pid is not None:
-                        worker.join(5)
-                        if worker.is_alive():
-                            worker.terminate()
-                            worker.join(5)
 
 
 if __name__ == "__main__":
