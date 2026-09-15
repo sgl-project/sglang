@@ -221,7 +221,11 @@ pub fn describe(config: &RunConfig) -> Result<EnvironmentPlan, String> {
             .unwrap_or(&repo.join("rust/target/parity-environments")),
     )?;
     let build_environment = build_environment(&config.server, profile.backend)?;
-    let identity = serde_json::to_vec(&json!({"commit": commit, "profile": profile, "lock": spec.sha256, "build": build_environment})).map_err(|e| e.to_string())?;
+    let mut identity = json!({
+        "commit": commit, "profile": profile, "lock": spec.sha256, "build": build_environment,
+    });
+    identity.sort_all_objects();
+    let identity = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
     let key = format!("{:x}", Sha256::digest(identity));
     let source_snapshot = cache.join("sources").join(&commit);
     let environment_dir = cache.join("environments").join(&key);

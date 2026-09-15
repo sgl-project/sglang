@@ -16,6 +16,7 @@ From the `rust/` workspace:
 
 ```sh
 cargo build -p sglang-parity
+# Use examples/run-mlx.json for the MLX backend settings.
 cp sglang-parity/examples/run.json /path/to/run.json
 # Edit the model and shared backend settings.
 cargo run -p sglang-parity -- --config /path/to/run.json --describe
@@ -144,9 +145,6 @@ Model files and GPU drivers are outside the Python lock. For reproducible model
 acceptance, use a local snapshot downloaded at a fixed model revision and record
 that revision with the run configuration. Resolving dependencies successfully is
 not evidence of successful device execution or Python/Rust parity.
-
-Both committed locks resolve with the pinned uv version. Real-model acceptance of
-this managed environment workflow remains pending on MLX and CUDA.
 
 ## Review the test contract
 

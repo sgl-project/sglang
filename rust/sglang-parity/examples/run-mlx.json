@@ -1,0 +1,32 @@
+{
+  "server": {
+    "model": "/path/to/model",
+    "args": [
+      "--device",
+      "mps",
+      "--disable-cuda-graph",
+      "--mlx-enable-sampling",
+      "--max-total-tokens",
+      "4096",
+      "--max-running-requests",
+      "4",
+      "--context-length",
+      "2048",
+      "--prefill-attention-backend",
+      "torch_native",
+      "--decode-attention-backend",
+      "torch_native"
+    ],
+    "env": {},
+    "port": 30000,
+    "seed": 42
+  },
+  "startup_timeout_secs": 600,
+  "request_timeout_secs": 120,
+  "shutdown_timeout_secs": 60,
+  "output_dir": "target/parity",
+  "environment": {
+    "backend": "mlx",
+    "setup_timeout_secs": 1800
+  }
+}
