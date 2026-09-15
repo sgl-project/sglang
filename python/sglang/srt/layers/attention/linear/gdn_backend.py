@@ -532,6 +532,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
 
+    def on_after_weight_load(self) -> None:
+        dispatcher = self.kernel_dispatcher
+        for kernel in dict.fromkeys(
+            (
+                dispatcher.decode_kernel,
+                dispatcher.extend_kernel,
+                dispatcher.verify_kernel,
+            )
+        ):
+            kernel.on_after_weight_load()
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         self.mis_metadata = None

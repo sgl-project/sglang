@@ -231,6 +231,11 @@ class AttentionBackend(ABC):
         """
         pass
 
+    def on_after_weight_load(self) -> None:
+        """Refresh weight-derived caches in place, including captured tensors."""
+        for backend in self.attn_backend_list or ():
+            backend.on_after_weight_load()
+
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         """The mask the draft stage fills in place, if this backend has one."""

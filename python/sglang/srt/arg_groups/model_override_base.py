@@ -278,6 +278,11 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
     return cfg.startup_weight_load_mode == "overlap"
 
 
+def should_attempt_startup_weight_load_overlap_of(cfg: Any) -> bool:
+    """Whether startup should check admission for deferred weight loading."""
+    return cfg.startup_weight_load_mode in ("overlap", "auto")
+
+
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """The predicate, read off a config-shaped object mid-resolution.
 
