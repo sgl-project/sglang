@@ -34,7 +34,8 @@ class TestSchedulerInternalStateEnvVars(unittest.TestCase):
         )
         scheduler.startup_available_gpu_memory_gb = 4.0
         scheduler.startup_time = 1.0
-        scheduler.max_total_num_tokens = 100
+        scheduler.logical_max_total_num_tokens = 100
+        scheduler.max_total_num_tokens_per_dcp_rank = 100
         scheduler.swa_tokens_per_layer = None
         scheduler.max_running_requests = 8
         scheduler.spec_algorithm = SimpleNamespace(
