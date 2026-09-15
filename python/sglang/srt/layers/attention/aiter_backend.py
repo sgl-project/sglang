@@ -133,6 +133,23 @@ class WrapperDispatch(Enum):
 
 
 @dataclass
+class MlaPrefillPsMetadata:
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    work_metadata: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+    max_q_len: int
+    is_causal: bool
+    need_lse: bool
+    num_partial_tiles: int
+
+
+@dataclass
 class ForwardMetadata:
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
@@ -151,15 +168,21 @@ class ForwardMetadata:
     custom_mask: Optional[torch.Tensor] = None
     mask_indptr: Optional[torch.Tensor] = None
     max_extend_len: Optional[int] = None
-    fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
+    chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
+    chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
+
+# Query rows one asm-prefill work tile covers. The scheduler, the partial
+# buffers and mla_reduce_v1 must all agree on it.
+_PREFILL_TILE_Q = 256
 
 
 _DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
@@ -679,6 +702,14 @@ class AiterAttnBackend(AttentionBackend):
             dtype_kv=dtype,
         )
 
+    @property
+    def _prefill_qlen_granularity(self) -> int:
+        """Query rows per scheduling unit: one tile's worth, divided across the
+        query heads the kernel processes together."""
+        return _PREFILL_TILE_Q // (
+            self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
+        )
+
     def make_mla_prefill_ps_meta_data_buffer(
         self, batch_size: int, max_qlen: int, qlen_granularity: int
     ):
@@ -735,12 +766,12 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map: torch.Tensor,
         reduce_partial_map: torch.Tensor,
         is_causal: bool = True,
+        need_lse: bool = False,
     ):
         gqa_ratio = self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
         num_heads_k = self.fp8_prefill_num_kv_head
-        tile_q = 256
         qhead_granularity = gqa_ratio
-        qlen_granularity = tile_q // qhead_granularity
+        qlen_granularity = self._prefill_qlen_granularity
         kvlen_granularity = 128
         block_size = 1
 
@@ -765,6 +796,7 @@ class AiterAttnBackend(AttentionBackend):
             kvlen_granularity=kvlen_granularity,
             block_size=block_size,
             is_causal=is_causal,
+            need_lse=need_lse,
         )
 
     # for page size > 1 useful conversion function
@@ -1298,6 +1330,34 @@ class AiterAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
     ):
+        """Whole-sequence asm prefill: causal, k/v cover every key in seq_lens.
+
+        The partition comes from init_forward_metadata, which built it with
+        need_lse False; this caller discards the LSE, so the two agree.
+        """
+        out, _ = self._mla_fp8_prefill_attn_ps(
+            q, k, v, layer, self.forward_metadata.prefill_ps_metadata
+        )
+        return out
+
+    def _mla_fp8_prefill_attn_ps(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        ps: MlaPrefillPsMetadata,
+    ):
+        """Run the asm prefill over one work partition, returning (out, lse).
+
+        The partition is what makes this reusable: the chunked-prefix route
+        attends key sets that are not the whole sequence (extend-only for the
+        skip-prefix pass, one chunk for each prefix pass), and every kernel argument that
+        depends on the key set travels in `ps`.
+
+        final_lse is natural log, [total_q, nhead] fp32 -- straight out of
+        mla_reduce_v1, which is the base the chunked merge takes.
+        """
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
@@ -1319,25 +1379,21 @@ class AiterAttnBackend(AttentionBackend):
             v = v.to(fp8_dtype)
         one_scale = torch.ones((), dtype=torch.float32, device=q.device)
 
-        tile_q = 256
-        reduce_indptr = self.forward_metadata.reduce_indptr
-        reduce_final_map = self.forward_metadata.reduce_final_map
-        reduce_partial_map = self.forward_metadata.reduce_partial_map
-
+        partial_q = max(ps.num_partial_tiles, 1) * _PREFILL_TILE_Q
         logits = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            (partial_q, nhead, v_head_dim),
             dtype=torch.float32,
             device=q.device,
         )
         attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead),
+            (partial_q, nhead),
             dtype=torch.float32,
             device=q.device,
         )
-        final_lse = torch.empty(
-            (total_q, nhead),
-            dtype=torch.float32,
-            device=q.device,
+        final_lse = (
+            torch.empty((total_q, nhead), dtype=torch.float32, device=q.device)
+            if ps.need_lse
+            else None
         )
         output = q.new_empty(
             (total_q, nhead, v_head_dim),
@@ -1348,14 +1404,14 @@ class AiterAttnBackend(AttentionBackend):
             q,
             k,
             v,
-            self.forward_metadata.qo_indptr,
-            self.forward_metadata.kv_indptr,
-            self.forward_metadata.fp8_prefill_kv_indices,
-            self.forward_metadata.work_indptr,
-            self.forward_metadata.work_info_set,
-            self.forward_metadata.max_q_len,
+            ps.qo_indptr,
+            ps.kv_indptr,
+            ps.kv_indices,
+            ps.work_indptr,
+            ps.work_info_set,
+            ps.max_q_len,
             layer.scaling,
-            True,
+            ps.is_causal,
             logits,
             attn_lse,
             output,
@@ -1366,16 +1422,25 @@ class AiterAttnBackend(AttentionBackend):
         mla_reduce_v1(
             logits,
             attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            tile_q,
+            ps.reduce_indptr,
+            ps.reduce_final_map,
+            ps.reduce_partial_map,
+            _PREFILL_TILE_Q,
             # Prefill PS metadata has no split cap; 0 keeps AITER's default reduce sizing.
             0,
             output,
             final_lse,
         )
-        return output[:, : layer.tp_q_head_num, :] if head_pad else output
+        if head_pad:
+            # Slicing the padded head axis leaves the kernel's stride behind, and
+            # merge_state reads its inputs as contiguous -- feeding it the view
+            # silently merges the wrong rows. Only models whose head count is
+            # outside _MLA_REDUCE_V1_HEADS pad at all, which is why this is
+            # invisible on a 16-head rank.
+            output = output[:, : layer.tp_q_head_num, :].contiguous()
+            if final_lse is not None:
+                final_lse = final_lse[:, : layer.tp_q_head_num].contiguous()
+        return output, final_lse
 
     def _kv_index_blocks(self, bs: int) -> int:
         if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
@@ -1874,48 +1939,21 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr = self.mla_indices_updater_prefill.qo_indptr
                 kv_indptr = self.mla_indices_updater_prefill.kv_indptr
 
-                work_metadata = None
-                work_indptr = None
-                work_info_set = None
-                reduce_indptr = None
-                reduce_final_map = None
-                reduce_partial_map = None
-                fp8_prefill_kv_indices = None
-
-                # fp8 PS-ASM prefill memory-faults on gfx950 for 12-head
-                # (zero-pad) models; keep it off and use flash-attn fallback.
-                if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
-                    tile_q = 256
-                    qlen_granularity = tile_q // (
-                        self.fp8_prefill_num_head // self.fp8_prefill_num_kv_head
-                    )
-                    (
-                        work_metadata,
-                        work_indptr,
-                        work_info_set,
-                        reduce_indptr,
-                        reduce_final_map,
-                        reduce_partial_map,
-                    ) = self.make_mla_prefill_ps_meta_data_buffer(
-                        bs, max_q_len, qlen_granularity
-                    )
-
-                    self.make_mla_prefill_ps_meta_data(
-                        qo_indptr,
-                        kv_indptr,
-                        forward_batch.seq_lens,
-                        work_metadata,
-                        work_indptr,
-                        work_info_set,
-                        reduce_indptr,
-                        reduce_final_map,
-                        reduce_partial_map,
+                prefill_ps_metadata = None
+                if self.use_fp8_prefill_attn:
+                    prefill_ps_metadata = self._build_prefill_ps_metadata(
+                        qo_indptr=qo_indptr,
+                        kv_indptr=kv_indptr,
+                        kv_lens_cpu=forward_batch.seq_lens_cpu,
+                        num_kv_tokens=forward_batch.seq_lens_sum,
+                        max_q_len=max_q_len,
+                        # The keys are the whole sequence, and the extend
+                        # tokens sit at its tail.
                         is_causal=True,
-                    )
-
-                    total_s = forward_batch.seq_lens_sum
-                    fp8_prefill_kv_indices = torch.arange(
-                        total_s, device=self.device, dtype=torch.int32
+                        need_lse=False,
+                        # Keep the static bound this path has always sized its
+                        # partial buffers with, rather than the emitted count.
+                        exact_partial_count=False,
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1925,13 +1963,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.kv_last_page_len[:bs],
                     max_q_len,
                     self.mla_indices_updater_prefill.max_kv_len,
-                    work_metadata=work_metadata,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    fp8_prefill_kv_indices=fp8_prefill_kv_indices,
+                    prefill_ps_metadata=prefill_ps_metadata,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -2689,7 +2721,150 @@ class AiterAttnBackend(AttentionBackend):
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ) -> None:
-        pass
+        """Build the chunked-prefix route's asm work partitions, once per forward.
+
+        The route's two attentions each attend a key set that is not the whole
+        sequence, and init_forward_metadata's partition describes only the whole
+        sequence. Everything else the route needs already sits on ForwardBatch.
+        """
+        # The one-shot core calls this hook too, with num_prefix_chunks pinned
+        # to 0. That route attends the whole assembled sequence and uses
+        # init_forward_metadata's partition, so building anything here would be
+        # per-forward work nobody reads.
+        if not forward_batch.num_prefix_chunks or not self.use_fp8_prefill_attn:
+            return
+
+        # Queries are the in-hand extend tokens in both passes -- only the keys
+        # differ -- so every partition shares this qo_indptr.
+        extend_lens_cpu = torch.tensor(
+            forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+        )
+        qo_indptr_cpu = torch.zeros(len(extend_lens_cpu) + 1, dtype=torch.int32)
+        qo_indptr_cpu[1:] = torch.cumsum(extend_lens_cpu, dim=0)
+        qo_indptr = self.forward_metadata.qo_indptr
+        max_q_len = self.forward_metadata.max_q_len
+
+        self.forward_metadata.chunked_skip_prefix_ps_metadata = (
+            self._build_prefill_ps_metadata(
+                qo_indptr=qo_indptr,
+                qo_indptr_cpu=qo_indptr_cpu,
+                kv_indptr=qo_indptr,
+                kv_indptr_cpu=qo_indptr_cpu,
+                kv_lens_cpu=extend_lens_cpu,
+                num_kv_tokens=int(qo_indptr_cpu[-1]),
+                max_q_len=max_q_len,
+                is_causal=True,
+                need_lse=True,
+            )
+        )
+
+        metadatas: list[Optional[MlaPrefillPsMetadata]] = []
+        for i in range(forward_batch.num_prefix_chunks):
+            chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
+            # A request with no keys in this chunk leaves an empty kv range,
+            # which the work partition has no shape for; those chunks take the
+            # varlen fallback in _forward_extend_prefix_chunk.
+            if forward_batch.prefix_chunk_has_zero_kv[i]:
+                metadatas.append(None)
+                continue
+            chunk_indptr_cpu = torch.zeros(len(chunk_lens_cpu) + 1, dtype=torch.int32)
+            chunk_indptr_cpu[1:] = torch.cumsum(chunk_lens_cpu, dim=0)
+            metadatas.append(
+                self._build_prefill_ps_metadata(
+                    qo_indptr=qo_indptr,
+                    qo_indptr_cpu=qo_indptr_cpu,
+                    kv_indptr=forward_batch.prefix_chunk_cu_seq_lens[i],
+                    kv_indptr_cpu=chunk_indptr_cpu,
+                    kv_lens_cpu=chunk_lens_cpu,
+                    num_kv_tokens=forward_batch.prefix_chunk_num_tokens[i],
+                    max_q_len=max_q_len,
+                    # Every key in a prefix chunk precedes every extend token.
+                    is_causal=False,
+                    need_lse=True,
+                )
+            )
+        self.forward_metadata.chunked_prefix_ps_metadatas = metadatas
+
+    def _build_prefill_ps_metadata(
+        self,
+        *,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+        num_kv_tokens: int,
+        max_q_len: int,
+        is_causal: bool,
+        need_lse: bool,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
+        exact_partial_count: bool = True,
+    ) -> MlaPrefillPsMetadata:
+        """Plan one asm-prefill work partition over the key set the caller names"""
+        (
+            work_metadata,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = self.make_mla_prefill_ps_meta_data_buffer(
+            len(kv_lens_cpu), max_q_len, self._prefill_qlen_granularity
+        )
+        self.make_mla_prefill_ps_meta_data(
+            qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu,
+            kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu,
+            kv_lens_cpu,
+            work_metadata,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            is_causal=is_causal,
+            need_lse=need_lse,
+        )
+        if exact_partial_count:
+            # One D2H sync per partition, in a host-side builder that already
+            # pays several inside get_ps_metadata_v1, and once per forward
+            # rather than per layer.
+            num_partial_tiles = int(reduce_indptr[-1].item())
+            if need_lse:
+                assert num_partial_tiles > 0, (
+                    "the scheduler emitted no partial tiles, so mla_reduce_v1 "
+                    "would write no LSE for this partition"
+                )
+            if num_partial_tiles:
+                max_partial_row = int(reduce_partial_map[:num_partial_tiles].max())
+                assert (
+                    max_partial_row + _PREFILL_TILE_Q
+                    <= num_partial_tiles * _PREFILL_TILE_Q
+                ), (
+                    f"reduce_partial_map reaches row {max_partial_row} and the "
+                    f"tile is {_PREFILL_TILE_Q} rows, but the partial buffers "
+                    f"hold only {num_partial_tiles * _PREFILL_TILE_Q} rows"
+                )
+        else:
+            num_partial_tiles = reduce_partial_map.size(0)
+        return MlaPrefillPsMetadata(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            # The k/v handed to the kernel are contiguous and in key order, so
+            # the page table is the identity -- same as the whole-sequence
+            # partition's arange over seq_lens_sum.
+            kv_indices=torch.arange(
+                num_kv_tokens, device=self.device, dtype=torch.int32
+            ),
+            work_metadata=work_metadata,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            max_q_len=max_q_len,
+            is_causal=is_causal,
+            need_lse=need_lse,
+            num_partial_tiles=num_partial_tiles,
+        )
 
     def _forward_extend_prefix_chunk(
         self,
@@ -2700,6 +2875,10 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
     ):
         idx = forward_batch.prefix_chunk_idx
+        ps_metadatas = self.forward_metadata.chunked_prefix_ps_metadatas
+        if ps_metadatas is not None and ps_metadatas[idx] is not None:
+            return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps_metadatas[idx])
+
         output, lse = flash_attn_varlen_func(
             q,
             k,
@@ -2712,6 +2891,7 @@ class AiterAttnBackend(AttentionBackend):
             causal=False,
             return_lse=True,
         )[:2]
+        # aiter returns [heads, tokens]; the merge indexes [tokens, heads].
         return output, lse.transpose(0, 1).contiguous()
 
     def _forward_extend_skip_prefix(
@@ -2721,6 +2901,10 @@ class AiterAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: RadixAttention,
     ):
+        ps = self.forward_metadata.chunked_skip_prefix_ps_metadata
+        if ps is not None:
+            return self._mla_fp8_prefill_attn_ps(q, k, v, layer, ps)
+
         qo_indptr = self.forward_metadata.qo_indptr
         max_q_len = self.forward_metadata.max_q_len
         output, lse = flash_attn_varlen_func(
@@ -2735,6 +2919,7 @@ class AiterAttnBackend(AttentionBackend):
             causal=True,
             return_lse=True,
         )[:2]
+        # aiter returns [heads, tokens]; the merge indexes [tokens, heads].
         return output, lse.transpose(0, 1).contiguous()
 
     @staticmethod
@@ -2940,7 +3125,7 @@ class AiterAttnBackend(AttentionBackend):
                 if forward_batch.mha_return_lse:
                     return self._forward_extend_skip_prefix(q, k, v, layer)
                 if self.dcp_world_size > 1:
-                    if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
+                    if self.use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     return flash_attn_varlen_func(
                         q,
@@ -2954,7 +3139,7 @@ class AiterAttnBackend(AttentionBackend):
                         causal=True,
                     )
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
+                    if self.use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
@@ -2988,7 +3173,6 @@ class AiterAttnBackend(AttentionBackend):
 
                     if (
                         self.use_fp8_prefill_attn
-                        and self.head_pad_mode != "zero"
                         and layer.kv_b_proj.weight.dtype == torch.uint8
                     ):
                         # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
@@ -3028,7 +3212,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if self.use_fp8_prefill_attn and self.head_pad_mode != "zero":
+                    if self.use_fp8_prefill_attn:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
