@@ -238,7 +238,9 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
+    block.attn.qkv_proj = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     block.mlp = torch.nn.Identity()
+    block.mlp.fc1 = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):

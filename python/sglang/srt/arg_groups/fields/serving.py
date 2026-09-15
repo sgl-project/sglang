@@ -30,6 +30,12 @@ class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    enable_response_store: A[
+        bool,
+        "Enable in-memory Responses storage for retrieval, chaining, and background "
+        "requests. Disabled by default; unsupported with prefill-decode "
+        "disaggregation. Storage has no TTL or size limit.",
+    ] = False
     tokenizer_path: A[Optional[str], "The path of the tokenizer."] = None
     tokenizer_mode: A[
         str,

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _flush_deferred_free_group,
     _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
+    install_move_gate,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -306,15 +307,20 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
+    def _move_gate_targets(self):
+        """Every member a compaction gate must cover. The mamba end is gated
+        even where its state is not itself transferred: the gate is about the
+        MOVER, and the two ends compact as peers."""
+        return (self.full_attn_allocator, self.mamba_allocator)
+
     def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
-        """Install the PD-disaggregation move gate on both sub-allocators."""
-        assert self.lazy_compaction, (
-            "PD disaggregation with the unified memory pool requires lazy "
-            "compaction (eager free-path compaction moves pages under "
-            "in-flight transfers)."
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="disagg_move_gate",
+            gate=gate,
+            feature="PD disaggregation",
+            lazy_compaction=self.lazy_compaction,
         )
-        self.full_attn_allocator.disagg_move_gate = gate
-        self.mamba_allocator.disagg_move_gate = gate
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
