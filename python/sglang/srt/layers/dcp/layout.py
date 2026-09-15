@@ -44,10 +44,10 @@ def get_dcp_lens(
 def maybe_dcp_kernel_indices(
     indices: torch.Tensor, dcp_size: int, dcp_rank: int
 ) -> torch.Tensor:
-    """Transfer kernels index per-rank rows; callers hold widened logical slots.
+    """Widened logical slots -> this rank's physical rows.
 
-    Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
-    Runs start page-aligned, so a strided view selects them without a mask.
+    Owner rule: slot % dcp_size == dcp_rank, row = slot // dcp_size. The run
+    starts page-aligned, so a strided view selects the owned slots without a mask.
     """
     if dcp_size == 1:
         return indices
