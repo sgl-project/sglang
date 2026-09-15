@@ -19,7 +19,7 @@ mod template_legacy;
 mod template_loader;
 mod tools;
 
-pub(super) use template::ChatFormatter;
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
@@ -62,6 +62,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     match template::load_chat_formatter(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.model_config.model_type.as_deref(),
         server_args.chat_template.as_deref(),
     ) {
         Ok(formatter) => {
