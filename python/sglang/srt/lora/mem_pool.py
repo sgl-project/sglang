@@ -147,7 +147,12 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_no_cpu_backup: bool = False,
     ):
+        assert not (
+            lora_no_cpu_backup and enable_lora_overlap_loading
+        ), "--lora-no-cpu-backup drops the staged weights right after install, which overlap loading still reads"
+        self.lora_no_cpu_backup: bool = lora_no_cpu_backup
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
@@ -742,10 +747,12 @@ class LoRAMemoryPool:
             cfg = base_model.config
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
+            # DeepSeek-style configs say n_shared_experts, Kimi K3 says num_shared_experts.
             has_shared_experts = (
-                hasattr(cfg, "shared_expert_intermediate_size")
-                and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+                (getattr(cfg, "shared_expert_intermediate_size", 0) or 0) > 0
+                or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+                or (getattr(cfg, "num_shared_experts", 0) or 0) > 0
+            )
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
@@ -962,6 +969,12 @@ class LoRAMemoryPool:
 
             # Select victim using eviction policy
             victim_uid = self.eviction_policy.select_victim(candidates_to_use)
+            if victim_uid is not None and self.lora_no_cpu_backup:
+                raise RuntimeError(
+                    f"Refusing to evict LoRA adapter '{victim_uid}': --lora-no-cpu-backup dropped its "
+                    "staged weights after installation, so it could never be reloaded. Increase "
+                    "--max-loras-per-batch."
+                )
 
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]
@@ -991,6 +1004,44 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                if self.lora_no_cpu_backup and lora_adapter is not None:
+                    lora_adapter.release_staged_weights()
+
+    def install_streamed_adapter(
+        self,
+        uid: str,
+        lora_adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, torch.nn.Module]],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+    ) -> None:
+        """--lora-no-cpu-backup: install into a free slot right after streaming, before the
+        staged device views are dropped."""
+        if uid in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id[uid]
+        elif EMPTY_SLOT in self.buffer_id_to_uid:
+            buffer_id = self.buffer_id_to_uid.index(EMPTY_SLOT)
+        elif None in self.uid_to_buffer_id:
+            # the base-model placeholder (e.g. from graph capture) has nothing to reload
+            buffer_id = self.uid_to_buffer_id.pop(None)
+            self.eviction_policy.remove(None)
+        else:
+            raise RuntimeError(
+                f"No free LoRA memory pool slot for streamed adapter '{uid}'; "
+                "--lora-no-cpu-backup cannot evict, increase --max-loras-per-batch."
+            )
+        self.load_lora_weight_to_buffer(
+            uid,
+            buffer_id,
+            lora_adapter,
+            lora_modules,
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+        )
+        self.uid_to_buffer_id[uid] = buffer_id
+        self.buffer_id_to_uid[buffer_id] = uid
+        self.eviction_policy.mark_used(uid)
+        lora_adapter.release_staged_weights()
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""

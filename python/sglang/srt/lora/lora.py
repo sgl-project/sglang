@@ -60,9 +60,11 @@ class LoRAAdapter(nn.Module):
         load_config: LoadConfig,
         lora_backend: BaseLoRABackend,
         base_model: Optional[torch.nn.Module] = None,
+        keep_weights_on_device: bool = False,
     ):
         super().__init__()
         self.uid: str = uid
+        self.keep_weights_on_device: bool = keep_weights_on_device
         self.config: LoRAConfig = config
         assert self.config.hf_config["peft_type"].lower() == "lora"
         self.base_hf_config: AutoConfig = base_hf_config
@@ -161,6 +163,23 @@ class LoRAAdapter(nn.Module):
 
         self._normalize_weights()
 
+    def _stage_weight(self, loaded_weight: torch.Tensor) -> torch.Tensor:
+        # streamed weights are CUDA-IPC views into the trainer's buckets, valid until the adapter is
+        # installed and the session closes; a full-adapter clone would not fit next to the base
+        if self.keep_weights_on_device and loaded_weight.is_cuda:
+            return loaded_weight
+        return loaded_weight.cpu()
+
+    def release_staged_weights(self):
+        """Drop the staged copies once installed in the memory pool; the adapter cannot be reinstalled."""
+        for layer in self.layers:
+            layer.weights.clear()
+            layer.pinned_weights.clear()
+        self.embedding_layers.clear()
+        self.pinned_embedding_layers.clear()
+        self.added_tokens_embeddings.clear()
+        self.pinned_added_tokens_embeddings.clear()
+
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
@@ -175,7 +194,7 @@ class LoRAAdapter(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
-            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            self.layers[layer_id].weights[name] = self._stage_weight(loaded_weight)
         elif "embed_tokens" in name or "lm_head" in name:
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
@@ -186,14 +205,14 @@ class LoRAAdapter(nn.Module):
                 "all" in normalized_target_modules
                 or module_name in normalized_target_modules
             ):
-                self.embedding_layers[name] = loaded_weight.cpu()
+                self.embedding_layers[name] = self._stage_weight(loaded_weight)
             else:
                 logger.debug(
                     f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
                 )
         elif "input_embeddings" in name or "output_embeddings" in name:
             # added/extra token emb
-            self.added_tokens_embeddings[name] = loaded_weight.cpu()
+            self.added_tokens_embeddings[name] = self._stage_weight(loaded_weight)
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
                 f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
                 f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
