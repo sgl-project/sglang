@@ -13,6 +13,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -270,8 +274,9 @@ def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
     return abs_x, abs_y
 
 
-class NEOChatModel(PreTrainedModel):
+class NEOChatModel(PreTrainedModel, LayerwiseOffloadableModuleMixin):
     config_class = NEOChatConfig
+    layer_names = ["language_model.model.layers"]
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
