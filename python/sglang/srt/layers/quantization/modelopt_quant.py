@@ -1436,6 +1436,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
     """
 
+    moe_weight_format = "nvfp4"
+
     def __init__(
         self,
         is_checkpoint_nvfp4_serialized: bool = False,

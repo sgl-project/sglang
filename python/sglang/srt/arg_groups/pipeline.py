@@ -151,6 +151,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_expert_pack, server_args)
 
+    from sglang.srt.arg_groups.speculative_hook import handle_speculative_model_inputs
+
+    run_hook(handle_speculative_model_inputs, server_args)
+
     # Validate PD disaggregation flags before CUDA graph config.
     from sglang.srt.arg_groups.pd_disaggregation_hook import (
         handle_encoder_disaggregation,
@@ -190,6 +194,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+        handle_cuda_graph_compatibility,
         handle_cuda_graph_config,
     )
 
@@ -229,7 +234,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_platform_defaults, server_args)
 
     # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
-    from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+    from sglang.srt.arg_groups.memory_hook import (
+        handle_cuda_graph_sizes,
+        handle_gpu_memory_budget,
+        handle_gpu_memory_settings,
+    )
 
     run_hook(handle_gpu_memory_settings, server_args)
 
@@ -329,9 +338,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_layernorm_sp, server_args)
 
-    # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
-    run_hook(validate_cutedsl_a2a_token_budget, server_args)
-
     # Handle model loading format.
     run_hook(handle_load_format, server_args)
 
@@ -347,10 +353,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate cache settings.
     run_hook(handle_cache_compatibility, server_args)
 
-    run_hook(handle_page_major_kv_layout, server_args)
-
-    run_hook(handle_unified_memory_pool, server_args)
-
     # Handle diffusion LLM inference.
     from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 
@@ -362,15 +364,19 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Handle debug utilities.
     run_hook(handle_debug_utils, server_args)
 
-    # Handle any other necessary validations.
-    run_hook(handle_other_validations, server_args)
-
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
     run_hook(handle_model_capability_adjustments, server_args)
 
+    run_hook(handle_cuda_graph_compatibility, server_args)
+    run_hook(handle_page_major_kv_layout, server_args)
+    run_hook(handle_unified_memory_pool, server_args)
+
+    run_hook(handle_cuda_graph_sizes, server_args)
+    run_hook(handle_other_validations, server_args)
+    run_hook(handle_gpu_memory_budget, server_args)
+
     # Validate after all batch-size declarations are visible.
+    run_hook(validate_cutedsl_a2a_token_budget, server_args)
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
-
-    server_args._resolution_finished = True

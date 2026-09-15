@@ -71,6 +71,7 @@ def _accepts(
         sa,
         "_model_config",
         SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[]),
             attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA,
             has_asymmetric_kv=has_asymmetric_kv,
             head_dim=192 if has_asymmetric_kv else 128,

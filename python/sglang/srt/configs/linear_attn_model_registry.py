@@ -36,6 +36,7 @@ class LinearAttnModelSpec:
     uses_mamba_radix_cache: bool = True
     support_mamba_cache: bool = True
     support_mamba_cache_extra_buffer: bool = False
+    strided_prefill_backends: frozenset[str] = field(default=frozenset(), kw_only=True)
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
     hybrid_backend_class_name: str | None = None
     config_predicate: Callable[[Any], bool] | None = None

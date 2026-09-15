@@ -141,6 +141,9 @@ class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
     weight_block_size: Optional[List[int]] = None
+    # Component format for startup MoE policy. Composed formats can declare the
+    # expert format without replacing their checkpoint/linear-layer identity.
+    moe_weight_format: Optional[str] = None
 
     def __init__(self):
         super().__init__()

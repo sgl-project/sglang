@@ -21,9 +21,9 @@ Keep this file in the following top-level order:
 3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
    aliases. A choice list used by only one field belongs inline in that field.
 4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
-   registration and small query helpers. New resolution steps are appended at
-   the end of ``arg_groups.pipeline.run_resolution_pipeline``, immediately
-   marked complete, unless an earlier dependency is documented explicitly.
+   registration and small query helpers. Resolution steps belong in dependency
+   order in ``arg_groups.pipeline.run_resolution_pipeline``; the gate below
+   owns completion and failure handling.
 5. Module-level ``ServerArgs`` construction/runtime shims.
 6. Networking constants and ``PortArgs``.
 
@@ -240,6 +240,14 @@ class ServerArgs:
     are listed in: field order *is* the positional constructor signature.
     """
 
+    _resolution_finished = False
+    _resolution_failed = False
+    _resolution_in_progress = False
+    _model_config = None
+    _model_config_built_from = None
+    _model_metadata = None
+    _gpu_memory_capacity = None
+
     def __post_init__(self):
         """Construction leaves the record at what the caller asked for.
 
@@ -262,21 +270,24 @@ class ServerArgs:
         arrived by pickle and brought its declarations along, so the child has
         nothing left to derive and projects what the parent decided.
         """
-        if getattr(self, "_resolution_finished", False):
-            return
-        if getattr(self, "_resolution_failed", False):
+        if self._resolution_failed:
             raise RuntimeError(
                 "resolution already failed on this ServerArgs; the handlers that "
                 "ran left their writes on the record, and a second pass would "
                 "read that partial output as fresh input. Build a new record "
                 "from the corrected arguments."
             )
+        if self._resolution_finished:
+            return
+        if self._resolution_in_progress:
+            raise RuntimeError("resolution is already in progress on this ServerArgs")
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
         # Sealed for the duration, not just afterwards: everything below this
         # line reads the input and declares against it. No exceptions -- even a
         # resolver from outside this tree assigns onto a stand-in, not here.
         self._input_frozen = True
+        self._resolution_in_progress = True
         try:
             run_resolution_pipeline(self)
         except BaseException:
@@ -286,9 +297,7 @@ class ServerArgs:
             raise
         finally:
             self._input_frozen = False
-        # Set here too, because the dummy/absent-model path returns before the
-        # end of the pipeline that normally sets it: the gate is about whether
-        # the handlers ran, not how far they got.
+            self._resolution_in_progress = False
         self._resolution_finished = True
 
     @property

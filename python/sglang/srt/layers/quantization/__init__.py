@@ -3,7 +3,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Dict, Optional, Type
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import (
@@ -155,6 +155,14 @@ CPU_QUANTIZATION_METHODS = {
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
+
+
+def get_moe_weight_format(quantization: Optional[str]) -> Optional[str]:
+    """The expert weight format, independent of a composed method's name."""
+    if quantization is None:
+        return None
+    config = QUANTIZATION_METHODS[quantization]
+    return config.moe_weight_format or quantization
 
 
 def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:

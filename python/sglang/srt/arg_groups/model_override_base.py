@@ -8,6 +8,7 @@ answer questions about the model. It deliberately depends on nothing in
 ``overrides.py``, so a family module never has to import its way back up.
 """
 
+import copy
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -221,7 +222,7 @@ def use_mla_backend(server_args: Any):
 
 
 def model_config_of(server_args: Any):
-    """The model configuration this record describes, built once and memoised.
+    """The model configuration for the current factory inputs, memoised.
 
     Takes a view as readily as the record: a view is a read overlay of one
     record, the memo has to live on that record either way, and the callers
@@ -230,25 +231,27 @@ def model_config_of(server_args: Any):
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         server_args = record_of(server_args)
     # Lazy init to avoid circular import
-    cfg = resolving_view(server_args)
-    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.configs.model_config import ModelConfig, _model_config_factory
 
     memo = getattr(server_args, "_model_config", None)
+    built_from = getattr(server_args, "_model_config_built_from", None)
+    # A supplied fixture has no construction key.
+    if memo is not None and built_from is None:
+        return memo
+    registration = _model_config_factory(server_args)
+    inputs = (
+        registration.inputs(server_args)
+        if registration.inputs is not None
+        else server_args.resolved_dict()
+    )
+    key = (registration, inputs)
     if memo is not None:
-        # The key is the path this record carried when the cache was
-        # filled. The GGUF and ModelScope handlers declare a different
-        # `model_path`, and a configuration built before them describes
-        # another checkpoint. `ModelConfig` re-points its own `model_path`
-        # at the local pull directory when the weights sit behind an
-        # object-store URI, so its field is not the key. A configuration a
-        # fixture supplied carries no key and is handed back as it is.
-        built_from = getattr(server_args, "_model_config_built_from", None)
-        if built_from is None or built_from == cfg.model_path:
+        if built_from == key:
             return memo
 
     model_config = ModelConfig.from_server_args(server_args)
     server_args._model_config = model_config
-    server_args._model_config_built_from = cfg.model_path
+    server_args._model_config_built_from = (registration, copy.deepcopy(inputs))
     if model_config.is_hybrid_swa:
         logger.info(
             "Hybrid SWA model detected. architectures=%s",
@@ -276,6 +279,32 @@ def ep_scale_joiner_of(cfg: Any) -> bool:
 def startup_weight_load_overlap_of(cfg: Any) -> bool:
     """Whether weight loading overlaps startup."""
     return cfg.startup_weight_load_mode == "overlap"
+
+
+def model_metadata_of(
+    server_args: Any, *, apply_model_overrides: bool = True, **kwargs
+):
+    """Isolated checkpoint metadata for policies that precede ModelConfig.
+
+    Source resolution and parsing are shared with the selected factory; callers
+    can inspect architecture, layer and draft facts without deriving runtime
+    shapes from inputs that are still being resolved.
+    """
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        server_args = record_of(server_args)
+    from sglang.srt.configs.model_config import (
+        ModelConfig,
+        _model_config_factory,
+        model_metadata_from_inputs,
+    )
+
+    registration = _model_config_factory(server_args)
+    inputs = (registration.inputs or ModelConfig.get_config_inputs)(
+        server_args, **kwargs
+    )
+    if not apply_model_overrides:
+        inputs["model_override_args"] = "{}"
+    return copy.deepcopy(model_metadata_from_inputs(server_args, inputs).hf_config)
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:

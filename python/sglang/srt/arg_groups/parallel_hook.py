@@ -22,7 +22,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import parse_connector_type
 
@@ -158,10 +158,6 @@ def handle_decode_context_parallelism(server_args: Any):
 def handle_data_parallelism(server_args: Any):
     # The dp_size==1 resets moved to the resolution pipeline
     # (arg_groups/overrides.py: _data_parallelism_defaults).
-    from sglang.srt.arg_groups.cuda_graph_hook import (
-        generate_prefill_cuda_graph_batch_sizes,
-    )
-
     cfg = resolving_view(server_args)
 
     run_post_process_pass(server_args, _data_parallelism_defaults)
@@ -201,32 +197,6 @@ def handle_data_parallelism(server_args: Any):
             f"DP attention is enabled. chunked prefill size is adjusted "
             f"from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}."
         )
-
-        # The prefill CUDA graph max_bs was derived from the pre-DP-division
-        # chunked_prefill_size in _handle_gpu_memory_settings (which runs
-        # before this handler). Re-clamp it (and the captured shape list) to
-        # the per-DP-rank chunked_prefill_size so breakable CUDA graph
-        # capture never exceeds the MoE all-to-all's max_num_tokens budget,
-        # which is also sized from the DP-adjusted chunked_prefill_size.
-        prefill_cfg = cfg.cuda_graph_config.prefill
-        if (
-            prefill_cfg.backend != Backend.DISABLED
-            and prefill_cfg.max_bs is not None
-            and prefill_cfg.max_bs > cfg.chunked_prefill_size
-            and (Phase.PREFILL, "max_bs") not in server_args._cuda_graph_config_locked
-        ):
-            clamped = {"max_bs": cfg.chunked_prefill_size}
-            if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
-                clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                    clamped["max_bs"]
-                )
-            declare_resolution(
-                server_args,
-                "_handle_data_parallelism",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, **clamped
-                ),
-            )
 
     # Resolve the phase-aware TP LM-head default before validating the
     # resulting DP/TP LM-head configuration.

@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.attention_hook import (
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
+    handle_cuda_graph_compatibility,
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
@@ -36,7 +37,11 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
-from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.memory_hook import (
+    handle_cuda_graph_sizes,
+    handle_gpu_memory_budget,
+    handle_gpu_memory_settings,
+)
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -576,8 +581,10 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
-        with self.assertLogs(serving_hook.logger, level="INFO") as logs:
-            handle_multimodal_feature_transport(server_args)
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
 
         self.assertEqual(resolution_result(server_args, "mm_feature_transport"), "cpu")
         self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
@@ -1235,6 +1242,32 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
         )
+
+    def test_composed_quantization_dispatch_preserves_method_identity(self):
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+        for weight_format in ("nvfp4", "mxfp8"):
+
+            class ComposedConfig(QuantizationConfig):
+                moe_weight_format = weight_format
+
+            with (
+                self.subTest(weight_format=weight_format),
+                patch.dict(QUANTIZATION_METHODS, {"external_composed": ComposedConfig}),
+            ):
+                server_args = self._make_args(
+                    quantization="external_composed", dispatch_type="auto"
+                )
+                handle_a2a_moe(server_args)
+                self.assertEqual(
+                    resolution_result(server_args, "flashinfer_a2a_dispatch_type"),
+                    weight_format,
+                )
+                self.assertEqual(server_args.quantization, "external_composed")
+                self.assertEqual(
+                    resolution_result(server_args, "quantization"), "external_composed"
+                )
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
@@ -2173,6 +2206,8 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     ),
                 ):
                     handle_gpu_memory_settings(args)
+                    handle_cuda_graph_sizes(args)
+                    handle_gpu_memory_budget(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
@@ -2188,6 +2223,7 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         )
         with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
+            handle_cuda_graph_compatibility(args)
         return args
 
     def test_cuda_graph_prefill_role_defaults_disable_decode_graph(self):
@@ -2319,6 +2355,7 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
         )
         with patch("sglang.srt.utils.is_cuda", return_value=True):
             handle_cuda_graph_config(args)
+            handle_cuda_graph_compatibility(args)
         return args
 
     def test_multimodal_arch_disables_prefill_breakable(self):
