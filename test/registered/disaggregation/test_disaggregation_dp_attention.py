@@ -18,10 +18,7 @@ register_cuda_ci(est_time=100, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
-    """PD-disagg + DP-attention e2e: the real scheduler load-report path feeding
-    the `total_tokens` LB, which no unit test can stand in for. The dispatch
-    algorithm itself -- tie-break, speculative increments, and the refresh
-    throttle that spreads a burst -- is covered in
+    """The dispatch algorithm itself is covered in
     test/registered/unit/managers/test_data_parallel_controller.py.
     """
 

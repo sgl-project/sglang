@@ -686,11 +686,9 @@ class TestDisaggregationStagingRadixPrefillLargerTP(PDDisaggregationServerBase):
             eval_name="gsm8k",
             api="completion",
             max_tokens=512,
-            # 50 rather than the 200 its sibling classes use: the small
-            # chunked-prefill-size above cuts throughput ~90x (3s -> 300s for
-            # the same eval), and every request walks the same grid-split
-            # path, so more examples buy no extra coverage. 50 still clears
-            # the 0.60 floor by ~2.6 sigma at the observed 0.76.
+            # 50, not the 200 its siblings use: the small chunked-prefill-size
+            # above costs ~90x throughput, every request walks the same
+            # grid-split path, and 50 still clears 0.60 by ~2.6 sigma at 0.76.
             num_examples=50,
             num_threads=128,
         )

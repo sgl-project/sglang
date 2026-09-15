@@ -1,11 +1,7 @@
 """DPBudget + DataParallelController dispatch tests.
 
-`total_tokens` is the most complex algorithm, and it is covered here in full:
-the tie-break on `total_requests`, the speculative increments `dispatch()`
-applies, and the 20ms `refresh_load_budget` throttle that lets a burst spread
-instead of collapsing onto one rank.
-test/registered/disaggregation/test_disaggregation_dp_attention.py keeps the
-end-to-end PD-disagg + DP-attention accuracy check on top.
+The e2e counterpart, over the real scheduler load-report path, is
+test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
 `__new__` and inject only the attrs the schedulers read (`workers`, `status`,
@@ -285,12 +281,6 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
 
 
 class TestRefreshLoadBudgetThrottle(CustomTestCase):
-    """The 20ms throttle in ``refresh_load_budget`` is what keeps a burst from
-    collapsing onto one DP rank. Inside the window the budget keeps the
-    speculative increments ``dispatch()`` made; outside it, the real scheduler
-    snapshot wins; and a snapshot whose timestamp has not moved must not wipe
-    the burst either."""
-
     @staticmethod
     def _controller_with_reader(dp_size, snapshots):
         ctl = _make_controller(dp_size)

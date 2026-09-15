@@ -198,14 +198,8 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
     "NIXL with the configured backend is required for this test.",
 )
 class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
-    """Small NIXL PD E2E coverage.
-
-    Mooncake already owns the broad disaggregation functional matrix in
-    test_disaggregation_basic.py. This class intentionally mirrors only the
-    subset that proves NIXL can launch, transfer KV, serve a request, return
-    logprobs, keep all workers alive, and preserve accuracy across the
-    transfer. All of it shares one server pair -- the checks differ only in
-    what they send, not in how the servers are configured.
+    """Mooncake owns the broad disaggregation functional matrix in
+    test_disaggregation_basic.py; this is the NIXL-only subset.
     """
 
     @classmethod
@@ -292,10 +286,9 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
     def setUpClass(cls):
         _require_configured_nixl_backend()
         super().setUpClass()
-        # 0.2 rather than the 0.05 the mooncake twin uses: this test never
-        # inspects the eval result, so the injection rate alone decides how
-        # much of the failure path gets walked. 0.2 over 50 requests leaves a
-        # ~1e-5 chance of walking none, where 0.05 over 50 would leave 8%.
+        # 0.2, not the mooncake twin's 0.05: this test never inspects the eval
+        # result, so the rate alone decides how much of the failure path runs;
+        # over 50 requests 0.05 would leave an 8% chance of exercising none.
         os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.2"
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
