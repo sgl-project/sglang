@@ -2950,9 +2950,10 @@ def set_gpu_proc_affinity(
         # the whole-machine assumption this function made before it consulted
         # the cpuset.
         allowed = set(range(psutil.cpu_count()))
-    # The second sibling of core c is c + total_pcores, so allowed ids below
-    # that bound are the cores to divide and the rest are their siblings. A
-    # cpuset holding only siblings still has to yield a usable pool.
+    # Linux numbers the second thread of core c as c + total_pcores, so ids
+    # below that bound are one per physical core. Dividing those stops a rank
+    # from being handed two threads of one core while another rank gets two
+    # whole cores. The fallback covers a cpuset holding only second threads.
     pool = sorted(cpu for cpu in allowed if cpu < total_pcores) or sorted(allowed)
 
     # physical cores per TP (N.B. more Cores than GPUs on node)
