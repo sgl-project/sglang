@@ -20,8 +20,6 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 
     _install_platform_stubs()
 
-from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
-
 # The transformers compatibility patches must be in place before transformers
 # is *used*, not before sglang is imported. Applying them eagerly costs ~2 s per
 # process (it imports torch and transformers, and transformers.masking_utils
@@ -32,6 +30,13 @@ from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patc
 
 def _install_hf_patch_hook():
     import importlib.abc as _abc
+
+    # Imported here, not at module level: the `sglang.srt.utils` package init
+    # star-imports `common`, and with it torch.
+    def _apply_hf_patches():
+        from sglang.srt.utils.hf_transformers_patches import apply_all
+
+        apply_all()
 
     if "transformers" in _sys.modules:
         _apply_hf_patches()
@@ -73,6 +78,8 @@ _LAZY_INIT = _envs.SGLANG_PRESPAWN_WORKERS.get()
 if _LAZY_INIT:
     _install_hf_patch_hook()
 else:
+    from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
+
     _apply_hf_patches()
 
     from sglang.lang.api import (
