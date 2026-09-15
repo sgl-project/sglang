@@ -30,22 +30,35 @@ class BenchmarkResult(BaseModel):
     profile_link_decode: Optional[str] = None
     server_args: Optional[List[str]] = None
 
-    def to_markdown_row(self) -> str:
+    def to_markdown_row(
+        self,
+        acc_latency: Optional[float] = None,
+        include_latency_breakdown: bool = False,
+    ) -> str:
         """Convert this benchmark result to a markdown table row."""
 
-        hourly_cost_per_gpu = 2  # $2/hour for one H100
-        hourly_cost = hourly_cost_per_gpu * 1  # Assuming tp_size = 1 for simplicity
-        input_util = 0.7
-        accept_length = round(self.acc_length, 2) if self.acc_length > 0 else "n/a"
         itl = 1 / (self.output_throughput / self.batch_size) * 1000
-        input_cost = 1e6 / (self.input_throughput * input_util) / 3600 * hourly_cost
-        output_cost = 1e6 / self.output_throughput / 3600 * hourly_cost
 
-        return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} |\n"
+        if not include_latency_breakdown:
+            hourly_cost_per_gpu = 2  # $2/hour for one H100
+            hourly_cost = hourly_cost_per_gpu * 1  # Assuming tp_size = 1 for simplicity
+            input_util = 0.7
+            accept_length = round(self.acc_length, 2) if self.acc_length > 0 else "n/a"
+            input_cost = 1e6 / (self.input_throughput * input_util) / 3600 * hourly_cost
+            output_cost = 1e6 / self.output_throughput / 3600 * hourly_cost
+
+            return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} |\n"
+
+        acc_latency_str = f"{acc_latency:.2f}" if acc_latency is not None else "n/a"
+
+        return f"| {self.batch_size} | {self.input_len} | {self.output_len} | {self.latency:.2f} | {self.last_ttft:.2f} | {itl:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {acc_latency_str} |\n"
 
 
 def generate_markdown_report(
-    results: List[BenchmarkResult], variant: Optional[str] = None
+    results: List[BenchmarkResult],
+    variant: Optional[str] = None,
+    acc_latency: Optional[float] = None,
+    include_latency_breakdown: bool = False,
 ) -> str:
     """Generate a markdown report from a list of BenchmarkResult object from a single run."""
     # Build model header with run_name if it's not "default"
@@ -63,12 +76,19 @@ def generate_markdown_report(
 
     summary = f"### {model_header}\n"
 
-    summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |\n"
-    summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |\n"
+    if include_latency_breakdown:
+        summary += "| batch size | input len | output len | perf latency (s) | FTL (s) | ITL (ms) | first token throughput (tok/s) | next token throughput (tok/s) | acc latency (s) |\n"
+        summary += "| ---------- | --------- | ---------- | ---------------- | ------- | -------- | ------------------------------ | ----------------------------- | --------------- |\n"
+    else:
+        summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |\n"
+        summary += "| ---------- | --------- | ----------- | ------------------------- | ------------------------- | ---------- | -------- | ----------------- | ------------------ |\n"
 
     # all results should share the same isl & osl
     for result in results:
-        summary += result.to_markdown_row()
+        summary += result.to_markdown_row(
+            acc_latency=acc_latency,
+            include_latency_breakdown=include_latency_breakdown,
+        )
 
     return summary
 
