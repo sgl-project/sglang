@@ -80,5 +80,18 @@ def test_fused_sigmoid_mul(m, num_heads, head_dim, dtype, gate_3d):
     _assert_close(ref, x_wrapper_inplace)
 
 
+@pytest.mark.parametrize("shape", [(17, 32000), (17, 32003)])
+@pytest.mark.parametrize("padded", [False, True])
+def test_fused_softcap(shape, padded):
+    logits = torch.randn(shape, dtype=torch.float32)
+    if padded:
+        logits = torch.cat((logits, torch.zeros(shape[0], 7)), dim=1)[:, : shape[1]]
+        assert not logits.is_contiguous()
+
+    expected = 30.0 * torch.tanh(logits / 30.0)
+    torch.ops.sgl_kernel.fused_softcap_cpu(logits, 30.0)
+    torch.testing.assert_close(logits, expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
