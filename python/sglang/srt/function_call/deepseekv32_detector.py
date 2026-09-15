@@ -14,6 +14,10 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek V3.2 model function call format.
@@ -114,7 +118,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
-            parsed = json.loads(invoke_content_stripped)
+            parsed = json.loads(
+                invoke_content_stripped, parse_constant=_reject_json_constant
+            )
             if not isinstance(parsed, dict):
                 raise ValueError("DeepSeek tool arguments must be a JSON object")
             return invoke_content_stripped
@@ -244,6 +250,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not is_tool_end:
                     break
 
+                current_params = self._parse_parameters_from_xml(invoke_content)
+
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
@@ -262,7 +270,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 while len(self.streamed_args_for_tool) <= self.current_tool_id:
                     self.streamed_args_for_tool.append("")
 
-                current_params = self._parse_parameters_from_xml(invoke_content)
                 all_calls.append(
                     ToolCallItem(
                         tool_index=self.current_tool_id,
@@ -295,7 +302,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self._buffer = ""
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=current_text, calls=all_calls)
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         if not self._buffer:
