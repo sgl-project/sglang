@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
-from sglang.srt.observability.trace import trace_set_thread_info
 from sglang.srt.managers.cache_controller import (
     CacheOperation,
 )
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.observability.trace import trace_set_thread_info
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -695,9 +695,7 @@ class HybridCacheController(BaseHiCacheController):
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(
-                extra_info=self._storage_trace_extra(
-                    operation, include_request_id=True
-                )
+                extra_info=self._storage_trace_extra(operation, include_request_id=True)
                 or None,
             )
             results = self.storage_backend.batch_get_v2(transfers_nonkv, extra_info)
@@ -760,9 +758,7 @@ class HybridCacheController(BaseHiCacheController):
                 )
                 or None,
             )
-            results = self.storage_backend.batch_set_v2(
-                backup_transfers, sidecar_extra
-            )
+            results = self.storage_backend.batch_set_v2(backup_transfers, sidecar_extra)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
