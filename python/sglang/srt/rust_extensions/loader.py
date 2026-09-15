@@ -122,13 +122,15 @@ def load_rust_extension(
 
     crate = _discover_crate(workspace, python_module)
     features = tuple(dict.fromkeys((*crate.features, *additional_features)))
-    context = _build_context(
-        crate,
-        features=features,
-        build_fingerprint=build_fingerprint,
-        extension_module=load_module,
-    )
     cache_root = _cache_root(cache_dir)
+    # Even a version query can make rustup install the workspace's toolchain.
+    with _filesystem_lock(cache_root / "locks" / "toolchain.lock"):
+        context = _build_context(
+            crate,
+            features=features,
+            build_fingerprint=build_fingerprint,
+            extension_module=load_module,
+        )
     extension_path = _cached_extension_path(
         cache_root, crate, context.fingerprint, load_module
     )
@@ -339,8 +341,11 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             cwd=cwd,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
+        detail = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            detail += f"\n{exc.stdout or ''}{exc.stderr or ''}"
         raise RuntimeError(
-            f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`"
+            f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`: {detail}"
         ) from exc
     return result.stdout.strip()
 

@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
@@ -239,23 +240,40 @@ crate-type = ["cdylib"]
             self.assertNotEqual(first.fingerprint, changed.fingerprint)
             self.assertEqual(first.target_fingerprint, changed.target_fingerprint)
 
-    def test_auto_builds_once_then_uses_cache(self):
+    def test_concurrent_loads_initialize_toolchain_and_build_once(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             workspace = self._workspace(root)
             artifact = root / "libdemo_extension.so"
             artifact.write_bytes(b"extension")
-            context = rust_extension._BuildContext("source", "fingerprint", "target")
             loaded = ModuleType("demo._core")
+            toolchain_busy = threading.Lock()
+            workers_ready = threading.Barrier(4)
+
+            def command_version(command, *args, **kwargs):
+                if not toolchain_busy.acquire(blocking=False):
+                    raise RuntimeError("concurrent toolchain installation")
+                try:
+                    time.sleep(0.05)
+                    return f"{command} 1.0"
+                finally:
+                    toolchain_busy.release()
+
+            def load_in_worker():
+                workers_ready.wait(timeout=5)
+                return load_rust_extension(
+                    "demo._core",
+                    mode="auto",
+                    workspace=workspace,
+                    cache_dir=root / "cache",
+                )
+
             with (
                 mock.patch.object(
                     rust_extension, "_import_bundled_extension", return_value=None
                 ),
                 mock.patch.object(
-                    rust_extension, "_build_context", return_value=context
-                ),
-                mock.patch.object(
-                    rust_extension, "_source_digest", return_value="source"
+                    rust_extension, "_command_version", side_effect=command_version
                 ),
                 mock.patch.object(
                     rust_extension, "_cargo_build", return_value=artifact
@@ -266,15 +284,10 @@ crate-type = ["cdylib"]
                     return_value=loaded,
                 ),
             ):
-                self.assertIs(
-                    rust_extension.load_rust_extension(
-                        "demo._core",
-                        mode="auto",
-                        workspace=workspace,
-                        cache_dir=root / "cache",
-                    ),
-                    loaded,
-                )
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(load_in_worker) for _ in range(4)]
+                    for future in futures:
+                        self.assertIs(future.result(timeout=10), loaded)
                 self.assertIs(
                     rust_extension.load_rust_extension(
                         "demo._core",
@@ -285,6 +298,22 @@ crate-type = ["cdylib"]
                     loaded,
                 )
             cargo_build.assert_called_once()
+
+    def test_toolchain_failure_preserves_command_output(self):
+        command = ["cargo", "--version", "--verbose"]
+        error = subprocess.CalledProcessError(
+            1,
+            command,
+            output="toolchain download started\n",
+            stderr="could not rename downloaded component: No such file or directory\n",
+        )
+        with mock.patch.object(rust_extension.subprocess, "run", side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
+                rust_extension._command_version(*command, cwd=Path("/workspace"))
+        self.assertIn("cargo --version --verbose", str(raised.exception))
+        self.assertIn(error.stdout.strip(), str(raised.exception))
+        self.assertIn(error.stderr.strip(), str(raised.exception))
+        self.assertIs(raised.exception.__cause__, error)
 
     def test_never_rejects_missing_cache_without_building(self):
         with TemporaryDirectory() as directory:
