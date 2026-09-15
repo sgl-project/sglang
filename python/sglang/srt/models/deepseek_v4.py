@@ -1155,19 +1155,46 @@ class MQALayer(MqaAttentionBase):
         stream_compressor = self.alt_streams[1]
         stream_indexer = self.alt_streams[2]
 
-        stream_kv.wait_stream(current_stream)
-        stream_compressor.wait_stream(current_stream)
-        stream_indexer.wait_stream(current_stream)
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        if not use_cp:
+            stream_kv.wait_stream(current_stream)
+            stream_compressor.wait_stream(current_stream)
+            stream_indexer.wait_stream(current_stream)
 
         x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
-            qkv_a_ready = current_stream.record_event()
+            if not use_cp:
+                qkv_a_ready = current_stream.record_event()
 
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
+
+        swa_k: Optional[torch.Tensor] = None
+        indexer_kv_score: Optional[torch.Tensor] = None
+        compressor_kv_score: Optional[torch.Tensor] = None
+        if use_cp:
+            # Keep all CP collectives on the parent stream and in one fixed order.
+            # Launching them independently on the worker streams can make ranks
+            # enter different collectives first and deadlock.
+            swa_k = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a).contiguous()
+            swa_k = cp_materialize_global_token_order(
+                swa_k, forward_batch, current_stream
+            )
+            if self.indexer is not None:
+                indexer_kv_score = self.indexer.compressor.compute_kv_score(
+                    x, forward_batch
+                )
+            if self.compressor is not None:
+                compressor_kv_score = self.compressor.compute_kv_score(x, forward_batch)
+
+            # This is the actual fork point: every worker sees all materialized
+            # buffers only after the parent finishes the ordered collectives.
+            stream_kv.wait_stream(current_stream)
+            stream_compressor.wait_stream(current_stream)
+            stream_indexer.wait_stream(current_stream)
 
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
@@ -1178,20 +1205,33 @@ class MQALayer(MqaAttentionBase):
                     attn_backend=attn_backend,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
+                    precomputed_kv_score=indexer_kv_score,
                 )
 
         with torch.cuda.stream(stream_kv):
-            if qkv_a_ready is not None:
-                stream_kv.wait_event(qkv_a_ready)
-            # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
+            if use_cp:
+                assert swa_k is not None
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=swa_k,
+                    forward_batch=forward_batch,
+                )
+            else:
+                if qkv_a_ready is not None:
+                    stream_kv.wait_event(qkv_a_ready)
+                # Fused norm + rope + cache write -- no bf16 KV intermediate.
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                )
 
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
-                    x, forward_batch, self.layer_id, self.compressor
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                    precomputed_kv_score=compressor_kv_score,
                 )
 
         q = self._compute_q_b(q_lora, positions, q_out)
@@ -1704,6 +1744,15 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+            is_unified_kv_triton,
+        )
+
+        unified = is_unified_kv_triton()
+        use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
+            forward_batch
+        )
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -1712,7 +1761,7 @@ class MQALayer(MqaAttentionBase):
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and (not use_prefill_cp or (not _is_hip and not unified))
             and not (_is_hip and self.compressor is None)
         ) or (
             _is_npu
@@ -1722,12 +1771,6 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-            is_unified_kv_triton,
-        )
-
-        unified = is_unified_kv_triton()
         unified_fp8_verify = (
             unified
             and is_unified_kv_fp8()
@@ -1816,8 +1859,8 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
+            # The regular multi-stream path fuses the KV cache write. Prefill CP
+            # instead materializes BF16 KV on the parent stream before forking.
             if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
