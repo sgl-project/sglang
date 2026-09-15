@@ -15,7 +15,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=75, stage="base-b", runner_config="1-gpu-large")
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
 
@@ -202,15 +202,18 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
                         )
                     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
-    def test_rejects_cross_group_tile(self):
+    def test_cross_group_tile(self):
         a, b, a_s, b_s, _ = self._inputs(32, 64, m=16, n=32)
         with patch.object(
             fp8_kernel,
             "get_w8a8_block_fp8_configs",
             return_value={16: self._config(64)},
         ):
-            with self.assertRaisesRegex(ValueError, "BLOCK_SIZE_K.*group_k"):
-                fp8_kernel.w8a8_block_fp8_matmul_triton(a, b, a_s, b_s, [32, 32])
+            out = fp8_kernel.w8a8_block_fp8_matmul_triton(
+                a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16
+            )
+        # 32 * 1 * 1 + 32 * 4 * 2; one cross-group dot would return 64.
+        torch.testing.assert_close(out, torch.full_like(out, 288), rtol=0, atol=0)
 
     def test_torch_compile_default_config(self):
         a, b, a_s, b_s, expected = self._inputs(32, 65)
@@ -221,7 +224,14 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     def test_rejects_invalid_tiles(self):
-        for group_k, bk in [(32, 64), (32, 128), (96, 64), (32, 0), (32, -32)]:
+        for group_k, bk in [
+            (32, 48),
+            (96, 128),
+            (32, 512),
+            (96, 64),
+            (32, 0),
+            (32, -32),
+        ]:
             with self.subTest(group_k=group_k, bk=bk):
                 a, b, a_s, b_s, _ = self._inputs(group_k, group_k * 2)
                 with patch.object(
@@ -272,7 +282,7 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
                     for bk in (32, 64, 0, -32):
                         config_file.write_text(json.dumps({"3": self._config(bk)}))
                         fp8_kernel.get_w8a8_block_fp8_configs.cache_clear()
-                        if bk == 32:
+                        if bk in (32, 64):
                             out = fp8_kernel.w8a8_block_fp8_matmul_triton(
                                 a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16
                             )
@@ -327,16 +337,20 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
             spec.loader.exec_module(tuner)
         for group_k, bk in [(32, 32), (128, 64), (32, 64)]:
             a, b, a_s, b_s, expected = self._inputs(group_k, group_k * 2)
-            if bk > group_k:
-                with self.assertRaisesRegex(ValueError, "BLOCK_SIZE_K.*group_k"):
-                    tuner.w8a8_block_matmul(
-                        a, b, a_s, b_s, [32, group_k], self._config(bk)
-                    )
-            else:
-                out = tuner.w8a8_block_matmul(
-                    a, b, a_s, b_s, [32, group_k], self._config(bk), torch.bfloat16
-                )
-                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            out = tuner.w8a8_block_matmul(
+                a, b, a_s, b_s, [32, group_k], self._config(bk), torch.bfloat16
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        self.assertEqual(
+            {c["BLOCK_SIZE_K"] for c in tuner.get_tuning_configs(32, "fp8")},
+            {32, 64, 128},
+        )
+        for kind, group in [("int8", 128), ("fp8", 96)]:
+            configs = tuner.get_tuning_configs(group, kind)
+            self.assertTrue(all(group % c["BLOCK_SIZE_K"] == 0 for c in configs))
+        with patch.object(tuner, "is_cuda", return_value=False):
+            configs = tuner.get_tuning_configs(64, "fp8")
+            self.assertEqual({c["BLOCK_SIZE_K"] for c in configs}, {64})
         # The shared tuning entry also accepts INT8; its dispatch is unchanged.
         a, b, a_s, b_s, expected = self._inputs(128, 256)
         out = tuner.w8a8_block_matmul(
@@ -349,6 +363,156 @@ class TestW8A8BlockFP8TileValidation(CustomTestCase):
             torch.bfloat16,
         )
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_unrolled_group_tails(self):
+        # Dyadic inputs/scales permit exact FP64 reference comparisons. Padding
+        # scale storage with NaNs also detects reads of masked-off K groups.
+        gen = torch.Generator(device=device).manual_seed(29)
+        for group_k, bk in [
+            (32, 64),
+            (32, 128),
+            (32, 256),
+            (64, 128),
+            (64, 256),
+            (128, 256),
+        ]:
+            for k in [17, group_k + 1, 288, 576]:
+                m, n = 3, 35
+                groups = (k + group_k - 1) // group_k
+                a = (
+                    torch.randint(-4, 5, (m, k), device=device, generator=gen).float()
+                    / 4
+                ).to(torch.float8_e4m3fn)
+                b = (
+                    torch.randint(-4, 5, (n, k), device=device, generator=gen).float()
+                    / 4
+                ).to(torch.float8_e4m3fn)
+                for layout in ["compact", "padded", "column"]:
+
+                    def scales(rows):
+                        if layout == "column":
+                            storage = torch.full(
+                                (groups + 8, rows), float("nan"), device=device
+                            )
+                            view = storage[:groups].t()
+                        elif layout == "padded":
+                            storage = torch.full(
+                                (rows, groups + 8), float("nan"), device=device
+                            )
+                            view = storage[:, :groups]
+                        else:
+                            view = torch.empty((rows, groups), device=device)
+                        view.copy_(
+                            2.0
+                            ** torch.randint(
+                                -1, 2, view.shape, device=device, generator=gen
+                            ).float()
+                        )
+                        return view
+
+                    a_s, b_s = scales(m), scales(2)
+                    da = a.double() * a_s.double().repeat_interleave(group_k, 1)[:, :k]
+                    db = (
+                        b.double()
+                        * b_s.double()
+                        .repeat_interleave(32, 0)[:n]
+                        .repeat_interleave(group_k, 1)[:, :k]
+                    )
+                    ref = da @ db.t()
+                    for dtype in [torch.float16, torch.bfloat16, torch.float32]:
+                        with self.subTest(
+                            group_k=group_k, bk=bk, k=k, layout=layout, dtype=dtype
+                        ):
+                            with patch.object(
+                                fp8_kernel,
+                                "get_w8a8_block_fp8_configs",
+                                return_value={m: self._config(bk)},
+                            ):
+                                out = fp8_kernel.w8a8_block_fp8_matmul_triton(
+                                    a, b, a_s, b_s, [32, group_k], output_dtype=dtype
+                                )
+                            torch.testing.assert_close(
+                                out, ref.to(dtype), rtol=0, atol=0
+                            )
+
+    def test_config_selection_boundaries(self):
+        configs = {2: self._config(32), 16: self._config(128)}
+        for m in (8, 9, 10, 24):
+            with self.subTest(m=m):
+                a, b, a_s, b_s, expected = self._inputs(32, 65, m=m)
+                selected = []
+
+                def observe(m, n, config):
+                    selected.append(config["BLOCK_SIZE_K"])
+                    return fp8_kernel._w8a8_block_fp8_matmul
+
+                with (
+                    patch.object(
+                        fp8_kernel, "get_w8a8_block_fp8_configs", return_value=configs
+                    ),
+                    patch.object(
+                        fp8_kernel,
+                        "select_w8a8_block_fp8_matmul_kernel",
+                        side_effect=observe,
+                    ),
+                ):
+                    out = fp8_kernel.w8a8_block_fp8_matmul_triton(
+                        a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16
+                    )
+                key = min(configs, key=lambda value: abs(value - m))
+                self.assertEqual(selected, [configs[key]["BLOCK_SIZE_K"]])
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_unrolled_compile_and_graph(self):
+        a, b, a_s, b_s, expected = self._inputs(32, 65)
+        configs = {2: self._config(32), 16: self._config(128)}
+        with patch.object(
+            fp8_kernel,
+            "get_w8a8_block_fp8_configs",
+            new=lambda *args: configs,
+        ):
+            compiled = torch.compile(
+                fp8_kernel.w8a8_block_fp8_matmul_triton, fullgraph=True
+            )
+            for m in (3, 9, 10, 16):
+                a, b, a_s, b_s, expected = self._inputs(32, 65, m=m)
+                out = compiled(a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16)
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    fp8_kernel.w8a8_block_fp8_matmul_triton(
+                        a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = fp8_kernel.w8a8_block_fp8_matmul_triton(
+                    a, b, a_s, b_s, [32, 32], output_dtype=torch.bfloat16
+                )
+            graph.replay()
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_unrolled_rejects_unsupported_storage_and_backend(self):
+        a, b, a_s, b_s, _ = self._inputs(32, 64)
+        with patch.object(
+            fp8_kernel, "get_w8a8_block_fp8_configs", return_value={3: self._config(64)}
+        ):
+            with self.assertRaises(NotImplementedError):
+                fp8_kernel.w8a8_block_fp8_matmul_triton(
+                    a, b, a_s.half(), b_s.half(), [32, 32]
+                )
+            # Structurally valid packed scales reach the new path's dtype guard.
+            packed_a = torch.ones((3, 1), device=device, dtype=torch.int32)
+            packed_b = torch.ones((35, 1), device=device, dtype=torch.int32)
+            with self.assertRaisesRegex(ValueError, "FP32 scale storage"):
+                fp8_kernel.w8a8_block_fp8_matmul_triton(
+                    a, b, packed_a, packed_b, [32, 32]
+                )
+        with patch.object(fp8_kernel, "_is_cuda", False):
+            with self.assertRaisesRegex(ValueError, "BLOCK_SIZE_K.*group_k"):
+                fp8_kernel._validate_w8a8_block_fp8_config(32, self._config(64))
 
 
 if __name__ == "__main__":
