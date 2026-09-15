@@ -7,14 +7,9 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_sp_parallel_rank,
-    get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
-)
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
-    SP_STOCHASTIC_NOISE_KEY,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -50,29 +45,6 @@ class LLaDAImageLatentPreparationStage(LatentPreparationStage):
                 dtype=model_dtype,
             ).float()
         batch = super().forward(batch, server_args)
-        batch.extra.pop(SP_STOCHASTIC_NOISE_KEY, None)
-
-        sp_size = get_sp_world_size()
-        if self.scheduler.config.stochastic_sampling and sp_size > 1:
-            full_shape = tuple(int(value) for value in batch.raw_latent_shape)
-            if len(full_shape) != 4:
-                raise ValueError(
-                    "LLaDA-Image SP noise requires four-dimensional latents"
-                )
-            latent_height = full_shape[2]
-            if latent_height % sp_size != 0:
-                raise ValueError(
-                    "LLaDA-Image SP noise requires height divisible by SP size"
-                )
-            local_height = latent_height // sp_size
-            sp_rank = get_sp_parallel_rank()
-            batch.extra[SP_STOCHASTIC_NOISE_KEY] = {
-                "full_shape": full_shape,
-                "dim": 2,
-                "start": sp_rank * local_height,
-                "length": local_height,
-            }
-
         return batch
 
 

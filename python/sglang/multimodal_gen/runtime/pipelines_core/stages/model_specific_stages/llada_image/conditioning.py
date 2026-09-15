@@ -11,7 +11,6 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_sp_parallel_rank,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -75,12 +74,6 @@ class LLaDAImageTextEncoderRunner:
         from sglang.srt.runtime_context import create_context, use_context
         from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
-        # Keep the SRT world aligned with the pure-Ulysses ranks. Within that
-        # world, SP ranks become data replicas so conditioning matches SP1.
-        text_tp_size = int(server_args.sp_degree)
-        text_tp_rank = get_sp_parallel_rank()
-        text_dp_attention = text_tp_size > 1
-
         self.queryformer = queryformer
         self.text_projection = text_projection
         self.tokenizer = tokenizer
@@ -101,24 +94,14 @@ class LLaDAImageTextEncoderRunner:
             revision=server_args.revision,
             skip_tokenizer_init=True,
             dtype="bfloat16",
-            tp_size=text_tp_size,
-            dp_size=text_tp_size if text_dp_attention else 1,
-            enable_dp_attention=text_dp_attention,
-            enable_dp_lm_head=text_dp_attention,
-            dcp_size=1,
-            attn_cp_size=1,
-            ep_size=1,
-            moe_dp_size=text_tp_size if text_dp_attention else 1,
-            moe_dense_tp_size=1 if text_dp_attention else None,
-            moe_a2a_backend="none",
-            pp_size=1,
+            tp_size=1,
             attention_backend="llada2_cfg_flashinfer",
             disable_cuda_graph=True,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             max_prefill_tokens=8192,
             max_total_tokens=8192,
-            max_running_requests=4 if text_dp_attention else 2,
+            max_running_requests=2,
             mem_fraction_static=(
                 server_args.pipeline_config.text_encoder_mem_fraction_static
             ),
@@ -135,25 +118,7 @@ class LLaDAImageTextEncoderRunner:
                 self.worker = TpModelWorker(
                     server_args=srt_args,
                     gpu_id=gpu_id,
-                    ps=ParallelState.trivial(
-                        tp_rank=text_tp_rank,
-                        tp_size=text_tp_size,
-                        dp_rank=text_tp_rank if text_dp_attention else 0,
-                        dp_size=text_tp_size if text_dp_attention else 1,
-                        attn_tp_rank=0 if text_dp_attention else text_tp_rank,
-                        attn_tp_size=1 if text_dp_attention else text_tp_size,
-                        attn_cp_rank=0,
-                        attn_cp_size=1,
-                        attn_dcp_rank=0,
-                        attn_dcp_size=1,
-                        attn_dp_rank=text_tp_rank if text_dp_attention else 0,
-                        attn_dp_size=text_tp_size if text_dp_attention else 1,
-                        moe_ep_rank=0,
-                        moe_ep_size=1,
-                        moe_dp_rank=text_tp_rank if text_dp_attention else 0,
-                        moe_dp_size=text_tp_size if text_dp_attention else 1,
-                        gpu_id=gpu_id,
-                    ),
+                    ps=ParallelState.trivial(gpu_id=gpu_id),
                     nccl_port=server_args.nccl_port or 29500,
                 )
                 # Run the post-construction init phases the srt scheduler drives.
@@ -166,7 +131,6 @@ class LLaDAImageTextEncoderRunner:
                 srt_parallel_state._TP = saved_srt_tp
                 srt_parallel_state._ATTN_TP = saved_srt_attn_tp
             self.server_args = srt_args
-            self.text_dp_attention = text_dp_attention
             self.model_runner = self.worker.model_runner
             self.page_size = self.model_runner.page_size
             self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -241,8 +205,7 @@ class LLaDAImageTextEncoderRunner:
         import sglang.srt.distributed.parallel_state as srt_parallel_state
         from sglang.srt.runtime_context import use_context
 
-        # The TP scope belongs to diffusion. Install the encoder context after it
-        # so replicated attention and MoE keep the encoder's derived widths.
+        # Restore the encoder context inside the diffusion TP scope.
         with (
             mm_parallel_state.use_tensor_parallel_group(self.encoder_tp_group),
             use_context(self.runtime_context),
@@ -343,12 +306,6 @@ class LLaDAImageTextEncoderRunner:
             spec_algorithm=SpeculativeAlgorithm.NONE,
             dllm_config=None,
         )
-        if self.text_dp_attention:
-            token_count = sum(sequence_lengths)
-            batch.global_num_tokens = [token_count] * self.server_args.dp_size
-            batch.global_num_tokens_for_logprob = [len(reqs)] * (
-                self.server_args.dp_size
-            )
         try:
             batch.prepare_for_extend()
             batch.forward_mode = ForwardMode.EXTEND

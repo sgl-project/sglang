@@ -94,39 +94,6 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 SimpleNamespace(conditioning_mask_active=False)
             )
 
-    def test_runtime_lifecycle_apis_reject_partial_coverage(self):
-        from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-        from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
-            MemoryOccupationController,
-        )
-        from sglang.multimodal_gen.runtime.post_training.weights_updater import (
-            WeightsUpdater,
-        )
-
-        self.assertTrue(PipelineConfig().supports_memory_release())
-        self.assertTrue(PipelineConfig().supports_hot_weight_updates())
-        config = LLaDAImagePipelineConfig()
-        self.assertFalse(config.supports_memory_release())
-        self.assertFalse(config.supports_hot_weight_updates())
-
-        pipeline = SimpleNamespace(server_args=SimpleNamespace(pipeline_config=config))
-        controller = MemoryOccupationController(
-            pipeline=pipeline, rank=0, use_fsdp_inference=False
-        )
-        result = controller.release_memory_occupation()
-        self.assertFalse(result["success"])
-        self.assertIn("does not support memory release", result["message"])
-        self.assertFalse(controller.is_sleeping())
-
-        updater = object.__new__(WeightsUpdater)
-        updater.pipeline = pipeline
-        ok, message = updater.update_weights_from_disk("/unused/path")
-        self.assertFalse(ok)
-        self.assertIn("old checkpoint", message)
-        ok, message = updater.update_weights_from_tensor(named_tensors=[])
-        self.assertFalse(ok)
-        self.assertIn("old checkpoint", message)
-
     def test_forward_batch_declares_conditioning_text_lens_field(self):
         import dataclasses
 
@@ -157,147 +124,12 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
             self.runner.component_names, ["queryformer", "text_projection"]
         )
 
-    def test_text_runner_uses_sp_group_as_text_encoder_tp_group(self):
-        resolved_page_size = 16
-        fake_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(page_size=resolved_page_size),
-            model_config=object(),
-            get_memory_pool=lambda: (object(), object()),
-            alloc_memory_pool=lambda: None,
-            init_attention_backends=lambda: None,
-            init_cuda_graphs=lambda: None,
-        )
-        srt_args_module = "sglang.srt.server_args.ServerArgs"
-        worker_module = "sglang.srt.managers.tp_worker.TpModelWorker"
-        with (
-            patch(
-                worker_module,
-                return_value=fake_worker,
-            ) as worker_cls,
-            patch(
-                "sglang.srt.runtime_context.create_context",
-                side_effect=lambda *_args, **_kwargs: RuntimeContext(ParallelContext()),
-            ),
-            patch(
-                "sglang.srt.mem_cache.cache_init_params.CacheInitParams",
-                return_value=object(),
-            ) as cache_init_params_cls,
-            patch(
-                "sglang.srt.mem_cache.chunk_cache.ChunkCache",
-                return_value=object(),
-            ),
-            patch(
-                srt_args_module,
-                side_effect=lambda **kwargs: SimpleNamespace(page_size=None, **kwargs),
-            ) as srt_args_cls,
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_local_torch_device",
-                return_value=torch.device("cpu"),
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_sp_parallel_rank",
-                return_value=1,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.prepare_diffusers_component_path_for_loading",
-                side_effect=lambda path: f"resolved:{path}",
-            ),
-        ):
-            runner = LLaDAImageTextEncoderRunner(
-                model_root="/unused/model",
-                queryformer=object(),
-                text_projection=object(),
-                tokenizer=object(),
-                server_args=SimpleNamespace(
-                    sp_degree=2,
-                    nccl_port=29500,
-                    trust_remote_code=True,
-                    revision=None,
-                    component_paths={
-                        "text_encoder": "/custom/text_encoder",
-                        "tokenizer": "/custom/tokenizer",
-                    },
-                    pipeline_config=SimpleNamespace(
-                        text_encoder_mem_fraction_static=0.1
-                    ),
-                ),
-            )
-            untrusted_runner = LLaDAImageTextEncoderRunner(
-                model_root="/unused/model",
-                queryformer=object(),
-                text_projection=object(),
-                tokenizer=object(),
-                server_args=SimpleNamespace(
-                    sp_degree=2,
-                    nccl_port=29500,
-                    trust_remote_code=False,
-                    revision="pinned-rev",
-                    component_paths={},
-                    pipeline_config=SimpleNamespace(
-                        text_encoder_mem_fraction_static=0.1
-                    ),
-                ),
-            )
-
-        requested_kwargs, untrusted_kwargs = [
-            call.kwargs for call in srt_args_cls.call_args_list
-        ]
-        worker_srt_args = worker_cls.call_args_list[0].kwargs["server_args"]
-        self.assertIs(runner.server_args, worker_srt_args)
-        self.assertIs(
-            untrusted_runner.server_args,
-            worker_cls.call_args_list[1].kwargs["server_args"],
-        )
-        self.assertIs(runner.worker, fake_worker)
-        self.assertEqual(
-            requested_kwargs["model_path"], "resolved:/custom/text_encoder"
-        )
-        self.assertEqual(
-            requested_kwargs["tokenizer_path"], "resolved:/custom/tokenizer"
-        )
-        self.assertEqual(untrusted_kwargs["model_path"], "/unused/model/text_encoder")
-        self.assertEqual(untrusted_kwargs["tokenizer_path"], "/unused/model/tokenizer")
-        self.assertIsNone(worker_srt_args.page_size)
-        self.assertEqual(runner.page_size, resolved_page_size)
-        self.assertEqual(
-            [call.kwargs["page_size"] for call in cache_init_params_cls.call_args_list],
-            [resolved_page_size, resolved_page_size],
-        )
-        self.assertEqual(requested_kwargs["tp_size"], 2)
-        self.assertEqual(requested_kwargs["dp_size"], 2)
-        self.assertTrue(requested_kwargs["enable_dp_attention"])
-        self.assertTrue(requested_kwargs["enable_dp_lm_head"])
-        self.assertEqual(requested_kwargs["attn_cp_size"], 1)
-        self.assertEqual(requested_kwargs["ep_size"], 1)
-        self.assertEqual(requested_kwargs["moe_dp_size"], 2)
-        self.assertEqual(requested_kwargs["moe_dense_tp_size"], 1)
-        self.assertEqual(requested_kwargs["moe_a2a_backend"], "none")
-        self.assertEqual(requested_kwargs["max_running_requests"], 4)
-        parallel_state = worker_cls.call_args_list[0].kwargs["ps"]
-        self.assertEqual(parallel_state.tp_rank, 1)
-        self.assertEqual(parallel_state.tp_size, 2)
-        self.assertEqual(parallel_state.dp_rank, 1)
-        self.assertEqual(parallel_state.dp_size, 2)
-        self.assertEqual(parallel_state.attn_tp_rank, 0)
-        self.assertEqual(parallel_state.attn_tp_size, 1)
-        self.assertEqual(parallel_state.attn_cp_rank, 0)
-        self.assertEqual(parallel_state.attn_cp_size, 1)
-        self.assertEqual(parallel_state.attn_dp_rank, 1)
-        self.assertEqual(parallel_state.attn_dp_size, 2)
-        self.assertEqual(parallel_state.moe_ep_rank, 0)
-        self.assertEqual(parallel_state.moe_ep_size, 1)
-        self.assertEqual(parallel_state.moe_dp_rank, 1)
-        self.assertEqual(parallel_state.moe_dp_size, 2)
-        self.assertIs(requested_kwargs["trust_remote_code"], True)
-        self.assertIs(untrusted_kwargs["trust_remote_code"], False)
-        self.assertEqual(untrusted_kwargs["revision"], "pinned-rev")
-
     def test_text_runner_scopes_singleton_attention_group_and_restores(self):
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_parallel_state
         import sglang.srt.distributed.parallel_state as srt_parallel_state
 
         diffusion_group = object()
-        encoder_group = SimpleNamespace(world_size=2, rank_in_group=1)
+        encoder_group = SimpleNamespace(world_size=1, rank_in_group=0)
         encoder_attention_group = object()
         runner = object.__new__(LLaDAImageTextEncoderRunner)
         runner.runtime_context = RuntimeContext(ParallelContext())
@@ -361,76 +193,6 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
 
         self.assertEqual(prefill_adder_cls.call_args.args[0], runner.page_size)
 
-    def test_text_dp_metadata_covers_each_replica(self):
-        from sglang.srt.managers.schedule_policy import AddReqResult
-
-        class StopAfterMetadata(Exception):
-            pass
-
-        class FakeReq:
-            def __init__(self, *_args, **_kwargs):
-                self.kv = None
-                self.req_pool_idx = None
-
-            def init_next_round_input(self, _tree_cache):
-                return None
-
-        class FakePrefillAdder:
-            def __init__(self, *_args, **_kwargs):
-                self.can_run_list = []
-
-            def add_one_req(self, req, **_kwargs):
-                self.can_run_list.append(req)
-                return AddReqResult.CONTINUE
-
-        def stop_after_metadata():
-            raise StopAfterMetadata
-
-        batch = SimpleNamespace(prepare_for_extend=stop_after_metadata)
-        runner = object.__new__(LLaDAImageTextEncoderRunner)
-        runner.tokenizer = lambda *_args, **_kwargs: SimpleNamespace(
-            input_ids=[[1, 2], [3]]
-        )
-        runner.queryformer = SimpleNamespace(config=SimpleNamespace(num_queries=2))
-        runner.worker = SimpleNamespace(model_config=SimpleNamespace(vocab_size=128))
-        runner.server_args = SimpleNamespace(
-            chunked_prefill_size=-1,
-            max_prefill_tokens=8192,
-            dp_size=2,
-        )
-        runner.text_dp_attention = True
-        runner.page_size = 1
-        runner.tree_cache = object()
-        runner.token_to_kv_pool_allocator = object()
-        runner.req_to_token_pool = object()
-
-        with (
-            patch(
-                "sglang.srt.sampling.sampling_params.SamplingParams",
-                return_value=SimpleNamespace(normalize=lambda _config: None),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.Req",
-                side_effect=FakeReq,
-            ),
-            patch(
-                "sglang.srt.managers.schedule_policy.PrefillAdder",
-                side_effect=FakePrefillAdder,
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.ScheduleBatch.init_new",
-                return_value=batch,
-            ),
-        ):
-            with self.assertRaises(StopAfterMetadata):
-                runner._encode_impl(
-                    ["positive", "negative"],
-                    max_sequence_length=16,
-                )
-
-        self.assertEqual(batch.global_num_tokens, [7, 7])
-        self.assertEqual(batch.global_num_tokens_for_logprob, [2, 2])
-
     def test_text_runner_restores_diffusion_groups_when_worker_init_fails(self):
         import sglang.srt.distributed.parallel_state as srt_parallel_state
 
@@ -463,10 +225,6 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_local_torch_device",
                 return_value=torch.device("cpu"),
             ),
-            patch(
-                "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.llada_image.conditioning.get_sp_parallel_rank",
-                return_value=0,
-            ),
             patch.object(srt_parallel_state, "_TP", diffusion_group),
             patch.object(srt_parallel_state, "_ATTN_TP", diffusion_group),
         ):
@@ -493,7 +251,7 @@ class TestLLaDAImageTextConditioning(unittest.TestCase):
 
 class TestLLaDAImageRuntimeContext(unittest.TestCase):
     def test_encoder_preserves_diffusion_runtime(self):
-        """The embedded DP encoder must retain its topology inside the TP scope."""
+        """The embedded encoder retains its context inside the diffusion TP scope."""
         import sglang.multimodal_gen.runtime.distributed.parallel_state as mm_state
         import sglang.srt.distributed.parallel_state as srt_state
         from sglang.srt import runtime_context as rc
@@ -514,7 +272,7 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
                 diffusion_log = diffusion_context.overrides_log()
                 diffusion_buffer = rc.get_buffer("conditioning", object)
                 diffusion_group = SimpleNamespace(world_size=1, rank_in_group=0)
-                encoder_group = SimpleNamespace(world_size=2, rank_in_group=1)
+                encoder_group = SimpleNamespace(world_size=1, rank_in_group=0)
                 encoder_attention_group = SimpleNamespace(world_size=1, rank_in_group=0)
                 observed = {}
 
@@ -524,11 +282,11 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
 
                 def check_encoder_context():
                     context = rc.assert_published(observed["args"], role="scheduler")
-                    self.assertEqual(rc.get_parallel().tp_size, 2)
+                    self.assertEqual(rc.get_parallel().tp_size, 1)
                     self.assertEqual(rc.get_parallel().attn_tp_size, 1)
-                    self.assertEqual(rc.get_parallel().attn_dp_size, 2)
+                    self.assertEqual(rc.get_parallel().attn_dp_size, 1)
                     self.assertEqual(rc.get_parallel().moe_tp_size, 1)
-                    self.assertEqual(rc.get_schedule().max_running_requests, 4)
+                    self.assertEqual(rc.get_schedule().max_running_requests, 2)
                     return context
 
                 def allocate():
@@ -587,7 +345,6 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
                         f"{conditioning}.get_local_torch_device",
                         return_value=torch.device("cpu"),
                     ),
-                    patch(f"{conditioning}.get_sp_parallel_rank", return_value=1),
                     patch.object(mm_state, "_TP", diffusion_group),
                     patch.object(srt_state, "_TP", diffusion_group),
                     patch.object(srt_state, "_ATTN_TP", diffusion_group),
@@ -598,7 +355,7 @@ class TestLLaDAImageRuntimeContext(unittest.TestCase):
                         text_projection=object(),
                         tokenizer=object(),
                         server_args=SimpleNamespace(
-                            sp_degree=2,
+                            sp_degree=1,
                             nccl_port=29500,
                             trust_remote_code=False,
                             revision=None,

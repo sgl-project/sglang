@@ -15,7 +15,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
-    is_fp8_fnuz,
 )
 from sglang.multimodal_gen.runtime.loader import fsdp_load
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
@@ -98,15 +97,7 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                 state_dict, weight_ref = _make_serialized_fp8_checkpoint()
                 checkpoint_weight = state_dict["qkv.weight"].clone()
                 checkpoint_scales = state_dict["qkv.weight_scale"].clone()
-                scale_factor = 2 if is_fp8_fnuz() else 1
-                expected_dtype = (
-                    torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-                )
-                expected_weight = (checkpoint_weight.float() / scale_factor).to(
-                    expected_dtype
-                )
-                runtime_scales = checkpoint_scales * scale_factor
-                expected_max_scale = runtime_scales.max()
+                expected_max_scale = checkpoint_scales.max()
 
                 with patch(
                     "sglang.multimodal_gen.runtime.layers.quantization."
@@ -133,21 +124,16 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
 
                 # Both paths rebind the runtime weight transposed. CUTLASS can
                 # consume a channelwise scale, so it preserves the checkpoint's
-                # FP8 shards in the native format. The fallback uses one max scale.
+                # FP8 shards; the fallback requantizes them to one max scale.
                 weight = model.qkv.weight
-                self.assertEqual(weight.dtype, expected_dtype)
+                self.assertEqual(weight.dtype, torch.float8_e4m3fn)
                 self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
                 weight_scale = model.qkv.weight_scale.flatten()
                 if cutlass_supported:
                     expected_scales = torch.repeat_interleave(
-                        runtime_scales, _SHARD_OUT
+                        checkpoint_scales, _SHARD_OUT
                     )
-                    torch.testing.assert_close(
-                        weight.t().view(torch.int8),
-                        expected_weight.view(torch.int8),
-                        rtol=0,
-                        atol=0,
-                    )
+                    self.assertTrue(torch.equal(weight.t(), checkpoint_weight))
                 else:
                     expected_scales = expected_max_scale.expand(weight_scale.numel())
                 torch.testing.assert_close(
@@ -157,7 +143,7 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     model.qkv.input_scale.flatten().max(),
-                    torch.tensor(0.5 * scale_factor),
+                    torch.tensor(0.5),
                     check_device=False,
                 )
 
@@ -171,7 +157,7 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
                     dequant,
                     weight_ref,
                     rtol=0.5,
-                    atol=float(checkpoint_scales.max()) * 8,
+                    atol=float(expected_max_scale) * 8,
                 )
 
                 # Layerwise offload contract: the component lands on CPU

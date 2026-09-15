@@ -40,7 +40,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
-    enable_moe_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -93,23 +92,6 @@ LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-
-_LEGACY_LLADA2_FP8_CONFIG_DEFAULTS = {
-    "embedding_dropout": 0.0,
-    "moe_router_enable_expert_bias": True,
-    "norm_topk_prob": True,
-    "router_dtype": "fp32",
-    "score_function": "sigmoid",
-}
-
-
-def _apply_legacy_llada2_fp8_config_defaults(config: PretrainedConfig) -> None:
-    if not getattr(config, "use_fp8_experts", False):
-        return
-    for name, default in _LEGACY_LLADA2_FP8_CONFIG_DEFAULTS.items():
-        if not hasattr(config, name):
-            setattr(config, name, default)
-
 
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
@@ -214,7 +196,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.tp_size = get_parallel().tp_size
-        self.moe_fully_replicated = enable_moe_fully_dp()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
@@ -316,7 +297,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep() or self.moe_fully_replicated
+                    if get_moe_a2a_backend().is_deepep()
                     else {}
                 ),
             )
@@ -403,12 +384,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if (
-            self.tp_size > 1
-            and not self.moe_fully_replicated
-            and not should_skip_post_experts_all_reduce(
-                is_tp_path=True,
-            )
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -825,7 +802,6 @@ class LLaDA2MoeModelLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        _apply_legacy_llada2_fp8_config_defaults(config)
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
@@ -915,15 +891,8 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        validate_llada_fp8_experts = bool(
-            getattr(self.quant_config, "llada_experts_only", False)
-        )
-        loaded_expert_weight_count = 0
-        loaded_expert_scale_count = 0
         for name, loaded_weight in prepare_llada2_language_weights(
-            weights,
-            num_experts=self.config.num_experts,
-            expand_expert_scales=validate_llada_fp8_experts,
+            weights, num_experts=self.config.num_experts
         ):
             if (
                 ("v_head" in name)
@@ -980,11 +949,6 @@ class LLaDA2MoeModelLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
-                    if validate_llada_fp8_experts:
-                        if name.endswith("weight_scale_inv"):
-                            loaded_expert_scale_count += 1
-                        elif name.endswith("weight"):
-                            loaded_expert_weight_count += 1
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -1010,43 +974,6 @@ class LLaDA2MoeModelLM(nn.Module):
                     and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
                 }
             )
-        if validate_llada_fp8_experts:
-            sparse_layers = [
-                layer
-                for layer in self.model.layers
-                if not isinstance(layer, PPMissingLayer)
-                and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
-            ]
-            expected_tensor_count = len(sparse_layers) * self.config.num_experts * 3
-            if loaded_expert_weight_count != expected_tensor_count:
-                raise ValueError(
-                    "Incomplete LLaDA FP8 expert weights: loaded "
-                    f"{loaded_expert_weight_count}, expected {expected_tensor_count}."
-                )
-            if loaded_expert_scale_count != expected_tensor_count:
-                scale_param_names = [
-                    name
-                    for name in params_dict
-                    if "mlp.experts" in name and "scale" in name
-                ]
-                raise ValueError(
-                    "Incomplete LLaDA FP8 expert scales: loaded "
-                    f"{loaded_expert_scale_count}, expected {expected_tensor_count}; "
-                    f"registered scale parameters sample={scale_param_names[:8]}."
-                )
-
-            if sparse_layers:
-                first_experts = sparse_layers[0].mlp.experts
-                logger.info(
-                    "Loaded LLaDA experts-only FP8: w13=%s/%s, w2=%s/%s, "
-                    "w13_scale=%s, w2_scale=%s",
-                    tuple(first_experts.w13_weight.shape),
-                    first_experts.w13_weight.dtype,
-                    tuple(first_experts.w2_weight.shape),
-                    first_experts.w2_weight.dtype,
-                    tuple(first_experts.w13_weight_scale_inv.shape),
-                    tuple(first_experts.w2_weight_scale_inv.shape),
-                )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

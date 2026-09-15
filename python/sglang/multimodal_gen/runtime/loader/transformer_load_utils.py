@@ -382,7 +382,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
 
 
 class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
-    """Disable whole-DiT CPU offload for FP8 modes that require CUDA setup."""
+    """Adapter for diffusion ModelOpt FP8 checkpoints."""
 
     def __init__(
         self,
@@ -404,11 +404,7 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_config is None:
             return
 
-        quant_name = _get_quant_config_name(quant_config)
-        is_online_fp8 = quant_name == "fp8" and not getattr(
-            quant_config, "is_checkpoint_fp8_serialized", False
-        )
-        if quant_name != "modelopt_fp8" and not is_online_fp8:
+        if _get_quant_config_name(quant_config) != "modelopt_fp8":
             return
 
         component_offload = _uses_component_offload(
@@ -430,9 +426,8 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
                     feature_name="ModelOpt FP8 diffusion checkpoints",
                 )
             logger.warning(
-                "%s diffusion quantization keeps the DiT resident instead "
+                "ModelOpt FP8 diffusion checkpoints keep the DiT resident instead "
                 "of using component offload. Layerwise offload remains supported.",
-                quant_name,
             )
 
     def prepare(self) -> None:

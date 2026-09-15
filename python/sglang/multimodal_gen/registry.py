@@ -1144,7 +1144,6 @@ def _register_configs():
         ],
     )
     # Qwen-Image
-
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,

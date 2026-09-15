@@ -39,7 +39,6 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-SP_STOCHASTIC_NOISE_KEY = "sp_stochastic_noise"
 
 
 @dataclass
@@ -456,68 +455,6 @@ class FlowMatchEulerDiscreteScheduler(
         else:
             self._step_index = self._begin_index
 
-    @staticmethod
-    def _draw_stochastic_noise(
-        sample: torch.Tensor,
-        generator: torch.Generator | list[torch.Generator] | None,
-        batch,
-    ) -> torch.Tensor:
-        batch_extra = getattr(batch, "extra", None)
-        metadata = batch_extra.get(SP_STOCHASTIC_NOISE_KEY) if batch_extra else None
-        if metadata is None:
-            return randn_tensor(
-                sample.shape,
-                generator=generator,
-                device=sample.device,
-                dtype=sample.dtype,
-            )
-
-        required_keys = {"full_shape", "dim", "start", "length"}
-        if not isinstance(metadata, dict) or not required_keys.issubset(metadata):
-            raise ValueError("Invalid SP stochastic noise metadata fields")
-        if not getattr(batch, "did_sp_shard_latents", False):
-            raise ValueError("Invalid SP stochastic noise metadata without sharding")
-
-        full_shape = metadata["full_shape"]
-        dim = metadata["dim"]
-        start = metadata["start"]
-        length = metadata["length"]
-        if (
-            not isinstance(full_shape, tuple)
-            or len(full_shape) != sample.ndim
-            or any(type(value) is not int or value <= 0 for value in full_shape)
-        ):
-            raise ValueError("Invalid SP stochastic noise metadata full shape")
-        if type(dim) is not int or dim < 1 or dim >= sample.ndim:
-            raise ValueError("Invalid SP stochastic noise metadata dimension")
-        if type(start) is not int or type(length) is not int:
-            raise ValueError("Invalid SP stochastic noise metadata slice")
-        if length != sample.shape[dim] or start < 0:
-            raise ValueError("Invalid SP stochastic noise metadata local slice")
-        if start + length > full_shape[dim]:
-            raise ValueError("Invalid SP stochastic noise metadata slice bounds")
-        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
-        if raw_latent_shape is None or tuple(raw_latent_shape) != full_shape:
-            raise ValueError("Invalid SP stochastic noise metadata raw shape")
-
-        expected_local_shape = list(full_shape)
-        expected_local_shape[dim] = length
-        if tuple(expected_local_shape) != tuple(sample.shape):
-            raise ValueError("Invalid SP stochastic noise metadata sample shape")
-        if isinstance(generator, list) and len(generator) != full_shape[0]:
-            raise ValueError("Invalid SP stochastic noise metadata generator count")
-
-        full_noise = randn_tensor(
-            full_shape,
-            generator=generator,
-            device=sample.device,
-            dtype=sample.dtype,
-        )
-        noise = full_noise.narrow(dim, start, length).contiguous()
-        if noise.shape != sample.shape:
-            raise ValueError("Invalid SP stochastic noise metadata result shape")
-        return noise
-
     def step(
         self,
         model_output: torch.FloatTensor,
@@ -608,7 +545,12 @@ class FlowMatchEulerDiscreteScheduler(
         else:
             if self.config.stochastic_sampling:
                 x0 = sample - current_sigma * model_output
-                noise = self._draw_stochastic_noise(sample, generator, batch)
+                noise = randn_tensor(
+                    sample.shape,
+                    generator=generator,
+                    device=sample.device,
+                    dtype=sample.dtype,
+                )
                 prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
             else:
                 prev_sample = sample + dt * model_output

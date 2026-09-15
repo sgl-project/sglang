@@ -31,8 +31,6 @@ from torch.nn.utils.rnn import pad_sequence
 
 from sglang.multimodal_gen.configs.models.dits.llada_image import LLaDAImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_parallel_rank,
-    get_sp_world_size,
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
@@ -167,8 +165,6 @@ class LLaDAImageAttnProcessor:
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         freqs_cis: torch.Tensor | None = None,
-        num_replicated_suffix: int = 0,
-        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         qkv, _ = attn.to_qkv(hidden_states)
         query, key, value = qkv.split(
@@ -224,8 +220,6 @@ class LLaDAImageAttnProcessor:
             key,
             value,
             attn_mask=attention_mask,
-            num_replicated_suffix=num_replicated_suffix,
-            skip_sequence_parallel_override=skip_sequence_parallel_override,
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states, _ = attn.to_out[0](hidden_states)
@@ -297,16 +291,12 @@ class LLaDAImageAttention(nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         freqs_cis: torch.Tensor,
-        num_replicated_suffix: int = 0,
-        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         return self.processor(
             self,
             hidden_states,
             attention_mask,
             freqs_cis,
-            num_replicated_suffix,
-            skip_sequence_parallel_override,
         )
 
 
@@ -401,8 +391,6 @@ class LLaDAImageTransformerBlock(nn.Module):
         noise_mask: torch.Tensor | None = None,
         adaln_noisy: torch.Tensor | None = None,
         adaln_clean: torch.Tensor | None = None,
-        num_replicated_suffix: int = 0,
-        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         if self.modulation:
             sequence_length = hidden_states.shape[1]
@@ -449,8 +437,6 @@ class LLaDAImageTransformerBlock(nn.Module):
                 self.attention_norm1(hidden_states) * scale_msa,
                 attention_mask,
                 freqs_cis,
-                num_replicated_suffix,
-                skip_sequence_parallel_override,
             )
             hidden_states = apply_rmsnorm_tanh_mul_add(
                 attention_output, gate_msa, hidden_states, self.attention_norm2
@@ -466,8 +452,6 @@ class LLaDAImageTransformerBlock(nn.Module):
                 self.attention_norm1(hidden_states),
                 attention_mask,
                 freqs_cis,
-                num_replicated_suffix,
-                skip_sequence_parallel_override,
             )
             hidden_states = hidden_states + self.attention_norm2(attention_output)
             hidden_states = hidden_states + self.ffn_norm2(
@@ -833,7 +817,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         image_offsets: list[tuple[int, int]] | None = None,
     ) -> list[torch.Tensor]:
         outputs = []
-        sequence_multiple = SEQUENCE_MULTIPLE // get_sp_world_size()
+        sequence_multiple = SEQUENCE_MULTIPLE
         for batch_index, batch_hidden_states in enumerate(hidden_states):
             if image_offsets is None:
                 batch_sizes = [sizes[batch_index]]
@@ -926,13 +910,11 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 latent, patch_size, f_patch_size
             )
             image_height_start = 0
-            if get_sp_world_size() > 1:
-                image_height_start = get_sp_parallel_rank() * token_grid_size[1]
             padded_features, position_ids, padding_mask, _, _ = self._pad_with_ids(
                 patches,
                 token_grid_size,
                 (position_cursor, image_height_start, 0),
-                sequence_multiple=SEQUENCE_MULTIPLE // get_sp_world_size(),
+                sequence_multiple=SEQUENCE_MULTIPLE,
             )
             image_sequence.features.append(padded_features)
             image_sequence.position_ids.append(position_ids)
@@ -1000,15 +982,13 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     image, patch_size, f_patch_size
                 )
                 image_height_start = 0
-                if get_sp_world_size() > 1:
-                    image_height_start = get_sp_parallel_rank() * token_grid_size[1]
                 padded_features, position_ids, padding_mask, _, noise_mask = (
                     self._pad_with_ids(
                         patches,
                         token_grid_size,
                         (position_start, image_height_start, 0),
                         noise_value,
-                        sequence_multiple=SEQUENCE_MULTIPLE // get_sp_world_size(),
+                        sequence_multiple=SEQUENCE_MULTIPLE,
                     )
                 )
                 batch_image_features.append(padded_features)
@@ -1040,9 +1020,7 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     glm_cap_feats[batch_index],
                     (len(glm_cap_feats[batch_index]), 1, 1),
                     (
-                        len(batch_cap_features)
-                        + len(batch_image_features) * get_sp_world_size()
-                        + 1,
+                        len(batch_cap_features) + len(batch_image_features) + 1,
                         0,
                         0,
                     ),
@@ -1190,7 +1168,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
         noisy_embedding = None
         clean_embedding = None
         image_offsets = None
-        num_replicated_suffix = 0
 
         if is_editing:
             if t.shape[0] == 1:
@@ -1301,7 +1278,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     cap_features,
                     cap_attention_mask,
                     cap_frequencies,
-                    skip_sequence_parallel_override=True,
                 )
 
             sigvq_lengths = [len(features) for features in sigvq_sequence.features]
@@ -1334,41 +1310,20 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                         sigvq_features,
                         sigvq_attention_mask,
                         sigvq_frequencies,
-                        skip_sequence_parallel_override=True,
                     )
 
-            if get_sp_world_size() > 1:
-                if batch_size != 1:
-                    raise NotImplementedError(
-                        "LLaDA-Image sequence parallelism currently supports batch size 1."
-                    )
-                feature_groups = (image_features, cap_features, sigvq_features)
-                frequency_groups = (
-                    image_frequencies,
-                    cap_frequencies,
-                    sigvq_frequencies,
-                )
-                length_groups = (image_lengths, cap_lengths, sigvq_lengths)
-                noise_mask_groups = (
-                    image_noise_mask,
-                    cap_noise_mask,
-                    sigvq_noise_mask,
-                )
-                num_replicated_suffix = cap_lengths[0] + sigvq_lengths[0]
-                image_offsets = [(0, image_lengths[0])]
-            else:
-                feature_groups = (cap_features, image_features, sigvq_features)
-                frequency_groups = (
-                    cap_frequencies,
-                    image_frequencies,
-                    sigvq_frequencies,
-                )
-                length_groups = (cap_lengths, image_lengths, sigvq_lengths)
-                noise_mask_groups = (
-                    cap_noise_mask,
-                    image_noise_mask,
-                    sigvq_noise_mask,
-                )
+            feature_groups = (cap_features, image_features, sigvq_features)
+            frequency_groups = (
+                cap_frequencies,
+                image_frequencies,
+                sigvq_frequencies,
+            )
+            length_groups = (cap_lengths, image_lengths, sigvq_lengths)
+            noise_mask_groups = (
+                cap_noise_mask,
+                image_noise_mask,
+                sigvq_noise_mask,
+            )
 
             (
                 unified_features,
@@ -1482,7 +1437,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     condition_features,
                     condition_attention_mask,
                     condition_frequencies,
-                    skip_sequence_parallel_override=True,
                 )
 
             (
@@ -1496,12 +1450,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                 (image_frequencies, condition_frequencies),
                 (image_lengths, condition_lengths),
             )
-            if get_sp_world_size() > 1:
-                if batch_size != 1:
-                    raise NotImplementedError(
-                        "LLaDA-Image sequence parallelism currently supports batch size 1."
-                    )
-                num_replicated_suffix = condition_lengths[0]
 
         for layer in self.layers:
             if is_editing:
@@ -1512,7 +1460,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     noise_mask=unified_noise_mask,
                     adaln_noisy=noisy_embedding,
                     adaln_clean=clean_embedding,
-                    num_replicated_suffix=num_replicated_suffix,
                 )
             else:
                 unified_features = layer(
@@ -1520,7 +1467,6 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin, AttentionMixin):
                     unified_attention_mask,
                     unified_frequencies,
                     adaln_input,
-                    num_replicated_suffix=num_replicated_suffix,
                 )
 
         if is_editing:
