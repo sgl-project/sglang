@@ -677,8 +677,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # Registered TreeCore backend serving the unified radix cache.
-    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
+    # Rust is the default where supported. An unset value permits known
+    # compatibility fallbacks; explicitly selecting a backend stays strict.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # ===================================================================

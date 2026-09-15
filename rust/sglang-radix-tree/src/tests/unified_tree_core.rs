@@ -1375,6 +1375,7 @@ fn insert_first_write_creates_the_namespace() {
     let mut tc = core();
     matched_chain(&mut tc);
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
@@ -1876,6 +1877,7 @@ fn swa_host_backed_node_advances_best_match_but_keeps_the_device_anchor() {
 
 fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -1892,6 +1894,7 @@ fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i
 
 fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params(key, value)
     }
@@ -1944,6 +1947,7 @@ fn insert_params_in_namespace<'a>(
     cache_salt: Option<&'a str>,
 ) -> InsertParams<'a, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(extra_key, cache_salt),
         ..insert_params(key, value)
     }
@@ -1988,6 +1992,7 @@ fn insert_prev_prefix_len_narrows_the_dup_window() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 2,
         ..insert_params(&vec![1, 2, 3], &[20, 21, 22])
     });
@@ -2031,6 +2036,7 @@ fn insert_prev_prefix_len_spans_a_multi_node_walk() {
     // The request already matched [1,2,3]: only the second node's overlap
     // is duplicate.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 3,
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
@@ -2052,6 +2058,7 @@ fn insert_prev_prefix_len_narrows_mid_node_on_a_multi_node_walk() {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     // prev_prefix_len 4 lands mid second node: only its last token is duplicate.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         prev_prefix_len: 4,
         ..insert_params(&vec![1, 2, 3, 4, 5], &[30, 31, 32, 33, 34])
     });
@@ -2124,6 +2131,7 @@ fn insert_priority_floor_applies_along_the_path() {
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
     tc.insert(&InsertParams {
+        rotation_base: None,
         priority: 5,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
@@ -2147,6 +2155,7 @@ fn insert_chunked_skips_the_hit_count() {
         .node(tc.arena.resolve(a).expect("live test node"))
         .hit_count;
     tc.insert(&InsertParams {
+        rotation_base: None,
         chunked: true,
         ..insert_params(&vec![1, 2], &[20, 21])
     });
@@ -3100,6 +3109,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     );
     let key: Vec<(i64, i64)> = vec![(1, 2), (2, 3)];
     tc.insert(&InsertParams {
+        rotation_base: None,
         key: &key,
         namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
@@ -3419,6 +3429,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -3448,6 +3459,7 @@ fn prefetch_anchor_info_maps_the_namespace() {
     );
     // A node minted by a split inherits the namespace.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7], &[30])
     });
@@ -4713,6 +4725,7 @@ fn insert_empty_key_is_a_noop_and_mints_no_namespace_root() {
     assert_eq!(tc.arena.len(), 1);
     // A namespaced empty insert never creates the namespace root.
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![], &[])
     });
@@ -4730,6 +4743,7 @@ fn root_node_handle_is_namespace_independent() {
     assert_eq!(tc.root_node_handle(Some("ghost")), root_handle);
     assert!(!tc.arena.namespace_exists(Some("ghost")));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![1], &[10])
     });
@@ -4801,12 +4815,14 @@ fn get_hash_values_reads_the_nodes_own_hashes() {
 fn insert_empty_key_still_touches_the_existing_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         priority: 7,
         ..insert_params(&vec![], &[])
     });
     assert_eq!(tc.arena.node(tc.arena.root()).priority, 7);
     // A namespaced empty insert touches the same single root.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         priority: 9,
         ..insert_params(&vec![], &[])
@@ -4818,6 +4834,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
 fn insert_into_a_named_namespace_is_isolated() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -4849,6 +4866,7 @@ fn insert_sub_page_key_is_a_noop_and_mints_no_namespace_root() {
     assert!(result.mamba_exist);
     assert_eq!(tc.arena.len(), 1);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![1], &[10])
     });
@@ -6623,6 +6641,7 @@ fn reset_restores_a_fresh_tree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -6703,6 +6722,7 @@ fn total_size_spans_namespaces_and_aux_values() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -6750,6 +6770,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7049,6 +7070,7 @@ fn all_values_flatten_spans_namespaces() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7061,6 +7083,7 @@ fn collect_all_nodes_visits_every_root_subtree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
@@ -7076,6 +7099,7 @@ fn pretty_format_renders_every_namespace_and_component() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7], &[30])
     });
@@ -7109,6 +7133,7 @@ fn sane_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&insert_params(&vec![1, 2, 9], &[30, 31, 39]));
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
@@ -7657,11 +7682,13 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
     let recorder = Arc::new(RecordingComponentForTest::default());
     tc.register_component_(recorder.clone());
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The deeper insert walks down through the existing [7,8] node.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8, 9], &[40, 41, 42])
     });
@@ -8475,6 +8502,7 @@ fn sequence_insert_params<'k>(
         Tensor::from_slice(&[*mamba_next])
     });
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(&kv),
@@ -8636,6 +8664,7 @@ fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
 fn an_emptied_namespace_leaves_nothing_behind() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -8653,6 +8682,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     tc.sanity_check(&[], &[]);
     // A later insert respins the namespace from scratch.
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
@@ -8666,6 +8696,7 @@ fn namespaces_do_not_accumulate_across_salts() {
     for salt in 0..64 {
         let salt = format!("session-{salt}");
         tc.insert(&InsertParams {
+            rotation_base: None,
             namespace: KeyNamespaceRef::new(Some(&salt), None),
             ..insert_params(&vec![1, 2], &[10, 11])
         });
@@ -8680,6 +8711,7 @@ fn namespaces_do_not_accumulate_across_salts() {
 fn a_zero_length_match_anchors_at_the_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
+        rotation_base: None,
         namespace: KeyNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });

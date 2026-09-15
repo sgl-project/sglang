@@ -134,6 +134,8 @@ pub struct MatchPrefixParams<'k, K: ChildKeyType> {
 
 /// Params for an insert; the key is borrowed from the caller.
 pub struct InsertParams<'k, K: ChildKeyType> {
+    /// Logical-page owner rotation; None keeps unsharded insert behavior.
+    pub rotation_base: Option<i64>,
     /// The insert key (already page-typed; bigram conversion happens at the boundary).
     pub key: &'k K,
     /// Namespace of the insert; picks the matching subtree root.
@@ -163,6 +165,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
 /// Result of an insert.
 #[derive(Default)]
 pub struct InsertResult {
+    /// The incoming pages use another chain rotation and were not adopted.
+    pub rotation_tail_declined: bool,
     /// Tokens of the insert key that overlapped existing nodes.
     pub prefix_len: usize,
     /// The inserted key's full (page-aligned) length.
@@ -234,6 +238,7 @@ pub struct InsertWalkState<K: ChildKeyType> {
     value: Tensor,
     namespace: KeyNamespace,
     session_id: Option<Arc<str>>,
+    rotation_base: Option<i64>,
     prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
@@ -490,6 +495,8 @@ pub struct ComponentState {
 pub struct CacheInitParams {
     /// Eviction-policy name resolved into the tree's strategy.
     pub eviction_policy: String,
+    /// Hit count at which SLRU promotes a node to the protected segment.
+    pub slru_protected_threshold: i64,
     /// Atoms per radix page; children are keyed by their key's first page.
     pub page_size: usize,
     /// Whether the cache runs the write-back (vs write-through) policy.
@@ -516,6 +523,7 @@ impl Default for CacheInitParams {
     fn default() -> Self {
         CacheInitParams {
             eviction_policy: "lru".to_string(),
+            slru_protected_threshold: 2,
             page_size: 1,
             is_write_back: false,
             enable_hicache: false,
@@ -538,6 +546,8 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
+    /// Full device tokens freed without a host copy during this device step.
+    pub unbacked_tokens: usize,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -558,6 +568,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Full has no device LRU, so track nodes whose device and host values coexist.
     pub(crate) full_coexisting_host_nodes: EvictableNodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
+    /// Present only during a device-eviction step, including its cascades.
+    tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
     pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
     /// Device-eviction candidates; the lowest priority is popped first.
@@ -751,10 +763,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_host_leaves: EvictableNodeSet::new(),
             full_coexisting_host_nodes: EvictableNodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
+            tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
             full_evict_device_heap: BinaryHeap::new(),
-            eviction_strategy: get_eviction_strategy(&params.eviction_policy),
+            eviction_strategy: get_eviction_strategy(
+                &params.eviction_policy,
+                params.slru_protected_threshold,
+            ),
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
@@ -791,6 +807,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_host_leaves = EvictableNodeSet::new();
         self.full_coexisting_host_nodes = EvictableNodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
+        self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
         self.namespaced_event_hashes.clear();
@@ -1492,6 +1509,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     last_device_node_id: Some(self.arena.node(root_id).id),
                     inserted_host_node: None,
                     host_insert_dropped: false,
+                    rotation_tail_declined: false,
                     mamba_exist: true,
                     swa_branch_inserted: false,
                     adopted_ranges: None,
@@ -1505,6 +1523,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node = self.arena.node_mut(root_id);
             node.priority = node.priority.max(params.priority);
         }
+        if let Some(rotation_base) = params.rotation_base {
+            if let Some((prefix_len, node_id)) =
+                self.rotation_conflict_(params, aligned_key_len, rotation_base)
+            {
+                return Ok(InsertStepResult {
+                    actions: Vec::new(),
+                    result: Some(InsertResult {
+                        prefix_len,
+                        last_device_node_id: Some(self.arena.node(node_id).id),
+                        rotation_tail_declined: true,
+                        adopted_ranges: params.track_adopted_ranges.then(HashMap::new),
+                        ..InsertResult::default()
+                    }),
+                });
+            }
+        }
         // The walk reads only [0, aligned_key_len); the ragged tail never enters.
         self.ongoing_insert_walk_state = Some(InsertWalkState {
             phase: InsertPhase::Walk,
@@ -1514,6 +1548,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             value: params.value.narrow(0, 0, aligned_key_len as i64),
             namespace: params.namespace.to_owned(),
             session_id: params.session_id.map(Arc::from),
+            rotation_base: params.rotation_base,
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
@@ -1531,6 +1566,40 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             pending_actions: Vec::new(),
         });
         Ok(self.advance_insert_())
+    }
+
+    /// Check the matched chain before insert can restore, repoint, split, or
+    /// free any incoming pages. A mixed rotation would invalidate the cyclic
+    /// page-owner mapping used by logical-page KV sharding.
+    fn rotation_conflict_(
+        &self,
+        params: &InsertParams<'_, K>,
+        aligned_key_len: usize,
+        rotation_base: i64,
+    ) -> Option<(usize, NodeIdx_)> {
+        let mut node_id = self.arena.root();
+        let mut matched = 0;
+        while matched < aligned_key_len {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id,
+                params.namespace,
+                params.key.page_at(matched, self.page_size),
+            ) else {
+                break;
+            };
+            let child = self.arena.node(child_id);
+            let prefix_len = params
+                .key
+                .match_len(matched, &child.key, self.page_size)
+                .min(aligned_key_len - matched);
+            node_id = child_id;
+            matched += prefix_len;
+            if prefix_len < child.key.atom_len() {
+                break;
+            }
+        }
+        let node = self.arena.node(node_id);
+        (!node.is_root() && node.rotation_base != Some(rotation_base)).then_some((matched, node_id))
     }
 
     /// Continue the suspended insert after its step actions were executed.
@@ -1637,6 +1706,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         let params = InsertParams {
+            rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
             session_id: state.session_id.as_deref(),
@@ -1765,7 +1835,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 state.total_prefix_length as i64,
                 (state.aligned_key_len - state.total_prefix_length) as i64,
             );
-            self.add_new_node_in_namespace_(
+            let new_node_id = self.add_new_node_in_namespace_(
                 state.node_id,
                 K::from(
                     state.key.as_ref()[state.total_prefix_length..state.aligned_key_len].to_vec(),
@@ -1774,7 +1844,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 state.priority,
                 state.namespace.as_ref(),
                 state.session_id.as_deref(),
-            )
+            );
+            self.arena.node_mut(new_node_id).rotation_base = state.rotation_base;
+            new_node_id
         } else {
             state.node_id
         };
@@ -1791,6 +1863,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result.prefix_len = state.total_prefix_length;
         result.last_device_node_id = Some(self.arena.node(target_node_id).id);
         let params = InsertParams {
+            rotation_base: state.rotation_base,
             key: &state.key,
             namespace: state.namespace.as_ref(),
             session_id: state.session_id.as_deref(),
@@ -1888,6 +1961,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let parent_id = child.parent();
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
+        let child_rotation_base = child.rotation_base;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
         let parent_map_key = key_head.child_key(page_size);
@@ -1904,6 +1978,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             child_id,
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
+        self.arena.node_mut(new_node_id).rotation_base = child_rotation_base;
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
@@ -2174,6 +2249,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         // The walk gates on the walked component's entry, so seed it.
         tracker.entry(component_type).or_insert(0);
         let mut result = EvictionStepResult::default();
+        assert!(self.tracked_unbacked_tokens.is_none());
+        self.tracked_unbacked_tokens = Some(0);
         let node_id = self
             .component_by_type_(component_type)
             .evict_device_next_node(
@@ -2182,6 +2259,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
+        result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         for (ct, total) in tracker {
             let delta = total - baseline.get(&ct).copied().unwrap_or(0);
             if delta > 0 {
@@ -2214,6 +2292,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 "node {node_id} is not a D-leaf"
             );
         }
+        assert!(self.tracked_unbacked_tokens.is_none());
+        self.tracked_unbacked_tokens = Some(0);
         if self.arena.node(node_id).backuped() {
             self.demote_(
                 node_id,
@@ -2221,11 +2301,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
+            result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
             return Ok((None, result));
         }
         if is_write_back {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ true);
+            result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
             return Ok((Some(backup), result));
         }
 
@@ -2236,6 +2318,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             &mut result.device_frees,
             &mut result.host_frees,
         );
+        result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
         Ok((None, result))
     }
 
@@ -2360,11 +2443,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         component_type: ComponentType,
         num_tokens: usize,
     ) -> EvictionStepResult {
+        self.drive_host_eviction_with_options(component_type, num_tokens, false)
+    }
+
+    /// Skip Full duplicate reclaim when requested by the controller, while
+    /// retaining auxiliary reclaim and the normal host-leaf eviction walk.
+    pub fn drive_host_eviction_with_options(
+        &mut self,
+        component_type: ComponentType,
+        num_tokens: usize,
+        skip_full_duplicate_reclaim: bool,
+    ) -> EvictionStepResult {
         let mut result = EvictionStepResult::default();
         if let Some(component) = self.try_component_by_type_(component_type) {
             // The drive gates on the driven component's entry, so seed it.
             result.tracker.insert(component_type, 0);
-            if self.is_write_back {
+            if self.is_write_back
+                && !(skip_full_duplicate_reclaim && component_type == BASE_COMPONENT_TYPE)
+            {
                 component.reclaim_coexisting_host_values(
                     self,
                     num_tokens,
@@ -2670,6 +2766,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target: EvictLayer,
         tracker: Option<&mut HashMap<ComponentType, usize>>,
     ) -> (usize, usize) {
+        let had_host_copy = self.arena.has_host_value(node_id, component_type);
         let component = self.component_by_type_(component_type);
         let (device_freed, host_freed) =
             component.evict_component(self, node_id, device_frees, host_frees, target);
@@ -2680,6 +2777,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 host_freed
             };
             *tracker.entry(component_type).or_insert(0) += freed;
+        }
+        if component_type == BASE_COMPONENT_TYPE && !had_host_copy {
+            if let Some(unbacked_tokens) = self.tracked_unbacked_tokens.as_mut() {
+                *unbacked_tokens += device_freed;
+            }
         }
 
         // Detach from the targeted LRU list(s).
@@ -3120,6 +3222,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 last_device_node_id: None,
                 inserted_host_node: None,
                 host_insert_dropped: false,
+                rotation_tail_declined: false,
                 mamba_exist: true,
                 swa_branch_inserted: false,
                 adopted_ranges: None,
@@ -3160,6 +3263,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             last_device_node_id: None,
             inserted_host_node: None,
             host_insert_dropped: false,
+            rotation_tail_declined: false,
             mamba_exist: false,
             swa_branch_inserted: false,
             adopted_ranges: None,
@@ -3568,6 +3672,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// The NodeId anchoring matches; the single root serves every namespace.
     pub fn root_node_handle(&self, _extra_key: Option<&str>) -> NodeId {
         self.arena.node(self.arena.root()).id
+    }
+
+    /// The chain's logical-page rotation, or None on the root/unsharded nodes.
+    pub fn rotation_base_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.arena.node(node_id).rotation_base)
     }
 
     /// Return input indices in depth-first, subtree-weight order.

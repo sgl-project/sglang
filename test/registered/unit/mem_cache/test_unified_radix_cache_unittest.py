@@ -115,7 +115,7 @@ register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
 # A dedicated test entry point overrides this without changing the process-wide
 # production backend selection. Direct Python-core tests in this module remain
 # Python-only; every fixture-backed cache test is shared by both inspectors.
-_TREE_CORE_TEST_BACKEND: Optional[str] = None
+_TREE_CORE_TEST_BACKEND: Optional[str] = "python"
 
 
 def _selected_tree_core_test_backend() -> str:
@@ -10193,12 +10193,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
     def test_write_through_eviction_counts_unbacked_tokens(self):
-        if _selected_tree_core_test_backend() == "rust":
-            # The unbacked-eviction tracker is a Python tree-core feature;
-            # UnifiedRadixCache only enables it for that backend.
-            self.skipTest(
-                "write-through unbacked-eviction tracking is Python-core only"
-            )
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
         cache.metrics_collector = mock.Mock()
