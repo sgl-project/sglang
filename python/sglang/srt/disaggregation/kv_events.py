@@ -266,6 +266,26 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
+class RemovalReason(str, enum.Enum):
+    """Why blocks left a storage tier in a ``BlockRemoved`` event.
+
+    These are the causes the cache implementations actually distinguish at the
+    point of removal. The difference that matters to a consumer is whether the
+    content is gone or merely somewhere else: a miss after ``EVICTED`` means
+    capacity pressure, a miss after ``DEMOTED`` is still servable from a lower
+    tier. Request completion and abort are deliberately absent -- finishing a
+    request only drops a lock reference, and the blocks stay cached until one
+    of the causes below removes them.
+    """
+
+    # Capacity pressure. This action kept no copy anywhere else.
+    EVICTED = "evicted"
+    # Freed here because a copy exists in a lower tier (e.g. GPU -> host).
+    DEMOTED = "demoted"
+    # A redundant copy was reclaimed; the block stays cached in a higher tier.
+    DUPLICATE_RECLAIMED = "duplicate_reclaimed"
+
+
 class OffloadedState(msgspec.Struct):
     """Decode-side offload progress for one request, keyed by Req in the manager."""
 
@@ -294,6 +314,10 @@ class BlockStored(KVCacheEvent):
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    # Why the blocks left ``medium``, one of ``RemovalReason``. Optional, so an
+    # emitter that does not state one produces exactly the map an older
+    # consumer sees today. "Not stated" is not the same as "evicted".
+    reason: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):

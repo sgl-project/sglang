@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    RemovalReason,
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
@@ -56,7 +57,7 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and tail.reason == event.reason:
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
@@ -149,10 +150,15 @@ class KVCacheEventRecorder:
             parent_block_hash = block_hash
             page_index += 1
 
-    def record_remove(self, node: Any, medium=None) -> None:
+    def record_remove(
+        self, node: Any, medium=None, *, reason: str = RemovalReason.EVICTED
+    ) -> None:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
+        # ``reason`` defaults to EVICTED because every call site that does not
+        # pass one is a capacity eviction; the paths that keep a copy elsewhere
+        # (demotion, duplicate reclaim) name themselves.
         if not self.enabled:
             return
         if medium is None:
@@ -173,7 +179,9 @@ class KVCacheEventRecorder:
             page_index += 1
 
         if block_hashes:
-            self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+            self.enqueue(
+                BlockRemoved(block_hashes=block_hashes, medium=medium, reason=reason)
+            )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:
