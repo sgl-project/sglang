@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -26,16 +27,22 @@ from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
     device_context,
-    is_cpu,
     is_npu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
-_use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+
+
+def _apply_gate(x, z, activation):
+    if activation in ("swish", "silu"):
+        return x * F.silu(z)
+    if activation == "sigmoid":
+        return x * torch.sigmoid(z)
+    return x
 
 
 def rms_norm_ref(
@@ -47,6 +54,7 @@ def rms_norm_ref(
     group_size=None,
     norm_before_gate=True,
     upcast=True,
+    activation="swish",
 ):
     dtype = x.dtype
     N = x.shape[-1]
@@ -56,7 +64,7 @@ def rms_norm_ref(
         x = x.float()
         z = z.float() if z is not None else z
     if z is not None and not norm_before_gate:
-        x = x * F.silu(z)
+        x = _apply_gate(x, z, activation)
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
         out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
@@ -67,7 +75,7 @@ def rms_norm_ref(
         if bias is not None:
             out = out + bias
     if z is not None and norm_before_gate:
-        out *= F.silu(z)
+        out = _apply_gate(out, z, activation)
     return out.to(dtype)
 
 
@@ -459,7 +467,7 @@ class LayerNorm(torch.nn.Module):
         )
 
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size,
@@ -486,28 +494,72 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        if _use_cpu:
-            assert (
-                self.norm_before_gate
-                and self.group_size is None
-                and self.activation == "swish"
-            ), (
-                "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
-            )
-            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
-                x, self.weight, z, self.eps
-            )
-        else:
-            return layernorm_fn(
-                x,
-                self.weight,
-                self.bias,
-                z=z,
-                eps=self.eps,
-                group_size=self.group_size,
-                norm_before_gate=self.norm_before_gate,
-                is_rms_norm=True,
-                activation=self.activation,
-            )
+    def forward_native(self, x, z=None):
+        output_shape = None
+        if z is not None and z.shape != x.shape:
+            if not (
+                x.ndim == 2
+                and z.ndim == 3
+                and z.shape[0] * z.shape[1] == x.shape[0]
+                and z.shape[2] == x.shape[1]
+            ):
+                raise ValueError(
+                    f"Unsupported gated RMSNorm shapes: x={x.shape}, z={z.shape}"
+                )
+            output_shape = x.shape
+            x = x.reshape(z.shape)
+
+        out = rms_norm_ref(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+        )
+        return out.reshape(output_shape) if output_shape is not None else out
+
+    def _torch_compile_forward(self, num_tokens: int) -> None:
+        return None
+
+    def forward_cpu(self, x, z=None):
+        if not cpu_has_amx_support():
+            return self.forward_native(x, z)
+        assert (
+            self.norm_before_gate
+            and self.group_size is None
+            and self.activation == "swish"
+        ), (
+            "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+        )
+        return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, self.weight, z, self.eps)
+
+    def forward_triton(self, x, z=None):
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )
+
+    def forward_cuda(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_hip(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_npu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_xpu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_musa(self, x, z=None):
+        return self.forward_triton(x, z)
