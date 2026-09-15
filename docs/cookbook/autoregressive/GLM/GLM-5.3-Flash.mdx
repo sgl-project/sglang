@@ -29,7 +29,7 @@ Every listed hardware platform exposes both strategies. A **Verified** badge mea
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
-**Breakable Cuda Graph** defaults to **Off**. Select **On** to add `--cuda-graph-backend-prefill breakable` to the generated command. This requires a build that includes [PR #38522](https://github.com/sgl-project/sglang/pull/38522).
+**Breakable Cuda Graph** defaults to **On** for CUDA serving. The generated command explicitly includes `--cuda-graph-backend-prefill breakable`, which also enables BCG on older builds that include [PR #38522](https://github.com/sgl-project/sglang/pull/38522). Select **Off** to pass `--cuda-graph-backend-prefill disabled`. Existing benchmark badges remain tied to their measured BCG-off configurations.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
