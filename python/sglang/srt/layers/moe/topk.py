@@ -616,6 +616,7 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
         topk_output = select_experts(
@@ -625,6 +626,7 @@ class TopK(BaseFusedOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            dynamic_expert_bias=dynamic_expert_bias,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -635,8 +637,11 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
-        if self.topk_config.output_format is not None:
+        if dynamic_expert_bias is not None:
+            output_format = TopKOutputFormat.STANDARD
+        elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
@@ -699,6 +704,7 @@ class TopK(BaseFusedOp):
                     topk_config=self.topk_config,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
+                    dynamic_expert_bias=dynamic_expert_bias,
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -709,6 +715,7 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         topk_output = select_experts(
             hidden_states=hidden_states,
@@ -717,6 +724,7 @@ class TopK(BaseFusedOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            dynamic_expert_bias=dynamic_expert_bias,
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -727,7 +735,20 @@ class TopK(BaseFusedOp):
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
+        if dynamic_expert_bias is not None:
+            self.topk_config.torch_native = False
+            return select_experts(
+                hidden_states=hidden_states,
+                layer_id=self.layer_id,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                dynamic_expert_bias=dynamic_expert_bias,
+            )
+
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
         return fused_topk_npu(
@@ -1313,7 +1334,9 @@ def biased_topk_impl(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
 
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
+        -1, num_experts
+    )
     _, topk_ids = torch.topk(
         scores_for_choice,
         k=topk,
@@ -1473,7 +1496,9 @@ def biased_grouped_topk_impl(
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
+        -1, num_experts
+    )
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
         .topk(2, dim=-1)[0]
@@ -1619,13 +1644,18 @@ def biased_grouped_topk_gpu(
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
+    dynamic_bias = correction_bias.ndim == 2
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
+    # The JIT router accepts one shared bias vector, not per-token bias rows.
     if (
-        (_is_cuda and num_expert_group and num_expert_group > 1)
-        # ROCm also admits single-group routing; CUDA's condition is unchanged.
-        or (_is_hip and num_expert_group)
+        not dynamic_bias
+        and (
+            (_is_cuda and num_expert_group and num_expert_group > 1)
+            # ROCm also admits single-group routing; CUDA's condition is unchanged.
+            or (_is_hip and num_expert_group)
+        )
     ) and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
@@ -1671,6 +1701,7 @@ def biased_grouped_topk_gpu(
             if num_expert_group > 1
             else num_experts <= 384
         )
+        and not dynamic_bias
     ):
         # Pre-allocate output tensors (flashinfer mutates them in-place)
         topk_weights = torch.empty(
@@ -1713,7 +1744,7 @@ def biased_grouped_topk_gpu(
 
         return topk_weights, topk_ids
 
-    elif _is_cuda and num_expert_group > 1:
+    elif _is_cuda and num_expert_group > 1 and not dynamic_bias:
         # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
         # unified Triton router replaces the retired AOT moe_fused_gate kernel. It
         # handles any experts-per-group (no MAX_VPT=32 cap) and any num_experts.
@@ -1811,6 +1842,7 @@ def biased_grouped_topk_gpu(
         # needs experts<=512 + topk<=8.
         _jit_gate_ok = (
             _is_cuda
+            and not dynamic_bias
             and num_expert_group == 1
             and (topk_group is None or topk_group == 1)
             and (
@@ -2161,19 +2193,16 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif use_per_rank_shared_slots:
-            # Shared experts appended as extra columns in topk_ids: their value
-            # would be out-of-bounds for the logical-to-physical dispatch table,
-            # so split, dispatch the routed cols, recombine.
+        elif num_fused_shared_experts > 0:
+            # Shared IDs are outside EPLB's routed-expert table for both global
+            # and per-rank layouts, so remap only routed columns.
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-            # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # Per-rank shared-slot remap later adds shared slots to the topk ID
-            # space, so keep the routed physical ids separately for statistics.
+            # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
@@ -2324,6 +2353,7 @@ def select_experts(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    dynamic_expert_bias: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2332,7 +2362,11 @@ def select_experts(
     renormalize = topk_config.renormalize
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     custom_routing_function = topk_config.custom_routing_function
-    correction_bias = topk_config.correction_bias
+    correction_bias = (
+        topk_config.correction_bias
+        if dynamic_expert_bias is None
+        else dynamic_expert_bias
+    )
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
     apply_routed_scaling_factor_on_output = (
@@ -2353,7 +2387,12 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
-    if _use_aiter and use_grouped_topk and correction_bias is not None:
+    if (
+        _use_aiter
+        and use_grouped_topk
+        and correction_bias is not None
+        and dynamic_expert_bias is None
+    ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k
@@ -2371,7 +2410,24 @@ def select_experts(
         if has_per_rank_fused_shared_slots(num_fused_shared_experts)
         else num_fused_shared_experts
     )
-    if use_grouped_topk:
+    if dynamic_expert_bias is not None:
+        if scoring_func != "sigmoid":
+            raise ValueError(
+                "Per-token expert bias is only supported with sigmoid routing"
+            )
+        topk_weights, topk_ids = biased_grouped_topk_impl(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            correction_bias=correction_bias,
+            topk=top_k,
+            renormalize=renormalize,
+            num_expert_group=num_expert_group or 1,
+            topk_group=topk_group or 1,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
