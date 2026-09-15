@@ -379,8 +379,8 @@ class SiglipEncoderLayer(nn.Module):
         )
 
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = SiglipMLP(
-            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = SiglipMLP(
+            config, quant_config=quant_config, prefix=add_prefix("ffn", prefix)
         )
 
     def forward(
@@ -390,7 +390,6 @@ class SiglipEncoderLayer(nn.Module):
         rope_emb: Tuple[torch.Tensor, torch.Tensor],
         forward_metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
-
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
@@ -406,7 +405,7 @@ class SiglipEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -655,6 +654,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -669,13 +669,14 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
                 continue
             if "head.attention" in name or "head.layernorm" in name:
                 continue
-            if "head.mlp" in name or "head.probe" in name:
+            if "head.ffn" in name or "head.probe" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -684,6 +685,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
                 if "vision_model" in name and "out_proj" in name:
                     # adapt to VisionAttention
                     name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(

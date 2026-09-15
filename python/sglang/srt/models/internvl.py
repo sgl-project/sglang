@@ -252,7 +252,7 @@ class InternVisionEncoderLayer(nn.Module):
             use_data_parallel=use_data_parallel,
             aux_stream=aux_stream,
         )
-        self.mlp = InternMLP(config, use_data_parallel)
+        self.ffn = InternMLP(config, use_data_parallel)
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
 
@@ -288,7 +288,7 @@ class InternVisionEncoderLayer(nn.Module):
         )
 
         hidden_states = hidden_states + self.drop_path2(
-            self.mlp(self.norm2(hidden_states).to(hidden_states.dtype)) * self.ls2
+            self.ffn(self.norm2(hidden_states).to(hidden_states.dtype)) * self.ls2
         )
 
         return hidden_states
@@ -685,6 +685,11 @@ class InternVLChatModel(nn.Module):
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         expert_params_mapping = []
         if "InternLM2ForCausalLM" in self.config.llm_config.architectures:
             stacked_params_mapping = [
@@ -748,9 +753,10 @@ class InternVLChatModel(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -765,7 +771,8 @@ class InternVLChatModel(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -777,9 +784,13 @@ class InternVLChatModel(nn.Module):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     if "wqkv" in name:
                         config = self.config
                         kv_groups = (

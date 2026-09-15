@@ -190,6 +190,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -212,7 +216,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                     loaded_params.add("lm_head.weight")
 
         body_loaded = self.model.load_weights(body_weights())
-        loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
+        loaded_params.update(
+            {
+                map_weight_name(name)
+                for name in ((f"{_MODEL_PREFIX}{n}" for n in body_loaded))
+            }
+        )
 
         if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
             loaded_params.add("lm_head.weight")
@@ -236,9 +245,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
+                layer_id: layer.ffn.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if isinstance(layer.ffn, Qwen2MoeSparseMoeBlock)
             }
         )
 

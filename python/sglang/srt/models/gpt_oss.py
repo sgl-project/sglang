@@ -583,11 +583,11 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = GptOssSparseMoeBlock(
+            self.ffn = GptOssSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             raise NotImplementedError(
@@ -656,7 +656,7 @@ class GptOssDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -808,9 +808,9 @@ class GptOssForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, GptOssSparseMoeBlock)
+                if isinstance(self.model.layers[layer_id].ffn, GptOssSparseMoeBlock)
             }
         )
 
@@ -983,6 +983,9 @@ class GptOssForCausalLM(nn.Module):
         )
 
     def _load_mxfp4_experts_weights(self, weights):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -1042,7 +1045,8 @@ class GptOssForCausalLM(nn.Module):
                     ...,
                 ]
 
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1051,7 +1055,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
 
             elif "down_proj_blocks" in name:
                 # Handle MLP down projection weights
@@ -1067,7 +1071,8 @@ class GptOssForCausalLM(nn.Module):
                     moe_tp_rank_start // 2 : moe_tp_rank_end // 2,
                 ]
 
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1076,7 +1081,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
 
             elif "gate_up_proj_scales" in name:
                 # Handle MLP gate and up projection weights scale
@@ -1087,7 +1092,8 @@ class GptOssForCausalLM(nn.Module):
                     ...,
                 ]
 
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1096,7 +1102,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
 
             elif "down_proj_scales" in name:
                 # Handle MLP down projection weights
@@ -1107,7 +1113,8 @@ class GptOssForCausalLM(nn.Module):
                     moe_tp_rank_start // mxfp4_block : moe_tp_rank_end // mxfp4_block,
                 ]
 
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1116,7 +1123,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
             elif "gate_up_proj_bias" in name:
                 # Handle MLP gate and up projection biases
                 new_name = name.replace("gate_up_proj_bias", "w13_weight_bias")
@@ -1126,7 +1133,8 @@ class GptOssForCausalLM(nn.Module):
                     2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
                 ]
 
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1135,7 +1143,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
 
             elif "down_proj_bias" in name:
                 narrow_weight = weight[moe_ep_rank_start:moe_ep_rank_end, ...]
@@ -1144,7 +1152,8 @@ class GptOssForCausalLM(nn.Module):
 
                 # Handle MLP down projection bias
                 new_name = name.replace("down_proj_bias", "w2_weight_bias")
-                param = params_dict[new_name]
+                registered_new_name = map_weight_name(new_name)
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(
                     param,
@@ -1153,7 +1162,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                loaded_params.add(new_name)
+                loaded_params.add(registered_new_name)
 
         return loaded_params
 
@@ -1164,6 +1173,10 @@ class GptOssForCausalLM(nn.Module):
         weight_name_mapping: dict,
         other_loaded_param_names=[],
     ):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         if is_nextn:
             logging.warning(
                 "Loading weights for nextn is currently not supported in GptOssForCausalLM. "
@@ -1265,12 +1278,13 @@ class GptOssForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1280,9 +1294,10 @@ class GptOssForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
@@ -1297,12 +1312,16 @@ class GptOssForCausalLM(nn.Module):
                     )
                     break
                 else:
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         if "sinks" in name:
                             start = get_parallel().attn_tp_rank * param.numel()
                             tp_size = get_parallel().tp_size

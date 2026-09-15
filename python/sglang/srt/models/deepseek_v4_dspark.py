@@ -922,10 +922,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
             if mapped is None:
                 continue
-            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+            if self.num_fused_shared_experts > 0 and ".ffn.shared_experts." in mapped:
                 mapped = mapped.replace(
-                    ".mlp.shared_experts.",
-                    f".mlp.experts.{self.config.n_routed_experts}.",
+                    ".ffn.shared_experts.",
+                    f".ffn.experts.{self.config.n_routed_experts}.",
                 )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
@@ -1017,7 +1017,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         mapped_rest = rest
         mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
-        mapped_rest = mapped_rest.replace("ffn.", "mlp.", 1)
         mapped_rest = mapped_rest.replace("attn_norm.", "input_layernorm.", 1)
         mapped_rest = mapped_rest.replace("ffn_norm.", "post_attention_layernorm.", 1)
         mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
@@ -1069,8 +1068,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = rest
         if mapped_rest.startswith("attn."):
             mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-        elif mapped_rest.startswith("ffn."):
-            mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
         elif mapped_rest.startswith("attn_norm."):
             mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
         elif mapped_rest.startswith("ffn_norm."):

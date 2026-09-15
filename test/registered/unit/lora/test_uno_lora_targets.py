@@ -1,4 +1,4 @@
-"""Target-layer validation for UNO's specialized LoRA backend."""
+"""LoRA target resolution and UNO backend target validation."""
 
 import unittest
 from types import SimpleNamespace
@@ -14,7 +14,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
+from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.utils import get_normalized_target_modules, get_target_module_name
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -230,6 +233,29 @@ class TestUnoLoRATargets(CustomTestCase):
             target_modules={"qkv_proj"},
         )
         manager.init_lora_modules.assert_not_called()
+
+
+class TestCheckpointLoRATargets(CustomTestCase):
+    def test_legacy_lora_keys_resolve_to_registered_ffn(self):
+        targets = get_normalized_target_modules(
+            ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+        )
+        gate, up = torch.ones(2, 4), torch.full((2, 4), 3.0)
+        prefix = "base_model.model.model.layers.0.mlp"
+        weights = {
+            f"{prefix}.gate_proj.lora_A.weight": gate,
+            f"{prefix}.up_proj.lora_A.weight": up,
+        }
+        LoRAAdapter.normalize_gate_up_proj(None, list(weights), weights)
+        key, value = next(iter(weights.items()))
+        torch.testing.assert_close(value, torch.cat((gate, up)))
+        target = get_target_module_name(key, targets)
+        model = Qwen3VLForConditionalGeneration.__new__(Qwen3VLForConditionalGeneration)
+        registered = f"model.layers.0.ffn.{target}"
+        self.assertEqual(get_target_module_name(registered, targets), target)
+        self.assertTrue(model.should_apply_lora(registered))
+        self.assertTrue(model.should_apply_lora("model.layers.0.mlp.down_proj"))
+        self.assertFalse(model.should_apply_lora("visual.layers.0.mlp.down_proj"))
 
 
 if __name__ == "__main__":

@@ -115,10 +115,10 @@ def _build_qwen3_mock():
     attn.o_proj = _MockLinearBase()
     layer.self_attn = attn
 
-    mlp = nn.Module()
-    mlp.gate_up_proj = _MockLinearBase()
-    mlp.down_proj = _MockLinearBase()
-    layer.mlp = mlp
+    ffn = nn.Module()
+    ffn.gate_up_proj = _MockLinearBase()
+    ffn.down_proj = _MockLinearBase()
+    layer.ffn = ffn
 
     inner.layers = nn.ModuleList([layer])
     inner.embed_tokens = nn.Embedding(10, 8)  # not a LinearBase — should be excluded

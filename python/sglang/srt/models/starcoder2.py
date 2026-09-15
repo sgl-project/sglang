@@ -182,8 +182,8 @@ class Starcoder2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = Starcoder2MLP(
-            config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+        self.ffn = Starcoder2MLP(
+            config, quant_config=quant_config, prefix=f"{prefix}.ffn"
         )
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.norm_epsilon)
         self.post_attention_layernorm = nn.LayerNorm(
@@ -209,7 +209,7 @@ class Starcoder2DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -317,6 +317,7 @@ class Starcoder2ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -333,6 +334,7 @@ class Starcoder2ForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

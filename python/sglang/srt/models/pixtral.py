@@ -142,6 +142,10 @@ class PixtralForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            return name
+
         def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
             return weight[0].startswith("vision_encoder")
 
@@ -179,25 +183,29 @@ class PixtralForConditionalGeneration(nn.Module):
                     # TODO: Remove this if condition once the model is fixed
                     if "fake_quantizer.qscale_act" in trimmed_name:
                         continue
-                    param = vision_encoder_dict[trimmed_name]
+                    registered_trimmed_name = map_weight_name(trimmed_name)
+                    param = vision_encoder_dict[registered_trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_patch_merger((name, w)):
                     # Load vision patch merger weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    param = patch_merger_dict[trimmed_name]
+                    registered_trimmed_name = map_weight_name(trimmed_name)
+                    param = patch_merger_dict[registered_trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_pre_mm_projector_norm((name, w)):
                     # Load vision pre_mm_projector_norm weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    param = pre_mm_projector_norm_dict[trimmed_name]
+                    registered_trimmed_name = map_weight_name(trimmed_name)
+                    param = pre_mm_projector_norm_dict[registered_trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 elif is_vision_lang_adapter_weights((name, w)):
                     # Load vision-language adapter weights directly
                     trimmed_name = ".".join(name.split(".")[1:])
-                    param = vision_lang_adapter_dict[trimmed_name]
+                    registered_trimmed_name = map_weight_name(trimmed_name)
+                    param = vision_lang_adapter_dict[registered_trimmed_name]
                     with torch.no_grad():
                         default_weight_loader(param, w)
                 else:
@@ -549,8 +557,8 @@ class PixtralHFTransformerBlock(nn.Module):
             prefix=f"{prefix}.attention",
         )
 
-        self.feed_forward = PixtralHFMLP(
-            config, quant_config=quant_config, prefix=f"{prefix}.feed_forward"
+        self.ffn = PixtralHFMLP(
+            config, quant_config=quant_config, prefix=f"{prefix}.ffn"
         )
 
         self.ffn_norm = RMSNorm(config.hidden_size, eps=1e-5)
@@ -587,7 +595,7 @@ class PixtralHFTransformerBlock(nn.Module):
 
         # Pass through feed-forward layer
         # First reshape to 2D for the feed-forward network, then reshape back
-        ffn_output = self.feed_forward(ffn_normalized)
+        ffn_output = self.ffn(ffn_normalized)
 
         # Apply second residual connection
         output = hidden_states + ffn_output
@@ -711,7 +719,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, args: VisionEncoderArgs):
         super().__init__()
         self.attention = Attention(args)
-        self.feed_forward = FeedForward(args)
+        self.ffn = FeedForward(args)
         self.attention_norm = RMSNorm(args.hidden_size, eps=1e-5)
         self.ffn_norm = RMSNorm(args.hidden_size, eps=1e-5)
 
@@ -727,7 +735,7 @@ class TransformerBlock(nn.Module):
         h = x + r
         ffn_norm_h = self.ffn_norm(h.view(-1, h.shape[-1]))
         ffn_norm_h = ffn_norm_h.view(h.shape)
-        r = self.feed_forward.forward(ffn_norm_h)
+        r = self.ffn.forward(ffn_norm_h)
         out = h + r
         return out
 
@@ -1008,6 +1016,11 @@ class PixtralHFVisionModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         """Load weights from a HuggingFace checkpoint with proper parameter mapping."""
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
 
         # for (param, weight, shard_id): load weight into param as param's shard_id part
@@ -1025,8 +1038,9 @@ class PixtralHFVisionModel(nn.Module):
                 if weight_name in name:
                     # Replace the weight name part with the combined parameter name
                     transformed_name = name.replace(weight_name, param_name)
-                    if transformed_name in params_dict:
-                        param = params_dict[transformed_name]
+                    registered_transformed_name = map_weight_name(transformed_name)
+                    if registered_transformed_name in params_dict:
+                        param = params_dict[registered_transformed_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -1035,10 +1049,12 @@ class PixtralHFVisionModel(nn.Module):
             else:
                 if ".attention.o_proj" in name:
                     alt_name = name.replace(".attention.o_proj", ".attention.proj")
-                    if alt_name in params_dict:
+                    registered_alt_name = map_weight_name(alt_name)
+                    if registered_alt_name in params_dict:
                         name = alt_name
-                if name in params_dict:
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict:
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

@@ -19,7 +19,7 @@ def _empty(cls):
 
 
 class TestLongcatNextNRequantization(unittest.TestCase):
-    def test_longcat_nextn_requantizes_both_dense_projections(self):
+    def test_longcat_nextn_requantizes_both_ffn_projections(self):
         from sglang.srt.models import longcat_flash_nextn as longcat
 
         model = _empty(longcat.LongcatFlashForCausalLMNextN)
@@ -33,17 +33,17 @@ class TestLongcatNextNRequantization(unittest.TestCase):
             kv_a_proj_with_mqa=object(),
             q_proj=object(),
         )
-        layer.mlp = _empty(longcat.LongcatFlashMLP)
-        layer.mlp.gate_up_proj = nn.Linear(4, 12, bias=False)
-        layer.mlp.down_proj = nn.Linear(6, 4, bias=False)
-        for proj in (layer.mlp.gate_up_proj, layer.mlp.down_proj):
+        layer.ffn = _empty(longcat.LongcatFlashMLP)
+        layer.ffn.gate_up_proj = nn.Linear(4, 12, bias=False)
+        layer.ffn.down_proj = nn.Linear(6, 4, bias=False)
+        for proj in (layer.ffn.gate_up_proj, layer.ffn.down_proj):
             proj.weight_scale_inv = torch.ones(1)
         model.model.decoder = layer
         with patch.object(longcat, "requant_weight_ue8m0_inplace") as requant:
             model._weight_requant_ue8m0()
         self.assertEqual(requant.call_count, 2)
         for call, proj in zip(
-            requant.call_args_list, (layer.mlp.gate_up_proj, layer.mlp.down_proj)
+            requant.call_args_list, (layer.ffn.gate_up_proj, layer.ffn.down_proj)
         ):
             self.assertIs(call.args[0], proj.weight)
             self.assertIs(call.args[1], proj.weight_scale_inv)

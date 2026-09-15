@@ -133,12 +133,12 @@ class Eagle3MLADecoderLayer(nn.Module):
             in {"awq", "awq_marlin", "moe_wna16"}
         )
 
-        self.mlp = DeepseekV2MLP(
+        self.ffn = DeepseekV2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -182,7 +182,7 @@ class Eagle3MLADecoderLayer(nn.Module):
             attn_out = attn_out[0]
 
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -423,6 +423,10 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         return self.hot_token_id
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
@@ -451,9 +455,10 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                 if weight_name not in mapped_name:
                     continue
                 target_name = mapped_name.replace(weight_name, param_name)
-                if target_name not in params_dict:
+                registered_target_name = map_weight_name(target_name)
+                if registered_target_name not in params_dict:
                     continue
-                param = params_dict[target_name]
+                param = params_dict[registered_target_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 handled = True
@@ -478,8 +483,9 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                         [cached_a_proj[q_name], cached_a_proj[kv_name]], dim=0
                     )
                     fused_name = q_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                    if fused_name in params_dict:
-                        param = params_dict[fused_name]
+                    registered_fused_name = map_weight_name(fused_name)
+                    if registered_fused_name in params_dict:
+                        param = params_dict[registered_fused_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -488,10 +494,11 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                     cached_a_proj.pop(kv_name)
                 continue
 
-            if mapped_name not in params_dict:
+            registered_mapped_name = map_weight_name(mapped_name)
+            if registered_mapped_name not in params_dict:
                 logger.warning("Eagle3 MLA: skipping unexpected weight %s", name)
                 continue
-            param = params_dict[mapped_name]
+            param = params_dict[registered_mapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

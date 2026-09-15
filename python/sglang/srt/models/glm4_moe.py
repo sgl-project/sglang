@@ -815,10 +815,10 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Glm4MoeSparseMoeBlock(
+            self.ffn = Glm4MoeSparseMoeBlock(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
             )
@@ -827,12 +827,12 @@ class Glm4MoeDecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = Glm4MoeMLP(
+            self.ffn = Glm4MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -910,7 +910,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -943,7 +942,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1235,6 +1234,7 @@ class Glm4MoeForCausalLM(nn.Module):
         is_nextn=False,
         params_dict=None,
     ):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1263,16 +1263,15 @@ class Glm4MoeForCausalLM(nn.Module):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-
                 pattern = re.compile(
-                    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
+                    "^model\\.layers\\.(\\d+)\\.ffn\\.shared_experts\\.(.+)$"
                 )
                 for name, weight in weights:
                     match = pattern.match(name)
                     if match:
                         layer_id = int(match.group(1))
                         suffix = match.group(2)
-                        name = f"model.layers.{layer_id}.mlp.experts.{self.config.n_routed_experts}.{suffix}"
+                        name = f"model.layers.{layer_id}.ffn.experts.{self.config.n_routed_experts}.{suffix}"
                     yield name, weight
 
             weights = iter_weights_with_fused_shared_experts(weights)
@@ -1347,12 +1346,13 @@ class Glm4MoeForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -1373,6 +1373,7 @@ class Glm4MoeForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         # Expert weight not on this rank, will be skipped below
                         continue
@@ -1500,12 +1501,12 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
             names.add(self._map_mtp_ckpt_name(name, layer_prefix))
 
         # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts". Expanded per-expert leaf excludes do not
+        # "model.decoder.ffn.experts". Expanded per-expert leaf excludes do not
         # match that prefix, so add the coarse prefix when any routed expert in
         # the MTP layer is excluded. This keeps only that fused MoE module bf16
         # while allowing the remaining draft modules to use their quant config.
-        if any(".mlp.experts." in name for name in mtp_excluded):
-            names.add("model.decoder.mlp.experts")
+        if any(".ffn.experts." in name for name in mtp_excluded):
+            names.add("model.decoder.ffn.experts")
 
         import copy
 

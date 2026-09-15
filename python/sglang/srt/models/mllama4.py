@@ -4,7 +4,7 @@ import math
 import os
 import re
 from collections.abc import Iterable
-from typing import List, Optional, Set, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -187,14 +187,14 @@ class Llama4VisionEncoderLayer(nn.Module):
             qkv_bias=True,
             customized_position_embedding_applier=apply_position_embedding,
         )
-        self.mlp = Llama4VisionMLP(
+        self.ffn = Llama4VisionMLP(
             input_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             output_size=config.hidden_size,
             bias=True,
             output_activation=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
             use_data_parallel=use_data_parallel,
         )
 
@@ -215,7 +215,7 @@ class Llama4VisionEncoderLayer(nn.Module):
         # Feed forward
         residual = hidden_state
         hidden_state = self.post_attention_layernorm(hidden_state)
-        hidden_state = self.mlp(hidden_state)
+        hidden_state = self.ffn(hidden_state)
         hidden_state = residual + hidden_state
 
         outputs = hidden_state
@@ -644,6 +644,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         return name, loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        def map_weight_name(name: str) -> str:
+            if "vision_adapter.mlp." in name:
+                return name
+            name = name.replace("feed_forward.", "ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -685,11 +692,17 @@ class Llama4ForConditionalGeneration(nn.Module):
                 )
 
             if self._handle_scale_remapping(name, params_dict):
-                loaded_params.add(name)
+                registered_name = map_weight_name(name)
+                loaded_params.add(registered_name)
                 continue
 
             if self._handle_stacked_params(
-                name, loaded_weight, stacked_params_mapping, params_dict, loaded_params
+                name,
+                loaded_weight,
+                stacked_params_mapping,
+                params_dict,
+                loaded_params,
+                map_weight_name=map_weight_name,
             ):
                 continue
 
@@ -700,11 +713,15 @@ class Llama4ForConditionalGeneration(nn.Module):
                 params_dict,
                 num_experts,
                 loaded_params,
+                map_weight_name=map_weight_name,
             ):
                 continue
 
-            loaded_params.add(name)
-            self._handle_default_weight(name, loaded_weight, params_dict)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
+            self._handle_default_weight(
+                name, loaded_weight, params_dict, map_weight_name=map_weight_name
+            )
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             logger.warning(
@@ -741,13 +758,16 @@ class Llama4ForConditionalGeneration(nn.Module):
         stacked_params_mapping: list,
         params_dict: dict,
         loaded_params: set,
+        *,
+        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Handle stacked parameter loading. Returns True if handled."""
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name in name:
                 transformed_name = name.replace(weight_name, param_name)
-                loaded_params.add(transformed_name)
-                param = params_dict[transformed_name]
+                registered_transformed_name = map_weight_name(transformed_name)
+                loaded_params.add(registered_transformed_name)
+                param = params_dict[registered_transformed_name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 return True
         return False
@@ -760,6 +780,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
         loaded_params: set,
+        *,
+        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Handle expert weight loading for MoE (Mixture of Experts) layers.
 
@@ -778,16 +800,31 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         if "experts.gate_up_proj" not in name and "experts.down_proj" not in name:
             return self._handle_other_expert_params(
-                name, loaded_weight, expert_params_mapping, params_dict, loaded_params
+                name,
+                loaded_weight,
+                expert_params_mapping,
+                params_dict,
+                loaded_params,
+                map_weight_name=map_weight_name,
             )
 
         if "scale" in name:
             return self._handle_expert_scale_params(
-                name, loaded_weight, params_dict, num_experts, loaded_params
+                name,
+                loaded_weight,
+                params_dict,
+                num_experts,
+                loaded_params,
+                map_weight_name=map_weight_name,
             )
         else:
             return self._handle_expert_weight_params(
-                name, loaded_weight, params_dict, num_experts, loaded_params
+                name,
+                loaded_weight,
+                params_dict,
+                num_experts,
+                loaded_params,
+                map_weight_name=map_weight_name,
             )
 
     def _handle_other_expert_params(
@@ -797,6 +834,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         expert_params_mapping: list,
         params_dict: dict,
         loaded_params: set,
+        *,
+        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Handle expert parameters that are not gate_up_proj or down_proj weights.
 
@@ -813,11 +852,12 @@ class Llama4ForConditionalGeneration(nn.Module):
         for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
             if weight_name in name:
                 transformed_name = name.replace(weight_name, param_name)
-                param = params_dict[transformed_name]
+                registered_transformed_name = map_weight_name(transformed_name)
+                param = params_dict[registered_transformed_name]
                 param.weight_loader(
                     param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
                 )
-                loaded_params.add(transformed_name)
+                loaded_params.add(registered_transformed_name)
                 return True
         return False
 
@@ -857,6 +897,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
         loaded_params: set,
+        *,
+        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Handle quantization scale parameters for expert weights.
 
@@ -878,10 +920,11 @@ class Llama4ForConditionalGeneration(nn.Module):
         # Transform name
         transformed_name, _, _ = self._transform_expert_name(name)
 
-        if transformed_name not in params_dict:
+        registered_transformed_name = map_weight_name(transformed_name)
+        if registered_transformed_name not in params_dict:
             return True
 
-        param = params_dict[transformed_name]
+        param = params_dict[registered_transformed_name]
 
         # Handle scale parameters
         if expert_match:
@@ -894,7 +937,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             # Load the same scale for all experts
             for expert_id in range(num_experts):
                 param.data[expert_id] = loaded_weight
-        loaded_params.add(transformed_name)
+        loaded_params.add(registered_transformed_name)
 
         return True
 
@@ -905,6 +948,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
         loaded_params: set,
+        *,
+        map_weight_name: Callable[[str], str],
     ) -> bool:
         """Handle actual weight tensors for expert layers (gate_up_proj and down_proj).
 
@@ -931,12 +976,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         for param_name, weight_chunk, shard_id in zip(
             [transformed_name] * len(shard_id_list), loaded_weight_list, shard_id_list
         ):
-            if param_name not in params_dict:
+            registered_param_name = map_weight_name(param_name)
+            if registered_param_name not in params_dict:
                 continue
 
-            param = params_dict[param_name]
+            param = params_dict[registered_param_name]
             weight_loader = param.weight_loader
-            loaded_params.add(param_name)
+            loaded_params.add(registered_param_name)
 
             # Handle the case where loaded_weight might be a single tensor for all experts
             if weight_chunk.dim() == 2:
@@ -963,14 +1009,20 @@ class Llama4ForConditionalGeneration(nn.Module):
         return True
 
     def _handle_default_weight(
-        self, name: str, loaded_weight: torch.Tensor, params_dict: dict
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        *,
+        map_weight_name: Callable[[str], str],
     ):
         """Handle default weight loading."""
         # Skip loading extra bias for GPTQ models
-        if name.endswith(".bias") and name not in params_dict:
+        if name.endswith(".bias") and map_weight_name(name) not in params_dict:
             return
 
-        param = params_dict[name]
+        registered_name = map_weight_name(name)
+        param = params_dict[registered_name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
 

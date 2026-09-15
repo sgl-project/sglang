@@ -556,6 +556,12 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.forward = self.thinker.forward
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            if "merger.mlp." in name or "merger_list." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -626,16 +632,20 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
                 # [TODO] Skip layers that are on other devices (check if sglang has a similar function)
                 # if is_pp_missing_parameter(name, self):
                 #     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -654,6 +664,7 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
+                        name_mapped = map_weight_name(name_mapped)
                         loaded_weight = loaded_weight.transpose(-1, -2)  # no bias
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -683,11 +694,12 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        if name_mapped in params_dict.keys():
-                            param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        if registered_name_mapped in params_dict.keys():
+                            param = params_dict[registered_name_mapped]
                         else:
                             continue
                         # We should ask the weight loader to return success or
@@ -714,11 +726,15 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                         name = name.replace(r"attn.out_proj.", r"attn.proj.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

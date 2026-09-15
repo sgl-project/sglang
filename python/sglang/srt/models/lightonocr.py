@@ -207,6 +207,12 @@ class LightOnOCRForConditionalGeneration(nn.Module):
         - ``vision_projection.linear_2.*`` -> self.vision_language_adapter.w_out
         - ``language_model.*`` -> self.language_model (Qwen3ForCausalLM)
         """
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         vision_encoder_dict = dict(self.vision_encoder.named_parameters())
         patch_merger_dict = dict(self.patch_merger.named_parameters())
         norm_dict = dict(self.vision_projection_norm.named_parameters())
@@ -235,8 +241,9 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name in trimmed:
                             transformed = trimmed.replace(weight_name, param_name)
-                            if transformed in vision_encoder_dict:
-                                param = vision_encoder_dict[transformed]
+                            registered_transformed = map_weight_name(transformed)
+                            if registered_transformed in vision_encoder_dict:
+                                param = vision_encoder_dict[registered_transformed]
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
@@ -251,8 +258,9 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                             trimmed = trimmed.replace(
                                 ".attention.o_proj", ".attention.proj"
                             )
-                        if trimmed in vision_encoder_dict:
-                            param = vision_encoder_dict[trimmed]
+                        registered_trimmed = map_weight_name(trimmed)
+                        if registered_trimmed in vision_encoder_dict:
+                            param = vision_encoder_dict[registered_trimmed]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
@@ -264,15 +272,17 @@ class LightOnOCRForConditionalGeneration(nn.Module):
 
                     if remaining.startswith("patch_merger."):
                         trimmed = remaining[len("patch_merger.") :]
-                        if trimmed in patch_merger_dict:
-                            param = patch_merger_dict[trimmed]
+                        registered_trimmed = map_weight_name(trimmed)
+                        if registered_trimmed in patch_merger_dict:
+                            param = patch_merger_dict[registered_trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 
                     elif remaining.startswith("norm."):
                         trimmed = remaining[len("norm.") :]
-                        if trimmed in norm_dict:
-                            param = norm_dict[trimmed]
+                        registered_trimmed = map_weight_name(trimmed)
+                        if registered_trimmed in norm_dict:
+                            param = norm_dict[registered_trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 
@@ -281,8 +291,9 @@ class LightOnOCRForConditionalGeneration(nn.Module):
                         trimmed = remaining.replace("linear_1.", "w_in.").replace(
                             "linear_2.", "w_out."
                         )
-                        if trimmed in adapter_dict:
-                            param = adapter_dict[trimmed]
+                        registered_trimmed = map_weight_name(trimmed)
+                        if registered_trimmed in adapter_dict:
+                            param = adapter_dict[registered_trimmed]
                             with torch.no_grad():
                                 default_weight_loader(param, w)
 

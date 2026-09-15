@@ -548,6 +548,11 @@ class DSparkDraftMixin:
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_conv.", "ffn_conv.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
@@ -574,12 +579,13 @@ class DSparkDraftMixin:
         super().load_weights(backbone_weights)
 
         for name, loaded_weight in markov_weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 raise ValueError(
                     f"DSpark unexpected markov weight {name!r} not found in model "
                     f"parameters (known markov params require a {type(self.markov_head).__name__} head)."
                 )
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
@@ -593,19 +599,25 @@ class DSparkDraftMixin:
         confidence_weights: list,
         params_dict: dict,
     ) -> None:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_conv.", "ffn_conv.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         if self.confidence_head is None:
             return
         loaded_names = set()
         for name, loaded_weight in confidence_weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 raise ValueError(
                     f"DSpark unexpected confidence weight {name!r} not found in "
                     "model parameters."
                 )
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_names.add(name)
+            loaded_names.add(registered_name)
 
         confidence_param_names = {
             name for name in params_dict if name.startswith("confidence_head.")
@@ -858,7 +870,7 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
         self.markov_head = None
         self.confidence_head = None
         for layer in self.layers:
-            layer.mlp = None
+            layer.ffn = None
             layer.self_attn.o_proj = None
         torch.cuda.empty_cache()
 

@@ -118,7 +118,7 @@ class InternS1ProTextDecoderLayer(Qwen3MoeDecoderLayer):
             assert config.num_experts_per_tok % self.router_n_groups == 0, (
                 f"{config.num_experts_per_tok} cannot be divided by {self.router_n_groups}"
             )
-            self.mlp.topk = TopK(
+            self.ffn.topk = TopK(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
                 use_grouped_topk=False,
@@ -211,6 +211,11 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
     def _load_fope_weights(self, name: str, loaded_weight: torch.Tensor, params_dict):
         """load fope weights"""
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         attn_tp_size = get_parallel().attn_tp_size
         attn_tp_rank = get_parallel().attn_tp_rank
 
@@ -224,8 +229,9 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
 
         # rotary_emb is shared cross layers
         param_name = name.replace(".rotary_emb.", ".layers.0.self_attn.rotary_emb.")
-        assert param_name in params_dict
-        param = params_dict[param_name]
+        registered_param_name = map_weight_name(param_name)
+        assert registered_param_name in params_dict
+        param = params_dict[registered_param_name]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
 

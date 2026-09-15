@@ -94,7 +94,7 @@ class TestRadioWeightLoading(CustomTestCase):
             ),
             "encoder.layer.2.layer_scale1.lambda1": "model.encoder.layers.2.ls1",
             "encoder.layer.3.layer_scale2.lambda1": "model.encoder.layers.3.ls2",
-            "encoder.layer.4.mlp.fc1.bias": "model.encoder.layers.4.mlp.fc1.bias",
+            "encoder.layer.4.mlp.fc1.bias": "model.encoder.layers.4.ffn.fc1.bias",
             "encoder.layer.5.norm2.weight": "model.encoder.layers.5.norm2.weight",
         }
         for source, target in cases.items():

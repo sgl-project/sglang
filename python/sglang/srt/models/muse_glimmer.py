@@ -331,8 +331,8 @@ class MuseGlimmerDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = MuseGlimmerMLP(
-            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = MuseGlimmerMLP(
+            config, quant_config=quant_config, prefix=add_prefix("ffn", prefix)
         )
         self.post_ffn_norm = RMSNorm(config.hidden_size, eps=config.post_norm_eps)
 
@@ -349,7 +349,7 @@ class MuseGlimmerDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + self.post_ffn_norm(hidden_states)
         return hidden_states
 
@@ -592,8 +592,8 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        self.mlp = MuseGlimmerVisionMLP(
-            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = MuseGlimmerVisionMLP(
+            config, quant_config=quant_config, prefix=add_prefix("ffn", prefix)
         )
 
     def forward(
@@ -609,7 +609,7 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             forward_metadata=forward_metadata,
         )
-        return hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states + self.ffn(self.norm2(hidden_states))
 
 
 class MuseGlimmerVisionModel(nn.Module):
@@ -866,6 +866,7 @@ class MuseGlimmerForCausalLM(nn.Module):
         self.model.layers_to_capture = list(layer_ids)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -908,6 +909,7 @@ class MuseGlimmerForCausalLM(nn.Module):
                 if "output_gate_proj" in name:
                     continue
                 mapped = name.replace(weight_name, param_name)
+
                 if mapped not in params_dict:
                     continue
                 param = params_dict[mapped]

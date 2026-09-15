@@ -127,7 +127,7 @@ def test_kimi_moonvit_forwards_one_precomputed_max_seqlen():
     layer.norm0 = nn.Identity()
     layer.norm1 = nn.Identity()
     layer.attn = CapturingAttention()
-    layer.mlp = nn.Identity()
+    layer.ffn = nn.Identity()
 
     hidden_states = torch.ones(3, 4)
     output = layer(

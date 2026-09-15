@@ -1520,23 +1520,23 @@ class XllmDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = XllmSparseMoeBlock(
+            self.ffn = XllmSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = XllmMLP(
+            self.ffn = XllmMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -1579,12 +1579,12 @@ class XllmDecoderLayer(nn.Module):
             forward_batch
         )
 
-        if isinstance(self.mlp, XllmMLP):
-            hidden_states = self.mlp(
+        if isinstance(self.ffn, XllmMLP):
+            hidden_states = self.ffn(
                 hidden_states, use_reduce_scatter=use_reduce_scatter
             )
         else:
-            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+            hidden_states = self.ffn(hidden_states, forward_batch, use_reduce_scatter)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -1768,6 +1768,7 @@ class XllmForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = self.stacked_params_mapping
         expert_params_mapping = self.expert_params_mapping
         strict_checkpoint = getattr(self.config, "model_type", None) in (
@@ -1818,10 +1819,10 @@ class XllmForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if weight_name in (".gate_proj", ".up_proj") and ".mlp." not in name:
+                if weight_name in (".gate_proj", ".up_proj") and ".ffn." not in name:
                     continue
                 # Skip experts (handled below in expert_params_mapping)
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
@@ -1832,6 +1833,7 @@ class XllmForCausalLM(nn.Module):
                             f"checkpoint={checkpoint_name!r}, mapped={name!r}"
                         )
                     continue
+
                 if name not in params_dict:
                     if strict_checkpoint:
                         raise RuntimeError(
@@ -1851,6 +1853,7 @@ class XllmForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1872,6 +1875,7 @@ class XllmForCausalLM(nn.Module):
                                 f"checkpoint={checkpoint_name!r}, mapped={name!r}"
                             )
                         continue
+
                     if name not in params_dict:
                         if strict_checkpoint:
                             raise RuntimeError(

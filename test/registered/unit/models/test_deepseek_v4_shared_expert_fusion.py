@@ -179,7 +179,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                 self.config = config
 
             def named_parameters(self):
-                return [("stages.0.mlp.experts.w13_weight", Param())]
+                return [("stages.0.ffn.experts.w13_weight", Param())]
 
             def _remap_dspark_weight_name(self, name):
                 return DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(self, name)
@@ -195,7 +195,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
         self.assertEqual(len(loaded), 1)
         self.assertIs(loaded[0][0], weight)
-        self.assertEqual(loaded[0][1], "stages.0.mlp.experts.w13_weight")
+        self.assertEqual(loaded[0][1], "stages.0.ffn.experts.w13_weight")
         self.assertEqual(loaded[0][2:], ("w1", config.n_routed_experts))
 
 

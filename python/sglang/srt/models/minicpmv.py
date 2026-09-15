@@ -66,7 +66,10 @@ from sglang.srt.models.minicpmv_vit import (
     MiniCPMV_VisionTransformer,
 )
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
-from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+from sglang.srt.models.qwen3 import (
+    Qwen3Config,
+    Qwen3ForCausalLM,
+)
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
@@ -1565,6 +1568,12 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         Vision-side still needs QKV stacking + ``out_proj -> proj`` rename.
         """
 
+        def map_weight_name(name: str) -> str:
+            if "resampler.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         llm_weights: List[Tuple[str, torch.Tensor]] = []
         vision_weights: List[Tuple[str, torch.Tensor]] = []
         for name, w in weights:
@@ -1592,15 +1601,17 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 if weight_name not in name:
                     continue
                 target = name.replace(weight_name, param_name)
-                if target not in params_dict:
+                registered_target = map_weight_name(target)
+                if registered_target not in params_dict:
                     continue
-                param = params_dict[target]
+                param = params_dict[registered_target]
                 param.weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
@@ -1687,6 +1698,12 @@ class MiniCPMV:
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Defer to the version-specific subclass loader if it overrides the
         # base (4.6 does — it needs prefix remap + Qwen3.5 LLM delegation).
+        def map_weight_name(name: str) -> str:
+            if "resampler.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         sub_loader = getattr(type(self.minicpmv), "load_weights", None)
         base_loader = getattr(MiniCPMBaseModel, "load_weights", None)
         if sub_loader is not None and sub_loader is not base_loader:
@@ -1709,14 +1726,18 @@ class MiniCPMV:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
+            if (
+                name.startswith("model.vision_tower")
+                and map_weight_name(name) not in params_dict
+            ):
                 continue
 
             # adapt to VisionAttention
             name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
 
             if "sampler" in name:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 continue
@@ -1727,18 +1748,20 @@ class MiniCPMV:
                     continue
                 name = name.replace(weight_name, param_name)
                 # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

@@ -352,11 +352,11 @@ class SDARMoeBlock(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.mlp = SDARMoeSparseMoeBlock(
+        self.ffn = SDARMoeSparseMoeBlock(
             layer_id=layer_id,
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -382,7 +382,6 @@ class SDARMoeBlock(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -411,7 +410,7 @@ class SDARMoeBlock(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(
+            hidden_states = self.ffn(
                 hidden_states,
                 forward_batch=forward_batch,
             )
@@ -595,6 +594,7 @@ class SDARMoeForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -657,12 +657,13 @@ class SDARMoeForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
 
                 name2 = name.replace(weight_name, param_name)
                 if name2.endswith(".bias") and name2 not in params_dict:
                     continue
+
                 if name2 not in params_dict:
                     continue
 
@@ -679,6 +680,7 @@ class SDARMoeForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name2 = name.replace(weight_name, param_name)
+
                     if name2 not in params_dict:
                         continue
 
@@ -701,6 +703,7 @@ class SDARMoeForCausalLM(nn.Module):
                     # 3) regular params
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     if name not in params_dict:
                         continue
 
@@ -713,9 +716,9 @@ class SDARMoeForCausalLM(nn.Module):
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(
                 lambda: {
-                    lid: self.model.layers[lid].mlp.get_moe_weights()
+                    lid: self.model.layers[lid].ffn.get_moe_weights()
                     for lid in range(self.start_layer, self.end_layer)
-                    if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
+                    if isinstance(self.model.layers[lid].ffn, SDARMoeSparseMoeBlock)
                 }
             )
 

@@ -220,13 +220,13 @@ class SolarDecoderLayer(nn.Module):
             bias=attention_bias,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = SolarMLP(
+        self.ffn = SolarMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             bias=getattr(config, "mlp_bias", False),
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -254,7 +254,7 @@ class SolarDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -466,7 +466,7 @@ class SolarForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             is_packed = False

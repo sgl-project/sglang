@@ -111,12 +111,12 @@ class Ernie4_5_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        self.mlp = Ernie4_5_VisionMLP(
+        self.ffn = Ernie4_5_VisionMLP(
             dim,
             mlp_hidden_dim,
             act_layer=act_layer,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -138,7 +138,7 @@ class Ernie4_5_VisionBlock(nn.Module):
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.ffn(self.norm2(x))
         return x
 
 
@@ -335,16 +335,23 @@ class VariableResolutionResamplerModel(nn.Module):
         return x
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def map_weight_name(name: str) -> str:
+            if "resampler_model.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -421,7 +428,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self.blocks[0].mlp.fc2.weight.device
+        return self.blocks[0].ffn.fc2.weight.device
 
     def rot_pos_emb(
         self, grid_thw: torch.Tensor
@@ -730,6 +737,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            if "resampler_model.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -766,14 +779,17 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
 
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("mlp.experts." in name) and map_weight_name(
+                    name
+                ) not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -823,11 +839,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    ) and map_weight_name(name) not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -857,11 +874,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    ) and map_weight_name(name) not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

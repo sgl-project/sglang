@@ -1551,10 +1551,10 @@ class Dots3DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Dots3MoE(
+            self.ffn = Dots3MoE(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
@@ -1564,12 +1564,12 @@ class Dots3DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = Dots3MLP(
+            self.ffn = Dots3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -1607,7 +1607,6 @@ class Dots3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -1634,7 +1633,7 @@ class Dots3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        hidden_states = self.mlp(
+        hidden_states = self.ffn(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
 
@@ -1686,7 +1685,7 @@ class Dots3DecoderLayer(nn.Module):
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
-            state.hidden_states_mlp_output = self.mlp(
+            state.hidden_states_mlp_output = self.ffn(
                 hidden_states, state.forward_batch
             )
         else:
@@ -1884,9 +1883,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
+                layer_id: layer.ffn.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Dots3MoE)
+                if isinstance(layer.ffn, Dots3MoE)
             }
         )
 
@@ -2136,10 +2135,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
             if layer_id in moe_layers or is_nextn:
                 if (
-                    isinstance(layer.mlp, Dots3MoE)
-                    and layer.mlp.shared_experts is not None
+                    isinstance(layer.ffn, Dots3MoE)
+                    and layer.ffn.shared_experts is not None
                 ):
-                    shared_experts = layer.mlp.shared_experts
+                    shared_experts = layer.ffn.shared_experts
                     for module in [
                         shared_experts.gate_up_proj,
                         shared_experts.down_proj,
@@ -2148,7 +2147,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                             module.weight, module.weight_scale_inv, weight_block_size
                         )
 
-                experts = layer.mlp.experts
+                experts = layer.ffn.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
                         experts.w13_weight_fp8,
@@ -2156,11 +2155,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
-                mlp = layer.mlp
-                assert isinstance(mlp, Dots3MLP)
+                ffn = layer.ffn
+                assert isinstance(ffn, Dots3MLP)
                 for module in [
-                    mlp.gate_up_proj,
-                    mlp.down_proj,
+                    ffn.gate_up_proj,
+                    ffn.down_proj,
                 ]:
                     requant_weight_ue8m0_inplace(
                         module.weight, module.weight_scale_inv, weight_block_size
@@ -2172,6 +2171,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         is_nextn=False,
         extra_params_mapping=None,
     ):
+        def map_weight_name(name: str) -> str:
+            if "merger.mlp." in name or "adapter.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
 
         if is_nextn:
             num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2262,9 +2266,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 and g_proj_name in cached_a_proj
             ):
                 return False
-            if param_name not in params_dict:
+            registered_param_name = map_weight_name(param_name)
+            if registered_param_name not in params_dict:
                 raise ValueError(f"{param_name} not found in params_dict.")
-            param = params_dict[param_name]
+            param = params_dict[registered_param_name]
             target_dim = param.shape[cat_dim] if param.dim() > cat_dim else None
             is_scale = param_name.endswith(".weight_scale_inv")
             q_a_proj_weight = cached_a_proj[q_a_proj_name]
@@ -2376,7 +2381,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                             name = name.replace(
                                 matched_prefix, "model.shared_head.head"
                             )
-                            param = params_dict.get(name)
+                            registered_name = map_weight_name(name)
+                            param = params_dict.get(registered_name)
                             if param is None:
                                 continue
                             weight_loader = _get_param_weight_loader(param)
@@ -2425,13 +2431,19 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
+                    if ("mlp.experts." in name) and map_weight_name(
+                        name
+                    ) not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     futures.append(
                         executor.submit(weight_loader, param, loaded_weight, shard_id)
@@ -2443,7 +2455,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
+                        registered_name = map_weight_name(name)
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         futures.append(
                             executor.submit(
@@ -2458,7 +2471,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
+                        if (
+                            name.endswith(".bias")
+                            and map_weight_name(name) not in params_dict
+                        ):
                             continue
                         # Skip loading embed_tokens if not first rank in pipeline parallelism
                         if ".embed_tokens." in name and not self.pp_group.is_first_rank:
@@ -2523,7 +2539,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
+                            ) and map_weight_name(name) not in params_dict:
                                 # modelopt attn kv scale is named differently
                                 for scale in ["k_scale", "v_scale"]:
                                     if scale in name:
@@ -2531,13 +2547,14 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
-                            if name not in params_dict:
+                            registered_name = map_weight_name(name)
+                            if registered_name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[registered_name]
                             weight_loader = _get_param_weight_loader(param)
                             futures.append(
                                 executor.submit(weight_loader, param, loaded_weight)

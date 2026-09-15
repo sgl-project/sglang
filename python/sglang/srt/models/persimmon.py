@@ -166,8 +166,8 @@ class PersimmonDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PersimmonMLP(
-            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = PersimmonMLP(
+            config, quant_config=quant_config, prefix=add_prefix("ffn", prefix)
         )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
@@ -195,7 +195,7 @@ class PersimmonDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         hidden_states = hidden_states + residual
 
@@ -308,10 +308,12 @@ class PersimmonForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
             if name not in params_dict:
                 if name == "lm_head.weight":
                     continue

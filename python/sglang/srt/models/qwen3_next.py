@@ -486,13 +486,13 @@ def _apply_qwen3_next_mlp(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
     ):
-        if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = layer.mlp(
+        if isinstance(layer.ffn, Qwen2MoeSparseMoeBlock):
+            hidden_states = layer.ffn(
                 hidden_states,
                 forward_batch=forward_batch,
             )
         else:
-            hidden_states = layer.mlp(hidden_states)
+            hidden_states = layer.ffn(hidden_states)
 
     if fuse_mlp_allreduce:
         hidden_states._sglang_needs_allreduce_fusion = True
@@ -535,23 +535,23 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.ffn = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
             )
         else:
-            self.mlp = Qwen2MoeMLP(
+            self.ffn = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".linear_attn", "")),
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -703,23 +703,23 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.ffn = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
                 enable_cuda_shared_expert_fusion=True,
             )
         else:
-            self.mlp = Qwen2MoeMLP(
+            self.ffn = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".self_attn", "")),
             )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -1042,9 +1042,9 @@ class Qwen3NextForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
+                layer_id: layer.ffn.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if isinstance(layer.ffn, Qwen2MoeSparseMoeBlock)
             }
         )
 
@@ -1056,8 +1056,8 @@ class Qwen3NextForCausalLM(nn.Module):
         if not hasattr(self.model, "layers"):
             return 0
         for layer in self.model.layers:
-            if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
-                return layer.mlp.num_fused_shared_experts
+            if isinstance(layer.ffn, Qwen2MoeSparseMoeBlock):
+                return layer.ffn.num_fused_shared_experts
         return 0
 
     @torch.no_grad()
@@ -1111,6 +1111,7 @@ class Qwen3NextForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self attention
@@ -1165,10 +1166,10 @@ class Qwen3NextForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
-            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+            if self.enable_shared_expert_fusion and "ffn.shared_expert." in name:
                 name = name.replace(
-                    "mlp.shared_expert.",
-                    f"mlp.experts.{self.config.num_experts}.",
+                    "ffn.shared_expert.",
+                    f"ffn.experts.{self.config.num_experts}.",
                 )
 
             # Remap modelopt FP8 KV cache scale names:
@@ -1184,7 +1185,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     continue
 
                 # TODO(fix mtp loading)
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
 
                 replaced_name = name.replace(weight_name, param_name)
@@ -1194,9 +1195,11 @@ class Qwen3NextForCausalLM(nn.Module):
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
+
                 if replaced_name not in params_dict:
                     continue
                 name = replaced_name
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
@@ -1217,6 +1220,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     ) and replaced_name not in params_dict:
                         continue
                     name = replaced_name
+
                     param = params_dict[name]
 
                     weight_loader = getattr(param, "weight_loader")
@@ -1240,11 +1244,13 @@ class Qwen3NextForCausalLM(nn.Module):
                             f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         )
                         continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         return loaded_params
 

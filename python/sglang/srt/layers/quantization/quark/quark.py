@@ -610,7 +610,7 @@ class QuarkConfig(QuantizationConfig):
                     [
                         "re:.*model.layers.61.*",
                         "re:.*self_attn.*",
-                        "re:.*mlp.gate$",
+                        "re:.*ffn.gate$",
                     ]
                 )
             elif model_type == "qwen3_5_moe":
@@ -948,10 +948,10 @@ class QuarkConfig(QuantizationConfig):
         lookup_stub = torch.nn.Module()
         try:
             for base in _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES:
-                moe_name = f"{base}.mlp.experts"
+                moe_name = f"{base}.ffn.experts"
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
-                    shared_name = f"{base}.mlp.shared_expert.{suffix}"
+                    shared_name = f"{base}.ffn.shared_expert.{suffix}"
                     shared_cfg = self._find_matched_config(shared_name, lookup_stub)
                     if not deep_compare(moe_cfg, shared_cfg):
                         return False

@@ -15,19 +15,19 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestComputeAttentionAndMoeLayers(unittest.TestCase):
-    def test_native_discovery_does_not_read_ffn(self):
+    def test_native_discovery_does_not_read_mlp(self):
         class NativeLayer:
-            mlp = None
+            ffn = None
 
             @property
-            def ffn(self):
-                raise AssertionError("Native layer discovery must not read ffn")
+            def mlp(self):
+                raise AssertionError("Native layer discovery must not read mlp")
 
-        mlp = SimpleNamespace(experts=object())
+        ffn = SimpleNamespace(experts=object())
         layer_model = SimpleNamespace(
             layers=[
-                SimpleNamespace(mlp=mlp),
-                SimpleNamespace(ffn=SimpleNamespace(experts=object())),
+                SimpleNamespace(ffn=ffn),
+                SimpleNamespace(mlp=SimpleNamespace(experts=object())),
                 NativeLayer(),
                 SimpleNamespace(),
             ]
@@ -35,8 +35,8 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
 
         result = compute_attention_and_moe_layers(layer_model)
 
-        self.assertEqual(result.moe_layers, [mlp.experts, None, None, None])
-        self.assertEqual(result.moe_fusions, [mlp, None, None, None])
+        self.assertEqual(result.moe_layers, [ffn.experts, None, None, None])
+        self.assertEqual(result.moe_fusions, [ffn, None, None, None])
         self.assertEqual(result.attention_layers, [None] * 4)
 
     def test_explicit_moe_members_remain_supported(self):
@@ -82,8 +82,8 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
         x = torch.ones(1, 2)
         output_before = legacy(x)
 
-        # Native discovery reads the current SGLang member. Only the
-        # Transformers adapter supplies a policy for third-party members.
+        # The same third-party layers do not opt a native runner into legacy
+        # member lookup. Only the Transformers adapter supplies that policy.
         class NativeModel(nn.Module):
             @property
             def get_layer_ffn(self):
@@ -92,7 +92,7 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
         native_result = ModelRunner.get_cuda_graph_layers(
             SimpleNamespace(model=NativeModel()), layer_model
         )
-        self.assertEqual(native_result.moe_fusions, [legacy.mlp, None, both.mlp, None])
+        self.assertEqual(native_result.moe_fusions, [None, modern.ffn, both.ffn, None])
 
         adapter = TransformersForCausalLM.__new__(TransformersForCausalLM)
         nn.Module.__init__(adapter)

@@ -483,6 +483,12 @@ class Phi4MMForCausalLM(nn.Module):
         return bool(self.lora_pattern.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward_out.", "ffn_out.")
+            name = name.replace("feed_forward_in.", "ffn_in.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -525,12 +531,14 @@ class Phi4MMForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict.get(name)
+                registered_name = map_weight_name(name)
+                param = params_dict.get(registered_name)
                 if param is None:
                     if "lora" not in name:
                         logger.warning(f"Warning: {name} not found in model parameters")

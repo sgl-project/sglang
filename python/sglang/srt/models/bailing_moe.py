@@ -590,23 +590,23 @@ class BailingMoEBlock(nn.Module):
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
         if self.is_layer_sparse:
-            self.mlp = BailingMoESparseMoeBlock(
+            self.ffn = BailingMoESparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = BailingMoEMLP(
+            self.ffn = BailingMoEMLP(
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -673,7 +673,7 @@ class BailingMoEBlock(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -874,6 +874,7 @@ class BailingMoEForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -956,12 +957,13 @@ class BailingMoEForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -975,6 +977,7 @@ class BailingMoEForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -991,6 +994,7 @@ class BailingMoEForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     if name not in params_dict:
                         continue
 
@@ -1002,10 +1006,10 @@ class BailingMoEForCausalLM(nn.Module):
 
         if not is_nextn:
             self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
+                layer_id: layer.ffn.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
                 if not isinstance(layer, PPMissingLayer)
-                and isinstance(layer.mlp, BailingMoESparseMoeBlock)
+                and isinstance(layer.ffn, BailingMoESparseMoeBlock)
             }
 
     @classmethod

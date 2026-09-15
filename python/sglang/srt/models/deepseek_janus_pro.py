@@ -53,7 +53,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    map_state_dict_names,
+)
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.utils import logger
 
@@ -541,7 +544,7 @@ class VisionTransformerBlock(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
+        self.ffn = mlp_layer(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
@@ -554,7 +557,7 @@ class VisionTransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        x = x + self.drop_path2(self.ls2(self.ffn(self.norm2(x))))
         return x
 
 
@@ -1083,7 +1086,12 @@ def create_siglip_vit(
     if ckpt_path:
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
-        incompatible_keys = model.load_state_dict(state_dict, strict=False)
+        incompatible_keys = model.load_state_dict(
+            map_state_dict_names(
+                state_dict, lambda name: (name + ".").replace(".mlp.", ".ffn.")[:-1]
+            ),
+            strict=False,
+        )
         print(
             f"SigLIP-ViT restores from {ckpt_path},\n"
             f"\tincompatible_keys:', {incompatible_keys}."
@@ -1384,7 +1392,7 @@ class AttentionPoolLatent(nn.Module):
         self.norm = (
             norm_layer(out_features) if norm_layer is not None else nn.Identity()
         )
-        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio))
+        self.ffn = Mlp(embed_dim, int(embed_dim * mlp_ratio))
 
         self.init_weights()
 
@@ -1427,7 +1435,7 @@ class AttentionPoolLatent(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        x = x + self.mlp(self.norm(x))
+        x = x + self.ffn(self.norm(x))
 
         # optional pool if latent seq_len > 1 and pooled output is desired
         if self.pool == "token":
@@ -2005,6 +2013,10 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return helper.pad_input_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -2022,7 +2034,10 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
+            if (
+                name.startswith("model.vision_tower")
+                and map_weight_name(name) not in params_dict
+            ):
                 continue
 
             # skip generation sub model
@@ -2041,18 +2056,20 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 name = name.replace(weight_name, param_name)
 
                 # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", None)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

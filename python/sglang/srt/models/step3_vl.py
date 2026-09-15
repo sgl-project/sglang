@@ -346,12 +346,12 @@ class Step3TextDecoderLayer(nn.Module):
         )
 
         if not self.is_layer_sparse:
-            self.mlp = Step3TextMLP(
+            self.ffn = Step3TextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act="silu",
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             self.use_moe = True
@@ -360,7 +360,7 @@ class Step3TextDecoderLayer(nn.Module):
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
-                    prefix=add_prefix("mlp", prefix),
+                    prefix=add_prefix("ffn", prefix),
                 )
                 self.share_expert = Step3TextMLP(
                     hidden_size=config.hidden_size,
@@ -374,7 +374,7 @@ class Step3TextDecoderLayer(nn.Module):
                     layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
-                    prefix=add_prefix("mlp", prefix),
+                    prefix=add_prefix("ffn", prefix),
                 )
 
         self.layer_communicator = LayerCommunicator(
@@ -399,7 +399,6 @@ class Step3TextDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -417,7 +416,7 @@ class Step3TextDecoderLayer(nn.Module):
         if self.use_moe:
             hidden_states = self.moe_mlp_forward(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -665,7 +664,7 @@ class Step3VisionEncoderLayer(nn.Module):
         self.self_attn = Step3VisionAttention(
             self.embed_dim, num_heads=config.num_attention_heads
         )
-        self.mlp = Step3VisionMLP(
+        self.ffn = Step3VisionMLP(
             dim=self.embed_dim,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -673,7 +672,7 @@ class Step3VisionEncoderLayer(nn.Module):
 
     def forward(self, hidden_states) -> torch.Tensor:
         hidden_states = hidden_states + self.layer_norm1(self.self_attn(hidden_states))
-        hidden_states = hidden_states + self.layer_norm2(self.mlp(hidden_states))
+        hidden_states = hidden_states + self.layer_norm2(self.ffn(hidden_states))
         return hidden_states
 
 
@@ -922,6 +921,10 @@ class Step3VLForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", 0),
@@ -972,7 +975,8 @@ class Step3VLForConditionalGeneration(nn.Module):
                     part_name = weight_name.split(".")[-2]
                     fake_weight_name = name.replace(part_name, weight_name[:-1])
                     actual_param_name = name.replace(part_name + ".", param_name)
-                    param = params_dict[actual_param_name]
+                    registered_actual_param_name = map_weight_name(actual_param_name)
+                    param = params_dict[registered_actual_param_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -990,26 +994,29 @@ class Step3VLForConditionalGeneration(nn.Module):
                 if "gate." not in name and "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 break
             else:
                 if "moe" not in name:
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    loaded_params.add(registered_name)
                 else:
                     if "gate." in name:
                         name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
+                        registered_name = map_weight_name(name)
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight)
-                        loaded_params.add(name)
+                        loaded_params.add(registered_name)
                         continue
 
                     for mapping in expert_params_mapping:
@@ -1021,7 +1028,10 @@ class Step3VLForConditionalGeneration(nn.Module):
                         part_name = weight_name.split(".")[-2]
                         fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
-                        param = params_dict[actual_param_name]
+                        registered_actual_param_name = map_weight_name(
+                            actual_param_name
+                        )
+                        param = params_dict[registered_actual_param_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -1030,7 +1040,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
-                        loaded_params.add(actual_param_name)
+                        loaded_params.add(registered_actual_param_name)
                         # Don't break here, because this 'loaded_weight' includes all the weights for this layer
 
     @classmethod

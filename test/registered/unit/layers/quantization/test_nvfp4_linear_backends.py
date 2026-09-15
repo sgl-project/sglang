@@ -84,7 +84,7 @@ def _make_merged_layer(n_half: int, k: int):
         bias=False,
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
-        prefix="model.layers.0.mlp.gate_up_proj",
+        prefix="model.layers.0.ffn.gate_up_proj",
         tp_rank=0,
         tp_size=1,
     ).cuda()

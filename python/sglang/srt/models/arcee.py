@@ -224,12 +224,12 @@ class ArceeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             bias=attention_bias,
         )
-        self.mlp = ArceeMLP(
+        self.ffn = ArceeMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -257,7 +257,7 @@ class ArceeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -474,6 +474,7 @@ class ArceeForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
@@ -504,6 +505,7 @@ class ArceeForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
+
                 if name not in params_dict:
                     continue
 

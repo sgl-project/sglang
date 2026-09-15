@@ -158,6 +158,11 @@ class HYV3ForCausalLMNextN(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("shared_mlp.", "shared_ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         nextn_layer_id = self.config.num_hidden_layers
         nextn_prefix = f"model.layers.{nextn_layer_id}."
         spec_weight_names = ("enorm", "hnorm", "eh_proj")
@@ -214,9 +219,10 @@ class HYV3ForCausalLMNextN(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 is_found = True
@@ -231,9 +237,10 @@ class HYV3ForCausalLMNextN(nn.Module):
                     continue
                 is_expert_weight = True
                 name_mapped = name.replace(weight_name, param_name)
-                if name_mapped not in params_dict:
+                registered_name_mapped = map_weight_name(name_mapped)
+                if registered_name_mapped not in params_dict:
                     continue
-                param = params_dict[name_mapped]
+                param = params_dict[registered_name_mapped]
                 weight_loader = param.weight_loader
                 weight_loader(
                     param,
@@ -246,9 +253,10 @@ class HYV3ForCausalLMNextN(nn.Module):
             if is_expert_weight:
                 continue
 
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

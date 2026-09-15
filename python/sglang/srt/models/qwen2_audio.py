@@ -139,6 +139,10 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -166,18 +170,26 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
                 name_tmp = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
-                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
+                if (
+                    name_tmp.endswith(".bias")
+                    and map_weight_name(name_tmp) not in params_dict
+                ):
                     continue
-                param = params_dict[name_tmp]
+                registered_name_tmp = map_weight_name(name_tmp)
+                param = params_dict[registered_name_tmp]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 try:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                 except KeyError:
                     print(params_dict.keys())
                     raise

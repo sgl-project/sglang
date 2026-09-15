@@ -24,9 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
@@ -253,11 +251,11 @@ class Spark2_5DecoderLayer(nn.Module):
         )
 
         # MLP
-        self.mlp = Spark2_5MLP(
+        self.ffn = Spark2_5MLP(
             config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -285,7 +283,7 @@ class Spark2_5DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -489,6 +487,7 @@ class Spark2_5ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -527,6 +526,7 @@ class Spark2_5ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
+
                 if mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]

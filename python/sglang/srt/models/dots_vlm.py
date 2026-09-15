@@ -98,6 +98,11 @@ class DotsVLMForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = list(weights)
 
         # Separate vision tower weights and language model weights
@@ -117,9 +122,10 @@ class DotsVLMForCausalLM(nn.Module):
             vision_state_dict = dict(vision_weights)
             params_dict = dict(self.named_parameters(remove_duplicate=False))
             for name, loaded_weight in vision_state_dict.items():
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     raise ValueError(f"Weight {name} not found in params_dict")
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
                 weight_loader(param, loaded_weight)

@@ -790,29 +790,29 @@ class BailingMoELinearDecoderLayer(nn.Module):
         is_previous_moe_layer = self._is_layer_sparse(config, self.layer_id - 1)
         is_next_layer_moe_layer = self._is_layer_sparse(config, self.layer_id + 1)
         if self.expert_num == 1:
-            self.mlp = BailingMLP(
+            self.ffn = BailingMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
                 # MoE layer
-                self.mlp = BailingMoE(
+                self.ffn = BailingMoE(
                     config,
                     quant_config=quant_config,
                     layer_id=self.layer_id,
-                    prefix=add_prefix("mlp", prefix),
+                    prefix=add_prefix("ffn", prefix),
                     alt_stream=alt_stream,
                 )
             else:
                 # dense layer
-                self.mlp = BailingMLP(
+                self.ffn = BailingMLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=config.intermediate_size,
                     quant_config=quant_config,
-                    prefix=add_prefix("mlp", prefix),
+                    prefix=add_prefix("ffn", prefix),
                 )
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
         self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
@@ -896,7 +896,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1324,7 +1324,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                 )
 
             if layer_id in moe_layers or is_nextn:
-                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                shared_experts = getattr(layer.ffn, "shared_experts", None)
                 if shared_experts is not None:
                     for module in [
                         shared_experts.gate_up_proj,
@@ -1334,7 +1334,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                             module.weight, module.weight_scale_inv, weight_block_size
                         )
 
-                experts = layer.mlp.experts
+                experts = layer.ffn.experts
                 if isinstance(experts, DeepEPMoE):
                     for w in [
                         experts.w13_weight_fp8,
@@ -1342,11 +1342,11 @@ class BailingMoELinearForCausalLM(nn.Module):
                     ]:
                         requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
-                mlp = layer.mlp
-                assert isinstance(mlp, DeepseekV2MLP)
+                ffn = layer.ffn
+                assert isinstance(ffn, DeepseekV2MLP)
                 for module in [
-                    mlp.gate_up_proj,
-                    mlp.down_proj,
+                    ffn.gate_up_proj,
+                    ffn.down_proj,
                 ]:
                     requant_weight_ue8m0_inplace(
                         module.weight, module.weight_scale_inv, weight_block_size
@@ -1380,11 +1380,14 @@ class BailingMoELinearForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
     ) -> Set[str]:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
+
         def load_linear_attn_weight(
             name: str, loaded_weight: torch.Tensor, self
         ) -> None:
             if is_pp_missing_parameter(name, self):
                 return
+
             param = params_dict[name]
             weight_loader = getattr(
                 param, "weight_loader", BailingMoELinearAttention.weight_direct_load
@@ -1472,12 +1475,13 @@ class BailingMoELinearForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
 
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
@@ -1554,6 +1558,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+
                             if param_name not in params_dict:
                                 continue
                             param = params_dict[param_name]
@@ -1567,6 +1572,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                     else:
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
+
                             if name not in params_dict:
                                 continue
                         if is_pp_missing_parameter(name, self):
@@ -1577,6 +1583,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                             and is_linear_layer(layer_idx, self.model.layer_group_size)
                         ):
                             load_linear_attn_weight(name, loaded_weight, self)
+
                             loaded_params.add(name)
                             continue
 
@@ -1585,6 +1592,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

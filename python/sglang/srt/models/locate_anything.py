@@ -156,6 +156,10 @@ class LocateAnythingForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         # Remap HF checkpoint prefixes onto SGLang submodule names.
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         prefix_mapping = {
             "vision_model.": "vision_tower.",
             "mlp1.0.": "multi_modal_projector.pre_norm.",
@@ -199,15 +203,16 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             )
 
             if is_vision_weight:
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 continue
 
             # Language-model weights: apply Qwen2 stacked shard mapping.
@@ -215,24 +220,29 @@ class LocateAnythingForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped = name.replace(weight_name, param_name)
-                if mapped.endswith(".bias") and mapped not in params_dict:
+                if (
+                    mapped.endswith(".bias")
+                    and map_weight_name(mapped) not in params_dict
+                ):
                     continue
-                if mapped not in params_dict:
+                registered_mapped = map_weight_name(mapped)
+                if registered_mapped not in params_dict:
                     continue
-                param = params_dict[mapped]
+                param = params_dict[registered_mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(mapped)
+                loaded_params.add(registered_mapped)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
 
         # Reconcile: warn about any model parameter that never received a weight,
         # so a partial/mismatched checkpoint is visible in the logs rather than

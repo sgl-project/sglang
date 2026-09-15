@@ -2333,10 +2333,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = DeepseekV2MoE(
+            self.ffn = DeepseekV2MoE(
                 config=config,
                 quant_config=moe_quant_config_override or quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
@@ -2346,12 +2346,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = DeepseekV2MLP(
+            self.ffn = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
@@ -2478,12 +2478,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if isinstance(self.mlp, DeepseekV2MLP):
+        if isinstance(self.ffn, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
         if (
-            isinstance(self.mlp, DeepseekV2MoE)
-            and not self.mlp.experts.moe_runner_config.inplace
+            isinstance(self.ffn, DeepseekV2MoE)
+            and not self.ffn.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
@@ -2497,7 +2497,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
+                hidden_states = self.ffn(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
@@ -2625,9 +2625,9 @@ class DeepseekV2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
             offloader_kwargs=dict(
                 submodule_accessor=lambda layer: (
-                    layer.mlp.experts
-                    if isinstance(layer.mlp, DeepseekV2MoE)
-                    else layer.mlp
+                    layer.ffn.experts
+                    if isinstance(layer.ffn, DeepseekV2MoE)
+                    else layer.ffn
                 ),
                 whitelist_param_names_creator=lambda module: (
                     [
@@ -2668,13 +2668,13 @@ class DeepseekV2Model(nn.Module):
                 [
                     1
                     for i in range(len(self.layers))
-                    if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                    if isinstance(self.layers[i].ffn, DeepseekV2MoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                if isinstance(self.layers[i].ffn, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
                     # Keep the original deepep-class scope here and only add DeepEP v2,
                     # so unrelated backends' allocator sizing is unchanged.
@@ -2938,9 +2938,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
+                if isinstance(self.model.layers[layer_id].ffn, DeepseekV2MoE)
             }
         )
         self.capture_aux_hidden_states = False

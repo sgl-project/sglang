@@ -859,6 +859,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
+
         if (
             self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"

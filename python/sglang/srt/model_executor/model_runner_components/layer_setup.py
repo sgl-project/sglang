@@ -102,8 +102,8 @@ def compute_attention_and_moe_layers(
         ffn = None
         if get_layer_ffn is not None:
             ffn = get_layer_ffn(layer)
-        elif hasattr(layer, "mlp"):
-            ffn = layer.mlp
+        elif hasattr(layer, "ffn"):
+            ffn = layer.ffn
         if hasattr(ffn, "experts"):
             moe_block = ffn.experts
             moe_fusion = ffn

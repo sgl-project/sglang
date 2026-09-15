@@ -6,7 +6,7 @@ before the model is built, so the gate must answer from the config and
 quantization it is handed — no instance, no layers. These cases pin each
 family's branch table, which matters because most of these checkpoints cannot
 be run on a single dev box: a wrong answer here is a silently wrong weight
-remap (the loader remaps `mlp.shared_experts` into a fused slot the layers
+remap (the loader remaps `ffn.shared_experts` into a fused slot the layers
 never allocated), not a crash.
 
 Conditions that depend on the device or the parallel topology are exercised
@@ -336,7 +336,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
     def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
         reason = self._reason_on_cuda(
             self._compressed_tensors(
-                ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+                ["re:.*(ffn|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
             )
         )
         self.assertIn("different quant methods", reason)
@@ -364,7 +364,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
                 bailing_moe_nextn.BailingMoeForCausalLMNextN,
                 config,
                 self._compressed_tensors(
-                    ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+                    ["re:.*(ffn|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
                 ),
             )
 
@@ -658,15 +658,15 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         # The normalization the constructor applies, shared with the gate.
         mixed_bf16_mtp = SimpleNamespace(
             get_name=lambda: "modelopt_mixed",
-            quantized_layers={"model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}},
+            quantized_layers={"model.layers.0.ffn.experts": {"quant_algo": "NVFP4"}},
         )
         self.assertIsNone(_mtp_quant_config(mixed_bf16_mtp))
         # MIXED_PRECISION checkpoints that quantize the MTP head keep it.
         mixed_fp8_mtp = SimpleNamespace(
             get_name=lambda: "modelopt_mixed",
             quantized_layers={
-                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
-                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
+                "model.layers.0.ffn.experts": {"quant_algo": "NVFP4"},
+                "mtp.layers.0.ffn.experts": {"quant_algo": "FP8_BLOCK_SCALES"},
             },
         )
         self.assertIs(_mtp_quant_config(mixed_fp8_mtp), mixed_fp8_mtp)
@@ -681,7 +681,7 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         )
         self.assertIs(_mtp_quant_config(online), online)
         quark_mtp = SimpleNamespace(
-            get_name=lambda: "quark", exclude_layers=["mtp.mlp.experts"]
+            get_name=lambda: "quark", exclude_layers=["mtp.ffn.experts"]
         )
         self.assertIsNone(_mtp_quant_config(quark_mtp))
         kept = _quant("fp8")

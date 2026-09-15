@@ -175,7 +175,7 @@ def _disable_shared_experts_fusion() -> bool:
     )
 
 
-def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
+def _maybe_enable_silu_fp4_quant_fusion(ffn: nn.Module) -> None:
     """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
 
     Replaces the separate act_and_mul and per-token FP4 quantize kernels with
@@ -188,17 +188,17 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
     if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+        isinstance(ffn.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and ffn.gate_up_proj.quant_method.quant_mode == "w4a4"
+        and isinstance(ffn.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return
     try:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
     except ImportError:
         return
-    mlp._enable_silu_fp4_quant_fusion = True
-    mlp.down_proj._accepts_prequantized_fp4 = True
+    ffn._enable_silu_fp4_quant_fusion = True
+    ffn.down_proj._accepts_prequantized_fp4 = True
     logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
@@ -949,7 +949,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
         if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.ffn = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -958,7 +958,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     if (_is_cuda or _disable_shared_experts_fusion())
                     else None
                 ),
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
             )
@@ -966,14 +966,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen2MoeMLP(
+            self.ffn = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".linear_attn", "")),
             )
-            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            _maybe_enable_silu_fp4_quant_fusion(self.ffn)
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
@@ -1053,7 +1053,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         defer_moe_finalize = (
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and isinstance(self.ffn, Qwen2MoeSparseMoeBlock)
             and hasattr(self.layer_communicator, "should_use_finalize")
             and self.layer_communicator.should_use_finalize(
                 forward_batch, int(hidden_states.shape[0])
@@ -1071,14 +1071,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-                hidden_states = self.mlp(
+            if isinstance(self.ffn, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.ffn(
                     hidden_states,
                     forward_batch,
                     defer_finalize=defer_moe_finalize,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.ffn(hidden_states)
         if fuse_mlp_allreduce:
             hidden_states = _finish_mlp_output(
                 hidden_states, expect_deferred=defer_moe_finalize
@@ -1190,18 +1190,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
-            self.mlp = Qwen2MoeMLP(
+            self.ffn = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".self_attn", "")),
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
         elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.ffn = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -1210,7 +1210,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     if (_is_cuda or _disable_shared_experts_fusion())
                     else None
                 ),
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("ffn", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
             )
@@ -1491,7 +1491,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         defer_moe_finalize = (
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
-            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and isinstance(self.ffn, Qwen2MoeSparseMoeBlock)
             and hasattr(self.layer_communicator, "should_use_finalize")
             and self.layer_communicator.should_use_finalize(
                 forward_batch, int(hidden_states.shape[0])
@@ -1507,14 +1507,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-                hidden_states = self.mlp(
+            if isinstance(self.ffn, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.ffn(
                     hidden_states,
                     forward_batch,
                     defer_finalize=defer_moe_finalize,
                 )
             else:
-                hidden_states = self.mlp(hidden_states)
+                hidden_states = self.ffn(hidden_states)
         if fuse_mlp_allreduce:
             hidden_states = _finish_mlp_output(
                 hidden_states, expect_deferred=defer_moe_finalize
@@ -1669,8 +1669,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             unsupported_layers = [
                 layer.layer_id
                 for layer in self.layers
-                if not isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
-                or not layer.mlp.supports_deferred_finalize
+                if not isinstance(layer.ffn, Qwen2MoeSparseMoeBlock)
+                or not layer.ffn.supports_deferred_finalize
             ]
             if unsupported_layers:
                 raise RuntimeError(
@@ -1880,6 +1880,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1925,29 +1929,32 @@ class Qwen3_5ForCausalLM(nn.Module):
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
     @classmethod
@@ -1969,6 +1976,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2022,9 +2033,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             shard_id: str,
             num_experts: int,
         ):
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 return False
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
@@ -2080,13 +2092,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2131,10 +2147,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        param = params_dict[registered_name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
@@ -2154,18 +2171,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
         return loaded_params
 
@@ -2235,6 +2257,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2289,14 +2315,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip layers on other devices.
                 # if is_pp_missing_parameter(name, self):
                 #     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2308,12 +2335,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2327,7 +2355,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         param_lm_head, "weight_loader", default_weight_loader
                     )
                     weight_loader(param_lm_head, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -2380,9 +2409,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if not hasattr(self.model, "layers"):
             return 0
         for layer_id in range(self.model.start_layer, self.model.end_layer):
-            mlp = getattr(self.model.layers[layer_id], "mlp", None)
-            if hasattr(mlp, "num_fused_shared_experts"):
-                return mlp.num_fused_shared_experts
+            ffn = getattr(self.model.layers[layer_id], "ffn", None)
+            if hasattr(ffn, "num_fused_shared_experts"):
+                return ffn.num_fused_shared_experts
         return 0
 
     def get_embed_and_head(self):
@@ -2405,6 +2434,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2495,9 +2528,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_id: str,
             num_experts: int,
         ):
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 return False
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
@@ -2574,13 +2608,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
+                if (
+                    name.endswith(ignore_suffixes)
+                    and map_weight_name(name) not in params_dict
+                ):
                     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -2629,11 +2667,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             )
                         elif self.enable_shared_expert_fusion:
                             # shared experts should be loaded to experts.w13_weight and experts.w2_weight
-                            param = params_dict[name_mapped]
+                            registered_name_mapped = map_weight_name(name_mapped)
+                            param = params_dict[registered_name_mapped]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            param = params_dict[name_mapped]
+                            param = params_dict[registered_name_mapped]
                             if f"{num_experts}.gate_up_proj" in name:
                                 # split into w1 and w3
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -2667,10 +2706,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         # Skip loading extra parameters for GPTQ models.
                         if (
                             name_mapped.endswith(ignore_suffixes)
-                            and name_mapped not in params_dict
+                            and map_weight_name(name_mapped) not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        registered_name_mapped = map_weight_name(name_mapped)
+                        param = params_dict[registered_name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.
@@ -2695,24 +2735,29 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+                if isinstance(self.model.layers[layer_id].ffn, Qwen2MoeSparseMoeBlock)
             }
         )
 

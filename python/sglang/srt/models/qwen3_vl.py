@@ -240,13 +240,13 @@ class Qwen3_VisionBlock(nn.Module):
             use_dp_attention_reduce=is_dp_attention_enabled(),
             workspace_buffer=workspace_buffer,
         )
-        self.mlp = Qwen3_VisionMLP(
+        self.ffn = Qwen3_VisionMLP(
             dim,
             intermediate_dim,
             hidden_act=hidden_act,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
             use_data_parallel=use_data_parallel,
         )
 
@@ -276,8 +276,8 @@ class Qwen3_VisionBlock(nn.Module):
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
         norm2 = self.norm2(x)
-        mlp = self.mlp(norm2)
-        x += mlp
+        ffn = self.ffn(norm2)
+        x += ffn
         return x
 
 
@@ -1076,6 +1076,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def map_weight_name(name: str) -> str:
+            if "merger.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("attn.qkv.", "attn.q.", "q"),
@@ -1091,15 +1097,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     continue
                 name = name.replace(weight_name, param_name)
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
     def _prepare_graph_inputs(
@@ -1580,7 +1589,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens
 
     _lora_pattern = re.compile(
-        r"^model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
+        r"^model\.layers\.(\d+)\.(?:self_attn|ffn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)$"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
@@ -1666,6 +1675,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            if "merger.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1717,13 +1732,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
                 # that were remapped gate_proj -> gate_up_proj but are not params).
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1735,10 +1751,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 try:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name in params_dict.keys():
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict.keys():
+                        param = params_dict[registered_name]
                     else:
                         continue
 

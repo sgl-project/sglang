@@ -491,7 +491,7 @@ class DFlashDecoderLayer(nn.Module):
         config,
         layer_id: int,
         attention_conv: Optional[DFlashGroupedConv] = None,
-        mlp_conv: Optional[DFlashGroupedConv] = None,
+        ffn_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
         prefix: str = "",
     ) -> None:
@@ -508,13 +508,13 @@ class DFlashDecoderLayer(nn.Module):
             prefix=attention_prefix,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        mlp_prefix = f"{prefix}.mlp" if prefix else ""
-        self.mlp = DFlashMLP(
+        mlp_prefix = f"{prefix}.ffn" if prefix else ""
+        self.ffn = DFlashMLP(
             config=config, quant_config=quant_config, prefix=mlp_prefix
         )
 
         self.attention_conv = attention_conv
-        self.mlp_conv = mlp_conv
+        self.ffn_conv = ffn_conv
 
     def forward(
         self,
@@ -551,11 +551,11 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
 
         mlp_kernel = None
-        if self.mlp_conv is not None:
-            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.ffn_conv is not None:
+            hidden_states, mlp_kernel = self.ffn_conv.prepare(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         if mlp_kernel is not None:
-            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+            hidden_states = self.ffn_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -610,7 +610,7 @@ class DFlashDraftModel(nn.Module):
                     config=config,
                     layer_id=i,
                     attention_conv=grouped_conv(),
-                    mlp_conv=grouped_conv(),
+                    ffn_conv=grouped_conv(),
                     quant_config=quant_config,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
@@ -691,7 +691,7 @@ class DFlashDraftModel(nn.Module):
         """
         self.block_size = int(block_size)
         for layer in self.layers:
-            for conv in (layer.attention_conv, layer.mlp_conv):
+            for conv in (layer.attention_conv, layer.ffn_conv):
                 if conv is not None:
                     conv.block_size = self.block_size
 
@@ -765,6 +765,11 @@ class DFlashDraftModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_conv.", "ffn_conv.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -784,18 +789,24 @@ class DFlashDraftModel(nn.Module):
         }
 
         def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
                 return name
             if name.startswith("model."):
                 stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
+                registered_stripped_name = map_weight_name(stripped_name)
+                if registered_stripped_name in params_dict:
                     return stripped_name
             else:
                 prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
+                registered_prefixed_name = map_weight_name(prefixed_name)
+                if registered_prefixed_name in params_dict:
                     return prefixed_name
             aliased_name = _VENDOR_ENCODER_ALIASES.get(name)
-            if aliased_name is not None and aliased_name in params_dict:
+            if (
+                aliased_name is not None
+                and map_weight_name(aliased_name) in params_dict
+            ):
                 return aliased_name
             return None
 
@@ -815,17 +826,19 @@ class DFlashDraftModel(nn.Module):
                 resolved_name = resolve_param_name(mapped_name)
                 if resolved_name is None:
                     continue
-                param = params_dict[resolved_name]
+                registered_resolved_name = map_weight_name(resolved_name)
+                param = params_dict[registered_resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(resolved_name)
+                loaded_params.add(registered_resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
-                param = params_dict[resolved_name]
+                registered_resolved_name = map_weight_name(resolved_name)
+                param = params_dict[registered_resolved_name]
                 if resolved_name.endswith("fc.weight"):
                     if self.is_nemotron_35_draft:
                         expected_shape = (
@@ -863,7 +876,7 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(resolved_name)
+                loaded_params.add(registered_resolved_name)
 
         if self.projector_type == "domino":
             required = {

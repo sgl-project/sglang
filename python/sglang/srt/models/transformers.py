@@ -1250,13 +1250,13 @@ class MoEMixin:
         self.num_shared_experts = num_shared_experts
         self.num_redundant_experts = num_redundant
 
-        def _add_all_reduce(mlp: nn.Module):
-            class MLPWithAllReduce(mlp.__class__):
+        def _add_all_reduce(ffn: nn.Module):
+            class MLPWithAllReduce(ffn.__class__):
                 def forward(self, *args, **kwargs):
                     output = super().forward(*args, **kwargs)
                     return self.experts.maybe_all_reduce_tensor_model_parallel(output)
 
-            mlp.__class__ = MLPWithAllReduce
+            ffn.__class__ = MLPWithAllReduce
 
         def _recursive_replace(module: nn.Module, prefix: str):
             for child_name, child_module in module.named_children():
@@ -1267,14 +1267,14 @@ class MoEMixin:
                 is_3d = len(params) > 0 and all(p.ndim == 3 for p in params)
 
                 if child_name == "experts" and (is_modulelist or is_3d):
-                    mlp = module
+                    ffn = module
                     experts = child_module
 
                     has_bias = any("bias" in n for n, _ in experts.named_parameters())
 
                     nonlocal reduce_results
                     if reduce_results:
-                        if any("shared_expert" in n for n, _ in mlp.named_parameters()):
+                        if any("shared_expert" in n for n, _ in ffn.named_parameters()):
                             reduce_results = False
                             self.num_shared_experts = 1
 
@@ -1293,17 +1293,17 @@ class MoEMixin:
                         with_bias=has_bias,
                         expert_mapping=expert_mapping,
                     )
-                    mlp.experts = fused_experts
+                    ffn.experts = fused_experts
                     log_replacement(qual_name, experts, fused_experts)
 
-                    self.mlp_moe_layers.append(mlp)
+                    self.mlp_moe_layers.append(ffn)
                     self.moe_layers.append(fused_experts)
                     self.num_moe_layers += 1
 
                     if not reduce_results and (
                         fused_experts.tp_size > 1 or fused_experts.ep_size > 1
                     ):
-                        _add_all_reduce(mlp)
+                        _add_all_reduce(ffn)
                 else:
                     _recursive_replace(child_module, prefix=qual_name)
 

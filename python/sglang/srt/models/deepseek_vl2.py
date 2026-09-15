@@ -243,6 +243,10 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return hs
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -258,7 +262,8 @@ class DeepseekVL2ForCausalLM(nn.Module):
                 name = name.replace("language.", "")
                 self.language_model.load_weights([(name, loaded_weight)])
             else:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)
 

@@ -461,10 +461,10 @@ class Lfm2DecoderLayer(nn.Module):
                 prefix=add_prefix("conv", prefix),
             )
 
-        self.feed_forward = Lfm2MLP(
+        self.ffn = Lfm2MLP(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("feed_forward", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -490,9 +490,7 @@ class Lfm2DecoderLayer(nn.Module):
                 hidden_states = self.conv(normed, forward_batch)
 
             hidden_states = hidden_states + residual
-            hidden_states = hidden_states + self.feed_forward(
-                self.ffn_norm(hidden_states)
-            )
+            hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
 
         return hidden_states, residual
 
@@ -627,6 +625,10 @@ class Lfm2BidirectionalModel(Lfm2Model):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -652,25 +654,27 @@ class Lfm2BidirectionalModel(Lfm2Model):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     break
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     break
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
 
         return loaded_params
 
@@ -748,6 +752,10 @@ class Lfm2ForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -777,25 +785,27 @@ class Lfm2ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     break
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     break
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader")
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                loaded_params.add(registered_name)
 
         # Handle tied lm_head weight
         if "lm_head.weight" not in loaded_params and "lm_head.weight" in params_dict:

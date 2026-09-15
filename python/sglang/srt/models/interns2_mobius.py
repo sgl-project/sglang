@@ -186,13 +186,13 @@ def _expected_mobius_load_slots(
         if parameter_id in seen_parameters:
             continue
         seen_parameters.add(parameter_id)
-        if ".meta_mlp." in name and name.endswith(
+        if ".meta_ffn." in name and name.endswith(
             ("experts.w13_weight", "experts.w13_weight_scale_inv")
         ):
             for expert_id in range(num_experts):
                 expected.add((name, "w1", expert_id))
                 expected.add((name, "w3", expert_id))
-        elif ".meta_mlp." in name and name.endswith(
+        elif ".meta_ffn." in name and name.endswith(
             ("experts.w2_weight", "experts.w2_weight_scale_inv")
         ):
             for expert_id in range(num_experts):
@@ -200,7 +200,7 @@ def _expected_mobius_load_slots(
         elif ".qkv_proj." in name and name.startswith("model.layers."):
             for shard_id in ("q", "k", "v"):
                 expected.add((name, shard_id, None))
-        elif ".mlp.shared_expert.gate_up_proj." in name:
+        elif ".ffn.shared_expert.gate_up_proj." in name:
             for shard_id in (0, 1):
                 expected.add((name, shard_id, None))
         elif ".in_proj_qkvz." in name:
@@ -221,13 +221,19 @@ def _load_mobius_weights_strict(
     config: InternS2MobiusTextConfig,
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> set[str]:
+    def map_weight_name(name: str) -> str:
+        name = name.replace("meta_mlp.", "meta_ffn.")
+        name = name.replace("mlp.", "ffn.")
+        return name
+
     params_dict = dict(owner.named_parameters(remove_duplicate=False))
     expected_slots = _expected_mobius_load_slots(params_dict, config.num_experts)
     loaded_slots: set[tuple[str, object, int | None]] = set()
     loaded_sources: set[str] = set()
 
     def record_slot(name, shard_id=None, expert_id=None):
-        slot = (name, shard_id, expert_id)
+        registered_name = map_weight_name(name)
+        slot = (registered_name, shard_id, expert_id)
         if slot in loaded_slots:
             raise ValueError(f"Mobius destination load is duplicated: {slot}")
         loaded_slots.add(slot)
@@ -248,8 +254,9 @@ def _load_mobius_weights_strict(
                 "experts.down_proj_scale_inv",
             )
         ):
+            registered_name = map_weight_name(name)
             _load_fused_mobius_expert_weight(
-                name=name,
+                name=registered_name,
                 loaded_weight=loaded_weight,
                 params_dict=params_dict,
                 num_experts=config.num_experts,
@@ -264,25 +271,27 @@ def _load_mobius_weights_strict(
             if name.startswith("visual."):
                 continue
             destination = name.replace(weight_name, parameter_name)
-            if destination not in params_dict:
+            registered_destination = map_weight_name(destination)
+            if registered_destination not in params_dict:
                 raise KeyError(
                     f"Mobius packed destination is missing: {destination} "
                     f"(from {source_name})"
                 )
-            parameter = params_dict[destination]
+            parameter = params_dict[registered_destination]
             loader = parameter.weight_loader
             record_slot(destination, shard_id)
             loader(parameter, loaded_weight, shard_id)
             break
         else:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 raise KeyError(
                     f"Mobius destination is missing: {name} (from {source_name})"
                 )
-            parameter = params_dict[name]
+            parameter = params_dict[registered_name]
             loader = getattr(parameter, "weight_loader", default_weight_loader)
             if _is_optional_mobius_parameter(name):
-                expected_slots.add((name, None, None))
+                expected_slots.add((registered_name, None, None))
             record_slot(name)
             loader(parameter, loaded_weight)
 
@@ -381,12 +390,12 @@ def _mobius_reduce_combined_output(combined: torch.Tensor) -> torch.Tensor:
     return combined
 
 
-def _get_mobius_routed_bank(meta_mlp: nn.ModuleList, layer_id: int) -> nn.Module:
-    if not meta_mlp:
+def _get_mobius_routed_bank(meta_ffn: nn.ModuleList, layer_id: int) -> nn.Module:
+    if not meta_ffn:
         raise ValueError(
             "Intern-S2-Mobius requires at least one physical routed-expert bank"
         )
-    return meta_mlp[layer_id % len(meta_mlp)]
+    return meta_ffn[layer_id % len(meta_ffn)]
 
 
 class _InternS2MobiusDecoderMixin:
@@ -396,17 +405,17 @@ class _InternS2MobiusDecoderMixin:
         quant_config: QuantizationConfig | None,
         layer_prefix: str,
     ) -> None:
-        self.mlp = InternS2MobiusLayerMlp(
+        self.ffn = InternS2MobiusLayerMlp(
             config=config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", layer_prefix),
+            prefix=add_prefix("ffn", layer_prefix),
         )
 
     def _forward_mobius_mlp(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        meta_mlp: nn.ModuleList,
+        meta_ffn: nn.ModuleList,
     ) -> torch.Tensor:
         # Evaluate the layer-local branch first. Besides matching the intended
         # equation, this prevents a broken/in-place routed backend from
@@ -414,11 +423,11 @@ class _InternS2MobiusDecoderMixin:
         if hidden_states.shape[0] == 0:
             shared = torch.zeros_like(hidden_states)
         else:
-            shared = self.mlp.shared_expert(hidden_states)
-            gate, _ = self.mlp.shared_expert_gate(hidden_states)
+            shared = self.ffn.shared_expert(hidden_states)
+            gate, _ = self.ffn.shared_expert_gate(hidden_states)
             shared = torch.sigmoid(gate) * shared
 
-        routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
+        routed = _get_mobius_routed_bank(meta_ffn, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
         return _mobius_reduce_combined_output(routed + shared)
@@ -428,7 +437,7 @@ class _InternS2MobiusDecoderMixin:
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-        meta_mlp: nn.ModuleList,
+        meta_ffn: nn.ModuleList,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -442,7 +451,7 @@ class _InternS2MobiusDecoderMixin:
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             hidden_states = self._forward_mobius_mlp(
-                hidden_states, forward_batch, meta_mlp
+                hidden_states, forward_batch, meta_ffn
             )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -524,7 +533,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        meta_mlp: nn.ModuleList,
+        meta_ffn: nn.ModuleList,
         **kwargs,
     ):
         forward_batch = kwargs["forward_batch"]
@@ -539,7 +548,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
         return self._forward_after_attention(
-            hidden_states, residual, forward_batch, meta_mlp
+            hidden_states, residual, forward_batch, meta_ffn
         )
 
 
@@ -661,7 +670,7 @@ class InternS2MobiusAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         forward_batch: ForwardBatch,
-        meta_mlp: nn.ModuleList,
+        meta_ffn: nn.ModuleList,
         captured_last_layer_outputs: list[torch.Tensor] | None = None,
         **kwargs,
     ):
@@ -681,7 +690,7 @@ class InternS2MobiusAttentionDecoderLayer(
                 forward_batch=forward_batch,
             )
         return self._forward_after_attention(
-            hidden_states, residual, forward_batch, meta_mlp
+            hidden_states, residual, forward_batch, meta_ffn
         )
 
 
@@ -710,18 +719,18 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
         )
 
         bank_prefix = prefix.replace("model.language_model", "model")
-        self.meta_mlp = nn.ModuleList(
+        self.meta_ffn = nn.ModuleList(
             [
                 InternS2MobiusRoutedExpertBank(
                     bank_id=bank_id,
                     config=config,
                     quant_config=quant_config,
-                    prefix=add_prefix(f"meta_mlp.{bank_id}", bank_prefix),
+                    prefix=add_prefix(f"meta_ffn.{bank_id}", bank_prefix),
                 )
                 for bank_id in range(config.num_blocks)
             ]
         )
-        if len(self.meta_mlp) != config.num_blocks:
+        if len(self.meta_ffn) != config.num_blocks:
             raise AssertionError(
                 "physical routed-expert bank count does not match num_blocks"
             )
@@ -789,7 +798,7 @@ class InternS2MobiusForCausalLM(Qwen3_5ForCausalLM):
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
-                meta_mlp=self.meta_mlp,
+                meta_ffn=self.meta_ffn,
                 captured_last_layer_outputs=(
                     aux_hidden_states
                     if getattr(layer, "_is_layer_to_capture", False)

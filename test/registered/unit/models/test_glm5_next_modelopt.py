@@ -14,19 +14,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 NVIDIA_EXCLUDE_MODULES = [
     "model.language_model.embed_tokens",
     "model.language_model.layers.11.self_attn*",
-    "model.language_model.layers.11.mlp.gate",
-    "model.language_model.layers.11.mlp.shared_experts*",
+    "model.language_model.layers.11.ffn.gate",
+    "model.language_model.layers.11.ffn.shared_experts*",
     "model.visual*",
 ]
 
 RADIXARK_EXCLUDE_MODULES = [
     "model.language_model.embed_tokens",
     "model.language_model.layers.11.self_attn*",
-    "model.language_model.layers.11.mlp.gate",
+    "model.language_model.layers.11.ffn.gate",
     "model.visual*",
     "model.embed_tokens",
     "model.layers.11.self_attn*",
-    "model.layers.11.mlp.gate",
+    "model.layers.11.ffn.gate",
     "model.language_model.layers.45*",
     "model.layers.45*",
     "visual*",
@@ -67,7 +67,7 @@ class TestGlm5NextModelOpt(CustomTestCase):
                 self.assertTrue(
                     config.is_layer_excluded("model.layers.11.self_attn.kv_b_proj")
                 )
-                self.assertTrue(config.is_layer_excluded("model.layers.11.mlp.gate"))
+                self.assertTrue(config.is_layer_excluded("model.layers.11.ffn.gate"))
                 self.assertTrue(
                     config.is_layer_excluded("visual.blocks.0.attn.qkv_proj")
                 )

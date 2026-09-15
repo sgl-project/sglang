@@ -127,6 +127,10 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         llm_stacked_params = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -178,20 +182,25 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 name_tmp = name.replace(weight_name, param_name)
-                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
+                if (
+                    name_tmp.endswith(".bias")
+                    and map_weight_name(name_tmp) not in params_dict
+                ):
                     continue
-                if name_tmp not in params_dict:
+                registered_name_tmp = map_weight_name(name_tmp)
+                if registered_name_tmp not in params_dict:
                     continue
-                param = params_dict[name_tmp]
+                param = params_dict[registered_name_tmp]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

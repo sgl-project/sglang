@@ -148,7 +148,7 @@ class PhiLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PhiMLP(config, quant_config, prefix=add_prefix("mlp", prefix))
+        self.ffn = PhiMLP(config, quant_config, prefix=add_prefix("ffn", prefix))
 
     def forward(
         self,
@@ -163,7 +163,7 @@ class PhiLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        feed_forward_hidden_states = self.mlp(hidden_states)
+        feed_forward_hidden_states = self.ffn(hidden_states)
         hidden_states = attn_outputs + feed_forward_hidden_states + residual
         return hidden_states
 
@@ -281,8 +281,9 @@ class PhiForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
-        weights = dict(weights)
+        weights = dict((name, weight) for name, weight in weights)
         loaded_keys = set()
 
         for name, param in params_dict.items():

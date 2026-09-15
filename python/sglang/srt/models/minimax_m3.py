@@ -1305,22 +1305,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = MiniMaxM3MoE(
+            self.ffn = MiniMaxM3MoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = MiniMaxM3MLP(
+            self.ffn = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 intermediate_size=config.dense_intermediate_size,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
@@ -1409,7 +1409,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse or hidden_states.shape[0] != 0:
-            hidden_states = self.mlp(
+            hidden_states = self.ffn(
                 hidden_states,
                 forward_batch=forward_batch,
                 should_allreduce_fusion=should_allreduce_fusion,
@@ -1555,7 +1555,7 @@ class MiniMaxM3Model(nn.Module):
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+        orig_to_new_substr={".block_sparse_moe.": ".ffn."}
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1690,6 +1690,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
 
         stacked_params_mapping = [
             # Leading "." on ".qkv_proj" prevents it from falsely matching the sparse
@@ -1725,12 +1726,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             ):
                 continue
 
-            name = name.replace(".block_sparse_moe", ".mlp")
+            name = name.replace(".block_sparse_moe", ".ffn")
 
-            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            if self.num_fused_shared_experts > 0 and "ffn.shared_experts" in name:
                 name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.num_local_experts}",
+                    "ffn.shared_experts",
+                    f"ffn.experts.{self.config.num_local_experts}",
                 )
                 name = name.replace("gate_proj", "w1")
                 name = name.replace("down_proj", "w2")
@@ -1748,11 +1749,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     continue
                 # Must skip experts before the name.replace below, else gate_proj ->
                 # gate_up_proj -> gate_gate_up_proj double-remap breaks load.
-                if "mlp.experts." in name:
+                if "ffn.experts." in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -1771,6 +1773,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         continue
 
@@ -1807,6 +1810,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                             continue
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
             loaded_params.add(name)
 
         # Run before the loader's process pass: the raw fp8 weight + uint8 scale are

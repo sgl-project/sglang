@@ -164,8 +164,8 @@ class GPTBigCodeBlock(nn.Module):
             layer_id, config, quant_config, prefix=add_prefix("attn", prefix)
         )
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.mlp = GPTBigMLP(
-            inner_dim, config, quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = GPTBigMLP(
+            inner_dim, config, quant_config, prefix=add_prefix("ffn", prefix)
         )
 
     def forward(
@@ -183,7 +183,7 @@ class GPTBigCodeBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states)
+        feed_forward_hidden_states = self.ffn(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
         return hidden_states
@@ -281,6 +281,7 @@ class GPTBigCodeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:
@@ -289,6 +290,7 @@ class GPTBigCodeForCausalLM(nn.Module):
                 # Skip attention mask.
                 # NOTE: "c_attn.bias" should not be skipped.
                 continue
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             # TODO (@robertgshaw2-neuralmagic): move to fp8 linear method

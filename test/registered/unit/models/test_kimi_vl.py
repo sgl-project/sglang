@@ -93,8 +93,8 @@ class TestKimiVLEncoderParallelism(CustomTestCase):
 
         self.assertIsInstance(layer.attn.qkv_proj, QKVParallelLinear)
         self.assertIsInstance(layer.attn.proj, RowParallelLinear)
-        self.assertIsInstance(layer.mlp.fc0, ColumnParallelLinear)
-        self.assertIsInstance(layer.mlp.fc1, RowParallelLinear)
+        self.assertIsInstance(layer.ffn.fc0, ColumnParallelLinear)
+        self.assertIsInstance(layer.ffn.fc1, RowParallelLinear)
 
     def test_encoder_dp_uses_existing_mrope_sharding_helper(self):
         model = _bare_model(use_data_parallel=True)
