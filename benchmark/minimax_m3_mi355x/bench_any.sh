@@ -9,7 +9,7 @@ RESULT_DIR=/scratch/results/aiperf_${TAG}_c${CONC}
 [ -d "$RESULT_DIR" ] && mv "$RESULT_DIR" "${RESULT_DIR}_prev_$(date -u +%H%M%S)"
 mkdir -p $RESULT_DIR
 # an orphaned client on this port would corrupt the measurement, so refuse to start
-LOCK=/scratch/run/aiperf_port${PORT}.lock
+LOCK=/tmp/aiperf_port${PORT}.lock
 if [ -f "$LOCK" ] && kill -0 "$(cat $LOCK)" 2>/dev/null; then echo "ERROR: aiperf client pid $(cat $LOCK) for port $PORT still alive"; exit 2; fi
 echo $$ > $LOCK
 trap 'rm -f $LOCK' EXIT
@@ -23,7 +23,7 @@ SAMPLER=$!
 ( while true; do sleep 60; curl -s $URL/metrics > $RESULT_DIR/server_metrics_$(date -u +%H%M%S).prom; done ) &
 SNAP=$!
 START=$(date -u +%FT%TZ)
-${AIPERF_BIN:-/scratch/aiperf-venv/bin/aiperf} profile \
+${AIPERF_BIN:-/scratch/aiperf-sa-venv/bin/aiperf} profile \
   --scenario inferencex-agentx-mvp \
   --url "$URL" \
   --endpoint /v1/chat/completions \
