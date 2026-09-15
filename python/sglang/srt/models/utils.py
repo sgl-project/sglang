@@ -528,6 +528,23 @@ def apply_qk_norm(
             eps=q_eps,
         )
         return q, k
+    elif (
+        q.device.type == "cpu"
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and q_eps == k_eps
+        and q_norm.weight.shape == (head_dim,)
+        and k_norm.weight.shape == (head_dim,)
+    ):
+        torch.ops.sgl_kernel.fused_inplace_qknorm_cpu(
+            q=q.view(batch_size, -1, head_dim),
+            k=k.view(batch_size, -1, head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            eps=q_eps,
+            head_dim=head_dim,
+        )
+        return q, k
 
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()

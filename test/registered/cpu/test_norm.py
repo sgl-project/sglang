@@ -1,3 +1,4 @@
+import math
 import sys
 from typing import Optional, Tuple, Union
 
@@ -311,6 +312,77 @@ class TestFusedQKRMSNorm:
 
         assert global_sum_sq.shape == (batch_size, 2)
         assert global_sum_sq.dtype == torch.float32
+
+
+class TestFusedInplaceQKNorm:
+    @staticmethod
+    def _make_guarded_tensor(shape, dtype):
+        numel = math.prod(shape)
+        guard_numel = numel * shape[1]
+        storage = torch.full((guard_numel,), 42.0, dtype=dtype)
+        tensor = storage[:numel].view(shape)
+        tensor.copy_(torch.randn(shape, dtype=dtype))
+        return tensor, storage[numel:]
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,tp_size",
+        [(1, 1), (17, 1), (17, 2)],
+        ids=["decode-tp1", "prefill-tp1", "prefill-tp2"],
+    )
+    def test_fused_inplace_qknorm_muse_glimmer(
+        self, batch_size: int, tp_size: int, dtype: torch.dtype
+    ):
+        """Muse-Glimmer QKNorm must not write outside its in-place Q/K views."""
+        head_dim = 128
+        num_q_heads = 32 // tp_size
+        num_kv_heads = max(1, 2 // tp_size)
+        q, q_guard = self._make_guarded_tensor(
+            (batch_size, num_q_heads, head_dim), dtype
+        )
+        k, k_guard = self._make_guarded_tensor(
+            (batch_size, num_kv_heads, head_dim), dtype
+        )
+        q_guard_before = q_guard.clone()
+        k_guard_before = k_guard.clone()
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+        ref_q = TestNorm()._forward_native(q.clone(), q_weight, eps)
+        ref_k = TestNorm()._forward_native(k.clone(), k_weight, eps)
+        q_data_ptr = q.data_ptr()
+        k_data_ptr = k.data_ptr()
+
+        torch.ops.sgl_kernel.fused_inplace_qknorm_cpu(
+            q, k, q_weight, k_weight, eps, head_dim
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
+        torch.testing.assert_close(q_guard, q_guard_before, atol=0, rtol=0)
+        torch.testing.assert_close(k_guard, k_guard_before, atol=0, rtol=0)
+        assert q.data_ptr() == q_data_ptr
+        assert k.data_ptr() == k_data_ptr
+
+    @pytest.mark.parametrize("tensor_name", ["q", "k"])
+    def test_fused_inplace_qknorm_rejects_non_contiguous_input(self, tensor_name):
+        head_dim = 128
+        qkv = torch.randn(8, (32 + 2 + 2) * head_dim, dtype=torch.bfloat16)
+        q_flat, k_flat, _ = qkv.split(
+            [32 * head_dim, 2 * head_dim, 2 * head_dim], dim=-1
+        )
+        q = q_flat.view(8, 32, head_dim)
+        k = k_flat.view(8, 2, head_dim)
+        if tensor_name == "q":
+            k = k.contiguous()
+        else:
+            q = q.contiguous()
+        weight = torch.ones(head_dim, dtype=torch.bfloat16)
+
+        with pytest.raises(RuntimeError, match=f"{tensor_name} must be contiguous"):
+            torch.ops.sgl_kernel.fused_inplace_qknorm_cpu(
+                q, k, weight, weight, eps, head_dim
+            )
 
 
 class TestLayerNorm:
