@@ -725,13 +725,15 @@ class RadixCache(BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
-        child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -740,10 +742,10 @@ class RadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                key_offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if key_offset < key_len:
+                    child_key = key.child_key_at(key_offset, self.page_size)
 
         return value, node
 
@@ -795,18 +797,20 @@ class RadixCache(BasePrefixCache):
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
-        if len(key) == 0:
+        key_len = len(key)
+        if key_len == 0:
             return 0, node
 
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match_at(key, key_offset, page_size=self.page_size)
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            key_offset += prefix_len
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
@@ -817,10 +821,11 @@ class RadixCache(BasePrefixCache):
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if key_offset < key_len:
+                child_key = key.child_key_at(key_offset, self.page_size)
 
-        if len(key):
+        if key_offset < key_len:
+            key = key[key_offset:]
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
