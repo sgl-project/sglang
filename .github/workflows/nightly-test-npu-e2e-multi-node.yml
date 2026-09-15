@@ -157,8 +157,9 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
-          # Append the image tag so runs of the same case with different images
-          # (e.g. CANN 9.0.0 vs 9.1.0) persist logs/output into distinct directories.
+          # Append the image tag to the workflow-name segment so that runs with
+          # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
+          # image-tagged output/log directories.
           image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
           workflow_name="${workflow_name}--${image_label}"
 
