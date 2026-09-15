@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -953,20 +954,26 @@ class KimiK3MoE(nn.Module):
 
     def _select_experts(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         """Select logical experts and remap them to their loaded physical slots."""
-        topk_output = self.topk(
+        if int(os.getenv("ASCEND_FAKE_TOPK", "0")):
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=self._expert_location_dispatch_info(),
+            )
+            from sglang.srt.layers.moe.topk import (
+                StandardTopKOutput,
+            )
+            topk_output = StandardTopKOutput(
+                topk_output.topk_weights,
+                self.fake_topk[:hidden_states.shape[0]],
+                topk_output.router_logits,
+            )
+            return topk_output
+        return self.topk(
             hidden_states,
             router_logits,
             expert_location_dispatch_info=self._expert_location_dispatch_info(),
         )
-        # from sglang.srt.layers.moe.topk import (
-        #     StandardTopKOutput,
-        # )
-        # topk_output = StandardTopKOutput(
-        #     topk_output.topk_weights,
-        #     self.fake_topk[:hidden_states.shape[0]],
-        #     topk_output.router_logits,
-        # )
-        return topk_output
 
     @cached_property
     def _ep_front_eligible(self) -> bool:
