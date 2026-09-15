@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
