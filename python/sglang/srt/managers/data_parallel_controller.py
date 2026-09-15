@@ -748,9 +748,8 @@ class DataParallelController:
             info.get("startup_time") for info in scheduler_info
         )
 
-    def dispatch_health_check(self, req: Req):
-        # Preserve the existing PD/disaggregation routing contract; follow_bootstrap_room does not share
-        # mutable user load-balancing state.
+    def dispatch_health_check(self, req: Req) -> None:
+        # This policy routes by request metadata, not shared load-balancing state.
         if self.load_balance_method == LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM:
             self.follow_bootstrap_room_scheduler(req)
             return
@@ -762,21 +761,12 @@ class DataParallelController:
         if not active:
             raise RuntimeError("No active DP workers are available for health checks.")
 
-        attempts = 0
-        while attempts < len(active):
-            slot = active[self.health_round_robin_counter % len(active)]
-            self.health_round_robin_counter = (
-                self.health_round_robin_counter + 1
-            ) % len(active)
-            if self.status[slot]:
-                logger.debug(f"Choose worker {slot} for health check")
-                sock_send(self.workers[slot], req)
-                return
-            attempts += 1
-        raise RuntimeError(
-            f"Cannot route health check: all {len(active)} active DP workers "
-            "are unavailable."
-        )
+        slot = active[self.health_round_robin_counter % len(active)]
+        self.health_round_robin_counter = (
+            self.health_round_robin_counter + 1
+        ) % len(active)
+        logger.debug(f"Choose worker {slot} for health check")
+        sock_send(self.workers[slot], req)
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
