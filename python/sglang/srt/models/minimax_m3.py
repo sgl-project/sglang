@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -86,7 +87,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -122,6 +123,9 @@ _FP8_KV_DTYPES = (
 # rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
+
+# Large prefill batches can favor separate activation and quantization kernels.
+_M3_FUSED_SWIGLU_MAX_TOKENS = 1024
 
 _has_rocm_qk_norm_rope = False
 if _is_hip:
@@ -308,6 +312,30 @@ class MiniMaxM3MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
 
+        self._fuse_swiglu_mxfp8 = False
+        self._swiglu_quant_params = (
+            config.swiglu_alpha if hidden_act == "swigluoai" else None,
+            config.swiglu_limit if hidden_act == "swigluoai" else None,
+        )
+        if (
+            _is_cuda
+            and _device_sm in (100, 103)
+            and hidden_act == "swigluoai"
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and envs.SGLANG_OPT_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get()
+        ):
+            from sglang.srt.layers.quantization.fp8_utils import (
+                _deepgemm_w8a8_mxfp8_linear_with_fallback,
+            )
+
+            proj = self.down_proj
+            self._fuse_swiglu_mxfp8 = (
+                getattr(proj.quant_method, "w8a8_mxfp8_linear", None)
+                is _deepgemm_w8a8_mxfp8_linear_with_fallback
+                and proj.weight.shape[0] % 64 == 0
+                and proj.weight.shape[1] % 128 == 0
+            )
+
     def forward(
         self,
         x,
@@ -316,7 +344,20 @@ class MiniMaxM3MLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if (
+            self._fuse_swiglu_mxfp8
+            and gate_up.ndim == 2
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and 0 < gate_up.shape[0] <= _M3_FUSED_SWIGLU_MAX_TOKENS
+            and not get_forward().sp_active
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.moe.minimax_m3_swiglu_deepgemm import swiglu_quant
+
+            x = swiglu_quant(gate_up, *self._swiglu_quant_params)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
