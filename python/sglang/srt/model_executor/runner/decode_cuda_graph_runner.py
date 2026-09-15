@@ -1086,7 +1086,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    f"Capturing batches ({bs=} num_tokens={bs * self.captured_req_width} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
