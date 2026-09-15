@@ -46,11 +46,12 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     # Default true, both cause failures on CI, Keep off.
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
     # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2048",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "60",
-    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
@@ -90,6 +91,8 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     # Default true, both cause failures on CI, Keep off.
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
+    "SGLANG_DSPARK_QUANT_AUDIT": "1",
+    "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
     # deepep
     "HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
@@ -202,15 +205,17 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     36,
     40,
     48,
-    # MTP (EAGLE) configuration.
+    # MTP (DSPARK) configuration.
     "--speculative-algorithm",
-    "EAGLE",
-    "--speculative-num-steps",
-    2,
-    "--speculative-eagle-topk",
-    1,
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
     "--speculative-num-draft-tokens",
-    3,
+    6,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep deployment.
