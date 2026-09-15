@@ -1,12 +1,16 @@
 // Custom all-reduce kernels over the decoupled Communicator storage plane.
 //
-// Three algorithms are provided behind one entry point:
+// Four algorithms are provided behind one entry point:
 //   - 1shot_push: lamport-style push of local data to every peer's push
 //     workspace, then a local polling reduce (best at small sizes).
 //   - 1shot_pull: every rank reduces all peers' data (from the symmetric pull
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
+//   - 2shot_push: the same reduce-scatter / all-gather split, but both
+//     halves push. Readiness rides in the data — the same pos-zero marker
+//     1shot_push uses, which is what "push" names here — so neither half
+//     needs a barrier and no rank ever reads a peer's input.
 //
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
@@ -61,6 +65,17 @@ struct AllReducePullParams {
   PullWorkSpace<kWorldSize> ws;
 };
 
+template <uint32_t kWorldSize>
+struct AllReduce2ShotPushParams {
+  const void* __restrict__ input;
+  void* __restrict__ output;
+  uint32_t num_vecs;
+  uint32_t rank;
+  uint32_t slot_vecs;                 // div_ceil(num_vecs, kWorldSize): shard slot stride
+  PushWorkSpace<kWorldSize> scatter;  // one shard slot per source
+  PushWorkSpace<kWorldSize> gather;   // the shared push plane, flat per half
+};
+
 /// `vec_offset` is a *vector index* and must stay folded into the base pointers
 /// here: a typed 32-bit bias becomes one widening multiply-add off a
 /// constant-bank base, which ptxas keeps on the uniform datapath, so the whole
@@ -74,7 +89,10 @@ struct LoadStoreImpl {
   static constexpr uint32_t size() {
     return kWorldSize;
   }
-  SGL_DEVICE LoadStoreImpl(const AllReducePullParams<kWorldSize>& params, uint32_t vec_offset = 0) {
+  /// Templated on the params struct so kernels whose params carry extra
+  /// workspaces reuse the same peer table.
+  template <typename Params>
+  SGL_DEVICE LoadStoreImpl(const Params& params, uint32_t vec_offset = 0) {
     if constexpr (kUseGraph) {
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -261,6 +279,136 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   barrier.arrive_rel_acq(/*n=*/1);
 }
 
+/// Barrier-free two-shot all-reduce with a *pushed* reduce-scatter.
+///
+///   A: push my input, shard-wise, into each owner's scatter slot;
+///   B: poll my own scatter slots, reduce my shard, push it into every peer's
+///      gather half of the shared push plane, restore the scatter markers;
+///   C: drain my gather half into the output, restoring its markers.
+template <typename T, uint32_t kWorldSize, bool kUsePDL, bool kUseMc = false>
+ALL_REDUCE_KERNEL void
+all_reduce_2shot_push_kernel(const __grid_constant__ AllReduce2ShotPushParams<kWorldSize> params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  using Lamport = distributed::LamportTrait<T, kVecSize * 2, /*kAtom=*/4>;
+  const auto r = params.rank;
+  const auto num_vecs = params.num_vecs;
+  const auto slot_vecs = params.slot_vecs;
+  const auto num_threads = blockDim.x * gridDim.x;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
+  const auto scatter_epoch = distributed::PushEpoch<kWorldSize>{params.scatter};
+  const auto gather_epoch = distributed::PushEpoch<kWorldSize>{params.gather};
+
+  const auto my_lo = r * slot_vecs;
+  const auto my_hi = min((r + 1) * slot_vecs, num_vecs);
+  const auto my_len = my_hi > my_lo ? my_hi - my_lo : 0;
+
+  // A: scatter my input to the owners (my own shard is read locally in B).
+  // Each warp takes one destination -- rotated so every peer's ingress port
+  // is busy from the first wave -- instead of a vid loop deriving the
+  // destination by a runtime division per vector. The slot pointer is then
+  // warp-uniform, the lanes write coalesced runs, and every warp has work at
+  // every size.
+  {
+    constexpr uint32_t kFan = kWorldSize - 1;
+    const auto warp = global_tid / 32;
+    const auto lane = global_tid % 32;
+    const auto num_warps = num_threads / 32;
+    auto dst = r + 1 + warp % kFan;
+    if (dst >= kWorldSize) dst -= kWorldSize;
+    const auto group_warps = num_warps / kFan + (warp % kFan < num_warps % kFan ? 1 : 0);
+    const auto lo = min(dst * slot_vecs, num_vecs);
+    const auto len = min(lo + slot_vecs, num_vecs) - lo;
+    const auto slot = scatter_epoch.slot_ptr(dst, r);
+    for (auto lid = (warp / kFan) * 32 + lane; lid < len; lid += group_warps * 32) {
+      vec_t vec;
+      vec.load(params.input, lo + lid);
+      Lamport::clear_pos_zero(vec.data());
+      ptx::st_relaxed_16B(vec, slot, lid);
+    }
+  }
+
+  vec_t pos_zero_vec;
+  Lamport::fill_pos_zero(pos_zero_vec.data());
+
+  const bool spread_shard = my_len * 4 <= num_threads;
+  const auto tid_bc = spread_shard
+      ? (blockIdx.x + gridDim.x * (threadIdx.x / 32)) * 32 + (threadIdx.x % 32)
+      : global_tid;
+
+  // B: reduce my shard out of my scatter slots, fan the result out
+  for (auto lid = tid_bc; lid < my_len; lid += num_threads) {
+    const auto vid = my_lo + lid;
+    vec_t vecs[kWorldSize];
+#pragma unroll
+    for (uint32_t src = 0; src < kWorldSize; ++src) {
+      if (src == r) vecs[src].load(params.input, vid);
+    }
+    do {
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t src = 0; src < kWorldSize; ++src) {
+        if (src != r) {
+          ptx::ld_relaxed_16B(vecs[src], scatter_epoch.slot_ptr(r, src), lid);
+          has_zero |= Lamport::has_pos_zero(vecs[src].data());
+        }
+      }
+      if (!has_zero) break;
+    } while (true);
+    vec_t out = reduce_vec(vecs);
+    Lamport::clear_pos_zero(out.data());
+    if constexpr (kUseMc) {
+      // one multimem store instead of the unicast fan-out (total egress
+      // 1.5S -> 1.0S). It also lands in our own gather half, which nobody
+      // drains; phase C restores those markers so the shared slots come
+      // back clean for the plane's next user.
+      ptx::st_multimem_16B(out, params.gather.mc_workspace + gather_epoch.slot_offset(), vid);
+    } else {
+#pragma unroll
+      for (uint32_t dst = 0; dst < kWorldSize; ++dst) {
+        if (dst != r) ptx::st_relaxed_16B(out, gather_epoch.slot_ptr(dst), vid);
+      }
+    }
+    out.store(params.output, vid);
+#pragma unroll
+    for (uint32_t src = 0; src < kWorldSize; ++src) {
+      if (src != r) ptx::st_global_16B(pos_zero_vec, scatter_epoch.slot_ptr(r, src), lid);
+    }
+  }
+
+  // C: drain the gather half (everyone else's shards) into the output
+  const auto local_gather = gather_epoch.slot_ptr(r);
+  const auto num_remote_vecs = num_vecs - my_len;
+  for (auto rid = tid_bc; rid < num_remote_vecs; rid += num_threads) {
+    const auto vid = rid < my_lo ? rid : rid + my_len;
+    vec_t vec;
+    do {
+      ptx::ld_relaxed_16B(vec, local_gather, vid);
+      if (!Lamport::has_pos_zero(vec.data())) break;
+    } while (true);
+    vec.store(params.output, vid);
+    ptx::st_global_16B(pos_zero_vec, local_gather, vid);
+  }
+
+  if constexpr (kUseMc) {
+    for (auto lid = tid_bc; lid < my_len; lid += num_threads) {
+      const auto vid = my_lo + lid;
+      vec_t vec;
+      do {
+        ptx::ld_relaxed_16B(vec, local_gather, vid);
+        if (!Lamport::has_pos_zero(vec.data())) break;
+      } while (true);
+      ptx::st_global_16B(pos_zero_vec, local_gather, vid);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  gather_epoch.flip();  // one flip: both regions share the plane's counter
+}
+
 template <uint32_t N>
 __global__ void memcpy_kernel(void* __restrict__ dst, const void* __restrict__ src, uint32_t num_vecs) {
   static_assert(N % 4 == 0, "at least 4-bytes aligned for uint32_t load/store");
@@ -305,7 +453,7 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push") << algo;
+    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
     const auto num_elems_int64 = in.numel();
@@ -331,6 +479,29 @@ struct AllReduceKernel {
       using Impl = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
       const auto kernel = all_reduce_1shot_push_kernel<Impl, T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
+      LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
+          .enable_pdl(kUsePDL)(kernel, params);
+      return out;
+    }
+
+    if (algo == "2shot_push") {
+      CHECK_HOST(!use_graph);  // reads only our own input: nothing to register
+      const auto& push = comm.get_push_obj();
+      const auto slot_vecs = div_ceil(num_vecs, kWorldSize);
+      Tensor out = ffi::empty_like(in);
+      const auto params = AllReduce2ShotPushParams<kWorldSize>{
+          .input = in.data_ptr(),
+          .output = out.data_ptr(),
+          .num_vecs = num_vecs,
+          .rank = push.rank,
+          .slot_vecs = slot_vecs,
+          .scatter = push.get_scatter_workspace<kWorldSize>(int64_t{slot_vecs} * 16),
+          .gather = push.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
+      };
+      CHECK_HOST(!use_multicast || params.gather.mc_workspace != nullptr)
+          << "multicast needs a push plane with an mc workspace";
+      const auto kernel = use_multicast ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
+                                        : all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>;
       LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;
