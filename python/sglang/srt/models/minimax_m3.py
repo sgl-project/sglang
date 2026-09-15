@@ -113,12 +113,6 @@ if _is_gfx95_supported:
 else:
     router_gemv = router_gemv_supported = None
 
-_FP8_KV_DTYPES = (
-    torch.float8_e4m3fn,
-    torch.float8_e5m2,
-    torch.float8_e4m3fnuz,
-)
-
 # rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
@@ -1037,12 +1031,8 @@ class MiniMaxM3Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
-        # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
-        main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         can_use_cache_fusion = (
-            not main_kv_is_fp8
-            and idx_v is None
+            idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
             )
@@ -1075,6 +1065,9 @@ class MiniMaxM3Attention(nn.Module):
                 self.head_dim,
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
+                self.attn.k_scale_float or 1.0,
+                self.attn.v_scale_float or 1.0,
+                self.attn.idx_k_scale_float or 1.0,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k

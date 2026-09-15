@@ -384,6 +384,9 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     v_cache_ptr,
     idx_k_cache_ptr,
     loc_ptr,
+    k_scale,
+    v_scale,
+    idx_k_scale,
     q_weight_ptr,
     k_weight_ptr,
     idx_q_weight_ptr,
@@ -540,7 +543,12 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         + head_id * k_cache_stride_h
         + cols * k_cache_stride_d
     )
-    tl.store(cache_k_base, out_typed, mask=mask & is_k)
+    # caches may be fp8 with a per-tensor scale: divide before the cast, exact when unit-scaled
+    tl.store(
+        cache_k_base,
+        (out_typed.to(tl.float32) / k_scale).to(k_cache_ptr.dtype.element_ty),
+        mask=mask & is_k,
+    )
 
     v_base = v_ptr + token_id * v_stride_m + head_id * head_dim * v_stride_d
     v_val = tl.load(v_base + cols * v_stride_d, mask=mask & is_k, other=0.0)
@@ -550,17 +558,19 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
         + head_id * v_cache_stride_h
         + cols * v_cache_stride_d
     )
-    tl.store(cache_v_base, v_val, mask=mask & is_k)
+    tl.store(
+        cache_v_base,
+        (v_val.to(tl.float32) / v_scale).to(v_cache_ptr.dtype.element_ty),
+        mask=mask & is_k,
+    )
 
     is_idx_k = head_program == idx_k_program
     idx_cache_base = (
         idx_k_cache_ptr + loc * idx_k_cache_stride_s + cols * idx_k_cache_stride_d
     )
-    # Store in the index cache's own dtype (it may be fp8 under
-    # SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE); no-op cast when it matches q's.
     tl.store(
         idx_cache_base,
-        out.to(idx_k_cache_ptr.dtype.element_ty),
+        (out_typed.to(tl.float32) / idx_k_scale).to(idx_k_cache_ptr.dtype.element_ty),
         mask=mask & is_idx_k,
     )
 
@@ -585,6 +595,9 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    idx_k_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse sparse Q/K/index norm+RoPE with main KV and index-K cache stores."""
     assert q.dim() == k.dim() == v.dim() == idx_q.dim() == idx_k.dim() == 2
@@ -627,6 +640,9 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
         v_cache,
         idx_k_cache,
         out_cache_loc,
+        float(k_scale),
+        float(v_scale),
+        float(idx_k_scale),
         q_weight,
         k_weight,
         idx_q_weight,
