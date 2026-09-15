@@ -282,11 +282,13 @@ pub(crate) fn resolve_requirements(repo: &Path, profile: &Profile) -> Result<Vec
 }
 
 pub(crate) fn inputs_digest(repo: &Path, profile: &Profile) -> Result<String, String> {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "extractor_version": 1,
         "profile": profile,
         "requirements": resolve_requirements(repo, profile)?,
     });
+    // Downstream crates can enable serde_json's insertion-order map feature.
+    value.sort_all_objects();
     Ok(sha256(
         &serde_json::to_vec(&value).map_err(|error| error.to_string())?,
     ))
@@ -485,7 +487,9 @@ pub(crate) async fn update_lock(
     let packages = fs::read_to_string(&output).map_err(|error| error.to_string())?;
     validate_packages(&packages)?;
     if inputs_digest(repo, &load_profile(repo, profile.backend)?)? != input_digest {
-        return Err("dependency inputs changed while resolving the lock; retry update-lock".into());
+        return Err(
+            "dependency inputs changed while resolving the lock; retry --update-env-lock".into(),
+        );
     }
     fs::write(&output, header(&profile, &input_digest) + &packages)
         .map_err(|error| error.to_string())?;
