@@ -965,6 +965,11 @@ class Envs:
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
+    # Opt-in MiniMax-M3 prefill path using the dedicated normal-mode FuseEP
+    # operator (DispatchFFNCombineM3).  Requires fuseep_mode=2 and
+    # --moe-a2a-backend ascend_fuseep.  Decode continues on the existing
+    # low-latency FuseEP fused_deep_moe path.
+    SGLANG_ENABLE_M3_FUSEEP_PREFILL = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 

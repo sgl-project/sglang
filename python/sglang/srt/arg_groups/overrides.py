@@ -1654,6 +1654,34 @@ def _a2a_backend_overrides(view: Any) -> dict:
 
 
 @register_post_process
+def _m3_fuseep_prefill_validation(view: Any) -> dict:
+    """Enforce configuration constraints for MiniMax-M3 FuseEP prefill.
+
+    SGLANG_ENABLE_M3_FUSEEP_PREFILL requires:
+      - ``--moe-a2a-backend ascend_fuseep``
+      - ``--fuseep-mode 2`` (DISPATCH_FFN_COMBINE)
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_M3_FUSEEP_PREFILL.get():
+        return {}
+
+    if view.moe_a2a_backend != "ascend_fuseep":
+        raise ValueError(
+            "SGLANG_ENABLE_M3_FUSEEP_PREFILL requires "
+            "--moe-a2a-backend ascend_fuseep, "
+            f"got '{view.moe_a2a_backend}'."
+        )
+    if view.fuseep_mode != 2:
+        raise ValueError(
+            "SGLANG_ENABLE_M3_FUSEEP_PREFILL requires "
+            "SGLANG_NPU_FUSED_MOE_MODE=2 (--fuseep-mode 2), "
+            f"got {view.fuseep_mode}."
+        )
+    return {}
+
+
+@register_post_process
 def _a2a_ep_size(view: Any) -> dict:
     if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
         if view.ep_size != view.tp_size:

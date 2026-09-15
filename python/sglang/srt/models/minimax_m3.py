@@ -43,6 +43,8 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -391,9 +393,12 @@ class MiniMaxM3MoE(nn.Module):
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
-            # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
+            # DeepEP/FuseEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
-            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            shared_experts_tp1 = (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+            )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
@@ -417,7 +422,10 @@ class MiniMaxM3MoE(nn.Module):
 
         self.layer_id = layer_id
 
-        if get_moe_a2a_backend().is_deepep():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             self.ep_size = get_parallel().moe_ep_size
             self.top_k = config.num_experts_per_tok
 
@@ -433,12 +441,14 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
-        if get_moe_a2a_backend().is_deepep():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             return self.forward_deepep(hidden_states, forward_batch)
-        else:
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+        return self.forward_normal(
+            hidden_states, should_allreduce_fusion, use_reduce_scatter
+        )
 
     def forward_normal(
         self,
@@ -507,10 +517,38 @@ class MiniMaxM3MoE(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+        # DeepEPMoE returns the complete per-token routed result (no TP all-reduce
+        # here, unlike forward_normal), and the shared experts are replicated
+        # (tp_size=1, see __init__), so both are complete per token and add directly.
+        is_extend_in_batch = forward_batch.forward_mode.is_extend() or (
+            is_dp_attention_enabled() and get_is_extend_in_batch()
+        )
+        if is_dp_attention_enabled():
+            dp_global_num_tokens = get_dp_global_num_tokens()
+        else:
+            dp_global_num_tokens = None
 
-        # DeepEP returns the complete per-token routed result (no TP all-reduce here);
-        # shared experts are replicated (tp_size=1), so both add directly.
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        m3_fuseep_num_input_tokens = (
+            sum(dp_global_num_tokens)
+            if is_extend_in_batch and dp_global_num_tokens is not None
+            else None
+        )
+        use_m3_fuseep_normal = (
+            envs.SGLANG_ENABLE_M3_FUSEEP_PREFILL.get()
+            # The normal operator is prefill-only; decode uses FuseEP's
+            # low-latency fused_deep_moe path with the same weight layout.
+            and is_extend_in_batch
+            and getattr(topk_output, "expert_location_dispatch_info", None) is None
+        )
+        if get_moe_a2a_backend().is_ascend_fuseep():
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                m3_fuseep_normal=use_m3_fuseep_normal,
+                m3_fuseep_num_input_tokens=m3_fuseep_num_input_tokens,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if enable_npu_dual_stream:
             wait_share_stream()
