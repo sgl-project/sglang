@@ -128,14 +128,14 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    allocator_supported = (
+    hugetlb_supported = (
         allocator is not None
         and device is not None
         and device_uses_allocator(device)
         and allocator.supports_hugetlb()
     )
 
-    if allocator_supported:
+    if hugetlb_supported:
         size = hugepage_size_requested()
         mode = hugepage_mode(size)
         if mode == HUGEPAGE_MODE_REQUIRED:
