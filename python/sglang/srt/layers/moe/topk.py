@@ -86,6 +86,7 @@ except ImportError:
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.attention.dsv4 import mask_topk_ids
+from sglang.srt.alphamoe_env import alphamoe_envs
 from sglang.srt.distributed import (
     get_tp_group,
 )
@@ -555,6 +556,40 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self.alphamoe_router_only = (
+            alphamoe_envs.SGLANG_FLASHINFER_ALPHAMOE_ROUTER_ONLY.get()
+        )
+        self._alphamoe_router_cache = None
+        if self.alphamoe_router_only:
+            if (
+                not get_moe_runner_backend().is_triton()
+                or (quant_config is not None and quant_config.get_name() != "fp8")
+                or is_fp4_experts
+                or top_k != 10
+                or not renormalize
+                or scoring_func != "softmax"
+                or use_grouped_topk
+                or correction_bias is not None
+                or custom_routing_function is not None
+                or num_fused_shared_experts != 0
+                or routed_scaling_factor is not None
+                or apply_routed_scaling_factor_on_output
+                or output_format not in (None, TopKOutputFormat.STANDARD)
+            ):
+                raise ValueError(
+                    "AlphaMoE router-only requires the Qwen3-Next FP8 top-10 "
+                    "selected-logit softmax contract and the Triton MoE backend"
+                )
+            from flashinfer.fused_moe.alphamoe_fused_router import (
+                get_alphamoe_fused_router_module,
+            )
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                AlphaMoeRoutePlanCache,
+            )
+
+            get_alphamoe_fused_router_module()
+            self._alphamoe_router_cache = AlphaMoeRoutePlanCache()
 
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
@@ -570,6 +605,13 @@ class TopK(BaseFusedOp):
         # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
         # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
+        # AlphaMoE W8A8 owns routing and therefore consumes raw logits.  The
+        # NVFP4 kernel only consumes an already aligned route plan, so ModelOpt
+        # FP4 must keep SGLang's model-specific TopK (grouped sigmoid,
+        # correction bias, renormalization, and routed scaling included).
+        self.alphamoe_uses_standard_topk = (
+            quant_config is not None and quant_config.get_name() == "modelopt_fp4"
+        )
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -636,6 +678,12 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        if self.alphamoe_router_only:
+            return self._forward_alphamoe_router_only(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -652,6 +700,12 @@ class TopK(BaseFusedOp):
                 else TopKOutputFormat.BYPASSED
             )
         # ===== END TO BE REFACTORED ====
+        elif get_moe_runner_backend().is_flashinfer_alphamoe():
+            output_format = (
+                TopKOutputFormat.STANDARD
+                if self.alphamoe_uses_standard_topk
+                else TopKOutputFormat.BYPASSED
+            )
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
@@ -701,6 +755,53 @@ class TopK(BaseFusedOp):
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
+
+    def _forward_alphamoe_router_only(
+        self, hidden_states, router_logits, *, expert_location_dispatch_info
+    ) -> TopKOutput:
+        if (
+            hidden_states.shape[1] != 2048
+            or hidden_states.dtype != torch.bfloat16
+            or router_logits.shape != (hidden_states.shape[0], 512)
+            or expert_location_dispatch_info is not None
+        ):
+            raise ValueError(
+                "AlphaMoE router-only requires BF16 Qwen3-Next H2048/E512 "
+                "and trivial expert placement"
+            )
+        if hidden_states.shape[0] == 0:
+            return StandardTopKOutput(
+                topk_weights=torch.empty((0, 10), device=router_logits.device),
+                topk_ids=torch.empty(
+                    (0, 10), device=router_logits.device, dtype=torch.int32
+                ),
+                router_logits=router_logits,
+            )
+        from flashinfer.fused_moe import alphamoe_fused_router
+
+        from sglang.srt.layers.moe.alphamoe_trace import record_alphamoe_kernel
+
+        logits = router_logits.float().contiguous()
+        plan, _ = self._alphamoe_router_cache.get(
+            logits, hidden_size=0, top_k=10, block_m=8
+        )
+        plan = alphamoe_fused_router(
+            logits,
+            top_k=10,
+            block_m=8,
+            has_shared_expert=False,
+            plan=plan,
+            skip_check=True,
+        )
+        record_alphamoe_kernel(
+            kernel="alphamoe_fused_router",
+            hidden_states=hidden_states,
+            num_experts=512,
+            intermediate_size=None,
+            top_k=10,
+            block_m=8,
+        )
+        return StandardTopKOutput(plan.topk_weights, plan.topk_ids, router_logits)
 
     def forward_cpu(
         self,

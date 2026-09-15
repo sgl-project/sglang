@@ -912,13 +912,17 @@ class TestModuleLevelHelpers(unittest.TestCase):
             backends.FLASHINFER_TRTLLM,
             backends.EXPERIMENTAL_SGL_TRTLLM,
             backends.FLASHINFER_TRTLLM_ROUTED,
+            backends.FLASHINFER_ALPHAMOE,
             backends.FLASHINFER_CUTLASS,
             backends.FLASHINFER_MXFP4,
             backends.FLASHINFER_CUTEDSL,
             backends.FLASHINFER_MEGAMOE,
             backends.HPC_OPS,
         }
-        lora_global_ids = dispatcher_global_ids - {backends.FLASHINFER_MEGAMOE}
+        lora_global_ids = dispatcher_global_ids - {
+            backends.FLASHINFER_MEGAMOE,
+            backends.FLASHINFER_ALPHAMOE,
+        }
         config = types.SimpleNamespace(
             num_experts=8,
             num_local_experts=2,

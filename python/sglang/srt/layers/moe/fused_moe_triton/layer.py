@@ -460,6 +460,59 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        if get_moe_runner_backend().is_flashinfer_alphamoe():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_alphamoe import (
+                validate_alphamoe_nvfp4_runner_contract,
+                validate_alphamoe_runner_contract,
+            )
+
+            contract_kwargs = dict(
+                tp_size=self.moe_tp_size,
+                ep_size=self.moe_ep_size,
+                a2a_is_none=get_moe_a2a_backend().is_none(),
+                num_fused_shared_experts=num_fused_shared_experts,
+                with_bias=with_bias,
+                is_gated=is_gated,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                no_combine=no_combine,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_clamp_limit=gemm1_clamp_limit,
+                swiglu_limit=swiglu_limit,
+                params_dtype=params_dtype,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
+            if isinstance(self.quant_method, Fp8MoEMethod):
+                if (
+                    not self.quant_method.block_quant
+                    or tuple(self.quant_method.weight_block_size) != (128, 128)
+                    or not self.quant_method.quant_config.is_checkpoint_fp8_serialized
+                    or self.quant_method.use_mxfp8
+                    or self.quant_method.is_fp4_expert
+                ):
+                    raise ValueError(
+                        "flashinfer_alphamoe W8A8 requires a serialized FP8 "
+                        "checkpoint with FP32 128x128 block scales"
+                    )
+                validate_alphamoe_runner_contract(**contract_kwargs)
+            elif isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod):
+                if (
+                    not self.quant_method.quant_config.is_checkpoint_nvfp4_serialized
+                    or self.quant_method.quant_config.group_size != 16
+                    or self.quant_method.quant_config.use_per_token_activation
+                ):
+                    raise ValueError(
+                        "flashinfer_alphamoe NVFP4 requires a serialized static "
+                        "ModelOpt FP4 checkpoint with group_size=16; per-token "
+                        "activation scaling is not supported by PR #4340"
+                    )
+                validate_alphamoe_nvfp4_runner_contract(**contract_kwargs)
+            else:
+                raise ValueError(
+                    "flashinfer_alphamoe supports only validated W8A8 FP8 or "
+                    "serialized ModelOpt NVFP4 MoE weights"
+                )
         _validate_deepep_v2_quant_method(self.quant_method)
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
@@ -517,6 +570,7 @@ class FusedMoE(torch.nn.Module):
         if (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_alphamoe()
         ):
             self.moe_runner_config.inplace = False
 
@@ -1162,6 +1216,11 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif (
+            isinstance(method, Fp8MoEMethod)
+            and get_moe_runner_backend().is_flashinfer_alphamoe()
+        ):
+            method.maybe_restore_alphamoe_weights_for_load(self)
         elif isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1394,6 +1453,11 @@ class FusedMoE(torch.nn.Module):
                 param=param,
                 weight_name=weight_name,
             )
+        elif (
+            isinstance(method, Fp8MoEMethod)
+            and get_moe_runner_backend().is_flashinfer_alphamoe()
+        ):
+            method.maybe_restore_alphamoe_weights_for_load(self)
 
         if (
             self.quant_config is not None
