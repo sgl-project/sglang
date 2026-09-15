@@ -2806,6 +2806,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention; the metadata and
         latents it writes are what the layers after it attend through."""
@@ -2822,6 +2823,7 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                precomputed_x_global=precomputed_x_global,
             )
             return
         meta = self.forward_metadata
@@ -2860,7 +2862,16 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        precomputed_x_global: Optional[torch.Tensor] = None,
     ) -> None:
         """Every rank writes the whole prompt's compressed state and scores its own rows."""
         cp_meta = forward_batch.attn_cp_metadata
@@ -2879,9 +2890,12 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
+            x_global = precomputed_x_global
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
+            x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk_dense(
