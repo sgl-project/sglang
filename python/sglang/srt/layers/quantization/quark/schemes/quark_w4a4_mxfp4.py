@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -115,12 +116,8 @@ def _dequant_mxfp4_to_bf16(
 
 
 if _is_hip:
-    from aiter import (
-        gemm_a4w4 as _gemm_a4w4_orig,
-    )
-    from aiter import (
-        per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig,
-    )
+    from aiter import gemm_a4w4 as _gemm_a4w4_orig
+    from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,

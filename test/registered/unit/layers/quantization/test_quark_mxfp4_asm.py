@@ -7,6 +7,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import unittest
 
 import torch
+
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _asm_fp4_scale_swizzle_supported,
     _swizzle_asm_fp4_weight_scale,
