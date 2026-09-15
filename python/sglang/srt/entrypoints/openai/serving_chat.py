@@ -591,12 +591,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             effective_tools = self._effective_tools(request)
+            named_tool_choice = (
+                request.tool_choice
+                if isinstance(request.tool_choice, ToolChoice)
+                else None
+            )
             if (
                 effective_tools
                 and isinstance(request.tool_choice, str)
                 and request.tool_choice in ("required", "none")
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif effective_tools and named_tool_choice is not None:
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -605,12 +612,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                 )
 
+            visible_tools = request.tools
+            if visible_tools and named_tool_choice is not None:
+                named = [
+                    tool
+                    for tool in visible_tools
+                    if tool.function.name == named_tool_choice.function.name
+                ]
+                visible_tools = named or visible_tools
             request_tools = (
                 [
                     tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in request.tools
+                    for tool in visible_tools
                 ]
-                if request.tools
+                if visible_tools
                 else None
             )
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
