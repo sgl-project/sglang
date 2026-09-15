@@ -552,9 +552,10 @@ class KimiK3MoE(nn.Module):
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
-        # never materializes. Only the situ packed-routing trtllm-gen path
-        # serves the deferral; sizes beyond the push window fall back to the
-        # in-op finalize at runtime (finalize_push_fits).
+        # never materializes. Only the situ trtllm-gen path serves the
+        # deferral, on either routing form (packed ids on a fused route+quant
+        # hit, unpacked fp32 weights otherwise); sizes beyond the push window
+        # fall back to the in-op finalize at runtime (finalize_push_fits).
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"

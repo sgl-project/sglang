@@ -99,14 +99,13 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import (
-    alloc_for_decode,
-    alloc_for_extend,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
+    DecLockRefParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -125,7 +124,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -493,6 +494,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
+            if extra_key == RETAINED_CUDA_IPC_FEATURE_PROXY_KEY:
+                continue
             if isinstance(
                 self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
             ):
@@ -532,7 +535,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
-        values = [self.feature, self.precomputed_embeddings]
+        retained_proxy = self.model_specific_data.pop(
+            RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+        )
+        self.model_specific_data.pop(CUDA_IPC_FEATURE_COPY_EVENT_KEY, None)
+        values = [self.feature, self.precomputed_embeddings, retained_proxy]
         values.extend(self.model_specific_data.values())
         for value in values:
             if not isinstance(value, CudaIpcTensorTransportProxy):
@@ -681,10 +688,9 @@ class MultimodalInputs:
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             try:
-                # A request can be rejected before a deferred GPU feature is
-                # reconstructed. Acknowledge that transport lease before the
-                # proxy is dropped so the tokenizer pool can reuse its slice.
-                item.acknowledge_deferred_cuda_ipc_feature()
+                # Release both deferred features that were never used and
+                # borrowed features retained for possible re-prefill.
+                item.release_transport_proxies()
             except Exception:
                 logger.warning(
                     "Failed to release an unused multimodal feature transport",
@@ -974,6 +980,7 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
@@ -1125,13 +1132,20 @@ class Req(ReqDllmMixin):
         self.storage_prefetch_retry_pending = False
         self.storage_prefetch_retry_wait_polls = 0
         self.storage_prefetch_retry_attempts = 0
-        # The node to lock until for swa radix tree lock ref
-        self.swa_uuid_for_lock: Optional[int] = None
+        # Receipt of the tree lock held on last_node (anchor, SWA boundary,
+        # skipped components); every release replays it unchanged.
+        self.lock_receipt: DecLockRefParams = DecLockRefParams()
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
-        # per-component nodes this req skipped locking (e.g. mamba on the decode
-        # hold, already COW'd), so their dec releases only what it took.
-        self.skip_lock_node_ids: dict = {}
+        # Logical-page KV sharding: rotation base of the chain this request
+        # extends (owner of position-page P is (base + P) % shard_size).
+        # Refreshed at every sharded alloc — read through last_node, or drawn
+        # least-full for a new chain — and consumed by the radix insert to
+        # stamp new tree nodes. Allocation itself must NOT read it back when
+        # a tree node is available (the cache_unfinished_req dedup rebind
+        # would make it stale); the only allocation-time reader is the
+        # ChunkCache fallback, which has no tree nodes and no rebind.
+        self.kv_rotation_base: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1320,6 +1334,15 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
+
+    def advance_cache_request_handle(self) -> None:
+        self.cache_request_handle = dataclasses.replace(
+            self.cache_request_handle,
+            attempt_id=self.cache_request_handle.attempt_id + 1,
+        )
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1399,10 +1422,59 @@ class Req(ReqDllmMixin):
         self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
-        if self.multimodal_inputs is None:
+        if self.session is not None:
+            self._extend_session_image_inputs(image_inputs)
+        elif self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+
+    def _extend_session_image_inputs(self, image_inputs):
+        """Append media while preserving the saved session and its position history."""
+        # Padding can change token values without changing their count.
+        self.full_untruncated_fill_ids = array("q")
+        if self.multimodal_inputs is not None:
+            # Branches and aborted turns must leave the parent's metadata intact.
+            self.multimodal_inputs = dataclasses.replace(self.multimodal_inputs)
+
+        positions = image_inputs.mrope_positions
+        if positions is not None:
+            prefix_len = len(self.origin_input_ids) - positions.shape[1]
+            prefix = (
+                self.multimodal_inputs.mrope_positions
+                if self.multimodal_inputs is not None
+                else None
+            )
+            if prefix is None:
+                prefix = positions.new_empty((3, 0))
+            prefix = prefix[:, :prefix_len]
+            next_position = prefix.max() + 1 if prefix.numel() else 0
+            text_len = prefix_len - prefix.shape[1]
+            text_positions = (
+                torch.arange(
+                    text_len, dtype=positions.dtype, device=positions.device
+                ).expand(3, -1)
+                + next_position
+            )
+            # Fill the reply/text gap, then shift the new turn's media coordinates.
+            positions = torch.cat(
+                [prefix, text_positions, positions + next_position + text_len], dim=1
+            )
+
+        if self.multimodal_inputs is None:
+            self.multimodal_inputs = image_inputs
+        else:
+            # Use the full table above, or let the scheduler compute missing positions.
+            self.multimodal_inputs.mrope_positions = None
+            self.multimodal_inputs.mrope_position_delta = None
+            self.multimodal_inputs.merge(image_inputs)
+
+        self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        if positions is not None:
+            self.multimodal_inputs.mrope_positions = positions
+            self.multimodal_inputs.mrope_position_delta = (
+                positions.max() + 1 - positions.shape[1]
+            ).reshape(1, 1)
 
     def finished(self) -> bool:
         # Whether request reached finished condition
@@ -1819,11 +1891,11 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
-        self.swa_uuid_for_lock = None
+        self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
-        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -1952,6 +2024,7 @@ class Req(ReqDllmMixin):
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
+            "routed_dp_rank": self.disagg_prefill_dp_rank,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
 
@@ -3079,8 +3152,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
         return self.token_to_kv_pool_allocator.check_decode_capacity(
-            num_tokens=num_tokens, tree_cache=self.tree_cache
+            num_tokens=num_tokens,
+            tree_cache=self.tree_cache,
+            requests=requests,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
@@ -3344,6 +3425,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3668,14 +3753,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
+                        and req.lock_receipt.swa_uuid_for_lock is not None
                         and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
                         self.tree_cache.dec_swa_lock_only(
-                            req.last_node,
-                            req.swa_uuid_for_lock,
-                            skip_lock_node_ids=req.skip_lock_node_ids,
+                            req.last_node, req.lock_receipt
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
