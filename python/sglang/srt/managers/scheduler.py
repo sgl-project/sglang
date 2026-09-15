@@ -3838,7 +3838,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4048,7 +4048,7 @@ class Scheduler(
 
         return new_batch, running_batch
 
-    def _can_schedule_lora_req(
+    def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
         """
