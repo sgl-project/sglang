@@ -115,6 +115,12 @@ class Mm(msgspec.Struct):
         "skip reading media on a hot metadata-cache hit; only enable it when "
         "the caller guarantees that hashes identify immutable media bytes.",
     ] = False
+    trust_mm_cache_ids: A[
+        bool,
+        "Trust opaque video cache IDs from callers. Requires a non-empty "
+        "request cache_salt for tenant isolation and an enabled multimodal "
+        "preprocess cache. Currently supports Qwen2.5-VL video-only requests.",
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(

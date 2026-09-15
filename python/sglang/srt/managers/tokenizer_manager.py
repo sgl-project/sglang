@@ -1034,6 +1034,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             contains_mm_input or is_mossvl
         )
 
+        if contains_mm_input:
+            from sglang.srt.multimodal.video_cache import validate_video_cache_request
+
+            validate_video_cache_request(
+                obj,
+                processor=self.mm_processor,
+                enabled=get_mm().trust_mm_cache_ids,
+                language_only=get_disagg().language_only,
+            )
+
         if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
@@ -3578,6 +3588,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         """Handle EPD-disaggregation mode encoding request."""
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            from sglang.srt.multimodal.video_cache import (
+                has_video_cache_ids,
+                validate_video_cache_request,
+            )
+
+            # This dispatch precedes tokenization. Reject caller video IDs here
+            # so an unsupported request cannot start remote media I/O first.
+            if has_video_cache_ids(obj.video_data):
+                validate_video_cache_request(
+                    obj,
+                    processor=self.mm_processor,
+                    enabled=get_mm().trust_mm_cache_ids,
+                    language_only=True,
+                )
             # dispatch to encoder by default
             should_dispatch = True
             if get_disagg().enable_adaptive_dispatch_to_encoder:

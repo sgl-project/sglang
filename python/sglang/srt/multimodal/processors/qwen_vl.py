@@ -331,6 +331,7 @@ async def preprocess_video(
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
+    supports_video_cache_ids = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
     models = [
@@ -407,6 +408,18 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     @property
     def spatial_merge_size(self):
         return self._spatial_merge_size
+
+    def preprocess_fingerprint_payload(self):
+        payload = super().preprocess_fingerprint_payload()
+        if self.model_type == "qwen2_5_vl" and get_mm().trust_mm_cache_ids:
+            # Video defaults can live on either HF subprocessor, depending on
+            # the Transformers version. They affect both artifact and KV keys.
+            for name in ("image_processor", "video_processor"):
+                component = getattr(self._processor, name, None)
+                if component is not None:
+                    payload[name] = component.to_dict()
+            payload["vision_config"] = self.hf_config.vision_config.to_dict()
+        return payload
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -1143,6 +1156,16 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        from sglang.srt.multimodal.video_cache import (
+            has_video_cache_ids,
+            process_cached_qwen_video,
+        )
+
+        if has_video_cache_ids(request_obj.video_data):
+            return await process_cached_qwen_video(
+                self, input_text=input_text, request=request_obj
+            )
+
         if (
             not image_data
             or request_obj.video_data
