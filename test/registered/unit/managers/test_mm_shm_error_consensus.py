@@ -1,5 +1,11 @@
+import gc
+import mmap
+import pickle
 import unittest
+import weakref
 from array import array
+from datetime import timedelta
+from multiprocessing import shared_memory
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -9,8 +15,9 @@ import torch
 import torch.distributed
 import torch.multiprocessing
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -33,7 +40,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -58,6 +65,7 @@ class _Handle:
 
 def _failed_pointer() -> ShmPointerMMData:
     pointer = object.__new__(ShmPointerMMData)
+    pointer._uses_shm_view = False
     pointer.shm_name = "missing-vlm-feature"
     pointer.shape = torch.Size([1])
     pointer.dtype = torch.float32
@@ -70,6 +78,7 @@ def _failed_pointer() -> ShmPointerMMData:
 
 def _successful_pointer() -> ShmPointerMMData:
     pointer = object.__new__(ShmPointerMMData)
+    pointer._uses_shm_view = False
     pointer.shm_name = "unused"
     pointer.shape = torch.Size([1])
     pointer.dtype = torch.float32
@@ -124,15 +133,25 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
     )
 
 
-def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
+def _run_consensus_rank(
+    rank: int, world_size: int, init_file: str, state=None, malformed=False
+) -> None:
     torch.distributed.init_process_group(
         backend="gloo",
         init_method=Path(init_file).as_uri(),
         rank=rank,
         world_size=world_size,
+        timeout=timedelta(seconds=30),
     )
     try:
-        req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
+        if state is None:
+            pointer = _failed_pointer() if rank == 1 else _successful_pointer()
+        else:
+            pointer = object.__new__(ShmPointerMMData)
+            if malformed and rank == 1:
+                state = {**state, "shape": (999999,)}
+            pointer.__setstate__(state)
+        req = _request(pointer)
         parallel = SimpleNamespace(enable_dp_attention=False)
         receiver = _receiver(tp_size=world_size)
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
@@ -151,8 +170,17 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
             ),
         ):
             receiver._finalize_shm_features([req])
-        if not isinstance(req.mm_inputs, MMInputsProcessError):
-            raise AssertionError(f"rank {rank} did not receive the VLM request error")
+        if state is None or malformed:
+            if not isinstance(req.mm_inputs, MMInputsProcessError):
+                raise AssertionError(
+                    f"rank {rank} did not receive the VLM request error"
+                )
+        else:
+            feature = req.mm_inputs.mm_items[0].feature
+            feature.add_(rank + 1)
+            torch.distributed.barrier()
+            if not torch.equal(feature, torch.arange(8) + rank + 1):
+                raise AssertionError(f"rank {rank} observed another rank's writes")
     finally:
         torch.distributed.destroy_process_group()
 
@@ -160,6 +188,7 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
 class TestShmPointerFailureCleanup(unittest.TestCase):
     def test_clone_failure_still_unlinks_and_closes(self):
         pointer = object.__new__(ShmPointerMMData)
+        pointer._uses_shm_view = False
         handle = _Handle()
         pointer.shm_name = "unused"
         pointer._shm_handle = handle
@@ -176,6 +205,7 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
 
     def test_shm_open_failure_is_deferred_until_materialization(self):
         pointer = object.__new__(ShmPointerMMData)
+        pointer._uses_shm_view = False
         state = {
             "shm_name": "missing",
             "shape": torch.Size([1]),
@@ -193,6 +223,7 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
 
     def test_cleanup_error_does_not_escape_the_request_boundary(self):
         pointer = object.__new__(ShmPointerMMData)
+        pointer._uses_shm_view = False
         handle = _Handle(fail_unlink=True)
         pointer.shm_name = "unused"
         pointer._shm_handle = handle
@@ -204,6 +235,145 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
 
         self.assertTrue(torch.equal(result, torch.ones(1)))
         self.assertTrue(handle.closed)
+
+
+class TestShmReceiverViews(CustomTestCase):
+    def setUp(self):
+        override = envs.SGLANG_ENABLE_MM_SHM_ZERO_COPY.override(True)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+
+    def _sender(self, tensor):
+        pointer = ShmPointerMMData(tensor)
+        self.addCleanup(pointer.close_and_unlink)
+        return pointer
+
+    def test_storage_aliases_keep_mapping_after_unlink_and_wrapper_cleanup(self):
+        """Slices, detach and NumPy aliases may outlive the receiving request."""
+        sender = self._sender(torch.arange(24, dtype=torch.float32).reshape(4, 6))
+        mappings = []
+        original_mmap = mmap.mmap
+
+        def track_mapping(*args, **kwargs):
+            mapping = original_mmap(*args, **kwargs)
+            if kwargs.get("access") == mmap.ACCESS_COPY:
+                mappings.append(weakref.ref(mapping))
+            return mapping
+
+        with patch("sglang.srt.managers.mm_utils.mmap.mmap", track_mapping):
+            receiver = pickle.loads(pickle.dumps(sender))
+        address = receiver.tensor.data_ptr()
+        tensor = receiver.materialize()
+        self.assertEqual(tensor.data_ptr(), address)
+        self.assertEqual(len(mappings), 1)
+        detached = tensor[1:3].detach()
+        array_view = detached.numpy()
+        receiver.close_and_unlink()
+        receiver.close_and_unlink()
+        with self.assertRaisesRegex(RuntimeError, "released"):
+            receiver.materialize()
+        del receiver, tensor, detached
+        gc.collect()
+        with self.assertRaises(FileNotFoundError):
+            shared_memory.SharedMemory(name=sender.shm_name)
+        self.assertIsNotNone(mappings[0]())
+        self.assertEqual(
+            array_view.tolist(), [[6, 7, 8, 9, 10, 11], [12, 13, 14, 15, 16, 17]]
+        )
+        del array_view
+        gc.collect()
+        self.assertIsNone(mappings[0]())
+
+    def test_materialization_uses_the_mode_selected_when_attaching(self):
+        """Changing an env override cannot switch an attached buffer's owner."""
+        for enabled in (False, True):
+            sender = self._sender(torch.arange(8))
+            with envs.SGLANG_ENABLE_MM_SHM_ZERO_COPY.override(enabled):
+                receiver = pickle.loads(pickle.dumps(sender))
+            address = receiver.tensor.data_ptr()
+            with envs.SGLANG_ENABLE_MM_SHM_ZERO_COPY.override(not enabled):
+                result = receiver.materialize()
+            self.assertEqual(result.data_ptr() == address, enabled)
+            self.assertTrue(torch.equal(result, torch.arange(8)))
+
+    def test_writes_are_isolated_between_receivers(self):
+        """Eliminating the clone must not make rank-local mutations shared."""
+        for dtype in (torch.float32, torch.bfloat16, torch.int64):
+            with self.subTest(dtype=dtype):
+                expected = torch.arange(12, dtype=dtype).reshape(3, 4).t()
+                sender = self._sender(expected)
+                payload = pickle.dumps(sender)
+                first, second = pickle.loads(payload), pickle.loads(payload)
+                # All ranks have opened their mappings before any materialization.
+                a, b = first.materialize(), second.materialize()
+                a.add_(100)
+                self.assertTrue(torch.equal(b, expected))
+                self.assertTrue(torch.equal(a, expected + 100))
+
+    def test_router_forwarding_does_not_unlink_the_segment(self):
+        from sglang.srt.managers.io_struct import msgpack_decode, msgpack_encode
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        for encode, decode in (
+            (pickle.dumps, pickle.loads),
+            (msgpack_encode, msgpack_decode),
+        ):
+            sender = self._sender(torch.arange(8))
+            request = _request(sender)
+            request.sampling_params = SamplingParams()
+            forwarded = decode(encode(request))
+            payload = encode(forwarded)
+            del forwarded
+            gc.collect()
+            received = decode(payload)
+            tensor = received.mm_inputs.mm_items[0].feature.materialize()
+            self.assertTrue(torch.equal(tensor, torch.arange(8)))
+
+    def test_mapping_failure_is_deferred_and_segment_is_cleaned(self):
+        sender = self._sender(torch.ones(8))
+        original_mmap = mmap.mmap
+
+        def fail_private_mapping(*args, **kwargs):
+            if kwargs.get("access") == mmap.ACCESS_COPY:
+                raise OSError("mapping unavailable")
+            return original_mmap(*args, **kwargs)
+
+        with patch("sglang.srt.managers.mm_utils.mmap.mmap", fail_private_mapping):
+            receiver = pickle.loads(pickle.dumps(sender))
+        with self.assertRaisesRegex(RuntimeError, "mapping unavailable"):
+            receiver.materialize()
+        with self.assertRaises(FileNotFoundError):
+            shared_memory.SharedMemory(name=sender.shm_name)
+
+    def test_discard_does_not_invalidate_an_existing_reader(self):
+        from sglang.srt.managers.mm_utils import discard_shm_features
+
+        sender = self._sender(torch.arange(8))
+        receiver = pickle.loads(pickle.dumps(sender))
+        reader = receiver.tensor[2:6]
+        request = _request(receiver)
+        discard_shm_features(request)
+        self.assertTrue(torch.equal(reader, torch.arange(2, 6)))
+        with self.assertRaises(FileNotFoundError):
+            shared_memory.SharedMemory(name=sender.shm_name)
+
+    def test_real_rank_views_and_partial_deserialization_failure(self):
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed), TemporaryDirectory() as directory:
+                sender = self._sender(torch.arange(8))
+                torch.multiprocessing.spawn(
+                    _run_consensus_rank,
+                    args=(
+                        2,
+                        str(Path(directory) / "gloo-init"),
+                        sender.__getstate__(),
+                        malformed,
+                    ),
+                    nprocs=2,
+                    join=True,
+                )
+                with self.assertRaises(FileNotFoundError):
+                    shared_memory.SharedMemory(name=sender.shm_name)
 
 
 class TestShmRequestFailureConsensus(unittest.TestCase):
