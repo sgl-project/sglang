@@ -13,6 +13,23 @@
 
 export const popularModels = [
   {
+    name: "DeepSeek-V4.1-Flash",
+    vendor: "DeepSeek",
+    href: "/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",
+    logo: "/cards/logos/deepseek.png",
+    badge: "New",
+    tags: ["5 platforms", "Engram + DSpark", "FP8 dense / FP4 MoE"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet DeepSeek-V4.1 Flash on SGLang",
+      blurb:
+        "DeepSeek's sparse-attention Mixture-of-Experts model, served through SGLang's `dsv4` backend \u2014 pairing multi-ratio compressed KV pools behind FlashMLA with a learned sparse index that picks a top-512 candidate set per query, an mHC mixing stage, and Engram, an n-gram hash memory whose two fp8 tables are roughly 40% of the checkpoint. It ships DSpark, its own three-stage speculative draft. Recipes cover GB300, H200, B200, B300 and AMD MI350X.",
+      tags: ["384 experts / top-6", "Sparse index + Engram", "NVIDIA + AMD"],
+      cta: "Open the DeepSeek-V4.1 Flash cookbook",
+      caption: "DeepSeek-V4.1 Flash deployment guide",
+    },
+  },
+  {
     name: "Qwen3.8-Flash-Next",
     vendor: "Qwen",
     href: "/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",

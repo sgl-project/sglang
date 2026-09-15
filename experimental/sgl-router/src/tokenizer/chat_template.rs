@@ -6,9 +6,8 @@
 //! The engine caches KV blocks keyed on tokens it produces *after* applying the
 //! model's chat template (BOS + role/special markers + content). The router's
 //! cache-aware selection must hash the same token sequence, so it renders the
-//! same template before tokenizing — otherwise its query hashes never match the
-//! engine's stored blocks and cache-aware routing silently degrades to min-load
-//! (`sgl_router_overlap_blocks_sum` stuck at 0).
+//! same template before tokenizing; otherwise its query hashes never match the
+//! engine's stored blocks.
 //!
 //! The template and its special-token strings come from the model's
 //! `tokenizer_config.json` — the HuggingFace built-in template, which is what

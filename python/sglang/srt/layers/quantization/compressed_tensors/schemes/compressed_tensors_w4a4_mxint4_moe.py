@@ -310,11 +310,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(x.dtype)
-        )
+        correction_bias = topk_config.correction_bias
 
         local_num_experts = self.moe_runner_config.num_local_experts
         routing_method_type = layer.routing_method_type
