@@ -304,8 +304,6 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
-# The two fused groups the KDA projections collapse into; their constituents
-# come from packed_modules_mapping.
 _FUSED_KDA_PROJECTION_GROUPS = ("fused_qkvbfg_a_proj", "fused_fg_b_proj")
 
 
@@ -314,16 +312,12 @@ def _fused_qkvbfg_is_unquantized(
 ) -> bool:
     if quant_config is None:
         return True
-    if not envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.get():
-        return False
 
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-    # GLM-5.3-Flash's fp8 checkpoint lists every linear-attention projection in
-    # modules_to_not_convert, so a non-None config does not mean these are quantized.
+    # GLM-5.3-Flash lists every KDA projection in modules_to_not_convert.
     mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
-    # Probe the names the checkpoint uses, not the fused groups: is_layer_skipped
-    # raises on a group whose shards disagree.
+    # is_layer_skipped raises on a fused group whose shards disagree.
     for group in _FUSED_KDA_PROJECTION_GROUPS:
         for name in mapping[group]:
             probe = LinearBase(
@@ -387,8 +381,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                # The constituents are unquantized or this branch is unreachable.
-                # Not every quantizer maps the fused name back to those names.
+                # Not every quantizer maps the fused name back to the constituents.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
@@ -401,8 +394,7 @@ class Glm5NextLinearAttention(nn.Module):
                 batch=2,
                 input_size=self.head_dim,
                 output_size=projection_size,
-                # Follow the projection feeding this one: the loader can override
-                # the dtype the checkpoint declares.
+                # The loader can override the dtype the checkpoint declares.
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
             )
         else:

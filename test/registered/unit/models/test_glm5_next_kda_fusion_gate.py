@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -20,10 +19,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# GLM-5.3-Flash names its KDA layers self_attn, and its checkpoint lists these
-# projections under that prefix.
+# GLM-5.3-Flash names its KDA layers self_attn.
 _PREFIX = "model.layers.0.self_attn"
-# Every projection the two fused groups are built from.
 _KDA_PROJECTIONS = [
     f"{_PREFIX}.{name}"
     for name in (
@@ -52,18 +49,14 @@ def _fp8_config(skipped):
     )
 
 
-def test_unquantized_checkpoint_fuses_without_the_env_gate():
-    with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(False):
-        assert _fused_qkvbfg_is_unquantized(quant_config=None, prefix=_PREFIX)
+def test_unquantized_checkpoint_fuses():
+    assert _fused_qkvbfg_is_unquantized(quant_config=None, prefix=_PREFIX)
 
 
-@pytest.mark.parametrize("gate", [False, True])
-def test_quantized_kda_projections_never_fuse(gate):
-    """Genuinely quantized projections must not fuse, gate set or not."""
-    with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(gate):
-        assert not _fused_qkvbfg_is_unquantized(
-            quant_config=_fp8_config([]), prefix=_PREFIX
-        )
+def test_quantized_kda_projections_never_fuse():
+    assert not _fused_qkvbfg_is_unquantized(
+        quant_config=_fp8_config([]), prefix=_PREFIX
+    )
 
 
 @pytest.mark.parametrize(
@@ -74,30 +67,22 @@ def test_quantized_kda_projections_never_fuse(gate):
     ],
 )
 def test_mixed_precision_group_declines_instead_of_raising(quantized):
-    """A group whose projections disagree on precision falls back to the
-    unfused path rather than failing to initialize."""
     skipped = [
         p for p in _KDA_PROJECTIONS if p.rsplit(".", maxsplit=1)[1] not in quantized
     ]
-    with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True):
-        assert not _fused_qkvbfg_is_unquantized(
-            quant_config=_fp8_config(skipped), prefix=_PREFIX
-        )
+    assert not _fused_qkvbfg_is_unquantized(
+        quant_config=_fp8_config(skipped), prefix=_PREFIX
+    )
 
 
-def test_fp8_checkpoint_that_skips_kda_fuses_only_when_gated():
-    """An fp8 checkpoint that excludes the KDA projections fuses, but only
-    when the gate is set."""
-    config = _fp8_config(_KDA_PROJECTIONS)
-    with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True):
-        assert _fused_qkvbfg_is_unquantized(quant_config=config, prefix=_PREFIX)
-    with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(False):
-        assert not _fused_qkvbfg_is_unquantized(quant_config=config, prefix=_PREFIX)
+def test_fp8_checkpoint_that_skips_kda_fuses():
+    assert _fused_qkvbfg_is_unquantized(
+        quant_config=_fp8_config(_KDA_PROJECTIONS), prefix=_PREFIX
+    )
 
 
 def test_fused_projections_share_the_runtime_dtype():
-    """Both fused projections follow the runtime dtype, not the checkpoint's;
-    a mismatch raises 'expected scalar type Half but found BFloat16'."""
+    """A mismatch raises 'expected scalar type Half but found BFloat16'."""
     config = SimpleNamespace(
         dtype=torch.bfloat16,
         torch_dtype=torch.bfloat16,
@@ -124,8 +109,6 @@ def test_fused_projections_share_the_runtime_dtype():
 
 
 def test_eligible_layer_builds_unquantized():
-    """An eligible layer builds its fused projection unquantized, whatever the
-    quantizer would have resolved the fused name to on its own."""
     quant_config = BlockInt8Config.from_config(
         {
             "quant_method": "blockwise_int8",
@@ -134,8 +117,7 @@ def test_eligible_layer_builds_unquantized():
             "weight_block_size": [128, 128],
         }
     )
-    # Ask the quantizer the way construction does; checking is_layer_skipped
-    # directly would keep passing if this config gained the packed mapping.
+    # is_layer_skipped would keep passing if this config gained the packed mapping.
     probe = LinearBase(
         input_size=1,
         output_size=1,
@@ -158,7 +140,6 @@ def test_eligible_layer_builds_unquantized():
     )
     with (
         get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
-        envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True),
         set_default_torch_dtype(torch.bfloat16),
     ):
         layer = Glm5NextLinearAttention(
