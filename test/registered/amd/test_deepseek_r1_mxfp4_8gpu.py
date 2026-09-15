@@ -40,10 +40,10 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             "131072",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--enforce-piecewise-cuda-graph",
-            "--piecewise-cuda-graph-compiler",
+            "--cuda-graph-backend-prefill=tc_piecewise",
+            "--cuda-graph-tc-compiler",
             "eager",
-            "--piecewise-cuda-graph-max-tokens",
+            "--cuda-graph-max-bs-prefill",
             "8192",
         ]
         cls.process = popen_launch_server(
