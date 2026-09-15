@@ -518,7 +518,9 @@ class MoEGate(nn.Module):
             )
 
         if get_exec().deterministic.enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            if _is_cuda or _is_hip:
+                return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
+            return F.linear(hidden_states.float(), self.weight.float(), None)
 
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
             logits = tiny_gemm_bf16(
