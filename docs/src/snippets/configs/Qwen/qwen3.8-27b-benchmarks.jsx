@@ -30,7 +30,7 @@
 // (see journal 2026-08-14-1048-claude-jrn_f6c1265be8cbdf86c44fe36c).
 export const benchmarks = [
   {
-    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", strategy: "balanced", nodes: "single" },
     sglang_version: "lmsysorg/sglang:dev @ c4271c3fe",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 64 },
@@ -44,7 +44,7 @@ export const benchmarks = [
     notes: "NVFP4 = RadixArk W4A4-0811 (private). KV auto fp8_e4m3 from ckpt-declared kv_cache_quant_algo. GSM8K fp8-KV = 96.44 / bf16-KV = 96.82 (sgl-eval, `c7c03ec`, sibling experiment on `/scratch/qwen38-w4a4-kv-ab-0814` on `qwen38-27b-nvfp4-convert-0812`); both stop_rate 100% / truncated 0% on full 1319.",
   },
   {
-    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", strategy: "high-throughput", nodes: "single" },
     sglang_version: "lmsysorg/sglang:dev @ c4271c3fe",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 64 },

@@ -1,4 +1,4 @@
-"""Online (config-driven) quantized FusedMoE methods for Ascend NPU.
+"""Online (config-driven) quantized FusedMoE methods for NPU.
 
 These are the ``--quantization <scheme>`` entry points: the checkpoint holds
 BF16/FP16 expert weights and the per-gmm kernels quantize them at load time.
@@ -28,7 +28,7 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
     """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on A5).
 
     Weight creation, weight post-processing and the forward pass are identical
-    to the unquantized Ascend path — the only difference is which per-gmm kernel
+    to the unquantized NPU path — the only difference is which per-gmm kernel
     the layer gets, so everything but ``create_moe_runner`` is inherited.
     ``NPUMXFP8MoEMethod`` then quantizes the BF16 expert weights to MXFP8 in
     ``process_weights_after_loading``.

@@ -166,9 +166,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
-    assert (
-        topk_indices.shape[-1] >= topk
-    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
+    assert topk_indices.shape[-1] >= topk, (
+        f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
+    )
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -473,9 +473,9 @@ class SparsePrefillChunkCache:
         device = self.seq_lens.device
         c4_max = max(self.max_seq_len // 4, 1)
         c4_capacity = page_table.shape[-1] * c4_page_size
-        assert (
-            c4_max <= c4_capacity
-        ), f"live c4 extent {c4_max} exceeds metadata capacity {c4_capacity}"
+        assert c4_max <= c4_capacity, (
+            f"live c4 extent {c4_max} exceeds metadata capacity {c4_capacity}"
+        )
         first_q_per_req = self.query_start_loc[:-1].long()
         num_blocks = (c4_max + c4_page_size - 1) // c4_page_size
         assert num_blocks <= page_table.shape[1]

@@ -46,6 +46,7 @@ struct SetMlaKVBufferParams {
   int64_t stride_rope_bytes;
   int64_t stride_buffer_bytes;
   uint32_t batch_size;
+  int64_t reserved_skip_index;
 };
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, int kNumWarps, bool kUsePDL, typename TLoc>
@@ -81,7 +82,7 @@ __global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferP
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
   // Lane 0 issues one bulk store from the smem slot to the scattered gmem row.
-  if (threadIdx.x % kWarpThreads == 0) {
+  if (threadIdx.x % kWarpThreads == 0 && loc != params.reserved_skip_index) {
     cuda::ptx::cp_async_bulk(
         cuda::ptx::space_global,
         cuda::ptx::space_shared,
@@ -114,7 +115,8 @@ struct SetMlaKVBufferKernel {
       tvm::ffi::TensorView loc,
       tvm::ffi::TensorView k_nope,
       tvm::ffi::TensorView k_rope,
-      int64_t num_warps_per_block) {
+      int64_t num_warps_per_block,
+      int64_t reserved_skip_index) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -182,6 +184,7 @@ struct SetMlaKVBufferKernel {
         .stride_rope_bytes = S_rope.unwrap() * dtype_size,
         .stride_buffer_bytes = S_buf.unwrap() * dtype_size,
         .batch_size = batch,
+        .reserved_skip_index = reserved_skip_index,
     };
 
     const auto use_int32 = loc_dtype.is_type<int32_t>();

@@ -118,9 +118,9 @@ def get_rotary_pos_embed(
     if rope_dim_list is None:
         rope_dim_list = [head_dim // target_ndim for _ in range(target_ndim)]
 
-    assert (
-        sum(rope_dim_list) == head_dim
-    ), "sum(rope_dim_list) should equal to head_dim of attention layer"
+    assert sum(rope_dim_list) == head_dim, (
+        "sum(rope_dim_list) should equal to head_dim of attention layer"
+    )
 
     # Get SP info - now handled within NDRotaryEmbedding
     # sp_group = get_sp_group()

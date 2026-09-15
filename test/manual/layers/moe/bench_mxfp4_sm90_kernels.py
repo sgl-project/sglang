@@ -1,10 +1,10 @@
-"""Benchmark MXFP4 MoE kernels on H100/H200: SGLang Marlin vs FlashInfer cutlass.
+"""Benchmark MXFP4 MoE kernels on H100/H200: Marlin vs FlashInfer CUTLASS.
 
 Compares per-call latency of:
 
-  * Marlin path  :  ``fused_marlin_moe(...)`` after Marlin weight repack
-  * FlashInfer   :  ``cutlass_fused_moe(use_w4_group_scaling=True, ...)``
-                    (PR #3084's SM90 mixed-input path)
+  * Marlin path      : ``fused_marlin_moe(...)`` after Marlin weight repack
+  * FlashInfer W4A16 : PR #3084's SM90 mixed-input path
+  * FlashInfer W4A8  : PR #3738/#4431's corrected Humming path, when available
 
 Both run on the same random MXFP4 weights/scales (semantics differ slightly --
 Marlin uses a scalar swiglu clamp + no bias, FlashInfer fuses per-expert
@@ -15,7 +15,7 @@ Run on H100/H200:
 
     cd /sgl-workspace/sglang_dev3 && \\
     PYTHONPATH=python:/sgl-workspace/flashinfer FLASHINFER_DISABLE_VERSION_CHECK=1 \\
-    python python/sglang/test/bench_mxfp4_sm90_kernels.py
+    python test/manual/layers/moe/bench_mxfp4_sm90_kernels.py
 """
 
 from __future__ import annotations
@@ -25,15 +25,29 @@ from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
 import torch
-from flashinfer.autotuner import autotune
 
 # ---- FlashInfer ----
+from flashinfer import __version__ as flashinfer_version
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     cutlass_fused_moe,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
 )
 from flashinfer.fused_moe.core import ActivationType
+from packaging.version import Version
+
+try:
+    from flashinfer.fused_moe import (
+        preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+    )
+except ImportError:
+    preprocess_moe_weights_for_sm90_mixed_gemm_humming = None
+
+_fi_release = Version(flashinfer_version).release
+_fi_release = _fi_release + (0,) * (3 - len(_fi_release))
+if _fi_release[:3] < (0, 6, 18):
+    preprocess_moe_weights_for_sm90_mixed_gemm_humming = None
 
 # ---- SGLang Marlin ----
 from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -162,14 +176,50 @@ def build_flashinfer_inputs(shape: Shape, w13, w2, w13_s, w2_s, w13_b, w2_b):
     }
 
 
+def build_flashinfer_humming_inputs(shape: Shape, w13, w2, w13_s, w2_s, w13_b, w2_b):
+    if preprocess_moe_weights_for_sm90_mixed_gemm_humming is None:
+        raise RuntimeError("FlashInfer does not provide the corrected Humming API.")
+    w13_il, w13_s_il, w13_residual = preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+        w13, w13_s
+    )
+    w2_il, w2_s_il, w2_residual = preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+        w2, w2_s
+    )
+    e = shape.num_experts
+    return {
+        "w13": w13_il,
+        "w2": w2_il,
+        "quant_scales": [
+            w13_s_il.view(torch.int32),
+            (w13_residual * 64.0).contiguous(),
+            torch.ones((), dtype=torch.float32, device="cuda"),
+            w2_s_il.view(torch.int32),
+            (w2_residual * 64.0).contiguous(),
+        ],
+        "w13_b": w13_b,
+        "w2_b": w2_b,
+        "swiglu_alpha": torch.full((e,), 1.702, dtype=torch.float32, device="cuda"),
+        "swiglu_beta": torch.full((e,), 1.0, dtype=torch.float32, device="cuda"),
+        "swiglu_limit": torch.full((e,), 7.0, dtype=torch.float32, device="cuda"),
+    }
+
+
 def make_flashinfer_runner(
-    shape: Shape, prep, x, topk_w, topk_i, autotuned: bool, with_bias: bool = True
+    shape: Shape,
+    prep,
+    x,
+    topk_w,
+    topk_i,
+    autotuned: bool,
+    with_bias: bool = True,
+    use_humming: bool = False,
 ):
     out = torch.empty(shape.tokens, shape.hidden, dtype=torch.bfloat16, device="cuda")
     fc1_b = prep["w13_b"] if with_bias else None
     fc2_b = prep["w2_b"] if with_bias else None
 
     def _call():
+        humming_kwargs = {"use_wfp4afp8_humming": True} if use_humming else {}
         cutlass_fused_moe(
             input=x,
             token_selected_experts=topk_i,
@@ -186,6 +236,7 @@ def make_flashinfer_runner(
             use_w4_group_scaling=True,
             activation_type=ActivationType.Swiglu,
             output=out,
+            **humming_kwargs,
         )
 
     if autotuned:
@@ -327,6 +378,29 @@ def run_one_shape(shape: Shape, run_marlin: bool):
         f"{(fi_at_med / fi_at_nb_med - 1) * 100:+.1f}%)"
     )
     fi_med = fi_at_med  # alias for downstream speedup print
+
+    if preprocess_moe_weights_for_sm90_mixed_gemm_humming is not None:
+        humming_prep = build_flashinfer_humming_inputs(
+            shape, w13, w2, w13_s, w2_s, w13_b, w2_b
+        )
+        humming_call = make_flashinfer_runner(
+            shape,
+            humming_prep,
+            x,
+            topk_w,
+            topk_i,
+            autotuned=True,
+            with_bias=True,
+            use_humming=True,
+        )
+        humming_med, humming_min = time_call(humming_call)
+        print(
+            f"  FlashInfer Humming W4A8:            median={humming_med:.3f} ms  "
+            f"min={humming_min:.3f} ms"
+        )
+        print(f"  speedup (FI W4A16 / FI W4A8):      {fi_med / humming_med:.2f}x")
+    else:
+        print("  FlashInfer Humming W4A8:            SKIPPED (requires >= 0.6.18)")
 
     # Marlin
     if run_marlin:

@@ -56,12 +56,20 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.device_info import get_num_sms
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
-_MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
+
+# Split-K heuristic constants. The (1.5, 16) pair is tuned for MI355X (see
+# _kv_splits_heuristic); CUDA is unmeasured here and keeps the prior (2.0, 64).
+_is_hip = is_hip()
+_MAX_KV_SPLITS = 16 if _is_hip else 64  # Hard cap on kv_splits.
+_TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
@@ -88,7 +96,12 @@ def _cu_count() -> int:
     Wrapped in ``lru_cache`` so the first decode call pays the device-property
     lookup and all subsequent calls hit the cache — important inside a hot
     decode loop and CUDAGraph capture (no data-dependent host work).
+
+    ``aiter`` is imported lazily: it is a ROCm-only package, and the pure-Python
+    heuristics below must stay importable on a machine without it.
     """
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
     return get_num_sms()
 
 
@@ -141,7 +154,7 @@ def _kv_splits_heuristic(
     H: int,
     block_h: int,
     num_cu: int | None = None,
-    target_wg_per_cu: float = 2.0,
+    target_wg_per_cu: float = _TARGET_WG_PER_CU,
     max_kv_splits: int = _MAX_KV_SPLITS,
 ) -> int:
     """Pick KV_SPLITS to fill the GPU. CUDAGraph-safe: depends ONLY on
@@ -154,15 +167,30 @@ def _kv_splits_heuristic(
     ``T * ceil(H/block_h)`` underfills the device.
 
       base_ctas  = T * ceil(H / block_h)
-      target_wg  = target_wg_per_cu * num_cu     (≈ 1.7x to hide load-imbalance)
+      target_wg  = target_wg_per_cu * num_cu
       if base_ctas >= target_wg:  splits = 1     (grid already saturates GPU)
       else:                       splits = prev_pow2(min(target_wg/base_ctas,
                                                           max_kv_splits))
 
-    ``max_kv_splits`` (default 64) caps the number of split-kernel CTAs per
-    token. Higher values would buy more parallelism for bs=1 long-ctx, but
-    when per-token K is short most splits fall-through and the launch
-    overhead dominates. 64 is the sweet spot for MI300/MI355.
+    On HIP the tuned ``target_wg_per_cu`` is 1.5 (CUDA keeps 2.0, unmeasured
+    here). At 2.0 the rule over-split by exactly one power of two across the
+    whole decode range on MI355X: at H=128/block_h=64 it chose 8/4/2 splits for
+    T=32/64/128 where 4/2/1 measure faster. Split-K only pays while the base
+    grid underfills the device, and each extra split adds a partial-buffer write
+    plus reduce-kernel work that the shrinking per-split K no longer amortizes.
+
+    ``max_kv_splits`` caps the number of split-kernel CTAs per token (16 on HIP,
+    64 on CUDA). Higher values buy more parallelism for bs=1 long-ctx in
+    principle, but measured optima on MI355X never exceed 16 even at T=1: when
+    per-token K is short most splits fall through and the launch plus reduce
+    overhead dominates.
+
+    Measured over T in {1..256} x kv_len in {128,512,1024} at H=128 on MI355X,
+    scoring each candidate by distance from the per-shape optimum: (2.0, 64)
+    leaves 33.5% geomean regret (119% worst case), (1.5, 16) leaves 3.7% (36%
+    worst). The per-shape optimum does depend on per-token K, which is not
+    knowable at capture time, so the residual is the price of CUDAGraph safety
+    rather than a tuning gap.
 
     Rounded DOWN to a power of two — rounding up over-splits when
     splits_to_fill isn't already pow2 (e.g. T=2 → 258 → 512 doubles the wg
@@ -878,12 +906,28 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
-    return _sparse_attn_v4_paged_decode_triton(
-        q,
-        unified_kv,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        softmax_scale,
-        kv_scales=kv_scales,
-    )
+    if _is_gfx1250_supported:
+        # aiter ships only on ROCm, and this module is imported by a CPU-registered
+        # test, so the import has to sit behind the same gate as the call.
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            has_invalid=False,
+            kv_scales=kv_scales,
+        )
+    else:
+        return _sparse_attn_v4_paged_decode_triton(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            kv_scales=kv_scales,
+        )

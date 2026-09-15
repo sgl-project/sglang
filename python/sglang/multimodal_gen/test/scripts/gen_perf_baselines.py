@@ -46,7 +46,7 @@ def _all_cases() -> list[DiffusionTestCase]:
 def _baseline_path() -> Path:
     import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
-    return cfg.get_perf_baseline_path()
+    return cfg.get_perf_baseline_update_path()
 
 
 def _openai_client(port: int) -> OpenAI:

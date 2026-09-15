@@ -34,11 +34,12 @@ def _jit_fused_tma_module(
     """Compile and cache the warp-specialized TMA aggregation kernel (per-row
     bulk copies into chunk slots; chunk_rows / occupancy / consumer_regs are
     tuning knobs). The smem ring is frozen at 2 chunk slots and PDL is always
-    on: the kernel targets SM100+, where both are unconditional wins."""
+    on: the kernel targets SM100+ except SM12x."""
     major, minor = torch.cuda.get_device_capability()
-    if major < 10:
+    if major < 10 or major == 12:
         raise RuntimeError(
-            "attn_res_fused_tma requires SM100+ (tcgen05, cp.async.bulk)"
+            "attn_res_fused_tma requires SM100+ excluding SM12x; "
+            f"SM{major}{minor} is unsupported"
         )
     args = make_cpp_args(
         _DIM,
@@ -98,10 +99,9 @@ def _tuning(nvb: int, num_tokens: int) -> tuple[int, int, int]:
 
 
 _COMM_MAP: dict[int, Communicator] = {}
-_PULL_SEM_MC_MAP: dict[int, int] = {}
 
 
-def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int) -> None:
+def register_comm(comm: Communicator) -> None:
     # One communicator per world_size per process -- see the note in
     # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
     # overwrite here would hand the old group's callers the new group's peer
@@ -112,7 +112,6 @@ def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int) -> None:
         f"{comm.world_size}"
     )
     _COMM_MAP[comm.world_size] = comm
-    _PULL_SEM_MC_MAP[comm.world_size] = pull_sem_mc_ptr
 
 
 @register_custom_op(mutates_args=["out", "prefix_out"])
@@ -145,7 +144,6 @@ def _attn_res_fused_pull_rs_op(
         nvb,
         eps,
         input_mc_ptr,
-        _PULL_SEM_MC_MAP[world_size],
         max_blocks,
     )
 
@@ -217,7 +215,6 @@ def _attn_res_fused_direct_ag_op(
         nvb,
         eps,
         output_mc_ptr,
-        _PULL_SEM_MC_MAP[world_size],
         max_blocks,
         write_prefix,
     )

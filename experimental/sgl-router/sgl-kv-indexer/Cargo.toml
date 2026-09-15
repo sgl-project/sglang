@@ -32,4 +32,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [build-dependencies]
+protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"

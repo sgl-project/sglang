@@ -11,7 +11,10 @@ from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
@@ -110,6 +113,11 @@ class Attention(nn.Module):
                 num_heads=heads,
                 head_size=dim_head,
                 causal=False,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
                 skip_sequence_parallel=True,
             )
             if current_platform.is_cuda()
