@@ -470,7 +470,7 @@ jobs:
         recommend-tests-from-coverage,
       ]
     if: always()
-    uses: ./.github/workflows/_analyze_failure.yaml
+    uses: ./.github/workflows/_npu-analyze-failure.yml
     with:
       log_artifact_pattern: selected-test-logs-*
       recommendations_file: recommended_pytest_paths.txt
