@@ -20,7 +20,9 @@ in any of these branches before it reaches the expensive GPU path.
 import os
 import socket
 import struct
+import sys
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 import torch
@@ -348,17 +350,37 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
+    def _no_ue8m0(self):
+        # Pin the DeepGEMM UE8M0 probe so the cases are hardware-independent.
+        return unittest.mock.patch(
+            "sglang.srt.weight_cache.protocol._deepgemm_ue8m0_active",
+            return_value=False,
+        )
+
     def test_unquantized_is_supported(self):
         self.assertTrue(is_ipc_quant_supported("", None))
 
     def test_block_fp8_supported_but_per_tensor_fp8_rejected(self):
-        self.assertTrue(
-            is_ipc_quant_supported("fp8", {"weight_block_size": [128, 128]})
-        )
-        # Per-tensor FP8 (no weight_block_size) transposes the weight during
-        # post-processing -> not reproducible by the meta-init client.
-        self.assertFalse(is_ipc_quant_supported("fp8", {}))
-        self.assertFalse(is_ipc_quant_supported("fp8", None))
+        with self._no_ue8m0():
+            self.assertTrue(
+                is_ipc_quant_supported("fp8", {"weight_block_size": [128, 128]})
+            )
+            # Per-tensor FP8 (no weight_block_size) transposes the weight during
+            # post-processing -> not reproducible by the meta-init client.
+            self.assertFalse(is_ipc_quant_supported("fp8", {}))
+            self.assertFalse(is_ipc_quant_supported("fp8", None))
+
+    def test_block_fp8_rejected_when_ue8m0_repack_active(self):
+        # On SM100+ with DeepGEMM active, post-processing repacks
+        # weight_scale_inv to packed UE8M0 (shape/dtype change) that the
+        # meta-init client cannot reproduce; block-FP8 must be rejected there.
+        with unittest.mock.patch(
+            "sglang.srt.weight_cache.protocol._deepgemm_ue8m0_active",
+            return_value=True,
+        ):
+            self.assertFalse(
+                is_ipc_quant_supported("fp8", {"weight_block_size": [128, 128]})
+            )
 
     def test_unknown_method_rejected(self):
         self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
@@ -374,9 +396,10 @@ class TestIpcQuantAllowlist(CustomTestCase):
     def test_check_passes_on_supported(self):
         # Should not raise.
         check_ipc_quant_support("", None, where="daemon")
-        check_ipc_quant_support(
-            "fp8", {"weight_block_size": [128, 128]}, where="daemon"
-        )
+        with self._no_ue8m0():
+            check_ipc_quant_support(
+                "fp8", {"weight_block_size": [128, 128]}, where="daemon"
+            )
 
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
@@ -425,6 +448,36 @@ class TestCleanupStaleDaemonFiles(CustomTestCase):
 
         self.assertTrue(os.path.exists(ready_path))
         self.assertTrue(os.path.exists(socket_path))
+
+    @unittest.skipUnless(sys.platform == "linux", "zombie detection reads /proc")
+    def test_zombie_daemon_pid_is_treated_as_stale(self):
+        ready_path, socket_path = self._paths()
+        # A dead-but-unreaped daemon still passes os.kill(pid, 0); cleanup
+        # must treat it as stale instead of blocking takeover forever.
+        import subprocess
+        import time as time_mod
+
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time_mod.time() + 10
+            while time_mod.time() < deadline:
+                with open(f"/proc/{child.pid}/stat") as f:
+                    if f.read().rpartition(")")[2].split()[0] == "Z":
+                        break
+                time_mod.sleep(0.05)
+            else:
+                self.fail("child never became a zombie")
+
+            with open(ready_path, "w") as f:
+                f.write(f"pid={child.pid}\n")
+            open(socket_path, "w").close()
+
+            cleanup_stale_daemon_files(self.KEY)
+
+            self.assertFalse(os.path.exists(ready_path))
+            self.assertFalse(os.path.exists(socket_path))
+        finally:
+            child.wait(timeout=5)
 
     def test_force_takes_over_from_live_pid(self):
         ready_path, socket_path = self._paths()
