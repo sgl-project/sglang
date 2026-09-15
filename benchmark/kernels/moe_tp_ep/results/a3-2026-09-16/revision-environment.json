@@ -1,0 +1,32 @@
+{
+  "container": "4311e380b494",
+  "hardware": "Ascend910_9382, two compute devices in one A3 physical card",
+  "image_digest": null,
+  "image_provenance": "User confirmed the same temporary cloud container used previously; cloud platform does not provide image identity.",
+  "sglang_archive_commit": "5891f1c557bd7a047aeea6d62ab916544ffe9cd5",
+  "runtime_base_commit": "1895cabfa8",
+  "source_archive_sha256": "30cc6c3be7a5a126a449166da683830135e383b8c881808f0dd1e02270933cd5",
+  "deepep_version": "1.0.0+e145d906.cann.9.0.0.b250",
+  "release": "https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post3",
+  "packages": [
+    {
+      "name": "deep_ep-1.0.0+e145d906.cann.9.0.0.b250-cp311-cp311-linux_aarch64.whl",
+      "sha256": "c666260033266d519272e6936c5af3db478450a9c09be80ce38cf8d5e4a39b96"
+    },
+    {
+      "name": "sgl-kernel-npu-2026.9.0.post3-a3.zip",
+      "sha256": "801b2dcdaeee7d5ecf0859d27446136ae8e800f79cbde778fb256d2255b2759f"
+    }
+  ],
+  "sglang_source_path": "/root/sglang1098-revision/source/python/sglang",
+  "installed_sglang_distribution_metadata": "0.5.14.dev172+gf308abc05 (not the imported source identity)",
+  "qwen3_moe_py_sha256": "07ab423bf32b47951df6522ffa397b10421385607e22010759f99cd970ae6bb4",
+  "deep_ep_native_sha256": "4004776f8b4e31b8b55a4259ee6a2b69ae59d33f1b2728a42a0f1854040f77c4",
+  "python": "3.11.15",
+  "torch": "2.10.0+cpu",
+  "torch_npu": "2.10.0",
+  "cann_compiler_and_opp": "9.0.0",
+  "driver": "25.5.1",
+  "reproduction_instructions": "../../README.md#environment",
+  "environment_record": "formal/none_prefill_r1.json: metadata.environment"
+}

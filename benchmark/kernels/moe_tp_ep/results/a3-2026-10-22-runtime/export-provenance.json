@@ -1,0 +1,55 @@
+{
+  "transformations": "Source, model and result paths use portable placeholders; output directory names are descriptive. Numeric measurements, software and device identities are unchanged.",
+  "files": [
+    {
+      "path": "cpu-regressions.txt",
+      "original_sha256": "f3e0d56d82b44544bbe3f0d791ef3fbcd110f9293fb769b3c29b66034068c581",
+      "export_sha256": "f3e0d56d82b44544bbe3f0d791ef3fbcd110f9293fb769b3c29b66034068c581"
+    },
+    {
+      "path": "module-validation/decode_n777_seed20260922_skew0_round8_auto_comparison.json",
+      "original_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f",
+      "export_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f"
+    },
+    {
+      "path": "module-validation/decode_n777_seed20260922_skew0_round8_normal_comparison.json",
+      "original_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f",
+      "export_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f"
+    },
+    {
+      "path": "module-validation/execution.json",
+      "original_sha256": "37cb29ae10a92d609a23462fc2c1eb6ebe1c066f17241fc5c8c14b44ec8587aa",
+      "export_sha256": "d8dc998f294748b98f685959d6ee33de5e2daccb283ddc3b5fc85d62aced8812"
+    },
+    {
+      "path": "module-validation/prefill_n777_seed20260922_skew0_round8_auto_comparison.json",
+      "original_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f",
+      "export_sha256": "50ba8e917d2c8e44e73277d8138560f5befa58dfbf39ae96caa7a71ca2aee32f"
+    },
+    {
+      "path": "module-validation/timing/deepep_decode_r1.json",
+      "original_sha256": "a29609c4ca1256e8d23ac9e53c908326c7298a30a2a1fef934b069be12b3c77a",
+      "export_sha256": "a29609c4ca1256e8d23ac9e53c908326c7298a30a2a1fef934b069be12b3c77a"
+    },
+    {
+      "path": "module-validation/timing/deepep_prefill_r1.json",
+      "original_sha256": "15f1d098a890d01710d69f83846404fca659df6359e821b2dff98dd51dec0039",
+      "export_sha256": "15f1d098a890d01710d69f83846404fca659df6359e821b2dff98dd51dec0039"
+    },
+    {
+      "path": "module-validation/timing/none_decode_r1.json",
+      "original_sha256": "f199c1d063e89c52232fcbb0d660686296911c7c79bb78da33e719feed1023f5",
+      "export_sha256": "f199c1d063e89c52232fcbb0d660686296911c7c79bb78da33e719feed1023f5"
+    },
+    {
+      "path": "module-validation/timing/none_prefill_r1.json",
+      "original_sha256": "98b83abf30200195d8cd0cc21cab9d83d5d0beb61ebd54f604c55a66d7043ea8",
+      "export_sha256": "98b83abf30200195d8cd0cc21cab9d83d5d0beb61ebd54f604c55a66d7043ea8"
+    },
+    {
+      "path": "validation-summary.json",
+      "original_sha256": "66e7ff18047f15674bd2dce85d55f8494d56898898e80e2257ede185422ba3ad",
+      "export_sha256": "66e7ff18047f15674bd2dce85d55f8494d56898898e80e2257ede185422ba3ad"
+    }
+  ]
+}
