@@ -242,6 +242,10 @@ class GenerateReqInput:
     return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
+    # For streaming requests, emit a control chunk after the request has been
+    # dispatched to the scheduler. This lets disaggregated frontends start the
+    # decode-side KV receiver without waiting for the first generated token.
+    return_request_accepted: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states

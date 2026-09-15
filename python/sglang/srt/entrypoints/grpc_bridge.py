@@ -434,6 +434,7 @@ class RuntimeHandle:
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
         )
+        result["request_acceptance_events"] = True
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:

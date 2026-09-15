@@ -495,6 +495,9 @@ def _make_generate_obj(rid, is_single):
     obj.external_trace_header = None
     obj.bootstrap_room = None
     obj.max_thinking_tokens = None
+    obj.return_request_accepted = False
+    obj.return_prompt_token_ids = False
+    obj.stream = True
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -666,6 +669,47 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         tm._send_one_request.assert_not_called()
         # ... and the entry was cleaned up rather than leaked.
         self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_acceptance_event_is_emitted_after_scheduler_dispatch(self):
+        tm = _make_tm_for_generate(self)
+        rid = "accepted"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_request_accepted = True
+        tokenized = MagicMock()
+        tokenized.input_ids = [1, 2, 3]
+        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+        tm._send_one_request = AsyncMock(return_value=None)
+
+        async def drive():
+            return await tm.generate_request(obj).__anext__()
+
+        event = asyncio.run(drive())
+
+        tm._send_one_request.assert_awaited_once_with(tokenized)
+        self.assertEqual(event, {"meta_info": {"request_accepted": True}})
+
+    def test_acceptance_event_rejects_batch_requests(self):
+        tm = _make_tm_for_generate(self)
+        obj = _make_generate_obj(["b0", "b1"], is_single=False)
+        obj.return_request_accepted = True
+
+        async def drive():
+            return await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "only supported for single requests"):
+            asyncio.run(drive())
+
+    def test_acceptance_event_rejects_non_streaming_requests(self):
+        tm = _make_tm_for_generate(self)
+        obj = _make_generate_obj("non-streaming", is_single=True)
+        obj.return_request_accepted = True
+        obj.stream = False
+
+        async def drive():
+            return await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "only supported for streaming requests"):
+            asyncio.run(drive())
 
     def test_batch_failure_before_dispatch_cleans_up_all(self):
         tm = _make_tm_for_generate(self)

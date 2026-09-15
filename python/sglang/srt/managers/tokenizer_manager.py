@@ -782,6 +782,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.return_request_accepted
+            and not obj.is_single
+        ):
+            raise ValueError(
+                "return_request_accepted is only supported for single requests"
+            )
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.return_request_accepted
+            and not obj.stream
+        ):
+            raise ValueError(
+                "return_request_accepted is only supported for streaming requests"
+            )
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -826,6 +842,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if obj.return_request_accepted:
+                        yield {"meta_info": {"request_accepted": True}}
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:

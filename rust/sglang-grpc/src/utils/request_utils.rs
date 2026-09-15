@@ -297,6 +297,9 @@ pub(crate) fn build_generate_dict(
     if let Some(ref session_id) = req.session_id {
         d.insert("session_id".into(), serde_json::json!(session_id));
     }
+    if req.return_request_accepted.unwrap_or(false) {
+        d.insert("return_request_accepted".into(), serde_json::json!(true));
+    }
     insert_generation_controls(
         &mut d,
         req.priority,
@@ -496,6 +499,19 @@ mod tests {
             assert!(!mapped.contains_key("require_reasoning"));
             assert!(!mapped.contains_key("max_thinking_tokens"));
         }
+    }
+
+    #[test]
+    fn token_generate_dict_opts_into_request_acceptance_event() {
+        let request = proto::GenerateRequest {
+            return_request_accepted: Some(true),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("request", &request).unwrap();
+        assert_eq!(mapped["return_request_accepted"], serde_json::json!(true));
+
+        let mapped = build_generate_dict("request", &Default::default()).unwrap();
+        assert!(!mapped.contains_key("return_request_accepted"));
     }
 
     #[test]

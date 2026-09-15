@@ -839,6 +839,9 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            # Opt-in /generate streams can emit a control chunk immediately
+            # after their request is dispatched to the scheduler.
+            "request_acceptance_events": True,
         }
     )
 

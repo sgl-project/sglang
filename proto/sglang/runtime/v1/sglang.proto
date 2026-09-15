@@ -130,6 +130,7 @@ message GenerateRequest {
   optional int32 priority = 14;
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
+  optional bool return_request_accepted = 17;
 }
 
 message GenerateResponse {
