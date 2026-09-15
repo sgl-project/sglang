@@ -1,3 +1,4 @@
+use crate::config::sampling::SamplingOverrides;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -312,6 +313,12 @@ pub struct ModelConfig {
     pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.
     pub eligibility: Option<EligibilityConfig>,
+    /// Sampling parameters fixed fleet-wide for this model, and what happens
+    /// to a request that sends a different value: a 400 before admission, or
+    /// the client value forwarded untouched. Either way the configured value
+    /// is injected when the request omits the field — see
+    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
+    pub sampling_overrides: SamplingOverrides,
 }
 
 /// External KV Indexer client settings.
