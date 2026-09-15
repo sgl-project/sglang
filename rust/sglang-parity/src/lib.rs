@@ -17,6 +17,7 @@
 
 pub mod artifacts;
 pub mod compare;
+pub mod environment;
 pub mod http;
 pub mod process;
 pub mod runner;

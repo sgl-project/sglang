@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::artifacts::Artifacts;
 use crate::compare::{ComparisonRules, Difference, Violation, compare_json, prepare_comparison};
+use crate::environment::{self, EnvironmentConfig, EnvironmentPlan, PreparedEnvironment};
 use crate::http::{self, CaptureMode, HttpCase, HttpObservation};
 use crate::process::{Implementation, ServerConfig, SglangProcess};
 
@@ -17,6 +18,8 @@ use crate::process::{Implementation, ServerConfig, SglangProcess};
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub environment: EnvironmentConfig,
     #[serde(default = "default_startup_timeout")]
     pub startup_timeout_secs: u64,
     #[serde(default = "default_request_timeout")]
@@ -68,7 +71,8 @@ pub trait ResponsePolicy {
 impl RunConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.server.validate()?;
-        if self.startup_timeout_secs == 0
+        if self.environment.setup_timeout_secs == 0
+            || self.startup_timeout_secs == 0
             || self.request_timeout_secs == 0
             || !(1..=60).contains(&self.shutdown_timeout_secs)
         {
@@ -150,6 +154,7 @@ impl HttpSuite {
 /// The executable specification, also saved verbatim in the run artifacts.
 #[derive(Clone, Debug, Serialize)]
 pub struct EffectiveSuite {
+    pub environment: EnvironmentPlan,
     pub suite: HttpSuite,
     pub repeats_per_implementation: usize,
     pub implementation_order: [Implementation; 2],
@@ -163,6 +168,7 @@ pub fn describe(config: &RunConfig, suite: &HttpSuite) -> Result<EffectiveSuite,
     config.validate().map_err(RunError::Config)?;
     suite.validate().map_err(RunError::Config)?;
     Ok(EffectiveSuite {
+        environment: environment::describe(config).map_err(RunError::Config)?,
         suite: suite.clone(),
         repeats_per_implementation: 2,
         implementation_order: Implementation::ALL,
@@ -225,6 +231,7 @@ pub struct Report {
     pub directory: PathBuf,
     pub effective_suite: PathBuf,
     pub config: RunConfig,
+    pub environment: Option<Value>,
     pub runtime_errors: Vec<String>,
     pub cases: Vec<CaseResult>,
     pub equivalence: Vec<EquivalenceResult>,
@@ -284,6 +291,20 @@ struct RunArtifacts {
 }
 
 impl RunArtifacts {
+    fn verify_source(&mut self, prepared: &PreparedEnvironment) -> bool {
+        match prepared.verify_source() {
+            Ok(()) => true,
+            Err(error) => {
+                self.report
+                    .as_mut()
+                    .unwrap()
+                    .runtime_errors
+                    .push(format!("source verification: {error}"));
+                false
+            }
+        }
+    }
+
     fn save(&self) -> std::io::Result<()> {
         self.artifacts.write_json(
             &self.artifacts.root().join("report.json"),
@@ -314,7 +335,8 @@ impl Drop for RunArtifacts {
 ///
 /// # Errors
 /// Returns configuration, client setup, or artifact I/O errors. Service startup,
-/// shutdown, and request failures are recorded in the returned [`Report`].
+/// shutdown, environment preparation, and request failures are recorded in the
+/// returned [`Report`].
 pub async fn run(
     config: &RunConfig,
     suite: &HttpSuite,
@@ -326,10 +348,11 @@ pub async fn run(
     let effective_path = artifacts.root().join("effective_suite.json");
     artifacts.write_json(&effective_path, &effective)?;
     let report = Report {
-        state: "running".into(),
+        state: "preparing".into(),
         directory: artifacts.root().to_owned(),
         effective_suite: effective_path,
         config: config.clone(),
+        environment: None,
         runtime_errors: Vec::new(),
         cases: suite
             .cases
@@ -350,6 +373,27 @@ pub async fn run(
         report: Some(report),
     };
     state.save()?;
+    let prepared =
+        match environment::prepare(config, &effective.environment, state.artifacts.root()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let report = state.report.as_mut().unwrap();
+                report
+                    .runtime_errors
+                    .push(format!("environment preparation: {error}"));
+                for case in &mut report.cases {
+                    case.parity.status = Status::Skipped;
+                }
+                report.state = "complete".into();
+                state.save()?;
+                return Ok(state.report.take().unwrap());
+            }
+        };
+    let report = state.report.as_mut().unwrap();
+    report.environment = Some(prepared.record.clone());
+    report.state = "running".into();
+    state.save()?;
+    let mut source_valid = true;
     let requests = suite
         .cases
         .iter()
@@ -357,10 +401,14 @@ pub async fn run(
         .collect::<Result<Vec<_>, _>>()
         .map_err(std::io::Error::from)?;
     for implementation in Implementation::ALL {
+        if !state.verify_source(&prepared) {
+            source_valid = false;
+            break;
+        }
         let side_name = implementation.as_str();
         let side_dir = state.artifacts.directory(side_name)?;
         let mut process = match SglangProcess::start(
-            &config.server,
+            &prepared.server,
             implementation,
             &side_dir.join("server.log"),
             Duration::from_secs(config.startup_timeout_secs),
@@ -376,7 +424,11 @@ pub async fn run(
                     .unwrap()
                     .runtime_errors
                     .push(format!("{side_name} startup: {error}"));
+                source_valid = state.verify_source(&prepared);
                 state.save()?;
+                if !source_valid {
+                    break;
+                }
                 continue;
             }
         };
@@ -470,7 +522,9 @@ pub async fn run(
             };
             state.save()?;
         }
-        if let Err(error) = process.shutdown().await {
+        let shutdown = process.shutdown().await;
+        source_valid = state.verify_source(&prepared);
+        if let Err(error) = shutdown {
             state
                 .report
                 .as_mut()
@@ -481,14 +535,18 @@ pub async fn run(
             break;
         }
         state.save()?;
+        if !source_valid {
+            break;
+        }
     }
     let report = state.report.as_mut().unwrap();
     for case in &mut report.cases {
         case.parity = match (
+            source_valid,
             stable_value(&case.implementations["python"]),
             stable_value(&case.implementations["rust"]),
         ) {
-            (Some(left), Some(right)) => check(left, right, Status::Fail),
+            (true, Some(left), Some(right)) => check(left, right, Status::Fail),
             _ => Check {
                 status: Status::Skipped,
                 ..Check::default()
@@ -507,10 +565,11 @@ pub async fn run(
             for &index in &members[1..] {
                 let right = &report.cases[index];
                 let comparison = match (
+                    source_valid,
                     stable_value(&left.implementations[implementation.as_str()]),
                     stable_value(&right.implementations[implementation.as_str()]),
                 ) {
-                    (Some(left), Some(right)) => check(left, right, Status::Fail),
+                    (true, Some(left), Some(right)) => check(left, right, Status::Fail),
                     _ => Check {
                         status: Status::Skipped,
                         ..Check::default()

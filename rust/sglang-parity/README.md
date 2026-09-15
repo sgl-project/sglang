@@ -6,17 +6,18 @@ native HTTP `POST /generate`, including JSON and SSE responses.
 
 ## Run
 
-Prepare a SGLang Python environment that can launch both serving implementations,
-including the Rust HTTP extension and a model supported by your inference backend.
-The runner uses the same environment, model, hardware options, and request bytes
-for both implementations. It does not install dependencies or select a device.
+Provide a model and shared runtime options. By default, the runner prepares one
+Python 3.12.8 environment and the Rust HTTP extension for both implementations.
+It tests a detached snapshot of the calling checkout's exact `HEAD`; commit source
+changes first. Python and Rust use the same source, dependencies, model, hardware
+options, and request bytes.
 
 From the `rust/` workspace:
 
 ```sh
 cargo build -p sglang-parity
 cp sglang-parity/examples/run.json /path/to/run.json
-# Edit the Python executable, model, and shared backend settings.
+# Edit the model and shared backend settings.
 cargo run -p sglang-parity -- --config /path/to/run.json --describe
 cargo run -p sglang-parity -- --config /path/to/run.json
 ```
@@ -25,8 +26,7 @@ Relative `server.python`, `server.working_dir`, and `output_dir` paths resolve f
 the invocation directory; a bare executable name such as `python3` uses `PATH`.
 `server.working_dir` optionally selects the servers' working directory, where the
 server resolves relative model paths and file paths in `server.args`. On a Mac,
-use an environment and model supported by SGLang's MLX backend, set
-`server.env.SGLANG_USE_MLX` to `"1"`, and include `--mlx-enable-sampling` in
+use a model supported by SGLang's MLX backend and include `--mlx-enable-sampling` in
 `server.args` for the default sampling and output-logprob cases. Backend support
 for deterministic inference is required; the runner never retries with it disabled.
 
@@ -56,6 +56,97 @@ plus readiness probes. This is a finite baseline, not exhaustive API coverage.
 Custom request fields are sent unchanged and their responses are compared in full.
 New API features may also require extending the suite's protocol validation and
 unit tests; matching responses alone do not prove every requested option was honored.
+
+## Reproducible environments
+
+Review [`environments/profiles.json`](environments/profiles.json) and the generated
+[`mlx.lock`](environments/mlx.lock) / [`cuda.lock`](environments/cuda.lock) for the
+installation contract. These are separate from the API suite specification.
+
+| Backend | Host prerequisites | Dependency inputs |
+| --- | --- | --- |
+| `mlx` | Apple Silicon, macOS 14+, Xcode command-line tools | `python/pyproject_other.toml` base + expanded `srt_mps`; tokenizer compatibility constraint from the default manifest. |
+| `cuda` | Linux x86_64, glibc 2.31+, NVIDIA driver supporting CUDA 13.0, C compiler | Default `python/pyproject.toml`; PyTorch `cu130` wheels. |
+
+Both profiles include the local package's declared build dependencies. Install
+**uv 0.11.14**, Git, and the Rust toolchain specified by `rust/rust-toolchain.toml`
+first. The runner downloads Python **3.12.8** through uv when needed; it does not
+install system drivers or compilers. Third-party packages must have suitable
+wheels. The CUDA profile adds NVIDIA's official package index with uv's
+`first-index` policy, which obtains the genuine `cuda-tile` wheels instead of
+building its PyPI downloader stub. Lock generation and installation use the same
+index settings, and every installed distribution must match a recorded hash.
+
+Optional `environment` settings in `run.json`:
+
+```json
+{
+  "environment": {
+    "source_root": "/path/to/sglang",
+    "backend": "auto",
+    "cache_dir": "/path/to/parity-cache",
+    "setup_timeout_secs": 1800
+  }
+}
+```
+
+Omit `source_root` to discover the repository from the invocation directory.
+`auto` selects MLX on Apple Silicon and CUDA on Linux x86_64. The default cache is
+`<source_root>/rust/target/parity-environments`. Relative paths resolve from the
+invocation directory. `--describe` prints the commit, profile, lock digest, cache
+paths, and effective suite without downloading, installing, building, or starting
+services.
+
+The runner rejects staged or unstaged tracked changes and untracked files under
+`python/` or `rust/`. Ignored build outputs are permitted. It installs and runs
+against a detached Git worktree, checks its revision and cleanliness before and
+after each implementation, and removes inherited Python import overrides.
+Changing branches in the development checkout after preparation does not change
+the tested source.
+
+Environments are keyed by source commit, profile, lock digest, and shared build
+settings. Source and environment leases serialize reuse and remain held through
+both implementations.
+The venv is created at its final path; only successful verification writes the
+completion marker. The next attempt rebuilds an incomplete managed venv.
+Completed environments are validated without reinstalling dependencies; failed
+verification stops the run. Each run checks actual package
+versions, source import locations, a device operation, and the Rust loader's
+source fingerprint and extension path. Rust builds use the existing loader and
+`Cargo.lock`.
+
+To use an existing interpreter, set `server.python`. The runner validates its
+Python version and installed third-party packages against the selected lock and
+does not install into that environment. SGLang imports still come from the fixed
+source snapshot; Rust artifacts use the build cache. On MLX, installed SGLang
+metadata can still declare CUDA dependencies, so validation checks the selected
+platform lock and real imports instead of running a global dependency check.
+Extra installed packages are permitted and included in the recorded inventory;
+every applicable locked package must have the required version.
+
+### Updating dependencies
+
+From the desired checkout, with uv 0.11.14 available:
+
+```sh
+cargo run -p sglang-parity -- --update-env-lock --backend mlx
+cargo run -p sglang-parity -- --update-env-lock --backend cuda
+```
+
+These commands resolve the repository declarations and atomically replace one
+lock. Ordinary runs only install the locked versions with hash verification;
+they never re-resolve dependencies. Dependency/profile changes invalidate the
+input digest and require a lock update. Ordinary source changes do not. Commit
+updated locks alongside dependency changes. Generated files contain no local
+paths, timestamps, or source commit, so regeneration is reviewable.
+
+Model files and GPU drivers are outside the Python lock. For reproducible model
+acceptance, use a local snapshot downloaded at a fixed model revision and record
+that revision with the run configuration. Resolving dependencies successfully is
+not evidence of successful device execution or Python/Rust parity.
+
+Both committed locks resolve with the pinned uv version. Real-model acceptance of
+this managed environment workflow remains pending on MLX and CUDA.
 
 ## Review the test contract
 
@@ -121,6 +212,10 @@ Each run creates a unique directory under `output_dir` (default `target/parity`)
 <run-id>/
   effective_suite.json
   report.json
+  setup.log                # installation/build/verification output
+  environment.lock         # exact dependency lock used
+  environment-probe.json   # installed packages, device and Rust artifact evidence
+  environment.json         # source/profile/cache and successful verification record
   python/
     server.log
     <case>/<repeat>/
@@ -132,9 +227,10 @@ Each run creates a unique directory under `output_dir` (default `target/parity`)
     ...
 ```
 
-`report.json` records attempts, validation errors, repeatability, parity and
-equivalence differences, and artifact paths. Each difference has a JSON path,
-kind, and both values. Runtime failures and unexecuted attempts remain visible.
+`report.json` records environment evidence, attempts, validation errors,
+repeatability, parity and equivalence differences, and artifact paths. Each
+difference has a JSON path, kind, and both values. Runtime failures and unexecuted
+attempts remain visible.
 Interrupted runs preserve a partial report and the bytes received so far.
 
 | Exit code | Meaning |
@@ -157,7 +253,10 @@ comparison rules, and all artifacts; these do not depend on the CLI.
 | Location | Responsibility |
 | --- | --- |
 | `src/runner.rs` | Lifecycle order, repeated execution, final comparisons, reports. |
-| `src/process.rs` | Shared SGLang configuration and managed service lifetime. |
+| `src/process.rs` | Shared SGLang configuration and process-group ownership for setup and services. |
+| `src/environment.rs` | Source snapshots, platform selection, environment preparation, cache leases and provenance. |
+| `src/environment/lock.rs` | Shared dependency expansion, semantic input digests, lock validation and generation. |
+| `environments/` | Platform profiles, generated locks and the Python verification probe. |
 | `src/http.rs`, `src/sse.rs` | HTTP capture and generic SSE framing. |
 | `src/compare.rs` | Strict JSON differences and declared scalar-value exceptions. |
 | `src/artifacts.rs` | Artifact storage, without test decisions. |
@@ -185,6 +284,7 @@ cargo fmt --all -- --check
 cargo clippy -p sglang-parity --all-targets -- -D warnings
 cargo test -p sglang-parity
 cargo doc -p sglang-parity --no-deps
+python3 -m unittest discover -s sglang-parity/environments -p test_probe.py
 ```
 
 The CPU tests exercise separate contracts:
@@ -193,7 +293,8 @@ The CPU tests exercise separate contracts:
 | --- | --- |
 | `src/compare.rs`, `src/sse.rs` | Exact comparison and SSE framing, independent of any API. |
 | `suites/native_generate/tests.rs` | Valid native responses reconstruct correctly; malformed responses fail with useful diagnostics. |
-| `src/process.rs` | Managed server configuration, readiness, cancellation, and cleanup. |
+| `src/process.rs` | Managed configuration, setup/service subprocesses, readiness, cancellation and cleanup. |
+| `src/environment/`, `environments/test_probe.py` | Dependency contracts, cache lifecycle and provenance validation without a GPU. |
 | `tests/harness.rs` | Real HTTP capture, repeatability and parity verdicts, equivalence groups, exit codes, and artifacts. |
 
 Parser fixtures are inputs to unit tests, while integration tests use lightweight

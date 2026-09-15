@@ -2,19 +2,23 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use sglang_parity::environment::{self, Backend};
 use sglang_parity::{RunConfig, describe, run};
 
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
 
-const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate] [--suite-file <suite.json>] [--describe]\n\n--describe validates and prints the effective specification without starting services.";
+const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate] [--suite-file <suite.json>] [--describe]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
 
 #[derive(Default)]
 struct Arguments {
     config: Option<PathBuf>,
     suite_file: Option<PathBuf>,
     describe: bool,
+    update_env_lock: bool,
+    backend: Option<Backend>,
 }
 
 fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments>, String> {
@@ -30,7 +34,8 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
         }
         match argument.as_str() {
             "--describe" => result.describe = true,
-            "--config" | "--suite" | "--suite-file" => {
+            "--update-env-lock" => result.update_env_lock = true,
+            "--config" | "--suite" | "--suite-file" | "--backend" => {
                 let value = arguments
                     .next()
                     .filter(|value| !value.starts_with("--"))
@@ -38,6 +43,13 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
                 match argument.as_str() {
                     "--config" => result.config = Some(value.into()),
                     "--suite-file" => result.suite_file = Some(value.into()),
+                    "--backend" => {
+                        result.backend = Some(match value.as_str() {
+                            "mlx" => Backend::Mlx,
+                            "cuda" => Backend::Cuda,
+                            _ => return Err(format!("unsupported environment backend {value:?}")),
+                        })
+                    }
                     _ if value != "native_generate" => {
                         return Err(format!("unsupported suite {value:?}"));
                     }
@@ -47,13 +59,61 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
             _ => return Err(format!("unknown option {argument}")),
         }
     }
-    if result.config.is_none() {
-        return Err("--config is required".into());
+    if result.update_env_lock {
+        if ["--config", "--describe", "--suite", "--suite-file"]
+            .iter()
+            .any(|option| seen.contains(*option))
+        {
+            return Err("--update-env-lock cannot be combined with run or suite options".into());
+        }
+        if result.backend.is_none() {
+            return Err("--update-env-lock requires --backend mlx or cuda".into());
+        }
+    } else {
+        if result.backend.is_some() {
+            return Err("--backend requires --update-env-lock".into());
+        }
+        if result.config.is_none() {
+            return Err("--config is required".into());
+        }
     }
     Ok(Some(result))
 }
 
 async fn execute(arguments: Arguments) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = execute_inner(arguments) => result,
+        signal = async {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => signal,
+                _ = terminate.recv() => Ok(()),
+            }
+        } => {
+            signal?;
+            eprintln!("Operation interrupted; managed process groups have been stopped. Partial artifacts and setup logs are retained.");
+            Ok(2)
+        }
+    }
+}
+
+async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::Error>> {
+    if arguments.update_env_lock {
+        let backend = arguments.backend.unwrap();
+        let name = match backend {
+            Backend::Mlx => "mlx",
+            Backend::Cuda => "cuda",
+            Backend::Auto => unreachable!(),
+        };
+        let repo = environment::source_root(None).map_err(std::io::Error::other)?;
+        let log = repo.join(format!("rust/target/parity-env-lock-{name}.log"));
+        std::fs::create_dir_all(log.parent().unwrap())?;
+        let path = environment::update_lock(&repo, backend, &log, Duration::from_secs(1800))
+            .await
+            .map_err(std::io::Error::other)?;
+        println!("Lock: {}", path.display());
+        return Ok(0);
+    }
     let config: RunConfig = serde_json::from_slice(&std::fs::read(arguments.config.unwrap())?)?;
     let external = arguments
         .suite_file
@@ -71,20 +131,7 @@ async fn execute(arguments: Arguments) -> Result<i32, Box<dyn std::error::Error>
         );
         return Ok(0);
     }
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let report = tokio::select! {
-        result = run(&config, &suite, &policy) => result?,
-        signal = async {
-            tokio::select! {
-                signal = tokio::signal::ctrl_c() => signal,
-                _ = terminate.recv() => Ok(()),
-            }
-        } => {
-            signal?;
-            eprintln!("Run interrupted; managed services have been stopped. Partial artifacts remain in {}.", config.output_dir.display());
-            return Ok(2);
-        }
-    };
+    let report = run(&config, &suite, &policy).await?;
     for case in &report.cases {
         let violations: usize = case
             .implementations
@@ -139,8 +186,39 @@ mod tests {
             vec!["--cases", "cases.json"],
             vec!["--config", "one", "--config", "two"],
             vec!["--config", "one", "--suite", "grpc"],
+            vec!["--update-env-lock"],
+            vec!["--update-env-lock", "--backend", "auto"],
+            vec!["--update-env-lock", "--backend", "mlx", "--describe"],
+            vec!["--update-env-lock", "--backend", "cuda", "--config", "one"],
+            vec![
+                "--update-env-lock",
+                "--backend",
+                "mlx",
+                "--suite",
+                "native_generate",
+            ],
+            vec![
+                "--update-env-lock",
+                "--backend",
+                "mlx",
+                "--suite-file",
+                "one",
+            ],
+            vec!["--config", "one", "--backend", "mlx"],
         ] {
             assert!(parse(args.into_iter().map(String::from)).is_err());
+        }
+        for (name, backend) in [("mlx", Backend::Mlx), ("cuda", Backend::Cuda)] {
+            let arguments = parse(
+                ["--update-env-lock", "--backend", name]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(arguments.update_env_lock);
+            assert_eq!(arguments.backend, Some(backend));
+            assert!(arguments.config.is_none());
         }
     }
 }

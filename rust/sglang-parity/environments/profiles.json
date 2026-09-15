@@ -1,0 +1,18 @@
+{
+  "python": "3.12.8",
+  "uv": "0.11.14",
+  "profiles": {
+    "mlx": {
+      "platform": "aarch64-apple-darwin",
+      "macos_deployment_target": "14.0",
+      "indexes": [],
+      "torch_backend": null
+    },
+    "cuda": {
+      "platform": "x86_64-manylinux_2_31",
+      "macos_deployment_target": null,
+      "indexes": ["https://pypi.nvidia.com/"],
+      "torch_backend": "cu130"
+    }
+  }
+}
