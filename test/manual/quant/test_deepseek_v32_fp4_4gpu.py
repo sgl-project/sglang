@@ -67,7 +67,7 @@ class TestDeepseekV32FP4DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v3-fp4)\n{metrics["score"]=:.3f}\n'
             )
 
         self.assertGreater(metrics["score"], 0.93)
@@ -135,7 +135,7 @@ class TestDeepseekV32FP4TP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v3-fp4)\n{metrics["score"]=:.3f}\n'
             )
 
         self.assertGreater(metrics["score"], 0.93)

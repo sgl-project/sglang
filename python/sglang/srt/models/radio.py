@@ -42,6 +42,41 @@ input_dim_t: TypeAlias = int | tuple[int, int]
 norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
 
 
+def _map_hf_radio_weight_name(name: str) -> tuple[str, str | None] | None:
+    prefix = "radio_model.hf_model."
+    if not name.startswith(prefix):
+        return None
+
+    name = name.removeprefix(prefix)
+    if name == "summary_idxs":
+        return None
+
+    embedding_names = {
+        "embeddings.cls_register_token": "model.patch_generator.cls_token.token",
+        "embeddings.patch_projection": "model.patch_generator.embedder",
+        "embeddings.position_embedding": "model.patch_generator.pos_embed",
+        "embeddings.video_patch_projection": "model.patch_generator.video_embedder",
+    }
+    for source, target in embedding_names.items():
+        if name == source or name.startswith(f"{source}."):
+            return name.replace(source, target, 1), None
+
+    name = name.replace("encoder.layer.", "model.encoder.layers.", 1)
+    attention_names = {
+        ".attention.attention.query.": (".attn.attn.qkv_proj.", "q"),
+        ".attention.attention.key.": (".attn.attn.qkv_proj.", "k"),
+        ".attention.attention.value.": (".attn.attn.qkv_proj.", "v"),
+        ".attention.output.dense.": (".attn.attn.proj.", None),
+    }
+    for source, (target, shard_id) in attention_names.items():
+        if source in name:
+            return name.replace(source, target, 1), shard_id
+
+    name = name.replace(".layer_scale1.lambda1", ".ls1")
+    name = name.replace(".layer_scale2.lambda1", ".ls2")
+    return name, None
+
+
 def _ntuple(n):
     def parse(x):
         if isinstance(x, Iterable) and not isinstance(x, str):
@@ -202,9 +237,9 @@ class ViTPatchGenerator(nn.Module):
 
     def forward_video(self, x: torch.Tensor, temporal_patch_size: int) -> torch.Tensor:
         """Embed video frames with temporal compression via tubelet grouping."""
-        assert (
-            self.video_embedder is not None
-        ), "video_embedder is required for temporal compression"
+        assert self.video_embedder is not None, (
+            "video_embedder is required for temporal compression"
+        )
         T = temporal_patch_size
         num_frames = x.shape[0]
 
@@ -258,9 +293,9 @@ class ViTPatchGenerator(nn.Module):
         if src_embed.shape != targ_embed.shape:
             src_size = int(math.sqrt(src_embed.shape[1]))
 
-            assert (
-                src_size**2 == src_embed.shape[1]
-            ), "Unable to interpolate non-square embedding"
+            assert src_size**2 == src_embed.shape[1], (
+                "Unable to interpolate non-square embedding"
+            )
 
             src_embed = rearrange(
                 src_embed, "b (h w) c -> b c h w", h=src_size, w=src_size
@@ -281,9 +316,9 @@ class ViTPatchGenerator(nn.Module):
         if src_proj_weight.shape != targ_proj_weight.shape:
             src_patch_size = int(math.sqrt(src_proj_weight.shape[1] // 3))
 
-            assert (src_patch_size**2) * 3 == src_proj_weight.shape[
-                1
-            ], "Unable to interpolate non-square patch size"
+            assert (src_patch_size**2) * 3 == src_proj_weight.shape[1], (
+                "Unable to interpolate non-square patch size"
+            )
 
             src_proj_weight = rearrange(
                 src_proj_weight,
@@ -588,18 +623,34 @@ class RadioModel(nn.Module):
             weights_list = list(weights)
 
         for name, weight in weights_list:
-            if not name.startswith("radio_model."):
-                # Skip non-radio weights
-                continue
-            name = replace_substrings(name, remap_substrings)
-            name = replace_prefix(name, remap_prefixes)
+            source_name = name
+            is_hf_export = name.startswith("radio_model.hf_model.")
+            loaded_shard_id = None
+            if is_hf_export:
+                mapped_weight = _map_hf_radio_weight_name(name)
+                if mapped_weight is None:
+                    continue
+                name, loaded_shard_id = mapped_weight
+            else:
+                if not name.startswith("radio_model."):
+                    # Skip non-radio weights
+                    continue
+                name = replace_substrings(name, remap_substrings)
+                name = replace_prefix(name, remap_prefixes)
             if name and name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
+                if loaded_shard_id is None:
+                    weight_loader(param, weight)
+                else:
+                    weight_loader(param, weight, loaded_shard_id)
                 loaded_params.add(name)
                 if "video_embedder" in name:
                     self.model.patch_generator._video_embedder_loaded = True
+            elif is_hf_export:
+                raise ValueError(
+                    f"Unexpected HF RADIO weight: {source_name} (mapped to {name})"
+                )
 
         return loaded_params
 

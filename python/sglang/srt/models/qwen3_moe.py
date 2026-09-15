@@ -34,7 +34,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -58,11 +57,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -267,9 +261,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
-        # offline ModelSlim path (which carries a per-layer quant_model_description)
-        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # Router gate: description-driven quant. Only the offline ModelSlim path
+        # (which carries a per-layer quant_model_description) may quantise the
+        # gate — if the checkpoint stored it as MXFP8 it is loaded
         # and dequantised correctly instead of cast to bf16 without its block scale.
         # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
         gate_quant_config = (
@@ -324,9 +318,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
@@ -975,7 +972,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
@@ -995,15 +991,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled() and not is_cp_v2_active(forward_batch):
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.attn_cp_rank,
-                    self.attn_cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
 
         hidden_states = self.model(
             input_ids,

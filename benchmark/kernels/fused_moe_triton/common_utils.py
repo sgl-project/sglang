@@ -84,8 +84,16 @@ def get_model_config(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
+    ]:
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+    elif architecture in [
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -96,6 +104,7 @@ def get_model_config(
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
         "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
@@ -108,6 +117,7 @@ def get_model_config(
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
@@ -137,6 +147,7 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok

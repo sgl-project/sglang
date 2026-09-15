@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
@@ -132,7 +135,8 @@ class MemoryOccupationController:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
                 if device.startswith("cpu"):
-                    _module_to_pinned_cpu(module)
+                    if not restore_weight_snapshot(module):
+                        _module_to_pinned_cpu(module)
                 else:
                     module.to(device, non_blocking=True)
                 moved.append(name)
