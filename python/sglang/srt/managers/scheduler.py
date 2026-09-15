@@ -2728,6 +2728,7 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
         # Radix-native sessions use only the top-level session_id.
@@ -2742,7 +2743,6 @@ class Scheduler(
                 seq_length = len(recv_req.input_embeds)
                 recv_req.input_ids = array("q", [1]) * seq_length
 
-            is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -2793,14 +2793,6 @@ class Scheduler(
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
                 )
-
-            if is_beam:
-                error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
-                if error_msg:
-                    logger.error(error_msg)
-                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.output_streamer.stream_output([req], req.return_logprob)
-                    return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -3057,6 +3049,16 @@ class Scheduler(
                 req.routed_experts_start_len = 0
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
+                return
+
+        if is_beam:
+            # Initialize from the finalized prompt and generation budget. Besides
+            # validation, this allocates device state and registers a live group.
+            error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
+            if error_msg:
+                logger.error(error_msg)
+                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                self.output_streamer.stream_output([req], req.return_logprob)
                 return
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
