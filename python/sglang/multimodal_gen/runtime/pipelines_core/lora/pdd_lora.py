@@ -103,16 +103,16 @@ def fuse_pdd_head(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Blend a ``[N, out, in]`` bank into one ``[out, in]`` head."""
     if bank_w.ndim != 3:
-        raise ValueError(f"PDD weight bank must be 3D [N, out, in], got {tuple(bank_w.shape)}")
+        raise ValueError(
+            f"PDD weight bank must be 3D [N, out, in], got {tuple(bank_w.shape)}"
+        )
     if bank_b.ndim != 2 or bank_b.shape[0] != bank_w.shape[0]:
         raise ValueError(
             f"PDD bias bank must be [N, out] matching {tuple(bank_w.shape)}, "
             f"got {tuple(bank_b.shape)}"
         )
     if plan.numel() != bank_w.shape[0]:
-        raise ValueError(
-            f"PDD plan length {plan.numel()} != bank N {bank_w.shape[0]}"
-        )
+        raise ValueError(f"PDD plan length {plan.numel()} != bank N {bank_w.shape[0]}")
     plan = plan.to(device=bank_w.device, dtype=bank_w.dtype)
     weight = torch.einsum("n,noi->oi", plan, bank_w)
     bias = torch.einsum("n,no->o", plan, bank_b)
@@ -191,7 +191,9 @@ def _reshape_stacked_head(
             )
         return weight, bias
     if weight.ndim != 2:
-        raise ValueError(f"PDD head {source} must be 2D or 3D, got {tuple(weight.shape)}")
+        raise ValueError(
+            f"PDD head {source} must be 2D or 3D, got {tuple(weight.shape)}"
+        )
     if weight.shape[0] % out_features != 0:
         raise ValueError(
             f"PDD head {source} rows {weight.shape[0]} are not a multiple of "
@@ -361,13 +363,17 @@ def apply_pdd_head_bank(
     device = next(layer.parameters()).device
     dtype = torch.float32
     layer.register_buffer(
-        "_pdd_video_w", bank.video_weight.to(device=device, dtype=dtype), persistent=False
+        "_pdd_video_w",
+        bank.video_weight.to(device=device, dtype=dtype),
+        persistent=False,
     )
     layer.register_buffer(
         "_pdd_video_b", bank.video_bias.to(device=device, dtype=dtype), persistent=False
     )
     layer.register_buffer(
-        "_pdd_audio_w", bank.audio_weight.to(device=device, dtype=dtype), persistent=False
+        "_pdd_audio_w",
+        bank.audio_weight.to(device=device, dtype=dtype),
+        persistent=False,
     )
     layer.register_buffer(
         "_pdd_audio_b", bank.audio_bias.to(device=device, dtype=dtype), persistent=False
