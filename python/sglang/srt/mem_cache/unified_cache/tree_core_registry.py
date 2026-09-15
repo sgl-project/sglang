@@ -1,18 +1,27 @@
 """Registry for pluggable TreeCore implementations.
 
 The unified cache constructs its TreeCore through `create_tree_core`, selected
-by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "python"). To plug in a custom
-implementation, register it under a string name via
+by SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND (default "rust", with compatibility
+fallbacks when unset). To plug in a custom implementation, register it via
 `register_tree_core_backend(name, factory)`.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import logging
+import re
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.mem_cache.unified_cache.components import TreeComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
         UnifiedTreeCoreInterface,
@@ -24,6 +33,62 @@ TreeCoreFactory = Callable[
 ]
 
 _TREE_CORE_REGISTRY: dict[str, TreeCoreFactory] = {}
+_RUST_TREE_CORE_MODULE = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
+_RUST_TREE_CORE_MANIFEST = (
+    Path(__file__).resolve().parents[5] / "rust" / "sglang-radix-tree" / "Cargo.toml"
+)
+logger = logging.getLogger(__name__)
+
+
+def _rust_default_unsupported_reason(params: CacheInitParams) -> Optional[str]:
+    if params.enable_session_radix_cache:
+        return "session-aware caching requires the Python TreeCore"
+    if params.tree_components is not None and set(params.tree_components) - {
+        ComponentType.FULL,
+        ComponentType.SWA,
+        ComponentType.MAMBA,
+    }:
+        return "the configured components require the Python TreeCore"
+    if params.component_registry_override:
+        return "custom components require the Python TreeCore"
+    if sys.platform != "linux":
+        return "the Rust TreeCore supports Linux only"
+    from sglang.srt.rust_extensions.torch_build import (
+        _MAX_SUPPORTED_TORCH,
+        _MIN_SUPPORTED_TORCH,
+    )
+
+    match = re.match(r"^(\d+)\.(\d+)", str(torch.__version__))
+    if match is None or not (
+        _MIN_SUPPORTED_TORCH
+        <= (int(match.group(1)), int(match.group(2)))
+        <= _MAX_SUPPORTED_TORCH
+    ):
+        return f"PyTorch {torch.__version__} is outside the Rust TreeCore support range"
+    allocator = params.token_to_kv_pool_allocator
+    device = (
+        torch.device(allocator.device) if allocator is not None else torch.device("cpu")
+    )
+    if device.type not in ("cpu", "cuda"):
+        return f"the Rust TreeCore does not support device {device.type}"
+    if (
+        importlib.util.find_spec(_RUST_TREE_CORE_MODULE) is None
+        and not _RUST_TREE_CORE_MANIFEST.is_file()
+    ):
+        return "this installation contains neither the Rust TreeCore extension nor its sources"
+    return None
+
+
+def select_tree_core_backend(params: CacheInitParams) -> str:
+    """Use Rust by default where supported; explicit backend choices stay strict."""
+    backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+    if backend != "rust" or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
+        return backend
+    reason = _rust_default_unsupported_reason(params)
+    if reason is not None:
+        logger.info("Using the Python TreeCore: %s", reason)
+        return "python"
+    return backend
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:

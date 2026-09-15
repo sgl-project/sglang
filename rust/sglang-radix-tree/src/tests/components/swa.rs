@@ -543,6 +543,7 @@ fn insert_params_swa<'k>(
     swa_evicted_seqlen: usize,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -739,6 +740,7 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -806,6 +808,7 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -5509,6 +5512,7 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
     for (branching_seqlen, expected) in [(Some(3), true), (Some(4), false), (None, false)] {
         let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
         let result = tc.insert(&InsertParams {
+            rotation_base: None,
             swa_branching_seqlen: branching_seqlen,
             ..insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0)
         });
