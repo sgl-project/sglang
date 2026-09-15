@@ -738,6 +738,19 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers or []
             if self.should_backup(transfer)
         ]
+        # The Backup Req span lifecycle is owned here so the per-storage-thread
+        # thread span is built before any mooncake RPC -- the sidecar batch_set_v2
+        # below and the inherited MLA-KV write via super() -- and ended after
+        # both are done. Only init when this rank has real backup work: sidecar
+        # RPCs (backup_transfers) OR the replicated MLA-KV write (not
+        # self.backup_skip, i.e. tp0). A non-tp0 MLA rank with no rank-sharded
+        # sidecar issues zero RPCs, so it must not create an empty "Backup Req"
+        # (root_span + thread_span only, no hop). base _page_backup keeps its
+        # init/finish in its own backup_thread_func; this override calls super()
+        # only for the KV core loop, so there is no double-init.
+        needs_backup = bool(backup_transfers) or not self.backup_skip
+        if needs_backup:
+            self._init_op_trace(operation, rid=operation.id, role="Backup")
 
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
@@ -780,6 +793,9 @@ class HybridCacheController(BaseHiCacheController):
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
 
+        if needs_backup:
+            self._finish_op_trace(operation)
+
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
             return True
@@ -820,11 +836,9 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                # Create the hicache "Backup" root span here (off the scheduler
-                # hot path), mirroring the base controller's storage-thread init.
-                self._init_op_trace(operation, rid=operation.id, role="Backup")
+                # Span lifecycle is owned by _page_backup (init at start / finish at
+                # end, gated by whether this rank actually has backup work).
                 self._page_backup(operation)
-                self._finish_op_trace(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
