@@ -569,7 +569,7 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
-# Drain FlyDSL stage-1 LDS-DMA loads before the K-step barrier.
+# Drop this synchronization patch after the AITER pin includes ROCm/aiter#5561.
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
@@ -1178,6 +1178,8 @@ ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
+# Drop after the AITER pin includes ROCm/aiter#5562; model_configs preserves other models' rows.
+COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
