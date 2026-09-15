@@ -1,3 +1,4 @@
+import errno
 import gc
 import mmap
 import pickle
@@ -374,6 +375,67 @@ class TestShmReceiverViews(CustomTestCase):
                 )
                 with self.assertRaises(FileNotFoundError):
                     shared_memory.SharedMemory(name=sender.shm_name)
+
+    def test_allocation_exhaustion_falls_back_without_leaking_a_name(self):
+        from sglang.srt.managers.mm_utils import _wrap_shm_or_inline
+
+        names = []
+        original_shm = shared_memory.SharedMemory
+
+        def track_allocation(*args, **kwargs):
+            handle = original_shm(*args, **kwargs)
+            if kwargs.get("create"):
+                names.append(handle.name)
+            return handle
+
+        feature = torch.ones(8)
+        with (
+            patch(
+                "sglang.srt.managers.mm_utils.shared_memory.SharedMemory",
+                track_allocation,
+            ),
+            patch(
+                "sglang.srt.managers.mm_utils.os.posix_fallocate",
+                side_effect=OSError(errno.ENOSPC, "full"),
+            ),
+        ):
+            result = _wrap_shm_or_inline(feature)
+        self.assertIs(result, feature)
+        self.assertEqual(len(names), 1)
+        with self.assertRaises(FileNotFoundError):
+            original_shm(name=names[0])
+
+    def test_abort_preserves_session_features_and_active_aliases(self):
+        from sglang.srt.managers.schedule_batch import MultimodalInputs, Req
+
+        for session_owned in (False, True):
+            sender = self._sender(torch.arange(8))
+            receiver = pickle.loads(pickle.dumps(sender))
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE, feature=receiver.materialize()
+            )
+            inputs = MultimodalInputs(mm_items=[item])
+            alias = item.feature[2:6]
+            request = object.__new__(Req)
+            request.rid = "abort-shm-view"
+            request.session = (
+                SimpleNamespace(mm_inputs=inputs) if session_owned else None
+            )
+            request.multimodal_inputs = inputs
+            request.grammar = None
+            request.return_logprob = False
+            request.logprob_start_len = 0
+            with patch(
+                "sglang.srt.managers.schedule_batch.get_parallel",
+                return_value=SimpleNamespace(tp_rank=1),
+            ):
+                request.set_finish_with_abort("cancelled request")
+            self.assertIsNone(request.multimodal_inputs)
+            if session_owned:
+                self.assertTrue(torch.equal(item.feature, torch.arange(8)))
+            else:
+                self.assertIsNone(item.feature)
+            self.assertTrue(torch.equal(alias, torch.arange(2, 6)))
 
 
 class TestShmRequestFailureConsensus(unittest.TestCase):
