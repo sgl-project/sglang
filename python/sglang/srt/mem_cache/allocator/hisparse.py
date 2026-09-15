@@ -346,6 +346,17 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        # Delegated like the read-path translate above: this composite is not a
+        # SWA allocator itself, so it inherits neither the default nor an
+        # override, and the PD payload path calls this on whatever allocator
+        # the scheduler holds.
+        return self.logical_attn_allocator.translate_swa_indices_for_transfer(
+            kv_indices
+        )
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -357,6 +368,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
+
+    def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
+        self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
 
     def free_full(self, free_indices: torch.Tensor):
         if free_indices.numel() == 0:

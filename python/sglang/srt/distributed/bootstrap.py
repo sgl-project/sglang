@@ -39,7 +39,6 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
-    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -293,15 +292,12 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
-        duplicate_attn_cp_group=(
-            is_hip()
-            and get_exec().overlap.enable_two_batch_overlap
-            and get_parallel().enable_dsa_prefill_context_parallel
-        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
+        # Only WORLD is extended during scale-up. The joiner's model-parallel
+        # groups are fixed groups local to its launch cohort.
+        recovered_rank=is_ep_joiner and not is_scale_joiner,
         rank_offset=rank_offset,
-        max_world_size=get_parallel().max_ep_size,
+        max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(

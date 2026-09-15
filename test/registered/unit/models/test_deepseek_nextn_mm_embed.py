@@ -93,14 +93,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_nextn.mla_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
                 "sglang.srt.models.deepseek_nextn.fused_eh_norm",
                 side_effect=lambda h, p, ew, hw, eps: torch.cat(
                     [model.enorm(h), model.hnorm(p)], dim=-1
@@ -157,14 +149,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
         embed_calls = mock_embed.call_args_list
 
         with (
-            patch(
-                "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_nextn.mla_use_prefill_cp",
-                return_value=False,
-            ),
             patch(
                 "sglang.srt.models.deepseek_nextn.fused_eh_norm",
                 side_effect=lambda h, p, ew, hw, eps: torch.cat(

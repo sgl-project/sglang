@@ -2,7 +2,11 @@ from typing import Iterable, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+    unshuffle_fp8_weight,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
@@ -48,12 +52,21 @@ class ComparableWeight:
 class Fp8BlockComparable(ComparableWeight):
     """Deepseek-style FP8 quantization."""
 
-    def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
+    def __init__(
+        self,
+        w_q: torch.Tensor,
+        w_s: torch.Tensor,
+        is_shuffled: bool = False,
+    ):
         self.w_q = w_q
         self.w_s = w_s
+        self.is_shuffled = is_shuffled
 
     def __repr__(self) -> str:
-        return f"fp8_block(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype})"
+        return (
+            f"fp8_block(shape={tuple(self.w_q.shape)} dtype={self.w_q.dtype} "
+            f"is_shuffled={self.is_shuffled})"
+        )
 
     @staticmethod
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
@@ -90,6 +103,8 @@ class Fp8BlockComparable(ComparableWeight):
         s, block_size = self._scale_and_block_size()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
             q, s_chunk = q.cuda(), s_chunk.cuda()
+            if self.is_shuffled:
+                q = unshuffle_fp8_weight(q)
             yield (
                 block_quant_dequant(q, s_chunk, block_size, dtype=torch.bfloat16),
                 block_quant_dequant(
@@ -99,7 +114,10 @@ class Fp8BlockComparable(ComparableWeight):
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         s, block_size = self._scale_and_block_size()
-        return block_quant_dequant(self.w_q, s, block_size, dtype=dtype)
+        w_q = self.w_q
+        if self.is_shuffled:
+            w_q = unshuffle_fp8_weight(w_q)
+        return block_quant_dequant(w_q, s, block_size, dtype=dtype)
 
 
 class RawComparable(ComparableWeight):
