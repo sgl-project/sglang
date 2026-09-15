@@ -1200,7 +1200,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         }
 
         # HiCache and hardware backends still access the per-ratio attributes.
-        self.c4_kv_pool = self.kv_pools[4]
+        # Unified-KV HiSparse already bound c4_kv_pool to views of
+        # rows[swa_pages:]; kv_pools[4] is None because the loop above is skipped.
+        if not self.unified_hisparse:
+            self.c4_kv_pool = self.kv_pools[4]
         self.c128_kv_pool = self.kv_pools[128]
         self.c4_indexer_kv_pool = self.index_pools[4]
 

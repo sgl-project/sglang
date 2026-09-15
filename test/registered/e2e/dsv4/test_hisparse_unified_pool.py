@@ -286,6 +286,44 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         self.assertIsNone(hisparse_alloc.alloc(avail + 1))
         self.assertEqual(hisparse_alloc.available_size(), avail)
 
+    def test_init_compressed_pools_keeps_unified_hisparse_c4(self):
+        """_init_compressed_pools must not clobber the unified HiSparse C4 pool.
+
+        DeepSeekV4TokenToKVPool binds HiSparseUnifiedC4DevicePool, then always
+        called _init_compressed_pools which did c4_kv_pool = kv_pools[4] (None
+        on the unified path). Server start then died in the allocator assert.
+        """
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+            HiSparseUnifiedC4DevicePool,
+        )
+
+        stage_ratios = [4, 128]
+        unified = self._build_unified_pool(stage_ratios)
+        hisparse, _ = self._build_hisparse_pool(unified, stage_ratios)
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = True
+        pool.unified_hisparse = True
+        pool.c4_kv_pool = hisparse
+        pool.indexer_head_dim = QK_ROPE_HEAD_DIM
+        pool.compressed_pool_configs = {
+            4: SimpleNamespace(kv_size=1, indexer_size=1),
+            128: SimpleNamespace(kv_size=1, indexer_size=None),
+        }
+        pool._make_indexer_pool = lambda *a, **k: SimpleNamespace()
+        pool._init_compressed_pools(
+            stage_ratios=stage_ratios,
+            page_size=PAGE_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
+            enable_memory_saver=False,
+            enable_hisparse=True,
+            kv_pool_cls=object,
+        )
+        self.assertIs(pool.c4_kv_pool, hisparse)
+        self.assertIsInstance(pool.c4_kv_pool, HiSparseUnifiedC4DevicePool)
+        self.assertIsNone(pool.kv_pools[4])
+
 
 class TestUnifiedHiSparseCompressRemap(unittest.TestCase):
     """C4 out_loc remap in forward_unified, sitting next to main's fp8_2buff store.
