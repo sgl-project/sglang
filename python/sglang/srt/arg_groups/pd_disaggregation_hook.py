@@ -86,21 +86,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if (
-                cfg.speculative_algorithm is not None
-                and cfg.speculative_algorithm != "DSPARK"
-            ):
+            if cfg.speculative_algorithm is not None:
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache supports "
-                    "speculative decoding only with --speculative-algorithm "
-                    "DSPARK; got "
-                    f"{cfg.speculative_algorithm!r}."
-                )
-            if cfg.speculative_algorithm == "DSPARK":
-                logger.warning(
-                    "EXPERIMENTAL: PD decode radix cache with DSPARK requires "
-                    "Kimi-K3; the model-specific memory-pool validation runs "
-                    "after model loading."
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with speculative decoding "
+                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
 
             if resolved_view(server_args).enable_dp_attention:
