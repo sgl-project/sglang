@@ -34,7 +34,17 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -398,6 +408,15 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    # Set by whoever owns the event loop (the ASGI server) so that shutdown can
+    # hand the exit back to it. Left None for Engine and grpc, which own no
+    # server and exit directly. Declared here rather than in __init__ to keep
+    # the frozen constructor untouched.
+    _server_stop_hook: Optional[Callable[[], None]] = None
+
+    def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
+        self._server_stop_hook = hook
 
     @property
     def serving_chat_class(self):
@@ -3250,6 +3269,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
+        if self._server_stop_hook is not None:
+            # sys.exit() from inside a task raises SystemExit into the event
+            # loop and kills it under the ASGI server, so its lifespan shutdown
+            # never runs and the cancelled lifespan surfaces as an ERROR.
+            # Cancel our own tasks first: handing off means the loop outlives
+            # this coroutine, and a still-pending handle_loop would be reported
+            # as destroyed-while-pending on the way out.
+            current = asyncio.current_task()
+            for task in self.asyncio_tasks:
+                if task is not current:
+                    task.cancel()
+            self._server_stop_hook()
+            return
         sys.exit(0)
 
     def force_exit_handler(self):
