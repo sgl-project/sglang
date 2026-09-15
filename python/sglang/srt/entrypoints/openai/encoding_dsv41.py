@@ -282,7 +282,11 @@ def render_message(
             )
 
     elif role == "developer":
-        assert content, f"Invalid message for role `{role}`: {msg}"
+        # ValueError, not assert: serving_base maps ValueError to a 400 and an
+        # AssertionError to a 500, and an empty developer message is a client
+        # error (dsv32 raises DS32EncodingError for the same input).
+        if not content:
+            raise ValueError(f"Invalid message for role `{role}`: {msg}")
 
         content_developer = USER_SP_TOKEN
         content_developer += content
@@ -308,7 +312,10 @@ def render_message(
                 if block_type == "text":
                     parts.append(block.get("text", ""))
                 elif block_type == "tool_result":
-                    tool_content = block.get("content", "")
+                    # `or ""` because get's default only covers a *missing* key;
+                    # content=null (legal in OpenAI tool results) must not render
+                    # the literal string "None".
+                    tool_content = block.get("content") or ""
                     if isinstance(tool_content, list):
                         text_parts = []
                         for b in tool_content:
@@ -446,7 +453,8 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                # `or ""` because get's default only covers a *missing* key.
+                "content": msg.get("content") or "",
             }
             # Merge into previous message if it's already a user (merged tool)
             if (
@@ -465,7 +473,9 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
+                # `or ""` so a null content becomes an empty text block instead
+                # of a None the renderer crashes on.
+                content_blocks = [{"type": "text", "text": msg.get("content") or ""}]
             if (
                 merged
                 and merged[-1].get("role") == "user"
