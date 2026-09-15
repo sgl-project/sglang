@@ -462,13 +462,16 @@ class MambaPoolHost(HostKVCache):
                 # NPU: transfer all layers at once via dedicated kernel.
                 # layer_id == 0 covers every layer, so later calls must skip.
                 if layer_id == 0:
-                    transfer_mamba_state(
-                        device_buf=device_pool.mamba_cache.temporal,
-                        host_buf=self.temporal_buffer,
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        direction=TransferDirection.H2D,
-                    )
+                    # no ssm state on conv-only models: a 0-size batched
+                    # transfer errors, same guard as the per-layer path below
+                    if self.temporal_state_elem_size > 0:
+                        transfer_mamba_state(
+                            device_buf=device_pool.mamba_cache.temporal,
+                            host_buf=self.temporal_buffer,
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            direction=TransferDirection.H2D,
+                        )
                     for conv_idx in range(len(self.conv_state_shapes)):
                         transfer_mamba_state(
                             device_buf=device_pool.mamba_cache.conv[conv_idx],
