@@ -10,6 +10,7 @@ use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -36,6 +37,9 @@ pub struct AppContext {
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Open HTTP exchanges, on every route. What axum's graceful shutdown
+    /// waits on — `active_load` sees only the proxied subset.
+    pub inflight_http: Arc<InflightHttp>,
     ready: AtomicBool,
 }
 
@@ -92,6 +96,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -147,6 +152,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }

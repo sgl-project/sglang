@@ -232,3 +232,141 @@ async fn shutdown_with_no_inflight_returns_promptly() {
         "idle shutdown took too long: {elapsed:?}"
     );
 }
+
+/// Poll until `inflight_http` settles on `want`, so the assertions below do not
+/// race the guard drop that happens on the server task after the client has
+/// already seen the last byte.
+async fn wait_for_inflight_http(ctx: &Arc<AppContext>, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if ctx.inflight_http.count() == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "inflight_http stayed at {} instead of settling to {want}",
+        ctx.inflight_http.count(),
+    );
+}
+
+/// `inflight_http` is what the drain heartbeat reports, and it is only worth
+/// reporting if it tracks what axum's graceful shutdown actually waits on: the
+/// response BODY finishing, not the handler returning. A streaming completion
+/// hands back its headers immediately, so a count released at handler exit
+/// would read 0 for the entire window the heartbeat exists to explain — the
+/// same blind spot `active_load.inflight_count()` has, reproduced in the
+/// replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inflight_http_counts_a_streaming_response_until_its_body_finishes() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        SLOW_CHUNKS.to_vec(),
+        Duration::from_millis(60),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(ctx.inflight_http.count(), 0, "idle router counts nothing");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream started: {}",
+        resp.status()
+    );
+
+    // Headers are in, ~480 ms of chunks are not. This is precisely the state a
+    // SIGTERM lands in, and the count has to see it.
+    assert_eq!(
+        ctx.inflight_http.count(),
+        1,
+        "a streaming response whose body is still being written must stay counted",
+    );
+
+    let body = resp.bytes().await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("data: [DONE]"),
+        "the stream must have run to completion for this to say anything",
+    );
+    wait_for_inflight_http(&ctx, 0).await;
+
+    stop_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server resolves")
+        .expect("server task joined cleanly");
+}
+
+/// Every route is instrumented, not only the proxied ones. `/metrics`,
+/// `/readyz` and a 404 are exchanges axum's drain waits on too, and they are
+/// exactly the traffic `active_load` cannot see — so a guard that leaked on a
+/// non-proxied route would leave the heartbeat permanently busy and turn the
+/// drain report back into noise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inflight_http_returns_to_zero_after_non_proxied_routes() {
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        SLOW_CHUNKS.to_vec(),
+        Duration::from_millis(1),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for path in ["/metrics", "/readyz", "/healthz", "/v1/models", "/nope"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path} failed: {e}"));
+        // Body consumed, not just headers: an unread body is an unfinished
+        // exchange and would make this assert nothing.
+        let _ = resp.bytes().await.unwrap();
+    }
+    wait_for_inflight_http(&ctx, 0).await;
+
+    stop_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server resolves")
+        .expect("server task joined cleanly");
+}
