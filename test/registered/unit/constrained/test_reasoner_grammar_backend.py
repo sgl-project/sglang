@@ -244,13 +244,21 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             enable_strict_thinking=True,
         )
 
-        wrapped = reasoner._init_value_dispatch(("json", "{}"), reasoning=True)
-        self.assertIsInstance(wrapped, ReasonerGrammarObject)
-        wrapped.accept_token(10)
-        inner_grammar.accept_token.assert_not_called()
-        wrapped.accept_token(2)
-        wrapped.accept_token(42)
-        inner_grammar.accept_token.assert_called_once_with(42)
+        for key in (("json", "{}"), ("ebnf", 'root ::= "OK"')):
+            with self.subTest(key=key):
+                inner_grammar.reset_mock()
+                wrapped = reasoner._init_value_dispatch(key, reasoning=True)
+                self.assertIsInstance(wrapped, ReasonerGrammarObject)
+                wrapped.accept_token(10)
+                inner_grammar.accept_token.assert_not_called()
+                wrapped.accept_token(2)
+                wrapped.accept_token(42)
+                inner_grammar.accept_token.assert_called_once_with(42)
+
+        bare = reasoner._init_value_dispatch(
+            ("full_assistant_ebnf", 'root ::= "OK"'), reasoning=True
+        )
+        self.assertIs(bare, inner_grammar)
 
     def test_accepts_multi_token_think_start_marker(self):
         """think_start_token can be multi-token (e.g., GPT-OSS) since it's not used."""
