@@ -1,9 +1,9 @@
 #!/bin/bash
 # MiniMax-M3 AgentX reproduction on 4x MI350X/MI355X: TP4, MXFP4 quark checkpoint, fp8 KV, EAGLE3, SemiAnalysis AIPerf client.
-# Usage: bash reproduce.sh setup                 install sglang (this checkout) + aiter + client, download both models
-#        bash reproduce.sh real  [c ...]         recommended config; AIPerf points at c=1 8 24 32 (3600 s each) and a summary
+# Usage: bash reproduce.sh real  [c ...]         recommended config; AIPerf points at c=1 8 24 32 (3600 s each) and a summary
+#                                                (first run installs sglang from this checkout, aiter, the client and both models)
 #        bash reproduce.sh lossy [c ...]         ATOM-parity performance-only config (forced acceptance; outputs are not the model's)
-#        bash reproduce.sh serve real|lossy      server only          bash reproduce.sh stop      kill the server
+#        bash reproduce.sh setup | serve real|lossy | stop      setup only / server only / kill the server
 # Env:   M3_WORK=/scratch (models, results, logs, aiter, client; default /scratch if writable else ~/m3-agentx)
 #        GPUS=0,1,2,3  PORT=30000  DURATION=3600  SKIP_MODELS=1 (setup without downloads)  CHECK_ONLY=1 (preflight only)
 set -uo pipefail
@@ -38,11 +38,11 @@ setup() {
   echo "setup complete: work dir $M3_WORK"
 }
 
+installed() { [ -f "$MODEL/config.json" ] && [ -f "$DRAFT/config.json" ] && [ -x "$AIPERF" ] && "$PYTHON" -c "import sglang, aiter" 2>/dev/null; }
+
 preflight() {
   local fail=0 g used
-  for d in "$MODEL" "$DRAFT"; do [ -f "$d/config.json" ] || { echo "missing model $d (run: reproduce.sh setup)"; fail=1; }; done
-  [ -x "$AIPERF" ] || { echo "missing client $AIPERF (run: reproduce.sh setup)"; fail=1; }
-  "$PYTHON" -c "import sglang, aiter" 2>/dev/null || { echo "$PYTHON cannot import sglang and aiter (run: reproduce.sh setup)"; fail=1; }
+  installed || { [ -n "${CHECK_ONLY:-}" ] && { echo "setup incomplete under $M3_WORK (run: reproduce.sh setup)"; exit 1; }; echo "setup incomplete under $M3_WORK; running setup first"; (setup) || exit 1; }
   for g in ${GPUS//,/ }; do
     used=$(rocm-smi -d "$g" --showmemuse --csv 2>/dev/null | grep "^card" | cut -d, -f2)
     [ -n "$used" ] || { echo "GPU $g not visible to rocm-smi"; fail=1; continue; }

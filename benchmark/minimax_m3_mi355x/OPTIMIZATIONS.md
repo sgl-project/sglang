@@ -15,17 +15,15 @@ SGLang numbers are the in-window rate (tokens of the profiling records over the 
 
 ## Reproduce
 
-`benchmark/minimax_m3_mi355x/reproduce.sh` on `kevin-mii/sglang` `M3-perf` does everything; run it from a ROCm 7.2.4 container (Ubuntu 24.04, Python 3.12, torch 2.11.0+rocm7.2, e.g. `docker/rocm.Dockerfile` for gfx950) on a node with 4 free gfx950 GPUs. No fixed paths: the checkout is found from the script, everything else goes under `M3_WORK`.
+Inside the sglang ROCm 7.2.4 container for gfx950 (`docker/rocm.Dockerfile`, `GPU_ARCH=gfx950-rocm724`; Ubuntu 24.04, Python 3.12, torch 2.11.0+rocm7.2) on a node with 4 free GPUs:
 
 ```bash
 git clone -b M3-perf https://github.com/kevin-mii/sglang && cd sglang/benchmark/minimax_m3_mi355x
-export M3_WORK=/scratch            # any writable directory with ~300 GB free
-bash reproduce.sh setup            # sglang (editable), aiter 4ad99832 + FlyDSL swizzle fix, tuned MoE rows, both models, SemiAnalysis AIPerf fork 754356e9
-bash reproduce.sh real             # recommended config: c=1 8 24 32, 3600 s each, one server, sequential points, summary per point
-bash reproduce.sh lossy            # ATOM-parity performance-only config (forced acceptance); outputs are not the model's
+bash reproduce.sh real      # recommended config: c=1 8 24 32, 3600 s each; summary per point
+bash reproduce.sh lossy     # ATOM-parity performance-only config (forced acceptance); outputs are not the model's
 ```
 
-Each point prints AIPerf's `total_token_throughput` per GPU, the in-window rate, TTFT/ITL and p90 interactivity; raw AIPerf artifacts land in `$M3_WORK/results/aiperf_<mode>_c<N>/`. The `serve` function of the script holds the full `sglang.launch_server` command and every env var of both configs; the `bench` function holds ATOM's client environment and flags. `GPUS`, `PORT`, `DURATION` override the defaults; `CHECK_ONLY=1` runs the preflight (GPUs free, models, client). Run one server and one client per host. Quality gate for the real config: `python -m sglang.test.few_shot_gsm8k --port 30000 --num-questions 1000 --num-shots 5 --parallel 48` (expect 0.85-0.87).
+The first run installs sglang from the checkout, aiter 4ad99832 with the FlyDSL swizzle fix, the tuned MoE rows, both models and the SemiAnalysis AIPerf fork (754356e9) under `M3_WORK` (default `/scratch` if writable, else `~/m3-agentx`; ~300 GB). Each point prints AIPerf's `total_token_throughput` per GPU, the in-window rate, TTFT/ITL and p90 interactivity; raw artifacts land in `$M3_WORK/results/aiperf_<mode>_c<N>/`. `GPUS`, `PORT`, `DURATION` and concurrencies as arguments override the defaults. The script's `serve` function holds the full `sglang.launch_server` command and every env var of both configs; `bench` holds ATOM's client environment and flags. Quality gate for the real config: `python -m sglang.test.few_shot_gsm8k --port 30000 --num-questions 1000 --num-shots 5 --parallel 48` (expect 0.85-0.87).
 
 ---
 
