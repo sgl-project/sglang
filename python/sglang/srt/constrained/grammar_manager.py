@@ -160,7 +160,12 @@ class GrammarManager:
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
-                    key = ("ebnf", req.sampling_params.ebnf)
+                    key_type = (
+                        "full_assistant_ebnf"
+                        if req.sampling_params.ebnf_full_assistant
+                        else "ebnf"
+                    )
+                    key = (key_type, req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
