@@ -602,7 +602,30 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         else _materialize_cpu_indices(indices)
                     )
                     cpu_indices[source_id] = prepared_indices
-                locations.extend(entry.prepare_locations(prepared_indices))
+                # NOTE: open issue -- some nodes' recorded device_indices for
+                # the FULL component drift past entry._row_count (observed
+                # starting exactly at, and growing monotonically beyond,
+                # max_total_num_tokens; the real allocator in allocator/paged.py
+                # never hands out a page in that range). Root cause not yet
+                # isolated; this range is the forensic detail needed to chase
+                # it further. The caller already treats a raised ValueError
+                # here as a soft offload failure, not a crash.
+                try:
+                    locations.extend(entry.prepare_locations(prepared_indices))
+                except ValueError:
+                    logger.warning(
+                        "UMBP pool %s prepare_locations failed: keys=%s "
+                        "indices_numel=%d indices_min=%d indices_max=%d "
+                        "row_count=%d page_size=%d",
+                        name,
+                        transfer.keys,
+                        prepared_indices.numel(),
+                        int(prepared_indices.min()),
+                        int(prepared_indices.max()),
+                        entry._row_count,
+                        entry.page_size,
+                    )
+                    raise
             if len(keys) != len(locations) * entries_per_page:
                 raise ValueError(
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "

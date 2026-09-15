@@ -54,6 +54,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
