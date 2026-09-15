@@ -100,6 +100,9 @@ Also on `M3-perf` only (not upstreamed): `benchmark/minimax_m3_mi355x/` launch s
 
 ## 4. Tested and rejected (numbers in `M3_MI350X_STATUS.md`)
 
+- PTPC-FP8 dense (online per-token FP8 for the quark-excluded linears, tuned aiter a8w8 rows): neutral when adopted, but on the 2026-09-15 build it costs 9% decode at 24 streams (A/B: 2,732 vs 3,006 tok/s, same GPUs). Off by default; `PTPC_FP8=1` turns it back on.
+- Cleanup regression, fixed: "keep the long-prefix extend route out of graph capture" tested the combined capture-mode getter, which is also true while a breakable prefill graph replays, so every prefill over a cached prefix fell back to the plain Triton extend kernel (fresh 100K prefill 2.5 -> 3.0 s). The gate now reads the real capture flag only.
+
 `--enable-aiter-allreduce-fusion` (neutral, +3.4 ms memset/step); quick-reduce below 64 MB (custom AR takes those messages); chunk 16384; `--max-running-requests 64`; every scheduler knob (lpm, conservativeness, prefill-decode interval, max-prefill-tokens; all within +-2%); draft-model FP8 (neutral); expert parallelism (EP4 -15..-20%, fp4 atomic stage-2 broken in aiter); TP2 x DP2 with cache-aware routing (-40%); no-copy Gluon page layout (~1% of prefill for days of work); aiter MoE glue fusion (needs an upstream aiter kernel change, ~0.76 ms/step).
 
 ## 5. What ATOM still does that we do not

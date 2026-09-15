@@ -1582,12 +1582,11 @@ class TritonAttnBackend(AttentionBackend):
             include_draft_extend_v2=True
         ):
             return False
-        # the split count and partial buffers follow host shapes a captured graph would bake in
-        from sglang.srt.model_executor.runner_utils.capture_mode import (
-            get_is_capture_mode,
-        )
+        # skip only while a decode/draft graph is being captured: the split count follows host shapes
+        # (a breakable prefill graph runs attention as an eager break, so the route is fine there)
+        from sglang.srt.model_executor.runner_utils import capture_mode
 
-        if get_is_capture_mode():
+        if capture_mode.is_capture_mode:
             return False
         bs = forward_batch.batch_size
         return bs > 0 and kv_indices.numel() >= bs * self.long_prefix_extend_min_tokens

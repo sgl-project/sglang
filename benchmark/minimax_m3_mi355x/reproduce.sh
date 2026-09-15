@@ -53,15 +53,17 @@ preflight() {
 }
 
 serve() {  # $1 = real | lossy
-  local mode=$1 aiter_pkg; aiter_pkg=$("$PYTHON" -c "import os, aiter; print(os.path.dirname(aiter.__file__))")
+  local mode=$1 aiter_pkg; aiter_pkg=$("$PYTHON" -c "import os, aiter; print(os.path.dirname(aiter.__file__))" 2>/dev/null)
   export HIP_VISIBLE_DEVICES=$GPUS CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 PYTHONPATH=$SGLANG_DIR/python${PYTHONPATH:+:$PYTHONPATH}
   export SGLANG_USE_AITER=1 NCCL_MIN_NCHANNELS=112 HIP_FORCE_DEV_KERNARG=1
   export SGLANG_M3_ALLOW_CUSTOM_AR=1 ROCM_QUICK_REDUCE_QUANTIZATION=INT4 SGLANG_CUSTOM_AR_ONE_STAGE_MAX_BYTES=262144   # all-reduce: custom AR, INT4 quick-reduce for >=64 MB, 1-stage kernel under 256 KB
   export SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4                                    # Gluon sparse prefill on fp8 KV; indexer top-k every 4th layer
   export SGLANG_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_ENABLE_TRITON_EXTEND_LONG_PREFIX=1 SGLANG_USE_AITER_EXTEND_LONG_PREFIX=1  # long-cached-prefix extends: Triton route, aiter paged batch-prefill
   export SGLANG_CHUNKED_PREFILL_FAIRNESS_RESERVE=0.5 SGLANG_TIMEOUT_KEEP_ALIVE=3600                                     # short extends share the chunk budget; idle client connections stay open
-  export SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1 SGLANG_USE_AITER_FP8_PER_TOKEN=1 SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES=gate,lm_head,index_qkv_proj SGLANG_FUSED_NORM_FP8_QUANT_MAX_M=16384  # quark-excluded dense layers as per-token FP8
-  export AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE=$aiter_pkg/configs/a8w8_bpreshuffle_tuned_gemm.csv:$HERE/tuned_a8w8_bpreshuffle_m3_gfx950.csv
+  if [ -n "${PTPC_FP8:-}" ]; then  # optional: quark-excluded dense layers as per-token FP8; measured -9% decode at 24 streams on 2026-09-15, so off by default
+    export SGLANG_QUARK_USE_ONLINE_FP8_FOR_EXCLUDED=1 SGLANG_USE_AITER_FP8_PER_TOKEN=1 SGLANG_QUARK_ONLINE_FP8_SKIP_MODULES=gate,lm_head,index_qkv_proj SGLANG_FUSED_NORM_FP8_QUANT_MAX_M=16384
+    export AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE=$aiter_pkg/configs/a8w8_bpreshuffle_tuned_gemm.csv:$HERE/tuned_a8w8_bpreshuffle_m3_gfx950.csv
+  fi
   local steps=3 draft=4 memfrac=0.85 extra="--max-running-requests 48"
   if [ "$mode" = lossy ]; then  # PERFORMANCE-ONLY: forced acceptance length 2.78 over 3 draft tokens = ATOM's --spec-decode-acceptance-rate 0.5933
     export SGLANG_SIMULATE_ACC_LEN=2.78 SGLANG_SIMULATE_ACC_METHOD=match-expected SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0
