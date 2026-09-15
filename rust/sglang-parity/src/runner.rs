@@ -176,7 +176,7 @@ pub fn describe(config: &RunConfig, suite: &HttpSuite) -> Result<EffectiveSuite,
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
     #[default]
@@ -187,13 +187,13 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Check {
     pub status: Status,
     pub differences: Vec<Difference>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attempt {
     pub directory: PathBuf,
     pub observation: Option<HttpObservation>,
@@ -203,20 +203,20 @@ pub struct Attempt {
     comparison: Option<Value>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SideResult {
     pub attempts: Vec<Attempt>,
     pub repeatability: Check,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaseResult {
     pub name: String,
     pub implementations: BTreeMap<String, SideResult>,
     pub parity: Check,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EquivalenceResult {
     pub group: String,
     pub implementation: Implementation,
@@ -226,7 +226,7 @@ pub struct EquivalenceResult {
 }
 
 /// All completed and incomplete work, with paths to unmodified observations.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
     pub state: String,
     pub directory: PathBuf,
@@ -307,10 +307,13 @@ impl RunArtifacts {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        self.artifacts.write_json(
-            &self.artifacts.root().join("report.json"),
-            self.report.as_ref().expect("active report"),
-        )
+        let report = self.report.as_ref().expect("active report");
+        self.artifacts
+            .write_json(&self.artifacts.root().join("report.json"), report)?;
+        if matches!(report.state.as_str(), "complete" | "interrupted") {
+            crate::report::ReportView::new(report, self.artifacts.root()).write_html()?;
+        }
+        Ok(())
     }
 }
 

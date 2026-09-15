@@ -6,16 +6,19 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use sglang_parity::environment::{self, Backend};
-use sglang_parity::{RunConfig, describe, run};
+use sglang_parity::report::ReportView;
+use sglang_parity::{Report, RunConfig, describe, run};
 
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
 
-const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate] [--suite-file <suite.json>] [--describe]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
+const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate] [--suite-file <suite.json>] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
 
 #[derive(Default)]
 struct Arguments {
     config: Option<PathBuf>,
+    report: Option<PathBuf>,
+    case: Option<String>,
     suite_file: Option<PathBuf>,
     describe: bool,
     update_env_lock: bool,
@@ -36,13 +39,15 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
         match argument.as_str() {
             "--describe" => result.describe = true,
             "--update-env-lock" => result.update_env_lock = true,
-            "--config" | "--suite" | "--suite-file" | "--backend" => {
+            "--config" | "--suite" | "--suite-file" | "--backend" | "--report" | "--case" => {
                 let value = arguments
                     .next()
                     .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| format!("{argument} requires a value"))?;
                 match argument.as_str() {
                     "--config" => result.config = Some(value.into()),
+                    "--report" => result.report = Some(value.into()),
+                    "--case" => result.case = Some(value),
                     "--suite-file" => result.suite_file = Some(value.into()),
                     "--backend" => {
                         result.backend = Some(match value.as_str() {
@@ -60,7 +65,17 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
             _ => return Err(format!("unknown option {argument}")),
         }
     }
-    if result.update_env_lock {
+    if result.case.is_some() && result.report.is_none() {
+        return Err("--case requires --report".into());
+    }
+    if result.report.is_some() {
+        if seen
+            .iter()
+            .any(|option| !matches!(option.as_str(), "--report" | "--case"))
+        {
+            return Err("--report cannot be combined with run or environment options".into());
+        }
+    } else if result.update_env_lock {
         if ["--config", "--describe", "--suite", "--suite-file"]
             .iter()
             .any(|option| seen.contains(*option))
@@ -99,6 +114,18 @@ async fn execute(arguments: Arguments) -> Result<i32, Box<dyn std::error::Error>
 }
 
 async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::Error>> {
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    if let Some(path) = arguments.report {
+        let path = std::fs::canonicalize(path)?;
+        let report: Report = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let view = ReportView::new(&report, path.parent().expect("report file has a parent"));
+        let summary = view
+            .terminal(arguments.case.as_deref(), color)
+            .map_err(std::io::Error::other)?;
+        view.write_html()?;
+        print!("{summary}");
+        return Ok(report.exit_code());
+    }
     if arguments.update_env_lock {
         let backend = arguments.backend.unwrap();
         let name = match backend {
@@ -133,25 +160,12 @@ async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::
         return Ok(0);
     }
     let report = run(&config, &suite, &policy).await?;
-    for case in &report.cases {
-        let violations: usize = case
-            .implementations
-            .values()
-            .flat_map(|side| &side.attempts)
-            .map(|attempt| attempt.violations.len())
-            .sum();
-        println!(
-            "{}: parity={:?}, python={:?}, rust={:?}, violations={violations}",
-            case.name,
-            case.parity.status,
-            case.implementations["python"].repeatability.status,
-            case.implementations["rust"].repeatability.status
-        );
-    }
-    for error in &report.runtime_errors {
-        eprintln!("{error}");
-    }
-    println!("Report: {}", report.directory.join("report.json").display());
+    print!(
+        "{}",
+        ReportView::new(&report, &report.directory)
+            .terminal(None, color)
+            .map_err(std::io::Error::other)?
+    );
     Ok(report.exit_code())
 }
 
@@ -193,6 +207,17 @@ mod tests {
     fn rejects_ambiguous_or_obsolete_options() {
         for args in [
             vec!["--config", "--describe"],
+            vec!["--report", "report.json", "--describe"],
+            vec!["--report", "report.json", "--config", "run.json"],
+            vec![
+                "--report",
+                "report.json",
+                "--update-env-lock",
+                "--backend",
+                "mlx",
+            ],
+            vec!["--config", "run.json", "--case", "one"],
+            vec!["--report"],
             vec!["--cases", "cases.json"],
             vec!["--config", "one", "--config", "two"],
             vec!["--config", "one", "--suite", "grpc"],

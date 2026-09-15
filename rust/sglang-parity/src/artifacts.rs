@@ -35,8 +35,14 @@ impl Artifacts {
     pub fn write_json(&self, path: &Path, value: &impl Serialize) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec_pretty(value)?;
         bytes.push(b'\n');
-        let pending = path.with_extension("json.pending");
-        std::fs::write(&pending, bytes)?;
-        std::fs::rename(pending, path)
+        write_atomic(path, &bytes)
     }
+}
+
+/// Replace an artifact without exposing a partially written file to readers.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut pending = path.as_os_str().to_owned();
+    pending.push(".pending");
+    std::fs::write(&pending, bytes)?;
+    std::fs::rename(pending, path)
 }
