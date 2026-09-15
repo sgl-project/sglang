@@ -68,6 +68,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -737,32 +738,61 @@ def _gather_ple_embedding_from_pinned_kernel(
     weight_ptr,
     ids_ptr,
     output_ptr,
+    n_rows,
     embedding_dim,
     tp_vocab_start,
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    # Grid-striding rather than one program per row: the row count is
+    # ``tokens * ngram_heads``, which overruns Ascend's grid limit on a large
+    # prefill. Where the platform is unbounded the grid still equals ``n_rows``,
+    # so every program runs exactly one iteration as before.
     row_id = tl.program_id(0)
-    global_idx = tl.load(ids_ptr + row_id)
-    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
-    local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+    row_stride = tl.num_programs(0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     if is_fp8:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
-    tl.store(
-        output_ptr + row_id * embedding_dim + offsets,
-        tl.where(in_range, values, 0.0),
-        mask=mask,
-    )
+    for row in range(row_id, n_rows, row_stride):
+        global_idx = tl.load(ids_ptr + row)
+        in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+        local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+        tl.store(
+            output_ptr + row * embedding_dim + offsets,
+            tl.where(in_range, values, 0.0),
+            mask=mask,
+        )
+
+
+def _host_table_device_ptr(
+    host_ptr: int, nbytes: int, *, backend: str
+) -> Optional[int]:
+    """Device address for an offloaded PLE table, or None if none is needed.
+
+    The ``file`` backend hands the kernel a pageable mapping and depends on
+    faults paging rows in on demand, plus an ``MADV_DONTNEED`` trimmer that
+    discards them again -- neither survives being mapped into a device address
+    space, so it stays limited to devices that expose pageable host memory.
+    """
+    if backend != "pinned":
+        if not current_platform.is_cuda_alike():
+            raise ValueError(
+                "--ple-offload-backend=file requires a device whose kernels can "
+                "dereference pageable host memory "
+                "(cudaDevAttrPageableMemoryAccessUsesHostPageTables); use "
+                "--ple-offload-backend=pinned on this platform."
+            )
+        return None
+    return current_platform.register_host_memory(host_ptr, nbytes)
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
@@ -844,7 +874,25 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
+        self._device_table_ptr = _host_table_device_ptr(
+            self.weight.data_ptr(),
+            self.weight.numel() * self.weight.element_size(),
+            backend=backend,
+        )
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+
+    def unregister_host_table(self) -> None:
+        """Drop the device mapping. Must run before the host table is freed."""
+        if getattr(self, "_device_table_ptr", None) is None:
+            return
+        self._device_table_ptr = None
+        current_platform.unregister_host_memory(self.weight.data_ptr())
+
+    def __del__(self):
+        try:
+            self.unregister_host_table()
+        except Exception:  # teardown order, or a partially built module
+            pass
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -877,17 +925,24 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             output = out
 
         flat_ids = input_ids.reshape(-1).long()
-        if flat_ids.numel():
+        n_rows = flat_ids.numel()
+        if n_rows:
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
+            # Platforms without unified addressing hand the kernel the mapped
+            # address; the grid is clamped where the runtime bounds it.
+            weight_ptr = self._device_table_ptr or self.weight.data_ptr()
+            max_grid = current_platform.get_max_kernel_grid_size()
+            grid = n_rows if max_grid is None else min(n_rows, max_grid)
+            _gather_ple_embedding_from_pinned_kernel[(grid,)](
+                weight_ptr,
                 flat_ids,
                 output,
+                n_rows,
                 embedding_dim=self.embedding_dim,
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
