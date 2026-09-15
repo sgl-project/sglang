@@ -449,6 +449,15 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
+        fake_topk = torch.arange(config.n_routed_experts)
+        fake_topk = torch.cat([fake_topk[::2], fake_topk[1::2]])
+        self.tp_rank = get_parallel().tp_rank
+        fake_topk = torch.cat([
+            fake_topk[self.tp_rank * config.n_routed_experts // self.tp_size::1],
+            fake_topk[:self.tp_rank * config.n_routed_experts // self.tp_size:1]
+        ])
+        self.fake_topk = fake_topk.repeat(512).view(-1, 16).to(torch.int32).npu()
+
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
@@ -937,11 +946,20 @@ class KimiK3MoE(nn.Module):
 
     def _select_experts(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         """Select logical experts and remap them to their loaded physical slots."""
-        return self.topk(
+        topk_output = self.topk(
             hidden_states,
             router_logits,
             expert_location_dispatch_info=self._expert_location_dispatch_info(),
         )
+        # from sglang.srt.layers.moe.topk import (
+        #     StandardTopKOutput,
+        # )
+        # topk_output = StandardTopKOutput(
+        #     topk_output.topk_weights,
+        #     self.fake_topk[:hidden_states.shape[0]],
+        #     topk_output.router_logits,
+        # )
+        return topk_output
 
     @cached_property
     def _ep_front_eligible(self) -> bool:

@@ -615,6 +615,7 @@ class Envs:
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    SGLANG_DP_MLP_SYNC_FORCE_CPU_GROUP = EnvBool(False)
 
     # ===================================================================
     # Radix and sparse KV caches
