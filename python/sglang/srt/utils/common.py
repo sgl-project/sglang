@@ -814,7 +814,6 @@ def get_used_cpu_memory():
         return psutil.virtual_memory().used
 
 
-
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -854,7 +853,6 @@ def get_cpu_memory_capacity():
         numa_mem = psutil.virtual_memory().total / n_numa_node
         # Retrieved value in Byte, need MB
         return float(numa_mem // (1 << 20))
-
 
 
 def get_xpu_memory_capacity():

@@ -208,7 +208,9 @@ class TestGetAvailableGpuMemoryCpu(CustomTestCase):
 
     def test_capped_uses_cgroup_limit_minus_used(self):
         with (
-            mock.patch(f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)),
+            mock.patch(
+                f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)
+            ),
             mock.patch(f"{_COMMON}.get_used_cpu_memory", return_value=50 * (1 << 30)),
             mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0"]),
         ):
@@ -230,11 +232,10 @@ class TestGetAvailableGpuMemoryCpu(CustomTestCase):
         # dropped upstream in get_cpu_ids_by_node). Dividing the 200 GB limit by
         # 1, not 2, is what lets the socket use its full budget.
         with (
-            mock.patch(f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)),
+            mock.patch(
+                f"{_COMMON}._read_cgroup_memory_max", return_value=200 * (1 << 30)
+            ),
             mock.patch(f"{_COMMON}.get_used_cpu_memory", return_value=0),
             mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0"]),
         ):
             self.assertAlmostEqual(get_available_gpu_memory("cpu", 0), 200.0, places=1)
-
-
-

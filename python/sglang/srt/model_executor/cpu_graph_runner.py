@@ -728,9 +728,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = get_available_gpu_memory(
-                    "cpu", get_parallel().tp_rank
-                )
+                avail_mem = get_available_gpu_memory("cpu", get_parallel().tp_rank)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
