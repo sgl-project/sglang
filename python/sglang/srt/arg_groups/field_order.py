@@ -103,6 +103,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_tp_lm_head_all_to_all",
     "enable_attn_tp_input_scattered",
     "enable_shared_experts_attn_tp",
+    "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
     "disable_attn_tp_gather",
