@@ -636,8 +636,8 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if get_parallel().dcp_enabled and not self.is_draft_worker:
-            # The draft keeps the allocator-global slot view for its indexer,
-            # but uses ordinary full-KV attention and needs no DCP tables.
+            # Draft workers retain allocator-global cache slots and use the non-DCP
+            # attention path, so only target workers need DCP-specific metadata.
             self.forward_metadata.dcp_origin_out_cache_loc = (
                 forward_batch.origin_out_cache_loc
             )
@@ -721,8 +721,8 @@ class AscendAttnBackend(AttentionBackend):
         if get_parallel().dcp_enabled and not self.is_draft_worker:
             dcp_page_size = self.page_size * get_parallel().attn_dcp_size
             max_dcp_seq_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
-            # The captured DSA indexer store reads this fixed storage. Replay
-            # refreshes its allocator-global slot ids before graph execution.
+            # The captured DSA indexer cache-write operation reads from this fixed
+            # buffer. Replay refreshes its allocator-global slot ids before execution.
             self.graph_metadata["dcp_origin_out_cache_loc"] = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
@@ -912,18 +912,17 @@ class AscendAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
-        # Keep the host-side planning length distinct from the device graph
-        # buffer.  DCP frontier construction and block-table sizing must see
-        # the post-speculation KV length, while DFLASH already supplies that
-        # length in seq_lens_cpu.
-        planning_seq_lens_cpu = seq_lens_cpu[:bs].int()
+        # Compute the host-side KV lengths visible to this attention step. Target
+        # verify adds the draft block except for DFlash, whose seq_lens_cpu already
+        # includes it; speculative decode adds tokens through the current draft step.
+        attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
-            planning_seq_lens_cpu = (
-                planning_seq_lens_cpu + self.speculative_num_draft_tokens
+            attention_kv_lens_cpu = (
+                attention_kv_lens_cpu + self.speculative_num_draft_tokens
             )
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            planning_seq_lens_cpu = planning_seq_lens_cpu + self.speculative_step_id + 1
-        max_len = planning_seq_lens_cpu.max().item()
+            attention_kv_lens_cpu = attention_kv_lens_cpu + self.speculative_step_id + 1
+        max_len = attention_kv_lens_cpu.max().item()
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
         if self.is_hybrid_swa:
@@ -988,7 +987,7 @@ class AscendAttnBackend(AttentionBackend):
                     metadata.dcp_spec_seq_lens_cpu_int,
                     dcp_spec_block_tables,
                 ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=planning_seq_lens_cpu,
+                    kv_lens_cpu=attention_kv_lens_cpu,
                     req_pool_indices=req_pool_indices[:bs],
                     is_spec=True,
                 )
@@ -1007,7 +1006,7 @@ class AscendAttnBackend(AttentionBackend):
                     metadata.dcp_seq_lens_cpu_int,
                     dcp_block_tables,
                 ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=planning_seq_lens_cpu,
+                    kv_lens_cpu=attention_kv_lens_cpu,
                     req_pool_indices=req_pool_indices[:bs],
                 )
                 metadata.dcp_seq_lens.copy_(

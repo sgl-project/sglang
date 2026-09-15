@@ -52,7 +52,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
-        # benchmarks, so it does not need the DCP relayout used by transfer backends.
+        # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
         if cfg.disaggregation_transfer_backend not in (
             "mooncake",
             "nixl",

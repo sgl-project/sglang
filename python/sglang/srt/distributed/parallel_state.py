@@ -2596,7 +2596,7 @@ def initialize_model_parallel(
     if decode_context_parallel_size > 1 and not (is_hip() or is_cuda() or _is_npu):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP, CUDA, or Ascend NPU "
+            "currently only supported on the AMD HIP, CUDA, or NPU "
             "platform, but got decode_context_parallel_size "
             f"({decode_context_parallel_size}) on an unsupported platform."
         )

@@ -89,18 +89,14 @@ def remap_dcp_sparse_indices(
 ) -> torch.Tensor:
     """Map global sparse token indices to one rank's compact DCP KV layout.
 
-    The indexer orders entries by score. Sparse attention requires valid entries
-    before ``-1`` padding, so the rank-owned entries are stably compacted. This
-    follows vLLM-Ascend's DCP remap: use float32 owner arithmetic, then sort a
-    partition key and gather the remapped indices. SGLang's current DCP layout
-    has no KV interleave, so the interleave size is one.
+    Keep indices owned by this rank, convert them to local KV positions, and
+    stably move them before ``-1`` padding while preserving their score order.
     """
     if dcp_size == 1:
         return topk_indices
 
-    # Match vLLM-Ascend's remap arithmetic. The current SGLang block layout is
-    # interleave=1: global token p belongs to rank p % dcp_size and maps to
-    # local token p // dcp_size.
+    # Global token p belongs to rank p % dcp_size and maps to local position
+    # p // dcp_size.
     topk_indices_fp32 = topk_indices.to(torch.float32)
     local_owner_mask = (topk_indices_fp32 >= 0) & (
         torch.remainder(topk_indices_fp32, dcp_size) == dcp_rank
@@ -111,9 +107,7 @@ def remap_dcp_sparse_indices(
         torch.full_like(topk_indices_fp32, -1.0),
     ).to(topk_indices.dtype)
 
-    # Valid entries retain their original top-k order; invalid entries follow
-    # them and retain their source order. This is equivalent to vLLM's
-    # original_order + sort + gather implementation.
+    # Move valid entries before padding without changing their top-k order.
     topk_count = topk_indices.shape[-1]
     original_order = torch.arange(
         topk_count, dtype=torch.float32, device=topk_indices.device
