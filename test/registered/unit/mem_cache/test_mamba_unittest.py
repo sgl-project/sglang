@@ -100,9 +100,7 @@ class TestMamba(unittest.TestCase):
                             [],
                         )
                     )
-                    self.assertEqual(
-                        pool.get_kv_layer_ids(), [3, 7] * group_count
-                    )
+                    self.assertEqual(pool.get_kv_layer_ids(), [3, 7] * group_count)
 
     def test_mamba_pool(self):
         max_num_reqs = 10
