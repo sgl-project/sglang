@@ -239,3 +239,7 @@ class TestGetAvailableGpuMemoryCpu(CustomTestCase):
             mock.patch(f"{_COMMON}.get_cpu_ids_by_node", return_value=["0"]),
         ):
             self.assertAlmostEqual(get_available_gpu_memory("cpu", 0), 200.0, places=1)
+
+
+if __name__ == "__main__":
+    unittest.main()
