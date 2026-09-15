@@ -198,12 +198,15 @@ class Schedule(msgspec.Struct):
     # -------------------------------------------------------------------------
     max_mamba_cache_size: A[
         Optional[int],
-        "The maximum size of the mamba cache.",
+        "The maximum number of Mamba state cache slots. An explicit value takes "
+        "precedence over workload-cap and ratio-based sizing.",
     ] = None
     mamba_full_memory_ratio: A[
         Optional[float],
         Arg(
-            help="The ratio of mamba state memory to full kv cache memory.",
+            help="The ratio of mamba state memory to full kv cache memory. "
+            "Used as the fallback split when explicit --max-running-requests "
+            "and --max-total-tokens cannot be honored jointly.",
             resolvable=True,
             fallback=0.9,
         ),
