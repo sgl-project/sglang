@@ -1417,16 +1417,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
-                need_tp_slice = (
-                    target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
-                )
-                if (
-                    need_tp_slice
-                    and (not src_dim_per_tensor or not dst_dim_per_tensor)
-                    and list(src_item_lens) != list(dst_item_lens)
-                ):
+                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
+                    src_item_lens
+                ) != list(dst_item_lens):
                     raise RuntimeError(
                         "Mamba state layouts differ between prefill and decode "
                         f"(src item_lens={src_item_lens}, dst item_lens="
@@ -1435,7 +1428,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "prefill and decode must both enable it and use equal "
                         "attention TP sizes."
                     )
-                if need_tp_slice:
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
                     rc = (
                         self._send_mamba_state_slice(
                             req,
