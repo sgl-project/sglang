@@ -3322,8 +3322,8 @@ class TestNoneMeansUnset(CustomTestCase):
 
 
 class TestDwdpPlatformGate(CustomTestCase):
-    """#31995: --dwdp-size on a non-NVIDIA platform crashed with
-    ModuleNotFoundError('cuda') inside ModelRunner init instead of being rejected."""
+    """--dwdp-size on a non-NVIDIA platform must be rejected at arg resolution,
+    not crash later inside model-runner init on the missing cuda bindings."""
 
     def _args(self, **fields):
         return ServerArgs(model_path="dummy", tp_size=2, dwdp_size=2, **fields)
