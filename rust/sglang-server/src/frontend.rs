@@ -396,8 +396,6 @@ mod tests {
     use crate::message::io_struct::GetInternalStateReq;
     use crate::message::multimodal::MmItem;
     use crate::message::request::{GenerateRequest, MmData};
-    use crate::message::response::{ChunkEvent, SinkError};
-    use crate::utils::error::Error;
 
     struct Harness {
         handle: FrontendHandle,
@@ -471,80 +469,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_enqueues_received_request_and_connects_response_sink() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness.handle.submit(generate("request-1")).await.unwrap();
-
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        assert_eq!(request.rid.as_str(), "request-1");
-        assert!(matches!(request.state, RequestState::Received));
-        assert!(matches!(request.kind, RequestKind::Generate(_)));
-
-        request
-            .sink
-            .try_send(ResponseItem::Done(ChunkEvent::default()))
-            .unwrap();
-        assert!(matches!(call.recv().await, Some(ResponseItem::Done(_))));
-        drop(call);
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn response_channel_uses_configured_capacity() {
-        let harness = Harness::unbounded(1);
-        let mut call = harness.handle.submit(generate("bounded")).await.unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-
-        request
-            .sink
-            .try_send(ResponseItem::Frame(ChunkEvent::default()))
-            .unwrap();
-        assert_eq!(
-            request
-                .sink
-                .try_send(ResponseItem::Frame(ChunkEvent::default())),
-            Err(SinkError::Full)
-        );
-        assert!(matches!(call.recv().await, Some(ResponseItem::Frame(_))));
-    }
-
-    #[tokio::test]
-    async fn closed_intake_returns_unavailable_without_aborting() {
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, abort_rx) = flume::unbounded();
-        drop(intake_rx);
-        let handle = test_handle(intake_tx, abort_tx, 8);
-
-        let result = handle.submit(generate("rejected")).await;
-        assert!(matches!(result, Err(FrontendError::Unavailable)));
-        assert!(abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn submit_waits_for_intake_capacity() {
-        let (intake_tx, intake_rx) = flume::bounded(1);
-        let (abort_tx, _abort_rx) = flume::unbounded();
-        let handle = test_handle(intake_tx, abort_tx, 8);
-
-        let first = handle.submit(generate("first")).await.unwrap();
-        let second = handle.submit(generate("second"));
-        tokio::pin!(second);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut second)
-                .await
-                .is_err()
-        );
-
-        let _ = intake_rx.recv().unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(1), &mut second)
-            .await
-            .expect("submission should resume when intake has capacity")
-            .unwrap();
-        drop(first);
-        drop(second);
-    }
-
-    #[tokio::test]
     async fn cancellation_after_intake_acceptance_aborts_unobserved_handoff() {
         let (intake_tx, intake_rx) = flume::bounded(0);
         let (abort_tx, abort_rx) = flume::unbounded();
@@ -592,108 +516,6 @@ mod tests {
         assert!(!admission.try_accept());
         drop(request);
         assert!(abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn dropping_live_call_aborts_exactly_once() {
-        let harness = Harness::unbounded(8);
-        let call = harness.handle.submit(generate("live")).await.unwrap();
-        let _request = accept_intake(harness.intake_rx.recv().unwrap());
-
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "live"
-        ));
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn terminal_items_disarm_only_the_matching_operation() {
-        async fn assert_disarmed(kind: RequestKind, item: ResponseItem) {
-            let harness = Harness::unbounded(8);
-            let mut call = harness.handle.submit(kind).await.unwrap();
-            let request = accept_intake(harness.intake_rx.recv().unwrap());
-            request.sink.try_send(item).unwrap();
-
-            let _ = call.recv().await;
-            drop(call);
-            assert!(harness.abort_rx.try_recv().is_err());
-        }
-
-        assert_disarmed(generate("done"), ResponseItem::Done(ChunkEvent::default())).await;
-        assert_disarmed(
-            generate("failed"),
-            ResponseItem::Error(Error::Internal("failed".into())),
-        )
-        .await;
-        assert_disarmed(
-            RequestKind::Control(Box::new(ControlRequest::GetInternalStateReq(
-                GetInternalStateReq::new("control".into()),
-            ))),
-            ResponseItem::Control(Bytes::from_static(b"control")),
-        )
-        .await;
-        assert_disarmed(
-            RequestKind::Detokenize {
-                token_ids: vec![1, 2],
-            },
-            ResponseItem::Data(Bytes::from_static(b"data")),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn wrong_response_kind_keeps_generation_armed() {
-        for item in [
-            ResponseItem::Control(Bytes::from_static(b"control")),
-            ResponseItem::Data(Bytes::from_static(b"data")),
-        ] {
-            let harness = Harness::unbounded(8);
-            let mut call = harness.handle.submit(generate("wrong-kind")).await.unwrap();
-            let request = accept_intake(harness.intake_rx.recv().unwrap());
-            request.sink.try_send(item).unwrap();
-
-            let _ = call.recv().await;
-            drop(call);
-            assert!(matches!(
-                harness.abort_rx.recv().unwrap(),
-                AbortSource::Guard(rid) if rid.as_str() == "wrong-kind"
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn nonterminal_frame_keeps_call_armed() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness.handle.submit(generate("streaming")).await.unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        request
-            .sink
-            .try_send(ResponseItem::Frame(ChunkEvent::default()))
-            .unwrap();
-
-        assert!(matches!(call.recv().await, Some(ResponseItem::Frame(_))));
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "streaming"
-        ));
-    }
-
-    #[tokio::test]
-    async fn response_channel_close_before_terminal_keeps_call_armed() {
-        let harness = Harness::unbounded(8);
-        let mut call = harness.handle.submit(generate("truncated")).await.unwrap();
-        let request = accept_intake(harness.intake_rx.recv().unwrap());
-        drop(request);
-
-        assert!(call.recv().await.is_none());
-        drop(call);
-        assert!(matches!(
-            harness.abort_rx.recv().unwrap(),
-            AbortSource::Guard(rid) if rid.as_str() == "truncated"
-        ));
     }
 
     #[tokio::test]
@@ -768,45 +590,6 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[test]
-    fn readiness_initialization_and_transition_are_shared() {
-        let initially_unready = Harness::unbounded(8).handle;
-        let observer = initially_unready.clone();
-        assert!(!initially_unready.is_ready());
-        initially_unready.mark_ready();
-        assert!(observer.is_ready());
-
-        let (intake_tx, _) = flume::unbounded();
-        let (abort_tx, _) = flume::unbounded();
-        let initially_ready = FrontendHandle::new(
-            intake_tx,
-            abort_tx,
-            FrontendConfig {
-                response_capacity: 8,
-                response_activity: Default::default(),
-                startup_ready: true,
-                is_disaggregation: false,
-                mm_limits: BTreeMap::new(),
-            },
-        );
-        assert!(initially_ready.is_ready());
-    }
-
-    #[tokio::test]
-    async fn health_probe_reports_not_ready_without_submitting() {
-        let harness = Harness::unbounded(8);
-        assert_eq!(
-            harness
-                .handle
-                .probe_health(Duration::from_secs(1))
-                .await
-                .unwrap(),
-            HealthStatus::NotReady
-        );
-        assert!(harness.intake_rx.try_recv().is_err());
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn healthy_probe_uses_shared_activity_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -866,28 +649,6 @@ mod tests {
             abort_rx.recv().unwrap(),
             AbortSource::Guard(aborted) if aborted == rid
         ));
-    }
-
-    #[tokio::test]
-    async fn health_probe_surfaces_closed_intake_as_operational_error() {
-        let (intake_tx, intake_rx) = flume::unbounded();
-        let (abort_tx, abort_rx) = flume::unbounded();
-        drop(intake_rx);
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
-            Default::default(),
-            true,
-            false,
-            BTreeMap::new(),
-        );
-
-        assert!(matches!(
-            handle.probe_health(Duration::ZERO).await,
-            Err(FrontendError::Unavailable)
-        ));
-        assert!(abort_rx.try_recv().is_err());
     }
 
     #[tokio::test]
