@@ -2115,7 +2115,7 @@ def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int
     """
     try:
         pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
-    except psutil.NoSuchProcess:
+    except psutil.Error:
         pids = []
     if include_parent:
         pids.append(pid)
@@ -2150,7 +2150,7 @@ def wait_for_gpu_release(
     so the next launch can OOM against memory charged to a reaped process.
     Waiting on these pids, rather than on an idle GPU,
     keeps this usable while other servers of the same test still run.
-    Best effort: a timeout warns, never raises.
+    Best effort: a timeout or a dead NVML warns, never raises.
     """
     if not pids:
         return
@@ -2177,6 +2177,10 @@ def wait_for_gpu_release(
                 )
                 return
             time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
     finally:
         try:
             pynvml.nvmlShutdown()
