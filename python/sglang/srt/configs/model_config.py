@@ -2498,3 +2498,15 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def ngram_context_size(hf_config) -> int:
+    if getattr(hf_config, "use_ngram_embedding", False):
+        return hf_config.ngram_embedding_n
+    return 0
+
+
+def engram_ngram_size(hf_config) -> int:
+    if getattr(hf_config, "engram_layer_ids", ()):
+        return hf_config.engram_max_ngram_size
+    return 0
