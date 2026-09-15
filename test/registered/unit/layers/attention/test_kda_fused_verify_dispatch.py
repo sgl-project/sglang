@@ -63,6 +63,9 @@ def _inputs(batch, *, tokens=6, heads=16, head_dim=128, weight_dtype=torch.float
         retrieve_next_sibling=None,
         retrieve_parent_token=None,
         replayssm_rawv=None,
+        replayssm_rawk=None,
+        replayssm_g=None,
+        replayssm_beta=None,
     )
 
 
