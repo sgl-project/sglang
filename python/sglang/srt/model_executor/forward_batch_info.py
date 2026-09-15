@@ -828,6 +828,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
+            ngram_history=batch.ne_history,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
