@@ -99,19 +99,11 @@ executed sequentially.
 
 ### 5.2 Ascend NPU optimizations
 
-On Ascend NPU, SenseNova-U1 uses fused inference attention, RMSNorm, and
-SwiGLU MLP operators by default. The following environment variables disable
-individual paths for comparison or troubleshooting:
-
-```bash
-export SGLANG_SENSENOVA_NPU_FIA=0
-export SGLANG_SENSENOVA_NPU_FUSED_NORM=0
-export SGLANG_SENSENOVA_NPU_FUSED_MLP=0
-```
-
-Restart the server after changing a variable. Run one complete warmup request
-before benchmarking because the fused MLP packs its gate and up projection
-weights on first use.
+On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
+RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back
+when their requirements are not met. Run one complete warmup request before
+benchmarking because the fused MLP packs its gate and up projection weights on
+first use.
 
 ## 6. Benchmark
 

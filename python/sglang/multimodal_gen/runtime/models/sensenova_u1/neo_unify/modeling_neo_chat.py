@@ -24,7 +24,7 @@ from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import (
     Qwen3ForCausalLM,
     create_block_causal_mask,
-    npu_fia_enabled,
+    npu_fia_available,
 )
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
@@ -99,7 +99,7 @@ def prepare_flash_kv_cache(
             )
 
         use_npu_fia = (
-            past_k.device.type == "npu" and lengths is not None and npu_fia_enabled()
+            past_k.device.type == "npu" and lengths is not None and npu_fia_available()
         )
         if use_npu_fia:
             k_cache = torch.empty(
@@ -2626,7 +2626,7 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
-        if device.type == "npu" and batch_size > 1 and not npu_fia_enabled():
+        if device.type == "npu" and batch_size > 1 and not npu_fia_available():
             condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
             image_key_valid_mask = torch.ones(
                 (batch_size, token_h * token_w),

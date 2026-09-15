@@ -29,7 +29,6 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.layernorm import RMSNorm
 
@@ -59,16 +58,8 @@ _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
 
 
-def npu_fia_enabled() -> bool:
-    return envs.SGLANG_SENSENOVA_NPU_FIA
-
-
-def npu_fused_norm_enabled() -> bool:
-    return envs.SGLANG_SENSENOVA_NPU_FUSED_NORM
-
-
-def npu_fused_mlp_enabled() -> bool:
-    return envs.SGLANG_SENSENOVA_NPU_FUSED_MLP
+def npu_fia_available() -> bool:
+    return hasattr(torch.ops.npu, "npu_fused_infer_attention_score")
 
 
 def set_attn_backend(backend: str) -> str:
@@ -195,7 +186,7 @@ def _flash_or_sdpa(
         and not causal
         and dropout_p == 0.0
         and actual_seq_lengths_kv is not None
-        and npu_fia_enabled()
+        and npu_fia_available()
     ):
         if input_layout == "BNSD":
             q_bhsd, k_bhsd, v_bhsd = q, k, v
@@ -352,12 +343,11 @@ def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
 
 
 def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
-    use_npu_kernel = current_platform.is_npu() and npu_fused_norm_enabled()
     return RMSNorm(
         hidden_size,
         eps=eps,
         cast_x_before_out_mul=True,
-        force_native=not use_npu_kernel,
+        force_native=not current_platform.is_npu(),
     )
 
 
@@ -402,7 +392,6 @@ class Qwen3MLP(nn.Module):
             or x.dtype != torch.bfloat16
             or self.gate_proj.weight.dtype != x.dtype
             or self.config.hidden_act != "silu"
-            or not npu_fused_mlp_enabled()
         ):
             return False
         return hasattr(torch.ops.npu, "npu_swiglu")

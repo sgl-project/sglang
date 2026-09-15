@@ -53,9 +53,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     _sdpa_attn_func,
     create_block_causal_mask,
     make_qwen3_rms_norm,
-    npu_fia_enabled,
-    npu_fused_mlp_enabled,
-    npu_fused_norm_enabled,
+    npu_fia_available,
     position_ids_from_indexes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -372,55 +370,22 @@ def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
     assert destination[:, :, 5:].eq(0).all()
 
 
-@pytest.mark.parametrize("value", ["0", "false", "off"])
-def test_sensenova_u1_npu_fia_can_be_disabled(monkeypatch, value):
-    monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FIA", value)
-    assert not npu_fia_enabled()
+@pytest.mark.parametrize("available", [False, True])
+def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, available):
+    namespace = SimpleNamespace()
+    if available:
+        namespace.npu_fused_infer_attention_score = object()
+    monkeypatch.setattr(torch.ops, "npu", namespace, raising=False)
 
-
-def test_sensenova_u1_npu_fia_is_enabled_by_default(monkeypatch):
-    monkeypatch.delenv("SGLANG_SENSENOVA_NPU_FIA", raising=False)
-    assert npu_fia_enabled()
-
-
-@pytest.mark.parametrize(
-    ("env_name", "enabled"),
-    [
-        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
-        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
-    ],
-)
-@pytest.mark.parametrize("value", ["0", "false", "off"])
-def test_sensenova_u1_npu_fused_ops_can_be_disabled(
-    monkeypatch, env_name, enabled, value
-):
-    monkeypatch.setenv(env_name, value)
-    assert not enabled()
+    assert npu_fia_available() is available
 
 
 @pytest.mark.parametrize(
-    ("env_name", "enabled"),
-    [
-        ("SGLANG_SENSENOVA_NPU_FUSED_NORM", npu_fused_norm_enabled),
-        ("SGLANG_SENSENOVA_NPU_FUSED_MLP", npu_fused_mlp_enabled),
-    ],
+    ("is_npu", "uses_native"),
+    [(False, True), (True, False)],
 )
-def test_sensenova_u1_npu_fused_ops_are_enabled_by_default(
-    monkeypatch, env_name, enabled
-):
-    monkeypatch.delenv(env_name, raising=False)
-    assert enabled()
-
-
-@pytest.mark.parametrize(
-    ("is_npu", "enabled", "uses_native"),
-    [(False, True, True), (True, False, True), (True, True, False)],
-)
-def test_sensenova_u1_shared_rmsnorm_dispatch(
-    monkeypatch, is_npu, enabled, uses_native
-):
+def test_sensenova_u1_shared_rmsnorm_dispatch(monkeypatch, is_npu, uses_native):
     monkeypatch.setattr(current_platform, "is_npu", lambda: is_npu)
-    monkeypatch.setenv("SGLANG_SENSENOVA_NPU_FUSED_NORM", "1" if enabled else "0")
 
     norm = make_qwen3_rms_norm(64, eps=1e-6)
 
