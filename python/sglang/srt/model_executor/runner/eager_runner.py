@@ -32,7 +32,6 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
@@ -299,11 +298,8 @@ class EagerRunner(BaseRunner):
         ):
             kv_pool = get_token_to_kv_pool()
             if (
-                model_runner.ps.attn_dcp_size > 1
+                kv_pool.dcp_sharded
                 and not forward_batch.forward_mode.is_target_verify()
-                and not (
-                    isinstance(kv_pool, MLATokenToKVPool) and kv_pool.dcp_replicated
-                )
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )

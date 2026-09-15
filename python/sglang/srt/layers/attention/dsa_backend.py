@@ -350,9 +350,7 @@ class DeepseekSparseAttnBackend(
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         allocator = model_runner.token_to_kv_pool_allocator
         self.kv_address_space_size = allocator.size_full + allocator.page_size
-        self._dcp_sharded_kv = (
-            get_parallel().dcp_enabled and not model_runner.is_draft_worker
-        )
+        self._dcp_sharded_kv = self.token_to_kv_pool.dcp_sharded
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
