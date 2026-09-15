@@ -220,45 +220,58 @@ class TestRoundRobinScheduler(CustomTestCase):
 
 
 class TestDispatchingWithTrace(CustomTestCase):
-    def test_health_bypasses_user_load_balancing_state(self):
+    def _make_traced_controller(self) -> DataParallelController:
         ctl = _make_controller(dp_size=4)
         ctl.refresh_load_budget_on_dispatch = True
         ctl.refresh_load_budget = MagicMock()
         ctl.dispatching = MagicMock()
         ctl.dispatch_health_check = MagicMock()
+        return ctl
 
+    def test_health_bypasses_user_load_balancing_state(self):
+        ctl = self._make_traced_controller()
         health_req = _req(rid="HEALTH_CHECK_dispatch")
+
         ctl.dispatching_with_trace(health_req)
+
         ctl.refresh_load_budget.assert_not_called()
         ctl.dispatching.assert_not_called()
         ctl.dispatch_health_check.assert_called_once_with(health_req)
 
-        ctl.refresh_load_budget.reset_mock()
-        ctl.dispatching.reset_mock()
-        ctl.dispatch_health_check.reset_mock()
+    def test_user_uses_normal_load_balancing_state(self):
+        ctl = self._make_traced_controller()
         user_req = _req(rid="user_dispatch")
+
         ctl.dispatching_with_trace(user_req)
+
         ctl.refresh_load_budget.assert_called_once()
         ctl.dispatching.assert_called_once_with(user_req)
         ctl.dispatch_health_check.assert_not_called()
 
-    def test_batch_refreshes_budget_only_for_user_requests(self):
+    def test_health_only_batch_does_not_refresh_budget(self):
         ctl = _make_controller(dp_size=4)
         ctl.refresh_load_budget_on_dispatch = True
         ctl.refresh_load_budget = MagicMock()
         ctl.dispatching_with_trace = MagicMock()
-
         health_req = _req(rid="HEALTH_CHECK_batch")
+
         ctl.dispatch_batch_generate([health_req])
+
         ctl.refresh_load_budget.assert_not_called()
         ctl.dispatching_with_trace.assert_called_once_with(
             health_req, refresh_load_budget=False
         )
 
-        ctl.refresh_load_budget.reset_mock()
-        ctl.dispatching_with_trace.reset_mock()
+    def test_user_batch_refreshes_budget_once(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.refresh_load_budget_on_dispatch = True
+        ctl.refresh_load_budget = MagicMock()
+        ctl.dispatching_with_trace = MagicMock()
+        health_req = _req(rid="HEALTH_CHECK_batch")
         user_req = _req(rid="user_batch")
+
         ctl.dispatch_batch_generate([health_req, user_req])
+
         ctl.refresh_load_budget.assert_called_once()
         self.assertEqual(ctl.dispatching_with_trace.call_count, 2)
 
