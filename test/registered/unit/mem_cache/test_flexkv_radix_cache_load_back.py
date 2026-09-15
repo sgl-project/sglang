@@ -70,6 +70,9 @@ def _make_cache(page_size=4):
     cache.flexkv_connector = MagicMock()
     cache.store_stream = MagicMock()
     cache._load_markers = {}
+    cache._defer_duplicate_restores = False
+    cache._restoring_host_prefixes = {}
+    cache._restore_prefix_by_rid = {}
     cache._inflight_store_nodes = {}
     cache._pending_store_launches = {}
     cache._pending_store_copies = {}
@@ -508,6 +511,133 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
     cache.store_stream.wait_stream.assert_not_called()
 
 
+def _prepare_shared_restore():
+    cache, allocator = _make_cache()
+    cache._mode = FlexKVRadixCache.should_defer_shared_restore.__globals__[
+        "FlexKVMode"
+    ].IP
+    cache._defer_duplicate_restores = True
+    key = RadixKey(array("q", range(4)))
+    producer = SimpleNamespace(
+        rid="producer", kv=SimpleNamespace(cache_protected_len=0, holds_mamba=False)
+    )
+    cache._allocate_and_load(
+        key=key,
+        value_numel=0,
+        uncached_len=4,
+        last_node=cache.root_node,
+        tracking_rid=producer.rid,
+        sglang_req_id=producer.rid,
+        load_fn=lambda slots: int(slots.numel()),
+        request_owned_req=producer,
+    )
+    waiter = SimpleNamespace(
+        rid="waiter", host_hit_length=4, kv=SimpleNamespace(holds_mamba=False)
+    )
+    cache._load_markers[waiter.rid] = SimpleNamespace(key=key, value_numel=0)
+    return cache, allocator, producer, waiter
+
+
+def test_shared_restore_waits_without_borrowing_request_owned_slots():
+    cache, allocator, producer, waiter = _prepare_shared_restore()
+    assert cache.should_defer_shared_restore(waiter)
+    cache.flexkv_connector.release_pending.assert_called_once_with(waiter.rid)
+    assert waiter.rid not in cache._load_markers
+    assert cache._restore_prefix_by_rid[producer.rid] in cache._restoring_host_prefixes
+    assert allocator.alloc.call_count == 1
+    assert cache.root_node.children == {}
+    with patch.object(
+        RadixCache, "cache_unfinished_req", lambda *_args, **_kwargs: None
+    ):
+        cache.cache_unfinished_req(producer)
+    cache._load_markers[waiter.rid] = SimpleNamespace(
+        key=RadixKey(array("q", range(4))), value_numel=0
+    )
+    assert not cache.should_defer_shared_restore(waiter)
+    assert cache._restore_prefix_by_rid == {}
+    assert cache._restoring_host_prefixes == {}
+
+
+def test_aborting_restore_producer_releases_duplicate_admission():
+    cache, allocator, producer, waiter = _prepare_shared_restore()
+    assert cache.should_defer_shared_restore(waiter)
+    cache.release_aborted_request(producer.rid)
+    cache._load_markers[waiter.rid] = SimpleNamespace(
+        key=RadixKey(array("q", range(4))), value_numel=0
+    )
+    assert not cache.should_defer_shared_restore(waiter)
+    assert not cache.has_uncommitted_restore(producer)
+    assert (
+        cache._aborted_restore_leases[producer.pending_restore_generation].req
+        is producer
+    )
+    assert producer._flexkv_uncached_restore
+    allocator.free.assert_not_called()
+    assert cache.flexkv_connector.release_pending.call_args_list == [
+        call(waiter.rid),
+        call(producer.rid),
+    ]
+
+
+def test_shared_restore_respects_tenant_identity_and_disabled_flag():
+    cache, _allocator, _producer, waiter = _prepare_shared_restore()
+    for key in [
+        RadixKey(array("q", range(4)), extra_key="tenant"),
+        RadixKey(array("q", range(4)), cache_salt="other"),
+        RadixKey(array("q", range(4, 8))),
+    ]:
+        cache._load_markers[waiter.rid].key = key
+        assert not cache.should_defer_shared_restore(waiter)
+    cache._load_markers[waiter.rid].key = RadixKey(array("q", range(4)))
+    cache._defer_duplicate_restores = False
+    assert not cache.should_defer_shared_restore(waiter)
+
+
+@pytest.mark.parametrize("guard", ["mamba", "mp", "no_host_hit", "missing_marker"])
+def test_shared_restore_skips_unsupported_requests(guard):
+    cache, allocator, _producer, waiter = _prepare_shared_restore()
+    if guard == "mamba":
+        waiter.kv.holds_mamba = True
+    elif guard == "mp":
+        cache._mode = FlexKVRadixCache.should_defer_shared_restore.__globals__[
+            "FlexKVMode"
+        ].MP
+    elif guard == "no_host_hit":
+        waiter.host_hit_length = 0
+    else:
+        cache._load_markers.pop(waiter.rid)
+    assert not cache.should_defer_shared_restore(waiter)
+    cache.flexkv_connector.release_pending.assert_not_called()
+    assert allocator.alloc.call_count == 1
+
+
+def test_shared_restore_bigram_identity_includes_boundary_token():
+    cache, _allocator = _make_cache()
+    raw = array("q", [1, 2, 3, 4, 5])
+    key = RadixKey(raw, is_bigram=True)
+    prefix = cache._restore_prefix_key(key, 3)
+    assert prefix[-1] == (1, 2, 3, 4)
+    assert prefix != cache._restore_prefix_key(RadixKey(raw), 3)
+    assert prefix != cache._restore_prefix_key(
+        RadixKey(array("q", [1, 2, 3, 9, 5]), is_bigram=True), 3
+    )
+
+
+def test_repeated_duplicate_deferral_releases_every_held_lookup():
+    cache, allocator, producer, waiter = _prepare_shared_restore()
+    for _ in range(3):
+        cache._load_markers[waiter.rid] = SimpleNamespace(
+            key=RadixKey(array("q", range(4))), value_numel=0
+        )
+        assert cache.should_defer_shared_restore(waiter)
+        assert waiter.rid not in cache._load_markers
+    assert (
+        cache.flexkv_connector.release_pending.call_args_list == [call(waiter.rid)] * 3
+    )
+    assert allocator.alloc.call_count == 1
+    assert producer.rid in cache._restore_prefix_by_rid
+
+
 class _TestReq(SimpleNamespace):
     __hash__ = object.__hash__
 
@@ -549,8 +679,10 @@ def _restore_request(cache, *, rid="ip-request", length=4, load_fn=None):
 
 
 @pytest.mark.parametrize("completion", ["insert", "discard", "chunk"])
-def test_ip_restore_lease_ends_after_real_cache_completion(completion):
+@pytest.mark.parametrize("dedup", [False, True])
+def test_ip_restore_lease_ends_after_real_cache_completion(completion, dedup):
     cache, allocator = _make_cache()
+    cache._defer_duplicate_restores = dedup
     req = _restore_request(cache)
     assert cache.has_uncommitted_restore(req)
     with (
@@ -570,6 +702,8 @@ def test_ip_restore_lease_ends_after_real_cache_completion(completion):
     assert req.pending_restore_slots is None
     assert req.pending_restore_generation is None
     assert not req._flexkv_uncached_restore
+    assert cache._restore_prefix_by_rid == {}
+    assert cache._restoring_host_prefixes == {}
     if completion == "discard":
         assert allocator.free_segments.call_args.args[0][0][0].numel() == 4
     else:
@@ -579,8 +713,10 @@ def test_ip_restore_lease_ends_after_real_cache_completion(completion):
         assert torch.equal(match.device_indices, req.prefix_indices)
 
 
-def test_abort_unblocks_rid_but_retains_slots_until_request_cleanup():
+@pytest.mark.parametrize("dedup", [False, True])
+def test_abort_unblocks_rid_but_retains_slots_until_request_cleanup(dedup):
     cache, allocator = _make_cache()
+    cache._defer_duplicate_restores = dedup
     req = _restore_request(cache)
     restored = req.pending_restore_slots
     cache.release_aborted_request(req.rid)
@@ -588,6 +724,8 @@ def test_abort_unblocks_rid_but_retains_slots_until_request_cleanup():
     assert not cache.has_uncommitted_restore(req)
     assert cache._aborted_restore_leases[req.pending_restore_generation].req is req
     assert req._flexkv_uncached_restore
+    assert cache._restore_prefix_by_rid == {}
+    assert cache._restoring_host_prefixes == {}
     allocator.free.assert_not_called()
     cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=4)
     released, start = allocator.free_segments.call_args.args[0][0]
@@ -615,8 +753,10 @@ def test_mp_restore_is_tree_owned_and_ip_lease_excludes_reused_prefix():
 
 @pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
 @pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
-def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
+@pytest.mark.parametrize("dedup", [False, True])
+def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method, dedup):
     cache, allocator = _make_cache()
+    cache._defer_duplicate_restores = dedup
     req = _restore_request(cache)
     slots = req.pending_restore_slots
     live = _assert_allocator_free_once(allocator, slots)
@@ -638,6 +778,8 @@ def test_restore_lease_mismatch_fails_before_mutating_cache(mismatch, method):
     assert cache.root_node is original_root
     assert not cache.root_node.children
     assert cache.has_uncommitted_restore(req)
+    assert (req.rid in cache._restore_prefix_by_rid) is dedup
+
     cache.reset()
     assert not live
 
@@ -668,8 +810,10 @@ def test_duplicate_restore_cannot_replace_active_lease(entry):
 
 
 @pytest.mark.parametrize("drain_fails", [False, True])
-def test_restore_reset_preserves_ownership_until_transfers_drain(drain_fails):
+@pytest.mark.parametrize("dedup", [False, True])
+def test_restore_reset_preserves_ownership_until_transfers_drain(drain_fails, dedup):
     cache, allocator = _make_cache()
+    cache._defer_duplicate_restores = dedup
     req = _restore_request(cache)
     original_root = cache.root_node
     order = []
@@ -688,6 +832,7 @@ def test_restore_reset_preserves_ownership_until_transfers_drain(drain_fails):
         assert order == ["stream", "connector"]
         assert cache.root_node is original_root
         assert cache.has_uncommitted_restore(req)
+        assert (req.rid in cache._restore_prefix_by_rid) is dedup
     else:
         with patch.object(
             RadixCache, "reset", side_effect=lambda: order.append("tree")
@@ -695,6 +840,8 @@ def test_restore_reset_preserves_ownership_until_transfers_drain(drain_fails):
             cache.reset()
         assert order == ["stream", "connector", "free", "tree"]
         assert not cache.has_uncommitted_restore(req)
+        assert cache._restore_prefix_by_rid == {}
+        assert cache._restoring_host_prefixes == {}
 
 
 def test_failed_launch_keeps_allocated_slots_for_reset():
@@ -726,6 +873,46 @@ def test_short_layerwise_restore_retains_the_full_allocation_until_reset():
     cache.reset()
     assert torch.equal(allocator.free.call_args.args[0], lease.device_indices)
     assert cache._restore_leases == {}
+
+
+def test_aborted_shared_producer_keeps_slots_while_waiter_allocates_its_own():
+    cache, allocator, producer, waiter = _prepare_shared_restore()
+    producer_slots = producer.pending_restore_slots
+    cache.release_aborted_request(producer.rid)
+    assert not cache.should_defer_shared_restore(waiter)
+
+    restored, _ = cache._allocate_and_load(
+        key=RadixKey(array("q", range(4))),
+        value_numel=0,
+        uncached_len=4,
+        last_node=cache.root_node,
+        tracking_rid=waiter.rid,
+        sglang_req_id=waiter.rid,
+        load_fn=lambda slots: int(slots.numel()),
+        request_owned_req=waiter,
+    )
+    assert not cache.has_uncommitted_restore(producer)
+    assert (
+        cache._aborted_restore_leases[producer.pending_restore_generation].req
+        is producer
+    )
+    assert cache.has_uncommitted_restore(waiter)
+    assert not bool((restored == producer_slots.unsqueeze(1)).any())
+    allocator.free.assert_not_called()
+    # Late cleanup of the old producer must not clear its successor's marker.
+    cache._release_restore_prefix(producer.rid)
+    assert set(cache._restoring_host_prefixes.values()) == {waiter.rid}
+
+    order = []
+    cache.flexkv_connector.reset.side_effect = lambda: order.append("drain")
+    allocator.free.side_effect = lambda slots: order.append(slots.tolist())
+    cache.reset()
+    assert order[0] == "drain"
+    assert sorted(order[1:]) == sorted([producer_slots.tolist(), restored.tolist()])
+    assert cache._aborted_restore_leases == {}
+    assert cache._restore_leases == {}
+    assert cache._restoring_host_prefixes == {}
+    assert cache._restore_prefix_by_rid == {}
 
 
 def _scheduler_method(name, namespace):
@@ -855,8 +1042,10 @@ def test_scheduler_queue_abort_without_kv_row_retains_reclaimable_allocation(
     assert cache._aborted_restore_leases == {}
 
 
-def test_aborted_request_cleanup_does_not_free_or_commit_reused_rid():
+@pytest.mark.parametrize("dedup", [False, True])
+def test_aborted_request_cleanup_does_not_free_or_commit_reused_rid(dedup):
     cache, allocator = _make_cache()
+    cache._defer_duplicate_restores = dedup
     old = _restore_request(cache, rid="reused")
     old_slots = old.pending_restore_slots
     old_pool = cache.req_to_token_pool
@@ -869,6 +1058,8 @@ def test_aborted_request_cleanup_does_not_free_or_commit_reused_rid():
     cache.cache_finished_req(old, is_insert=False, kv_len_to_handle=4)
     assert live == set(new_slots.tolist())
     assert cache._restore_leases[new.rid].req is new
+    assert (new.rid in cache._restore_prefix_by_rid) is dedup
+    assert (new.rid in cache._restoring_host_prefixes.values()) is dedup
     assert cache._aborted_restore_leases == {}
     cache.req_to_token_pool = new_pool
     cache.cache_finished_req(new, is_insert=False, kv_len_to_handle=4)

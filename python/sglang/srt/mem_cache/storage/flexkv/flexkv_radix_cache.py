@@ -174,6 +174,11 @@ class FlexKVRadixCache(RadixCache):
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
         self._load_markers: dict[str, _LoadBackMarker] = {}
+        self._defer_duplicate_restores = os.environ.get(
+            "FLEXKV_DEFER_DUPLICATE_RESTORES", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._restoring_host_prefixes: dict[tuple, str] = {}
+        self._restore_prefix_by_rid: dict[str, tuple] = {}
         # ``store_kv`` is async — we keep a lock on the source node until
         # FlexKV signals completion at the scheduler's synchronized
         # ``check_hicache_events`` point.
@@ -224,6 +229,9 @@ class FlexKVRadixCache(RadixCache):
             self._free_uncommitted_restores()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
+        if hasattr(self, "_restoring_host_prefixes"):
+            self._restoring_host_prefixes.clear()
+            self._restore_prefix_by_rid.clear()
         if hasattr(self, "_inflight_store_nodes"):
             with self._node_lock:
                 self._inflight_store_nodes.clear()
@@ -351,6 +359,46 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
     # init_load_back (MP RETRIEVE)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _restore_prefix_key(key: RadixKey, end: int) -> tuple:
+        return (
+            key.extra_key,
+            key.cache_salt,
+            key.is_bigram,
+            tuple(key[:end].raw_token_ids()),
+        )
+
+    def should_defer_shared_restore(self, req: Req) -> bool:
+        """Wait for an identical restore's normal radix publication.
+
+        Waiting requests never borrow unready slots. Independent prefixes keep
+        their normal admission order, and the producer keeps existing ownership.
+        """
+        if not self._defer_duplicate_restores or self._mode is not FlexKVMode.IP:
+            return False
+        if req.host_hit_length <= 0:
+            return False
+        if req.kv.holds_mamba:
+            return False
+        marker = self._load_markers.get(req.rid)
+        if marker is None:
+            return False
+        end = min(marker.value_numel + req.host_hit_length, len(marker.key))
+        key = self._restore_prefix_key(marker.key, end)
+        owner = self._restoring_host_prefixes.get(key)
+        if owner is None or owner == req.rid:
+            return False
+        # This lookup will not launch: the next admission rematches the prefix.
+        # Cancel it now, before a later lookup can overwrite its held task id.
+        self.flexkv_connector.release_pending(req.rid)
+        self._load_markers.pop(req.rid, None)
+        return True
+
+    def _release_restore_prefix(self, rid: str) -> None:
+        key = getattr(self, "_restore_prefix_by_rid", {}).pop(rid, None)
+        if key is not None and self._restoring_host_prefixes.get(key) == rid:
+            self._restoring_host_prefixes.pop(key)
 
     def init_load_back(  # type: ignore[override]
         self,
@@ -535,6 +583,10 @@ class FlexKVRadixCache(RadixCache):
             fetched_slots = token_slots
 
         if request_owned_req is not None:
+            if self._defer_duplicate_restores:
+                prefix_key = self._restore_prefix_key(key, value_numel + num_retrieved)
+                self._restoring_host_prefixes[prefix_key] = tracking_rid
+                self._restore_prefix_by_rid[tracking_rid] = prefix_key
             # Normal request completion inserts these slots into the radix tree.
             # Until then they have exactly one owner: the request cleanup path.
             request_owned_req.kv.cache_protected_len = value_numel
@@ -670,6 +722,10 @@ class FlexKVRadixCache(RadixCache):
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
         self._commit_restore(req)
+        # Late cleanup of an aborted Req must not release a new producer
+        # that reused its rid while the old allocation was retained.
+        if not self.has_uncommitted_restore(req):
+            self._release_restore_prefix(req.rid)
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
         if not is_insert:
@@ -884,6 +940,10 @@ class FlexKVRadixCache(RadixCache):
             )
         super().cache_unfinished_req(req, chunked=chunked)
         self._commit_restore(req)
+        # Late cleanup of an aborted Req must not release a new producer
+        # that reused its rid while the old allocation was retained.
+        if not self.has_uncommitted_restore(req):
+            self._release_restore_prefix(req.rid)
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
 
@@ -933,6 +993,9 @@ class FlexKVRadixCache(RadixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         """Release admission tracking without polling launched transfers."""
+        # Stop waiting for an aborted producer. Its allocation remains
+        # tracked separately while waiters allocate their own slots.
+        self._release_restore_prefix(rid)
         self._load_markers.pop(rid, None)
         # Queue-limit/timeout aborts can finish without cache_finished_req.
         # Remove the scheduling guard, but keep a separate allocation ledger:

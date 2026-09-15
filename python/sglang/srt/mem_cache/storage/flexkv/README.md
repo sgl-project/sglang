@@ -460,3 +460,32 @@ The ~10 % divergence at `temperature=0` is the well-known KV-cache-reuse
 artifact caused by floating-point non-associativity between "prefill in
 place" and "load pre-computed KV" paths; it affects the mainline
 `--enable-hierarchical-cache` at the same rate and is not FlexKV-specific.
+
+## GLM5.2 cache deduplication
+
+The FlexKV adaptation supports two independent, opt-in optimizations. Set the
+same flags on every participating worker; both default to off.
+
+| Flag | Behavior | Implementation |
+| --- | --- | --- |
+| `FLEXKV_DEDUP_INDEXER_GROUP=1` | Store and transfer only active Index-K layers, retaining original layer IDs. | The paired FlexKV package's SGLang connector. |
+| `FLEXKV_DEFER_DUPLICATE_RESTORES=1` | Wait for an identical Host-prefix restore to publish its GPU radix entry before rematching. | This SGLang adaptation. |
+
+SGLang imports `flexkv.integration.sglang.connector` directly. IndexCache
+deduplication therefore requires a FlexKV package containing that feature.
+Use an empty or separately namespaced FlexKV/Mooncake cache pool when changing
+its layout flag. DSA cache layer split is unsupported by the compact layout.
+
+Shared-prefix restore deduplication applies to the ordinary FlexKV radix cache
+in IP/layerwise mode (`FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`). A waiter never
+borrows the producer's unfinished GPU slots. It cancels its held lookup and
+rematches after normal radix publication. Prefix identity includes token IDs,
+`extra_key`, `cache_salt`, and bigram mode. Independent prefixes proceed normally.
+
+Producer completion, cancellation, and reset release the waiting marker while
+preserving the existing allocation ownership and transfer-drain rules. Requests
+holding Mamba state, MP mode, and the hybrid cache path do not use this mechanism.
+
+CPU regressions cover admission, request ownership, repeated deferral, abort,
+reset, and reused request IDs. These checks do not establish GPU/model accuracy,
+performance, multi-node correctness, or production readiness.

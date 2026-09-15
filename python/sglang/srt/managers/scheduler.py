@@ -3847,6 +3847,11 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                continue
             if (
                 self.enable_hicache_storage
                 and get_memory().hicache_host_memory_mode == "buffer_only"
