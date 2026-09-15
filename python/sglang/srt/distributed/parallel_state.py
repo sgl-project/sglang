@@ -2874,8 +2874,7 @@ def create_custom_parallel_group(
         # an HCCL buffer; instead derive the standard TP/DP groups locally.
         num_groups = world_size // group_size
         gathered_configs = [
-            list(range(i * group_size, (i + 1) * group_size))
-            for i in range(num_groups)
+            list(range(i * group_size, (i + 1) * group_size)) for i in range(num_groups)
         ]
 
     unique_groups = []

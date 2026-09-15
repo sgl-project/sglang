@@ -37,6 +37,7 @@ if _is_cuda or _is_hip:
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection
+
     try:
         from sgl_kernel_npu.kvcacheio import transfer_mamba_state
     except ImportError:
@@ -440,9 +441,9 @@ class MambaPoolHost(HostKVCache):
             else:
                 # Per-layer fallback when the dedicated kernel is unavailable.
                 for lid in range(num_layers):
-                    dst[dst_indices.to(dst.device), lid, 0] = src_layers[
-                        lid
-                    ][src_indices.to(dst.device)].to(dst.device)
+                    dst[dst_indices.to(dst.device), lid, 0] = src_layers[lid][
+                        src_indices.to(dst.device)
+                    ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
