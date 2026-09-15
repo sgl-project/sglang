@@ -48,7 +48,14 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
+    os.environ.get("SGLANG_MODEL_LOADING_TIMEOUT_S", "1800")
+)
+# Default 1800s (30 min). The original 480s is too short for large checkpoints
+# where post-load weight processing (scale layout transforms, APE hotfix,
+# MHC norm caching) takes several minutes on certain TP ranks. Particularly
+# affected: DSpark checkpoints on ROCm where TP0/TP7 process heavier expert
+# shards. Override via SGLANG_MODEL_LOADING_TIMEOUT_S env var.
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
