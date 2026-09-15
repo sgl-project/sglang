@@ -179,6 +179,7 @@ class NcclM2NReceiver:
             if expected_hash != actual_hash:
                 raise ValueError("Miles nccl-rl manifest hash mismatch")
         self.manifest = manifest
+        self._pg = pg
         self.model = model
         self.device = (
             torch.device("cuda", torch.cuda.current_device())
@@ -384,6 +385,10 @@ class NcclM2NReceiver:
             name = entry["name"]
             family = entry["family"]
             pp_rank = entry.get("pp_rank")
+            if "pp_rank" in self.manifest and pp_rank != self.manifest["pp_rank"]:
+                raise ValueError(
+                    f"{name} belongs to another PP stage's M2N communicator"
+                )
             if (
                 name in names
                 or family not in ("dense", "routed_expert")
@@ -773,7 +778,16 @@ class NcclM2NReceiver:
         self._entries = self._validate_manifest(self._world_size)
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self.stream):
+            previous_source_mesh = None
             for entry, src_layout, dst_layout in self._entries:
+                if (
+                    previous_source_mesh is not None
+                    and src_layout.mesh != previous_source_mesh
+                ):
+                    # Dense and expert ownership may differ within a PP stage.
+                    # Bystander sources must not run ahead into shared staging.
+                    dist.barrier(group=self._pg)
+                previous_source_mesh = src_layout.mesh
                 destination, post_copy = self._destination(
                     entry, dst_layout.local_shape
                 )

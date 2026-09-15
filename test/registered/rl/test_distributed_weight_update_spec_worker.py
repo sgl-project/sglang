@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -288,6 +288,64 @@ def test_failed_process_group_destroy_remains_retryable():
     assert destroy_group.call_count == 2
     assert runner._model_update_group == {}
     assert runner._m2n_receivers == {}
+
+
+def test_destroying_one_m2n_stage_retires_all_native_resources_before_any_group():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    events = []
+    receivers = {}
+    groups = {"residual": object()}
+    for stage in range(2):
+        name = f"miles-m2n-pp{stage}"
+        receiver = Mock()
+        receiver.stream.synchronize.side_effect = lambda stage=stage: events.append(
+            f"sync:{stage}"
+        )
+        receiver.destroy.side_effect = lambda stage=stage: events.append(
+            f"native:{stage}"
+        )
+        receivers[name] = receiver
+        groups[name] = name
+    runner = SimpleNamespace(_m2n_receivers=receivers, _model_update_group=groups)
+    with patch(
+        "torch.distributed.destroy_process_group",
+        side_effect=lambda pg: events.append(f"pg:{pg}"),
+    ):
+        success, _ = ModelRunner.destroy_weights_update_group(runner, "miles-m2n-pp0")
+        assert success
+        assert ModelRunner.destroy_weights_update_group(runner, "miles-m2n-pp1")[0]
+    assert events == [
+        "sync:0",
+        "sync:1",
+        "native:0",
+        "native:1",
+        "pg:miles-m2n-pp0",
+        "pg:miles-m2n-pp1",
+    ]
+    assert runner._m2n_receivers == {}
+    assert list(runner._model_update_group) == ["residual"]
+
+
+def test_partial_pp_group_teardown_can_resume_on_remaining_group():
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    runner = SimpleNamespace(
+        _m2n_receivers={"pp0": Mock(), "pp1": Mock()},
+        _model_update_group={"pp0": "pg0", "pp1": "pg1"},
+    )
+    with patch(
+        "torch.distributed.destroy_process_group",
+        side_effect=[None, RuntimeError("PP1 destroy failed"), None],
+    ) as destroy:
+        success, message = ModelRunner.destroy_weights_update_group(runner, "pp0")
+        assert not success
+        assert "PP1 destroy failed" in message
+        assert list(runner._m2n_receivers) == ["pp1"]
+        assert ModelRunner.destroy_weights_update_group(runner, "pp1")[0]
+    assert destroy.call_args_list == [call("pg0"), call("pg1"), call("pg1")]
+    assert runner._m2n_receivers == {}
+    assert runner._model_update_group == {}
 
 
 def test_model_runner_begin_end_wire_to_loader_hooks():

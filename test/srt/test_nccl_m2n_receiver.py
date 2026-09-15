@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -276,6 +277,114 @@ def test_receiver_uses_custom_process_group_rank_with_nonzero_offset():
 
     assert receiver._comm_rank == 2
     pg.rank.assert_called_once_with()
+
+
+def test_pp_receiver_rejects_entries_owned_by_another_stage():
+    manifest = _manifest()
+    manifest["pp_rank"] = 1
+    receiver = _receiver(manifest)
+    with pytest.raises(ValueError, match="another PP stage"):
+        receiver._validate_manifest(4)
+
+
+def test_receiver_orders_source_handoffs_on_its_stage_process_group():
+    manifest = _manifest()
+    # First weight/scale pair is sourced by rank 0 alone; later pairs use 0,1.
+    for entry in manifest["entries"][:2]:
+        source = entry["source"]
+        source["mesh"] = [[0]]
+        source["local_shape"][0] *= 2
+        source["names_by_rank"] = {
+            "0": [name for names in source["names_by_rank"].values() for name in names]
+        }
+    receiver = _receiver(manifest)
+    receiver._pg = object()
+    receiver.comm_ptr = 123
+    receiver.stream = Mock()
+    receiver._entries = receiver._validate_manifest(4)
+    events = []
+    m2n = Mock()
+    m2n.reshard.side_effect = lambda *args, **kwargs: events.append(kwargs["src_mesh"])
+    with (
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+        patch(
+            "torch.distributed.barrier",
+            side_effect=lambda group: events.append("handoff"),
+        ) as barrier,
+    ):
+        receiver.receive()
+    assert events == [[[0]], [[0]], "handoff", [[0, 1]], [[0, 1]], [[0, 1]], [[0, 1]]]
+    barrier.assert_called_once_with(group=receiver._pg)
+
+
+def test_pp_receivers_keep_separate_communicators_and_destination_storage_across_updates():
+    model = _model()
+    model.model.layers.append(deepcopy(model.model.layers[0]))
+    manifests = [_manifest(), _manifest()]
+    for pp_rank, manifest in enumerate(manifests):
+        manifest["pp_rank"] = pp_rank
+        for entry in manifest["entries"]:
+            entry["pp_rank"] = pp_rank
+            for field in ("name", "pair_id"):
+                entry[field] = entry[field].replace("layers.0.", f"layers.{pp_rank}.")
+            entry["destination"]["parameter"] = entry["destination"][
+                "parameter"
+            ].replace("layers.0.", f"layers.{pp_rank}.")
+    m2n = Mock()
+    update = 0
+
+    def transfer(source, destination, comm_ptr, stream, **kwargs):
+        assert source is None
+        assert kwargs["src_mesh"] == [[0, 1]]
+        assert kwargs["dst_mesh"] == [[2, 3]]
+        destination.fill_((comm_ptr - 100) + update)
+
+    m2n.reshard.side_effect = transfer
+    groups = [Mock(), Mock()]
+    for group in groups:
+        group.rank.return_value = 2
+    with (
+        patch("sglang.srt.weight_sync.nccl_m2n._nccl_rl", return_value=m2n),
+        patch(
+            "sglang.srt.weight_sync.nccl_m2n._warm_and_borrow_nccl_comm",
+            side_effect=[101, 102],
+        ),
+        patch("sglang.srt.weight_sync.nccl_m2n.dist.get_world_size", return_value=4),
+        patch("torch.cuda.Stream"),
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.stream", side_effect=lambda stream: nullcontext()),
+    ):
+        receivers = [
+            NcclM2NReceiver(
+                pg=group,
+                manifest=manifest,
+                model=model,
+                device=torch.device("cpu"),
+                topology=_TOPOLOGY,
+                static_expert_placement=True,
+            )
+            for group, manifest in zip(groups, manifests)
+        ]
+        for update in (0, 2):
+            receivers[0].receive()
+            first_stage = model.model.layers[0].mlp.experts.w2_weight.detach().clone()
+            receivers[1].receive()
+            assert torch.equal(
+                model.model.layers[0].mlp.experts.w2_weight.float(), first_stage.float()
+            )
+            for pp_rank in (0, 1):
+                experts = model.model.layers[pp_rank].mlp.experts
+                for parameter in experts.parameters():
+                    assert torch.all(parameter.float() == pp_rank + 1 + update)
+        assert [invocation.args[2] for invocation in m2n.reshard.call_args_list] == [
+            101
+        ] * 6 + [102] * 6 + [101] * 6 + [102] * 6
+        receivers[0].destroy()
+        receivers[0].destroy()
+        assert receivers[0].comm_ptr is None
+        m2n.finalize.assert_called_once()
 
 
 @pytest.mark.parametrize("rank", [0, 1])
