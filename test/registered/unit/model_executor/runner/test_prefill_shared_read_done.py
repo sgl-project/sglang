@@ -13,7 +13,9 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -75,8 +77,20 @@ def test_dflash_family_target_prefill_publishes(algorithm):
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_speculative_prefill_publishes_only_after_staging(staged):
-    runner, batch = _model_runner(spec_algorithm=SpeculativeAlgorithm.EAGLE), _batch()
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        SpeculativeAlgorithm.EAGLE,
+        SpeculativeAlgorithm.EAGLE3,
+        SpeculativeAlgorithm.FROZEN_KV_MTP,
+        SpeculativeAlgorithm.STANDALONE,
+        SpeculativeAlgorithm.NGRAM,
+        SpeculativeAlgorithm.UNO,
+        CustomSpecAlgo("TEST_PREFILL", lambda _: object),
+    ],
+)
+def test_speculative_prefill_publishes_only_after_staging(algorithm, staged):
+    runner, batch = _model_runner(spec_algorithm=algorithm), _batch()
     calls = Mock()
     runner.prefill_shared_read_stager = calls.stage
     calls.stage.return_value = staged
@@ -123,11 +137,87 @@ def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backen
             (_model_runner(), _batch(ForwardMode.DECODE)),
             # The algorithm has a later prefill reader or unverified ownership.
             (_model_runner(spec_algorithm=SpeculativeAlgorithm.EAGLE), _batch()),
+            (
+                _model_runner(
+                    spec_algorithm=CustomSpecAlgo("TEST_PREFILL", lambda _: object)
+                ),
+                _batch(),
+            ),
             # Backend has not declared a pre-replay prefill read end.
             (_model_runner(compliant=False), _batch()),
         ):
             maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
             assert runner.shared_read_done_event is None
+
+
+class _TargetOnlyPrefillAlgo(CustomSpecAlgo):
+    def supports_prefill_shared_read_done(self) -> bool:
+        return True
+
+
+class TestPrefillReadDoneCapability(CustomTestCase):
+    def test_builtin_allowlist_is_unchanged(self):
+        allowed = {
+            SpeculativeAlgorithm.NONE,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        }
+        for algorithm in SpeculativeAlgorithm:
+            with self.subTest(algorithm=algorithm):
+                runner = _model_runner(spec_algorithm=algorithm)
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
+                    maybe_publish_prefill_shared_read_done(
+                        runner, _batch(), _DEVICE_MODULE
+                    )
+                self.assertEqual(
+                    runner.shared_read_done_event is not None, algorithm in allowed
+                )
+
+    def test_custom_algorithm_requires_explicit_opt_in(self):
+        for algorithm_type, expected in (
+            (CustomSpecAlgo, False),
+            (_TargetOnlyPrefillAlgo, True),
+        ):
+            with self.subTest(algorithm_type=algorithm_type):
+                algorithm = algorithm_type(
+                    "TEST_PREFILL", lambda _: object, supports_overlap=True
+                )
+                runner, batch = _model_runner(spec_algorithm=algorithm), _batch()
+                runner.prefill_shared_read_stager = Mock(return_value=False)
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
+                    maybe_publish_prefill_shared_read_done(
+                        runner, batch, _DEVICE_MODULE
+                    )
+                event = runner.shared_read_done_event
+                self.assertEqual(event is not None, expected)
+                if expected:
+                    self.assertTrue(event.recorded)
+                    runner.prefill_shared_read_stager.assert_not_called()
+                else:
+                    runner.prefill_shared_read_stager.assert_called_once_with(batch)
+
+    def test_opt_in_does_not_bypass_mode_backend_or_flag(self):
+        algorithm = _TargetOnlyPrefillAlgo("TEST_PREFILL", lambda _: object)
+        cases = [(False, ForwardMode.EXTEND, SharedReadEnds.PRE_REPLAY)]
+        cases.extend(
+            (True, mode, SharedReadEnds.PRE_REPLAY)
+            for mode in ForwardMode
+            if mode != ForwardMode.EXTEND
+        )
+        cases.extend(
+            (True, ForwardMode.EXTEND, declared)
+            for declared in SharedReadEnds
+            if declared != SharedReadEnds.PRE_REPLAY
+        )
+        for enabled, mode, declared in cases:
+            with self.subTest(enabled=enabled, mode=mode, declared=declared):
+                runner = _model_runner(spec_algorithm=algorithm)
+                runner.attn_backend.shared_read_ends.return_value = declared
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
+                    maybe_publish_prefill_shared_read_done(
+                        runner, _batch(mode), _DEVICE_MODULE
+                    )
+                self.assertIsNone(runner.shared_read_done_event)
 
 
 if __name__ == "__main__":
