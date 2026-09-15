@@ -202,6 +202,14 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn(DSML, normal)
 
+    def test_nonstandard_xml_constant_falls_back_to_string(self):
+        text = _wrapped(_invoke("get_weather", _param("city", "false", "NaN")))
+
+        _, calls = self._feed([text])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].parameters, '{"city": "NaN"}')
+
     def test_malformed_first_invoke_does_not_create_flush_state(self):
         detector = DeepSeekV4Detector()
 
