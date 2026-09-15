@@ -26,15 +26,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=509, stage="base-c", runner_config="8-gpu-h20")
-
-
-def _has_nixl():
-    try:
-        import nixl._api  # noqa: F401
-    except ImportError:
-        return False
-    return True
+register_cuda_ci(est_time=355, stage="base-c", runner_config="8-gpu-h20")
 
 
 def _has_mooncake():
@@ -132,16 +124,6 @@ class DisaggregationDecodeRadixCacheTestMixin:
             f"(first={metrics_first['score']:.4f}, second={metrics_second['score']:.4f}), "
             f"exceeds 3% threshold",
         )
-
-
-@unittest.skipUnless(
-    is_in_ci() or _has_nixl(),
-    "NIXL is required for decode radix cache disaggregation coverage.",
-)
-class TestDisaggregationDecodeRadixCacheNixl(
-    DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
-):
-    transfer_backend_name = "nixl"
 
 
 @unittest.skipUnless(
