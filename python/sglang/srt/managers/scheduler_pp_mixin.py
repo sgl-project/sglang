@@ -1166,9 +1166,7 @@ class SchedulerPPMixin:
         spec = get_spec()
         num_steps = spec.speculative_num_steps
         parent_width = (
-            spec.speculative_eagle_topk * (num_steps - 1) + 1
-            if num_steps > 1
-            else 0
+            spec.speculative_eagle_topk * (num_steps - 1) + 1 if num_steps > 1 else 0
         )
         parent_list = torch.arange(
             -1, parent_width - 1, dtype=torch.long, device=device
