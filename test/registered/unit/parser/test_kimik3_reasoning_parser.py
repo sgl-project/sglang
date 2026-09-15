@@ -66,7 +66,7 @@ def test_non_stream_tools_channel_passthrough() -> None:
         "<|close|>call<|sep|>"
         f"{TOOLS_CLOSE}"
     )
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     result = detector.detect_and_parse(
         f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{tools_channel}"
     )
@@ -136,7 +136,7 @@ def test_streaming_tools_channel_passthrough() -> None:
         "<|close|>call<|sep|>"
         f"{TOOLS_CLOSE}"
     )
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     text = f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{tools_channel}"
     reasoning, content = _stream(detector, _chunks(text, 5))
     assert reasoning == "thought"
@@ -161,6 +161,43 @@ _TOOLS_CHANNEL = (
 )
 
 
+def test_non_stream_drops_tools_channel_without_tool_call_parser() -> None:
+    """A request without declared tools cannot receive native tool markup as content."""
+    detector = KimiK3Detector(force_reasoning=True)
+    result = detector.detect_and_parse(
+        f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{_TOOLS_CHANNEL}"
+    )
+    assert result.reasoning_text == "thought"
+    assert result.normal_text == "reply"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 13])
+def test_streaming_drops_tools_channel_without_tool_call_parser(
+    chunk_size: int,
+) -> None:
+    """A request without declared tools cannot stream native tool markup."""
+    detector = KimiK3Detector(force_reasoning=True)
+    text = f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{_TOOLS_CHANNEL}"
+    reasoning, content = _stream(detector, _chunks(text, chunk_size))
+    assert reasoning == "thought"
+    assert content == "reply"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 13])
+def test_streaming_drops_partial_tools_marker_without_tool_call_parser(
+    chunk_size: int,
+) -> None:
+    """A truncated native tools opener cannot be emitted when the stream ends."""
+    detector = KimiK3Detector(force_reasoning=True)
+    text = (
+        f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}"
+        f"{TOOLS_OPEN.removesuffix('<|sep|>')}"
+    )
+    reasoning, content = _stream_with_finish(detector, _chunks(text, chunk_size))
+    assert reasoning == "thought"
+    assert content == "reply"
+
+
 def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
     """A tools channel emitted inside the think block, with think closing after
     it, must still reach the tool-call parser.
@@ -169,7 +206,7 @@ def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
     model from opening the tools channel first. Splitting on think_end put the
     whole call in reasoning_text, dropping it with no log line.
     """
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     result = detector.detect_and_parse(
         f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
     )
@@ -179,7 +216,7 @@ def test_non_stream_tools_channel_before_think_close_is_not_reasoning() -> None:
 
 @pytest.mark.parametrize("chunk_size", [1, 3, 7, 1000])
 def test_streaming_tools_channel_before_think_close(chunk_size: int) -> None:
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     text = f"thought{_TOOLS_CHANNEL}{THINK_CLOSE}{MESSAGE_CLOSE}"
     reasoning, content = _stream(detector, _chunks(text, chunk_size))
     assert reasoning == "thought"
@@ -198,7 +235,7 @@ _SKIPPED_THINK_REPLY = "The TTL is 20 minutes."
     ],
 )
 def test_non_stream_skipped_think_channel_is_content(text: str) -> None:
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     result = detector.detect_and_parse(text)
     assert result.reasoning_text == ""
     assert result.normal_text == _SKIPPED_THINK_REPLY
@@ -219,7 +256,7 @@ def test_non_stream_skipped_think_before_tools_keeps_reply_as_content(
     suffix: str,
 ) -> None:
     """A later think-close cannot reclassify a response closed before tools."""
-    detector = KimiK3Detector(force_reasoning=True)
+    detector = KimiK3Detector(force_reasoning=True, tool_call_parser_active=True)
     text = f"{_SKIPPED_THINK_REPLY}{RESPONSE_CLOSE}{_TOOLS_CHANNEL}{suffix}"
     result = detector.detect_and_parse(text)
     assert result.reasoning_text == ""
@@ -232,7 +269,11 @@ def test_streaming_skipped_think_channel_is_chunk_independent(
     stream_reasoning: bool, chunk_size: int | None
 ) -> None:
     """A skipped-think reply stays content across streaming boundaries."""
-    detector = KimiK3Detector(force_reasoning=True, stream_reasoning=stream_reasoning)
+    detector = KimiK3Detector(
+        force_reasoning=True,
+        stream_reasoning=stream_reasoning,
+        tool_call_parser_active=True,
+    )
     text = f"{_SKIPPED_THINK_REPLY}{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
     chunks = [text] if chunk_size is None else _chunks(text, chunk_size)
     reasoning, content = _stream(detector, chunks)
@@ -253,7 +294,11 @@ def test_streaming_skipped_think_before_tools_is_chunk_independent(
     stream_reasoning: bool, chunk_size: int | None
 ) -> None:
     """Response/tool routing is invariant to chunking and reasoning buffering."""
-    detector = KimiK3Detector(force_reasoning=True, stream_reasoning=stream_reasoning)
+    detector = KimiK3Detector(
+        force_reasoning=True,
+        stream_reasoning=stream_reasoning,
+        tool_call_parser_active=True,
+    )
     text = f"{_SKIPPED_THINK_REPLY}{RESPONSE_CLOSE}{_TOOLS_CHANNEL}"
     chunks = [text] if chunk_size is None else _chunks(text, chunk_size)
     reasoning, content = _stream(detector, chunks)
@@ -285,6 +330,17 @@ def test_streaming_skipped_think_ignores_delayed_think_close(
 
 def test_reasoning_parser_registration() -> None:
     assert isinstance(ReasoningParser("kimi_k3").detector, KimiK3Detector)
+
+
+def test_reasoning_parser_routes_k3_tools_by_parser_state() -> None:
+    """The serving parser preserves K3 tools only for the downstream tool parser."""
+    text = f"thought{THINK_CLOSE}{RESPONSE_OPEN}reply{RESPONSE_CLOSE}{_TOOLS_CHANNEL}"
+    inactive = ReasoningParser("kimi_k3", force_reasoning=True)
+    active = ReasoningParser(
+        "kimi_k3", force_reasoning=True, tool_call_parser_active=True
+    )
+    assert inactive.parse_non_stream(text) == ("thought", "reply")
+    assert active.parse_non_stream(text) == ("thought", f"reply{_TOOLS_CHANNEL}")
 
 
 def _stream_with_finish(detector: KimiK3Detector, chunks: list[str]) -> tuple[str, str]:
