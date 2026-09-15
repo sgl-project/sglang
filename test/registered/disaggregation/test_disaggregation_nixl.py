@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=441, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=335, stage="base-c", runner_config="8-gpu-h20")
 # base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
 
 NIXL_PREFILL_TP_SIZE = 4
@@ -292,7 +292,11 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
     def setUpClass(cls):
         _require_configured_nixl_backend()
         super().setUpClass()
-        os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.05"
+        # 0.2 rather than the 0.05 the mooncake twin uses: this test never
+        # inspects the eval result, so the injection rate alone decides how
+        # much of the failure path gets walked. 0.2 over 50 requests leaves a
+        # ~1e-5 chance of walking none, where 0.05 over 50 would leave 8%.
+        os.environ["SGLANG_TEST_DISAGG_FAILURE_PROB"] = "0.2"
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
         cls.launch_all()
@@ -308,12 +312,12 @@ class TestDisaggregationNixlFailure(NixlPDDisaggregationServerBase):
             eval_name="gsm8k",
             api="completion",
             max_tokens=512,
-            num_examples=200,
+            num_examples=50,
             num_threads=128,
         )
 
-        # Match TestDisaggregationMooncakeFailure: inject many transfer failures
-        # and tolerate eval/request errors as long as workers remain healthy.
+        # Tolerate eval/request errors; the gate is that workers stay healthy
+        # after the injected transfer failures, not the score itself.
         try:
             metrics = run_eval(args)
             print(f"Evaluation metrics: {metrics}")
