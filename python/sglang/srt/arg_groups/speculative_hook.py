@@ -5,6 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
@@ -198,14 +199,18 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not (
+        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+    ):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
+    # DFLASH + dp attention is validated on NPU only.
+    if cfg.enable_dp_attention and not cfg.device == "npu":
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
+            "Currently DFLASH speculative decoding does not support dp "
+            "attention on non-NPU devices."
         )
 
     if cfg.pp_size != 1:
@@ -722,16 +727,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     cfg = resolving_view(server_args)
 
-    supported_draft_backends = (
-        "flashinfer",
-        "fa3",
-        "fa4",
-        "triton",
-        "trtllm_mha",
-        "ascend",
+    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    fallback_backend = (
+        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
@@ -981,7 +981,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     view = resolved_view(server_args)
     if (
