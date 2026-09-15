@@ -513,14 +513,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.video_prompt_optional():
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -606,7 +607,9 @@ async def create_video(
         num_frames_val = form_value("num_frames", num_frames)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # An empty multipart prompt arrives as None; models that opted out of
+            # the prompt requirement above still need a string here.
+            prompt=prompt or "",
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),

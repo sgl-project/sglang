@@ -19,17 +19,25 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     MULTIVIEW_BACKEND_ENV_VAR,
     Cosmos3MultiviewConfig,
     parse_multiview_deployment_config,
+    validate_lidar_config,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     Cosmos3MultiviewSamplingParams,
     clamp_multiview_guidance_scale,
+    closest_multiview_aspect_ratio,
+    normalize_multiview_aspect_ratio,
     parse_local_condition_indexes,
+    validate_lidar_request,
     validate_multiview_request,
 )
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
     _get_config_info,
+)
+from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
+    pack_state,
+    unpack_state,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention import (
     DEFAULT_MAX_UND_TOKENS,
@@ -49,10 +57,30 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview_attention impor
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_vision,
 )
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_decoder import (
+    _DepthToPixels,
+    crop_lidar_width,
+    depth_to_space,
+    lidar_network_to_metric,
+)
+from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
+    Cosmos3LidarEncoder,
+    _SpaceToDepth,
+    pad_lidar_sweeps,
+    required_lidar_sweeps,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
+    lidar_output_payload,
+    lidar_payload_for_response,
+    render_lidar_range_frames,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_multiview import (
     COSMOS3_MULTIVIEW_EMPHASIS,
     Cosmos3MultiviewInputStage,
+    fit_uint8_cthw,
     format_multiview_prompts,
+    format_per_view_prompts,
+    format_separate_view_captions,
     media_kind,
     pad_view_frames_uint8,
     synthetic_multiview_pixels,
@@ -70,6 +98,94 @@ DEPLOYMENT_BLOCK = {
     "max_views": 11,
     "share_vision_temporal_positions": True,
 }
+
+
+# The V1.2 LiDAR contract of the joint export (transformer/config.json multiview.lidar).
+LIDAR_BLOCK = {
+    "apply_validity_mask": True,
+    "dtype": "float32",
+    "fps": 10.0,
+    "latent_channels": 128,
+    "network_config": {
+        "base_channels": 128,
+        "bottleneck_3d": True,
+        "bottleneck_3d_causal_time": True,
+        "bottleneck_3d_max_t": 32,
+        "bottleneck_3d_rope": True,
+        "depths": [3, 3, 3, 3],
+        "dilation": [1, 1, 1, 1],
+        "formulation": "VAE",
+        "in_channels": 3,
+        "mapping_depth": 2,
+        "mask_as_input": False,
+        "mlp_ratio": 3.0,
+        "num_heads": [4, 4, 8, 8],
+        "out_channels": 3,
+        "patch_size": [2, 2],
+        "positional_embedding": "learnable_embedding",
+        "resolution": [128, 1808],
+        "temporal_downsample": [False, False, False],
+        "temporal_upsample": [False, False, False],
+        "window_size": [5, 45],
+        "z_dim": 128,
+    },
+    "range_projection": {
+        "azimuth_end_degrees": -180.0,
+        "azimuth_endpoint": False,
+        "azimuth_start_degrees": 180.0,
+        "coordinate_system": "x_forward_y_left_z_up",
+        "intensity_encoding": "unit",
+        "invalid_range_m": 0.0,
+        "max_range_m": 100.0,
+        "min_range_m": 5.0,
+        "model_width": 1808,
+        "model_width_transform": "circular_pad",
+        "native_height": 128,
+        "native_width": 3600,
+        "return_selection": "nearest",
+        "semantic_height": 128,
+        "semantic_width": 1800,
+        "sensor": "pandar128",
+        "validity_threshold": 0.5,
+    },
+    "sample_posterior": False,
+    "spatial_compression": [16, 16],
+    "streaming_chunk_frames": 9,
+    "streaming_context_frames": 9,
+    "temporal_compression_factor": 1,
+    "version": "1.2",
+}
+INFERENCE_DEFAULTS = {
+    "control_guidance": 1.0,
+    "control_guidance_interval": None,
+    "emphasize_control_in_prompt": True,
+    "fps": 30.0,
+    "guidance": 6.0,
+    "guidance_interval": None,
+    "negative_metadata_mode": "none",
+    "normalize_cfg": False,
+    "num_steps": 35,
+    "resolution": "480",
+    "shift": 10.0,
+    "sigma_max": 80.0,
+}
+SCHEMA2_BLOCK = {
+    **DEPLOYMENT_BLOCK,
+    "decomposed_temporal_window_seconds": 0.4,
+    "schema_version": 2,
+    "separate_view_text_tokenization": True,
+    "variable_view_count": True,
+    "inference_defaults": INFERENCE_DEFAULTS,
+    "lidar": LIDAR_BLOCK,
+}
+
+
+def _adjust_multiview(params, deployment):
+    """The multiview-specific half of ``_adjust``; the base adjustment needs live ServerArgs."""
+    params._apply_deployment_defaults(deployment)
+    params._resolve_canvas(deployment)
+    params._apply_guidance_policy(deployment)
+    return params
 
 
 def _fa4_available() -> bool:
@@ -761,6 +877,34 @@ class TestLayoutHelpers(unittest.TestCase):
 
 
 class TestPixelHelpersAndPrompt(unittest.TestCase):
+    def test_fisheye_canvas_crop_rounds_half_to_even(self):
+        """1720x1080 fisheye sources resize to 523 rows for a 480x832 canvas; the
+        21.5-row crop offset must round to 22 like imaginaire4. A floor offset
+        shifted every fisheye anchor by one row (28 dB instead of 45 dB parity)."""
+        ramp = (
+            torch.arange(1080, dtype=torch.int64)
+            .remainder(256)
+            .to(torch.uint8)
+            .view(1, 1, 1080, 1)
+            .expand(3, 1, 1080, 1720)
+        )
+
+        actual = fit_uint8_cthw(ramp, height=480, width=832)
+
+        resized = torch.nn.functional.interpolate(
+            ramp.permute(1, 0, 2, 3).float(),
+            size=(523, 832),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        expected = resized[0, :, 22:502].round().clamp(0, 255).to(torch.uint8)
+        self.assertEqual(tuple(actual.shape), (3, 1, 480, 832))
+        self.assertTrue(torch.equal(actual[:, 0], expected))
+        self.assertFalse(
+            torch.equal(actual[:, 0], resized[0, :, 21:501].round().to(torch.uint8))
+        )
+
     def test_pad_view_frames_truncates_or_repeats_last_frame(self):
         frames = torch.stack(
             [torch.full((3, 2, 3), value, dtype=torch.uint8) for value in (10, 20)],
@@ -852,6 +996,59 @@ class TestDeploymentConfig(unittest.TestCase):
         self.assertTrue(deployment.align_temporal_positions_across_views)
         self.assertIsNone(deployment.decomposed_temporal_window_seconds)
         self.assertEqual(deployment.backend, "triton")
+
+    def test_accepts_the_schema2_joint_contract(self):
+        deployment = parse_multiview_deployment_config(
+            _transformer_config(SCHEMA2_BLOCK)
+        )
+        self.assertEqual(deployment.schema_version, 2)
+        self.assertFalse(deployment.is_legacy)
+        self.assertTrue(deployment.separate_view_text_tokenization)
+        self.assertTrue(deployment.variable_view_count)
+        self.assertTrue(deployment.supports_lidar)
+        self.assertEqual(deployment.decomposed_temporal_window_seconds, 0.4)
+        self.assertEqual(deployment.inference_default("num_steps", 1), 35)
+        self.assertEqual(deployment.inference_default("resolution", "720"), "480")
+        self.assertEqual(deployment.inference_default("guidance_interval", "x"), "x")
+        self.assertEqual(deployment.lidar["fps"], 10.0)
+        # Schema 2 may reorder or subset the rig; legacy exports may not.
+        block = copy.deepcopy(SCHEMA2_BLOCK)
+        block["cameras"] = list(reversed(COSMOS3_MADS_CAMERAS))
+        self.assertEqual(
+            parse_multiview_deployment_config(_transformer_config(block)).cameras,
+            tuple(reversed(COSMOS3_MADS_CAMERAS)),
+        )
+        for field, value, message in (
+            ("schema_version", 3, "schema_version"),
+            ("inference_defaults", {"resolution": "480"}, "inference_defaults"),
+            ("separate_view_text_tokenization", "yes", "boolean"),
+        ):
+            with self.subTest(field=field):
+                block = copy.deepcopy(SCHEMA2_BLOCK)
+                block[field] = value
+                with self.assertRaisesRegex((ValueError, TypeError), message):
+                    parse_multiview_deployment_config(_transformer_config(block))
+        block = copy.deepcopy(DEPLOYMENT_BLOCK)
+        block["lidar"] = LIDAR_BLOCK
+        with self.assertRaisesRegex(ValueError, "schema_version=2"):
+            parse_multiview_deployment_config(_transformer_config(block))
+
+    def test_lidar_contract_validation(self):
+        self.assertEqual(validate_lidar_config(LIDAR_BLOCK)["version"], "1.2")
+        for path, value, message in (
+            (("version",), "1.1", "V1.2"),
+            (("range_projection", "model_width"), 1800, "circularly padded"),
+            (("network_config", "patch_size"), [2, 4], "disagree"),
+            (("streaming_context_frames",), 4, "chunk length"),
+        ):
+            with self.subTest(path=path):
+                block = copy.deepcopy(LIDAR_BLOCK)
+                target = block
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_lidar_config(block)
 
     def test_rejects_wrong_backbone_before_multiview_fields(self):
         with self.assertRaisesRegex(ValueError, "backbone_type"):
@@ -966,16 +1163,58 @@ def _views(cameras, *, vision=False):
 class TestSamplingParamsAndInputStage(unittest.TestCase):
     def test_defaults_follow_the_reference(self):
         params = Cosmos3MultiviewSamplingParams()
-        self.assertEqual((params.width, params.height), (832, 480))
+        # The canvas is a bucket choice made at adjustment, not a field default.
+        self.assertEqual((params.width, params.height), (None, None))
         self.assertEqual(params.num_frames, 93)
         self.assertEqual(params.fps, 30)
         self.assertEqual(params.guidance_scale, 6.0)
         self.assertEqual(params.num_inference_steps, 35)
         self.assertEqual(params.negative_metadata_mode, "same")
         self.assertEqual(params.resolve_views(), [])
-        self.assertIn(
-            "multiview", Cosmos3MultiviewSamplingParams.video_request_extra_fields()
+        for name in ("multiview", "lidar", "resolution", "aspect_ratio"):
+            self.assertIn(
+                name, Cosmos3MultiviewSamplingParams.video_request_extra_fields()
+            )
+
+    def test_adjust_resolves_canvas_and_checkpoint_defaults(self):
+        legacy = parse_multiview_deployment_config(_transformer_config())
+        params = _adjust_multiview(
+            Cosmos3MultiviewSamplingParams(guidance_scale=9.0), legacy
         )
+        self.assertEqual((params.width, params.height), (832, 480))
+        self.assertEqual(params.num_frames, 93)
+        self.assertEqual(params.guidance_scale, 7.0)
+        with self.assertRaisesRegex(ValueError, "fixed at 480p 16:9"):
+            _adjust_multiview(Cosmos3MultiviewSamplingParams(resolution="720"), legacy)
+
+        schema2 = parse_multiview_deployment_config(_transformer_config(SCHEMA2_BLOCK))
+        params = _adjust_multiview(
+            Cosmos3MultiviewSamplingParams(guidance_scale=9.0), schema2
+        )
+        self.assertEqual((params.width, params.height), (832, 480))
+        self.assertEqual(params.num_frames, 201)
+        self.assertEqual(params.guidance_scale, 9.0)
+        self.assertEqual(params.flow_shift, 10.0)
+        self.assertEqual(params.aspect_ratio, "auto")
+        portrait = _adjust_multiview(
+            Cosmos3MultiviewSamplingParams(resolution=720, aspect_ratio="9:16"), schema2
+        )
+        self.assertEqual((portrait.width, portrait.height), (720, 1280))
+        explicit = _adjust_multiview(
+            Cosmos3MultiviewSamplingParams(width=1104, height=832, resolution="720"),
+            schema2,
+        )
+        self.assertEqual(explicit.aspect_ratio, "4,3")
+        with self.assertRaisesRegex(ValueError, "requires width=1280"):
+            _adjust_multiview(
+                Cosmos3MultiviewSamplingParams(
+                    width=832, height=480, resolution="720", aspect_ratio="16:9"
+                ),
+                schema2,
+            )
+        self.assertEqual(normalize_multiview_aspect_ratio("1920:1080"), "16,9")
+        self.assertEqual(closest_multiview_aspect_ratio(1084, 1924, "480"), "16,9")
+        self.assertEqual(closest_multiview_aspect_ratio(1000, 1000, "720"), "1,1")
 
     def test_views_from_multiview_object_and_control_path_list(self):
         params = Cosmos3MultiviewSamplingParams(
@@ -998,18 +1237,33 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
         self.assertTrue(all(view.camera_key is None for view in t2v.resolve_views()))
 
     def test_request_validation(self):
-        with self.assertRaisesRegex(ValueError, "every camera or none"):
+        # Partial vision is view completion, admitted here and checked per checkpoint later.
+        views = _views(("front", "left"))
+        views[0]["vision_path"] = "front.mp4"
+        self.assertEqual(len(validate_multiview_request({"views": views})), 2)
+        with self.assertRaisesRegex(ValueError, "every view or none"):
             views = _views(("front", "left"))
-            views[0]["vision_path"] = "front.png"
+            views[0]["prompt"] = "A car."
             validate_multiview_request({"views": views})
+        with self.assertRaisesRegex(ValueError, "control_path"):
+            validate_lidar_request({"control_path": "sweeps.tar"})
+        self.assertEqual(
+            validate_lidar_request({"control_path": "sweeps.safetensors"}),
+            {"control_path": "sweeps.safetensors", "decode": True},
+        )
         with self.assertRaisesRegex(ValueError, "control_path"):
             validate_multiview_request({"views": [{"camera_key": "front"}]})
         with self.assertRaisesRegex(ValueError, "Unsupported Cosmos3 multiview fields"):
             validate_multiview_request({"views": _views(("front",)), "lidar": {}})
         with self.assertRaisesRegex(ValueError, "resolution"):
-            validate_multiview_request({"views": _views(("front",)), "resolution": 720})
+            validate_multiview_request({"views": _views(("front",)), "resolution": 704})
+        with self.assertRaisesRegex(ValueError, "aspect_ratio"):
+            validate_multiview_request(
+                {"views": _views(("front",)), "aspect_ratio": "2:1"}
+            )
         with self.assertRaisesRegex(ValueError, "wsm"):
-            Cosmos3MultiviewSamplingParams(wsm={"weight": 1.0})
+            Cosmos3MultiviewSamplingParams(wsm={"strength": 1.0})
+        Cosmos3MultiviewSamplingParams(wsm={"weight": 1.0})
         with self.assertRaisesRegex(ValueError, "negative_metadata_mode"):
             Cosmos3MultiviewSamplingParams(negative_metadata_mode="sometimes")
         with self.assertRaisesRegex(ValueError, "max_sequence_length"):
@@ -1063,7 +1317,7 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
                     )
                 )
             )
-        with self.assertRaisesRegex(ValueError, "exactly 11"):
+        with self.assertRaisesRegex(ValueError, "exported checkpoint cameras"):
             stage._resolve_views(
                 batch_for(
                     Cosmos3MultiviewSamplingParams(
@@ -1071,6 +1325,29 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
                     )
                 )
             )
+        with self.assertRaisesRegex(ValueError, "exactly 11"):
+            stage._resolve_views(
+                batch_for(Cosmos3MultiviewSamplingParams(control_path=["c0.mp4"]))
+            )
+        # Schema 2 with variable_view_count admits a reordered subset but
+        # insists on a caption per camera.
+        subset_stage = Cosmos3MultiviewInputStage(
+            parse_multiview_deployment_config(_transformer_config(SCHEMA2_BLOCK))
+        )
+        subset = _views((COSMOS3_MADS_CAMERAS[3], COSMOS3_MADS_CAMERAS[0]))
+        with self.assertRaisesRegex(ValueError, "prompt"):
+            subset_stage._resolve_views(
+                batch_for(Cosmos3MultiviewSamplingParams(multiview={"views": subset}))
+            )
+        for view in subset:
+            view["prompt"] = "A car."
+        resolved = subset_stage._resolve_views(
+            batch_for(Cosmos3MultiviewSamplingParams(multiview={"views": subset}))
+        )
+        self.assertEqual(
+            [view.camera_key for view in resolved],
+            [COSMOS3_MADS_CAMERAS[3], COSMOS3_MADS_CAMERAS[0]],
+        )
         implied = stage._resolve_views(
             batch_for(
                 Cosmos3MultiviewSamplingParams(
@@ -1094,6 +1371,356 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "multiview.views"):
             stage._resolve_views(batch_for(Cosmos3MultiviewSamplingParams()))
+
+
+class TestPerViewCaptions(unittest.TestCase):
+    CAMERAS = ("camera_front_wide_120fov", "camera_rear_tele_30fov")
+    RIG = (
+        "This multiview driving sequence contains time-aligned recordings from 2 "
+        "vehicle-mounted cameras: front wide-angle camera (forward-facing, 120\u00b0 FOV); "
+        "rear telephoto camera (backward-facing, 30\u00b0 FOV)."
+    )
+
+    def test_rig_header_matches_the_training_formatter(self):
+        # Golden strings from imaginaire4 caption_format.format_separate_view_captions.
+        separate = format_separate_view_captions(["A car.", "Trees."], self.CAMERAS)
+        self.assertEqual(
+            separate[0],
+            f"{self.RIG}\n\nThe description below is for the front wide-angle camera mounted "
+            "on the vehicle. This camera is facing forward and has a 120\u00b0 field of "
+            "view:\n\nA car.",
+        )
+        self.assertEqual(
+            separate[1],
+            f"{self.RIG}\n\nThe description below is for the rear telephoto camera mounted "
+            "on the vehicle. This camera is facing backward and has a 30\u00b0 field of "
+            "view:\n\nTrees.",
+        )
+        prompts = format_per_view_prompts(
+            ["A car.", "Trees."],
+            self.CAMERAS,
+            num_frames=17,
+            fps=30.0,
+            height=480,
+            width=832,
+            emphasis=COSMOS3_MULTIVIEW_EMPHASIS,
+        )
+        self.assertTrue(
+            prompts[0].endswith(
+                "A car. The video is 0.6 seconds long and is of 30 FPS. This video is of "
+                f"480x832 resolution. {COSMOS3_MULTIVIEW_EMPHASIS}"
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "match the selected cameras"):
+            format_separate_view_captions(["A car."], self.CAMERAS)
+
+    def test_caption_scoping_in_the_predicate(self):
+        # Two cameras, one frame, one patch: [C0 C0 | C1 | W0 W1 | R0 R1], caption lengths (2, 1).
+        control = MaskItem(token_shape=(2, 1, 1), num_views=2, is_control=True)
+        target = MaskItem(token_shape=(2, 1, 1), num_views=2)
+        metadata = build_multiview_flex_metadata(
+            seq_len=7,
+            full_q_offsets=(3, 5, 7),
+            items_per_sample=(control, target),
+            device="cpu",
+            num_und=3,
+            caption_lengths=(2, 1),
+        )
+        self.assertEqual(metadata.view_id[:3].tolist(), [0, 0, 1])
+        allowed = multiview_pair_predicate(
+            metadata, torch.arange(metadata.q_len)[:, None], torch.arange(3)[None, :]
+        )
+        # Rows: W0 W1 R0 R1; camera 0 reads tokens 0-1, camera 1 reads token 2.
+        self.assertEqual(
+            allowed.tolist(), [[True, True, False], [False, False, True]] * 2
+        )
+        with self.assertRaisesRegex(ValueError, "partition"):
+            build_multiview_flex_metadata(
+                seq_len=7,
+                full_q_offsets=(3, 5, 7),
+                items_per_sample=(control, target),
+                device="cpu",
+                num_und=3,
+                caption_lengths=(2, 2),
+            )
+
+
+class TestLidarItems(unittest.TestCase):
+    def _metadata(self, window=0.4):
+        # Camera items at 0.4 s per latent frame, LiDAR items at 0.1 s per sweep.
+        camera = (2, 1, 1)
+        lidar = (4, 1, 1)
+        items = (
+            MaskItem(camera, 1, is_control=True, seconds_per_frame=0.4),
+            MaskItem(camera, 1, seconds_per_frame=0.4),
+            MaskItem(
+                lidar,
+                1,
+                view_offset=1,
+                is_control=True,
+                seconds_per_frame=0.1,
+                is_lidar=True,
+            ),
+            MaskItem(lidar, 1, view_offset=1, seconds_per_frame=0.1, is_lidar=True),
+        )
+        return build_multiview_flex_metadata(
+            seq_len=16,
+            full_q_offsets=(4, 6, 8, 12, 16),
+            items_per_sample=items,
+            device="cpu",
+            num_und=3,
+            decomposed_temporal_window_seconds=window,
+            control_attends_sensor=True,
+            caption_lengths=(3,),
+        )
+
+    def test_lidar_reads_every_caption_and_registers_by_capture_time(self):
+        metadata = self._metadata()
+        self.assertEqual(metadata.view_id[8:16].tolist(), [-2] * 8)
+        allowed = multiview_pair_predicate(
+            metadata, torch.arange(metadata.q_len)[:, None], torch.arange(16)[None, :]
+        )
+        # Camera target frame 0 (row 2) and LiDAR target sweeps (rows 8-11).
+        camera_frame0 = allowed[2]
+        lidar_sweep0, lidar_sweep3 = allowed[8], allowed[11]
+        self.assertTrue(camera_frame0[:3].all())  # the single caption
+        self.assertTrue(lidar_sweep0[:3].all())  # LiDAR reads every caption
+        # LiDAR target sees its own control at every sweep, never the camera control.
+        self.assertEqual(lidar_sweep0[8:12].tolist(), [True] * 4)
+        self.assertEqual(lidar_sweep0[4:6].tolist(), [False, False])
+        # Sweep 3 (0.3 s) sees camera frame 0 (0.0 s) within the 0.4 s window
+        # but camera frame 1 (0.4 s) lies ahead of it.
+        self.assertEqual(lidar_sweep3[6:8].tolist(), [True, False])
+        # Camera frame 0 (0.0 s) sees only LiDAR sweep 0 (0.0 s) among the targets.
+        self.assertEqual(camera_frame0[12:16].tolist(), [True, False, False, False])
+        # HD-map control attends its LiDAR target (control_attends_sensor) but not cameras.
+        hdmap = allowed[4]
+        self.assertEqual(hdmap[12:16].tolist(), [True] * 4)
+        self.assertEqual(hdmap[6:8].tolist(), [False, False])
+
+    def test_layout_items_drive_plan_offsets_and_tokens(self):
+        camera = MaskItem((2, 1, 2), 2, seconds_per_frame=0.5)
+        control = MaskItem((2, 1, 2), 2, is_control=True, seconds_per_frame=0.5)
+        lidar = MaskItem(
+            (3, 1, 3), 1, view_offset=2, seconds_per_frame=0.1, is_lidar=True
+        )
+        layout = MultiviewLayout(
+            num_views=2,
+            latent_frames=2,
+            patch_height=1,
+            patch_width=2,
+            seconds_per_frame=0.5,
+            decomposed_temporal_window_seconds=0.4,
+            items=(control, camera, lidar),
+            caption_lengths=(2, 2),
+            max_und_tokens=64,
+        )
+        self.assertEqual(layout.gen_tokens, 4 + 4 + 9)
+        default = MultiviewLayout(
+            num_views=2, latent_frames=2, patch_height=1, patch_width=2
+        )
+        self.assertEqual([item.is_control for item in default.items], [True, False])
+        self.assertNotEqual(layout.cache_key(), default.cache_key())
+        context = MultiviewAttentionContext(layout=layout, mask_cache={})
+        plan, geometry = get_multiview_attention_plan(
+            context,
+            real_und_len=4,
+            real_q_len=layout.gen_tokens,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(geometry.real_q_len, 17)
+        self.assertEqual(
+            plan.seq_lengths,
+            (geometry.padded_q_len, geometry.padded_und_len + geometry.padded_q_len),
+        )
+        metadata = build_multiview_flex_metadata(
+            seq_len=geometry.padded_und_len + geometry.padded_q_len,
+            full_q_offsets=(
+                geometry.padded_und_len,
+                geometry.padded_und_len + 4,
+                geometry.padded_und_len + 8,
+                geometry.padded_und_len + 17,
+            ),
+            items_per_sample=layout.items,
+            device="cpu",
+            num_und=4,
+            decomposed_temporal_window_seconds=0.4,
+            caption_lengths=layout.caption_lengths,
+        )
+        self.assertEqual(
+            metadata.view_id[geometry.padded_und_len + 8 :][:9].tolist(), [-2] * 9
+        )
+        self.assertEqual(metadata.view_id[:4].tolist(), [0, 0, 1, 1])
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            MultiviewLayout(
+                num_views=2,
+                latent_frames=2,
+                patch_height=1,
+                patch_width=2,
+                caption_lengths=(0,),
+            )
+
+    def test_pack_unpack_roundtrip(self):
+        camera = torch.arange(24.0).view(1, 2, 3, 2, 2)
+        lidar = torch.arange(100.0, 118.0).view(1, 2, 3, 1, 3)
+        packed = pack_state([camera, lidar])
+        self.assertEqual(tuple(packed.shape), (1, 42))
+        back = unpack_state(packed, (tuple(camera.shape[1:]), tuple(lidar.shape[1:])))
+        torch.testing.assert_close(back[0], camera)
+        torch.testing.assert_close(back[1], lidar)
+        with self.assertRaisesRegex(ValueError, "declared geometries"):
+            unpack_state(packed, ((2, 3, 2, 2),))
+
+    def test_sweep_helpers_and_input_normalization(self):
+        self.assertEqual(required_lidar_sweeps(17, 30.0, 10.0), 6)
+        self.assertEqual(required_lidar_sweeps(201, 30.0, 10.0), 67)
+        frames = torch.arange(3.0).view(1, 3, 1, 1).expand(3, 3, 1, 1).clone()
+        padded = pad_lidar_sweeps(frames, 6)
+        # Reflection pads [0, 1, 2] to [0, 1, 2, 2, 1], then one more reflected sweep.
+        self.assertEqual(padded[0, :, 0, 0].tolist(), [0.0, 1.0, 2.0, 2.0, 1.0, 1.0])
+        self.assertEqual(pad_lidar_sweeps(frames, 2).shape[1], 2)
+        encoder = Cosmos3LidarEncoder(LIDAR_BLOCK)
+        # Semantic-width input is circularly padded to the model width, ranges
+        # normalized into [-1, 1], invalid rays filled with -1.
+        clip = torch.zeros(3, 1, 128, 1800)
+        clip[0, 0, 0, 0] = 52.5
+        clip[1, 0, 0, 0] = 1.0
+        clip[2, 0, 0, 0] = 1.0
+        clip[0, 0, 1, 5] = 3.0  # below the 5 m minimum: invalid
+        clip[2, 0, 1, 5] = 1.0
+        prepared = encoder.prepare_input(clip)
+        self.assertEqual(tuple(prepared.shape), (1, 3, 1, 128, 1808))
+        self.assertAlmostEqual(prepared[0, 0, 0, 0, 4].item(), 0.0, places=5)
+        self.assertEqual(prepared[0, 1, 0, 0, 4].item(), 1.0)
+        self.assertEqual(prepared[0, 2, 0, 0, 4].item(), 1.0)
+        self.assertEqual(prepared[0, 0, 0, 1, 9].item(), -1.0)
+        self.assertEqual(prepared[0, 2, 0, 1, 9].item(), 0.0)
+        # The circular pad wraps the last semantic columns in front of column 0.
+        clip2 = torch.zeros(3, 1, 128, 1800)
+        clip2[0, 0, 7, 1799] = 20.0
+        clip2[2, 0, 7, 1799] = 1.0
+        prepared2 = encoder.prepare_input(clip2)
+        self.assertGreater(prepared2[0, 2, 0, 7, 3].item(), 0.5)
+
+
+class TestLidarDecoder(unittest.TestCase):
+    def test_network_to_metric_inverts_the_encoder_normalization(self):
+        """Range is the inverse affine of the encoder's [5, 100] m -> [-1, 1] map,
+        intensity the inverse of [0, 1] -> [-1, 1], and a ray whose mask logit
+        falls below the 0.5 sigmoid cut reads zero range, zero intensity, validity 0."""
+        torch.manual_seed(0)
+        range_m = torch.rand(1, 1, 2, 4, 6) * 95.0 + 5.0
+        intensity = torch.rand(1, 1, 2, 4, 6)
+        valid = torch.rand(1, 1, 2, 4, 6) > 0.4
+        network = torch.cat(
+            (
+                (range_m - 5.0) / 95.0 * 2.0 - 1.0,
+                intensity * 2.0 - 1.0,
+                torch.where(
+                    valid, torch.full_like(range_m, 8.0), torch.full_like(range_m, -8.0)
+                ),
+            ),
+            dim=1,
+        )
+
+        metric = lidar_network_to_metric(network, min_range_m=5.0, max_range_m=100.0)
+
+        self.assertTrue(
+            torch.allclose(
+                metric[:, 0][valid[:, 0]], range_m[:, 0][valid[:, 0]], atol=1e-4
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                metric[:, 1][valid[:, 0]], intensity[:, 0][valid[:, 0]], atol=1e-6
+            )
+        )
+        self.assertTrue(torch.equal(metric[:, 2], valid.float()[:, 0]))
+        self.assertEqual(
+            metric[:, :2][~valid.expand(-1, 2, -1, -1, -1)].abs().sum().item(), 0.0
+        )
+        probability = lidar_network_to_metric(
+            network, min_range_m=5.0, max_range_m=100.0, apply_validity_mask=False
+        )
+        self.assertTrue(torch.allclose(probability[:, 2], torch.sigmoid(network[:, 2])))
+
+    def test_pixel_shuffles_follow_the_reference_patch_order(self):
+        """The decoder's expand and detokenizer lay a (p1, p2, c) channel group out as
+        rows then columns, the inverse of the encoder's space-to-depth merge, so a
+        checkpoint trained with einops' "(P1 P2 C)" ordering decodes on the same grid."""
+        grouped = torch.arange(2 * 2 * 3 * 12, dtype=torch.float32).view(2, 2, 3, 12)
+
+        self.assertTrue(torch.equal(_SpaceToDepth()(depth_to_space(grouped)), grouped))
+        pixels = _DepthToPixels((2, 2), channels=3)(grouped)
+        self.assertEqual(tuple(pixels.shape), (2, 3, 4, 6))
+        # group index = p1 * 6 + p2 * 3 + c for the (row, column, channel) grouping
+        for p1 in range(2):
+            for p2 in range(2):
+                for c in range(3):
+                    self.assertEqual(
+                        pixels[1, c, 1 * 2 + p1, 2 * 2 + p2].item(),
+                        grouped[1, 1, 2, p1 * 6 + p2 * 3 + c].item(),
+                    )
+        self.assertTrue(
+            torch.equal(_SpaceToDepth()(pixels.permute(0, 2, 3, 1)), grouped)
+        )
+
+    def test_crop_lidar_width_centers_the_azimuth_padding(self):
+        clip = torch.arange(1808, dtype=torch.float32).view(1, 1, 1, 1, 1808)
+        cropped = crop_lidar_width(clip, 1800)
+        self.assertEqual(cropped.shape[-1], 1800)
+        self.assertEqual(cropped[..., 0].item(), 4.0)
+        with self.assertRaises(ValueError):
+            crop_lidar_width(clip, 1801)
+
+    def test_payload_and_preview_drop_invalid_rays(self):
+        clip = torch.zeros(3, 2, 4, 8)
+        clip[0] = 50.0
+        clip[1] = 0.5
+        clip[2] = 1.0
+        clip[2, :, 0] = 0.0  # first beam dropped by the mask
+        clip[0, :, 1] = 0.0  # second beam dropped by zero range
+        frames = render_lidar_range_frames(clip, min_range_m=5.0, max_range_m=100.0)
+        self.assertEqual(frames.shape, (2, 4, 8, 3))
+        self.assertEqual(frames[:, :2].max(), 0)
+        self.assertGreater(frames[:, 2:].max(), 0)
+        payload = lidar_output_payload(
+            clip,
+            fps=10.0,
+            min_range_m=5.0,
+            max_range_m=100.0,
+            files={"rangemap": "x"},
+            include_arrays=True,
+        )
+        self.assertEqual(payload["sweeps"], 2)
+        self.assertAlmostEqual(payload["valid_fraction"], 0.5)
+        self.assertEqual(payload["range_m"][:, :2].max(), 0.0)
+        self.assertEqual(
+            set(lidar_payload_for_response(payload))
+            & {"range_m", "intensity", "validity"},
+            set(),
+        )
+
+    def test_video_api_accepts_an_empty_top_level_prompt(self):
+        """Per-camera captions live in multiview.views[].prompt, so the multipart video
+        endpoint must not reject the empty top-level prompt schema-2 requests send."""
+        self.assertTrue(Cosmos3MultiviewSamplingParams.video_prompt_optional())
+
+    def test_lidar_request_decode_flag(self):
+        params = validate_lidar_request({"control_path": "/x/hdmap.safetensors"})
+        self.assertTrue(params["decode"])
+        params = validate_lidar_request(
+            {"control_path": "/x/hdmap.safetensors", "decode": False}
+        )
+        self.assertFalse(params["decode"])
+        with self.assertRaises(ValueError):
+            validate_lidar_request(
+                {"control_path": "/x/hdmap.safetensors", "decode": "no"}
+            )
+        with self.assertRaises(ValueError):
+            validate_lidar_request(
+                {"control_path": "/x/hdmap.safetensors", "outputs": []}
+            )
 
 
 class TestRegistry(unittest.TestCase):

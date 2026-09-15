@@ -497,6 +497,15 @@ class SamplingParams:
         return frozenset()
 
     @classmethod
+    def video_prompt_optional(cls) -> bool:
+        """Whether the video API accepts an empty top-level prompt for this model.
+
+        Models whose captions travel in a declared extra (one caption per camera,
+        say) override this; the pipeline then validates the captions it needs.
+        """
+        return False
+
+    @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
         """Declare model-owned JSON or multipart fields accepted by the video API.
 
