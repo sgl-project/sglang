@@ -93,7 +93,7 @@ export const config = {
     b200:   "lmsysorg/sglang:qwen38",
     b300:   "lmsysorg/sglang:qwen38",
     gb300:  "lmsysorg/sglang:qwen38",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260812",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
     mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
     mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
   },
@@ -178,11 +178,8 @@ export const config = {
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       // WideEP — the launch post's large-scale-EP claim — so the range goes past
@@ -236,8 +233,8 @@ export const config = {
     // ----- Card: "PD Disaggregation" -----
     // Role flags follow the P/D bundle's own prefill and decode workers. Two
     // flags those recipes carry are deliberately not emitted:
-    // --prefill-round-robin-balance is a DeprecatedAction on current SGLang and
-    // does nothing, and --mamba-track-interval is context-dependent (the source
+    // --prefill-round-robin-balance no longer exists on current SGLang (it was
+    // a deprecated no-op), and --mamba-track-interval is context-dependent (the source
     // recipes set it equal to their context cap) so a fixed value here would be
     // wrong for cells serving the native window.
     pdDisagg: {

@@ -1,31 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 # Attention module for the MiniMax H3 visual VAE (inference-only bundle).
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.utils import logging
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from .flash import flash_attn
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+
 from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+_FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
+    torch.cuda.get_device_properties(0).gcnArchName
+)
+
+
+def _sdpa_attention(query, key, value):
+    context = sdpa_kernel([SDPBackend.MATH]) if _FORCE_ROCM_MATH_SDPA else nullcontext()
+    with context:
+        return F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            dropout_p=0.0,
+        ).transpose(1, 2)
 
 
 def _vit_norm_input(module, hidden_states):
     if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
         return hidden_states.float()
-    weight = getattr(module, "weight", None)
-    return hidden_states.to(getattr(weight, "dtype", hidden_states.dtype))
+    weight = module.weight
+    return hidden_states.to(weight.dtype if weight is not None else hidden_states.dtype)
 
 
 def _apply_qk_norm(module, hidden_states):
     if (
         _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
-        and getattr(module, "weight", None) is None
-        and getattr(module, "bias", None) is None
+        and module.weight is None
+        and (not isinstance(module, nn.LayerNorm) or module.bias is None)
         and hidden_states.is_cuda
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and not torch.is_grad_enabled()
@@ -83,74 +105,32 @@ class Attention(nn.Module):
             )
 
         self.to_qkv = nn.Linear(self.embed_dim, self.attn_inner_dim * 3, bias=bias)
-
         self.to_out = nn.Linear(self.attn_inner_dim, self.embed_dim, bias=out_bias)
+        # Decode ranks process independent complete tiles. Reuse USPAttention's
+        # backend dispatch, while deliberately bypassing its sequence collectives.
+        self.attn = (
+            USPAttention(
+                num_heads=heads,
+                head_size=dim_head,
+                causal=False,
+                supported_attention_backends={
+                    AttentionBackendEnum.FA,
+                    AttentionBackendEnum.TORCH_SDPA,
+                },
+                default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+                skip_sequence_parallel=True,
+            )
+            if current_platform.is_cuda()
+            else None
+        )
 
         if len(kwargs) > 0 and (not dist.is_initialized() or dist.get_rank() == 0):
             logger.warning(f"Unused kwargs: {kwargs}")
-
-    def _perform_attention(self, query, key, value, pack_info):
-        cu_seqlens = pack_info.get("cu_seqlens", None)
-        mask_mod = pack_info.get("mask_mod", None)
-        block_sparse = pack_info.get("block_sparse", None)
-        valid_seq_len = pack_info.get("valid_seq_len", None)
-
-        if cu_seqlens is not None:
-            raise NotImplementedError(
-                "varlen attention is not supported in this inference-only bundle"
-            )
-
-        padded_seq_len = query.shape[1]
-        if valid_seq_len is not None:
-            valid_seq_len = int(valid_seq_len)
-            if not 0 < valid_seq_len <= padded_seq_len:
-                raise ValueError(
-                    "valid_seq_len must be in (0, padded_seq_len], got "
-                    f"{valid_seq_len} for padded_seq_len={padded_seq_len}"
-                )
-            query = query[:, :valid_seq_len]
-            key = key[:, :valid_seq_len]
-            value = value[:, :valid_seq_len]
-
-        if mask_mod is not None:
-            hidden_states = flash_attn(
-                query,
-                key,
-                value,
-                mask_mod=mask_mod,
-                block_sparse=block_sparse,
-            )
-        else:
-            hidden_states = flash_attn(
-                query,
-                key,
-                value,
-            )
-
-        if valid_seq_len is not None and valid_seq_len < padded_seq_len:
-            hidden_states = torch.cat(
-                [
-                    hidden_states,
-                    hidden_states.new_zeros(
-                        hidden_states.shape[0],
-                        padded_seq_len - valid_seq_len,
-                        hidden_states.shape[2],
-                        hidden_states.shape[3],
-                    ),
-                ],
-                dim=1,
-            )
-
-        return hidden_states
-
-    def perform_attention(self, query, key, value, pack_info={}):
-        return self._perform_attention(query, key, value, pack_info)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         rotary_pos_emb: Optional[torch.Tensor] = None,
-        pack_info: dict = {},
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -166,7 +146,13 @@ class Attention(nn.Module):
         if rotary_pos_emb is not None:
             query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
-        hidden_states = self.perform_attention(query, key, value, pack_info)
+        if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = self.attn(query, key, value)
+        else:
+            # FlashAttention kernels do not accept FP32. Preserve the explicit
+            # no-autocast and MPS paths instead of making backend selection
+            # change H3's supported precision contract.
+            hidden_states = _sdpa_attention(query, key, value)
 
         hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
         hidden_states = self.to_out(hidden_states)

@@ -18,23 +18,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
-    fused_gelu_active,
-    fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
+    can_use_linear_gelu,
+    fused_gelu_active,
     fused_layernorm_modulate,
+    fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -56,8 +52,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -451,12 +446,12 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
-        # quality="high" fusion site: up-proj GEMM + tanh-GELU in the cublasLt
+        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -535,9 +530,9 @@ class GlmImageAttention(torch.nn.Module):
         self.out_dim = out_dim if out_dim is not None else query_dim
 
         tp_size = get_tp_world_size()
-        assert (
-            self.heads % tp_size == 0
-        ), f"heads ({self.heads}) must be divisible by tp_size ({tp_size})"
+        assert self.heads % tp_size == 0, (
+            f"heads ({self.heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.num_local_heads = self.heads // tp_size
         self.num_local_kv_heads = self.num_local_heads
 
@@ -594,6 +589,12 @@ class GlmImageAttention(torch.nn.Module):
             raise ValueError(
                 f"unknown qk_norm: {qk_norm}. Should be one of None, 'layer_norm', 'fp32_layer_norm', 'layer_norm_across_heads', 'rms_norm', 'rms_norm_across_heads', 'l2'."
             )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=dim_head,
+            rotary_dim=dim_head,
+            use_precomputed_cache=False,
+            is_neox_style=True,
+        )
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
@@ -639,28 +640,17 @@ class GlmImageAttention(torch.nn.Module):
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
+            q_img = query[:, text_seq_length:, :, :]
+            k_img = key[:, text_seq_length:, :, :]
 
-            if _is_cuda and cos.dim() == 2:
-                q_img = query[:, text_seq_length:, :, :]
-                k_img = key[:, text_seq_length:, :, :]
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
-                q_out, k_out = apply_flashinfer_rope_qk_inplace(
-                    q_img, k_img, cos_sin_cache, is_neox=True
-                )
-            else:
-                query[:, text_seq_length:, :, :] = _apply_rotary_emb(
-                    query[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
-                )
-                key[:, text_seq_length:, :, :] = _apply_rotary_emb(
-                    key[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
-                )
+            q_img, k_img = self.rotary_emb(
+                query=q_img,
+                key=k_img,
+                cos=cos,
+                sin=sin,
+            )
+            query[:, text_seq_length:, :, :] = q_img
+            key[:, text_seq_length:, :, :] = k_img
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
@@ -677,9 +667,9 @@ class GlmImageAttention(torch.nn.Module):
         # 4. Attention
         if attention_mask is not None:
             text_attn_mask = attention_mask
-            assert (
-                text_attn_mask.dim() == 2
-            ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            assert text_attn_mask.dim() == 2, (
+                "the shape of text_attn_mask should be (batch_size, text_seq_length)"
+            )
         hidden_states = self.attn(
             query, key, value, num_replicated_prefix=text_seq_length
         )

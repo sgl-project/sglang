@@ -4,6 +4,7 @@ Benchmark & Correctness: Triton KDA vs CuTeDSL KDA (prefill, SM100 Blackwell).
 Compares:
   - Triton:  sglang's chunk_kda (FLA chunkwise gated delta rule, per-channel gate)
   - CuteDSL: kda_blackwell pipeline (fused Triton prologue -> kkt_inv_uw -> h -> o)
+  - Helion:  sglang's Helion chunk_kda
 
 KDA differs from GDN by a PER-CHANNEL decay gate (g is [T, H, K], not scalar).
 The cutedsl pipeline externalizes the per-channel decay into five pre-scaled
@@ -30,6 +31,9 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.fla.kda import chunk_kda, fused_recurrent_kda
+from sglang.kernels.ops.attention.helion.kda_prefill import (
+    chunk_kda as helion_chunk_kda,
+)
 from sglang.kernels.ops.attention.linear.kda_blackwell import prepare_metadata
 from sglang.kernels.ops.attention.linear.kda_blackwell.kernel_h import (
     kda_h_cutedsl,
@@ -132,6 +136,7 @@ def cutedsl_buffers(inp, num_sms, device):
         total=total,
         num_sms=num_sms,
         h0=torch.zeros(1, H, V, K, device=device, dtype=torch.float32),
+        state_indices=torch.zeros(1, device=device, dtype=torch.int32),
         U=torch.empty(pad_t, H, V, device=device, dtype=torch.bfloat16),
         W=torch.empty(pad_t, H, K, device=device, dtype=torch.bfloat16),
         V_new=torch.empty(pad_t, H, V, device=device, dtype=torch.bfloat16),
@@ -172,6 +177,7 @@ def run_cutedsl_pipeline(inp, buf, scale):
         buf["ht"],
         buf["cu"],
         buf["co"],
+        buf["state_indices"],
     )
     kda_o_cutedsl(
         qg,
@@ -219,7 +225,35 @@ def check_shape(T, H, K, V, device, dtype, num_sms):
     print(
         f"  [{status}] {tag} | o_err {o_err:.2e}  state_err {s_err:.2e}  finite={finite}"
     )
-    return ok
+
+    helion_state = torch.zeros(1, H, V, K, device=device, dtype=torch.float32)
+    helion_o = helion_chunk_kda(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"].clone(),
+        g=inp["g_act"],
+        beta=inp["beta"],
+        scale=scale,
+        initial_state=helion_state,
+        initial_state_indices=torch.zeros(1, device=device, dtype=torch.int32),
+        use_qk_l2norm_in_kernel=False,
+        cu_seqlens=None,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
+    )
+    helion_finite = bool(
+        torch.isfinite(helion_o).all() and torch.isfinite(helion_state).all()
+    )
+    helion_o_err = (helion_o[0].float() - o_ref.float()).abs().max().item()
+    helion_s_err = (helion_state.float() - state_ref.float()).abs().max().item()
+    helion_ok = helion_finite and helion_o_err < 1e-2 and helion_s_err < 5e-2
+    print(
+        f"  [{'PASS' if helion_ok else 'FAIL'}] Helion {tag} | "
+        f"o_err {helion_o_err:.2e}  state_err {helion_s_err:.2e}  "
+        f"finite={helion_finite}"
+    )
+    return ok and helion_ok
 
 
 # ---------------------------------------------------------------------------
@@ -264,15 +298,37 @@ def bench_shape(T, H, K, V, device, dtype, num_sms):
     def fn_cutedsl():
         run_cutedsl_pipeline(inp, buf, scale)
 
+    helion_v = v.clone()
+    helion_state = torch.zeros(1, H, V, K, device=device, dtype=torch.float32)
+
+    def fn_helion():
+        helion_chunk_kda(
+            q=q,
+            k=k,
+            v=helion_v,
+            g=g_act,
+            beta=beta,
+            scale=scale,
+            initial_state=helion_state,
+            initial_state_indices=idx,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=None,
+            A_log=None,
+            dt_bias=None,
+            lower_bound=None,
+        )
+
     quantiles = [0.5, 0.2, 0.8]
     fn_triton()
     fn_cutedsl()
+    fn_helion()
     torch.cuda.synchronize()
 
     ms_triton, _, _ = triton.testing.do_bench_cudagraph(fn_triton, quantiles=quantiles)
     ms_cutedsl, _, _ = triton.testing.do_bench_cudagraph(
         fn_cutedsl, quantiles=quantiles
     )
+    ms_helion, _, _ = triton.testing.do_bench_cudagraph(fn_helion, quantiles=quantiles)
 
     flops = kda_flops(T, H, K, V)
     mem_bytes = kda_bytes(T, H, K, V, 1, dtype)
@@ -281,7 +337,10 @@ def bench_shape(T, H, K, V, device, dtype, num_sms):
         f"  {H:>3}  {T:>7} | "
         f"{ms_triton:>8.3f}  {flops / ms_triton / 1e9:>7.2f}  {mem_bytes / ms_triton / 1e9:>7.2f} | "
         f"{ms_cutedsl:>8.3f}  {flops / ms_cutedsl / 1e9:>7.2f}  {mem_bytes / ms_cutedsl / 1e9:>7.2f} | "
-        f"{speedup:>7.2f}x"
+        f"{speedup:>7.2f}x | "
+        f"{ms_helion:>8.3f}  {flops / ms_helion / 1e9:>7.2f}  "
+        f"{mem_bytes / ms_helion / 1e9:>7.2f} | "
+        f"{ms_triton / ms_helion:>7.2f}x"
     )
 
 
@@ -312,8 +371,9 @@ def run_benchmark(device, dtype, args, num_sms):
         f"  {'H':>3}  {'T':>7} | "
         f"{'tri(ms)':>8}  {'TFLOP':>7}  {'TB/s':>7} | "
         f"{'cute(ms)':>8}  {'TFLOP':>7}  {'TB/s':>7} | {'speedup':>8}"
+        f" | {'helion(ms)':>10}  {'TFLOP':>7}  {'TB/s':>7} | {'tri/hel':>8}"
     )
-    print("  " + "-" * 84)
+    print("  " + "-" * 126)
     for H in args.num_heads:
         for T in args.seq_lens:
             bench_shape(T, H, 128, 128, device, dtype, num_sms)

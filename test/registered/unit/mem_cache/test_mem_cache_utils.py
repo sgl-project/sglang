@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.evict_policy import (
@@ -17,6 +18,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.utils import (
+    compute_node_event_hash_values,
     compute_node_hash_values,
     get_eviction_strategy,
     get_hash_str,
@@ -26,7 +28,7 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _legacy_get_hash_str(token_ids, prior_hash=None):
@@ -54,9 +56,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
+        self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -68,8 +72,17 @@ class _HashKey:
             start = index.start or 0
             stop = index.stop if index.stop is not None else len(self)
             if self.is_bigram:
-                return _HashKey(self.token_ids[start : stop + 1], is_bigram=True)
-            return _HashKey(self.token_ids[start:stop])
+                return _HashKey(
+                    self.token_ids[start : stop + 1],
+                    is_bigram=True,
+                    cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
+                )
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
@@ -260,6 +273,52 @@ class TestGetHashStr(unittest.TestCase):
         )
 
 
+class TestStorageHashNamespace(unittest.TestCase):
+    def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
+        root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
+        tokens = array("q", range(1, 129))
+
+        def child(extra_key=None, cache_salt=None):
+            return SimpleNamespace(
+                parent=root,
+                key=_HashKey(tokens, extra_key=extra_key, cache_salt=cache_salt),
+                hash_value=None,
+            )
+
+        plain = compute_node_hash_values(child(), page_size=64)
+        self.assertEqual(plain, get_hash_str(tokens, None, page_size=64))
+        # Also guard ambiguous concatenations: ("a", "bc") vs ("ab", "c").
+        namespaced = [
+            compute_node_hash_values(child(*namespace), page_size=64)
+            for namespace in [
+                ("lora-a", None),
+                ("lora-b", None),
+                (None, "tenant-a"),
+                ("lora-a", "tenant-a"),
+                ("a", "bc"),
+                ("ab", "c"),
+            ]
+        ]
+        for i in range(len(plain)):
+            page_hashes = {plain[i], *(hashes[i] for hashes in namespaced)}
+            self.assertEqual(len(page_hashes), 1 + len(namespaced))
+
+        # Continue the parent chain without re-seeding.
+        parent = child("lora-a", "tenant-a")
+        parent.hash_value = namespaced[3]
+        grand = SimpleNamespace(
+            parent=parent,
+            key=_HashKey(
+                array("q", range(200, 264)), extra_key="lora-a", cache_salt="tenant-a"
+            ),
+            hash_value=None,
+        )
+        self.assertEqual(
+            compute_node_hash_values(grand, page_size=64),
+            get_hash_str(array("q", range(200, 264)), namespaced[3][-1], page_size=64),
+        )
+
+
 class TestHashStrToInt64(unittest.TestCase):
     def test_zero_hash(self):
         result = hash_str_to_int64("0" * 64)
@@ -298,6 +357,7 @@ class TestComputeNodeHashValues(unittest.TestCase):
         node = MagicMock()
         node.key = key
         node.parent = parent
+        node.event_hash_value = None
         if parent is not None:
             parent.hash_value = parent_hash_values
         return node
@@ -317,6 +377,56 @@ class TestComputeNodeHashValues(unittest.TestCase):
                     compute_node_hash_values(node, page_size=page_size),
                     _legacy_page_hashes(key, page_size=page_size),
                 )
+
+    def test_cache_salt_seeds_root_hash_chain(self):
+        key = _HashKey(array("q", range(1, 17)), cache_salt="tenant-a")
+        seed = hashlib.sha256(b"sglang-cache-salt-v1\0tenant-a").hexdigest()
+        self.assertEqual(
+            compute_node_event_hash_values(self._make_node(key), page_size=8),
+            _legacy_page_hashes(key, page_size=8, prior_hash=seed),
+        )
+
+        other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")
+        self.assertNotEqual(
+            compute_node_event_hash_values(self._make_node(key), page_size=8),
+            compute_node_event_hash_values(self._make_node(other), page_size=8),
+        )
+
+    def test_cache_salt_event_hashes_are_memoized(self):
+        node = self._make_node(
+            _HashKey(array("q", range(1, 17)), cache_salt="tenant-a")
+        )
+        with patch(
+            "sglang.srt.mem_cache.utils.get_hash_str", wraps=get_hash_str
+        ) as mock_get_hash_str:
+            first = compute_node_event_hash_values(node, page_size=8)
+            second = compute_node_event_hash_values(node, page_size=8)
+
+        self.assertIs(first, second)
+        mock_get_hash_str.assert_called_once()
+
+    def test_cache_salt_event_hash_walk_is_iterative(self):
+        root = SimpleNamespace(
+            key=_HashKey(array("q")),
+            parent=None,
+            hash_value=[],
+            event_hash_value=None,
+        )
+        node = root
+        path = []
+        for token_id in range(1, 1102):
+            node = SimpleNamespace(
+                key=_HashKey(array("q", [token_id]), cache_salt="tenant-a"),
+                parent=node,
+                hash_value=None,
+                event_hash_value=None,
+            )
+            path.append(node)
+
+        result = compute_node_event_hash_values(node, page_size=1)
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(all(item.event_hash_value is not None for item in path))
 
     def test_parent_hash_is_used_only_when_parent_has_nonempty_key_and_hash(self):
         parent = MagicMock()

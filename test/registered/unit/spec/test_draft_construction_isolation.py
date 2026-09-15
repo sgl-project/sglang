@@ -19,11 +19,11 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context, get_flags, get_model
+from sglang.srt.runtime_context import get_context, get_flags, get_model, publish
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _AlwaysDisables:
@@ -145,9 +145,11 @@ class TestFusionDecisionFlag(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         self._seed()
-        initialize_moe_config(
-            ServerArgs(model_path="dummy", disable_shared_experts_fusion=True)
+        publish(
+            ServerArgs(model_path="dummy", disable_shared_experts_fusion=True),
+            role="scheduler",
         )
+        initialize_moe_config()
         moe = get_flags().moe
         self.assertTrue(moe.disable_shared_experts_fusion)
         self.assertTrue(moe.speculative_disable_shared_experts_fusion)

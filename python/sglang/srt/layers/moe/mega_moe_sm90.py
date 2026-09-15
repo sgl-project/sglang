@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
@@ -115,8 +114,7 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
     scale_group_mn, scale_group_k = 128, 128
 
     assert k1 % scale_group_k == 0 and k2 % scale_group_k == 0, (
-        f"invalid SM90 mega-moe K/group_size: k1={k1}, k2={k2}, "
-        f"group_k={scale_group_k}"
+        f"invalid SM90 mega-moe K/group_size: k1={k1}, k2={k2}, group_k={scale_group_k}"
     )
     expected_n_groups_1 = (n1 + scale_group_mn - 1) // scale_group_mn
     expected_n_groups_2 = (n2 + scale_group_mn - 1) // scale_group_mn
@@ -139,41 +137,16 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
         f"expected {expected_k_groups_2} (k2={k2}, group_k={scale_group_k})"
     )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        w13_interleaved = _interleave_l1_weight_only(w13)
-        experts.w13_weight.data = w13_interleaved
-        experts.mega_l1_weights = (
-            experts.w13_weight.data,
-            experts.w13_weight_scale_inv.data,
-        )
-        experts.mega_l2_weights = (
-            experts.w2_weight.data,
-            experts.w2_weight_scale_inv.data,
-        )
-    else:
-        import deep_gemm
-
-        w13_sf = deep_gemm.transform_sf_into_required_layout(
-            w13_sf_fp32,
-            mn=n1,
-            k=k1,
-            recipe=(128, 128),
-            num_groups=num_groups,
-            disable_ue8m0_cast=True,
-        )
-        w2_sf = deep_gemm.transform_sf_into_required_layout(
-            w2_sf_fp32,
-            mn=n2,
-            k=k2,
-            recipe=(128, 128),
-            num_groups=num_groups,
-            disable_ue8m0_cast=True,
-        )
-        l1_pair, l2_pair = deep_gemm.transform_weights_for_mega_moe_sm90(
-            (w13, w13_sf), (w2, w2_sf)
-        )
-        experts.mega_l1_weights = l1_pair
-        experts.mega_l2_weights = l2_pair
+    w13_interleaved = _interleave_l1_weight_only(w13)
+    experts.w13_weight.data = w13_interleaved
+    experts.mega_l1_weights = (
+        experts.w13_weight.data,
+        experts.w13_weight_scale_inv.data,
+    )
+    experts.mega_l2_weights = (
+        experts.w2_weight.data,
+        experts.w2_weight_scale_inv.data,
+    )
 
     experts._mega_moe_sm90_fp8_weights = True
     experts._mega_moe_weights_built = True

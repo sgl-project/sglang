@@ -11,7 +11,7 @@ from sglang.srt.lora.marlin_lora_temp.policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 # Both spellings of "this server serves adapters". The validator must apply the
@@ -40,7 +40,11 @@ def _validate_server(**overrides):
     server_args.update(overrides)
     return validate_experimental_sgl_marlin_server_args(
         types.SimpleNamespace(**server_args),
-        types.SimpleNamespace(ep_size=4, moe_a2a_backend="none"),
+        types.SimpleNamespace(
+            ep_size=4,
+            moe_a2a_backend="none",
+            enable_lora=server_args["enable_lora"],
+        ),
     )
 
 

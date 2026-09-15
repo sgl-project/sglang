@@ -1,8 +1,6 @@
 //! The terminal finish reason: Python's `FinishReasonDict` — what
-//! `BaseFinishReason.to_json()` (schedule_batch.py) puts on the egress wire, and
-//! what the API echoes back as `meta_info.finish_reason`. Ingress has no
-//! counterpart; it rides in the [`BatchHeader`](super::egress::BatchHeader) and on
-//! each terminal [`ChunkEvent`](super::ChunkEvent).
+//! `BaseFinishReason.to_json()` (schedule_batch.py) puts on the response, and
+//! what the API echoes back as `meta_info.finish_reason`.
 
 use serde::{Deserialize, Serialize};
 
