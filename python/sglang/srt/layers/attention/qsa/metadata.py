@@ -69,12 +69,15 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     req_pool_indices: Optional[torch.Tensor] = None
     # Parallel per-group arrays for the groups compressed this forward:
     # slot, sequence-local group-end position, and owning metadata row.
-    # The first member's token row in this forward's packed tensors is extend only,
-    # where group-aligned chunks keep every member in-chunk; None on paged forwards.
+    # The first member's token row in this forward's packed tensors is extend only.
+    # A private chunk-cache tail can make it precede the current packed rows;
+    # compress_prefix_members says how many leading members come from the ring.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
     compress_member_rows: Optional[torch.Tensor] = None
+    compress_prefix_members: Optional[torch.Tensor] = None
+    has_cross_prefix_group: bool = False
     is_cuda_graph: bool = False
     graph_write_locs: Optional[torch.Tensor] = None
     graph_compressed_page_table: Optional[torch.Tensor] = None
