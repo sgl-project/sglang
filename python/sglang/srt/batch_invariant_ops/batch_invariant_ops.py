@@ -35,6 +35,9 @@ _ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
+# Both paths are batch-invariant; split-K is the faster one at decode batch sizes, where
+# a persistent kernel's fixed 128-row tile is mostly padding.
+_ENABLE_MM_SPLITK = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_SPLITK", "1")
 
 if not _ENABLE_MM_DEEPGEMM:
     print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
@@ -574,11 +577,292 @@ def mean_dim(
     return output
 
 
+@triton.jit
+def _splitk_mm_kernel(
+    a_ptr,
+    b_ptr,
+    partial_ptr,
+    out_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_ps,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    K_PER_SPLIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    WRITE_OUT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """One output tile per program, over a fixed slice of K.
+
+    The reduction runs over k alone, so only BLOCK_K and the split partitioning can move
+    the result; BLOCK_M and BLOCK_N merely decide which (i, j) share a tile. Partials go
+    to a buffer for a separate sequential reduction rather than to atomics, which keeps
+    the result stable run to run.
+    """
+    pid_m, pid_n, pid_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    k_base = pid_k * K_PER_SPLIT
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for step in range(K_PER_SPLIT // BLOCK_K):
+        k = k_base + step * BLOCK_K + offs_k
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + k[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        acc = tl.dot(a, b, acc)
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    if WRITE_OUT:
+        # Bias and cast in the order the reduce pass would have applied them.
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+            acc += bias.to(tl.float32)[None, :]
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            acc.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        tl.store(
+            partial_ptr
+            + pid_k * stride_ps
+            + offs_m[:, None] * stride_pm
+            + offs_n[None, :] * stride_pn,
+            acc,
+            mask=mask,
+        )
+
+
+@triton.jit
+def _splitk_reduce_kernel(
+    partial_ptr,
+    out_ptr,
+    bias_ptr,
+    M,
+    N,
+    stride_ps,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    SPLITS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Sum the partials in split order, add the bias, cast once at the end."""
+    pid_m, pid_n = tl.program_id(0), tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for split in range(SPLITS):
+        acc += tl.load(
+            partial_ptr
+            + split * stride_ps
+            + offs_m[:, None] * stride_pm
+            + offs_n[None, :] * stride_pn,
+            mask=mask,
+            other=0.0,
+        )
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias.to(tl.float32)[None, :]
+
+    tl.store(
+        out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+_SPLITK_BLOCK_K = 64
+_SPLITK_REDUCE_BLOCK = 64
+_SPLITK_PREFERRED_K_PER_SPLIT = 2048
+# The fp32 partial buffer is SPLITS deep, so a wide enough N makes it the bottleneck.
+_SPLITK_MAX_PARTIAL_BYTES = 512 * 1024 * 1024
+_SPLITK_K_PER_SPLIT: Dict[int, int | None] = {}
+_SPLITK_MACHINE: Dict[int, Tuple[int, int]] = {}
+
+
+def _splitk_k_per_split(K: int) -> int | None:
+    """The K slice each split owns: the largest under the budget that divides K.
+
+    Taking it from K alone is the point. A slice chosen per batch size would move the
+    reduction tree with the batch, which is the variance this module exists to remove.
+
+    None means K admits no such slice and the caller must use another kernel.
+    """
+    if K not in _SPLITK_K_PER_SPLIT:
+        units = K // _SPLITK_BLOCK_K
+        budget = _SPLITK_PREFERRED_K_PER_SPLIT // _SPLITK_BLOCK_K
+        usable = (
+            [u for u in range(1, units + 1) if units % u == 0 and u <= budget]
+            if K % _SPLITK_BLOCK_K == 0
+            else []
+        )
+        _SPLITK_K_PER_SPLIT[K] = max(usable) * _SPLITK_BLOCK_K if usable else None
+    return _SPLITK_K_PER_SPLIT[K]
+
+
+def _splitk_tile(M: int, N: int, splits: int, device: int) -> Tuple[int, int, int, int]:
+    """BLOCK_M, BLOCK_N, num_warps, num_stages, none of which touches the K order.
+
+    That is what lets all four follow the shape and the card, where the split above must
+    not. BLOCK_M covers M without padding it. BLOCK_N is the widest tile that still
+    leaves a workgroup per compute unit, since column strips are the only parallelism a
+    decode batch has. num_warps gives each warp one 16-row MFMA tile. num_stages is what
+    LDS can hold, one A tile plus one B tile per stage.
+    """
+    if device not in _SPLITK_MACHINE:
+        try:
+            lds = triton.runtime.driver.active.utils.get_device_properties(device)[
+                "max_shared_mem"
+            ]
+        except Exception:
+            lds = 64 * 1024
+        cus = torch.cuda.get_device_properties(device).multi_processor_count
+        _SPLITK_MACHINE[device] = (cus, lds)
+    compute_units, lds = _SPLITK_MACHINE[device]
+
+    block_m = 128
+    for limit in (16, 32, 64):
+        if M <= limit:
+            block_m = limit
+            break
+
+    block_n = 64
+    m_tiles = triton.cdiv(M, block_m)
+    for candidate in (256, 128):
+        if m_tiles * triton.cdiv(N, candidate) * splits >= compute_units:
+            block_n = candidate
+            break
+
+    bytes_per_stage = (block_m + block_n) * _SPLITK_BLOCK_K * torch.bfloat16.itemsize
+    num_warps = min(8, max(4, block_m // 16))
+    return block_m, block_n, num_warps, min(3, max(1, lds // bytes_per_stage))
+
+
+def _splitk_mm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
+    """Batch-invariant ``a @ b (+ bias)`` via sized split-K, or None if unsupported.
+
+    Returning None rather than asserting keeps this a pure performance choice: anything
+    it does not cover falls through to `matmul_persistent`, which is batch-invariant too.
+    """
+    if a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype:
+        return None
+    if a.dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if bias is not None and (bias.ndim != 1 or bias.shape[0] != b.shape[1]):
+        return None
+
+    M, K = a.shape
+    _, N = b.shape
+    k_per_split = _splitk_k_per_split(K)
+    if k_per_split is None:
+        return None
+    splits = K // k_per_split
+    single_split = splits == 1
+    if (
+        not single_split
+        and splits * M * N * torch.float32.itemsize > _SPLITK_MAX_PARTIAL_BYTES
+    ):
+        return None
+
+    block_m, block_n, num_warps, num_stages = _splitk_tile(M, N, splits, a.device.index)
+    out = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    if single_split:
+        # No buffer is allocated, so `out` stands in for the pointer never read.
+        partial, partial_strides = out, (0, 0, 0)
+    else:
+        partial = torch.empty((splits, M, N), device=a.device, dtype=torch.float32)
+        partial_strides = partial.stride()
+    _splitk_mm_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n), splits)](
+        a,
+        b,
+        partial,
+        out,
+        bias if bias is not None else out,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        *partial_strides,
+        out.stride(0),
+        out.stride(1),
+        K_PER_SPLIT=k_per_split,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=_SPLITK_BLOCK_K,
+        WRITE_OUT=single_split,
+        HAS_BIAS=single_split and bias is not None,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    if single_split:
+        return out
+
+    _splitk_reduce_kernel[
+        (
+            triton.cdiv(M, _SPLITK_REDUCE_BLOCK),
+            triton.cdiv(N, _SPLITK_REDUCE_BLOCK),
+        )
+    ](
+        partial,
+        out,
+        bias if bias is not None else partial,
+        M,
+        N,
+        partial.stride(0),
+        partial.stride(1),
+        partial.stride(2),
+        out.stride(0),
+        out.stride(1),
+        SPLITS=splits,
+        HAS_BIAS=bias is not None,
+        BLOCK_M=_SPLITK_REDUCE_BLOCK,
+        BLOCK_N=_SPLITK_REDUCE_BLOCK,
+    )
+    return out
+
+
 def mm_batch_invariant(a, b):
+    if _ENABLE_MM_SPLITK:
+        out = _splitk_mm(a, b)
+        if out is not None:
+            return out
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
+    if _ENABLE_MM_SPLITK:
+        out = _splitk_mm(a, b, bias=bias)
+        if out is not None:
+            return out
     return matmul_persistent(a, b, bias=bias)
 
 
