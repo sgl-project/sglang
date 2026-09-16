@@ -838,13 +838,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def _prepare_read_plan_layouts(
-        self, request_transfers: list[list[PoolTransfer]]
+        self, request_transfers: list[tuple[str, list[PoolTransfer]]]
     ):
         # Consolidate index copies once per pool, preserving request/key order.
         # Each component describes (base, row stride, byte count, source offset).
         # Locations may be non-contiguous; Mooncake expands addresses in C++.
         batches = {}
-        for transfers in request_transfers:
+        for _rid, transfers in request_transfers:
             for transfer in transfers:
                 keys, indices = batches.setdefault(transfer.name, ([], []))
                 component_keys, _ = self.storage._get_hybrid_page_component_keys(
@@ -876,7 +876,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return layouts
 
     def load_with_read_plan(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[tuple[str, list[PoolTransfer]]],
     ) -> None:
         layouts = self._prepare_read_plan_layouts(request_transfers)
         plan = self.storage.store.create_read_plan(
