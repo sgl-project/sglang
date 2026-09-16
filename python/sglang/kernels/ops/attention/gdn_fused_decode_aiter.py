@@ -58,9 +58,20 @@ def available() -> bool:
     if run is None:
         return False
     try:
-        # The AITER kernel is Gluon; older Triton fails at compile time with an
-        # opaque error rather than an ImportError, so probe the module directly.
-        import triton.experimental.gluon  # noqa: F401
+        # The AITER kernel is Gluon. Probe the module AND the one arch-specific
+        # primitive it needs: a Triton that has `experimental.gluon` but not
+        # `gl.amd.cdna3` would import cleanly and then fail at first kernel
+        # compile with an opaque error, which is exactly the failure this gate
+        # exists to prevent. SGLang does not pin Triton, so feature-probe rather
+        # than version-compare.
+        import triton.experimental.gluon.language as gl
+
+        if not hasattr(getattr(getattr(gl, "amd", None), "cdna3", None), "buffer_load"):
+            logger.info(
+                "aiter fused GDN decode disabled: Triton Gluon lacks "
+                "gl.amd.cdna3.buffer_load"
+            )
+            return False
     except ImportError as exc:
         logger.info("aiter fused GDN decode disabled, no Triton Gluon: %s", exc)
         return False
