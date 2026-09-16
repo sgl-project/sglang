@@ -11,6 +11,10 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.auxiliary_output import (
+    CompositeDeviceAuxiliaryOutput,
+    append_auxiliary_output,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -30,6 +34,10 @@ register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 @dataclass
 class HostOutput:
     values: torch.Tensor
+    consumed: object = None
+
+    def consume(self, batch, commits):
+        self.consumed = (batch, commits)
 
 
 class DeviceOutput:
@@ -207,6 +215,40 @@ def test_auxiliary_host_outputs_are_owned_by_each_generation_result():
     assert first.auxiliary_host_output.values.tolist() == [1.0]
     assert second.auxiliary_host_output.values.tolist() == [2.0]
     assert first_device.copy_count == second_device.copy_count == 1
+
+
+def test_composite_auxiliary_output_copies_and_consumes_each_child():
+    first = DeviceOutput(torch.tensor([1.0]))
+    second = DeviceOutput(torch.tensor([2.0]))
+    third = DeviceOutput(torch.tensor([3.0]))
+
+    device_output = append_auxiliary_output(first, second)
+    device_output = append_auxiliary_output(device_output, third)
+
+    assert isinstance(device_output, CompositeDeviceAuxiliaryOutput)
+    assert device_output.outputs == (first, second, third)
+
+    copied = []
+
+    def copy_tensor(tensor):
+        copied.append(tensor)
+        return tensor.clone()
+
+    host_output = device_output.copy_to_host(copy_tensor)
+    batch = object()
+    commits = [object()]
+    host_output.consume(batch, commits)
+
+    assert copied == [first.values, second.values, third.values]
+    assert first.copy_count == second.copy_count == third.copy_count == 1
+    assert all(output.consumed == (batch, commits) for output in host_output.outputs)
+
+
+def test_append_auxiliary_output_ignores_absent_outputs():
+    output = DeviceOutput(torch.tensor([1.0]))
+
+    assert append_auxiliary_output(None, output) is output
+    assert append_auxiliary_output(output, None) is output
 
 
 def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
