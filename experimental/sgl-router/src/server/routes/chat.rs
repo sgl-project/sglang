@@ -3,6 +3,7 @@
 
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
@@ -36,6 +37,7 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
+    // Cheap parsing of routing fields.
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
         fields
@@ -54,7 +56,7 @@ pub async fn chat_completions(
         .get(&model)
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
-    // Validate sampling parameters and render/tokenize only when needed.
+    // Validate sampling parameters and render/tokenize when needed.
     let request = ChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
@@ -89,95 +91,159 @@ async fn select_workers(
     candidates: &[Arc<Worker>],
     resolver: &PdPoolResolver,
 ) -> Result<SelectedWorkers, ApiError> {
-    let external_prefix = external_prefix(ctx, request).await?;
-    let request_input_tokens = request.prefill_load as u64;
-    let needs_load_snapshot = policy.needs_load_snapshot()
+    // Find cached prompt prefixes; these are preferences, not final worker choices.
+    let prefix_matches = lookup_prefix_matches(ctx, request).await?;
+
+    // Reuse one snapshot of available engine load for both prefill and decode decisions.
+    let load_snapshot = capture_load_snapshot(ctx, policy, candidates);
+
+    // Read optional bucket latency/throughput targets and session-affinity headers.
+    let routing = RoutingContext::new(ctx, headers, prefix_matches, load_snapshot)?;
+
+    // Apply the policy, bucket constraints, and load checks to choose a plain/prefill worker.
+    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing)?;
+
+    // PD additionally chooses a decode peer; plain mode returns None.
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing)?;
+    Ok(SelectedWorkers {
+        prefill,
+        decode,
+        timestamped: policy.needs_dispatch_timestamps(),
+    })
+}
+
+fn capture_load_snapshot(
+    ctx: &AppContext,
+    policy: &dyn Policy,
+    candidates: &[Arc<Worker>],
+) -> Option<EngineLoadSnapshot> {
+    let needed = policy.needs_load_snapshot()
         || candidates
             .iter()
             .any(|worker| worker.mode() == WorkerMode::Prefill);
-    let load_snapshot =
-        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(Instant::now()));
-    let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
-        (
-            parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
-            parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?,
-        )
-    } else {
-        (None, None)
-    };
+    needed.then(|| ctx.engine_load.capture_snapshot(Instant::now()))
+}
 
-    let routing_key = ctx
-        .config
-        .model
-        .sticky
-        .as_ref()
-        .and_then(|s| headers.get(s.header_name.as_str()))
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty());
-    let affinity = ctx.config.model.affinity.as_ref();
-    let session_id = affinity
-        .and_then(|config| headers.get(config.session_id_header.as_str()))
+struct RoutingContext<'a> {
+    prefix_matches: Option<ExternalPrefixSignal>,
+    load_snapshot: Option<EngineLoadSnapshot>,
+    ttft_slo_ms: Option<u64>,
+    tps_slo: Option<f64>,
+    routing_key: Option<&'a str>,
+    session_id: Option<&'a str>,
+}
+
+impl<'a> RoutingContext<'a> {
+    fn new(
+        ctx: &AppContext,
+        headers: &'a HeaderMap,
+        prefix_matches: Option<ExternalPrefixSignal>,
+        load_snapshot: Option<EngineLoadSnapshot>,
+    ) -> Result<Self, ApiError> {
+        // Buckets group workers by token limits and service targets; disabled means one pool per role.
+        let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+            (
+                parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
+                parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?,
+            )
+        } else {
+            (None, None)
+        };
+        let routing_key = ctx
+            .config
+            .model
+            .sticky
+            .as_ref()
+            .and_then(|config| nonempty_header(headers, &config.header_name));
+        let session_id = ctx
+            .config
+            .model
+            .affinity
+            .as_ref()
+            .and_then(|config| nonempty_header(headers, &config.session_id_header));
+        Ok(Self {
+            prefix_matches,
+            load_snapshot,
+            ttft_slo_ms,
+            tps_slo,
+            routing_key,
+            session_id,
+        })
+    }
+}
+
+fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty());
-    let session_affinity_mode = affinity
-        .map(|config| config.session_affinity_mode)
-        .unwrap_or(SessionAffinityMode::Bucket);
-    let worker_queue_limit = affinity.and_then(|config| config.worker_queue_limit);
-    let saturation_queue_floor = affinity.and_then(|config| config.saturation_queue_floor);
-    let worker = select_prefill_worker(&PrefillSelectionInputs {
+        .filter(|value| !value.is_empty())
+}
+
+fn pick_prefill_worker(
+    ctx: &AppContext,
+    request: &ChatRequest,
+    policy: &dyn Policy,
+    candidates: &[Arc<Worker>],
+    routing: &RoutingContext<'_>,
+) -> Result<Arc<Worker>, ApiError> {
+    let affinity = ctx.config.model.affinity.as_ref();
+    select_prefill_worker(&PrefillSelectionInputs {
         policy,
         policy_kind: ctx.config.model.policy,
         bucket_selector: ctx.bucket_selector.as_ref(),
         metrics: ctx.metrics.as_ref(),
         model_id: &request.model,
         body: Some(&request.body),
-        routing_key,
-        session_id,
-        request_input_tokens,
+        routing_key: routing.routing_key,
+        session_id: routing.session_id,
+        request_input_tokens: request.prefill_load as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
-        external_prefix: external_prefix.as_ref(),
-        load_snapshot: load_snapshot.as_ref(),
+        external_prefix: routing.prefix_matches.as_ref(),
+        load_snapshot: routing.load_snapshot.as_ref(),
         workers: candidates,
-        ttft_slo_ms,
-        tps_slo,
-        session_affinity_mode,
-        worker_queue_limit,
-        saturation_queue_floor,
+        ttft_slo_ms: routing.ttft_slo_ms,
+        tps_slo: routing.tps_slo,
+        session_affinity_mode: affinity
+            .map(|config| config.session_affinity_mode)
+            .unwrap_or(SessionAffinityMode::Bucket),
+        worker_queue_limit: affinity.and_then(|config| config.worker_queue_limit),
+        saturation_queue_floor: affinity.and_then(|config| config.saturation_queue_floor),
     })
-    .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))?;
-
-    let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        let decode_workers = resolver
-            .decode_candidates(&request.model)
-            .map_err(|error| pool_error(error, &request.model))?;
-        Some(
-            select_decode_peer(&DecodeSelectionInputs {
-                decode_policy_kind: ctx.config.model.decode_policy,
-                bucket_selector: ctx.bucket_selector.as_ref(),
-                model_id: &request.model,
-                prefill_url: &worker.url,
-                decode_workers: &decode_workers,
-                request_input_tokens,
-                requested_max_output_tokens: request.max_output_tokens,
-                ttft_slo_ms,
-                tps_slo,
-                load_snapshot: load_snapshot.as_ref(),
-            })
-            .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
-                model: request.model.0.clone(),
-            })?,
-        )
-    } else {
-        None
-    };
-    Ok(SelectedWorkers {
-        prefill: worker,
-        decode: decode_peer,
-        timestamped: policy.needs_dispatch_timestamps(),
-    })
+    .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
 }
 
-async fn external_prefix(
+fn pick_decode_worker(
+    ctx: &AppContext,
+    request: &ChatRequest,
+    prefill: &Worker,
+    resolver: &PdPoolResolver,
+    routing: &RoutingContext<'_>,
+) -> Result<Option<Arc<Worker>>, ApiError> {
+    if prefill.mode() != WorkerMode::Prefill {
+        return Ok(None);
+    }
+    let candidates = resolver
+        .decode_candidates(&request.model)
+        .map_err(|error| pool_error(error, &request.model))?;
+    let decode = select_decode_peer(&DecodeSelectionInputs {
+        decode_policy_kind: ctx.config.model.decode_policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        model_id: &request.model,
+        prefill_url: &prefill.url,
+        decode_workers: &candidates,
+        request_input_tokens: request.prefill_load as u64,
+        requested_max_output_tokens: request.max_output_tokens,
+        ttft_slo_ms: routing.ttft_slo_ms,
+        tps_slo: routing.tps_slo,
+        load_snapshot: routing.load_snapshot.as_ref(),
+    })
+    .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+        model: request.model.0.clone(),
+    })?;
+    Ok(Some(decode))
+}
+
+async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &ChatRequest,
 ) -> Result<Option<ExternalPrefixSignal>, ApiError> {
