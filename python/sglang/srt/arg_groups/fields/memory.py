@@ -59,7 +59,7 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                "'{\"threshold\": 4096, \"next_prompt_estimate\": 512}'. An "
+                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
