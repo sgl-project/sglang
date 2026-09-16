@@ -16,6 +16,7 @@ mod admission;
 mod memory_backend;
 mod service;
 mod shutdown;
+mod valkey_backend;
 
 pub use admission::stamp_arrival;
 pub use client::{
@@ -33,3 +34,6 @@ pub use shutdown::shutdown_signal;
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;
+pub use valkey_backend::{
+    ValkeyConfig, ValkeyKvIndexerBackend, DEFAULT_KEY_PREFIX as VALKEY_DEFAULT_KEY_PREFIX,
+};

@@ -7,14 +7,27 @@ use std::{env, io};
 
 use sgl_kv_indexer::{
     server_builder_with_max_concurrent_streams, shutdown_signal, stamp_arrival,
-    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
-    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService, ValkeyConfig,
+    ValkeyKvIndexerBackend, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    VALKEY_DEFAULT_KEY_PREFIX,
 };
 use tonic::service::interceptor::InterceptedService;
 use tracing::info;
 
 const PREFIX_QUERY_MAX_INFLIGHT_ENV: &str = "KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT";
 const MAX_CONCURRENT_STREAMS_ENV: &str = "KV_INDEXER_MAX_CONCURRENT_STREAMS";
+/// `memory` (default) keeps the index in this process; `valkey` shares it
+/// through the keyspace named by [`VALKEY_URL_ENV`].
+const BACKEND_ENV: &str = "KV_INDEXER_BACKEND";
+const VALKEY_URL_ENV: &str = "KV_INDEXER_VALKEY_URL";
+const VALKEY_KEY_PREFIX_ENV: &str = "KV_INDEXER_VALKEY_KEY_PREFIX";
+const VALKEY_CLUSTER_ENV: &str = "KV_INDEXER_VALKEY_CLUSTER";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackendChoice {
+    Memory,
+    Valkey(ValkeyConfig),
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -30,7 +43,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
     let max_concurrent_streams = max_concurrent_streams_from_env()?;
 
-    let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
+    let choice = backend_choice_from_env()?;
+    let (backend, backend_name): (Arc<dyn KvIndexerBackend>, &str) = match &choice {
+        BackendChoice::Memory => (Arc::new(InMemoryKvIndexerBackend::new()), "memory"),
+        BackendChoice::Valkey(config) => {
+            let backend = ValkeyKvIndexerBackend::connect(config.clone())
+                .await
+                .map_err(|status| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        status.message().to_string(),
+                    )
+                })?;
+            (Arc::new(backend), "valkey")
+        }
+    };
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
     let service = InterceptedService::new(
@@ -39,18 +66,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stamp_arrival,
     );
 
-    info!(
-        %addr,
-        prefix_query_max_inflight,
-        max_concurrent_streams,
-        "starting single-server in-memory SGLang KV Indexer"
-    );
+    match &choice {
+        BackendChoice::Memory => info!(
+            %addr,
+            prefix_query_max_inflight,
+            max_concurrent_streams,
+            backend = backend_name,
+            "starting single-server in-memory SGLang KV Indexer"
+        ),
+        BackendChoice::Valkey(config) => info!(
+            %addr,
+            prefix_query_max_inflight,
+            max_concurrent_streams,
+            backend = backend_name,
+            key_prefix = %config.key_prefix,
+            cluster = config.cluster,
+            "starting SGLang KV Indexer over a shared Valkey keyspace"
+        ),
+    }
     server_builder_with_max_concurrent_streams(max_concurrent_streams)
         .add_service(service)
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+fn backend_choice_from_env() -> io::Result<BackendChoice> {
+    let kind = env_string(BACKEND_ENV)?.unwrap_or_else(|| "memory".to_string());
+    match kind.as_str() {
+        "memory" => Ok(BackendChoice::Memory),
+        "valkey" => {
+            let url = env_string(VALKEY_URL_ENV)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{BACKEND_ENV}=valkey requires {VALKEY_URL_ENV}"),
+                )
+            })?;
+            let key_prefix = env_string(VALKEY_KEY_PREFIX_ENV)?
+                .unwrap_or_else(|| VALKEY_DEFAULT_KEY_PREFIX.to_string());
+            let cluster = match env_string(VALKEY_CLUSTER_ENV)?.as_deref() {
+                None | Some("0") | Some("false") | Some("no") => false,
+                Some("1") | Some("true") | Some("yes") => true,
+                Some(other) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{VALKEY_CLUSTER_ENV} must be 0/1, got {other:?}"),
+                    ))
+                }
+            };
+            Ok(BackendChoice::Valkey(
+                ValkeyConfig::new(url)
+                    .with_key_prefix(key_prefix)
+                    .with_cluster(cluster),
+            ))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{BACKEND_ENV} must be \"memory\" or \"valkey\", got {other:?}"),
+        )),
+    }
+}
+
+fn env_string(name: &str) -> io::Result<Option<String>> {
+    match env::var(name) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be valid UTF-8"),
+        )),
+    }
 }
 
 fn prefix_query_max_inflight_from_env() -> io::Result<usize> {
