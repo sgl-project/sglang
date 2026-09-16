@@ -1,6 +1,14 @@
-export const config = {
+export const config = (() => {
+const platformAttention = (s) => s.hw === "rtx5090" ? "sdpa" : "fa";
+const effectiveAttention = (s) => s.attention === "platform" ? platformAttention(s) : s.attention;
+
+const config = {
   modelName: "Qwen-Image 2.1",
-  supportedHardware: ["h200"],
+  supportedHardware: ["h200", "b200", "rtx5090", "rtx4090"],
+  hardware: [
+    { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+    { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
+  ],
   groupHardware: false,
   matchDims: [],
 
@@ -29,20 +37,25 @@ export const config = {
       id: "placement",
       title: "Placement",
       scope: "serve",
-      description: "Keep weights resident on H200, or stream DiT layers to reduce device memory.",
+      description: "Hardware selection applies its recommended placement. Stream DiT layers when the full pipeline exceeds device memory.",
       learnMore: "#5-runtime-features",
       default: "resident",
       options: [
         {
-          id: "resident", label: "Resident", recommended: true,
+          id: "resident", label: "Resident",
+          recommendedWhen: (s) => ["h200", "b200"].includes(s.hw),
+          disabled: (s) => ["rtx5090", "rtx4090"].includes(s.hw) && Number(s.gpus_per_node) === 1,
+          disableReason: "The full resident pipeline exceeds one consumer GPU's memory. Select CPU offload.",
           flags: (s) => [Number(s.gpus_per_node) === 1 ? "--performance-mode speed" : "--performance-mode manual"],
-          description: "Single-H200 serving is verified. Custom topologies keep the selected placement explicit.",
+          description: "Keep all components on the GPU. Recommended for H200 and B200; consumer cards need offload.",
         },
         {
-          id: "offload", label: "Layerwise offload",
-          flags: ["--performance-mode manual", "--dit-layerwise-offload true"],
-          soft: true, softReason: "CLI offload passed; this server recipe has not been verified.",
-          description: "Trades host-to-device transfers for lower DiT residency; requires sufficient host RAM.",
+          id: "offload", label: "CPU offload",
+          flags: (s) => ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
+          recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
+          soft: (s) => !["rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
+          softReason: "This offload topology has not completed an HTTP verification run.",
+          description: "Streams DiT layers. RTX 4090 also offloads the encoder between requests to leave room for image editing. Requires sufficient host RAM.",
         },
       ],
     },
@@ -54,11 +67,16 @@ export const config = {
       learnMore: "#5-runtime-features",
       default: "platform",
       options: [
-        { id: "platform", label: "Automatic", recommended: true, description: "FlashAttention on the verified H200 server." },
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Select the H200 default explicitly." },
+        {
+          id: "platform", label: "Automatic", recommended: true,
+          flags: (s) => [`--attention-backend ${platformAttention(s) === "sdpa" ? "torch_sdpa" : "fa"}`],
+          description: "Uses the measured recommendation: SDPA on RTX 5090, FlashAttention on the other listed GPUs.",
+        },
+        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel; available on all listed platforms." },
         {
           id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"],
-          soft: true, softReason: "Full generation/edit precision comparisons used CLI SDPA; this server variant is unverified.",
+          soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("sdpa") && Number(s.gpus_per_node) === r.gpus_per_node),
+          softReason: "This hardware and placement combination has not completed HTTP verification with SDPA.",
           description: "Use for reference comparisons. Floating-point reduction order can differ from FlashAttention.",
         },
         {
@@ -168,7 +186,10 @@ export const config = {
     resource: {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
       verifiedRecipes: [
-        { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", default: true },
+        { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
+        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
+        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], default: true },
+        { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], default: true },
       ],
       autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
       validateTopology: (s, topology) => {
@@ -181,7 +202,8 @@ export const config = {
         if (![tp, ulysses, ring].every((n) => [1, 2].includes(n))) errors.push("TP, Ulysses and Ring must each be 1 or 2.");
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
-        if (ring > 1 && s.attention === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
+        if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
+        if (perNode === 1 && ["rtx5090", "rtx4090"].includes(s.hw) && s.placement === "resident") errors.push("The full resident pipeline exceeds this GPU's memory. Select CPU offload.");
         return errors;
       },
     },
@@ -196,13 +218,14 @@ export const config = {
         && entry.placement === s.placement && entry.tp_size === topology.tp_size
         && entry.ulysses_degree === topology.ulysses_degree && entry.ring_degree === topology.ring_degree);
       const serveVerified = !!recipe && errors.length === 0 && s.encoder === "auto"
-        && ["platform", "fa"].includes(s.attention) && s.precision === "native"
+        && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
         && s.execution === "eager" && s.vae === "full";
       // Exact HTTP workloads from the validation matrix, not blanket quality coverage.
       const requestVerified = serveVerified
-        && ((["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1)
-          || (s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
-          || (s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
+        && ((["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
+            && (s.hw === "h200" || s.mode === "text" || s.background === "scene"))
+          || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
+          || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
       const world = Number(s.nodes) * Number(s.gpus_per_node);
       const flags = ['--model-path "{{MODEL_PATH}}"', "--model-id Qwen-Image-2.1", `--num-gpus ${world}`];
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
@@ -223,7 +246,7 @@ export const config = {
             request: errors.length ? "error" : requestVerified ? "verified" : "unverified",
           },
           resolvedSettings: {
-            attention: s.attention === "platform" ? "FlashAttention (auto)" : undefined,
+            attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)` : undefined,
             encoder: s.encoder === "auto" && world === 1 ? "Single GPU (auto)" : undefined,
           },
         },
@@ -277,3 +300,6 @@ ${fields.join(" \\\n")}`;
   showPlaygroundLink: false,
   cells: [],
 };
+
+return config;
+})();

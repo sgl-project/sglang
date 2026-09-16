@@ -16,7 +16,7 @@ Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prer
 then install this integration from its source checkout with
 `uv pip install -e "python[diffusion]"`. Use an authorized checkpoint directory in
 place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux;
-the full checkpoint has been exercised on H200 with generation and editing requests.
+the hardware picker selects a tested single-GPU recipe for the full checkpoint.
 
 <Deployment config={config} />
 
@@ -26,8 +26,9 @@ tiling, and graph execution. **Request** controls the background, resolution,
 steps, and output count. Set reference PNG paths under **Variables**; edits
 upload files from the machine running cURL, so they need not exist on the server.
 
-The recommended server is one H200 with resident weights. Custom two-GPU
-topologies and unverified feature combinations remain selectable and are labeled
+Hardware selection applies the recommended placement for that GPU. H200 and
+B200 keep weights resident; consumer GPUs use offload to fit the full pipeline.
+Custom two-GPU topologies and unverified feature combinations remain selectable and are labeled
 **Unverified**. Invalid topology combinations disable Copy. This integration
 currently uses the Python/source command; no published Docker image is verified.
 
@@ -44,6 +45,44 @@ for i, item in enumerate(json.loads(Path("response.json").read_text())["data"]):
     Path(f"output-{i}.png").write_bytes(base64.b64decode(item["b64_json"]))
 PY
 ```
+
+### Platform measurements
+
+| GPU | Recommended placement / attention | Generation median | Single edit | Peak device memory |
+| --- | --- | --- | --- | --- |
+| H200 141GB | Resident / FlashAttention | Functional verification only | Passed | Not measured in this comparison |
+| B200 192GB | Resident / FlashAttention | 3.44 s | 3.84 s | 40.1 GiB |
+| RTX 5090 32GB | DiT layerwise offload / SDPA | 14.30 s | 16.84 s | 26.9 GiB |
+| RTX 4090 24GB | DiT layerwise + encoder CPU offload / FlashAttention | 24.60 s | 25.59 s | 21.4 GiB |
+
+The recommendations compare exact attention backends and memory placement on
+one GPU per platform. Each run warms up with one 512px, 4-step request, then
+measures three 1024px, 40-step generations, one single-image edit, and one
+transparent generation. All use seed 42, CFG 1, eager execution, full-image VAE
+decoding, and PNG output. Generation latency is the median of three sequential
+HTTP requests; editing is one request. Times include encoding and PNG response
+serialization, but exclude server startup. Device memory is the highest sampled
+`nvidia-smi` usage across loading and requests, sampled every 0.5 seconds.
+
+Measured on 2026-09-16 with source revision `128ae46cc`, PyTorch 2.13.0+cu130,
+Transformers 5.12.1, and Diffusers 0.37.0. SGLang's native encoder uses the
+Transformers 4.57.3 numerical semantics described below. The RTX 5090 runs used
+a 50 GiB process-group memory limit on a roughly 60 GiB host; this is a tested
+budget, not a minimum host-memory requirement.
+
+B200 FlashAttention was faster than SDPA in this comparison (3.44 vs 3.70 s).
+On RTX 5090 the two were within 1% (14.30 s SDPA vs 14.39 s FlashAttention);
+both passed, and the picker defaults to SDPA. Keeping eight DiT layers resident
+did not improve the RTX 5090 generation median, so that flag is omitted.
+On RTX 4090, DiT offload alone passed generation but ran out of memory during
+editing. The recommended command also sets `--text-encoder-cpu-offload true`;
+this complete recipe passed generation, editing, and transparent PNG output.
+
+These are measurements of this small workload, not universal latency or image
+quality guarantees. Different prompts, reference sizes, batching, and software
+versions can change memory use and latency. Transparent-input editing and the
+multi-reference/batched request recipes retain their separate H200 verification
+scope in the picker.
 
 ## 2. Model capabilities
 
@@ -163,5 +202,5 @@ results and require application-specific quality checks.
 
 See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
 for tested configurations and remaining validation boundaries. These checks
-are functional and numerical comparisons, not latency benchmarks or broad
-image-quality evaluations.
+are functional and numerical comparisons. The platform measurements above cover
+their stated HTTP workload; broader image quality is not evaluated.
