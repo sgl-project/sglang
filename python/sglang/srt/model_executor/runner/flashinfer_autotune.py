@@ -278,11 +278,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # autotune(cache=...) clears all file-loaded tactics on entry. In a
-        # speculative worker, loading the draft cache would then discard the
-        # target's prefill tactics after a restart (freshly profiled tactics
-        # live in a different cache and mask this on the first startup).
-        # The public load/save API merges the target and draft entries instead.
+        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
+        # the target's tactics when the draft worker loads; load and save them by hand.
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
