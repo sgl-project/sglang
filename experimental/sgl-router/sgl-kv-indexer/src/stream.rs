@@ -16,10 +16,20 @@
 //! Applies are idempotent but not commutative: a worker's REPORT and a later
 //! REVOKE of the same block must land in that order. Two consumers of one group
 //! would interleave them, so consumers of a shared group run under a lease
-//! (`SET NX PX`, renewed at a third of its TTL): one applies, the others stand
-//! by and take over inside one TTL. The new holder first reclaims entries the
-//! old one left pending (`XAUTOCLAIM`), then reads live. Entries are never lost
-//! while they sit in the stream, only delayed.
+//! (`SET NX PX`, renewed by a compare-and-set at a third of its TTL): one
+//! applies, the others stand by and take over inside one TTL. Entries are never
+//! lost while they sit in the stream, only delayed.
+//!
+//! Two properties keep the ordering the lease exists to protect:
+//!
+//! * The holder re-checks the lease as it works, not once per tick. A batch can
+//!   outlast the TTL, and the moment the lease is gone this consumer stops and
+//!   leaves the rest pending. Without that, a slow batch and a fresh holder
+//!   apply the same stream at the same time.
+//! * On taking the lease, the new holder drains the whole pending list first
+//!   with no idle-time floor, because the previous holder's lease has expired
+//!   and it is no longer applying. Claiming only entries idle for a full TTL
+//!   would apply fresh entries ahead of the dead holder's older ones.
 //!
 //! An in-memory indexer uses a private group created at `0`, so it rebuilds
 //! its index from the retained window on every start and needs no lease.
@@ -33,7 +43,7 @@
 //! entries in order before touching new ones.
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use redis::Value;
@@ -55,9 +65,22 @@ pub const DEFAULT_CONSUMER_GROUP: &str = "indexers";
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(10);
 
 const READ_BATCH: usize = 256;
+/// Fraction of the TTL at which a working holder renews, early enough that the
+/// renewal round trip cannot itself let the lease lapse.
+const RENEW_AT: u32 = 3;
 const READ_BLOCK: Duration = Duration::from_secs(1);
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Renews the lease only while ARGV[1] still holds it: 1 when the caller kept
+/// it, 0 when it changed hands or already lapsed.
+const RENEW_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+"#;
 
 pub fn stream_key(prefix: &str) -> String {
     format!("{prefix}events")
@@ -164,6 +187,11 @@ pub struct StreamConsumer<B> {
     config: StreamConsumerConfig,
     backend: B,
     holds_lease: bool,
+    /// Where the next `XAUTOCLAIM` resumes; `0-0` restarts at the oldest entry.
+    claim_cursor: String,
+    /// When this consumer's lease expires, so the apply loop can renew before it
+    /// lapses instead of trusting a check made one tick ago.
+    lease_until: Option<Instant>,
 }
 
 impl<B: KvIndexerBackend> StreamConsumer<B> {
@@ -183,6 +211,8 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
             config,
             backend,
             holds_lease: false,
+            claim_cursor: "0-0".to_string(),
+            lease_until: None,
         };
         // The group's read position is fixed here, so anything published after
         // `connect` returns is delivered even if `run` starts later.
@@ -218,6 +248,17 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
                     continue;
                 }
                 Ok(Tick::Standby) => self.config.lease_ttl.unwrap_or(READ_BLOCK) / 3,
+                // A flushed or restored Valkey loses the group; without
+                // recreating it the consumer retries NOGROUP forever and
+                // silently stops applying.
+                Err(status) if status.message().contains("NOGROUP") => {
+                    warn!(%status, "consumer group missing; recreating it");
+                    drain_pending = true;
+                    if let Err(status) = self.recreate_group().await {
+                        warn!(%status, retry_in = ?delay, "could not recreate the consumer group");
+                    }
+                    delay
+                }
                 Err(status) => {
                     warn!(%status, retry_in = ?delay, "event stream tick failed");
                     drain_pending = true;
@@ -256,8 +297,10 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
             }
         }
         let entries = if *drain_pending {
+            // Whatever is pending, ours or a dead holder's, in stream order and
+            // with no idle floor: holding the lease means nobody else applies.
             let mut entries = match self.config.lease_ttl {
-                Some(ttl) => self.autoclaim(ttl).await?,
+                Some(_) => self.autoclaim(Duration::ZERO).await?,
                 None => Vec::new(),
             };
             if entries.is_empty() {
@@ -283,6 +326,17 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
             return Ok(Tick::Idle);
         }
         for entry in entries {
+            // Losing the lease mid-batch means another consumer is applying now,
+            // so stop and leave the rest pending for it rather than interleave.
+            if !self.keep_lease().await? {
+                self.holds_lease = false;
+                *drain_pending = true;
+                info!(
+                    consumer = %self.config.consumer,
+                    "lease lost while applying; stopping this batch"
+                );
+                return Ok(Tick::Standby);
+            }
             if let Err(status) = self.apply(entry).await {
                 *drain_pending = true;
                 return Err(status);
@@ -296,6 +350,23 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
             StreamStart::Tail => "$",
             StreamStart::Beginning => "0",
         };
+        self.create_group(start).await
+    }
+
+    /// Recreates a group that vanished under a running consumer. Starting at the
+    /// oldest retained entry rather than at the tail: entries published while the
+    /// group was missing are unread by anyone, and re-applying the window is
+    /// idempotent, while skipping it loses them for good.
+    async fn recreate_group(&mut self) -> Result<(), Status> {
+        warn!(
+            group = %self.config.group,
+            "recreating the consumer group from the oldest retained entry"
+        );
+        self.claim_cursor = "0-0".to_string();
+        self.create_group("0").await
+    }
+
+    async fn create_group(&mut self, start: &str) -> Result<(), Status> {
         let mut pipe = redis::pipe();
         pipe.cmd("XGROUP")
             .arg("CREATE")
@@ -319,7 +390,10 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
         self.conn.run::<Vec<i64>>(&pipe).await.map(|_| ())
     }
 
-    /// Acquire or renew the lease. Renewal is conditional on still owning it.
+    /// Acquires the lease, or renews one this consumer still owns. `SET XX`
+    /// alone would only require the key to exist, so a lease that changed hands
+    /// between a read and the write would be stolen back; the renewal is a
+    /// compare-and-set on the holder name instead.
     async fn try_lease(&mut self, ttl: Duration) -> Result<bool, Status> {
         let ttl_ms = ttl.as_millis().max(1) as u64;
         let mut pipe = redis::pipe();
@@ -331,23 +405,34 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
             .arg(ttl_ms);
         let acquired: Vec<Option<String>> = self.conn.run(&pipe).await?;
         if acquired.first().is_some_and(Option::is_some) {
+            self.lease_until = Some(Instant::now() + ttl);
             return Ok(true);
         }
         let mut pipe = redis::pipe();
-        pipe.cmd("GET").arg(&self.lease);
-        let holder: Vec<Option<String>> = self.conn.run(&pipe).await?;
-        if holder.first().and_then(|h| h.as_deref()) != Some(self.config.consumer.as_str()) {
-            return Ok(false);
-        }
-        let mut pipe = redis::pipe();
-        pipe.cmd("SET")
+        pipe.cmd("EVAL")
+            .arg(RENEW_LUA)
+            .arg(1)
             .arg(&self.lease)
             .arg(&self.config.consumer)
-            .arg("XX")
-            .arg("PX")
             .arg(ttl_ms);
-        let renewed: Vec<Option<String>> = self.conn.run(&pipe).await?;
-        Ok(renewed.first().is_some_and(Option::is_some))
+        let renewed: Vec<i64> = self.conn.run(&pipe).await?;
+        let held = renewed.first().copied().unwrap_or(0) == 1;
+        self.lease_until = held.then(|| Instant::now() + ttl);
+        Ok(held)
+    }
+
+    /// Renews once the lease is within `1/RENEW_AT` of expiry. `false` means
+    /// this consumer no longer holds it and must stop applying.
+    async fn keep_lease(&mut self) -> Result<bool, Status> {
+        let Some(ttl) = self.config.lease_ttl else {
+            return Ok(true);
+        };
+        match self.lease_until {
+            Some(until) if until.saturating_duration_since(Instant::now()) > ttl / RENEW_AT => {
+                Ok(true)
+            }
+            _ => self.try_lease(ttl).await,
+        }
     }
 
     async fn release_lease(&mut self) -> Result<(), Status> {
@@ -360,15 +445,18 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
         self.conn.run::<Vec<i64>>(&pipe).await.map(|_| ())
     }
 
-    /// Entries a previous consumer left pending for longer than the lease.
+    /// Entries left pending, claimed from `self.claim_cursor` onwards. Carrying
+    /// the cursor across calls drains a pending list longer than one page in
+    /// stream order, instead of re-reading the first page forever.
     async fn autoclaim(&mut self, idle: Duration) -> Result<Vec<Entry>, Status> {
+        let cursor = self.claim_cursor.clone();
         let mut pipe = redis::pipe();
         pipe.cmd("XAUTOCLAIM")
             .arg(&self.key)
             .arg(&self.config.group)
             .arg(&self.config.consumer)
             .arg(idle.as_millis() as u64)
-            .arg("0-0")
+            .arg(&cursor)
             .arg("COUNT")
             .arg(READ_BATCH);
         let replies: Vec<Value> = self.conn.run(&pipe).await?;
@@ -381,7 +469,14 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
                 "valkey backend: unexpected XAUTOCLAIM reply",
             ));
         };
-        match parts.into_iter().nth(1) {
+        let mut parts = parts.into_iter();
+        // "0-0" back means the pending list was walked to the end.
+        self.claim_cursor = match parts.next() {
+            Some(next) => String::from_utf8(bytes_of(next, "claim cursor")?)
+                .map_err(|_| Status::internal("valkey backend: claim cursor is not UTF-8"))?,
+            None => "0-0".to_string(),
+        };
+        match parts.next() {
             Some(entries) => parse_entries(entries),
             None => Ok(Vec::new()),
         }

@@ -28,21 +28,31 @@ use test_net::free_addr;
 use tokio::sync::oneshot;
 use tonic::Status;
 
-/// Counts prefix queries so a test can tell which endpoint served one, and can
-/// be told to reject them like a server that disagrees about the request.
+/// How a server behaves when asked for a prefix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Behaviour {
+    Answer,
+    /// Rejects the request the way a server that disagrees about the contract does.
+    Reject,
+    /// Accepts the connection and never replies: a black-holed or wedged host,
+    /// which is the case a connect-refused endpoint does not exercise.
+    Hang,
+}
+
+/// Counts prefix queries so a test can tell which endpoint served one.
 #[derive(Clone)]
 struct CountingBackend {
     inner: Arc<InMemoryKvIndexerBackend>,
     queries: Arc<AtomicUsize>,
-    reject: bool,
+    behaviour: Behaviour,
 }
 
 impl CountingBackend {
-    fn new(reject: bool) -> Self {
+    fn new(behaviour: Behaviour) -> Self {
         Self {
             inner: Arc::new(InMemoryKvIndexerBackend::new()),
             queries: Arc::new(AtomicUsize::new(0)),
-            reject,
+            behaviour,
         }
     }
 
@@ -72,10 +82,15 @@ impl KvIndexerBackend for CountingBackend {
         request: MatchExternalKvPrefixRequest,
     ) -> Result<MatchExternalKvPrefixResponse, Status> {
         self.queries.fetch_add(1, Ordering::SeqCst);
-        if self.reject {
-            return Err(Status::invalid_argument("this server rejects the contract"));
+        match self.behaviour {
+            Behaviour::Reject => Err(Status::invalid_argument("this server rejects the contract")),
+            Behaviour::Hang => {
+                // Long enough to outlast any deadline these tests configure.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Err(Status::internal("unreachable: the caller gave up first"))
+            }
+            Behaviour::Answer => self.inner.match_external_kv_prefix(request).await,
         }
-        self.inner.match_external_kv_prefix(request).await
     }
 
     async fn get_external_kv_hit_counts(
@@ -94,8 +109,8 @@ struct Server {
 
 impl Server {
     /// A server holding one worker's placement for `hashes`.
-    async fn start(hashes: &[i64], reject: bool) -> Self {
-        let backend = CountingBackend::new(reject);
+    async fn start(hashes: &[i64], behaviour: Behaviour) -> Self {
+        let backend = CountingBackend::new(behaviour);
         backend
             .apply_external_kv_batch(ApplyExternalKvBatchRequest {
                 worker_id: "worker-0".to_string(),
@@ -179,8 +194,8 @@ const HASHES: [i64; 3] = [1, 2, 3];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dead_endpoint_costs_one_failover_not_a_probe_per_query() {
-    let mut first = Server::start(&HASHES, false).await;
-    let second = Server::start(&HASHES, false).await;
+    let mut first = Server::start(&HASHES, Behaviour::Answer).await;
+    let second = Server::start(&HASHES, Behaviour::Answer).await;
     let index = client(&[&first.url, &second.url], Duration::from_secs(2));
 
     // The preferred endpoint is the first configured one.
@@ -204,8 +219,8 @@ async fn a_dead_endpoint_costs_one_failover_not_a_probe_per_query() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_query_is_not_spread_across_the_fleet() {
-    let rejecting = Server::start(&HASHES, true).await;
-    let healthy = Server::start(&HASHES, false).await;
+    let rejecting = Server::start(&HASHES, Behaviour::Reject).await;
+    let healthy = Server::start(&HASHES, Behaviour::Answer).await;
     let index = client(&[&rejecting.url, &healthy.url], Duration::from_secs(2));
 
     let error = index
@@ -225,7 +240,7 @@ async fn a_rejected_query_is_not_spread_across_the_fleet() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_endpoint_down_reports_a_transient_failure_within_the_deadline() {
-    let mut only = Server::start(&HASHES, false).await;
+    let mut only = Server::start(&HASHES, Behaviour::Answer).await;
     let index = client(
         &[&only.url, "http://127.0.0.1:1"],
         Duration::from_millis(500),
@@ -256,8 +271,8 @@ async fn every_endpoint_down_reports_a_transient_failure_within_the_deadline() {
 /// rotation continues rather than pinning to the last survivor forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preference_rotates_back_when_the_current_endpoint_dies() {
-    let mut first = Server::start(&HASHES, false).await;
-    let mut second = Server::start(&HASHES, false).await;
+    let mut first = Server::start(&HASHES, Behaviour::Answer).await;
+    let mut second = Server::start(&HASHES, Behaviour::Answer).await;
     let index = client(&[&first.url, &second.url], Duration::from_secs(2));
 
     index.match_prefix(HASHES.to_vec()).await.expect("query");
@@ -266,10 +281,55 @@ async fn preference_rotates_back_when_the_current_endpoint_dies() {
     assert_eq!(second.backend.queries(), 1);
 
     // Now the survivor goes away and a replacement takes the first slot's place.
-    let replacement = Server::start(&HASHES, false).await;
+    let replacement = Server::start(&HASHES, Behaviour::Answer).await;
     let index = client(&[&replacement.url, &second.url], Duration::from_secs(2));
     second.stop().await;
     let outcome = index.match_prefix(HASHES.to_vec()).await.expect("query");
     assert_eq!(matched(&outcome).len(), 1);
     assert_eq!(replacement.backend.queries(), 1);
+}
+
+/// A preferred endpoint that accepts the connection and never answers must not
+/// be able to spend the whole query deadline: without a per-attempt share the
+/// loop times out on it and breaks with no budget left, so the endpoint list
+/// gives no protection against the most common indexer failure there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_preferred_endpoint_still_fails_over_inside_the_deadline() {
+    let hung = Server::start(&HASHES, Behaviour::Hang).await;
+    let healthy = Server::start(&HASHES, Behaviour::Answer).await;
+    let deadline = Duration::from_millis(600);
+    let index = client(&[&hung.url, &healthy.url], deadline);
+
+    let started = Instant::now();
+    let outcome = index
+        .match_prefix(HASHES.to_vec())
+        .await
+        .expect("the healthy endpoint must answer while the preferred one hangs");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        matched(&outcome)[0].matched_prefix_blocks,
+        HASHES.len() as u32
+    );
+    assert_eq!(
+        (hung.backend.queries(), healthy.backend.queries()),
+        (1, 1),
+        "both endpoints should have been asked exactly once"
+    );
+    assert!(
+        elapsed < deadline * 2,
+        "the query took {elapsed:?}, past the whole-query budget"
+    );
+
+    // And the preference moved, so the next query does not start on the hung one.
+    let started = Instant::now();
+    index
+        .match_prefix(HASHES.to_vec())
+        .await
+        .expect("second query");
+    assert!(
+        started.elapsed() < deadline,
+        "a second query should go straight to the healthy endpoint"
+    );
+    assert_eq!(hung.backend.queries(), 1);
 }
