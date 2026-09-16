@@ -462,10 +462,10 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 # K in blocks of at most 128 and sglang's JIT metadata builder asserts 64.
 def dsv41_index_page_size() -> int:
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-        DEEPGEMM_SPARSE_INDEXER,
+        DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
     )
 
-    if DEEPGEMM_SPARSE_INDEXER:
+    if DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
         return 128
     return 64
 

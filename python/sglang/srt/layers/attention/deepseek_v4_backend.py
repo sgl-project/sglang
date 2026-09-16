@@ -55,14 +55,13 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
     make_candidate_indexer,
-)
-from sglang.srt.layers.attention.dsv4.candidate_torch import (
-    CandidateMasks,
     mask_topk_scores,
     published_masks,
+    select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -75,9 +74,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
-    fp4_paged_mqa_logits,
-    fp32_jit_paged_topk,
-    select_candidate_blocks,
+    deep_gemm_fp4_paged_mqa_logits,
+    topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -3430,7 +3428,7 @@ class DeepseekV4AttnBackend(
         topk = min(indexer.index_topk, width)
         columns = torch.arange(width, device=lens.device)
         for rows, plan in metadata.row_chunks():
-            logits = fp4_paged_mqa_logits(
+            logits = deep_gemm_fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
                 k_cache,
                 weights[rows],
@@ -3539,7 +3537,7 @@ class DeepseekV4AttnBackend(
                 self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
             )
             return
-        logits = fp4_paged_mqa_logits(
+        logits = deep_gemm_fp4_paged_mqa_logits(
             (q_fp4, q_sf),
             k_cache,
             weights,
@@ -3549,7 +3547,7 @@ class DeepseekV4AttnBackend(
             metadata.max_compressed_seq_len,
         )
         # TODO(dark): add bf16 topk
-        fp32_jit_paged_topk(logits, metadata, page_indices, raw_indices)
+        topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.

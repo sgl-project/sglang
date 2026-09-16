@@ -51,31 +51,24 @@ class TestVerifyCandidateGraph(CustomTestCase):
         ):
             self.assertTrue(_resolve_folded_sampling(**args))
 
-    def test_candidate_backend_falls_back_for_unsupported_models(self):
-        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-            make_candidate_indexer,
-        )
-        from sglang.srt.layers.attention.dsv4.candidate_torch import (
-            TorchCandidateIndexer,
-        )
+    def test_candidate_indexer_gating(self):
+        from sglang.srt.layers.attention.dsv4 import candidate_indexer
 
-        with patch(
-            "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_SPARSE_INDEXER",
-            True,
-        ):
-            # The backend also initializes for V4 models without a candidate source.
-            for budget, block in ((0, 0), (2048, 16)):
-                with self.subTest(budget=budget, block=block):
-                    self.assertIsInstance(
-                        make_candidate_indexer(budget, block), TorchCandidateIndexer
-                    )
-        with patch(
-            "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_SPARSE_INDEXER",
-            False,
-        ):
-            self.assertIsInstance(
-                make_candidate_indexer(2048, 8), TorchCandidateIndexer
+        def platform(sm):
+            return patch.object(
+                candidate_indexer, "get_platform", lambda: SimpleNamespace(device_sm=sm)
             )
+
+        flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
+        # V4 models have no candidate source; Hopper selects through masks inline.
+        with platform(100), patch(flag, True):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
+        with platform(90), patch(flag, False):
+            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
+        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
+        with platform(100), patch(flag, False):
+            with self.assertRaises(RuntimeError):
+                candidate_indexer.make_candidate_indexer(2048, 8)
 
     def make_policy(self, width=6):
         return Dsv41CandidateGraphVariants(
