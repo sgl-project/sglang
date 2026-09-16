@@ -137,7 +137,7 @@ def _validate_hicache_backing(server_args: ServerArgs, hf_config) -> None:
     going through its admission, its swap-in, or its eviction bookkeeping -- so
     it would read masked or reused KV rather than fail.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 
     cfg = resolving_view(server_args)
 
@@ -146,6 +146,15 @@ def _validate_hicache_backing(server_args: ServerArgs, hf_config) -> None:
             "--enable-hisparse on the HiCache backing only supports DSA models "
             "(e.g. DeepSeek V3.2, GLM-5). DeepSeek V4 is private-host only: add "
             "--disable-radix-cache."
+        )
+
+    index_kpool = get_dsa_index_kpool(hf_config)
+    if index_kpool > 1:
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support pooled "
+            f"DSA indexers (index_kpool={index_kpool} > 1): pooled-indexer "
+            "backup/restore and sparse swap-in are not fully supported. "
+            "Use a model with index_kpool=1 for this backing."
         )
 
     if cfg.speculative_algorithm is not None:

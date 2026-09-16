@@ -29,6 +29,7 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
 )
@@ -1056,6 +1057,75 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             validate_hisparse_kv_cache_dtype(server_args)
+
+
+class TestHiSparseHiCacheKPoolPolicy(CustomTestCase):
+    @staticmethod
+    def _validate(hf_config, **overrides):
+        options = dict(
+            enable_hisparse=True,
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_back",
+            kv_cache_dtype="bfloat16",
+        )
+        options.update(overrides)
+        with get_context().override_server_args(**options) as server_args:
+            server_args._model_config = SimpleNamespace(hf_config=hf_config)
+            validate_hisparse(server_args)
+
+    def test_hicache_rejects_pooled_indexers(self):
+        """Pooled indexers must not enter HiCache's unsupported sparse-decode path."""
+        for pool_size, compress, dtype in (
+            (2, False, "bfloat16"),
+            (4, True, "bfloat16"),
+            (4, True, "fp8_e4m3"),
+        ):
+            with self.subTest(pool_size=pool_size, compress=compress, dtype=dtype):
+                hf_config = SimpleNamespace(
+                    architectures=["DeepseekV32ForCausalLM"],
+                    index_topk=2048,
+                    index_kpool=pool_size,
+                    index_kpool_compress=compress,
+                )
+                with self.assertRaisesRegex(ValueError, f"index_kpool={pool_size}"):
+                    self._validate(hf_config, kv_cache_dtype=dtype)
+
+    def test_hicache_rejects_nested_glm5_next_pooled_indexer(self):
+        """A KPool value nested under text_config must not bypass the startup guard."""
+        from sglang.srt.configs.glm5_next import Glm5NextConfig
+
+        hf_config = Glm5NextConfig(
+            architectures=["Glm5NextForConditionalGeneration"],
+            text_config={
+                "index_topk": 2048,
+                "index_kpool": 4,
+                "index_kpool_compress": True,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "index_kpool=4"):
+            self._validate(hf_config)
+
+    def test_hicache_preserves_unpooled_indexers(self):
+        for indexer_config in ({}, {"index_kpool": 1}):
+            with self.subTest(indexer_config=indexer_config):
+                self._validate(
+                    SimpleNamespace(
+                        architectures=["DeepseekV32ForCausalLM"],
+                        index_topk=2048,
+                        **indexer_config,
+                    )
+                )
+
+    def test_guard_is_scoped_to_hisparse_hicache_backing(self):
+        hf_config = SimpleNamespace(
+            architectures=["DeepseekV32ForCausalLM"], index_topk=2048, index_kpool=4
+        )
+        for overrides in (
+            {"enable_hisparse": False},
+            {"disable_radix_cache": True, "enable_hierarchical_cache": False},
+        ):
+            with self.subTest(overrides=overrides):
+                self._validate(hf_config, **overrides)
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
