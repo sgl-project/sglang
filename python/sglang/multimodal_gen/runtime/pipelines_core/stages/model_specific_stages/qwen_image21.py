@@ -98,8 +98,8 @@ class QwenImage21EncodingStage(PipelineStage):
             outputs = encoder(
                 **inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1
             )
-            # native Qwen3-VL exposes pre-final-norm intermediate states
-            final_hidden = encoder.model.language_model.norm(outputs.hidden_states[-1])
+            # the checkpoint expects Transformers 4.57's pre-final-norm hidden state
+            final_hidden = outputs.hidden_states[-1]
         valid = inputs.attention_mask[0].bool()
         hidden = final_hidden[0, valid][self.drop_idx :]
         ids = inputs.input_ids[0, valid][self.drop_idx :]
