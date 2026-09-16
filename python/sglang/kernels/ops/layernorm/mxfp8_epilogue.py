@@ -38,11 +38,7 @@ def ue8m0_scale(amax):
 def _mxfp8_epilogue(
     y, row, Q, S, K: tl.constexpr, BLOCK: tl.constexpr, GROUPS: tl.constexpr, g_lo, g_hi
 ):
-    """Quantize one BF16 row tile (already masked to zero past K) into Q/S.
-
-    Only groups in ``[g_lo, g_hi)`` are stored, so the row can be split across
-    CTAs that each recompute the shared statistic and write their own slice.
-    """
+    # Stores only groups in [g_lo, g_hi) so a row can be split across CTAs.
     GP: tl.constexpr = BLOCK // 32
     g = tl.arange(0, GP)
     gmask = (g < GROUPS) & (g >= g_lo) & (g < g_hi)

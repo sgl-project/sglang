@@ -1,6 +1,6 @@
 """Decode-batch bf16 GEMM for x[m, 512] @ w[128, 512].T.
 
-Shares dot_product's reduction order with tiny_gemm_bf16 for bitwise parity;
+Shares dot_product_vec's reduction order with tiny_gemm_bf16 for bitwise parity;
 a row's result does not depend on the batch composition.
 """
 

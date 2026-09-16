@@ -97,9 +97,8 @@ def candidate_block_logits(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Keep torch.topk's block selection, including its tie behavior.
 
-    A source masks the unread tail while reducing each block. A consumer masks
-    visibility and the published candidates in one pass, without copying the
-    capacity-sized logits before each masked_fill.
+    Without ``published`` (a source) mask the unread tail while scoring blocks;
+    with it (a consumer) apply visibility and the published mask in one pass.
     """
     rows, width = logits.shape
     output = torch.empty((rows, width), dtype=torch.float32, device=logits.device)

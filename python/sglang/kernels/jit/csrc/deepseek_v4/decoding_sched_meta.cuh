@@ -15,19 +15,9 @@
 // critical path, and it cannot be hoisted out because the schedule depends on
 // the per-request `topk_length` of the step being replayed.
 //
-// This kernel produces the same output with two changes to the walk:
-//
-//   * the request being consumed changes only `batch_size` times over the whole
-//     walk, so its three values live in registers and are reloaded on that event
-//     rather than re-read from shared memory once per partition;
-//   * the walk stops as soon as the last request is consumed.  Every partition
-//     after that one describes an empty range, all of them identical, and the
-//     whole block fills them in parallel.
-//
-// The shared-memory layout matches FlashMLA's exactly.  It has to: when the
-// walk finishes early it reads `first_block_idx_shared[batch_size]`, one past
-// the end, which lands on `last_block_idx_shared[0]` -- those entries belong to
-// parts with no work, but the bytes still have to agree.
+// This kernel produces the same output bit for bit; the shared-memory layout
+// matches FlashMLA's exactly because the idle-tail fill below reads one entry
+// past `first_block_idx_shared`, as FlashMLA does.
 
 namespace sglang {
 

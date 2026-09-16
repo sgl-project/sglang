@@ -1,14 +1,9 @@
 /// \file n128k512.cuh
 /// \brief Small bf16 GEMM specialised for N = 128, K = 512: `out[m, n] = sum_k a[m, k] * b[n, k]`.
 ///
-/// One warp owns one output column n and keeps that whole 1 KB weight row in
-/// registers (32 lanes x 32 bytes); it is prefetched before the PDL wait so the
-/// load overlaps the tail of the previous kernel. Rows of `a` are handled in
-/// groups of `M_SPLIT` (at most 8) per warp along `blockIdx.y`; the batch size is
-/// read from the params at run time, so eight compiled kernels serve every M.
-/// The reduction is a per-lane in-order fma over 16 elements followed by a warp
-/// butterfly, the same as `tiny_n_gemm_kernel`: results are row-invariant across
-/// M and bitwise equal to tiny_gemm where both apply.
+/// The lane-to-K mapping and reduction order are those of `tiny_n_gemm_kernel`,
+/// so results are row-invariant across M and bitwise equal to tiny_gemm where
+/// both apply.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
