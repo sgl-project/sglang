@@ -1110,7 +1110,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         lora_ranks = batch_info.lora_ranks
         max_lora_rank = self.down_lora_a_weights.shape[2]
-        cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+        cg_buffers = (
+            self.lora_backend.prefill_moe_cg_buffers
+            if batch_info is self.lora_backend.prefill_cuda_graph_batch_info
+            else getattr(self.lora_backend, "moe_cg_buffers", None)
+        )
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
 
