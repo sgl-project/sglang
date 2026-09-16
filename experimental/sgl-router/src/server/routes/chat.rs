@@ -229,6 +229,9 @@ pub async fn chat_completions(
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
+                // The indexer's wire contract carries neither the storage
+                // tier nor reverse-index presence.
+                tree_view: None,
             })
         }
         _ => ctx
