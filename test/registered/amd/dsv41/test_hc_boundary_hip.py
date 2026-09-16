@@ -367,14 +367,18 @@ class TestHcCompensatedPrefill(CustomTestCase):
 
         layer, scale, base = self._layer()
         layer.hc_attn_fn.add_(0.125)
-        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        with envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.override(True):
+            DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         torch.testing.assert_close(
             layer._hc_attn_bf16_parts[0], layer.hc_attn_fn.bfloat16(), atol=0, rtol=0
         )
         residual = torch.randn(4096, HC, H, device="cuda", dtype=torch.bfloat16)
-        with patch(
-            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
-            return_value=True,
+        with (
+            envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.override(True),
+            patch(
+                "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                return_value=True,
+            ),
         ):
             _, _, coeff = hc_boundary(
                 layer, None, residual, None, None, None, layer.hc_attn_fn, scale, base

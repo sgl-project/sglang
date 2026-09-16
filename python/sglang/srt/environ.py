@@ -933,8 +933,8 @@ class Envs:
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     # gfx950 mHC: the boundary reduce + sinkhorn rides in the layer's next RMSNorm launch (0: alone)
     SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM = EnvBool(True)
-    # gfx950 large prefill: compensated BF16 mHC projection after post-mix/collapse.
-    SGLANG_OPT_HIP_MHC_BF16X3_PREFILL = EnvBool(True)
+    # Opt-in: faster mHC projection can regress full-model decode throughput.
+    SGLANG_OPT_HIP_MHC_BF16X3_PREFILL = EnvBool(False)
     # gfx950 standalone mHC post: wider blocks for medium prefill batches.
     SGLANG_OPT_HIP_MHC_POST_SPLIT_H = EnvBool(True)
     # gfx950 TP4 BF16 WO-A: GEMV/tiny split-K and direct output for large verify batches.
