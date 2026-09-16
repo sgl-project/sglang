@@ -2,8 +2,7 @@
 
 ``Mxfp4MoEMethod.apply`` (SM100 branch, via the unified MoeRunner) must feed
 ``trtllm_fp4_block_scale_moe`` the same args a direct kernel call does, so the
-two outputs stay bit-exact. ``Mxfp4FlashinferTrtllmMoEMethod`` must pad a TP
-shard whose intermediate size is not 128-aligned before the kernel sees it.
+two outputs stay bit-exact.
 
 Fixtures are raw checkpoint-order MXFP4, converted by the production
 ``process_weights_after_loading`` so the kernel sees the interleaved weights and
@@ -371,7 +370,6 @@ def _tp_shard(fixtures, rank, tp_size):
     inter = w13.shape[1] // 2
     per_rank = inter // tp_size
     start, end = rank * per_rank, (rank + 1) * per_rank
-    # w13 stacks the gate rows above the up rows; a shard takes its slice of each.
     rows = torch.cat(
         (torch.arange(start, end), torch.arange(inter + start, inter + end))
     ).to(w13.device)

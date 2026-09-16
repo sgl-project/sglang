@@ -165,8 +165,6 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
 
 
 class _FakeAutoTuner:
-    """flashinfer's AutoTuner reduced to its file-loaded tactic table."""
-
     instance = None
 
     def __init__(self):
@@ -189,8 +187,7 @@ class _FakeAutoTuner:
 
 @contextlib.contextmanager
 def _fake_autotune(tune_mode=True, cache=None, skip_ops=None):
-    # flashinfer's documented contract: a cache path clears the loaded table on
-    # entry, loads the file, and saves the table back on exit.
+    # flashinfer's autotune(cache=...) clears the loaded table on entry, saves on exit.
     tuner = _FakeAutoTuner.get()
     if cache is not None:
         tuner.file_configs.clear()

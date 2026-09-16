@@ -53,8 +53,7 @@ def _pad_intermediate_size(layer: Module) -> None:
     if padded_size == intermediate_size:
         return
 
-    # Pad after TP loading so checkpoint shard offsets retain the original width.
-    # Gate and up occupy separate halves and must each get their own zero tail.
+    # Gate and up occupy separate halves; each needs its own zero tail.
     for name, fill_value in (
         ("w13_weight", 0),
         ("w13_weight_scale_inv", 1),
