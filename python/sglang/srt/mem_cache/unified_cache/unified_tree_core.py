@@ -524,7 +524,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, hooks: Optional[HiSparseEvictionHooks]
     ) -> None:
         """Let HiSparse follow this tree's device evictions; see
-        `HiSparseEvictionHooks` for what the two callbacks owe each other."""
+        `HiSparseEvictionHooks` for the callback contracts."""
         self.hisparse_eviction_hooks = hooks
 
     def _notify_hisparse_device_released(self, node: UnifiedTreeNode) -> None:
@@ -1427,6 +1427,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(child)
         # Only the new fragment needs qualifying; the child keeps its id.
         self._update_duplicate_tracking(new_node)
+        if self.hisparse_eviction_hooks is not None:
+            self.hisparse_eviction_hooks.on_node_split(new_node, child)
         return new_node, action
 
     def _add_new_node(

@@ -24,16 +24,23 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.hisparse_coordinator import (  # noqa: E402
     PrivateHostHiSparseCoordinator,
 )
+from sglang.srt.managers.hisparse_hicache_admission import AdmissionLedger  # noqa: E402
 from sglang.srt.managers.hisparse_hicache_coordinator import (  # noqa: E402
     HiCacheHiSparseCoordinator,
+    _AdmittedNodes,
     _ExpandedIndexerPages,
     _PendingAdmission,
 )
 from sglang.srt.managers.hisparse_protocol import HiSparseCoordinator  # noqa: E402
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator  # noqa: E402
+from sglang.srt.mem_cache.allocator.paged import (  # noqa: E402
+    PagedTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
+from sglang.srt.mem_cache.radix_cache import RadixKey  # noqa: E402
 from sglang.srt.mem_cache.sparsity import (  # noqa: E402
     HiSparseBacking,
     create_hisparse_coordinator,
@@ -43,6 +50,16 @@ from sglang.srt.mem_cache.sparsity import (  # noqa: E402
     hisparse_indexer_top_k,
     resolve_hisparse_backing,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: E402
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.full import (  # noqa: E402
+    FullComponent,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: E402
+    UnifiedTreeCore,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 
@@ -317,6 +334,232 @@ class TestHiCacheDeferredAdmission(CustomTestCase):
         coordinator.admit_pending()
         self.assertEqual(pending.attempts, 1)
         self.assertIn(1, coordinator._pending_admission)
+
+
+class TestHiCacheSplitHostLocks(CustomTestCase):
+    PAGE_SIZE = 64
+    PREFIX_LEN = 192
+    NUM_INDEXER_PAGES = 16
+
+    def setUp(self):
+        self.allocator = PagedTokenToKVPoolAllocator(
+            size=1024,
+            page_size=self.PAGE_SIZE,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=self.allocator,
+            page_size=self.PAGE_SIZE,
+        )
+        self.cache = object.__new__(UnifiedRadixCache)
+        self.cache.disable = False
+        self.cache.enable_session_radix_cache = False
+        self.core = UnifiedTreeCore(
+            params=params,
+            components={ComponentType.FULL: FullComponent(self.cache, params)},
+        )
+        self.core.enable_hicache = True
+        self.core.is_write_back = True
+        self.cache.tree_core = self.core
+        self.node = self._add_node(key_start=0)
+        self.host_rows = torch.arange(self.PREFIX_LEN, dtype=torch.int64)
+
+    def _add_node(self, *, key_start):
+        return self.core._add_new_node(
+            parent=self.core.root_node,
+            key=RadixKey(list(range(key_start, key_start + self.PREFIX_LEN))),
+            value=self.allocator.alloc(self.PREFIX_LEN),
+        )
+
+    def _coordinator(self, *, request_count=2, matched_node=None):
+        matched_node = self.node if matched_node is None else matched_node
+        coord = object.__new__(HiCacheHiSparseCoordinator)
+        coord.device = "cpu"
+        coord.page_size = self.PAGE_SIZE
+        coord.layer_num = 1
+        coord.device_buffer_size = self.PAGE_SIZE
+        coord.token_to_kv_pool_allocator = self.allocator
+        device_rows = matched_node.component_data[ComponentType.FULL].value
+        coord.req_to_token_pool = SimpleNamespace(
+            req_to_token=device_rows.int().repeat(request_count, 1)
+        )
+        coord.req_to_host_pool = torch.full_like(
+            coord.req_to_token_pool.req_to_token, -1
+        )
+        coord.req_device_buffer_locs = torch.stack(
+            [self.allocator.alloc(self.PAGE_SIZE).int() for _ in range(request_count)]
+        )
+        coord.req_device_buffer_tokens = torch.full(
+            (1, request_count, self.PAGE_SIZE), -1, dtype=torch.int32
+        )
+        coord._lru_init = torch.arange(self.PAGE_SIZE, dtype=torch.int16)
+        coord.lru_slots = coord._lru_init.repeat(1, request_count, 1)
+        coord._indexer_page_offset = 17
+        coord._indexer_pages = _ExpandedIndexerPages(
+            num_pages=self.NUM_INDEXER_PAGES, device="cpu"
+        )
+        coord.req_to_indexer_page = torch.stack(
+            [
+                coord._indexer_pages.alloc(self.PREFIX_LEN // self.PAGE_SIZE)
+                + coord._indexer_page_offset
+                for _ in range(request_count)
+            ]
+        )
+        coord.decode_producer_stream = None
+        coord._eviction_queue = []
+        coord._pending_admission = {}
+        coord._announced_first_eviction = True
+        coord.ledger = AdmissionLedger(
+            device_pool_tokens=1024,
+            temp_slot_tokens=self.PAGE_SIZE,
+            page_size=self.PAGE_SIZE,
+            chunk_tokens=self.PAGE_SIZE,
+        )
+        coord._req_nodes = {}
+        for slot in range(request_count):
+            coord.ledger.claim_node(matched_node)
+            coord.ledger.activate(
+                slot, self.PREFIX_LEN, rid=str(slot), decode_reserve=0
+            )
+            coord._req_nodes[slot] = _AdmittedNodes(matched=(matched_node,))
+        coord.item_size_bytes = 16
+        coord._host_binding = torch.zeros((1, 2), dtype=torch.int64)
+        self.cache.cache_controller = SimpleNamespace(
+            mem_pool_host=SimpleNamespace(
+                size=1024,
+                data_refs=[torch.zeros((1024, 16), dtype=torch.uint8)],
+                token_stride_size=16,
+            )
+        )
+        coord.set_tree_cache(self.cache)
+        return coord
+
+    def _demote(self):
+        self.core.commit_backup(
+            node_id=self.node.id, host_indices=self.host_rows, comp_xfers={}
+        )
+        result = self.core.demote(self.node.id)
+        for indices in result.device_frees[ComponentType.FULL]:
+            self.allocator.free(indices)
+        result.device_frees.clear()
+        result.host_frees.clear()
+
+    def _split_and_restore_prefix(self):
+        parent, _ = self.core._split_node(
+            key=self.node.key, child=self.node, split_len=2 * self.PAGE_SIZE
+        )
+        ancestor, _ = self.core._split_node(
+            key=parent.key, child=parent, split_len=self.PAGE_SIZE
+        )
+        for node in (ancestor, parent):
+            if node.component_data[ComponentType.FULL].value is None:
+                self.core._unevict_node_on_insert(
+                    node, self.allocator.alloc(self.PAGE_SIZE)
+                )
+        self.core.inc_lock_ref(parent.id)
+        return ancestor, parent, self.node
+
+    def _reclaim_host(self):
+        with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+            result = self.core.drive_host_eviction(ComponentType.FULL, self.PREFIX_LEN)
+        chunks = result.host_frees[ComponentType.FULL]
+        freed = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.int64)
+        result.device_frees.clear()
+        result.host_frees.clear()
+        return freed
+
+    def _finish(self, coord, slot):
+        coord.request_finished(
+            SimpleNamespace(rid=str(slot), kv=SimpleNamespace(req_pool_idx=slot))
+        )
+
+    def _assert_shared_ownership_and_release(self, coord, fragments):
+        self.assertEqual(self._reclaim_host().numel(), 0)
+        self.assertEqual(coord.ledger._claimed_tokens, self.PREFIX_LEN)
+        self.assertEqual(coord.ledger._host_locked_tokens, self.PREFIX_LEN)
+        self.assertTrue(
+            all(
+                n.component_data[ComponentType.FULL].host_lock_ref == 2
+                for n in fragments
+            )
+        )
+        free_before = self.allocator.available_size()
+        self._finish(coord, 0)
+        self.assertEqual(self._reclaim_host().numel(), 0)
+        self.assertTrue(
+            all(
+                n.component_data[ComponentType.FULL].host_lock_ref == 1
+                for n in fragments
+            )
+        )
+        self._finish(coord, 1)
+        self.assertEqual(coord.ledger._claimed_tokens, 0)
+        self.assertEqual(coord.ledger._host_locked_tokens, 0)
+        self.assertFalse(coord.ledger._node_claims)
+        self.assertEqual(coord._indexer_pages.available(), self.NUM_INDEXER_PAGES)
+        self.assertEqual(
+            self.allocator.available_size(), free_before + 2 * self.PAGE_SIZE
+        )
+        self.assertTrue(torch.equal(self._reclaim_host().sort().values, self.host_rows))
+
+    def test_shared_host_rows_survive_repeated_split_until_last_request_finishes(self):
+        """Reloading split prefix fragments must not reclaim host rows still read
+        by either active request; finishing both requests must release every lock."""
+        coord = self._coordinator()
+        self._demote()
+        coord._sync_evictions()
+        fragments = self._split_and_restore_prefix()
+        self._assert_shared_ownership_and_release(coord, fragments)
+
+    def test_pending_eviction_pins_split_fragments_until_request_locks_take_over(self):
+        """A split between eviction callback and application must retain its
+        temporary host locks, then hand all fragments to the affected requests."""
+        coord = self._coordinator()
+        self._demote()
+        fragments = self._split_and_restore_prefix()
+        self.assertEqual(self._reclaim_host().numel(), 0)
+        coord._sync_evictions()
+        self.assertTrue(torch.equal(coord.req_to_host_pool[0], self.host_rows.int()))
+        self._assert_shared_ownership_and_release(coord, fragments)
+
+    def test_unmatched_eviction_releases_all_temporary_split_locks(self):
+        """An unrelated eviction must leave no fragment pinned after attribution
+        finds no active request referencing its rows."""
+        coord = self._coordinator(
+            request_count=1, matched_node=self._add_node(key_start=1000)
+        )
+        self._demote()
+        fragments = self._split_and_restore_prefix()
+        coord._sync_evictions()
+        self.assertTrue(
+            all(
+                n.component_data[ComponentType.FULL].host_lock_ref == 0
+                for n in fragments
+            )
+        )
+        self.assertTrue(torch.equal(self._reclaim_host().sort().values, self.host_rows))
+        self.assertFalse(coord._req_nodes[0].host_locks)
+        self.assertEqual(coord.ledger._host_locked_tokens, 0)
+        self._finish(coord, 0)
+        self.assertEqual(coord.ledger._claimed_tokens, 0)
+
+    def test_device_only_split_preserves_shared_prefix_accounting(self):
+        """Splitting a claimed device prefix must not bill it a second time when
+        another request claims the new parent before any host backup exists."""
+        coord = self._coordinator()
+        ancestor, _, _ = self._split_and_restore_prefix()
+        coord.ledger.claim_node(ancestor)
+        self.assertEqual(coord.ledger._claimed_tokens, self.PREFIX_LEN)
+        coord.ledger.release_node(ancestor)
+        for slot in range(2):
+            self._finish(coord, slot)
+        self.assertFalse(coord.ledger._node_claims)
+        self.assertEqual(coord.ledger._claimed_tokens, 0)
 
 
 class TestBackingsImplementTheProtocol(CustomTestCase):

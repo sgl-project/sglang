@@ -87,16 +87,13 @@ class _EvictionEvent(msgspec.Struct):
     invariant violation for any position backing an active request, reported as
     one.
 
-    The node is held under one temporary host lock until the event is applied.
-    `lock_params` replays the acquire-time skip set at release: components without
-    a host_value (MAMBA) skipped the increment, so the decrement must skip them
-    too or their host_lock_ref underflows.
+    `locked_nodes` holds a temporary acquire receipt for every fragment of the
+    evicted node, including parents created by splits before the event is applied.
     """
 
     sorted_dev: torch.Tensor
     sorted_host: Optional[torch.Tensor]
-    node: object
-    lock_params: object
+    locked_nodes: list
 
 
 class _PendingAdmission(msgspec.Struct):
@@ -151,8 +148,8 @@ class HiCacheHiSparseCoordinator:
     """`HiSparseCoordinator` over the radix tree plus the HiCache host tier.
 
     Implements `managers/hisparse_protocol.py`. The entry points below the
-    protocol (`on_node_evicted`, `node_backs_active_request`) are the tree cache's
-    hooks; it reaches them through the concrete class after checking `backing`.
+    protocol (`on_node_evicted`, `node_backs_active_request`, `on_node_split`) are
+    the tree cache's hooks, installed when the cache is attached.
     """
 
     backing = HiSparseBacking.HICACHE
@@ -363,6 +360,7 @@ class HiCacheHiSparseCoordinator:
             HiSparseEvictionHooks(
                 on_device_released=self.on_node_evicted,
                 backs_live_request=self.node_backs_active_request,
+                on_node_split=self.on_node_split,
             )
         )
         host_pool = tree_cache.cache_controller.mem_pool_host
@@ -888,19 +886,43 @@ class HiCacheHiSparseCoordinator:
         # requests whose rows actually hold these indices get their own lock, then
         # this one is dropped -- so an unrelated churn node is never pinned for the
         # lifetime of a long decode.
-        locked_node = None
-        lock_params = None
+        locked_nodes = []
         if sorted_host is not None:
             lock_params = self.tree_cache.inc_host_lock_ref(node.id).to_dec_params()
-            locked_node = node
+            locked_nodes.append((node, lock_params))
         self._eviction_queue.append(
             _EvictionEvent(
                 sorted_dev=sorted_dev,
                 sorted_host=sorted_host,
-                node=locked_node,
-                lock_params=lock_params,
+                locked_nodes=locked_nodes,
             )
         )
+
+    def on_node_split(self, new_parent, child) -> None:
+        self.ledger.split_node_claim(new_parent=new_parent, child=child)
+        for nodes in self._req_nodes.values():
+            if any(node.id == child.id for node in nodes.matched):
+                nodes.matched = nodes.matched + (new_parent,)
+
+        if new_parent.component_data[ComponentType.FULL].host_value is None:
+            return
+
+        # Each child acquire needs a separate parent receipt for request teardown.
+        for nodes in self._req_nodes.values():
+            for node, _ in tuple(nodes.host_locks):
+                if node.id == child.id:
+                    params = self.tree_cache.inc_host_lock_ref(
+                        new_parent.id
+                    ).to_dec_params()
+                    nodes.host_locks.append((new_parent, params))
+
+        # Pending events own locks too, before attribution hands them to requests.
+        for event in self._eviction_queue:
+            if any(node.id == child.id for node, _ in event.locked_nodes):
+                params = self.tree_cache.inc_host_lock_ref(
+                    new_parent.id
+                ).to_dec_params()
+                event.locked_nodes.append((new_parent, params))
 
     def node_backs_active_request(self, node) -> bool:
         """Tree-cache hook: whether dropping this node would mask live positions.
@@ -972,15 +994,15 @@ class HiCacheHiSparseCoordinator:
                 else:
                     dropped.append((req_pool_idx, match.sum()))
                 row.masked_fill_(match, -1)
-                if event.node is not None:
+                if event.locked_nodes:
                     attributions.append((event_idx, req_pool_idx))
                     hit_counts.append(match.sum())
 
         self._report_dropped_without_host(dropped)
         self._attribute_host_locks(attributions, hit_counts)
         for event in self._eviction_queue:
-            if event.node is not None:
-                self.tree_cache.dec_host_lock_ref(event.node.id, event.lock_params)
+            for node, params in event.locked_nodes:
+                self.tree_cache.dec_host_lock_ref(node.id, params)
         self._eviction_queue.clear()
 
     @staticmethod
@@ -1032,10 +1054,10 @@ class HiCacheHiSparseCoordinator:
                     req_pool_idx,
                 )
             self.ledger.note_evicted_positions(req_pool_idx, hits)
-            node = self._eviction_queue[event_idx].node
-            dec_params = self.tree_cache.inc_host_lock_ref(node.id).to_dec_params()
-            self._req_nodes[req_pool_idx].host_locks.append((node, dec_params))
-            self.ledger.claim_node(node, host_locked=True)
+            for node, _ in self._eviction_queue[event_idx].locked_nodes:
+                dec_params = self.tree_cache.inc_host_lock_ref(node.id).to_dec_params()
+                self._req_nodes[req_pool_idx].host_locks.append((node, dec_params))
+                self.ledger.claim_node(node, host_locked=True)
 
     # ------------------------------------------------------------------
     # Tree locking

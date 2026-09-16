@@ -45,11 +45,8 @@ class HiSparseEvictionHooks(NamedTuple):
     nothing in `mem_cache` gains a runtime dependency on `managers`.
 
     The HiCache HiSparse backing lets the tree evict the attention KV of a request
-    that is still decoding, which no other feature does. Two things therefore have
-    to cross from the tree to the coordinator, and they are two callables rather
-    than a coordinator reference so the tree can only do these two. Registered as
-    one value so the pair cannot be half-installed: with the veto missing, a
-    copy-less drop would strand a live request's positions silently.
+    that is still decoding. Register eviction, drop-veto and split callbacks as
+    one value: losing a host copy or its lock would strand live request positions.
 
     `on_device_released` gets the node whose device KV is about to be freed, while
     `component_data[FULL].value` still holds its device indices and `.host_value`
@@ -58,11 +55,14 @@ class HiSparseEvictionHooks(NamedTuple):
     in flight. `backs_live_request` answers whether a node's device KV is part of a
     live HiSparse request's prefix.
 
-    The private-host backing registers neither: its staging owns the only copy.
+    `on_node_split` runs after the component data and tree links have been split;
+    it must transfer lock ownership to the new parent before its host rows can
+    be reclaimed. The private-host backing registers no tree callbacks.
     """
 
     on_device_released: Callable[[UnifiedTreeNode], None]
     backs_live_request: Callable[[UnifiedTreeNode], bool]
+    on_node_split: Callable[[UnifiedTreeNode, UnifiedTreeNode], None]
 
 
 class HiSparseCoordinator(Protocol):

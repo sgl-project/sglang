@@ -253,6 +253,20 @@ class AdmissionLedger:
             if claim.host_locked:
                 self._host_locked_tokens -= claim.tokens
 
+    def split_node_claim(self, *, new_parent, child) -> None:
+        """Split every claim across both fragments without changing total charges."""
+        claim = self._node_claims.get(child.id)
+        if claim is None:
+            return
+        parent_tokens = self._node_token_len(new_parent)
+        child_tokens = self._node_token_len(child)
+        assert claim.tokens == parent_tokens + child_tokens
+        assert new_parent.id not in self._node_claims
+        self._node_claims[new_parent.id] = _NodeClaim(
+            refs=claim.refs, tokens=parent_tokens, host_locked=claim.host_locked
+        )
+        claim.tokens = child_tokens
+
     # ---- in-flight claims ---------------------------------------------
 
     def note_pending(self, rid: str, tokens: int) -> None:
