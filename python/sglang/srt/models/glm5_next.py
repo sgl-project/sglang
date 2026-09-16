@@ -117,6 +117,63 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
+#: How many missing names to name in the log line before summarising the rest.
+#: Enough to identify which modules were skipped without printing hundreds of
+#: lines when a whole tower is missing.
+_UNLOADED_REPORT_LIMIT = 12
+
+
+def report_unloaded_params(
+    param_names: Iterable[str],
+    loaded_params: Iterable[str],
+    *,
+    model_label: str = "Glm5Next",
+) -> List[str]:
+    """Warn about parameters ``load_weights`` never populated.
+
+    ``load_weights`` skips any checkpoint tensor whose rewritten name misses
+    ``params_dict``, which is the right behaviour for a tensor this model does
+    not own but indistinguishable from a checkpoint whose names this loader was
+    not written against. In the latter case the module keeps its initialised
+    values and the server starts on a partly-random model: it logs that it is
+    ready, answers ``/health`` with 200, and generates noise.
+
+    That happened on GLM-5.3-Flash checkpoints written by ``save_pretrained``
+    (sgl-project/sglang#38618): 524 of 1609 tensors -- 304.4B parameters, 97% of
+    a 628 GB file -- were dropped with no warning, no traceback and no non-zero
+    exit. The only tell was a load time of 3.85 s where a complete load takes
+    139.84 s, which nobody is watching.
+
+    Returned as well as logged so a caller or a test can assert on it.
+
+    Args:
+        param_names: Every parameter the model declares, i.e.
+            ``params_dict.keys()`` as captured before the load.
+        loaded_params: The names ``load_weights`` actually wrote.
+        model_label: Name to print, so a nextn or encoder-only pass is
+            distinguishable in a log.
+
+    Returns:
+        The sorted missing names, empty when the load was complete.
+    """
+    missing = sorted(set(param_names) - set(loaded_params))
+    if not missing:
+        return []
+    shown = ", ".join(missing[:_UNLOADED_REPORT_LIMIT])
+    if len(missing) > _UNLOADED_REPORT_LIMIT:
+        shown += f", ... (+{len(missing) - _UNLOADED_REPORT_LIMIT} more)"
+    logger.warning(
+        "%s: %d of %d parameters were not initialized from the checkpoint and "
+        "keep their initial values; the model will run but its output is not "
+        "meaningful. This usually means the checkpoint uses tensor names this "
+        "loader does not expect. Missing: %s",
+        model_label,
+        len(missing),
+        len(set(param_names)),
+        shown,
+    )
+    return missing
+
 
 # transformers renames GLM-5.3-Flash tensors while loading the released
 # checkpoint (`conversion_mapping.py`, entry "glm5_next") and never reverses
@@ -1532,6 +1589,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         params_dict = dict(self.named_parameters())
         weight_names = []
+        # Names actually written below, to be diffed against params_dict once
+        # the load finishes. weight_names above records the CHECKPOINT side and
+        # so cannot answer "did every parameter get a value".
+        loaded_params: set[str] = set()
         for name, loaded_weight in convert_hf_native_weights(weights):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
@@ -1613,6 +1674,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 is_expert_weight = False
@@ -1633,6 +1695,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    loaded_params.add(name)
                     break
                 else:
                     if is_expert_weight:
@@ -1679,6 +1742,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 weight_loader(param, fused_weight)
+                                # The fused parameter is what params_dict
+                                # holds; q_a_proj / kv_a_proj_with_mqa are
+                                # only the checkpoint's halves of it.
+                                loaded_params.add(target)
                             cached_a_proj.pop(q_a_proj_name, None)
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
@@ -1694,6 +1761,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+
+        # Only a full load can be checked for completeness. A nextn pass reads
+        # the speculative layers alone, and encoder_only / language_only skip a
+        # whole tower on purpose, so in those modes most of params_dict is
+        # legitimately untouched.
+        is_partial_load = (
+            is_nextn
+            or getattr(self, "encoder_only", False)
+            or getattr(self, "language_only", False)
+        )
+        if not is_partial_load:
+            report_unloaded_params(params_dict.keys(), loaded_params)
 
         if getattr(self, "encoder_only", False):
             run_post = False
