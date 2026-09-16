@@ -1534,6 +1534,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        # Read once per forward, BEFORE the decoder-layer loop, so unlike
+        # short_conv_layer_cache it has no per-layer barrier of its own. The
+        # host tier restores side state on the first Mamba layer's transfer, so
+        # wait for that layer before reading the history.
+        if (
+            self.layer_transfer_counter is not None
+            and self.layer_transfer_counter.consumer_index >= 0
+            and self.mamba_map
+        ):
+            first_mamba_layer = min(self.mamba_map)
+            self.layer_transfer_counter.wait_until(first_mamba_layer - self.start_layer)
         return self.ngram_pool.get_context(ngram_indices)
 
     def set_ngram_context(
