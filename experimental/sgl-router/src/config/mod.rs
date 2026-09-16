@@ -11,6 +11,9 @@ use anyhow::{anyhow, ensure, Result};
 pub const K8S_DEFAULT_GRACE_SECS: u64 = 30;
 
 /// Maximum shutdown pause; deployments must also allow time to drain in-flight requests.
+/// This is the hard typo gate (an extra digit, seconds confused with milliseconds);
+/// whether a legal drain fits a particular grace period is [`shutdown_drain_advisory`]'s
+/// job, because the operator can raise the budget.
 pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 1800;
 
 /// A shutdown pause that exhausts the declared or assumed pod grace period.
@@ -47,7 +50,10 @@ impl Config {
         self.model.sampling_overrides.validate()?;
         ensure!(
             self.server.shutdown_drain_secs <= MAX_SHUTDOWN_DRAIN_SECS,
-            "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {})",
+            "shutdown_drain_secs must be at most {MAX_SHUTDOWN_DRAIN_SECS} (got {}); \
+             past the ceiling a value is a typo rather than a drain. A long but \
+             deliberate drain is fine — declare --termination-grace-secs so startup \
+             can check it against the pod's real budget",
             self.server.shutdown_drain_secs,
         );
         match &self.discovery {
@@ -190,7 +196,8 @@ fn validate_bucket_config(bucket_config: &BucketConfig) -> Result<()> {
     }
     ensure!(
         has_prefill_bucket,
-        "bucket_config must contain at least one Prefill bucket"
+        "bucket_config must contain at least one Prefill bucket; enabling Bucket \
+         routing otherwise leaves every request without a Prefill domain"
     );
     Ok(())
 }
@@ -487,6 +494,9 @@ mod tests {
         assert!(shutdown_drain_advisory(0, None).is_none());
     }
 
+    /// Pinned because this is the one case an operator meets without choosing it:
+    /// an edit to either constant that silenced the warning would change the default
+    /// deployment's behaviour, and should have to say so here.
     #[test]
     fn the_default_drain_warns_until_the_grace_period_is_raised() {
         let advisory = shutdown_drain_advisory(default_shutdown_drain_secs(), None)

@@ -450,12 +450,18 @@ pub struct AffinityConfig {
     pub cache_candidate_max_workers: usize,
     pub cache_switch_margin_tokens: u64,
     /// Waiting-request limit for cache affinity; `None` disables.
-    /// Uses engine queue counts, not router in-flight counts, and fails open without fresh data.
+    /// Gates on the engine-published *waiting* count rather than total depth because
+    /// waiting is the question the request cares about — will it sit behind other work —
+    /// while depth proxies it badly (an engine can queue far below its running cap on
+    /// long-prompt traffic). Fails open without a fresh sample: the router-side
+    /// in-flight counter cannot separate running from waiting requests.
     /// Counts sum across DP ranks, so scale the limit with `dp_size`.
     pub worker_queue_limit: Option<u64>,
     /// Keep the least-pressured prefix owner when the queue gate rejects all admitted
     /// cache candidates and no fresh fleet queue is below this floor. Unknown queues
-    /// do not count as idle. Requires `floor <= worker_queue_limit`; scale with `dp_size`.
+    /// do not count as idle — the opposite of the gate's fail-open, deliberately: the
+    /// pin asks whether a provably better destination exists, and an unknown queue is
+    /// not proof. Requires `floor <= worker_queue_limit`; scale with `dp_size`.
     pub saturation_queue_floor: Option<u64>,
 }
 

@@ -3,6 +3,12 @@
 
 //! Fleet sampling defaults and constraints. Custom JSON visitors preserve duplicate
 //! keys so validation can reject them and report the offending parameter.
+//!
+//! The flag is read once, at startup, on a router that crash-loops if it is wrong,
+//! so the message an operator reads out of `kubectl logs` is the whole debugging
+//! session: every rejection names the offending key, the value it saw, and the
+//! domain it violated. (A `serde_json::Map` would keep only the last of a repeated
+//! key and silently enforce a value the operator did not write.)
 
 use anyhow::{anyhow, ensure, Result};
 use std::collections::BTreeMap;
@@ -243,7 +249,10 @@ fn parse_band(
 }
 
 /// Validate before normalization so diagnostics retain the configured number.
-/// Domains follow the OpenAI contract plus engine-specific parameters.
+/// Domains follow the OpenAI contract plus engine-specific parameters — deliberately
+/// NARROWER than what the engine accepts: these values are injected into request
+/// bodies, and a fleet contract outside the range every OpenAI client library
+/// validates against is far more likely a typo than an intent.
 fn checked_value(field: SamplingField, n: &serde_json::Number) -> Result<f64> {
     let name = field.wire_name();
     // Handle conversion failure even if serde_json arbitrary precision is enabled later.

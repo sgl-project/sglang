@@ -546,13 +546,11 @@ impl CacheArgs {
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
-            ensure!(
-                policy != PolicyKind::CacheAware,
-                "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
-            );
-            return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware"
-            ));
+            return Err(if policy == PolicyKind::CacheAware {
+                anyhow!("--kv-indexer-endpoint requires --cache-prefix-provider indexer")
+            } else {
+                anyhow!("--kv-indexer-endpoint requires --policy cache_aware")
+            });
         }
         ensure!(
             !cache_aware_uses_indexer || self.kv_indexer_endpoint.is_some(),
