@@ -531,7 +531,7 @@ del _mod, _fn, _bk
 _HC_NORM_KERNELS = [
     ("hc_combine_norm", "hc_combine_norm"),
     ("mhc_post_split_h", "mhc_post_split_h"),
-    ("mxfp8_epilogue", "hc_combine_norm_mxfp8"),
+    ("hc_combine_norm", "hc_combine_norm_mxfp8"),
     ("mxfp8_epilogue", "rmsnorm_mxfp8"),
 ]
 for _mod, _fn in _HC_NORM_KERNELS:
