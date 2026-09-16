@@ -113,8 +113,9 @@ class Spec(msgspec.Struct):
         "Experimental DSPARK mode for PP2. Replicate the TP draft model on both "
         "pipeline stages, with a fixed owner per request and next-round proposal "
         "relay. Requires a bundled DeepSeek-V4 checkpoint, PD on both endpoints, "
-        "greedy sampling, static verify, disabled CUDA graphs and radix cache, "
-        "and no mixed chunk, DP attention, or context parallelism.",
+        "greedy sampling, static verify, disabled radix cache, and no mixed chunk, "
+        "DP attention, or context parallelism. Decode CUDA graphs are supported; "
+        "prefill CUDA graphs must be disabled.",
     ] = False
     speculative_accept_threshold_single: A[
         float,

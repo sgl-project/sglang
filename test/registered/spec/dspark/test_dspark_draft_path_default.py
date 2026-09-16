@@ -144,6 +144,25 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
                 _handle_dspark(args)
                 self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
 
+    def test_decode_cuda_graph_is_admitted(self):
+        args = self._replicated_args("decode")
+        args.disable_cuda_graph = False
+        args.cuda_graph_max_bs_decode = 256
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+    def test_prefill_requires_only_prefill_graph_disabled(self):
+        args = self._replicated_args("prefill")
+        args.disable_cuda_graph = False
+        args.disable_prefill_cuda_graph = True
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.disable_prefill_cuda_graph = False
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "prefill CUDA graph"):
+                _handle_dspark(args)
+
     def test_non_pd_mode_is_rejected(self):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             with self.assertRaisesRegex(ValueError, "PD disaggregation"):

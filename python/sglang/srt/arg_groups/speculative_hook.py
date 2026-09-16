@@ -608,10 +608,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-dspark-pp-replicated-draft does not support "
                 "--enable-dp-attention."
             )
-        if not cfg.disable_cuda_graph:
+        if (
+            cfg.disaggregation_mode == "prefill"
+            and not cfg.disable_cuda_graph
+            and not cfg.disable_prefill_cuda_graph
+            and cfg.cuda_graph_backend_prefill != "disabled"
+        ):
             raise ValueError(
                 "--speculative-dspark-pp-replicated-draft currently requires "
-                "--disable-cuda-graph."
+                "the prefill CUDA graph to be disabled."
             )
         if cfg.pp_async_batch_depth != 0:
             raise ValueError(
