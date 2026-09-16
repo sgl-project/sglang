@@ -62,7 +62,9 @@ class TimedServerManager(ServerManager):
                         f"http://127.0.0.1:{self.port}/liveness", timeout=0.5
                     )
                     if response.status_code == 200:
-                        self.readiness["liveness"] = time.perf_counter() - self.started
+                        self.readiness.setdefault(
+                            "liveness", time.perf_counter() - self.started
+                        )
                         return
                 except requests.RequestException:
                     pass
@@ -73,6 +75,18 @@ class TimedServerManager(ServerManager):
         try:
             super()._wait_for_ready(process, stdout_path)
             self.readiness["health"] = time.perf_counter() - self.started
+            if "liveness" not in self.readiness:
+                # Health may win the race with the observer's next poll. Probe
+                # liveness explicitly before stopping it, rather than treating
+                # scheduling order as an endpoint failure. This records the
+                # actual observation time, not an inferred health timestamp.
+                response = requests.get(
+                    f"http://127.0.0.1:{self.port}/liveness", timeout=1
+                )
+                assert response.status_code == 200, response.text
+                self.readiness.setdefault(
+                    "liveness", time.perf_counter() - self.started
+                )
         finally:
             stopped.set()
             observer.join(timeout=2)
