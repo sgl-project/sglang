@@ -334,10 +334,12 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 
 DCP shards the KV cache across TP ranks by token position
 (`pos % dcp_size == dcp_rank`), so each rank stores roughly `1/dcp_size` of the
-KV cache and `max_total_num_tokens` scales up accordingly. Each rank attends over
-only its own shard, then the partial outputs are merged across ranks by
-log-sum-exp. The cross-rank collectives run over oneCCL (`xccl`) through
-`torch.distributed`.
+positions. Each rank attends over only its own shard, then the partial outputs are
+merged across ranks by log-sum-exp. The cross-rank collectives run over oneCCL
+(`xccl`) through `torch.distributed`.
+
+Note that `max_total_num_tokens` reported at startup is the **per-rank** slot
+count; the servable context is `max_total_num_tokens * dcp_size`.
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
@@ -345,15 +347,126 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --tp 2 --dcp-size 2
 ```
 
-Both MHA/GQA models (e.g. Qwen, Llama) and MLA models (e.g. DeepSeek-V3) are
-supported.
+The model has to satisfy `total_num_kv_heads <= tp_size / dcp_size`; MLA models
+are rejected on XPU. Both are checked at startup — see
+[Which models can use DCP](#which-models-can-use-dcp) for why.
 
 ### Requirements
 
 | Requirement | Reason |
 |---|---|
-| `--attention-backend triton` | The `intel_xpu` kernels return no usable softmax LSE (`flash_attn_with_kvcache` leaves it zero-filled; `flash_mla_decode` has no LSE output), which the cross-rank merge needs. Rejected at startup. |
+| `--attention-backend triton` | The `intel_xpu` backend does not implement DCP; see below. Rejected at startup. |
+| `total_num_kv_heads <= tp_size / dcp_size` | Every rank of a DCP group must hold the same KV heads, and only Qwen3.5 shards its qkv projection that way; see below. Rejected at startup. |
+| An MHA/GQA model | The Triton MLA KV write has no DCP-aware kernel; see below. Rejected at startup. |
 | `dcp_size` divides `tp_size` | DCP groups are formed inside each TP group. |
+| Lower `--mem-fraction-static` than the same model without DCP | The per-layer xccl all-gather / reduce-scatter need Level Zero scratch outside the static pool. A 9B model at TP=4/DCP=2 on 4x Arc Pro B60 serves fine at `0.70` but `0.85` fails with `UR_RESULT_ERROR_OUT_OF_RESOURCES` raised from the TP all-reduce. |
+
+### Which models can use DCP
+
+DCP shards KV by *position*, so every rank of a DCP group must hold the **same** KV
+heads: the group all-gathers Q and each rank attends the gathered heads against its
+own position shard. `get_num_kv_heads`, which sizes the KV pool and the attention
+backend, therefore divides the KV heads over `tp_size // dcp_size` rather than
+`tp_size`. The attention module has to shard the qkv projection the same way — by
+passing `kv_tp_rank`/`kv_tp_size` to `QKVParallelLinear` — and today only
+`models/qwen3_5.py` does. Every other GQA model divides by the full `tp_size`, so
+it builds fewer KV heads per rank than the pool was allocated for.
+
+That mismatch used to corrupt silently rather than raise:
+`masked_set_kv_buffer_kernel` strides the destination by `loc * H * D` with `H`
+taken from the *model's* head count, so against a wider buffer every token landed
+at a fraction of its correct address and the upper KV heads were never written.
+Prefill and the first token came out right and every decode token after that was
+garbage — Llama-3.1-8B at TP=4/DCP=2 scored 0.0 on GSM8K and emitted text like
+`apoculculculcul`. It is now refused at startup.
+
+So on XPU, `--dcp-size N` needs `total_num_kv_heads <= tp_size / N`, which leaves
+one KV head per rank at both widths. Conveniently that is also the only regime where
+DCP pays off, because there the KV heads were already being *replicated* across
+ranks and DCP replaces that waste with a position split:
+
+| model, TP=4, `mem-fraction-static 0.60` | KV heads/rank | per-rank tokens | servable context |
+|---|---|---|---|
+| Qwen2.5-1.5B (2 KV heads), `--dcp-size 1` | 1 | 1,015,888 | 1,015,888 |
+| Qwen2.5-1.5B, `--dcp-size 2` | 1 | 1,015,888 | **2,031,776** |
+| GLM-4.1V-9B-Thinking (2 KV heads), `--dcp-size 1` | 1 | 487,859 | 487,859 |
+| GLM-4.1V-9B-Thinking, `--dcp-size 2` | 1 | 487,859 | **975,718** |
+
+Both models return byte-identical greedy output at `--dcp-size 1` and
+`--dcp-size 2`, which is the cheap check worth running when qualifying a model here.
+On the accuracy gate, GLM-4.1V-9B-Thinking scores 0.880 on GSM8K (200 questions,
+5-shot) at both widths, with no invalid completions.
+
+Outside the admitted regime, raising `dcp_size` replicates KV heads by exactly the
+factor by which it divides positions, so the two cancel and nothing is gained even
+ignoring the correctness problem:
+
+| Llama-3.1-8B (8 KV heads), TP=4, `mem-fraction-static 0.70` | KV heads/rank | per-rank tokens | servable context |
+|---|---|---|---|
+| `--dcp-size 1` | 2 | 423,755 | 423,755 |
+| `--dcp-size 2` (now rejected) | 4 | 211,877 | 423,754 |
+
+Widening a model like that needs its attention module to take
+`kv_tp_rank`/`kv_tp_size` the way `qwen3_5.py` does; the loader already supports it.
+Until then, an 8-KV-head model at TP=4 is limited to `--dcp-size 1`.
+
+### Performance expectations
+
+It does not make decode faster, and on PCIe-connected parts it costs a lot.
+GLM-4.1V-9B-Thinking at TP=4 on 4x Arc Pro B60, `mem-fraction-static 0.70`, Triton:
+
+| shape | decode, `dcp-size 1` | decode, `dcp-size 2` | prefill, 1 -> 2 |
+|---|---|---|---|
+| batch 4, 4096-token prompts | 54.37 tok/s | 28.80 tok/s (0.53x) | 3159 -> 2945 tok/s |
+| batch 1, 32768-token prompts | 9.95 tok/s | 7.63 tok/s (0.77x) | 576 -> 529 tok/s |
+
+The two extra collectives per layer outweigh the halved per-rank KV read; the gap
+narrows as context grows because the KV read is a larger share of the step, but it
+does not close. Prefill is close to unaffected. So the reason to enable
+`--dcp-size > 1` on XPU is the context length in the table above, not throughput:
+it fits a workload that otherwise would not fit, at roughly half the decode rate.
+Measure your own shape before enabling it.
+
+### Why not the `intel_xpu` backend?
+
+`intel_xpu` is the faster backend for ordinary serving on Intel GPUs, so DCP being
+Triton-only is a real cost. Two things block it today:
+
+1. **No DCP implementation.** `xpu_backend.py` has no sharded KV index build, no
+   per-rank partial-plus-LSE decode return, and no prefix merge in the extend
+   path. Running DCP on it would not merely be slow: each rank would attend over
+   only its `1/dcp_size` shard as if it were the whole context and silently return
+   wrong output.
+2. **No softmax LSE from the kernels.** The cross-rank merge weights each rank's
+   partial by its log-sum-exp, and the kernels cannot supply one.
+   `flash_attn_with_kvcache` accepts `return_softmax_lse` but leaves the buffer
+   zero-filled (uninitialized when `num_splits` is set),
+   `flash_attn_varlen_func` likewise returns zeros, and `flash_mla_decode` has no
+   LSE output or flag at all.
+
+Lifting the restriction needs an
+[sgl-kernel-xpu](https://github.com/sgl-project/sgl-kernel-xpu) change to emit the
+LSE from both decode kernels, and only then the backend-side DCP plumbing. Until
+both land, use `--attention-backend triton` for DCP runs; `intel_xpu` stays the
+default everywhere else.
+
+### Why not MLA models?
+
+This is the more painful gap, because MLA is what DCP was designed for. Under DCP
+`MLATokenToKVPool` takes a *widened* write loc, and only `set_mla_kv_buffer` runs
+the kernel that resolves the per-rank owner rule. Both MLA writes reachable from
+the Triton backend take the combined-row `set_kv_buffer` instead — the Triton
+decode write, and DeepSeek's MHA prefill write in
+`deepseek_common/attention_forward_methods/forward_mha.py` — and that door asserts
+under DCP rather than guessing a loc space. The one component that declares the loc
+resolved, the unified memory pool, refuses `triton` under DCP in favour of the
+CUDA-only paged MLA backends (`flashinfer`, `trtllm_mla`, `cutedsl_mla`,
+`tokenspeed_mla`) and in any case only builds for hybrid Mamba/SWA models.
+
+So MLA + DCP is Triton-unsupported on every platform, not just XPU; XPU is simply
+where it cannot be worked around, because DCP here must use Triton. Lifting it
+needs either a DCP owner-rule-aware combined-row write kernel, or an MLA-capable
+XPU backend that emits a widened loc.
 
 ### Limitations
 

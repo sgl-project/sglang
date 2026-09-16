@@ -25,11 +25,17 @@ What the CI test (TestDSV31DCP8TP8GSM8K) covers:
 
 What the CI test does NOT cover (and the manual tests address):
   - Exact parity with non-DCP outputs (TestDSV31DCP8LogprobParity)
-  - A second DCP shape (TestDSV31DCP4TP8GSM8K; CUDA only -- see the class
-    docstring for why XPU cannot vary the shape here)
+  - A second DCP shape (TestDSV31DCP4TP8GSM8K: DCP=4 at TP=8 on CUDA; skipped on
+    XPU, where the KV-head replication rule leaves DCP=2 as the only valid width
+    at TP=4 — see _XPU_PLATFORM)
   - MHA extend path on CUDA (all_gather_kv_cache_for_mha_extend /
     mha_chunk_extend) — DeepSeek-V3.1 uses MLA, so those paths are never
     exercised there. The XPU config is GQA and does exercise them.
+  - The multi-KV-head branch of the DCP query all-gather reorder. The replication
+    rule leaves one KV head per rank for every model whose qkv projection is not
+    DCP-aware, so that branch is unreachable from here;
+    test/registered/xpu/test_xpu_dcp.py TestDCPGatheredQHeadOrder covers it as a
+    kernel-level test.
 
 Future improvements:
   - Add dcp_world_size to /server_info so tests can assert DCP is active
@@ -53,7 +59,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -137,24 +143,38 @@ _CUDA_PLATFORM = _PlatformConfig(
 # XPU deviations, each forced rather than chosen:
 #   backend: flashinfer is CUDA-only. The Triton DCP path (LSE merge + sharded
 #     KV index build + per-rank masked KV write) is the XPU path; the intel_xpu
-#     backend cannot serve DCP at all (its decode kernels return no softmax LSE,
-#     rejected by ServerArgs).
-#   model: DeepSeek-V3.1 is ~700GB. Qwen2.5-1.5B-Instruct is GQA rather than MLA,
-#     so the XPU run covers cp_lse_ag_out_rs_mha and the DCP query all-gather
-#     head reorder instead of the MLA merge.
-#   shape: get_num_kv_heads shards KV over tp // dcp_size groups, so tp must stay
-#     a multiple of dcp_size and Qwen2.5-1.5B's vocab of 151936 is not divisible
-#     by 6; tp=4/dcp=2 is the shape validated here -- hence dcp_alt=None.
-#   gsm8k threshold: a 1.5B model cannot reach 0.90. The gate is sized to catch a
-#     *broken* merge (which collapses accuracy toward zero) rather than to
-#     certify model quality.
+#     backend cannot serve DCP at all -- it has no DCP implementation and its
+#     decode kernels return no softmax LSE, rejected by ServerArgs.
+#   model: DeepSeek-V3.1 is ~700GB. GLM-4.1V-9B-Thinking is the largest dense-
+#     attention model that fits 4 B60s *and* satisfies the DCP replication rule,
+#     total_num_kv_heads <= tp_size / dcp_size: DCP shards KV by position, so each
+#     rank of a group must hold the same KV heads, and only Qwen3.5 shards its qkv
+#     projection that way (ServerArgs rejects everything else that violates it).
+#     Its 2 KV heads at tp // dcp_size = 2 clear the bar. It is GQA rather than MLA,
+#     so the XPU run covers cp_lse_ag_out_rs_mha and the MHA extend path instead of
+#     the MLA merge.
+#   shape: tp must stay a multiple of dcp_size, and the replication rule caps
+#     dcp_size at tp_size // 2 = 2 here, so dcp=2 is the only DCP width available --
+#     dcp_alt=None and the second-shape class skips. Varying it needs a
+#     DCP-aware-qkv model (Qwen3.5), which needs GDN kernels sgl-kernel-xpu does not
+#     ship yet.
+#   gsm8k threshold: 0.80, against a measured 0.880 at DCP=2 and 0.880 without DCP
+#     (200 questions, 5 shots, invalid 0.000 in both) -- so DCP costs no accuracy
+#     here and the gate has ~8 points of headroom for run-to-run variation. It is
+#     deliberately not tighter: the failure this guards against is a broken LSE
+#     merge or a KV write landing at the wrong stride, which collapses accuracy
+#     toward zero rather than shaving a point off it.
+#   mem-fraction-static: 0.60, well under the 0.88 the CUDA config uses. The
+#     per-layer xccl all-gather / reduce-scatter want Level Zero scratch from
+#     outside the static pool; 0.85 already dies with
+#     UR_RESULT_ERROR_OUT_OF_RESOURCES from the TP all-reduce at dcp=2.
 _XPU_PLATFORM = _PlatformConfig(
-    model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    model=DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP,
     backend="triton",
     tp_size=4,
     dcp_size=2,
     dcp_alt=None,
-    gsm8k_threshold=0.30,
+    gsm8k_threshold=0.80,
     gsm8k_questions=100 if is_in_ci() else 200,
     gsm8k_threads=32,
     launch_timeout_mult=3,
@@ -162,7 +182,7 @@ _XPU_PLATFORM = _PlatformConfig(
         "--device",
         "xpu",
         "--mem-fraction-static",
-        "0.6",
+        "0.60",
         "--chunked-prefill-size",
         "2048",
         "--disable-radix-cache",
@@ -200,10 +220,13 @@ _LOGPROB_PARITY_PROMPTS = [
 def _get_max_total_num_tokens(base_url: str) -> int:
     """Fetch max_total_num_tokens from /server_info.
 
-    NOTE: this is NOT a DCP activation signal. The scheduler reports
-    ``max_total_num_tokens * dcp_size`` while each rank's pool is 1/dcp_size the
-    size, so the product stays ~constant across dcp_size (measured on XPU:
-    1015888 both with and without DCP=2 at TP=4). Use it for liveness only.
+    NOTE: this is NOT a DCP activation signal, in either direction. The scheduler
+    reports ``max_total_num_tokens * dcp_size``, so what it means depends on how the
+    per-rank pool responded to dcp_size, which depends on the model's KV head count:
+    on XPU the per-rank pool is unchanged between DCP=1 and DCP=2 (measured: 487859
+    both for GLM-4.1V-9B, 1015888 both for Qwen2.5-1.5B at TP=4), so the reported
+    number doubles; for a model whose KV heads get replicated instead it stays flat.
+    Neither tells you the DCP code path ran. Use it for liveness only.
     """
     resp = requests.get(f"{base_url}/server_info", timeout=30)
     resp.raise_for_status()
@@ -230,14 +253,15 @@ class TestDSV31DCP8TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
         no-repetition, temp=0 determinism, max_new_tokens=1)
 
     Platform: CUDA runs DeepSeek-V3.1 (MLA) at DCP=8/TP=8 with flashinfer; XPU
-    runs Qwen2.5-1.5B-Instruct (GQA) at DCP=2/TP=4 with Triton. See _PLATFORM.
+    runs GLM-4.1V-9B-Thinking (GQA) at DCP=2/TP=4 with Triton. See _PLATFORM.
     """
 
     model = _PLATFORM.model
     base_url = DEFAULT_URL_FOR_TEST
 
     # CUDA: non-DCP V3.1 on 200 questions typically scores ~0.93–0.94, so 0.90
-    # leaves ~3–4% headroom. XPU: a 1.5B model needs a lower bar; see _PLATFORM.
+    # leaves ~3–4% headroom. XPU: 0.80 against a measured 0.880 both with and
+    # without DCP; see _PLATFORM.
     # For tighter verification, run TestDSV31DCP8LogprobParity manually.
     gsm8k_accuracy_thres = _PLATFORM.gsm8k_threshold
     gsm8k_num_questions = _PLATFORM.gsm8k_questions
@@ -468,21 +492,22 @@ class TestDSV31DCP8LogprobParity(BasicDecodeCorrectnessMixin, CustomTestCase):
 # Test 3: second DCP shape (manual-only, exercises a different all-gather)
 # ---------------------------------------------------------------------------
 @unittest.skipIf(
-    _IS_XPU,
-    "Qwen2.5-1.5B on XPU is validated only at tp=4/dcp=2 (vocab 151936 is not "
-    "divisible by 6, so tp=4/dcp=3 is out), so there is no second shape to "
-    "vary here.",
+    _PLATFORM.dcp_alt is None,
+    "Platform admits only one DCP width (XPU: the KV-head replication rule caps "
+    "dcp_size at tp_size // total_num_kv_heads = 2), so this would re-run the CI "
+    "shape.",
 )
 @unittest.skipIf(
-    is_in_ci(), "Requires 8 GPUs; run locally for additional DCP coverage."
+    is_in_ci(),
+    "Second DCP shape; run locally rather than paying for another full model load "
+    "in CI.",
 )
 class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestCase):
-    """DCP=4 with TP=8 — exercises a different all-gather pattern than DCP=8.
+    """DCP=4 — exercises a different all-gather width than the CI shape.
 
-    With DCP=4, each rank stores 1/4 of the KV cache (vs 1/8 for DCP=8).
-    The 4-way all-gather uses a different GroupCoordinator configuration,
-    and the token-to-shard mapping (position % 4 vs position % 8) exercises
-    different edge cases in:
+    TP=8 on CUDA: 1/4 of the KV cache per rank vs 1/8 at DCP=8. The wider
+    all-gather uses a different GroupCoordinator configuration, and the
+    token-to-shard mapping exercises different edge cases in:
       - update_local_kv_lens_for_dcp (different div/mod arithmetic)
       - plan_dcp_decode_metadata (different local_kv_lens distribution)
       - create_dcp_kv_indices (different padding/alignment)
