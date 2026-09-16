@@ -77,7 +77,7 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
         self.assertEqual(args.dsv41_main_kv_layout, "auto")
         self.assertEqual(args.dsv41_main_kv_consumer, "auto")
 
-    def test_pr1_rejects_packed_consumer_before_pool_allocation(self):
+    def test_packed_layout_requires_explicit_direct_consumer(self):
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v41_features,
         )
@@ -98,7 +98,37 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
                 "sglang.srt.arg_groups.deepseek_v4_hook.model_config_of",
                 return_value=model_config,
             ),
-            self.assertRaisesRegex(ValueError, "no attention consumer in PR1"),
+            self.assertRaisesRegex(ValueError, "currently requires.*direct"),
+        ):
+            validate_deepseek_v41_features(object())
+
+    def test_sm90_direct_consumer_is_accepted(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_features,
+        )
+
+        config = SimpleNamespace(
+            dsv41_main_kv_layout="packed_fp4",
+            dsv41_main_kv_consumer="direct",
+            dsv4_attn_backend="flashmla",
+            enable_encoder_swa_bounded_replay=False,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.resolving_view",
+                return_value=config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.deepseek_v4_hook.get_platform",
+                return_value=SimpleNamespace(is_sm90=True),
+            ),
         ):
             validate_deepseek_v41_features(object())
 

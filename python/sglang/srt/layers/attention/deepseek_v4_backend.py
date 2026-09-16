@@ -192,6 +192,13 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+@functools.lru_cache(maxsize=1)
+def _get_flashmla_capabilities() -> dict:
+    from sgl_kernel.flash_mla import get_mla_capabilities
+
+    return get_mla_capabilities()
+
+
 # FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
 # only for that shape and go stale silently if FlashMLA retunes it.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
@@ -1171,6 +1178,19 @@ class DeepseekV4AttnBackend(
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
+        self.dsv41_main_kv_consumer = getattr(
+            kernel, "dsv41_main_kv_consumer", "auto"
+        )
+        if self.dsv41_main_kv_consumer == "direct":
+            capabilities = _get_flashmla_capabilities()
+            if (
+                capabilities["mixed_kvcache_api_version"] < 1
+                or not capabilities["mixed_kvcache_supported"]
+            ):
+                raise RuntimeError(
+                    "the loaded FlashMLA extension does not provide the SM90 "
+                    "mixed packed-Main v1 API"
+                )
         self.enable_decoder_swa_bounded_replay: bool = (
             get_exec().features.enable_decoder_swa_bounded_replay
         )
@@ -3429,9 +3449,14 @@ class DeepseekV4AttnBackend(
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
-            extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
+            extra_k_cache, packed_main_view = None, None
+            extra_indices, extra_topk_lengths = None, None
             if compress_ratio != 0:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+                extra_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
+                if extra_layout.is_packed_main_kv:
+                    packed_main_view = token_to_kv_pool.get_extra_key_view(layer_id)
+                else:
+                    extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                     compress_ratio
@@ -3510,7 +3535,10 @@ class DeepseekV4AttnBackend(
             # The tail stays dense: its window floor lives in swa_page_indices,
             # which the sparse chunk cache ignores.
             if (
-                self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
+                packed_main_view is None
+                and self._use_sparse_prefill(
+                    forward_batch, num_qo_tokens=q.shape[0]
+                )
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
@@ -3537,6 +3565,7 @@ class DeepseekV4AttnBackend(
             if (
                 self.is_dsv41
                 and get_platform().is_sm100
+                and packed_main_view is None
                 and can_use_swapab_attention(
                     q,
                     swa_k_cache,
@@ -3608,22 +3637,58 @@ class DeepseekV4AttnBackend(
                         extra_indices=extra_indices,
                         extra_topk_length=extra_topk_lengths,
                     )
-                o = flash_mla_with_kvcache(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=flashmla_metadata,
-                    softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                if packed_main_view is not None:
+                    assert extra_indices is not None
+                    if self.dsv41_main_kv_consumer != "direct":
+                        raise RuntimeError(
+                            "packed Main KV reached attention without the direct "
+                            "consumer selected"
+                        )
+                    from sgl_kernel.flash_mla import (
+                        flash_mla_with_mixed_kvcache,
+                    )
+
+                    capabilities = _get_flashmla_capabilities()
+                    if not capabilities["mixed_kvcache_supported"]:
+                        raise RuntimeError(
+                            "the loaded FlashMLA extension does not support "
+                            "SM90 mixed packed-Main attention"
+                        )
+                    o = flash_mla_with_mixed_kvcache(
+                        q=q,
+                        swa_cache=swa_k_cache,
+                        swa_indices=swa_page_indices,
+                        swa_topk_length=swa_topk_lengths,
+                        main_cache_bytes=packed_main_view.storage,
+                        main_indices=extra_indices,
+                        main_topk_length=extra_topk_lengths,
+                        swa_layout=token_to_kv_pool.get_swa_key_layout().value,
+                        main_layout=packed_main_view.spec.layout_id.value,
+                        main_page_slots=packed_main_view.spec.page_slots,
+                        main_page_bytes=packed_main_view.spec.page_bytes,
+                        head_dim_v=self.head_dim_v,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        attn_sink=attn_sink,
+                    )[0]
+                else:
+                    o = flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                        kv_format=token_to_kv_pool.get_swa_key_layout().value,
+                    )[0]
 
             o = o.squeeze(1)
             return o
