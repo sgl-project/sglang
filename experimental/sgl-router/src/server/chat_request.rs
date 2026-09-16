@@ -14,6 +14,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 
+/// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 pub(crate) struct ChatRequest {
@@ -108,6 +109,7 @@ enum ProbedValue {
     Unusable,
 }
 
+/// Arbitrary; bounds the parse of a client-controlled string, and no real sampling literal is longer.
 const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
 
 /// Match engine coercion: trim ordinary numbers, but preserve whitespace for underscored ones.
@@ -345,6 +347,7 @@ fn should_tokenize_request(
 }
 
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
+    // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
 
@@ -418,6 +421,7 @@ fn build_outgoing_body(
     }
     if let Some(b) = bootstrap {
         obj.insert("bootstrap_host".into(), json!(b.host));
+        // A missing port must be JSON null, not omitted; the engine's validator distinguishes them.
         obj.insert("bootstrap_port".into(), json!(b.port));
         obj.insert("bootstrap_room".into(), json!(b.room));
     }
@@ -432,6 +436,7 @@ fn input_ids_safe_to_forward(value: &Value) -> bool {
     if request_has_tools(value) || request_has_non_text_content(value) {
         return false;
     }
+    // chat_template is blocked even though SGLang ignores it, so the offload stays correct on other engines.
     for key in [
         "chat_template",
         "chat_template_kwargs",

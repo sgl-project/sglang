@@ -9,8 +9,8 @@ use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
-use crate::proxy::chat_dispatch::{self as dispatch, SelectedWorkers};
 use crate::server::app_context::AppContext;
+use crate::server::chat_forward::{forward, SelectedWorkers};
 use crate::server::chat_request::{parse_probe, ChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -26,6 +26,7 @@ const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
 /// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
+/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
 /// Validate, select workers, and forward a chat-completions request.
@@ -68,7 +69,7 @@ pub async fn chat_completions(
     .await?;
 
     // PD sends to both workers and returns the decode response.
-    dispatch::forward(&ctx, request, workers, headers, start).await
+    forward(&ctx, request, workers, headers, start).await
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {

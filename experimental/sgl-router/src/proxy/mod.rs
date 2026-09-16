@@ -3,7 +3,6 @@
 
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
-pub(crate) mod chat_dispatch;
 pub mod sse;
 
 use crate::health::circuit_breaker::CircuitBreaker;

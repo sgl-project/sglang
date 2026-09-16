@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod app_context;
+pub(crate) mod chat_forward;
 pub(crate) mod chat_request;
 pub mod error;
 pub mod header_utils;

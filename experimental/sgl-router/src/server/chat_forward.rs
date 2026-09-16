@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
+// Sent to both PD workers and mirrored onto the response so sidecars and tests can observe Final D.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 type LoadGuards = (LoadGuard, ActiveLoadGuard);
 
@@ -130,6 +131,8 @@ fn spawn_prefill(
 ) {
     let proxy = Arc::clone(&ctx.proxy);
     // Detach prefill so client cancellation cannot interrupt the KV transfer.
+    // Router shutdown still cancels it, and a prefill failure surfaces as the decode-side
+    // bootstrap_room timeout rather than an immediate 502.
     tokio::spawn(async move {
         let _holds = guards;
         match proxy
@@ -264,6 +267,7 @@ impl DispatchMetrics {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
+        // HTTP status is counted into responses_total by the app.rs middleware, not here.
         let http_status = match result {
             Ok(response) => response.status().as_u16(),
             Err(error) => error.status_code().as_u16(),
