@@ -268,6 +268,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
         native_method = native_fp8.Fp8LinearMethod.__new__(native_fp8.Fp8LinearMethod)
         native_method.use_marlin = False
         native_method.use_mxfp8 = False
+        native_method.block_fp8_as_mxfp8 = False
         native_method.block_quant = False
         native_method.cutlass_fp8_supported = True
         native_method.use_per_token_if_dynamic = False
