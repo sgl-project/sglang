@@ -18,7 +18,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 @cache_once
