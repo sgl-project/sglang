@@ -26,19 +26,22 @@ const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUE
     name = "sgl-router",
     version,
     about = "Slim KV-aware OpenAI-compatible router for SGLang workers",
-    after_help = "Examples:\n  sgl-router --model-id Qwen/Qwen3-0.6B --worker-urls http://localhost:30001\n  sgl-router --model-id Qwen/Qwen3-0.6B --service-discovery --selector app=sglang\n\nChoose exactly one discovery backend. Policy-specific groups only apply to the named policies."
+    after_help = "Examples:\n  sgl-router --model-id Qwen/Qwen3-0.6B --worker-urls http://localhost:30001\n  sgl-router --model-id Qwen/Qwen3-0.6B --service-discovery --selector app=sglang\n\nChoose exactly one discovery backend. Policy-specific options name their required policy in the descriptions."
 )]
 pub struct Cli {
-    #[command(flatten, next_help_heading = "Model and tokenizer")]
+    #[command(flatten, next_help_heading = "Model, tokenizer and sampling")]
     pub model: ModelArgs,
-    #[command(flatten, next_help_heading = "HTTP server and graceful shutdown")]
+    #[command(flatten, next_help_heading = "Server, timeouts and logging")]
     pub server: ServerArgs,
     #[command(
         flatten,
-        next_help_heading = "Worker discovery (choose static URLs or Kubernetes)"
+        next_help_heading = "Worker discovery (static URLs or Kubernetes)"
     )]
     pub discovery: DiscoveryArgs,
-    #[command(flatten, next_help_heading = "Routing policies and worker buckets")]
+    #[command(
+        flatten,
+        next_help_heading = "Routing policies, admission and circuit breaker"
+    )]
     pub routing: RoutingArgs,
     #[command(
         flatten,
@@ -47,40 +50,9 @@ pub struct Cli {
     pub cache: CacheArgs,
     #[command(
         flatten,
-        next_help_heading = "Session affinity (--policy session_aware)"
+        next_help_heading = "Session affinity, sticky routing and pressure guards"
     )]
-    pub session: SessionArgs,
-    #[command(
-        flatten,
-        next_help_heading = "Pressure guard (session_aware and cache_aware)"
-    )]
-    pub pressure: PressureArgs,
-    #[command(flatten, next_help_heading = "Sticky routing (--policy sticky)")]
-    pub sticky: StickyArgs,
-    #[command(
-        flatten,
-        next_help_heading = "Score composition (--policy score_policy or fused_score)"
-    )]
-    pub scoring: ScoringArgs,
-    #[command(
-        flatten,
-        next_help_heading = "Worker admission (constraints before policy selection)"
-    )]
-    pub admission: AdmissionArgs,
-    #[command(
-        flatten,
-        next_help_heading = "Circuit breaker (enabled by --cb-threshold)"
-    )]
-    pub circuit_breaker: CircuitBreakerArgs,
-    #[command(
-        flatten,
-        next_help_heading = "Fleet sampling defaults and request constraints"
-    )]
-    pub sampling: SamplingArgs,
-    #[command(flatten, next_help_heading = "Upstream and request-tracking timeouts")]
-    pub timeouts: TimeoutArgs,
-    #[command(flatten, next_help_heading = "Logging")]
-    pub logging: LoggingArgs,
+    pub affinity: AffinityArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -92,6 +64,25 @@ pub struct ModelArgs {
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
+
+    /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
+    /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
+    /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
+    /// fields; {"min": LO, "max": HI} bands only constrain supplied values
+    /// and require reject mode. See README for domains and null handling.
+    #[arg(long, value_name = "JSON")]
+    pub override_sampling_params: Option<String>,
+
+    /// How to handle sampling values that differ from configured defaults:
+    /// reject returns 400 before admission; allow forwards the client value.
+    /// Defaults to reject. Requires --override-sampling-params.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "override_sampling_params"
+    )]
+    pub sampling_param_conflict: Option<ConflictPolicy>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -114,6 +105,23 @@ pub struct ServerArgs {
     /// Omitting this assumes 30 seconds; this flag does not change the pod spec.
     #[arg(long)]
     pub termination_grace_secs: Option<u64>,
+
+    /// Per-request upstream timeout in seconds.
+    #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
+    pub request_timeout_secs: u64,
+
+    /// Max lifetime of an in-flight request entry before the janitor
+    /// reaps it (returns 504 `stale_request_expired`).
+    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
+    pub stale_request_timeout_secs: u64,
+
+    /// Default tracing level (overridden by `RUST_LOG`).
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Log output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub log_format: LogFormat,
 }
 
 #[derive(clap::Args, Debug)]
@@ -158,6 +166,33 @@ pub struct RoutingArgs {
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
+
+    /// Weighted scoring terms, e.g. prefix_cache=2.0,load_based=0.3.
+    /// Defaults to prefix_cache,load_based for score_policy or fused_score.
+    /// Requires --policy score_policy or fused_score. Omitted weights use each term's default.
+    #[arg(long, value_delimiter = ',')]
+    pub fuse: Vec<FusedTerm>,
+
+    /// Ordered hard constraints applied before policy selection.
+    #[arg(long, value_delimiter = ',')]
+    pub filter: Vec<FilterKind>,
+
+    /// Router-local in-flight limit for `--filter overloaded`.
+    #[arg(long)]
+    pub max_in_flight: Option<usize>,
+
+    /// Minimum cached prompt share for `--filter prefix_cache`.
+    #[arg(long)]
+    pub prefix_cache_min_share: Option<f32>,
+
+    /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
+    #[arg(long)]
+    pub cb_threshold: Option<NonZeroU32>,
+
+    /// Circuit-breaker cool-down in seconds. Only meaningful with
+    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
+    #[arg(long)]
+    pub cb_cool_down_secs: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -220,156 +255,71 @@ pub struct CacheArgs {
 }
 
 #[derive(clap::Args, Debug)]
-pub struct SessionArgs {
+pub struct AffinityArgs {
     /// Header carrying the session ID for `--policy session_aware`.
     #[arg(long)]
     pub session_id_header: Option<String>,
 
-    /// Session idle timeout in seconds. Defaults to 600.
+    /// Session idle timeout in seconds (--policy session_aware). Defaults to 600.
     #[arg(long)]
     pub session_idle_secs: Option<u64>,
 
-    /// Session eviction sweep interval in seconds. Defaults to 60.
+    /// Session eviction interval in seconds (--policy session_aware). Defaults to 60.
     #[arg(long)]
     pub session_eviction_interval_secs: Option<u64>,
 
-    /// Use a deterministic backup for the affinity key and candidate range.
+    /// Use a deterministic session backup (--policy session_aware).
     #[arg(long)]
     pub stable_pair: bool,
 
-    /// Session admission mode. Defaults to soft (allow the backup to relieve pressure).
+    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
     #[arg(long, value_enum)]
     pub affinity_mode: Option<AffinityMode>,
 
-    /// Session lookup and fallback behavior. Defaults to bucket (search the target bucket).
+    /// Session lookup mode (--policy session_aware). Defaults to bucket (search the target bucket).
     #[arg(long, value_enum)]
     pub session_affinity_mode: Option<SessionAffinityMode>,
-}
 
-#[derive(clap::Args, Debug)]
-pub struct PressureArgs {
-    /// Disables the Session/Cache-Aware pressure guard.
-    #[arg(long)]
-    pub disable_pressure_guard: bool,
-
-    /// Waiting-uncached-token gap required by the pressure guard. Defaults to 1024.
-    #[arg(long)]
-    pub pressure_abs_threshold_tokens: Option<u64>,
-
-    /// Pressure gap in milliseconds when a prefill queue estimate is available. Unset by default.
-    #[arg(long)]
-    pub pressure_abs_threshold_ms: Option<f64>,
-
-    /// Waiting-uncached-token multiplier required by the pressure guard. Defaults to 1.5.
-    #[arg(long)]
-    pub pressure_rel_threshold: Option<f64>,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct StickyArgs {
-    /// Header carrying the sticky routing key. Defaults to x-sgl-routing-key.
+    /// Routing-key header (--policy sticky). Defaults to x-sgl-routing-key.
     #[arg(long)]
     pub routing_key_header: Option<String>,
 
-    /// Policy for new or missing routing keys. Defaults to round_robin.
+    /// Policy for new or missing routing keys (--policy sticky). Defaults to round_robin.
     #[arg(long, value_enum)]
     pub sticky_fallback_policy: Option<StickyFallbackKind>,
 
-    /// Evict sticky assignments idle for this many seconds. Defaults to 600.
+    /// Idle timeout in seconds (--policy sticky). Defaults to 600.
     #[arg(long)]
     pub sticky_idle_secs: Option<u64>,
 
-    /// Wall-clock cadence of the sticky idle-eviction sweep, in seconds.
+    /// Eviction sweep interval in seconds (--policy sticky).
     /// Defaults to 60.
     #[arg(long)]
     pub sticky_eviction_interval_secs: Option<u64>,
-}
 
-#[derive(clap::Args, Debug)]
-pub struct ScoringArgs {
-    /// Weighted scoring terms, e.g. prefix_cache=2.0,load_based=0.3.
-    /// Defaults to prefix_cache,load_based for score_policy or fused_score.
-    /// Omitted weights use each term's default.
-    #[arg(long, value_delimiter = ',')]
-    pub fuse: Vec<FusedTerm>,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct AdmissionArgs {
-    /// Ordered hard constraints applied before policy selection.
-    #[arg(long, value_delimiter = ',')]
-    pub filter: Vec<FilterKind>,
-
-    /// Router-local in-flight limit for `--filter overloaded`.
+    /// Disable the pressure guard (--policy session_aware or cache_aware).
     #[arg(long)]
-    pub max_in_flight: Option<usize>,
+    pub disable_pressure_guard: bool,
 
-    /// Minimum cached prompt share for `--filter prefix_cache`.
+    /// Pressure-guard token gap (session_aware or cache_aware). Defaults to 1024.
     #[arg(long)]
-    pub prefix_cache_min_share: Option<f32>,
-}
+    pub pressure_abs_threshold_tokens: Option<u64>,
 
-#[derive(clap::Args, Debug)]
-pub struct CircuitBreakerArgs {
-    /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
+    /// Pressure-guard gap in ms (session_aware or cache_aware), when a queue estimate exists. Unset by default.
     #[arg(long)]
-    pub cb_threshold: Option<NonZeroU32>,
+    pub pressure_abs_threshold_ms: Option<f64>,
 
-    /// Circuit-breaker cool-down in seconds. Only meaningful with
-    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
+    /// Pressure-guard token multiplier (session_aware or cache_aware). Defaults to 1.5.
     #[arg(long)]
-    pub cb_cool_down_secs: Option<u64>,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct SamplingArgs {
-    /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
-    /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
-    /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
-    /// fields; {"min": LO, "max": HI} bands only constrain supplied values
-    /// and require reject mode. See README for domains and null handling.
-    #[arg(long, value_name = "JSON")]
-    pub override_sampling_params: Option<String>,
-
-    /// How to handle sampling values that differ from configured defaults:
-    /// reject returns 400 before admission; allow forwards the client value.
-    /// Defaults to reject. Requires --override-sampling-params.
-    #[arg(
-        long,
-        value_enum,
-        value_name = "MODE",
-        requires = "override_sampling_params"
-    )]
-    pub sampling_param_conflict: Option<ConflictPolicy>,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct TimeoutArgs {
-    /// Per-request upstream timeout in seconds.
-    #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
-    pub request_timeout_secs: u64,
-
-    /// Max lifetime of an in-flight request entry before the janitor
-    /// reaps it (returns 504 `stale_request_expired`).
-    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
-    pub stale_request_timeout_secs: u64,
-}
-
-#[derive(clap::Args, Debug)]
-pub struct LoggingArgs {
-    /// Default tracing level (overridden by `RUST_LOG`).
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
-
-    /// Log output format.
-    #[arg(long, value_enum, default_value = "text")]
-    pub log_format: LogFormat,
+    pub pressure_rel_threshold: Option<f64>,
 }
 
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
-        let affinity = self.build_affinity()?;
+        let affinity = self
+            .affinity
+            .build_config(&self.cache, self.routing.policy)?;
         let discovery = self.discovery.into_config()?;
         let bucket_config = self
             .routing
@@ -377,19 +327,19 @@ impl Cli {
             .as_deref()
             .map(load_bucket_config)
             .transpose()?;
-        let circuit_breaker = self.circuit_breaker.into_config()?;
+        let circuit_breaker = self.routing.build_circuit_breaker()?;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
-        let fused = self.scoring.into_config(self.routing.policy)?;
-        let eligibility = self.admission.into_config(self.routing.policy)?;
-        let sticky = self.sticky.into_config(self.routing.policy)?;
+        let fused = self.routing.build_fused()?;
+        let eligibility = self.routing.build_eligibility()?;
+        let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
-            .sampling
+            .model
             .override_sampling_params
             .as_deref()
             .map(|raw| {
                 parse_sampling_overrides(
                     raw,
-                    self.sampling.sampling_param_conflict.unwrap_or_default(),
+                    self.model.sampling_param_conflict.unwrap_or_default(),
                 )
             })
             .transpose()?
@@ -403,8 +353,8 @@ impl Cli {
                 termination_grace_secs: self.server.termination_grace_secs,
             },
             observability: ObservabilityConfig {
-                log_level: self.logging.log_level,
-                log_format: self.logging.log_format,
+                log_level: self.server.log_level,
+                log_format: self.server.log_format,
             },
             model: ModelConfig {
                 tokenizer_path: self
@@ -425,176 +375,14 @@ impl Cli {
             },
             discovery,
             proxy: ProxyConfig {
-                request_timeout_secs: self.timeouts.request_timeout_secs,
+                request_timeout_secs: self.server.request_timeout_secs,
             },
             active_load: ActiveLoadConfig {
-                stale_request_timeout_secs: self.timeouts.stale_request_timeout_secs,
+                stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
         config.validate()?;
         Ok(config)
-    }
-
-    fn build_affinity(&self) -> Result<Option<AffinityConfig>> {
-        let (session, cache, pressure) = (&self.session, &self.cache, &self.pressure);
-        let policy = self.routing.policy;
-        let affinity_policy = matches!(policy, PolicyKind::SessionAware | PolicyKind::CacheAware);
-        let tuned_session_affinity = session.session_id_header.is_some()
-            || session.session_idle_secs.is_some()
-            || session.session_eviction_interval_secs.is_some()
-            || session.stable_pair
-            || session.affinity_mode.is_some()
-            || session.session_affinity_mode.is_some();
-        ensure!(
-            !tuned_session_affinity || policy == PolicyKind::SessionAware,
-            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
-                 --session-affinity-mode require --policy session_aware"
-        );
-        ensure!(
-            !pressure.disable_pressure_guard || affinity_policy,
-            "--disable-pressure-guard requires --policy session_aware or cache_aware"
-        );
-        let tuned_cache_candidates = cache.cache_affinity_min_matched_tokens.is_some()
-            || cache.cache_affinity_min_match_ratio.is_some()
-            || cache.cache_candidate_min_workers.is_some()
-            || cache.cache_candidate_ratio.is_some()
-            || cache.cache_candidate_max_workers.is_some()
-            || cache.cache_switch_margin_tokens.is_some()
-            || cache.worker_queue_limit.is_some()
-            || cache.saturation_queue_floor.is_some();
-        // Value checks before the policy check: a value that is wrong under
-        // every policy should say so, rather than pointing at --policy.
-        ensure!(
-            cache.worker_queue_limit != Some(0),
-            "--worker-queue-limit must be at least 1"
-        );
-        if let Some(floor) = cache.saturation_queue_floor {
-            // The floor modifies the gate's diversion; without the gate
-            // there is no diversion to cancel and the knob would sit dead.
-            let Some(limit) = cache.worker_queue_limit else {
-                return Err(anyhow!(
-                    "--saturation-queue-floor requires --worker-queue-limit (there is no \
-                     diversion to cancel without it)"
-                ));
-            };
-            ensure!(floor != 0, "--saturation-queue-floor must be at least 1");
-            ensure!(
-                floor <= limit,
-                "--saturation-queue-floor ({floor}) must be at most --worker-queue-limit \
-                     ({limit})"
-            );
-        }
-        ensure!(
-            !tuned_cache_candidates || policy == PolicyKind::CacheAware,
-            "cache candidate tuning flags require --policy cache_aware"
-        );
-        ensure!(
-            affinity_policy
-                || (pressure.pressure_abs_threshold_tokens.is_none()
-                    && pressure.pressure_abs_threshold_ms.is_none()
-                    && pressure.pressure_rel_threshold.is_none()),
-            "pressure guard tuning requires --policy session_aware or cache_aware"
-        );
-        if !affinity_policy {
-            return Ok(None);
-        }
-        let defaults = AffinityConfig::default();
-        let session_id_header = session
-            .session_id_header
-            .clone()
-            .unwrap_or(defaults.session_id_header);
-        axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
-            anyhow!(
-                "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
-            )
-        })?;
-        let pressure_rel_threshold = pressure
-            .pressure_rel_threshold
-            .unwrap_or(defaults.pressure_rel_threshold);
-        ensure!(
-            pressure_rel_threshold.is_finite() && pressure_rel_threshold > 1.0,
-            "--pressure-rel-threshold must be finite and greater than 1"
-        );
-        ensure!(
-            pressure
-                .pressure_abs_threshold_ms
-                .is_none_or(|threshold| threshold.is_finite() && threshold >= 0.0),
-            "--pressure-abs-threshold-ms must be finite and non-negative"
-        );
-        let cache_affinity_min_match_ratio = cache
-            .cache_affinity_min_match_ratio
-            .or(defaults.cache_affinity_min_match_ratio);
-        ensure!(
-            cache_affinity_min_match_ratio
-                .is_none_or(|ratio| ratio.is_finite() && (0.0..=1.0).contains(&ratio)),
-            "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
-        );
-        let cache_candidate_ratio = cache
-            .cache_candidate_ratio
-            .unwrap_or(defaults.cache_candidate_ratio);
-        ensure!(
-            cache_candidate_ratio.is_finite() && (0.0..=1.0).contains(&cache_candidate_ratio),
-            "--cache-candidate-ratio must be finite and in [0, 1]"
-        );
-        let cache_candidate_min_workers = cache
-            .cache_candidate_min_workers
-            .unwrap_or(defaults.cache_candidate_min_workers);
-        let cache_candidate_max_workers = cache
-            .cache_candidate_max_workers
-            .unwrap_or(defaults.cache_candidate_max_workers);
-        ensure!(
-            cache_candidate_min_workers > 0
-                && cache_candidate_max_workers > 0
-                && cache_candidate_min_workers <= cache_candidate_max_workers,
-            "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
-                 positive and min must not exceed max"
-        );
-        let session_idle_secs = session
-            .session_idle_secs
-            .unwrap_or(defaults.session_idle_secs);
-        let session_eviction_interval_secs = session
-            .session_eviction_interval_secs
-            .unwrap_or(defaults.session_eviction_interval_secs);
-        ensure!(
-            session_idle_secs != 0,
-            "--session-idle-secs must be greater than 0"
-        );
-        ensure!(
-            session_eviction_interval_secs != 0,
-            "--session-eviction-interval-secs must be greater than 0"
-        );
-        Ok(Some(AffinityConfig {
-            session_id_header,
-            session_idle_secs,
-            session_eviction_interval_secs,
-            stable_pair: session.stable_pair,
-            mode: session.affinity_mode.unwrap_or(defaults.mode),
-            session_affinity_mode: session
-                .session_affinity_mode
-                .unwrap_or(defaults.session_affinity_mode),
-            pressure_guard: !pressure.disable_pressure_guard && defaults.pressure_guard,
-            pressure_abs_threshold_tokens: pressure
-                .pressure_abs_threshold_tokens
-                .unwrap_or(defaults.pressure_abs_threshold_tokens),
-            pressure_abs_threshold_ms: pressure
-                .pressure_abs_threshold_ms
-                .or(defaults.pressure_abs_threshold_ms),
-            pressure_rel_threshold,
-            cache_affinity_min_matched_tokens: cache
-                .cache_affinity_min_matched_tokens
-                .or(defaults.cache_affinity_min_matched_tokens),
-            cache_affinity_min_match_ratio,
-            cache_candidate_min_workers,
-            cache_candidate_ratio,
-            cache_candidate_max_workers,
-            cache_switch_margin_tokens: cache
-                .cache_switch_margin_tokens
-                .unwrap_or(defaults.cache_switch_margin_tokens),
-            worker_queue_limit: cache.worker_queue_limit.or(defaults.worker_queue_limit),
-            saturation_queue_floor: cache
-                .saturation_queue_floor
-                .or(defaults.saturation_queue_floor),
-        }))
     }
 }
 
@@ -642,8 +430,8 @@ impl DiscoveryArgs {
     }
 }
 
-impl CircuitBreakerArgs {
-    fn into_config(self) -> Result<Option<CircuitBreakerConfig>> {
+impl RoutingArgs {
+    fn build_circuit_breaker(&self) -> Result<Option<CircuitBreakerConfig>> {
         ensure!(
             self.cb_cool_down_secs.is_none() || self.cb_threshold.is_some(),
             "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
@@ -655,6 +443,74 @@ impl CircuitBreakerArgs {
         });
 
         Ok(circuit_breaker)
+    }
+
+    fn build_fused(&self) -> Result<Option<Vec<FusedTerm>>> {
+        let is_score_composition = matches!(
+            self.policy,
+            PolicyKind::FusedScore | PolicyKind::ScorePolicy
+        );
+        ensure!(
+            self.fuse.is_empty() || is_score_composition,
+            "--fuse requires --policy score_policy or fused_score"
+        );
+        if !is_score_composition {
+            return Ok(None);
+        }
+        let terms = if self.fuse.is_empty() {
+            DEFAULT_FUSE
+                .iter()
+                .map(|&kind| FusedTerm { kind, weight: None })
+                .collect()
+        } else {
+            self.fuse.clone()
+        };
+        for (i, t) in terms.iter().enumerate() {
+            ensure!(
+                !terms[..i].iter().any(|p| p.kind == t.kind),
+                "--fuse: `{}` is listed more than once",
+                t.kind
+            );
+        }
+        Ok(Some(terms))
+    }
+
+    fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
+        for (i, kind) in self.filter.iter().enumerate() {
+            ensure!(
+                !self.filter[..i].contains(kind),
+                "--filter: `{kind}` is listed more than once"
+            );
+        }
+        let has = |k: FilterKind| self.filter.contains(&k);
+        ensure!(
+            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
+            "--max-in-flight and `--filter overloaded` require each other"
+        );
+        ensure!(
+            self.max_in_flight != Some(0),
+            "--max-in-flight must be greater than 0"
+        );
+        ensure!(
+            (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
+            "--prefix-cache-min-share and `--filter prefix_cache` require each other"
+        );
+        ensure!(
+            self.prefix_cache_min_share
+                .is_none_or(|s| s > 0.0 && s <= 1.0),
+            "--prefix-cache-min-share must be in (0, 1]"
+        );
+        ensure!(
+            self.policy != PolicyKind::Sticky || self.filter.is_empty(),
+            "--filter cannot be combined with --policy sticky"
+        );
+        let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
+            filters: self.filter.clone(),
+            max_in_flight: self.max_in_flight,
+            min_prefix_share: self.prefix_cache_min_share,
+        });
+
+        Ok(eligibility)
     }
 }
 
@@ -723,78 +579,169 @@ impl CacheArgs {
     }
 }
 
-impl ScoringArgs {
-    fn into_config(self, policy: PolicyKind) -> Result<Option<Vec<FusedTerm>>> {
-        let is_score_composition =
-            matches!(policy, PolicyKind::FusedScore | PolicyKind::ScorePolicy);
+impl AffinityArgs {
+    fn build_config(
+        &self,
+        cache: &CacheArgs,
+        policy: PolicyKind,
+    ) -> Result<Option<AffinityConfig>> {
+        let affinity_policy = matches!(policy, PolicyKind::SessionAware | PolicyKind::CacheAware);
+        let tuned_session_affinity = self.session_id_header.is_some()
+            || self.session_idle_secs.is_some()
+            || self.session_eviction_interval_secs.is_some()
+            || self.stable_pair
+            || self.affinity_mode.is_some()
+            || self.session_affinity_mode.is_some();
         ensure!(
-            self.fuse.is_empty() || is_score_composition,
-            "--fuse requires --policy score_policy or fused_score"
+            !tuned_session_affinity || policy == PolicyKind::SessionAware,
+            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+                 --session-affinity-mode require --policy session_aware"
         );
-        if !is_score_composition {
+        ensure!(
+            !self.disable_pressure_guard || affinity_policy,
+            "--disable-pressure-guard requires --policy session_aware or cache_aware"
+        );
+        let tuned_cache_candidates = cache.cache_affinity_min_matched_tokens.is_some()
+            || cache.cache_affinity_min_match_ratio.is_some()
+            || cache.cache_candidate_min_workers.is_some()
+            || cache.cache_candidate_ratio.is_some()
+            || cache.cache_candidate_max_workers.is_some()
+            || cache.cache_switch_margin_tokens.is_some()
+            || cache.worker_queue_limit.is_some()
+            || cache.saturation_queue_floor.is_some();
+        // Value checks before the policy check: a value that is wrong under
+        // every policy should say so, rather than pointing at --policy.
+        ensure!(
+            cache.worker_queue_limit != Some(0),
+            "--worker-queue-limit must be at least 1"
+        );
+        if let Some(floor) = cache.saturation_queue_floor {
+            // The floor modifies the gate's diversion; without the gate
+            // there is no diversion to cancel and the knob would sit dead.
+            let Some(limit) = cache.worker_queue_limit else {
+                return Err(anyhow!(
+                    "--saturation-queue-floor requires --worker-queue-limit (there is no \
+                     diversion to cancel without it)"
+                ));
+            };
+            ensure!(floor != 0, "--saturation-queue-floor must be at least 1");
+            ensure!(
+                floor <= limit,
+                "--saturation-queue-floor ({floor}) must be at most --worker-queue-limit \
+                     ({limit})"
+            );
+        }
+        ensure!(
+            !tuned_cache_candidates || policy == PolicyKind::CacheAware,
+            "cache candidate tuning flags require --policy cache_aware"
+        );
+        ensure!(
+            affinity_policy
+                || (self.pressure_abs_threshold_tokens.is_none()
+                    && self.pressure_abs_threshold_ms.is_none()
+                    && self.pressure_rel_threshold.is_none()),
+            "pressure guard tuning requires --policy session_aware or cache_aware"
+        );
+        if !affinity_policy {
             return Ok(None);
         }
-        let terms = if self.fuse.is_empty() {
-            DEFAULT_FUSE
-                .iter()
-                .map(|&kind| FusedTerm { kind, weight: None })
-                .collect()
-        } else {
-            self.fuse
-        };
-        for (i, t) in terms.iter().enumerate() {
-            ensure!(
-                !terms[..i].iter().any(|p| p.kind == t.kind),
-                "--fuse: `{}` is listed more than once",
-                t.kind
-            );
-        }
-        Ok(Some(terms))
+        let defaults = AffinityConfig::default();
+        let session_id_header = self
+            .session_id_header
+            .clone()
+            .unwrap_or(defaults.session_id_header);
+        axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+            anyhow!(
+                "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+            )
+        })?;
+        let pressure_rel_threshold = self
+            .pressure_rel_threshold
+            .unwrap_or(defaults.pressure_rel_threshold);
+        ensure!(
+            pressure_rel_threshold.is_finite() && pressure_rel_threshold > 1.0,
+            "--pressure-rel-threshold must be finite and greater than 1"
+        );
+        ensure!(
+            self.pressure_abs_threshold_ms
+                .is_none_or(|threshold| threshold.is_finite() && threshold >= 0.0),
+            "--pressure-abs-threshold-ms must be finite and non-negative"
+        );
+        let cache_affinity_min_match_ratio = cache
+            .cache_affinity_min_match_ratio
+            .or(defaults.cache_affinity_min_match_ratio);
+        ensure!(
+            cache_affinity_min_match_ratio
+                .is_none_or(|ratio| ratio.is_finite() && (0.0..=1.0).contains(&ratio)),
+            "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
+        );
+        let cache_candidate_ratio = cache
+            .cache_candidate_ratio
+            .unwrap_or(defaults.cache_candidate_ratio);
+        ensure!(
+            cache_candidate_ratio.is_finite() && (0.0..=1.0).contains(&cache_candidate_ratio),
+            "--cache-candidate-ratio must be finite and in [0, 1]"
+        );
+        let cache_candidate_min_workers = cache
+            .cache_candidate_min_workers
+            .unwrap_or(defaults.cache_candidate_min_workers);
+        let cache_candidate_max_workers = cache
+            .cache_candidate_max_workers
+            .unwrap_or(defaults.cache_candidate_max_workers);
+        ensure!(
+            cache_candidate_min_workers > 0
+                && cache_candidate_max_workers > 0
+                && cache_candidate_min_workers <= cache_candidate_max_workers,
+            "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
+                 positive and min must not exceed max"
+        );
+        let session_idle_secs = self.session_idle_secs.unwrap_or(defaults.session_idle_secs);
+        let session_eviction_interval_secs = self
+            .session_eviction_interval_secs
+            .unwrap_or(defaults.session_eviction_interval_secs);
+        ensure!(
+            session_idle_secs != 0,
+            "--session-idle-secs must be greater than 0"
+        );
+        ensure!(
+            session_eviction_interval_secs != 0,
+            "--session-eviction-interval-secs must be greater than 0"
+        );
+        Ok(Some(AffinityConfig {
+            session_id_header,
+            session_idle_secs,
+            session_eviction_interval_secs,
+            stable_pair: self.stable_pair,
+            mode: self.affinity_mode.unwrap_or(defaults.mode),
+            session_affinity_mode: self
+                .session_affinity_mode
+                .unwrap_or(defaults.session_affinity_mode),
+            pressure_guard: !self.disable_pressure_guard && defaults.pressure_guard,
+            pressure_abs_threshold_tokens: self
+                .pressure_abs_threshold_tokens
+                .unwrap_or(defaults.pressure_abs_threshold_tokens),
+            pressure_abs_threshold_ms: self
+                .pressure_abs_threshold_ms
+                .or(defaults.pressure_abs_threshold_ms),
+            pressure_rel_threshold,
+            cache_affinity_min_matched_tokens: cache
+                .cache_affinity_min_matched_tokens
+                .or(defaults.cache_affinity_min_matched_tokens),
+            cache_affinity_min_match_ratio,
+            cache_candidate_min_workers,
+            cache_candidate_ratio,
+            cache_candidate_max_workers,
+            cache_switch_margin_tokens: cache
+                .cache_switch_margin_tokens
+                .unwrap_or(defaults.cache_switch_margin_tokens),
+            worker_queue_limit: cache.worker_queue_limit.or(defaults.worker_queue_limit),
+            saturation_queue_floor: cache
+                .saturation_queue_floor
+                .or(defaults.saturation_queue_floor),
+        }))
     }
-}
 
-impl AdmissionArgs {
-    fn into_config(self, policy: PolicyKind) -> Result<Option<EligibilityConfig>> {
-        for (i, kind) in self.filter.iter().enumerate() {
-            ensure!(
-                !self.filter[..i].contains(kind),
-                "--filter: `{kind}` is listed more than once"
-            );
-        }
-        let has = |k: FilterKind| self.filter.contains(&k);
-        ensure!(
-            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
-            "--max-in-flight and `--filter overloaded` require each other"
-        );
-        ensure!(
-            self.max_in_flight != Some(0),
-            "--max-in-flight must be greater than 0"
-        );
-        ensure!(
-            (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
-            "--prefix-cache-min-share and `--filter prefix_cache` require each other"
-        );
-        ensure!(
-            self.prefix_cache_min_share
-                .is_none_or(|s| s > 0.0 && s <= 1.0),
-            "--prefix-cache-min-share must be in (0, 1]"
-        );
-        ensure!(
-            policy != PolicyKind::Sticky || self.filter.is_empty(),
-            "--filter cannot be combined with --policy sticky"
-        );
-        let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
-            filters: self.filter,
-            max_in_flight: self.max_in_flight,
-            min_prefix_share: self.prefix_cache_min_share,
-        });
-
-        Ok(eligibility)
-    }
-}
-
-impl StickyArgs {
-    fn into_config(self, policy: PolicyKind) -> Result<Option<StickyConfig>> {
+    fn into_sticky_config(self, policy: PolicyKind) -> Result<Option<StickyConfig>> {
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -894,6 +841,15 @@ mod tests {
                 command.render_help()
             }
             .to_string();
+            let headings: std::collections::HashSet<_> = command
+                .get_arguments()
+                .filter_map(|arg| arg.get_help_heading())
+                .collect();
+            assert_eq!(
+                headings.len(),
+                6,
+                "keep related options in six broad groups"
+            );
             for arg in command
                 .get_arguments()
                 .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
@@ -1532,8 +1488,11 @@ mod tests {
             .split_once("--sticky-fallback-policy <STICKY_FALLBACK_POLICY>")
             .expect("sticky fallback option is documented");
         let choices = after
-            .split_once("--sticky-idle-secs")
-            .expect("sticky fallback precedes its tuning")
+            .split_once("[possible values:")
+            .expect("sticky fallback lists its choices")
+            .1
+            .split_once(']')
+            .unwrap()
             .0;
 
         for value in ["round_robin", "random", "power_of_two", "load_based"] {
