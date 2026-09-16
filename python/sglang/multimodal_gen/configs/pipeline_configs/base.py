@@ -222,6 +222,9 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
+    # Registered DiT class to load instead of the checkpoint's ``_class_name``,
+    # for pipelines that drive shared weights with a different forward.
+    transformer_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
