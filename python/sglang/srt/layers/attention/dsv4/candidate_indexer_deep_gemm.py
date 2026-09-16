@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     IndexerInputs,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
-    fp4_paged_mqa_logits,
+    deep_gemm_fp4_paged_mqa_logits,
 )
 
 CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
@@ -37,17 +37,11 @@ class SparseBlockTable(CandidateMetadata):
     # top-k maps column j of the sparse row to slot phys_blocks[b, j // 8] * 8 + j % 8
     # with the plain page-table transform at page size 8
     phys_blocks: torch.Tensor
-    # [rows] int32: length of each row of the sparse logits (see `valid_lens`)
+    # [rows] int32: length of each row of the sparse logits: the published blocks
+    # laid out block by block, the newest possibly partial (`candidate_row_lens`)
     valid_lens: torch.Tensor
-
-
-def valid_lens(seq_lens: torch.Tensor, topk_blocks: int) -> torch.Tensor:
-    """Length of each row of the sparse logits: the published blocks laid out
-    block by block, the newest (highest) block possibly partial. Torch reference
-    of ``candidate_row_lens``; the decode path takes the kernel's value."""
-    block = CANDIDATE_BLOCK_SIZE
-    num = ((seq_lens + block - 1) // block).clamp_max(topk_blocks)
-    return block * (num - 1) + (seq_lens - 1) % block + 1
+    # recorded on the side stream once the fields above are complete
+    ready: torch.cuda.Event
 
 
 def amax_topk_blocks(
@@ -59,9 +53,8 @@ def amax_topk_blocks(
 ) -> torch.Tensor:
     """Per row the ``topk_blocks`` blocks of 8 positions with the largest block
     maximum among its first ``seq_lens[b]`` positions, the newest block always
-    included: block ids in no particular order, ``-1`` past the row's count
-    (``sort_candidate_blocks`` turns them into the published table). ``nblocks``
-    is ``ceil(seq_lens / 8)`` as int32, from ``candidate_row_lens``."""
+    included: block ids in no particular order, ``-1`` past the row's count.
+    ``nblocks`` is ``ceil(seq_lens / 8)`` as int32."""
     rows = logits.shape[0]
     block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
@@ -77,41 +70,21 @@ def amax_topk_blocks(
     return blocks
 
 
-_ROW_IDS: dict = {}
-
-
-def _row_ids(rows: int, device: torch.device) -> torch.Tensor:
-    """``arange(rows)`` int32 from a cached buffer (grown in steps of 8192), so the
-    every-row-its-own-request case costs no launch."""
-    buf = _ROW_IDS.get(device)
-    if buf is None or buf.numel() < rows:
-        size = max(8192, -(-rows // 8192) * 8192)
-        buf = _ROW_IDS[device] = torch.arange(size, dtype=torch.int32, device=device)
-    return buf[:rows]
-
-
 def build_sparse_indexer_schedule(
     blocks: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     page_size: int,
     q_dtype: torch.dtype,
-    request_ids: Optional[torch.Tensor] = None,
+    request_ids: torch.Tensor,
 ) -> torch.Tensor:
     """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
     int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
-    ``request_ids`` ``[rows]``, one id per row with a request's rows consecutive
-    (verify: its draft tokens), lets DeepGEMM pair two rows of a request on one
-    KV pass; each row keeps its own block list and output layout. Paired rows
-    must share their page-table row. None: every row is its own request."""
+    ``request_ids`` ``[rows]`` int32 lets DeepGEMM pair two rows of a request on
+    one KV pass; each row keeps its own block list and output layout, and paired
+    rows must share their page-table row."""
     import deep_gemm
 
-    rows = blocks.shape[0]
-    if request_ids is None:
-        request_ids = _row_ids(rows, blocks.device)  # cached, no launch
-    else:
-        # the scheduler keeps request indices as int64; one small cast per publish
-        request_ids = request_ids[:rows].to(torch.int32).contiguous()
     return deep_gemm.get_paged_sparse_mqa_logits_metadata(
         seq_lens.contiguous(),
         page_table,
@@ -155,32 +128,42 @@ def topk_transform_sparse(
     """Top-``k`` (``k = page_indices.shape[1]``) of every row of the sparse
     ``logits`` (bf16 ``[rows, topk_blocks * 8]``) within its first ``valid_lens[b]``
     columns, written as pool slots, ``-1`` where a row has fewer than ``k`` valid
-    columns, in no particular order. Column ``j`` is slot
-    ``phys_blocks[b, j // 8] * 8 + j % 8``: the bf16 top-k kernel's page-table
-    transform at page size 8 over the physical block table."""
+    columns, in no particular order."""
     topk_transform_bf16_small(
         logits, valid_lens, table.phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
     )
 
 
-def warmup(rows: int, topk_blocks: int, page_size: int, q_dtype: torch.dtype, device):
-    """Build one schedule so DeepGEMM allocates its per-stream metadata workspace
-    outside any CUDA-graph capture."""
-    seq_lens = torch.full(
-        (rows,), CANDIDATE_BLOCK_SIZE, dtype=torch.int32, device=device
-    )
-    blocks = torch.zeros(rows, topk_blocks, dtype=torch.int32, device=device)
-    page_table = torch.zeros(rows, 1, dtype=torch.int32, device=device)
-    build_sparse_indexer_schedule(blocks, seq_lens, page_table, page_size, q_dtype)
-
-
+# TODO(dark): support publish prefill/select prefill
+# TODO(dark): support fusion of publish + topk of publish layer
 class DeepGemmCandidateIndexer:
     def __init__(self, topk_blocks: int, block_size: int):
         assert block_size == CANDIDATE_BLOCK_SIZE, block_size
         self.topk_blocks = topk_blocks
         self.block_size = block_size
         self.alt_stream = torch.cuda.Stream()
-        self.need_wait = False
+        self._row_ids: Optional[torch.Tensor] = None
+        self._retired_row_ids: list = []  # captured graphs keep reading the buffers they saw
+
+    def _request_ids(
+        self, request_ids: Optional[torch.Tensor], rows: int, device: torch.device
+    ) -> torch.Tensor:
+        """int32 ``[rows]``; None means every row is its own request, served from a
+        cached ``arange`` (grown in steps of 8192) so that case costs no launch."""
+        if request_ids is not None:
+            # the scheduler keeps request indices as int64; one small cast per publish
+            return request_ids[:rows].to(torch.int32).contiguous()
+        buf = self._row_ids
+        if buf is None or buf.numel() < rows:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"row-id buffer grows to {rows} rows inside a CUDA graph capture; "
+                "warm up with the largest row count first"
+            )
+            if buf is not None:
+                self._retired_row_ids.append(buf)
+            size = max(8192, -(-rows // 8192) * 8192)
+            buf = self._row_ids = torch.arange(size, dtype=torch.int32, device=device)
+        return buf[:rows]
 
     def publish_decode(
         self,
@@ -188,13 +171,12 @@ class DeepGemmCandidateIndexer:
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> SparseBlockTable:
-        """Layer 20 end to end: dense logits, its own plain top-k into
-        ``page_indices`` (and ``raw_indices`` when given), the block table from
-        the same logits and DeepGEMM's schedule for it; the backend stores the
-        table on the forward metadata."""
+        """The publishing layer's own plain top-k into ``page_indices``, plus the
+        block table for the consumers; the backend stores it on the forward
+        metadata."""
         metadata = inputs.metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
-        logits = fp4_paged_mqa_logits(
+        logits = deep_gemm_fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
@@ -203,10 +185,10 @@ class DeepGemmCandidateIndexer:
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
-        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        main_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(main_stream)
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
-        self.need_wait = True
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         topk_transform_paged_v2(
             logits,
@@ -234,18 +216,22 @@ class DeepGemmCandidateIndexer:
                 metadata.page_table,
                 metadata.compressed_page_size,
                 inputs.q_fp4.dtype,
-                inputs.request_ids,
+                self._request_ids(inputs.request_ids, inputs.num_rows, blocks.device),
             )
+            # select_decode reads these on the main stream
+            for t in (blocks, schedule, phys_blocks, row_valid_lens):
+                t.record_stream(main_stream)
+            ready = torch.cuda.Event()
+            ready.record(self.alt_stream)
             return SparseBlockTable(
                 blocks=blocks,
                 schedule=schedule,
                 phys_blocks=phys_blocks,
                 valid_lens=row_valid_lens,
+                ready=ready,
             )
 
-    def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
-        """A consumer: bf16 logits ``[rows, topk_blocks * 8]`` of the published
-        blocks only."""
+    def _scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
         return sparse_logits(
             inputs.q_fp4,
             inputs.q_sf,
@@ -261,15 +247,9 @@ class DeepGemmCandidateIndexer:
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        """A consumer: top-``k`` (``k = page_indices.shape[1]``) inside the
-        published blocks, written ascending as slots through the page table with
-        ``-1`` past the valid count (and as positions into ``raw_indices`` when
-        given)."""
         assert raw_indices is None
         table = candidate_metadata
-        if self.need_wait:
-            self.need_wait = False
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
-        logits = self.scores(table, inputs)
+        torch.cuda.current_stream().wait_event(table.ready)
+        logits = self._scores(table, inputs)
         # decode carries no raw_indices; the kernel writes slots only
         topk_transform_sparse(logits, table.valid_lens, table, page_indices)
