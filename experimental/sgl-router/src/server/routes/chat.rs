@@ -109,10 +109,10 @@ enum ProbedValue {
     Unusable,
 }
 
-/// Longest numeric string the probe will normalize. A sampling value is a
-/// short literal, so the cap keeps a client-sized string off the
-/// underscore-stripping path below; an over-long one stays
-/// [`ProbedValue::Unusable`], which `reject` refuses rather than forwards.
+/// Longest numeric string the probe will read. A sampling value is a short
+/// literal, so the cap keeps a client-sized string off the parse path
+/// entirely; an over-long one stays [`ProbedValue::Unusable`], which `reject`
+/// refuses rather than forwards.
 const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
 
 /// Read a string the way the engine's pydantic lax mode reads it.
@@ -132,7 +132,14 @@ const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
 /// decides how much of what the engine accepts is answered precisely instead
 /// of with a 400.
 fn parse_as_engine_number(s: &str) -> Option<f64> {
-    if let Ok(v) = s.trim().parse::<f64>() {
+    // Bounded BEFORE the first parse, not just before the underscore path: the
+    // string is client-controlled and can run to the body limit, and parsing
+    // one is linear in its length. Nothing that long is a sampling value.
+    let trimmed = s.trim();
+    if trimmed.len() > MAX_SAMPLING_NUMERIC_LEN {
+        return None;
+    }
+    if let Ok(v) = trimmed.parse::<f64>() {
         return Some(v);
     }
     if s.len() > MAX_SAMPLING_NUMERIC_LEN
@@ -293,57 +300,98 @@ impl<'de> Deserialize<'de> for ProbeKey {
     }
 }
 
-impl<'de> Deserialize<'de> for RequestProbe {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct ProbeVisitor;
-        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
-            type Value = RequestProbe;
+/// Reads the probed fields out of the request object.
+///
+/// `read_sampling` is false only on [`probe_without_sampling_values`]'s
+/// fallback pass, where a sampling value is scanned rather than converted.
+struct ProbeVisitor {
+    read_sampling: bool,
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
+impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+    type Value = RequestProbe;
 
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<RequestProbe, M::Error> {
-                let mut probe = RequestProbe::default();
-                let mut seen = 0u8;
-                while let Some(key) = map.next_key::<ProbeKey>()? {
-                    match key {
-                        ProbeKey::Routing(r) => {
-                            if seen & r.bit() != 0 {
-                                return Err(serde::de::Error::custom(format_args!(
-                                    "duplicate field `{}`",
-                                    r.wire_name()
-                                )));
-                            }
-                            seen |= r.bit();
-                            match r {
-                                RoutingKey::Stream => probe.stream = map.next_value()?,
-                                RoutingKey::Model => probe.model = map.next_value()?,
-                                RoutingKey::MaxTokens => probe.max_tokens = map.next_value()?,
-                                RoutingKey::MaxCompletionTokens => {
-                                    probe.max_completion_tokens = map.next_value()?
-                                }
-                            }
-                        }
-                        ProbeKey::Sampling(field) => {
-                            probe.sampling[field.index()] = map.next_value()?;
-                        }
-                        ProbeKey::Other => {
-                            map.next_value::<IgnoredAny>()?;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<RequestProbe, M::Error> {
+        let mut probe = RequestProbe::default();
+        let mut seen = 0u8;
+        while let Some(key) = map.next_key::<ProbeKey>()? {
+            match key {
+                ProbeKey::Routing(r) => {
+                    if seen & r.bit() != 0 {
+                        return Err(serde::de::Error::custom(format_args!(
+                            "duplicate field `{}`",
+                            r.wire_name()
+                        )));
+                    }
+                    seen |= r.bit();
+                    match r {
+                        RoutingKey::Stream => probe.stream = map.next_value()?,
+                        RoutingKey::Model => probe.model = map.next_value()?,
+                        RoutingKey::MaxTokens => probe.max_tokens = map.next_value()?,
+                        RoutingKey::MaxCompletionTokens => {
+                            probe.max_completion_tokens = map.next_value()?
                         }
                     }
                 }
-                Ok(probe)
+                ProbeKey::Sampling(field) => {
+                    probe.sampling[field.index()] = if self.read_sampling {
+                        map.next_value()?
+                    } else {
+                        // Scanned, not converted — the whole point of
+                        // this pass. The key IS present, so it is
+                        // unreadable rather than absent: a contract
+                        // must not inject over a value the client sent.
+                        map.next_value::<IgnoredAny>()?;
+                        ProbedValue::Unusable
+                    };
+                }
+                ProbeKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
+        Ok(probe)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // `deserialize_map` is what pins the body to a JSON object: `null`,
         // `[]` and `"hi"` are all rejected here, so no separate shape-anchoring
         // pass is needed.
-        d.deserialize_map(ProbeVisitor)
+        d.deserialize_map(ProbeVisitor {
+            read_sampling: true,
+        })
     }
+}
+
+/// Re-read a body without converting its sampling values.
+///
+/// serde_json converts a number literal while resolving [`ProbedValue`], so a
+/// governed key holding one outside `f64`'s range — `{"temperature": 1e400}` —
+/// fails the WHOLE parse, where the `IgnoredAny` that covered these keys
+/// before the contract existed scanned past it. Left alone that 400s a body
+/// the router used to forward, on a request nothing has opted in to, with a
+/// message ("body must be a JSON object") that is not even true of it.
+///
+/// So the probe falls back to this pass, which reads the routing keys exactly
+/// as before and marks each sampling key present-but-unreadable. A governed
+/// `reject` then refuses it, which is the same answer it gives any other value
+/// it cannot represent.
+fn probe_without_sampling_values(body: &[u8]) -> Result<RequestProbe, serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let probe = serde::Deserializer::deserialize_map(
+        &mut de,
+        ProbeVisitor {
+            read_sampling: false,
+        },
+    )?;
+    de.end()?;
+    Ok(probe)
 }
 
 impl RequestProbe {
@@ -1451,13 +1499,24 @@ fn apply_sampling_overrides(
     // Length is a startup constant, and `Vec::with_capacity(0)` does not
     // allocate — so an unconfigured contract still costs nothing.
     let mut inject = Vec::with_capacity(overrides.params.len());
+    // Every configured parameter is judged even after one has failed. The
+    // counter is how an operator sizes a rollout's blast radius per parameter,
+    // and stopping at the first violation would report zero for every
+    // parameter that sorts after it — a fleet violating both `temperature` and
+    // `top_p` on every request would look like it violates only `temperature`.
+    // The client is still told about one parameter, so the 400 stays one
+    // sentence.
+    let mut first_violation: Option<ApiError> = None;
     for (&field, spec) in &overrides.params {
         let name = field.wire_name();
-        let reject = |detail: String| {
+        let violation = |detail: String, first: &mut Option<ApiError>| {
             metrics.record_sampling_contract_rejection(name);
-            ApiError::SamplingContract {
+            let err = ApiError::SamplingContract {
                 param: name,
                 detail,
+            };
+            if first.is_none() {
+                *first = Some(err);
             }
         };
         let got = match probe.sampling_field(field) {
@@ -1475,33 +1534,46 @@ fn apply_sampling_overrides(
             // A value the router cannot read as a number is a value it cannot
             // prove conforms. Under `reject` that is a refusal, not a pass.
             ProbedValue::Unusable => {
-                return Err(reject(match spec {
-                    ParamSpec::Exact(want) => {
-                        format!("expected {want} (or omit the field), got a non-numeric value")
-                    }
-                    &ParamSpec::Range { lo, hi } => {
-                        format!("must be a number between {lo} and {hi}, got a non-numeric value")
-                    }
-                }));
+                violation(
+                    match spec {
+                        ParamSpec::Exact(want) => {
+                            format!("expected {want} (or omit the field), got a non-numeric value")
+                        }
+                        &ParamSpec::Range { lo, hi } => {
+                            format!(
+                                "must be a number between {lo} and {hi}, got a non-numeric value"
+                            )
+                        }
+                    },
+                    &mut first_violation,
+                );
+                continue;
             }
             ProbedValue::Number(got) => got,
         };
         match spec {
             ParamSpec::Exact(want) => {
                 if Some(got) != want.as_f64() {
-                    return Err(reject(format!(
-                        "got {got}, expected {want} (or omit the field)"
-                    )));
+                    violation(
+                        format!("got {got}, expected {want} (or omit the field)"),
+                        &mut first_violation,
+                    );
                 }
             }
             &ParamSpec::Range { lo, hi } => {
                 if !(lo..=hi).contains(&got) {
-                    return Err(reject(format!("must be between {lo} and {hi}, got {got}")));
+                    violation(
+                        format!("must be between {lo} and {hi}, got {got}"),
+                        &mut first_violation,
+                    );
                 }
             }
         }
     }
-    Ok(inject)
+    match first_violation {
+        Some(err) => Err(err),
+        None => Ok(inject),
+    }
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
@@ -1517,10 +1589,21 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     // skipping the unknown majority through `IgnoredAny`. It never builds a
     // `serde_json::Value` and allocates nothing per unrecognized key, so the
     // shape check costs no separate pass over a multi-MiB body.
-    serde_json::from_slice(body).map_err(|e| {
-        tracing::debug!(error = %e, "chat-completions request-probe deserialize failed");
-        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-    })
+    let err = match serde_json::from_slice::<RequestProbe>(body) {
+        Ok(probe) => return Ok(probe),
+        Err(e) => e,
+    };
+    // The one failure this pass can invent that the fallback cannot is
+    // converting a sampling number literal; malformed JSON, a non-object body
+    // and a duplicated routing key all fail both, so retrying here cannot
+    // launder a body that is genuinely bad.
+    if let Ok(probe) = probe_without_sampling_values(body) {
+        return Ok(probe);
+    }
+    tracing::debug!(error = %err, "chat-completions request-probe deserialize failed");
+    Err(ApiError::BadRequest(
+        "invalid request: body must be a JSON object".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -2224,10 +2307,9 @@ mod tests {
     }
 
     /// A sampling key carrying a huge non-numeric value must cost nothing: it
-    /// is drained, not materialized, and it does not fail the probe. Before
-    /// these fields were probed the value was skipped by `IgnoredAny`, and
-    /// probing them must not put a client-sized allocation back on the path
-    /// nor start rejecting bodies that used to be forwarded.
+    /// is drained, not materialized, and it does not fail the probe. Probing
+    /// these keys must neither put a client-sized allocation on the request
+    /// path nor reject a body an ungoverned router forwards.
     #[test]
     fn oversized_non_numeric_sampling_value_is_drained_not_materialized() {
         let big_array = format!("[{}]", "1,".repeat(50_000) + "1");
@@ -2317,11 +2399,11 @@ mod tests {
         );
     }
 
-    /// The two bypasses reported on the PR: the engine reads both of these as
-    /// numbers, so a `reject` contract that waved them through was pinning
-    /// nothing. `false` is 0 and `"0.5_0"` is 0.5 to pydantic — a pin of 1
-    /// must refuse both, and a pin of the value they coerce to must accept
-    /// them, since the engine will sample with exactly that.
+    /// The engine reads each of these as a number, so a contract that waved
+    /// them through would pin nothing. `false` is 0 and `"0.5_0"` is 0.5 to
+    /// pydantic — a pin of 1 must refuse both, and a pin of the value they
+    /// coerce to must accept them, since the engine samples with exactly
+    /// that.
     #[test]
     fn values_the_engine_reads_as_numbers_are_judged_not_waved_through() {
         for (body_value, engine_sees) in [("false", 0.0), ("true", 1.0), (r#""0.5_0""#, 0.5)] {
@@ -2497,5 +2579,105 @@ mod tests {
                 metrics.render()
             );
         }
+    }
+
+    /// A number literal outside `f64`'s range must not fail the probe.
+    ///
+    /// serde_json converts a literal while resolving `ProbedValue`, and errors
+    /// rather than saturating — so probing the sampling keys turned
+    /// `{"temperature": 1e400}` into a 400 whose message ("body must be a JSON
+    /// object") was not true of it, on a router with no contract configured.
+    /// An unprobed key holding the same literal was unaffected, which is the
+    /// asymmetry that gives the bug away.
+    #[test]
+    fn out_of_range_number_literal_does_not_fail_the_probe() {
+        for body in [
+            r#"{"model":"x","temperature":1e400}"#,
+            r#"{"model":"x","temperature":-1e309}"#,
+            r#"{"model":"x","top_k":1E1000,"stream":true}"#,
+        ] {
+            let probe = parse_probe(&Bytes::copy_from_slice(body.as_bytes()))
+                .unwrap_or_else(|e| panic!("{body} must still parse: {e:?}"));
+            assert_eq!(probe.model.as_deref(), Some("x"), "{body}");
+        }
+        // Routing fields still come through on the fallback pass.
+        let probe = probe_of(r#"{"model":"x","temperature":1e400,"stream":true}"#);
+        assert_eq!(probe.stream, Some(true));
+
+        // The key was PRESENT, so it is unreadable rather than absent: a
+        // contract must not inject over a value the client sent...
+        let probe = probe_of(r#"{"model":"x","temperature":1e400}"#);
+        assert_eq!(
+            probe.sampling_field(SamplingField::Temperature),
+            ProbedValue::Unusable
+        );
+        let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&allow, &probe, &metrics())
+            .unwrap()
+            .is_empty());
+        // ...and `reject` refuses it, as it does any value it cannot read.
+        let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&reject, &probe, &metrics()).is_err());
+
+        // A body that is genuinely malformed still 400s -- the fallback must
+        // not launder one.
+        for bad in [
+            r#"{"model":"x","stream":true,"stream":false}"#,
+            "[]",
+            "null",
+            "{oops",
+        ] {
+            assert!(
+                parse_probe(&Bytes::copy_from_slice(bad.as_bytes())).is_err(),
+                "{bad} must still be rejected"
+            );
+        }
+    }
+
+    /// The counter answers "how much traffic is the contract turning away, and
+    /// on which parameter". Stopping at the first violation would report zero
+    /// for every parameter sorting after it, so a fleet violating two would
+    /// look like it violates one — and the operator would roll the second out
+    /// believing it had no blast radius.
+    #[test]
+    fn every_violated_parameter_is_counted_not_just_the_first() {
+        let overrides = overrides_of(
+            ConflictPolicy::Reject,
+            r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
+        );
+        let metrics = metrics();
+        let probe = probe_of(r#"{"model":"x","temperature":0.7,"top_p":0.8,"n":2}"#);
+
+        let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+        // The client still hears about one parameter.
+        let ApiError::SamplingContract { param, .. } = &err else {
+            panic!("expected SamplingContract, got {err:?}");
+        };
+        assert_eq!(*param, "temperature");
+
+        let rendered = metrics.render();
+        for name in ["temperature", "top_p", "n"] {
+            assert!(
+                rendered.contains(&format!(
+                    r#"sgl_router_sampling_contract_rejections_total{{param="{name}"}} 1"#
+                )),
+                "{name} must be counted:\n{rendered}"
+            );
+        }
+    }
+
+    /// The cap applies to the plain parse too, not only the underscore path:
+    /// the string is client-controlled and parsing one is linear in its
+    /// length, so an unbounded digit run would be free CPU amplification on
+    /// every request that carries one.
+    #[test]
+    fn overlong_plain_numeric_string_is_not_parsed() {
+        let long = "1".repeat(MAX_SAMPLING_NUMERIC_LEN + 1);
+        assert_eq!(parse_as_engine_number(&long), None);
+        assert_eq!(
+            parse_as_engine_number(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
+            "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
+            "a value at the cap is still read"
+        );
     }
 }

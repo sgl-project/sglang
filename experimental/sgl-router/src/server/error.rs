@@ -29,7 +29,7 @@ pub enum ApiError {
     /// `param` is a `&'static str` from
     /// [`crate::config::SamplingField::wire_name`], which keeps it usable as a
     /// bounded metric label.
-    #[error("{param} is fixed by this deployment: {detail}")]
+    #[error("{param} violates this deployment's sampling contract: {detail}")]
     SamplingContract { param: &'static str, detail: String },
 
     /// Could not reach the upstream worker (connect refused, DNS, TLS, request
