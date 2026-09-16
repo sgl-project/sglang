@@ -6,6 +6,7 @@ from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
+    is_xpu,
     lazy_fallback,
     select_impl,
 )
@@ -420,8 +421,8 @@ def fuse_scale_shift_kernel(
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
         scale_reshaped = scale.squeeze(2).reshape(-1, C).contiguous()
-        if shift.dim() == 4 and is_hip():
-            # ROCm has no fused CUTLASS scale-shift kernel, so this native path
+        if shift.dim() == 4 and (is_hip() or is_xpu()):
+            # ROCm and XPU lack a fused CUTLASS scale-shift kernel, so this path
             # handles the causal Wan / LingBot output AdaLN, which passes a
             # per-frame shift [B, F, 1, C]. Broadcast it across each frame's
             # tokens to per-token [B, L, C] before flattening to [B*L, C],
