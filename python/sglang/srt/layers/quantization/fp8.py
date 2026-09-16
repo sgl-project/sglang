@@ -184,7 +184,7 @@ DSV4_DEQUANT_FP4_TABLE = torch.tensor(
         3.0,
         4.0,
         6.0,
-        0.0,
+        -0.0,
         -0.5,
         -1.0,
         -1.5,
