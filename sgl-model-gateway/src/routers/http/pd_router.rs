@@ -715,9 +715,27 @@ impl PDRouter {
         let mut prefill_fut: futures::future::BoxFuture<
             'static,
             Result<reqwest::Response, reqwest::Error>,
-        > = Box::pin(prefill_request.send());
-        let decode_fut = decode_request.send();
-        tokio::pin!(decode_fut);
+        > = Box::pin(async move {
+            // Treat a prefill leg as pending until its body is drained, not just
+            // until headers arrive. SSE keepalives/early headers are not proof
+            // that KV transfer has completed. Decode may stream meanwhile.
+            let response = prefill_request.send().await?;
+            if !response.status().is_success() {
+                // Rejecting headers are enough to cancel the paired decoder.
+                // Error bodies may themselves be slow or streaming.
+                return Ok(response);
+            }
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let body = response.bytes().await?;
+            let mut completed = http::Response::new(body);
+            *completed.status_mut() = status;
+            *completed.version_mut() = version;
+            *completed.headers_mut() = headers;
+            Ok(reqwest::Response::from(completed))
+        });
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
@@ -740,14 +758,40 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
+                    match dr {
+                        Ok(res) if !res.status().is_success() => {
+                            // D cannot use the prefill result. Cancel P before
+                            // reading the error body, which may also be slow.
+                            drop(prefill_fut);
+                            let status = res.status();
+                            // Streaming errors have a tracked SSE body.
+                            if !context.is_stream {
+                                decode.record_outcome(status.is_client_error());
+                            }
+                            let mut response = self
+                                .handle_decode_error_response(res, &context, prefill, decode)
+                                .await;
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Err(e) => {
+                            drop(prefill_fut);
+                            decode.record_outcome(false);
+                            let mut response = error::bad_gateway(
+                                "decode_server_error",
+                                format!("Decode server error: {}", e),
+                            );
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Ok(res) => decode_early = Some(Ok(res)),
+                    }
                     if context.is_stream
                         && !context.return_logprob
-                        && matches!(&dr, Ok(res) if res.status().is_success())
                     {
-                        decode_commit = dr.ok();
+                        decode_commit = decode_early.take().and_then(Result::ok);
                         break;
                     }
-                    decode_early = Some(dr);
                 }
             }
         }
@@ -757,7 +801,7 @@ impl PDRouter {
             let status = StatusCode::from_u16(res.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let response_headers = header_utils::preserve_response_headers(res.headers());
-            return self.create_streaming_response(
+            let mut response = self.create_streaming_response(
                 res.bytes_stream(),
                 status,
                 None,
@@ -767,6 +811,9 @@ impl PDRouter {
                 decode,
                 Some(prefill_fut),
             );
+            // The relay records both workers when their actual legs finish.
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
         }
         let prefill_result =
             prefill_result.expect("dispatch loop exits with prefill resolved or decode committed");
@@ -782,6 +829,10 @@ impl PDRouter {
         };
 
         if prefill_failed {
+            // Cancel either a pending connection or an already-received D body
+            // before awaiting the prefill error payload.
+            drop(decode_fut);
+            drop(decode_early);
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
@@ -1200,6 +1251,7 @@ impl PDRouter {
             None => Box::pin(std::future::pending()),
         };
         tokio::spawn(async move {
+            let mut cancel_prefill = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1226,7 +1278,8 @@ impl PDRouter {
                                     "code": 502
                                 }
                             });
-                            let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {}\n\n", err))));
+                            let event = format!("data: {}\n\n", err);
+                            let _ = tx.send(Ok(bytes::Bytes::from(event)));
                             break;
                         }
                         if let Ok(resp) = pr {
@@ -1262,6 +1315,7 @@ impl PDRouter {
                                 }
 
                                 if tx.send(Ok(result)).is_err() {
+                                    cancel_prefill = true;
                                     tracing::debug!(
                                         "Receiver dropped (likely client disconnect), \
                                         cancelling upstream PD stream"
@@ -1274,6 +1328,8 @@ impl PDRouter {
                                 }
                             }
                             Some(Err(e)) => {
+                                // D can no longer consume P's result.
+                                cancel_prefill = true;
                                 // BreakerTrackedStream already logged the error
                                 // and marked the terminal state as Errored so
                                 // the worker's circuit breaker will tick on drop.
@@ -1284,6 +1340,7 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
+                        cancel_prefill = true;
                         tracing::info!(
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
@@ -1292,8 +1349,8 @@ impl PDRouter {
                     }
                 }
             }
-            if prefill_pending {
-                // The client stream ended before the prefill leg resolved: let
+            if prefill_pending && !cancel_prefill {
+                // Decode finished before the prefill leg resolved: let
                 // it finish on its own so its breaker outcome is recorded and
                 // its connection is not severed mid-request.
                 tokio::spawn(async move {
@@ -1903,6 +1960,336 @@ mod tests {
         Box::new(worker)
     }
 
+    async fn mock_pd_pair(
+        prefill_app: axum::Router,
+        decode_app: axum::Router,
+    ) -> (PDRouter, Vec<tokio::task::JoinHandle<()>>) {
+        let router = create_test_pd_router();
+        let mut tasks = Vec::new();
+        for (app, role) in [
+            (
+                prefill_app,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            ),
+            (decode_app, WorkerType::Decode),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(url, role, true)));
+        }
+        (router, tasks)
+    }
+
+    #[tokio::test]
+    async fn prefill_body_drain_does_not_delay_decode_and_cancels_with_client() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = dropped.clone();
+        let prefill_started = started.clone();
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let guard = NotifyOnDrop(notify.clone());
+                let started = prefill_started.clone();
+                async move {
+                    started.notify_one();
+                    // Headers and keepalive precede the actual prefill result.
+                    let stream = futures_util::stream::unfold(guard, |guard| async {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": keepalive\n\n")),
+                            guard,
+                        ))
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let wait_started = started.clone();
+        let decode = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let started = wait_started.clone();
+                async move {
+                    started.notified().await;
+                    // Ensure P headers arrive first, reproducing the old race.
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                        ))
+                    });
+                    let stream = first.chain(futures_util::stream::pending());
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        );
+        let (router, tasks) = mock_pd_pair(prefill, decode).await;
+        let body = json!({"model":"test","messages":[],"stream":true});
+        let (p, d) = router.select_pd_pair(None, None, None).await.unwrap();
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            model_id: None,
+            is_stream: true,
+            return_logprob: false,
+            batch_size: None,
+            request_text: None,
+            headers: None,
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            router.execute_dual_dispatch_internal(None, body, context, p, d, Instant::now()),
+        )
+        .await
+        .expect("P headers/keepalives must not prevent decode streaming");
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("event: message_start"));
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("P body must be cancelled with the client, not detached");
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_stream_failure_cancels_paired_leg() {
+        use futures_util::StreamExt;
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        for prefill_fails in [false, true] {
+            let trigger = Arc::new(tokio::sync::Notify::new());
+            let peer_dropped = Arc::new(tokio::sync::Notify::new());
+            let trigger_copy = trigger.clone();
+            let failed = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let trigger = trigger_copy.clone();
+                    async move {
+                        let initial = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": initial\n\n"))
+                        });
+                        let failure = futures_util::stream::once(async move {
+                            trigger.notified().await;
+                            Err::<bytes::Bytes, _>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "test disconnect",
+                            ))
+                        });
+                        (
+                            [(CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(initial.chain(failure)),
+                        )
+                    }
+                }),
+            );
+            let drop_copy = peer_dropped.clone();
+            let peer = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let guard = NotifyOnDrop(drop_copy.clone());
+                    async move {
+                        let stream = futures_util::stream::unfold(guard, |guard| async {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            Some((
+                                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": alive\n\n")),
+                                guard,
+                            ))
+                        });
+                        (
+                            [(CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(stream),
+                        )
+                    }
+                }),
+            );
+            let (prefill, decode) = if prefill_fails {
+                (failed, peer)
+            } else {
+                (peer, failed)
+            };
+            let (router, tasks) = mock_pd_pair(prefill, decode).await;
+            let (p, d) = router.select_pd_pair(None, None, None).await.unwrap();
+            let context = PDRequestContext {
+                route: "/v1/chat/completions",
+                model_id: None,
+                is_stream: true,
+                return_logprob: false,
+                batch_size: None,
+                request_text: None,
+                headers: None,
+            };
+            let response = router
+                .execute_dual_dispatch_internal(
+                    None,
+                    json!({"model":"test","messages":[],"stream":true}),
+                    context,
+                    p,
+                    d,
+                    Instant::now(),
+                )
+                .await;
+            let mut stream = response.into_body().into_data_stream();
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            trigger.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer_dropped.notified())
+                .await
+                .expect("a transport error must close the other HTTP leg");
+            // Keep the client alive throughout the test: cancellation must come
+            // from the upstream failure, not from dropping this response body.
+            drop(stream);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejecting_leg_cancels_peer_before_reading_error_body() {
+        struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        // Include both directions and streaming D rejects. An error body is
+        // deliberately blocked until its peer's live HTTP body is cancelled.
+        for (prefill_rejects, stream) in [(false, false), (false, true), (true, false)] {
+            for status in [StatusCode::BAD_REQUEST, StatusCode::SERVICE_UNAVAILABLE] {
+                let peer_dropped = Arc::new(tokio::sync::Notify::new());
+                let peer_started = Arc::new(tokio::sync::Notify::new());
+                let notify = peer_dropped.clone();
+                let started = peer_started.clone();
+                let peer = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move || {
+                        let guard = NotifyOnDrop(notify.clone());
+                        let started = started.clone();
+                        async move {
+                            started.notify_one();
+                            let stream = futures_util::stream::unfold(guard, |guard| async {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                Some((
+                                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                        b": alive\n\n",
+                                    )),
+                                    guard,
+                                ))
+                            });
+                            Body::from_stream(stream)
+                        }
+                    }),
+                );
+                let dropped = peer_dropped.clone();
+                let started = peer_started.clone();
+                let error_body = json!({
+                    "type":"error",
+                    "error":{"type":"overloaded_error","message":"test rejection"}
+                })
+                .to_string();
+                let rejected = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move || {
+                        let started = started.clone();
+                        let dropped = dropped.clone();
+                        let error_body = error_body.clone();
+                        async move {
+                            started.notified().await;
+                            // Peer sends headers and multiple keepalives first.
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            let body = futures_util::stream::once(async move {
+                                dropped.notified().await;
+                                Ok::<_, std::io::Error>(bytes::Bytes::from(error_body))
+                            });
+                            (
+                                status,
+                                [(CONTENT_TYPE, "application/json")],
+                                Body::from_stream(body),
+                            )
+                        }
+                    }),
+                );
+                let (prefill, decode) = if prefill_rejects {
+                    (rejected, peer)
+                } else {
+                    (peer, rejected)
+                };
+                let (router, tasks) = mock_pd_pair(prefill, decode).await;
+                let (p, d) = router.select_pd_pair(None, None, None).await.unwrap();
+                let context = PDRequestContext {
+                    route: "/v1/chat/completions",
+                    model_id: None,
+                    is_stream: stream,
+                    return_logprob: false,
+                    batch_size: None,
+                    request_text: None,
+                    headers: None,
+                };
+                let request = json!({"model":"test","max_tokens":16,"messages":[],"stream":stream});
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    router.execute_dual_dispatch_internal(
+                        None,
+                        request,
+                        context,
+                        p,
+                        d,
+                        Instant::now(),
+                    ),
+                )
+                .await
+                .expect("rejecting headers must cancel the peer before reading their body");
+                assert_eq!(response.status(), status);
+                assert!(response
+                    .extensions()
+                    .get::<BreakerOutcomesRecorded>()
+                    .is_some());
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("test rejection"));
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_chat_request_text_uses_full_conversation() {
         // Regression test for https://github.com/sgl-project/sglang/issues/26263
@@ -2160,6 +2547,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1
