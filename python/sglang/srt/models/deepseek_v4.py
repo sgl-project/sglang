@@ -465,29 +465,41 @@ def _apply_wo_a_bf16_matmul(
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
-    The CUDA fast paths are gated on the exact validated TP4 shapes and write
-    token-major output directly. ROCm decode can use aiter batched GEMM with an
-    optional fp8-grid operand; other cases use torch.einsum.
+    The fast paths are gated on the exact validated TP4 shapes and write
+    token-major output directly: single-token decode GEMV and Blackwell verify /
+    large prefill batches on CUDA, large prefill batches on gfx950. ROCm decode
+    can use aiter batched GEMM with an optional fp8-grid operand; other cases
+    use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
         fast_path
-        and _is_cuda
         and (
             (
-                is_decode
-                and o.shape[0] == 1
-                and (get_platform().is_blackwell or get_platform().is_sm90)
+                _is_cuda
+                and (
+                    (
+                        is_decode
+                        and o.shape[0] == 1
+                        and (get_platform().is_blackwell or get_platform().is_sm90)
+                    )
+                    or (
+                        is_target_verify
+                        and 0 < o.shape[0] <= 384
+                        and get_platform().is_blackwell
+                    )
+                    or (
+                        is_prefill
+                        and 4096 <= o.shape[0] <= 65536
+                        and get_platform().is_blackwell
+                    )
+                )
             )
             or (
-                is_target_verify
-                and 0 < o.shape[0] <= 384
-                and get_platform().is_blackwell
-            )
-            or (
-                is_prefill
+                _is_hip
+                and _is_gfx95_supported
+                and is_prefill
                 and 4096 <= o.shape[0] <= 65536
-                and get_platform().is_blackwell
             )
         )
         and o.shape[1:] == (2, 4096)
