@@ -281,3 +281,9 @@ def test_lowering_matches_eager_for_schema_variants(
             rtol=5e-3,
             msg=lambda default, name=name: f"lowering {name!r} diverged: {default}",
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
