@@ -389,7 +389,9 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if self.use_harmony:
                 messages, request_prompts, engine_prompts = (
-                    self._make_request_with_harmony(request, prev_response)
+                    await self._run_request_conversion(
+                        self._make_request_with_harmony, request, prev_response
+                    )
                 )
                 require_reasoning = self._is_thinking_enabled_for_request(request)
             else:
@@ -665,6 +667,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         return self.create_error_response("Unknown error")
 
     async def _make_request(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+        tokenizer: Any,
+    ):
+        return await self._run_request_conversion(
+            self._make_request_sync, request, prev_response, tokenizer
+        )
+
+    def _make_request_sync(
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],

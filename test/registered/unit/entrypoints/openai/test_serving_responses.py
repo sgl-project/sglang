@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import sys
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, patch
@@ -1730,3 +1731,29 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("harmony", [False, True])
+def test_response_conversion_uses_shared_executor(response_serving, harmony):
+    from sglang.srt.entrypoints.openai.request_conversion import (
+        RequestConversionExecutor,
+    )
+
+    serving = response_serving(harmony=harmony)
+    serving.request_conversion_executor = RequestConversionExecutor(1)
+    method = "_make_request_with_harmony" if harmony else "_make_request_sync"
+    original = getattr(serving, method)
+    worker_threads = []
+
+    def convert(*args):
+        worker_threads.append(threading.get_ident())
+        return original(*args)
+
+    setattr(serving, method, convert)
+    result = asyncio.run(
+        create_response_result(
+            serving, ResponsesRequest(model="x", input="Hello", store=False)
+        )
+    )
+    assert result.status == "completed"
+    assert worker_threads and all(t != threading.get_ident() for t in worker_threads)
