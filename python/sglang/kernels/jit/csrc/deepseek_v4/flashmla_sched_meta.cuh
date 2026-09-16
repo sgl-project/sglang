@@ -21,7 +21,7 @@
 
 namespace sglang {
 
-namespace dsv4_sched_meta {
+namespace flashmla {
 
 // sizeof(DecodingSchedMeta)/4: begin/end req, begin/end block, begin split,
 // the two per-end split flags, one pad word.
@@ -51,7 +51,7 @@ __device__ __forceinline__ int ceil_to_i(int a, int b) {
   return (a + b - 1) / b * b;
 }
 
-__global__ void __launch_bounds__(kBlockSize) decoding_sched_meta_kernel(__grid_constant__ const Params p) {
+__global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_constant__ const Params p) {
   extern __shared__ int smem[];
   const int b = p.b;
   int* num_blocks_shared = smem;                   // [b]
@@ -206,9 +206,9 @@ __global__ void __launch_bounds__(kBlockSize) decoding_sched_meta_kernel(__grid_
   }
 }
 
-}  // namespace dsv4_sched_meta
+}  // namespace flashmla
 
-void decoding_sched_meta(
+void flashmla_sched_meta(
     tvm::ffi::TensorView tile_scheduler_metadata,
     tvm::ffi::TensorView num_splits,
     tvm::ffi::Optional<tvm::ffi::TensorView> topk_length,
@@ -219,7 +219,7 @@ void decoding_sched_meta(
     int64_t topk,
     int64_t extra_topk) {
   using namespace host;
-  using namespace dsv4_sched_meta;
+  using namespace flashmla;
 
   auto parts = SymbolicSize{"num_sm_parts"};
   auto meta_ints = SymbolicSize{"meta_ints"};
@@ -270,7 +270,7 @@ void decoding_sched_meta(
 
   const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
   RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
-  LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(decoding_sched_meta_kernel, p);
+  LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_sched_meta_kernel, p);
 }
 
 }  // namespace sglang
