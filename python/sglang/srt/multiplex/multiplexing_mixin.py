@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerMultiplexMixin:
-
     def init_pdmux(self: Scheduler):
         # The current split prefill batch
         self.split_prefill_batch: Optional[ScheduleBatch] = None
@@ -115,8 +114,7 @@ class SchedulerMultiplexMixin:
         while True:
             with torch.cuda.stream(decode_stream):
                 set_pdmux_status(False)
-                recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                self.ingest_requests()
                 running_batch = self.running_batch
 
             with torch.cuda.stream(prefill_stream):

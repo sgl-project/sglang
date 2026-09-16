@@ -19,6 +19,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     ForwardMetadata,
 )
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+    Dsv4NpuRoPE,
+    rope_cos_sin,
+)
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -32,6 +37,40 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+# A5 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
+# stored unquantized, so the kernels need both dimensions spelled out.
+_NPU_ARCH35_KV_TILE_SIZE = 64
+_NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
+
+
+def _sparse_attn_ops():
+    """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
+
+    A5 reads a quantized KV cache, which is a different kernel rather than a
+    flag on the pre-A5 one.
+    """
+    if is_npu_arch35():
+        return (
+            torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
+            torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
+        )
+    return (
+        torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
+        torch.ops.npu.sparse_attn_sharedkv,
+    )
+
+
+def _sparse_attn_kv_quant_kwargs() -> dict:
+    """Extra kwargs the A5 kv-quant kernels need to interpret the KV layout."""
+    if not is_npu_arch35():
+        return {}
+    return {
+        "kv_quant_mode": 1,
+        "tile_size": _NPU_ARCH35_KV_TILE_SIZE,
+        "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
+    }
 
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -102,6 +141,21 @@ def _build_explicit_state_block_table(
     ).contiguous()
 
 
+def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
+    """Build the Atlas A5 cache_mode=2 request-bank table.
+
+    A5 interprets this input as one bank id per request and computes the
+    in-bank ring offset itself.  It must never receive the A3 explicit
+    per-token location table.
+    """
+    if req_pool_indices.ndim != 1:
+        raise ValueError(
+            "Atlas A5 compressor requires a 1-D request-bank table, got "
+            f"shape={tuple(req_pool_indices.shape)}"
+        )
+    return req_pool_indices.to(dtype=torch.int32).contiguous()
+
+
 class CompressorAscendBackendMixin:
 
     def _dspark_ragged_verify_layout(self, forward_batch: ForwardBatch):
@@ -164,6 +218,11 @@ class CompressorAscendBackendMixin:
 
     def _build_npu_compress_metadata(self, forward_batch: ForwardBatch) -> None:
         fm = self.forward_metadata
+        fm.dsv4_cycle_state_block_table = (
+            _build_cycle_state_block_table(forward_batch.req_pool_indices)
+            if is_npu_arch35()
+            else None
+        )
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
@@ -352,10 +411,16 @@ class CompressorAscendBackendMixin:
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
             if ratio == 4:
-                slots = req_to_token[req_pool_64, : n_c_tokens * ratio]
-                c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
-                    torch.int32
+                col_idx = torch.arange(
+                    0,
+                    n_c_tokens * ratio,
+                    self.page_size,
+                    device=req_to_token.device,
                 )
+                slots = torch.index_select(
+                    torch.index_select(req_to_token, 1, col_idx), 0, req_pool_64
+                )
+                c_page_table = (slots // self.page_size).to(torch.int32)
             else:
                 c128_page_size = req_to_token_pool.c128_page_size
                 n_groups = (n_c_tokens + c128_page_size - 1) // c128_page_size
@@ -411,21 +476,27 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        table_cache = fm.dsv4_explicit_state_block_tables
-        if ratio not in table_cache:
-            table_cache[ratio] = _build_explicit_state_block_table(
-                compress_ratio=ratio,
-                coff=coff,
-                state_pool=state_pool,
-                token_to_kv_pool=pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                start_pos=fm.start_pos,
-                cu_seqlens=fm.actual_seq_lengths_q_pa,
-                seqused=fm.seqused,
-                max_input_capacity=fm.dsv4_max_input_capacity,
-            )
-        state_block_table = table_cache[ratio]
+        if is_npu_arch35():
+            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
+            # compressor derives the in-bank offset from start_pos; passing
+            # the A3 explicit [B, width] table here would be an ABI violation.
+            state_block_table = fm.dsv4_cycle_state_block_table
+        else:
+            table_cache = fm.dsv4_explicit_state_block_tables
+            if ratio not in table_cache:
+                table_cache[ratio] = _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=coff,
+                    state_pool=state_pool,
+                    token_to_kv_pool=pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            state_block_table = table_cache[ratio]
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -436,7 +507,11 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = torch.ops.npu.compressor(
+        # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
+        compressor_op = (
+            torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
+        )
+        cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
@@ -489,9 +564,9 @@ class CompressorAscendBackendMixin:
         coff = 1 + int(compressor.overlap)
         split = coff * compressor.head_dim
         w = compressor.wkv_gate.weight
-        assert (
-            w.shape[0] == 2 * split
-        ), f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
+        assert w.shape[0] == 2 * split, (
+            f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2 * split}"
+        )
         compressor._fused_wkv_w = w[:split]
         compressor._fused_wgate_w = w[split:]
         compressor._fused_norm_weight_fp32 = compressor.norm.weight.to(torch.float32)
@@ -505,6 +580,9 @@ class CompressorAscendBackendMixin:
     ) -> None:
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
+        # A5 quantizes and scatters in one fused kernel, so the dequant scale is
+        # produced inside indexer_compress_epilog rather than here.
+        fused_fp8_indexer_write = li_kv_dtype == "float8" and compressor.is_in_indexer
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
@@ -538,6 +616,36 @@ class CompressorAscendBackendMixin:
                     kv = kv[valid]
                     if kv_scale is not None:
                         kv_scale = kv_scale[valid]
+
+        # Eager verify keeps no row when no request completed a compression block
+        # this step (loc is then all-zero, the skip sentinel), and prefill can hand
+        # us an empty chunk. Nothing to write: the pre-A5 scatter treated that as a
+        # no-op, while both A5 fused epilog kernels reject a zero-row input. Unlike
+        # the `loc is None` check below (missing metadata = a bug), an empty write is
+        # a legitimate step outcome. Static shape read, so graph capture is unaffected.
+        if kv.shape[0] == 0:
+            return
+
+        if fused_fp8_indexer_write:
+            if loc is None:
+                raise RuntimeError(
+                    "DSV4 A5 fused indexer epilog needs a slot mapping, but "
+                    f"loc is None (mode={forward_batch.forward_mode}, "
+                    f"ratio={compressor.ratio}). Writing nothing here would "
+                    "leave the indexer KV cache stale."
+                )
+            torch.ops.custom.indexer_compress_epilog(
+                indexer_compress_cache=self.token_to_kv_pool.get_compress_buffer(
+                    compressor.layer_id, True
+                ),
+                indexer_compress_scale=self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                    compressor.layer_id, True
+                ),
+                x=kv,
+                slot_mapping=loc.to(torch.int32),
+            )
+            return
+
         self.token_to_kv_pool.set_compress_buffer(
             compressor.layer_id,
             loc,
@@ -548,7 +656,6 @@ class CompressorAscendBackendMixin:
 
 
 class C4IndexerAscendBackendMixin:
-
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
@@ -560,7 +667,7 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
         c4_indexer.compressor(x, forward_batch)
@@ -609,7 +716,7 @@ class C4IndexerAscendBackendMixin:
         with torch.npu.stream(stream_q):
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
-            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch)
             q.record_stream(stream_q)
 
         cur.wait_stream(stream_w)
@@ -633,7 +740,7 @@ class C4IndexerAscendBackendMixin:
         )
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
-        if li_kv_dtype == "int8":
+        if li_kv_dtype in ("int8", "float8"):
             # Empty/idle rank (T=0) must skip the indexer kernel; test is_idle
             # rather than .item() since a host sync is illegal during capture.
             if bs == 0 or forward_batch.forward_mode.is_idle():
@@ -720,30 +827,29 @@ class C4IndexerAscendBackendMixin:
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "int8"
+        # A5's lightning indexer consumes FP8 K + fp32 scales; pre-A5 stays int8.
+        c4_indexer.compressor.li_kv_dtype = "float8" if is_npu_arch35() else "int8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
 
     def _compute_q_npu(
-        self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
+        self, c4_indexer, q_lora: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
 
+        positions = forward_batch.positions
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
         q = q.view(bs, c4_indexer.n_local_heads, c4_indexer.head_dim)
         qk_nope = c4_indexer.head_dim - c4_indexer.rope_head_dim
-        # Position-gathered RoPE values are forward-local.  The rotary embedding
-        # object is shared, so retaining them there can leak target positions into
-        # NextN (or a previous graph replay) when the next batch has the same shape.
-        cos4, sin4 = Dsv4NpuRoPE.for_freqs(
-            c4_indexer.freqs_cis, getattr(c4_indexer, "rotary_emb", None)
-        ).get_cos_sin(
+        # Per-forward memo keyed on the c4 layers' freqs_cis (the indexer
+        # shares it), so every c4 layer reads one gather instead of its own.
+        cos4, sin4 = rope_cos_sin(
+            c4_indexer.freqs_cis,
+            getattr(c4_indexer, "rotary_emb", None),
+            forward_batch,
             positions,
             q.dtype,
-            view_4d=True,
-            allow_build=False,
-            cache_dtype=torch.float32,
         )
         Dsv4NpuRoPE.apply_rotary_mul_inplace(
             q,
@@ -763,20 +869,33 @@ class C4IndexerAscendBackendMixin:
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+        import torch_npu
+
+        if k.dtype == torch.float8_e4m3fn:
+            # A5: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
+            # stay fp32 and the kernel wants one scale per (token, head).
+            q_quant, q_scale = torch_npu.npu_dynamic_block_quant(
+                q.view(-1, q.shape[-1]), dst_type=k.dtype
+            )
+            q_quant = q_quant.view(-1, c4_indexer.n_heads, c4_indexer.head_dim)
+            q_scale = q_scale.view(-1, c4_indexer.n_heads)
+        else:
+            q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
+            q_scale = q_scale.to(torch.float16)
+
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
         kwargs = dict(
-            query=q_int8,
+            query=q_quant,
             key=k,
-            key_dequant_scale=k_scale.squeeze(-2),
+            key_dequant_scale=k_scale.squeeze(-2).to(q_scale.dtype),
             actual_seq_lengths_query=fm.actual_seq_lengths_q,
             actual_seq_lengths_key=fm.actual_seq_lengths_kv,
             block_table=fm.c4_page_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            weights=weights.to(torch.float16),
-            query_dequant_scale=q_scale.to(torch.float16),
+            weights=weights.to(q_scale.dtype),
+            query_dequant_scale=q_scale,
             cmp_ratio=4,
             query_quant_mode=0,
             key_quant_mode=0,
@@ -801,9 +920,9 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported on the NPU indexer path"
+        assert not skip_compressor, (
+            "skip_compressor=True is not supported on the NPU indexer path"
+        )
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
@@ -826,7 +945,9 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
+        self.use_graph_swa_mask = False
         cfg = model_runner.model_config
+        self._dsv4_config = cfg
         tp_size = get_parallel().attn_tp_size
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
@@ -850,6 +971,11 @@ class DeepseekV4AscendAttnBackend(
             model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_dspark()
         )
+        self._is_eagle_algorithm = bool(
+            model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_eagle()
+            and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
         self._is_dspark_draft_worker = bool(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
@@ -860,6 +986,9 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+        # High-water mark of written page-table columns per shared graph
+        # buffer; see _copy_page_table_into_graph.
+        self._graph_table_high_water: dict[str, int] = {}
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1079,6 +1208,11 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
+        metadata.dsv4_cycle_state_block_table = (
+            torch.zeros(bs, dtype=torch.int32, device=device)
+            if is_npu_arch35()
+            else None
+        )
         metadata.dsv4_explicit_state_block_tables = {
             ratio: torch.full(
                 (
@@ -1122,14 +1256,19 @@ class DeepseekV4AscendAttnBackend(
 
         self.graph_metadata[metadata_key] = metadata
 
-    @staticmethod
-    def _copy_2d_with_tail(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
-        # Graph replay metadata buffers are sliced to the active bs; only the
-        # page-column tail needs the sentinel refresh.
+    def _copy_page_table_into_graph(self, key: str, src: torch.Tensor) -> None:
+        # Graph page tables live in buffers shared across bs buckets (each
+        # bucket's metadata holds a row slice), refreshed in place on replay.
+        full = self.graph_metadata[key]
         r, c = src.shape
-        dst[:r, :c].copy_(src)
-        if c < dst.shape[1]:
-            dst[:, c:].fill_(val)
+        full[:r, :c].copy_(src)
+        high = self._graph_table_high_water.get(key, 0)
+        if c < high:
+            # Full height, not just this replay's slice: other buckets'
+            # replays may have written rows beyond this bucket's row count.
+            full[:, c:high].fill_(-1)
+        elif c > high:
+            self._graph_table_high_water[key] = c
 
     @staticmethod
     def _copy_1d_with_zero_tail(dst: torch.Tensor, src: Optional[torch.Tensor]) -> None:
@@ -1137,15 +1276,89 @@ class DeepseekV4AscendAttnBackend(
             dst.zero_()
             return
         n = src.numel()
-        assert (
-            n <= dst.shape[0]
-        ), f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
+        assert n <= dst.shape[0], (
+            f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
+        )
         if n > 0:
             if src.dtype != dst.dtype:
                 src = src.to(dst.dtype)
             dst[:n].copy_(src)
         if n < dst.shape[0]:
             dst[n:].fill_(0)
+
+    @staticmethod
+    def _stable_compact_1d(
+        dst: torch.Tensor, values: torch.Tensor, keep: torch.Tensor
+    ) -> None:
+        """Compact selected values into a fixed graph buffer without NonZero.
+
+        For every selected element, ``cumsum(keep) - 1`` is exactly its ordinal
+        in ``nonzero(keep)``.  Selected elements therefore have unique scatter
+        destinations, while rejected elements contribute integer zero only.
+        This preserves the stable boolean-index order without a dynamic output
+        shape or a device-to-host size read.
+        """
+        dst.zero_()
+        if dst.numel() == 0 or values.numel() == 0:
+            return
+
+        values = values.reshape(-1)
+        keep = keep.reshape(-1)
+        if values.numel() != keep.numel():
+            raise ValueError(
+                "stable compact requires value/mask size equality, got "
+                f"{values.numel()} and {keep.numel()}"
+            )
+
+        ranks = torch.cumsum(keep.to(torch.int64), dim=0) - 1
+        in_bounds = keep & (ranks < dst.numel())
+        safe_ranks = ranks.clamp(min=0, max=dst.numel() - 1)
+        compact_values = torch.where(
+            in_bounds,
+            values.to(dst.dtype),
+            torch.zeros_like(values, dtype=dst.dtype),
+        )
+        dst.scatter_add_(0, safe_ranks, compact_values)
+
+    def _fill_verify_positions_cmp_padding_one_device(
+        self,
+        positions: torch.Tensor,
+        dst: torch.Tensor,
+        ratio: int,
+        live_seq_lens: torch.Tensor,
+        n_draft: int,
+    ) -> None:
+        """Device-only fixed-shape equivalent of the eager CPU reference path."""
+        if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
+            dst.zero_()
+            return
+
+        n_draft = int(n_draft)
+        request_num = positions.shape[0] // n_draft
+        if request_num == 0:
+            dst.zero_()
+            return
+        if live_seq_lens.device != positions.device:
+            raise ValueError(
+                "device verify compression metadata requires live_seq_lens and "
+                "positions on the same device"
+            )
+
+        live_seq_lens = live_seq_lens[:request_num]
+        token_offsets = torch.arange(
+            1,
+            n_draft + 1,
+            dtype=live_seq_lens.dtype,
+            device=live_seq_lens.device,
+        )
+        absolute_lengths = live_seq_lens.view(-1, 1) + token_offsets.view(1, -1)
+        boundary_mask = ((absolute_lengths % ratio) == 0) & (
+            live_seq_lens.view(-1, 1) > 0
+        )
+        # Match the CPU reference exactly: select the boundary token from the
+        # request-major positions array, then move RoPE to the group's first token.
+        values = positions[: request_num * n_draft].reshape(-1) + (1 - ratio)
+        self._stable_compact_1d(dst, values, boundary_mask.reshape(-1))
 
     def _build_dsv4_graph_replay_ctx(self, forward_batch: ForwardBatch):
         graph_mode = forward_batch.forward_mode
@@ -1178,16 +1391,19 @@ class DeepseekV4AscendAttnBackend(
         raw_seq_lens_cpu = seq_lens_cpu[:bs]
         is_idle_replay = runtime_mode.is_idle()
         if graph_mode.is_target_verify():
+            explicit_live_cpu = getattr(
+                getattr(forward_batch, "spec_info", None),
+                "live_seq_lens_cpu",
+                None,
+            )
             if is_idle_replay:
                 live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
                 final_seq_lens_cpu = live_seq_lens_cpu
-            elif self._is_dspark_algorithm:
-                # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l00993641 revised >>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                explicit_live_cpu = getattr(
-                    getattr(forward_batch, "spec_info", None),
-                    "live_seq_lens_cpu",
-                    None,
-                )
+            elif self._is_dspark_algorithm or explicit_live_cpu is not None:
+                # DSpark/DFLASH temporarily expand seq_lens_cpu to the final
+                # target-verify length and carry the committed/live prefix
+                # separately. Graph replay batches are lightweight namespace
+                # views and do not necessarily retain spec_algorithm.
                 if explicit_live_cpu is None:
                     # DSpark draft-block forward uses TARGET_VERIFY mode but its
                     # reusable spec_info does not carry live_seq_lens_cpu.
@@ -1198,8 +1414,8 @@ class DeepseekV4AscendAttnBackend(
                     )
 
                 # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l00993641 revised >>>>>>>>>>>>>>>>>>>>>>>>>>>>
-
                 else:
+
                     live_seq_lens_cpu = torch.as_tensor(
                         forward_batch.spec_info.live_seq_lens_cpu,
                         dtype=raw_seq_lens_cpu.dtype,
@@ -1250,6 +1466,7 @@ class DeepseekV4AscendAttnBackend(
             forward_batch=forward_batch,
             fm=self.forward_metadata,
             graph_mode=graph_mode,
+            runtime_mode=runtime_mode,
             is_idle_replay=is_idle_replay,
             has_compress=has_compress,
             active_target_verify=active_target_verify,
@@ -1260,6 +1477,7 @@ class DeepseekV4AscendAttnBackend(
             verify_lens=verify_lens,
             effective_verify_lens_cpu=effective_verify_lens_cpu,
             device=device,
+            seq_lens_cpu=seq_lens_cpu,
             final_seq_lens_cpu=final_seq_lens_cpu,
             live_seq_lens_cpu=live_seq_lens_cpu,
             live_seq_lens=live_seq_lens,
@@ -1313,7 +1531,7 @@ class DeepseekV4AscendAttnBackend(
         )
         for key in ("c4_page_table", "c128_page_table"):
             if key in result:
-                self._copy_2d_with_tail(getattr(ctx.fm, key), result[key], -1)
+                self._copy_page_table_into_graph(key, result[key])
 
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1328,21 +1546,18 @@ class DeepseekV4AscendAttnBackend(
                 loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
             should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
-            pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
-            self._copy_1d_with_zero_tail(
-                getattr(fm, f"positions_cmp_padding_c{ratio}"), pos_cmp
+            dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
+            self._stable_compact_1d(
+                dst,
+                positions_last.to(torch.int64) + (1 - ratio),
+                should_compress,
             )
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
-        verify_seq_lens_cpu = ctx.final_seq_lens_cpu
-        verify_seq_lens_cpu = torch.where(
-            ctx.live_seq_lens_cpu > 0,
-            verify_seq_lens_cpu,
-            ctx.live_seq_lens_cpu,
-        )
+        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         if ctx.ragged_layout is not None:
             self._fill_ragged_verify_positions_cmp_padding_one(
                 positions=ctx.forward_batch.positions,
@@ -1358,7 +1573,29 @@ class DeepseekV4AscendAttnBackend(
                 final_seq_lens_cpu=verify_seq_lens_cpu,
                 verify_lens_cpu=ctx.effective_verify_lens_cpu,
             )
+        elif self._is_eagle_algorithm:
+            self._fill_verify_positions_cmp_padding_one_device(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c4,
+                4,
+                ctx.live_seq_lens,
+                n_draft=ctx.tokens_per_bs,
+            )
+
+            self._fill_verify_positions_cmp_padding_one_device(
+                ctx.forward_batch.positions,
+                fm.positions_cmp_padding_c128,
+                128,
+                ctx.live_seq_lens,
+                n_draft=ctx.tokens_per_bs,
+            )
         else:
+            verify_seq_lens_cpu = ctx.final_seq_lens_cpu
+            verify_seq_lens_cpu = torch.where(
+                ctx.live_seq_lens_cpu > 0,
+                verify_seq_lens_cpu,
+                ctx.live_seq_lens_cpu,
+            )
             self._fill_verify_positions_cmp_padding_one(
                 ctx.forward_batch.positions,
                 fm.positions_cmp_padding_c4,
@@ -1373,7 +1610,6 @@ class DeepseekV4AscendAttnBackend(
                 verify_seq_lens_cpu,
                 n_draft=ctx.tokens_per_bs,
             )
-        fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         valid = ctx.live_seq_lens[: ctx.bs] > 0
         if ctx.ragged_layout is not None:
             fm.seqused.copy_(
@@ -1447,7 +1683,7 @@ class DeepseekV4AscendAttnBackend(
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             if 0 < max_seq_pages < swa_src.shape[1]:
                 swa_src = swa_src[:, :max_seq_pages]
-        self._copy_2d_with_tail(fm.swa_page_table, swa_src, -1)
+        self._copy_page_table_into_graph("swa_page_table", swa_src)
 
     def _refresh_graph_dspark_sparse_metadata(self, ctx) -> None:
         if not (self._is_dspark_draft_worker and ctx.graph_mode.is_target_verify()):
@@ -1561,6 +1797,11 @@ class DeepseekV4AscendAttnBackend(
 
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
+        if is_npu_arch35():
+            ctx.fm.dsv4_cycle_state_block_table.copy_(
+                ctx.forward_batch.req_pool_indices[: ctx.bs]
+            )
+
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)
 
@@ -1577,6 +1818,8 @@ class DeepseekV4AscendAttnBackend(
         self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
         self._refresh_graph_kernel_metadata(ctx)
+
+        self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
@@ -1727,7 +1970,11 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         fm = self.forward_metadata
+        metadata_op, _ = _sparse_attn_ops()
         common = {
+            **_sparse_attn_kv_quant_kwargs(),
+            "cu_seqlens_q": actual_seq_lengths_q_pa,
+            "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
             "cmp_mask_mode": 3,
@@ -1764,8 +2011,9 @@ class DeepseekV4AscendAttnBackend(
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
                 "seqused_kv": actual_seq_lengths_kv,
             }
-            metadata_op = torch.ops.custom.npu_sparse_attn_sharedkv_metadata
-        kernel_metadata = {"c1a_metadata": metadata_op(**c1a_kwargs)}
+            metadata_op, _ = _sparse_attn_ops()
+        c1a_metadata = metadata_op(**c1a_kwargs)
+        kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1774,9 +2022,8 @@ class DeepseekV4AscendAttnBackend(
                 "cmp_topk": self._dsv4_index_topk,
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
-            kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
-            )
+            metadata_op, _ = _sparse_attn_ops()
+            kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
             if actual_seq_lengths_q_pa is not None:
                 # the indexer metadata op wants a fresh contiguous tensor without the leading 0
@@ -1804,9 +2051,8 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
-            kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
-            )
+            metadata_op, _ = _sparse_attn_ops()
+            kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
 
         return kernel_metadata
 
@@ -1852,6 +2098,7 @@ class DeepseekV4AscendAttnBackend(
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
         attn_kwargs = dict(
+            **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1875,7 +2122,8 @@ class DeepseekV4AscendAttnBackend(
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        _, attn_op = _sparse_attn_ops()
+        out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -1921,6 +2169,7 @@ class DeepseekV4AscendAttnBackend(
         )
 
         attn_kwargs = dict(
+            **_sparse_attn_kv_quant_kwargs(),
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1946,7 +2195,8 @@ class DeepseekV4AscendAttnBackend(
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         q_arg = attn_kwargs.pop("q")
-        out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        _, attn_op = _sparse_attn_ops()
+        out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -1987,6 +2237,7 @@ class DeepseekV4AscendAttnBackend(
         bs = forward_batch.batch_size
         ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         n_draft = int(forward_batch.spec_info.draft_token_num)
+
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
@@ -2001,6 +2252,7 @@ class DeepseekV4AscendAttnBackend(
                 (0, bs - live_seq_lens_cpu.numel()),
             )
             verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
+
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
@@ -2120,7 +2372,7 @@ class DeepseekV4AscendAttnBackend(
         abs_positions = start_positions.view(-1, 1) + torch.arange(
             n_draft, dtype=start_positions.dtype
         ).view(1, -1)
-        boundary_mask = abs_positions % ratio == 0
+        boundary_mask = (abs_positions % ratio == 0) & (seq_lens_cpu.view(-1, 1) > 0)
         indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
 
         if indices.numel() == 0:
@@ -2129,7 +2381,11 @@ class DeepseekV4AscendAttnBackend(
         # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
         # surface later as an unrelated CopyKernel stream failure.
         indices = indices[: dst.numel()].to(device=positions.device)
-        dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
+        # ``indices`` selects the final token of each newly completed group.
+        # The compressed KV applies RoPE at the group's first token, matching
+        # the decode path and ``comp_pos = (position // ratio) * ratio``.
+        compressed_positions = torch.gather(positions, 0, indices) + (1 - ratio)
+        dst[: indices.numel()].copy_(compressed_positions)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int]
@@ -2181,7 +2437,6 @@ def _get_kv_indices(
 
 
 class DeepseekV4AscendMultiStepDraftBackend:
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2253,31 +2508,17 @@ class DeepseekV4AscendMultiStepDraftBackend:
         )
         swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
 
-        def step_compress(loc, ratio: int):
-            if loc is None or loc.numel() == 0:
-                return loc
-            raw_bs = step_width // self.topk
-            seq_lens = forward_batch.seq_lens[:raw_bs].to(torch.int64)
-            positions = seq_lens[:, None, None] + torch.arange(
-                self.speculative_num_steps,
-                device=seq_lens.device,
-                dtype=seq_lens.dtype,
-            )
-            positions = positions.expand(-1, self.topk, -1)
-            should_compress = ((positions + 1) % ratio) == 0
-            counts = should_compress.reshape(-1).to(torch.int64)
-            offsets = torch.cumsum(counts, dim=0) - counts
-            step_mask = should_compress[:, :, step_id].reshape(-1)
-            step_offsets = offsets.reshape(
-                raw_bs, self.topk, self.speculative_num_steps
-            )[:, :, step_id].reshape(-1)
-            return loc[step_offsets[step_mask].to(torch.int64)]
-
         return DSV4OutCacheLoc(
             out_full_loc=full_steps[step_id],
             out_swa_loc=swa_steps[step_id],
-            out_c4_loc=step_compress(bundle.out_c4_loc, 4),
-            out_c128_loc=step_compress(bundle.out_c128_loc, 128),
+            out_c4_loc=(
+                None if bundle.out_c4_loc is None else bundle.out_c4_loc.new_empty((0,))
+            ),
+            out_c128_loc=(
+                None
+                if bundle.out_c128_loc is None
+                else bundle.out_c128_loc.new_empty((0,))
+            ),
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):

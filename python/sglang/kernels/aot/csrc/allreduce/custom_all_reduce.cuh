@@ -338,6 +338,9 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
 #endif
   }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
 

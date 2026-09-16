@@ -250,12 +250,12 @@ class TestCacheReport(CustomTestCase):
         )
 
         # Verify cache hit for same salt
-        assert (
-            cached_tokens_1_second > cached_tokens_1_first
-        ), "Should have cache hit with same cache_salt"
-        assert (
-            cached_tokens_1_second == prompt_tokens_1 - 1
-        ), "Should cache all prompt tokens except the last one"
+        assert cached_tokens_1_second > cached_tokens_1_first, (
+            "Should have cache hit with same cache_salt"
+        )
+        assert cached_tokens_1_second == prompt_tokens_1 - 1, (
+            "Should cache all prompt tokens except the last one"
+        )
 
         # Third request with different cache_salt "salt2" - should not get cache hit
         response3 = self.client.chat.completions.create(
@@ -269,9 +269,9 @@ class TestCacheReport(CustomTestCase):
         print(f"First request with salt2 - cached_tokens: {cached_tokens_2_first}")
 
         # Verify no cache hit for different salt (should be similar to first request with salt1)
-        assert (
-            cached_tokens_2_first <= cached_tokens_1_first + self.min_cached
-        ), "Different cache_salt should not share cache"
+        assert cached_tokens_2_first <= cached_tokens_1_first + self.min_cached, (
+            "Different cache_salt should not share cache"
+        )
 
         # Fourth request with same cache_salt "salt2" - should now get cache hit
         response4 = self.client.chat.completions.create(
@@ -285,9 +285,9 @@ class TestCacheReport(CustomTestCase):
         print(f"Second request with salt2 - cached_tokens: {cached_tokens_2_second}")
 
         # Verify cache hit for salt2
-        assert (
-            cached_tokens_2_second > cached_tokens_2_first
-        ), "Should have cache hit with same cache_salt for salt2"
+        assert cached_tokens_2_second > cached_tokens_2_first, (
+            "Should have cache hit with same cache_salt for salt2"
+        )
 
 
 if __name__ == "__main__":

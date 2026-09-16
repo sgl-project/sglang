@@ -13,14 +13,14 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    kill_process_tree,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # RadixAttention server integration tests
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=148, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=405, suite="base-c-test-cpu")
+register_cpu_ci(est_time=405, suite="stage-b-test-cpu-intel")
 
 
 class TestRadixCacheFCFS(CustomTestCase):
@@ -40,11 +40,12 @@ class TestRadixCacheFCFS(CustomTestCase):
                 "--schedule-policy",
                 "fcfs",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
@@ -68,6 +69,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
                 "--schedule-policy",
                 "lpm",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
 
@@ -89,6 +91,7 @@ class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
                 "--schedule-policy",
                 "lpm",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
 
