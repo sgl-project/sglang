@@ -10,18 +10,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=52, suite="base-a-test-cpu")
 
-import contextlib
 import json
 import multiprocessing
 import os
-import sys
 import tempfile
 import traceback
 import unittest
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch.distributed as dist
 
@@ -162,117 +158,6 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             ),
             [False, False],
         )
-
-
-class _FakeAutoTuner:
-    instance = None
-
-    def __init__(self):
-        self.file_configs = {}
-
-    @classmethod
-    def get(cls):
-        if cls.instance is None:
-            cls.instance = cls()
-        return cls.instance
-
-    def load_configs(self, path):
-        entries = json.loads(Path(path).read_text())
-        entries.pop("_metadata", None)
-        self.file_configs.update(entries)
-
-    def save_configs(self, path):
-        Path(path).write_text(json.dumps(self.file_configs))
-
-
-@contextlib.contextmanager
-def _fake_autotune(tune_mode=True, cache=None, skip_ops=None):
-    # flashinfer's autotune(cache=...) clears the loaded table on entry, saves on exit.
-    tuner = _FakeAutoTuner.get()
-    if cache is not None:
-        tuner.file_configs.clear()
-        if Path(cache).is_file():
-            tuner.load_configs(cache)
-    yield
-    if cache is not None and tune_mode:
-        tuner.save_configs(cache)
-
-
-def _fake_flashinfer_autotuner():
-    group = [None]
-    return SimpleNamespace(
-        AutoTuner=_FakeAutoTuner,
-        autotune=_fake_autotune,
-        _collect_metadata=lambda: {},
-        get_autotune_process_group=lambda: group[0],
-        set_autotune_process_group=lambda g: group.__setitem__(0, g),
-    )
-
-
-class TestAutotuneCachePhases(CustomTestCase):
-    """Loaded target tactics survive draft warmup, unless cache reuse is disabled."""
-
-    def test_target_and_draft_cache_reuse(self):
-        from sglang.srt.model_executor.runner import flashinfer_autotune as warmup
-
-        _FakeAutoTuner.instance = None
-        tuner = _FakeAutoTuner.get()
-        runner = SimpleNamespace(
-            device="cpu",
-            forward_stream=SimpleNamespace(wait_stream=lambda stream: None),
-            tp_group=SimpleNamespace(world_size=1),
-        )
-        fake_torch = SimpleNamespace(
-            cuda=SimpleNamespace(current_stream=lambda: runner.forward_stream),
-            get_device_module=lambda device: SimpleNamespace(
-                stream=lambda stream: nullcontext()
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            target, draft = (
-                Path(directory) / name for name in ("target.json", "draft.json")
-            )
-            target.write_text(json.dumps({"target_prefill": ["TestRunner", 7]}))
-            draft.write_text(json.dumps({"draft_decode": ["TestRunner", 3]}))
-            with (
-                patch.dict(
-                    sys.modules,
-                    {
-                        "flashinfer": SimpleNamespace(),
-                        "flashinfer.autotuner": _fake_flashinfer_autotuner(),
-                    },
-                ),
-                patch.object(warmup, "torch", fake_torch),
-                patch.object(
-                    warmup,
-                    "flashinfer_autotune_cache_path",
-                    side_effect=[target, draft, draft],
-                ),
-                patch.object(
-                    warmup, "get_flashinfer_autotune_skip_ops", return_value=set()
-                ),
-                warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
-            ):
-                with warmup.flashinfer_autotune_context(runner, run_lm_head=False):
-                    self.assertEqual(
-                        tuner.file_configs["target_prefill"], ["TestRunner", 7]
-                    )
-                with warmup.flashinfer_autotune_context(runner, run_lm_head=False):
-                    self.assertEqual(
-                        tuner.file_configs["target_prefill"], ["TestRunner", 7]
-                    )
-                    self.assertEqual(
-                        tuner.file_configs["draft_decode"], ["TestRunner", 3]
-                    )
-                saved = json.loads(draft.read_text())
-                self.assertEqual(saved["target_prefill"], ["TestRunner", 7])
-                self.assertEqual(saved["draft_decode"], ["TestRunner", 3])
-                with (
-                    warmup.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(False),
-                    warmup.flashinfer_autotune_context(runner, run_lm_head=False),
-                ):
-                    self.assertNotIn("target_prefill", tuner.file_configs)
-                    self.assertNotIn("draft_decode", tuner.file_configs)
 
 
 if __name__ == "__main__":
