@@ -4139,10 +4139,31 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        # Settle the previous forward before saving PD state to the CPU. The GPU
+        # has already advanced KV/Mamba, while output_ids and the bonus token can
+        # still be one result behind. Retracting first would make result processing
+        # skip that accepted block, restoring a newer state at an older boundary.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (
+            (kv_full_retract_flag or test_retract)
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.enable_overlap
+            and self.result_queue
         ):
+            while self.result_queue:
+                pending_batch, pending_result = self.result_queue.popleft()
+                self.process_batch_result(pending_batch, pending_result)
+            # The overlap loop must not process this result a second time.
+            self.last_batch = None
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            # Completed requests may have released enough memory already.
+            kv_full_retract_flag = not batch.check_decode_mem()
+
+        if kv_full_retract_flag or test_retract:
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
