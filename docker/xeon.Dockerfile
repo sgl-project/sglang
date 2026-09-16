@@ -36,10 +36,9 @@ ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
 WORKDIR /sgl-workspace
 RUN source /opt/.venv/bin/activate && \
-    git clone "${SGLANG_REPO}" sglang && \
+    git clone ${SGLANG_REPO} sglang && \
     cd sglang && \
-    git fetch origin "${VER_SGLANG}" && \
-    git checkout --detach FETCH_HEAD && \
+    git checkout ${VER_SGLANG} && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install ".[diffusion]" && \

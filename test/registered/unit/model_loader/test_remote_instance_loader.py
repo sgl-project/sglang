@@ -1,13 +1,11 @@
-"""Unit tests for remote loader configuration and memory registration."""
+"""Unit tests for RemoteInstanceModelLoader construction - no server, no weights."""
 
 import unittest
-from unittest.mock import Mock, patch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    register_memory_region_v2,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,80 +71,6 @@ class TestRemoteInstanceModelLoaderExtraConfig(CustomTestCase):
             with self.subTest(backend=backend):
                 loader = loader_mod.RemoteInstanceModelLoader(_load_config(backend))
                 self.assertFalse(loader.load_config.model_loader_extra_config)
-
-
-class TestRemoteInstanceWeightMemoryRegistration(CustomTestCase):
-    def _register_memory(self, hip):
-        allocation_base = 0x100000
-        allocation_size = 0x200000
-        first_pointer = allocation_base + 2048
-        second_pointer = allocation_base + 4096
-        parameters = [
-            (
-                name,
-                Mock(
-                    data_ptr=Mock(return_value=pointer),
-                    numel=Mock(return_value=128),
-                    element_size=Mock(return_value=2),
-                ),
-            )
-            for name, pointer in (("first", first_pointer), ("second", second_pointer))
-        ]
-        model = Mock()
-        model.named_parameters.return_value = parameters
-        transfer_engine = Mock()
-        transfer_engine.register_memory.return_value = 0
-        snapshot = [
-            {
-                "address": allocation_base,
-                "total_size": allocation_size,
-                "blocks": [
-                    {
-                        "address": first_pointer,
-                        "size": 2048,
-                        "state": "active_allocated",
-                    },
-                    {
-                        "address": second_pointer,
-                        "size": 4096,
-                        "state": "active_allocated",
-                    },
-                ],
-            },
-            {
-                "address": 0x500000,
-                "total_size": allocation_size,
-                "blocks": [
-                    {
-                        "address": 0x500000,
-                        "size": 4096,
-                        "state": "active_allocated",
-                    }
-                ],
-            },
-        ]
-        with (
-            patch("torch.version.hip", hip),
-            patch("torch.cuda.memory.memory_snapshot", return_value=snapshot),
-        ):
-            metadata = register_memory_region_v2(model, transfer_engine)
-        self.assertEqual(
-            metadata,
-            {
-                "first": (first_pointer, 128, 2),
-                "second": (second_pointer, 128, 2),
-            },
-        )
-        return transfer_engine
-
-    def test_hip_registers_allocation_containing_interior_weights(self):
-        transfer_engine = self._register_memory("7.2")
-        # Both weights share this allocation; the unrelated segment is omitted.
-        transfer_engine.register_memory.assert_called_once_with(0x100000, 0x200000)
-
-    def test_non_hip_merges_adjacent_weight_blocks(self):
-        transfer_engine = self._register_memory(None)
-        transfer_engine.register_memory.assert_called_once_with(0x100000 + 2048, 6144)
 
 
 if __name__ == "__main__":

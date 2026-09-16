@@ -260,7 +260,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
     never get their user-space release.
     """
 
-    def _make_scheduler(self, recv_side_effect):
+    def _make_scheduler(self, *, recv_side_effect):
         from collections import deque
 
         scheduler = MagicMock()
@@ -269,14 +269,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.request_receiver.recv_requests.side_effect = recv_side_effect
-
-        def ingest_requests():
-            reqs = scheduler.request_receiver.recv_requests()
-            scheduler.process_input_requests(reqs)
-            return reqs
-
-        scheduler.ingest_requests.side_effect = ingest_requests
+        scheduler.ingest_requests.side_effect = recv_side_effect
         # Model handle_shutdown: processing a non-empty recv batch (the
         # ShutdownReq) flips the flag; the loop must notice at the top of the
         # next iteration instead of polling forever.
