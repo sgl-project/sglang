@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication.all_reduce_fusion import (
+    _require_cluster_launch_arch,
     default_cluster_size,
     get_registered_comm,
 )
@@ -19,6 +20,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 @cache_once
 def _module(world_size, top_k, cluster_size, weight_dtype):
+    _require_cluster_launch_arch()
     args = make_cpp_args(
         world_size, 5120, top_k, cluster_size, is_arch_support_pdl(), weight_dtype, True
     )
@@ -209,6 +211,7 @@ def all_reduce_mhc_norm(x, residual, post, comb, pre, norm_weight, eps, *, world
 
 @cache_once
 def _quant_module(world_size, top_k, cluster_size, weight_dtype):
+    _require_cluster_launch_arch()
     args = make_cpp_args(
         world_size,
         5120,

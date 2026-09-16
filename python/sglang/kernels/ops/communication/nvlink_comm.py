@@ -21,11 +21,11 @@ SUPPORTED_OPS: Final = ["all_reduce", "all_gather", "reduce_scatter"]
 
 
 class Partition(NamedTuple):
-    num_prefix_tokens: int  # excluive prefix sum of tokens
+    num_prefix_tokens: int  # exclusive prefix sum of tokens
     num_local_tokens: int  # number of tokens in this rank
 
 
-def get_token_partion(num_tokens: int, comm: Communicator) -> Partition:
+def get_token_partition(num_tokens: int, comm: Communicator) -> Partition:
     rank = comm.rank
     world_size = comm.world_size
     avg_tokens = num_tokens // world_size
@@ -251,8 +251,8 @@ def all_gather_copy_engine_unicast(
     at this rank so the links are not all driven in the same order -- and the two
     barriers around it are stream memory ops. `output` must be symmetric memory,
     since this rank writes its shard straight into every peer's copy; `input` is
-    read locally and can be an ordinary tensor. `group` is only needed on the
-    first call for a given communicator, to allocate the barrier flags.
+    read locally and can be an ordinary tensor. Allocate ``ce_flags`` once per
+    communicator with :func:`make_ce_flags` and reuse it across calls.
     """
     from torch._C._distributed_c10d import _SymmetricMemory
 
