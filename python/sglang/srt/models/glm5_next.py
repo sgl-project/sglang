@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -303,6 +304,32 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+def _kda_projections_are_unquantized(quant_config, prefix):
+    if quant_config is None:
+        return True
+    if quant_config.get_name() != "fp8":
+        return False
+    # The checkpoint may be FP8 while every KDA projection is explicitly BF16.
+    # Check original names: the new fused name is not in checkpoint exclusions.
+    return all(
+        is_layer_skipped(
+            f"{prefix}.{name}",
+            quant_config.ignored_layers,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+        for name in (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "f_b_proj",
+            "g_a_proj",
+            "g_b_proj",
+        )
+    )
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -337,7 +364,10 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = (
+            head_shard_size == self.tp_size
+            and _kda_projections_are_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -351,7 +381,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
