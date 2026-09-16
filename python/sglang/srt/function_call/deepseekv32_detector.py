@@ -145,10 +145,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             re.finditer(self.parameter_regex, invoke_content, re.DOTALL)
         )
 
+        # Stray prose around the parameter tags is ignored, as before. Leftover
+        # text holding a DSML fragment is a parameter tag that did not match
+        # (unclosed, self-closing, missing `string=`), and emitting the call
+        # without that argument would be worse than emitting no call.
         last_match_end = 0
+        leftover = []
         for match in param_matches:
-            if invoke_content[last_match_end : match.start()].strip():
-                raise ValueError("Malformed DeepSeek tool parameter")
+            leftover.append(invoke_content[last_match_end : match.start()])
             param_name = match.group(1)
             param_type = match.group(2)
             param_value = match.group(3)
@@ -164,8 +168,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                 except (json.JSONDecodeError, ValueError):
                     parameters[param_name] = param_value.strip()
+        leftover.append(invoke_content[last_match_end:])
 
-        if invoke_content[last_match_end:].strip():
+        leftover_text = "".join(leftover)
+        if "｜DSML｜" in leftover_text or (not param_matches and leftover_text.strip()):
             raise ValueError("Malformed DeepSeek tool parameter")
 
         return json.dumps(parameters, ensure_ascii=False)
