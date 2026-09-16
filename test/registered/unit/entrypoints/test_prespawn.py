@@ -27,6 +27,9 @@ class _FakeProc:
     def terminate(self):
         self.terminated = True
 
+    def join(self, timeout=None):
+        pass
+
 
 def _prespawned(server_args, procs):
     return prespawn.Prespawned(
@@ -67,14 +70,17 @@ class TestHandOver(CustomTestCase):
     def test_nothing_prespawned(self):
         self.assertIsNone(prespawn.take(ServerArgs(model_path="dummy")))
 
-    def test_only_the_spawning_record_may_adopt(self):
+    def test_a_different_record_stops_the_workers(self):
+        """Workers pre-spawned for one record must not keep their GPUs when a
+        launch from another record (which cannot adopt them) proceeds."""
         mine = ServerArgs(model_path="dummy")
         other = ServerArgs(model_path="dummy")
-        prespawn._PRESPAWNED = _prespawned(mine, procs=[_FakeProc()])
-        pre = prespawn._PRESPAWNED
+        proc = _FakeProc()
+        prespawn._PRESPAWNED = _prespawned(mine, procs=[proc])
         self.assertIsNone(prespawn.take(other))
-        self.assertIs(prespawn._PRESPAWNED, pre, "a refused take() keeps the workers")
-        self.assertIs(prespawn.take(mine), pre)
+        self.assertTrue(proc.terminated)
+        self.assertIsNone(prespawn._PRESPAWNED)
+        self.assertIsNone(prespawn.take(mine))
 
     def test_adopted_once(self):
         mine = ServerArgs(model_path="dummy")

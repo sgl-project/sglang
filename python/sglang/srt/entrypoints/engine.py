@@ -1073,9 +1073,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Pre-spawned workers (SGLANG_PRESPAWN_WORKERS=1) already went through the
         # else-branch below in prespawn.maybe_prespawn(); adopt them here.
-        pre = prespawn.take(server_args) if port_args is None else None
-        if pre is not None and run_scheduler_process_func is not run_scheduler_process:
-            prespawn.abandon(pre)
+        pre = prespawn.take(server_args)
+        if pre is not None and (
+            port_args is not None
+            or run_scheduler_process_func is not run_scheduler_process
+        ):
+            prespawn.abandon(pre)  # caller-provided ports or a custom entry point
             pre = None
         if pre is not None:
             port_args = pre.port_args
@@ -1778,7 +1781,16 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method (forkserver when start_early() prepared one).
-    mp.set_start_method(envs.SGLANG_MP_START_METHOD.get(), force=True)
+    start_method = envs.SGLANG_MP_START_METHOD.get()
+    if start_method == "forkserver" and cfg.enable_memory_saver:
+        # torch_memory_saver is LD_PRELOADed into a freshly exec'd worker; a
+        # fork() of the preloaded forkserver cannot pick it up.
+        logger.warning(
+            "--enable-memory-saver needs spawned workers; SGLANG_EARLY_FORKSERVER "
+            "is ignored for this launch"
+        )
+        start_method = "spawn"
+    mp.set_start_method(start_method, force=True)
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:

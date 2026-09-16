@@ -80,8 +80,9 @@ def _configure_forkserver_env() -> None:
     # NUMA numactl wrapper (SGLANG_NUMA_BIND_V2) execs in front of a spawned
     # interpreter and cannot apply to a forked child, so binding falls back to
     # the in-process implementation.
-    os.environ["SGLANG_MP_START_METHOD"] = "forkserver"
-    os.environ.setdefault("SGLANG_NUMA_BIND_V2", "0")
+    envs.SGLANG_MP_START_METHOD.set("forkserver")
+    if not envs.SGLANG_NUMA_BIND_V2.is_set():
+        envs.SGLANG_NUMA_BIND_V2.set(False)
     # torch.cuda.is_available() goes through cudaGetDeviceCount and marks the
     # process as unsafe to fork even without a context; the NVML-based check
     # does not. sglang calls is_available() at import time.
@@ -89,8 +90,8 @@ def _configure_forkserver_env() -> None:
 
 
 def _publish_forkserver(*, address: str, pid: int) -> None:
-    os.environ["SGLANG_FORKSERVER_ADDRESS"] = address
-    os.environ["SGLANG_FORKSERVER_PID"] = str(pid)
+    envs.SGLANG_FORKSERVER_ADDRESS.set(address)
+    envs.SGLANG_FORKSERVER_PID.set(pid)
 
 
 def _try_attach_daemon(*, fs) -> bool:
@@ -346,7 +347,7 @@ def _reuse_forkserver() -> None:
     alive fd (handed over by the server), only the address/pid are missing.
     ensure_running() would waitpid() the server, which is our parent, so it is
     disabled on this instance."""
-    addr = os.environ.get("SGLANG_FORKSERVER_ADDRESS")
+    addr = envs.SGLANG_FORKSERVER_ADDRESS.get()
     if not addr:
         return
     import multiprocessing.forkserver as fs
@@ -356,7 +357,7 @@ def _reuse_forkserver() -> None:
     # forks, but not the pid, and ensure_running() keys on the pid.
     if inst._forkserver_pid is None:
         inst._forkserver_address = addr
-        inst._forkserver_pid = int(os.environ.get("SGLANG_FORKSERVER_PID", "0")) or None
+        inst._forkserver_pid = envs.SGLANG_FORKSERVER_PID.get()
         inst.ensure_running = lambda: None
 
 
@@ -399,8 +400,6 @@ def _install_import_time_cuda_shim() -> None:
     current_device, which initializes a CUDA context and makes fork() unusable.
     Answer those probes from NVML while the preload imports run; children
     restore the real functions in run()."""
-    import types
-
     import torch
 
     if _TORCH_CUDA_ORIG:
@@ -419,16 +418,7 @@ def _install_import_time_cuda_shim() -> None:
         if torch.cuda.is_initialized():
             return _TORCH_CUDA_ORIG["get_device_properties"](device)
         idx = device if isinstance(device, int) else 0
-        major, minor, name, mem, cores = _nvml_device(idx)
-        return types.SimpleNamespace(
-            major=major,
-            minor=minor,
-            name=name,
-            total_memory=mem,
-            # 128 FP32 cores per SM on Hopper/Ada/Blackwell; import-time users
-            # only size grids with it.
-            multi_processor_count=(cores // 128) if cores else 0,
-        )
+        return _NvmlDeviceProperties(idx, _TORCH_CUDA_ORIG["get_device_properties"])
 
     def current_device():
         if torch.cuda.is_initialized():
@@ -438,6 +428,29 @@ def _install_import_time_cuda_shim() -> None:
     torch.cuda.get_device_capability = get_device_capability
     torch.cuda.get_device_properties = get_device_properties
     torch.cuda.current_device = current_device
+
+
+class _NvmlDeviceProperties:
+    """torch.cuda.get_device_properties() answered from NVML during the preload.
+    An attribute NVML cannot supply falls back to the real query, which
+    initializes CUDA in this process."""
+
+    def __init__(self, index: int, real_query):
+        major, minor, name, total_memory, cores = _nvml_device(index)
+        self._index = index
+        self._real_query = real_query
+        self.major = major
+        self.minor = minor
+        self.name = name
+        self.total_memory = total_memory
+        # FP32 cores per SM: 64 on Volta/Turing and GA100, 128 on GA10x, Ada,
+        # Hopper and Blackwell.
+        per_sm = 64 if major < 8 or (major == 8 and minor < 6) else 128
+        if cores:
+            self.multi_processor_count = cores // per_sm
+
+    def __getattr__(self, attr):
+        return getattr(self._real_query(self._index), attr)
 
 
 def _restore_torch_cuda() -> None:
@@ -511,7 +524,7 @@ def run_daemon() -> None:
     import signal
     import time
 
-    os.environ["SGLANG_EARLY_FORKSERVER"] = "1"
+    envs.SGLANG_EARLY_FORKSERVER.set(True)
     _configure_forkserver_env()
     mp.set_start_method("forkserver", force=True)
     mp.set_forkserver_preload(PRELOAD)

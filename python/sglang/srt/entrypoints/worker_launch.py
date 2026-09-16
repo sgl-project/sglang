@@ -60,8 +60,8 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
-# Same value as data_parallel_controller.SCHEDULER_PIDS_ARG (asserted there);
-# duplicated so this module does not import the controller.
+# Same value as data_parallel_controller.SCHEDULER_PIDS_ARG (checked by
+# test_worker_launch.py); duplicated so this module does not import the controller.
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
@@ -328,7 +328,16 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method (forkserver when start_early() prepared one).
-    mp.set_start_method(envs.SGLANG_MP_START_METHOD.get(), force=True)
+    start_method = envs.SGLANG_MP_START_METHOD.get()
+    if start_method == "forkserver" and cfg.enable_memory_saver:
+        # torch_memory_saver is LD_PRELOADed into a freshly exec'd worker; a
+        # fork() of the preloaded forkserver cannot pick it up.
+        logger.warning(
+            "--enable-memory-saver needs spawned workers; SGLANG_EARLY_FORKSERVER "
+            "is ignored for this launch"
+        )
+        start_method = "spawn"
+    mp.set_start_method(start_method, force=True)
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:

@@ -117,6 +117,13 @@ class TestMirrorsEngine(CustomTestCase):
                 )
 
 
+class TestControllerContract(CustomTestCase):
+    def test_scheduler_pids_arg_matches_controller(self):
+        from sglang.srt.managers.data_parallel_controller import SCHEDULER_PIDS_ARG
+
+        self.assertEqual(worker_launch.SCHEDULER_PIDS_ARG, SCHEDULER_PIDS_ARG)
+
+
 class TestStaysLight(CustomTestCase):
     def test_light_modules_do_not_import_the_server_stack(self):
         code = (

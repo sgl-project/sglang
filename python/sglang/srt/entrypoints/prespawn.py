@@ -34,6 +34,7 @@ class Prespawned(msgspec.Struct):
     port_args: Any  # PortArgs
     result: Any  # worker_launch.SchedulerInitResult
     procs: Optional[List[Any]]
+    context: Any = None  # runtime-context snapshot from before prepare_launch published
 
 
 def enabled() -> bool:
@@ -98,29 +99,44 @@ def maybe_prespawn(server_args: ServerArgs) -> None:
         time.perf_counter() - t2,
     )
     _PRESPAWNED = Prespawned(
-        server_args=server_args, port_args=port_args, result=result, procs=procs
+        server_args=server_args,
+        port_args=port_args,
+        result=result,
+        procs=procs,
+        context=context_before_publish,
     )
 
 
 def take(server_args: ServerArgs) -> Optional[Prespawned]:
     """Hand the pre-spawned workers to `_launch_subprocesses` (once). Only the
-    record they were spawned from may adopt them."""
+    record they were spawned from may adopt them; a launch from any other
+    record stops them, so they never outlive the launch that adopts nothing."""
     global _PRESPAWNED
     pre = _PRESPAWNED
-    if pre is None or pre.server_args is not server_args:
+    if pre is None:
         return None
     _PRESPAWNED = None
+    if pre.server_args is not server_args:
+        abandon(pre)
+        return None
     return pre
 
 
 def abandon(pre: Prespawned) -> None:
-    """The caller cannot use the pre-spawned workers: stop them."""
+    """The caller cannot use the pre-spawned workers: stop them and restore the
+    runtime context from before they were published, so the normal launch path
+    can publish its own record."""
     logger.warning("[prespawn] pre-spawned workers not adopted; terminating them")
     for p in pre.procs or []:
         try:
             p.terminate()
+            p.join(timeout=10)
         except Exception:
             pass
+    if pre.context is not None:
+        from sglang.srt.runtime_context import restore_context
+
+        restore_context(pre.context)
 
 
 def _since_process_start() -> float:
