@@ -1185,8 +1185,9 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
 
 #[cfg(test)]
 mod forwarded_json_tests {
-    use super::*;
     use http::header::CONTENT_TYPE;
+
+    use super::*;
 
     #[tokio::test]
     async fn preserves_original_sampling_values() {
