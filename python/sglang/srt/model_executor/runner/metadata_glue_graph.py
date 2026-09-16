@@ -11,9 +11,9 @@ graph launch.
 
 Correctness contract:
 
-- The caller only routes here when the replay is padding-free
-  (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
-  Python-visible branch inside the backends is constant per key.
+- Callers keep Python-visible backend branches constant per key. Qualified
+  DSA draft replay uses padded static buffers; other callers require no padding.
+  TBO / pdmux / LoRA are off.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.
@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 class MetadataGlueGraph:
     NUM_WARMUP = 2
 
-    def __init__(self, device):
+    def __init__(self, device, leaves: List[Any] | None = None):
         self.device = device
+        self._explicit_leaves = leaves
         self.disabled = False
         self._states: Dict[Any, dict] = {}
         self._capture_stream = None
@@ -55,8 +56,9 @@ class MetadataGlueGraph:
         static buffers and backend state may have been rebuilt)."""
         self._states.clear()
 
-    @staticmethod
-    def _leaves(attn_backend) -> List[Any]:
+    def _leaves(self, attn_backend) -> List[Any]:
+        if self._explicit_leaves is not None:
+            return self._explicit_leaves
         backends = [attn_backend]
         if attn_backend.attn_backend_list is not None:
             backends.extend(attn_backend.attn_backend_list)

@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import get_device_sm
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
@@ -180,6 +181,21 @@ def layer_norm_gated_fwd_kernel1(
     tl.store(y + o_d, b_y, mask=m_d)
 
 
+def _get_gated_norm_block_size(
+    x: torch.Tensor, activation: str, is_rms_norm: bool
+) -> int:
+    if (
+        x.dtype == torch.bfloat16
+        and x.shape[1] == 128
+        and 0 < x.shape[0] <= 2048
+        and is_rms_norm
+        and activation == "sigmoid"
+        and get_device_sm() == 103
+    ):
+        return 8
+    return 32
+
+
 def layer_norm_gated_fwd(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -223,7 +239,7 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
-        BT = 32
+        BT = _get_gated_norm_block_size(x, activation, is_rms_norm)
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
         )

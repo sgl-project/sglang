@@ -7,11 +7,92 @@ import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="nightly", runner_config="4-gpu-gb300")
 
 
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
-@pytest.mark.parametrize("num_tokens", [0, 1, 8, 17, 32, 64])
+@pytest.mark.parametrize(
+    "sm,hc_mult,hidden_size,num_tokens,expected",
+    [
+        (103, 4, 4096, 1, True),
+        (103, 4, 4096, 512, True),
+        (103, 4, 4096, 0, False),
+        (103, 4, 4096, 513, False),
+        (103, 4, 7168, 6, False),
+        (103, 2, 4096, 6, False),
+        (103, 8, 4096, 6, False),
+        (100, 4, 4096, 6, False),
+        (90, 4, 4096, 6, False),
+    ],
+)
+def test_mhc_post_split_guard(
+    monkeypatch, sm, hc_mult, hidden_size, num_tokens, expected
+):
+    monkeypatch.setattr(mhc, "get_device_sm", lambda: sm)
+    assert mhc._use_split_mhc_post(num_tokens, hc_mult, hidden_size) == expected
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,split_hidden",
+    [
+        (6, 4096, True),
+        (96, 4096, True),
+        (480, 4096, True),
+        (512, 4096, True),
+        (513, 4096, False),
+        (8000, 4096, False),
+        (6, 7168, False),
+    ],
+)
+def test_mhc_post_matches_default_kernel(
+    monkeypatch, num_tokens, hidden_size, split_hidden
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for TileLang mHC kernels")
+    if split_hidden and mhc.get_device_sm() != 103:
+        pytest.skip("The split mHC post path is selected only on SM103")
+
+    monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(
+        num_tokens, 4, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    post = torch.rand(num_tokens, 4, 1, device="cuda", dtype=torch.float32)
+    comb = torch.rand(num_tokens, 4, 4, device="cuda", dtype=torch.float32)
+    expected = torch.empty_like(residual)
+    mhc.mhc_post_tilelang(
+        comb,
+        residual,
+        post.squeeze(-1),
+        x,
+        expected,
+        4,
+        hidden_size,
+        split_hidden=False,
+    )
+    if split_hidden:
+        split_output = torch.empty_like(residual)
+        mhc.mhc_post_tilelang(
+            comb,
+            residual,
+            post.squeeze(-1),
+            x,
+            split_output,
+            4,
+            hidden_size,
+            split_hidden=True,
+        )
+        torch.testing.assert_close(split_output, expected, atol=0, rtol=0)
+    actual = mhc_post(x, residual, post, comb)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "hidden_size,num_tokens",
+    [(h, n) for h in (4096, 7168) for n in (0, 1, 8, 17, 32, 64)]
+    + [(4096, 512), (4096, 513)],
+)
 @pytest.mark.parametrize("use_norm", [False, True])
 def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch, hidden_size, num_tokens, use_norm
