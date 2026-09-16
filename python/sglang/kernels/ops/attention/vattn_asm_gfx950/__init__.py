@@ -22,6 +22,8 @@ import tempfile
 
 import torch
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG2E = 1.4426950408889634
 
@@ -97,7 +99,14 @@ def _declared_kernarg_size(source_file):
 def _hip_lib():
     global _hip
     if _hip is None:
-        _hip = ctypes.CDLL("libamdhip64.so")
+        # ROCm 10 images carry two libamdhip64 of the same SONAME: torch loads
+        # the one under _rocm_sdk_core, while LD_LIBRARY_PATH points at the
+        # _rocm_sdk_devel copy. Binding the devel one still loads the module,
+        # but every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709). Initialize CUDA so torch's copy is
+        # mapped, then bind to that.
+        torch.cuda.current_device()
+        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
