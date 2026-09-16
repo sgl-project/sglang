@@ -57,8 +57,8 @@ class TestEncoderDecoderForward(unittest.TestCase):
         # The caller picks (page_table, cache_seqlens, causal) via
         # _encoder_decoder_page_table -- cross-attn -> encoder_page_table +
         # encoder_lens_int32 + causal=False; self-attn -> page_table +
-        # cache_seqlens_int32 + causal=True -- then hands them to the generic
-        # _forward_attn_flat_page_table, which must forward them unchanged with a
+        # cache_seqlens_int32 + causal=True -- then hands them to
+        # _forward_encoder_decoder_attn, which must forward them unchanged with a
         # page_size=1 k_cache (shape[1]==1) so PR #454 routes to the varlen gather.
         enc_pt = torch.arange(5, dtype=torch.int32).unsqueeze(0)
         dec_pt = (torch.arange(4, dtype=torch.int32) + 10).unsqueeze(0)
@@ -70,7 +70,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         )
         key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
         value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
-        q = torch.randn(1, self.HQ * self.D)
+        q = torch.randn(1, self.HQ, self.D)
         cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32)
 
         for is_cross, exp_pt, exp_seqlens, exp_causal in (
@@ -94,15 +94,16 @@ class TestEncoderDecoderForward(unittest.TestCase):
                 )
 
             with patch.object(xpu_backend, "flash_attn_with_kvcache", fake_kvcache):
-                self.backend._forward_attn_flat_page_table(
+                self.backend._forward_encoder_decoder_attn(
                     q=q,
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    layer=layer,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=1,
+                    scale=layer.scaling,
+                    softcap=layer.logit_cap,
                     causal=causal,
                 )
             self.assertTrue(torch.equal(captured["page_table"], exp_pt))
@@ -117,18 +118,20 @@ class TestEncoderDecoderForward(unittest.TestCase):
         # zeros and never launch the kernel.
         key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
         value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
-        q = torch.randn(1, self.HQ * self.D)
+        q = torch.randn(1, self.HQ, self.D)
         sentinel = MagicMock(side_effect=AssertionError("kernel must not run"))
+        layer = self._layer(True)
         with patch.object(xpu_backend, "flash_attn_with_kvcache", sentinel):
-            out = self.backend._forward_attn_flat_page_table(
+            out = self.backend._forward_encoder_decoder_attn(
                 q=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
-                layer=self._layer(True),
                 page_table=torch.zeros(1, 0, dtype=torch.int32),
                 cache_seqlens=torch.zeros(1, dtype=torch.int32),
                 cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
                 max_seqlen_q=1,
+                scale=layer.scaling,
+                softcap=layer.logit_cap,
                 causal=False,
             )
         sentinel.assert_not_called()
@@ -141,7 +144,7 @@ class TestEncoderDecoderForward(unittest.TestCase):
         # counts (2 and 3) exercise the cu_seqlens_q -> per-request row mapping.
         key_cache = self.k_flat.view(-1, 1, self.HK, self.D)
         value_cache = self.v_flat.view(-1, 1, self.HK, self.D)
-        q = torch.randn(5, self.HQ * self.D)
+        q = torch.randn(5, self.HQ, self.D)
 
         def fake_kvcache(*_, **kw):
             # All-ones (never-NaN) sentinel so zeroed rows are distinguishable.
@@ -149,16 +152,18 @@ class TestEncoderDecoderForward(unittest.TestCase):
                 (kw["q"].shape[0], kw["q"].shape[1], kw["v_cache"].shape[-1])
             )
 
+        layer = self._layer(True)
         with patch.object(xpu_backend, "flash_attn_with_kvcache", fake_kvcache):
-            out = self.backend._forward_attn_flat_page_table(
+            out = self.backend._forward_encoder_decoder_attn(
                 q=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
-                layer=self._layer(True),
                 page_table=torch.zeros(2, 4, dtype=torch.int32),
                 cache_seqlens=torch.tensor([0, 4], dtype=torch.int32),
                 cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
                 max_seqlen_q=3,
+                scale=layer.scaling,
+                softcap=layer.logit_cap,
                 causal=False,
             )
         self.assertTrue(torch.equal(out[:2], torch.zeros(2, self.HQ, self.D)))
