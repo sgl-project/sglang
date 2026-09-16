@@ -1,4 +1,4 @@
-"""gfx950 BF16 WO-A prefill layout, numerical equivalence and graph replay."""
+"""gfx950 BF16 WO-A dispatch, numerical equivalence and graph replay."""
 
 import unittest
 from unittest.mock import patch
@@ -15,7 +15,11 @@ register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 class TestWoABf16Prefill(unittest.TestCase):
     def setUp(self):
         from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+        from sglang.srt.runtime_context import get_context
 
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         self.project = _apply_wo_a_bf16_matmul
         torch.manual_seed(39186)
 
@@ -51,6 +55,83 @@ class TestWoABf16Prefill(unittest.TestCase):
                         y, torch.einsum("tgd,grd->tgr", x, w), atol=0, rtol=0
                     )
                 del graph, x, w, y
+
+    def test_decode_verify_and_mutable_graph(self):
+        from sglang.srt.models import deepseek_v4 as model
+
+        for rows in (1, 2, 8, 129, 192, 256, 384):
+            with self.subTest(rows=rows):
+                x, w = self.operands(rows, strided=rows == 8)
+                kwargs = dict(is_decode=True, is_target_verify=rows > 1)
+                name = "wo_a_bf16_gemv" if rows == 1 else "wo_a_bf16_small_batch"
+                if rows <= 8:
+                    with patch.object(
+                        model, name, wraps=getattr(model, name)
+                    ) as kernel:
+                        self.project(x, w, **kwargs)
+                        kernel.assert_called_once()
+                else:
+                    self.project(x, w, **kwargs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y = self.project(x, w, **kwargs)
+                for _ in range(2):
+                    x.normal_()
+                    w.normal_(std=0.015625)
+                    graph.replay()
+                    ref = torch.einsum("tgd,grd->tgr", x, w)
+                    self.assertTrue(y.is_contiguous())
+                    if rows > 8:
+                        torch.testing.assert_close(y, ref, atol=0, rtol=0)
+                    else:
+                        error = (y.float() - ref.float()).square().mean()
+                        self.assertLess(
+                            (error / ref.float().square().mean()).sqrt().item(), 1e-4
+                        )
+
+    def test_decode_verify_fallbacks(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_context
+
+        for reason in ("flag", "deterministic", "invariant", "medium", "large", "mode"):
+            with self.subTest(reason=reason):
+                rows = {"medium": 128, "large": 385, "mode": 8}.get(reason, 1)
+                x, w = self.operands(rows)
+                with (
+                    envs.SGLANG_OPT_HIP_WO_A_BF16_DECODE.override(reason != "flag"),
+                    get_context().override_server_args(
+                        enable_deterministic_inference=reason == "deterministic"
+                    ),
+                    patch(
+                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                        return_value=reason == "invariant",
+                    ),
+                    patch(
+                        "sglang.srt.models.deepseek_v4._wo_a_aiter_batched_gemm_enabled",
+                        False,
+                    ),
+                    patch(
+                        "sglang.srt.models.deepseek_v4.wo_a_bf16_gemv",
+                        side_effect=AssertionError("unexpected GEMV"),
+                    ),
+                    patch(
+                        "sglang.srt.models.deepseek_v4.wo_a_bf16_small_batch",
+                        side_effect=AssertionError("unexpected split-K"),
+                    ),
+                    patch(
+                        "torch.bmm",
+                        side_effect=AssertionError("unexpected direct output"),
+                    ),
+                ):
+                    y = self.project(
+                        x,
+                        w,
+                        is_decode=True,
+                        is_target_verify=rows > 1 and reason != "mode",
+                    )
+                torch.testing.assert_close(
+                    y, torch.einsum("tgd,grd->tgr", x, w), atol=0, rtol=0
+                )
 
     def test_fallbacks(self):
         for reason in (

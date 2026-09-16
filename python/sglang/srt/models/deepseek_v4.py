@@ -465,13 +465,30 @@ def _apply_wo_a_bf16_matmul(
 ) -> torch.Tensor | Mxfp8SwizzledInput:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
-    The fast paths are gated on the exact validated TP4 shapes and write
-    token-major output directly: single-token decode GEMV and Blackwell verify /
-    large prefill batches on CUDA, large prefill batches on gfx950. ROCm decode
-    can use aiter batched GEMM with an optional fp8-grid operand; other cases
-    use torch.einsum.
+    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
+    verify batches up to 384 rows and large prefill batches write token-major
+    output directly to avoid the layout copy before wo_b. gfx950 also uses the
+    direct output for large prefill batches and 129–384 verify rows, plus
+    GEMV/split-K for one-token decode and 2–8 verify rows. Other ROCm decode can use
+    aiter batched GEMM with an optional fp8-grid operand; other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
+    hip_decode_verify = (
+        _is_hip
+        and _is_gfx95_supported
+        and envs.SGLANG_OPT_HIP_WO_A_BF16_DECODE.get()
+        and (
+            (is_decode and o.shape[0] == 1 and o.is_contiguous())
+            or (is_target_verify and (2 <= o.shape[0] <= 8 or 129 <= o.shape[0] <= 384))
+        )
+    )
+    if hip_decode_verify:
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        hip_decode_verify = not (
+            is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+        )
     if (
         fast_path
         and (
@@ -495,6 +512,7 @@ def _apply_wo_a_bf16_matmul(
                     )
                 )
             )
+            or hip_decode_verify
             or (
                 _is_hip
                 and _is_gfx95_supported
@@ -513,7 +531,7 @@ def _apply_wo_a_bf16_matmul(
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
         if 2 <= o.shape[0] <= 8:
-            if fuse_mxfp8_quant:
+            if fuse_mxfp8_quant and _is_cuda:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
         result = torch.empty(
