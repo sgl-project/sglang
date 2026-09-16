@@ -35,18 +35,25 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_effective_routes(app: Any):
+    """Iterate path operation routes across supported FastAPI versions."""
+    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
+        app, "routes", []
+    )
+    try:
+        from fastapi.routing import iter_route_contexts
+    except ImportError:
+        return iter(routes)
+    return iter_route_contexts(routes)
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    # Prefer app.router.routes when available; fall back to app.routes.
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-
-    for route in routes:
+    for route in _iter_effective_routes(app):
         try:
             match, child_scope = route.matches(scope)
         except Exception:
@@ -61,10 +68,7 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
 
 def app_has_admin_force_endpoints(app: Any) -> bool:
     """Return True if any route endpoint is marked as ADMIN_FORCE."""
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-    for route in routes:
+    for route in _iter_effective_routes(app):
         endpoint = getattr(route, "endpoint", None)
         if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
             return True
@@ -90,14 +94,16 @@ def decide_request_auth(
       it must be rejected (403) even if api_key is provided.
 
     NOTE :
-    - Health/metrics endpoints are always allowed (even when api_key/admin_api_key is set),
-      to support k8s/liveness/readiness and Prometheus scraping without embedding secrets.
-    - We match them by prefix to cover common variants like /health_generate.
+    - Health/liveness/metrics endpoints are always allowed (even when
+      api_key/admin_api_key is set), to support k8s probes and Prometheus scraping
+      without embedding secrets.
+    - Health and metrics are matched by prefix to cover variants like
+      /health_generate. Liveness is matched exactly.
     """
     if method == "OPTIONS":
         return AuthDecision(allowed=True)
 
-    if path.startswith("/health") or path.startswith("/metrics"):
+    if path == "/liveness" or path.startswith("/health") or path.startswith("/metrics"):
         return AuthDecision(allowed=True)
 
     def _check_bearer_token(
