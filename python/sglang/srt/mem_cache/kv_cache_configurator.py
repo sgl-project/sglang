@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -59,6 +60,10 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
+)
+from sglang.srt.mem_cache.dsv41_main_kv_layout import (
+    MainKVLayoutSpec,
+    resolve_dsv41_main_kv_layout_specs,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -278,6 +283,12 @@ class KVCacheConfigurator:
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    dsv4_kv_layout: Optional[KVLayout] = field(init=False, default=None)
+    dsv4_compressed_kv_layout: Optional[str] = field(init=False, default=None)
+    dsv41_main_kv_layout_specs: Optional[dict[int, MainKVLayoutSpec]] = field(
+        init=False, default=None
+    )
+    _dsv4_layouts_resolved: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
@@ -292,6 +303,30 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
+
+    def resolve_dsv4_storage_layouts(
+        self,
+    ) -> tuple[KVLayout, Optional[str], Optional[dict[int, MainKVLayoutSpec]]]:
+        if self._dsv4_layouts_resolved:
+            return (
+                self.dsv4_kv_layout,
+                self.dsv4_compressed_kv_layout,
+                self.dsv41_main_kv_layout_specs,
+            )
+
+        option = getattr(self.server_args, "dsv41_main_kv_layout", "auto")
+        if option in ("flashmla_fp8", "packed_fp4"):
+            kv_layout, compressed_kv_layout = KVLayout.V4, None
+        else:
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+
+        specs = resolve_dsv41_main_kv_layout_specs(option, self.page_size)
+
+        self.dsv4_kv_layout = kv_layout
+        self.dsv4_compressed_kv_layout = compressed_kv_layout
+        self.dsv41_main_kv_layout_specs = specs
+        self._dsv4_layouts_resolved = True
+        return kv_layout, compressed_kv_layout, specs
 
     def hybrid_swa_token_capacity(
         self,
@@ -1384,9 +1419,15 @@ class KVCacheConfigurator:
             pool_cls = DeepSeekV4TokenToKVPool
             # 584-byte V4 pages, or the V4.1 fp8 / fp4 pages of the SM100 FlashMLA
             # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
-            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            (
+                kv_layout,
+                compressed_kv_layout,
+                main_kv_layout_specs,
+            ) = self.resolve_dsv4_storage_layouts()
             kv_layout_kwargs = dict(
-                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+                kv_layout=kv_layout,
+                compressed_kv_layout=compressed_kv_layout,
+                main_kv_layout_specs=main_kv_layout_specs,
             )
 
         token_to_kv_pool = pool_cls(

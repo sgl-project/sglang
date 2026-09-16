@@ -3191,9 +3191,12 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
-            # The fp4 cache stores the e2m1 codes themselves: the kernel rotates the
-            # tail and rounds once, no fake quantization in between.
+        if pool.get_extra_key_layout(layer.layer_id) in (
+            KVLayout.V41_FP4,
+            KVLayout.DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1,
+        ):
+            # FP4 caches persist E2M1 codes for at least the noPE region. Their
+            # writers rotate the tail and round once, with no prior fake quantization.
             pool.set_extra_key_buffer_fused(
                 layer_id=layer.layer_id, loc=slots, cache_k=latent, freqs_cis=freqs
             )

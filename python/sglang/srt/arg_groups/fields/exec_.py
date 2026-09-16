@@ -261,6 +261,25 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    dsv41_main_kv_layout: A[
+        str,
+        Arg(
+            help="DeepSeek-V4.1 ratio-1/ratio-2 Main-KV storage layout. "
+            "'auto' keeps the current FlashMLA layout, 'flashmla_fp8' explicitly "
+            "selects it, and 'packed_fp4' selects the versioned 384-byte layout "
+            "once a compatible consumer is available.",
+            choices=["auto", "flashmla_fp8", "packed_fp4"],
+        ),
+    ] = "auto"
+    dsv41_main_kv_consumer: A[
+        str,
+        Arg(
+            help="Consumer for the versioned DeepSeek-V4.1 packed Main-KV "
+            "layout. PR1 reserves 'staged' and 'direct'; neither is available "
+            "until its corresponding follow-up implementation lands.",
+            choices=["auto", "staged", "direct"],
+        ),
+    ] = "auto"
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(

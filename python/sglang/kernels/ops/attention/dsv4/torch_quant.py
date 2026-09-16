@@ -116,3 +116,132 @@ def dequantize_k_cache_v41(pages: torch.Tensor, page_size: int) -> torch.Tensor:
     return (values.view(num_pages, page_size, 16, 32) * scale_bf16.unsqueeze(-1)).view(
         num_pages, page_size, 512
     )
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def quantize_to_e2m1_codes(x: torch.Tensor) -> torch.Tensor:
+    """Round to E2M1 with ties-to-even and return the four-bit codes."""
+    x = x.float()
+    magnitudes = torch.tensor(
+        _E2M1_MAGNITUDES, dtype=torch.float32, device=x.device
+    )
+    sign = torch.signbit(x).to(torch.uint8) << 3
+    absolute = torch.nan_to_num(x.abs(), nan=0.0, posinf=6.0).clamp_max(6.0)
+    midpoints = (magnitudes[:-1] + magnitudes[1:]) / 2
+    code = torch.bucketize(absolute, midpoints, right=True)
+    on_tie = (absolute.unsqueeze(-1) == midpoints).any(dim=-1)
+    tie_code = torch.bucketize(absolute, midpoints, right=False)
+    code = torch.where(on_tie, tie_code + (tie_code & 1), code)
+    return sign | code.to(torch.uint8)
+
+
+def dequantize_e2m1_codes(codes: torch.Tensor) -> torch.Tensor:
+    magnitudes = torch.tensor(
+        _E2M1_MAGNITUDES, dtype=torch.float32, device=codes.device
+    )
+    values = magnitudes[(codes & 7).long()]
+    return torch.where((codes & 8) != 0, -values, values)
+
+
+def quantize_dsv41_packed_main_kv(k: torch.Tensor) -> torch.Tensor:
+    """Pack finite ``[num_pages, page_size, 512]`` values into the 384-byte
+    DSV4.1 Main-KV layout.
+
+    The 448 noPE values keep their E2M1 payload and 28 E4M3 block scales. The
+    64 RoPE values undergo the same block-16 fake quantization but persist as
+    dequantized BF16. Four reserved bytes complete every scale row.
+    """
+    if k.ndim != 3 or k.shape[-1] != 512:
+        raise ValueError(
+            "packed Main KV input must have shape [num_pages, page_size, 512], "
+            f"got {tuple(k.shape)}"
+        )
+    if k.shape[1] not in (128, 256):
+        raise ValueError(
+            f"packed Main KV pages must contain 128 or 256 slots, got {k.shape[1]}"
+        )
+    if not bool(torch.isfinite(k).all().item()):
+        raise ValueError("packed Main KV only supports finite input")
+
+    num_pages, page_size, _ = k.shape
+    blocks = k.float().view(num_pages, page_size, 32, 16)
+    amax = blocks.abs().amax(dim=-1)
+    scale = (amax * (1.0 / FP4_MAX)).clamp(min=2**-9, max=FP8_MAX)
+    scale_e4m3 = scale.to(torch.float8_e4m3fn)
+    # Adding positive zero clears an input -0.0, while a negative non-zero value
+    # that rounds to zero still contributes the E2M1 sign bit.
+    normalized = (blocks + 0.0) / scale_e4m3.float().unsqueeze(-1)
+    codes = quantize_to_e2m1_codes(normalized)
+
+    nope_codes = codes[..., :28, :].reshape(num_pages, page_size, 448)
+    payload = nope_codes[..., 0::2] | (nope_codes[..., 1::2] << 4)
+
+    scale_rows = torch.zeros(
+        (num_pages, page_size, 32), dtype=torch.uint8, device=k.device
+    )
+    scale_rows[..., :28] = scale_e4m3[..., :28].view(torch.uint8)
+
+    rope_values = (
+        dequantize_e2m1_codes(codes[..., 28:, :])
+        * scale_e4m3[..., 28:].float().unsqueeze(-1)
+    ).reshape(num_pages, page_size, 64)
+    rope = rope_values.to(torch.bfloat16).view(torch.uint8)
+
+    payload_bytes = page_size * 224
+    scale_offset = payload_bytes
+    rope_offset = page_size * 256
+    page_bytes = page_size * 384
+    pages = torch.zeros((num_pages, page_bytes), dtype=torch.uint8, device=k.device)
+    pages[:, :payload_bytes] = payload.reshape(num_pages, payload_bytes)
+    pages[:, scale_offset:rope_offset] = scale_rows.reshape(num_pages, page_size * 32)
+    pages[:, rope_offset:] = rope.reshape(num_pages, page_size * 128)
+    return pages
+
+
+def dequantize_dsv41_packed_main_kv(
+    pages: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Decode the 384-byte DSV4.1 Main-KV layout to BF16
+    ``[num_pages, page_size, 512]`` values."""
+    if pages.dtype is not torch.uint8 or pages.ndim != 2:
+        raise ValueError(
+            "packed Main KV pages must be 2D torch.uint8, "
+            f"got dtype={pages.dtype}, shape={tuple(pages.shape)}"
+        )
+    if page_size not in (128, 256):
+        raise ValueError(
+            f"packed Main KV page_size must be 128 or 256, got {page_size}"
+        )
+    page_bytes = page_size * 384
+    if pages.shape[1] != page_bytes:
+        raise ValueError(
+            "packed Main KV page width does not match page_size: "
+            f"{pages.shape[1]} != {page_bytes}"
+        )
+
+    num_pages = pages.shape[0]
+    payload_bytes = page_size * 224
+    rope_offset = page_size * 256
+    payload = pages[:, :payload_bytes].reshape(num_pages, page_size, 224)
+    scale_rows = pages[:, payload_bytes:rope_offset].reshape(num_pages, page_size, 32)
+
+    codes = torch.empty(
+        (num_pages, page_size, 448), dtype=torch.uint8, device=pages.device
+    )
+    codes[..., 0::2] = payload & 0xF
+    codes[..., 1::2] = payload >> 4
+    values = dequantize_e2m1_codes(codes).view(num_pages, page_size, 28, 16)
+    scales = scale_rows[..., :28].view(torch.float8_e4m3fn).float()
+    nope = (
+        (values * scales.unsqueeze(-1))
+        .reshape(num_pages, page_size, 448)
+        .to(torch.bfloat16)
+    )
+
+    rope = (
+        pages[:, rope_offset:]
+        .contiguous()
+        .view(torch.bfloat16)
+        .reshape(num_pages, page_size, 64)
+    )
+    return torch.cat((nope, rope), dim=-1)
