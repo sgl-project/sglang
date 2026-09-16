@@ -1838,7 +1838,9 @@ class Scheduler(
             from sglang.srt.entrypoints.sidecar_context import LOCAL_KV_EVENT_SOURCES
 
             result_dict[LOCAL_KV_EVENT_SOURCES] = (
-                self.kv_events_publisher.local_kv_event_sources(self.page_size)
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
             )
         return result_dict
 

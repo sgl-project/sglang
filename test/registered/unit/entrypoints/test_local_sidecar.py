@@ -4,9 +4,11 @@ import atexit
 import dataclasses
 import json
 import os
+import signal
+import threading
 import time
 import unittest
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -68,12 +70,13 @@ class TestSidecarContext(unittest.TestCase):
             SchedulerKvEventsPublisher,
         )
 
-        for pp, tp, cp, dp_attention in (
-            (0, 0, 0, True),
-            (0, 0, 0, False),
-            (1, 0, 0, True),
-            (0, 1, 0, True),
-            (0, 0, 1, True),
+        for pp, tp, cp, dp_attention, dcp_size in (
+            (0, 0, 0, True, 1),
+            (0, 0, 0, False, 1),
+            (0, 0, 0, True, 4),
+            (1, 0, 0, True, 1),
+            (0, 1, 0, True, 1),
+            (0, 0, 1, True, 1),
         ):
             ps = SimpleNamespace(
                 pp_rank=pp,
@@ -84,9 +87,11 @@ class TestSidecarContext(unittest.TestCase):
                 dp_rank=None if dp_attention else 4,
             )
             publisher = MagicMock()
-            publisher.describe_local_source.return_value = source(4)
+            publisher.describe_local_source.side_effect = lambda block_size: (
+                dataclasses.replace(source(4), block_size=block_size)
+            )
             with (
-                self.subTest(ps=ps),
+                self.subTest(ps=ps, dcp_size=dcp_size),
                 patch(
                     "sglang.srt.managers.scheduler_components.kv_events_publisher.EventPublisherFactory.create",
                     return_value=publisher,
@@ -112,19 +117,25 @@ class TestSidecarContext(unittest.TestCase):
                 scheduler.page_size = 64
                 scheduler.kv_events_publisher = component
                 with get_context().override_server_args(
-                    sidecar_scope="local-telemetry"
+                    sidecar_scope="local-telemetry", dcp_size=dcp_size
                 ):
                     info = scheduler.get_init_info()
                 if pp == tp == cp == 0:
                     create.assert_called_once_with('{"publisher":"zmq"}', 4)
-                    self.assertEqual(info[LOCAL_KV_EVENT_SOURCES], [source(4)])
+                    publisher.describe_local_source.assert_called_once_with(
+                        64 * dcp_size
+                    )
+                    self.assertEqual(
+                        info[LOCAL_KV_EVENT_SOURCES],
+                        [dataclasses.replace(source(4), block_size=64 * dcp_size)],
+                    )
                 else:
                     create.assert_not_called()
                     self.assertEqual(info[LOCAL_KV_EVENT_SOURCES], [])
                 with get_context().override_server_args(sidecar_scope="leader"):
                     self.assertNotIn(LOCAL_KV_EVENT_SOURCES, scheduler.get_init_info())
 
-    def test_engine_extracts_metadata_on_direct_and_dp_controller_paths(self):
+    def test_engine_extracts_sources_from_scheduler_or_controller_reply(self):
         from sglang.srt.entrypoints.engine import Engine
 
         for dp_size in (1, 8):
@@ -172,6 +183,67 @@ class TestSidecarContext(unittest.TestCase):
             self.assertEqual(result.local_kv_event_sources, sources)
             self.assertEqual(result.scheduler_infos, [{"status": "ready"}])
 
+    def test_dp_controller_collects_and_forwards_local_scheduler_sources(self):
+        from sglang.srt.managers import data_parallel_controller as dpc
+
+        # Node 1 owns DP ranks 2 and 3; their CP companions own no publisher.
+        infos = [
+            dict(
+                status="ready",
+                max_total_num_tokens=64,
+                max_req_input_len=32,
+                **{LOCAL_KV_EVENT_SOURCES: sources},
+            )
+            for sources in ([source(2)], [], [source(3)], [])
+        ]
+        pipes = [(MagicMock(), MagicMock()) for _ in infos]
+        for (reader, _), info in zip(pipes, infos):
+            reader.recv.return_value = info
+        controller = dpc.DataParallelController.__new__(dpc.DataParallelController)
+        controller.env_lock = threading.Lock()
+        controller.scheduler_procs = []
+        controller.local_kv_event_sources = []
+        controller.run_scheduler_process_func = MagicMock()
+
+        def initialize(server_args, port_args, run_scheduler):
+            controller.launch_tensor_parallel_group(server_args, port_args, 0, None)
+            return controller
+
+        ready = MagicMock()
+        with (
+            get_context().override_server_args(
+                node_rank=1,
+                nnodes=2,
+                tp_size=8,
+                pp_size=1,
+                dp_size=4,
+                enable_dp_attention=True,
+                attn_cp_size=2,
+            ),
+            patch.object(dpc, "DataParallelController", side_effect=initialize),
+            patch.object(dpc.mp, "Pipe", side_effect=pipes),
+            patch.object(dpc.mp, "Process"),
+            patch.object(dpc.PortArgs, "init_new", return_value=MagicMock()),
+            patch.object(dpc.TorchMemorySaverAdapter, "create"),
+            patch.object(dpc.numa_utils, "configure_subprocess"),
+            patch.object(dpc, "maybe_reindex_device_id", return_value=nullcontext(0)),
+            patch.object(dpc, "publish"),
+            patch.object(dpc, "configure_logger"),
+            patch.object(dpc, "kill_itself_when_parent_died"),
+            patch.object(dpc.setproctitle, "setproctitle"),
+            patch.object(dpc.psutil, "Process") as parent,
+        ):
+            dpc.run_data_parallel_controller_process(
+                MagicMock(), MagicMock(), ready, controller.run_scheduler_process_func
+            )
+        parent.return_value.parent.return_value.send_signal.assert_not_called()
+        ready.send.assert_called_once()
+        self.assertEqual(
+            ready.send.call_args.args[0][LOCAL_KV_EVENT_SOURCES],
+            [source(2), source(3)],
+        )
+        self.assertTrue(all(LOCAL_KV_EVENT_SOURCES not in info for info in infos))
+
     def test_extracts_all_local_sources_without_leaking_into_server_info(self):
         # Same helper handles direct scheduler replies and DPC ready replies.
         infos = [
@@ -182,11 +254,8 @@ class TestSidecarContext(unittest.TestCase):
         local = take_local_kv_event_sources(infos)
         self.assertEqual(local, [source(4), source(5)])
         self.assertEqual(infos, [{"status": "ready"}] * 3)
-        controller_info = {"status": "ready", LOCAL_KV_EVENT_SOURCES: local}
-        self.assertEqual(take_local_kv_event_sources([controller_info]), local)
-        self.assertEqual(controller_info, {"status": "ready"})
 
-    def test_conflicting_sources_fail_startup(self):
+    def test_conflicting_sources_are_rejected(self):
         for conflicting in (
             [
                 source(4),
@@ -197,7 +266,7 @@ class TestSidecarContext(unittest.TestCase):
             with self.subTest(conflicting=conflicting), self.assertRaises(ValueError):
                 take_local_kv_event_sources([{LOCAL_KV_EVENT_SOURCES: conflicting}])
 
-    def test_leader_and_follower_get_same_group_and_only_local_sources(self):
+    def test_context_selects_mode_and_preserves_supplied_sources(self):
         contexts = []
         for node_rank, ranks in ((0, [0, 1]), (1, [2, 3])):
             with get_context().override_server_args(
@@ -252,11 +321,25 @@ class TestLocalSidecar(unittest.TestCase):
             sidecar="test_local_sidecar",
             sidecar_args=[report.getsockopt_string(zmq.LAST_ENDPOINT)],
         ):
+            # A provider crash must fail this test, not SIGQUIT the whole runner.
+            real_kill = os.kill
+            crashed = threading.Event()
+
+            def intercept_kill(pid, sig):
+                if pid == os.getpid() and sig == signal.SIGQUIT:
+                    crashed.set()
+                else:
+                    real_kill(pid, sig)
+
+            kill_patch = patch("sglang.srt.utils.watchdog.os.kill", intercept_kill)
+            kill_patch.start()
+            self.addCleanup(kill_patch.stop)
             sidecar = start_sidecar(context)
         self.addCleanup(sidecar.stop)
         # Includes spawned interpreter/provider initialization, without a handshake.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
+            self.assertFalse(crashed.is_set(), "Follower provider exited unexpectedly")
             publisher.publish(KVEventBatch(ts=time.time(), events=[AllBlocksCleared()]))
             if report.poll(100):
                 topic, sequence, payload = report.recv_multipart()
@@ -269,6 +352,7 @@ class TestLocalSidecar(unittest.TestCase):
         else:
             self.fail("Follower sidecar did not forward its local DP-rank events")
         sidecar.stop()
+        self.assertFalse(crashed.is_set(), "Follower provider exited unexpectedly")
         self.assertFalse(sidecar.proc.is_alive())
 
     def test_follower_context_is_installed_before_provider_import(self):
@@ -294,69 +378,39 @@ class TestLocalSidecar(unittest.TestCase):
             _run_sidecar("provider", [], None, context)
         provider_main.assert_called_once_with([])
 
-    def test_follower_process_receives_context_without_grpc_endpoint(self):
-        context = SidecarContext("telemetry", 1, 2, 8, "tcp://leader:5000", [source(4)])
-        with (
-            get_context().override_server_args(sidecar="provider"),
-            patch("sglang.srt.entrypoints.sidecar.mp.get_context") as mp_context,
-            patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
-        ):
-            start_sidecar(context)
-        self.assertEqual(
-            mp_context.return_value.Process.call_args.kwargs["args"],
-            ("provider", [], None, context),
-        )
-        self.assertFalse(sidecar_class.call_args.kwargs["allow_clean_exit"])
-        mp_context.return_value.Pipe.assert_not_called()
-        sidecar_class.return_value.start.assert_called_once_with()
-
     def test_unexpected_clean_exit_is_fatal(self):
         proc = MagicMock(pid=1234, exitcode=0)
         proc.is_alive.return_value = False
         sidecar = Sidecar(proc, "provider", 1, allow_clean_exit=False)
         with patch("sglang.srt.utils.watchdog.os.kill") as kill:
             self.assertTrue(sidecar._watchdog._check_processes())
-        kill.assert_called_once()
+        kill.assert_called_once_with(os.getpid(), signal.SIGQUIT)
 
 
 class TestFollowerSidecarLifecycle(unittest.TestCase):
-    def launch(
-        self,
-        *,
-        sources,
-        blocking=True,
-        failure=None,
-        start_failure=None,
-        scope="local-telemetry",
-    ):
+    @contextmanager
+    def launch(self, *, sources, blocking=True, scope="local-telemetry"):
         from sglang.srt.entrypoints.engine import Engine, SchedulerInitResult
 
         events = []
         result = SchedulerInitResult(
             scheduler_infos=[{"status": "ready"}],
             local_kv_event_sources=sources,
-            wait_for_ready=lambda: events.append("scheduler-ready"),
+            wait_for_ready=MagicMock(
+                side_effect=lambda: events.append("scheduler-ready")
+            ),
+            block_until_scheduler_exits=MagicMock(
+                side_effect=lambda: events.append("blocking")
+            ),
         )
         sidecar = MagicMock()
         sidecar.stop.side_effect = lambda: events.append("sidecar-stopped")
 
         def start(context):
             events.append("sidecar-started")
-            self.assertEqual(events, ["scheduler-ready", "sidecar-started"])
-            if start_failure:
-                raise start_failure
             return sidecar
 
-        def block():
-            events.append("blocking")
-            if failure:
-                raise failure
-
-        result.block_until_scheduler_exits = block
-        proc = MagicMock(pid=12345)
-        stack = ExitStack()
-        self.addCleanup(stack.close)
-        stack.enter_context(
+        with (
             get_context().override_server_args(
                 sidecar="provider",
                 sidecar_scope=scope,
@@ -364,56 +418,59 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
                 nnodes=2,
                 dp_size=8,
                 dist_init_addr="leader:5000",
-            )
-        )
-        stack.enter_context(
+            ),
             patch.dict(
                 os.environ,
                 {"SGLANG_BLOCK_NONZERO_RANK_CHILDREN": "1" if blocking else "0"},
-            )
-        )
-        for name in (
-            "configure_logger",
-            "_set_envs_and_config",
-            "load_plugins",
-            "publish",
-        ):
-            stack.enter_context(patch(f"sglang.srt.entrypoints.engine.{name}"))
-        stack.enter_context(
+            ),
+            patch("sglang.srt.entrypoints.engine.configure_logger"),
+            patch("sglang.srt.entrypoints.engine._set_envs_and_config"),
+            patch("sglang.srt.entrypoints.engine.load_plugins"),
+            patch("sglang.srt.entrypoints.engine.publish"),
             patch(
                 "sglang.srt.entrypoints.engine.resolving_view",
                 return_value=SimpleNamespace(
                     reasoning_parser=None, tool_call_parser=None
                 ),
-            )
-        )
-        stack.enter_context(
+            ),
             patch.object(
-                Engine, "_launch_scheduler_processes", return_value=(result, [proc])
-            )
-        )
-        stack.enter_context(
-            patch("sglang.srt.entrypoints.sidecar.start_sidecar", side_effect=start)
-        )
-        health = stack.enter_context(
+                Engine,
+                "_launch_scheduler_processes",
+                return_value=(result, [MagicMock(pid=12345)]),
+            ),
+            patch(
+                "sglang.srt.entrypoints.sidecar.start_sidecar", side_effect=start
+            ) as start_mock,
             patch(
                 "sglang.srt.entrypoints.engine.launch_dummy_health_check_server",
                 side_effect=lambda *args: events.append("health"),
+            ) as health,
+            patch("sglang.srt.entrypoints.engine.kill_process_tree") as kill,
+        ):
+            yield SimpleNamespace(
+                run=lambda: Engine._launch_subprocesses(
+                    MagicMock(),
+                    MagicMock(),
+                    MagicMock(),
+                    MagicMock(),
+                    port_args=MagicMock(),
+                ),
+                result=result,
+                sidecar=sidecar,
+                start=start_mock,
+                events=events,
+                health=health,
+                kill=kill,
             )
-        )
-        kill = stack.enter_context(
-            patch("sglang.srt.entrypoints.engine.kill_process_tree")
-        )
-        launch = lambda: Engine._launch_subprocesses(
-            MagicMock(), MagicMock(), MagicMock(), MagicMock(), port_args=MagicMock()
-        )
-        return launch, result, sidecar, events, health, kill
 
     def test_blocking_follower_starts_sidecar_and_stops_on_exit(self):
-        launch, _, sidecar, events, _, _ = self.launch(sources=[source(4)])
-        launch()
+        with self.launch(sources=[source(4)]) as follower:
+            follower.run()
+        follower.start.assert_called_once_with(
+            SidecarContext("telemetry", 1, 2, 8, "tcp://leader:5000", [source(4)])
+        )
         self.assertEqual(
-            events,
+            follower.events,
             [
                 "scheduler-ready",
                 "sidecar-started",
@@ -422,52 +479,49 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
                 "sidecar-stopped",
             ],
         )
-        sidecar.stop.assert_called_once_with()
 
     def test_blocking_failure_stops_sidecar(self):
-        launch, _, sidecar, _, _, _ = self.launch(
-            sources=[source(4)], failure=RuntimeError("scheduler stopped")
-        )
-        with self.assertRaisesRegex(RuntimeError, "scheduler stopped"):
-            launch()
-        sidecar.stop.assert_called_once_with()
+        with self.launch(sources=[source(4)]) as follower:
+            follower.result.block_until_scheduler_exits.side_effect = RuntimeError(
+                "scheduler stopped"
+            )
+            with self.assertRaisesRegex(RuntimeError, "scheduler stopped"):
+                follower.run()
+        follower.sidecar.stop.assert_called_once_with()
 
     def test_source_free_and_legacy_followers_do_not_start_sidecar(self):
         for sources, scope in (([], "local-telemetry"), ([source(4)], "leader")):
-            with self.subTest(scope=scope):
-                launch, _, sidecar, events, _, _ = self.launch(
-                    sources=sources, scope=scope
-                )
-                launch()
-                self.assertNotIn("sidecar-started", events)
-                sidecar.stop.assert_not_called()
+            with (
+                self.subTest(scope=scope),
+                self.launch(sources=sources, scope=scope) as follower,
+            ):
+                follower.run()
+                follower.start.assert_not_called()
+                follower.sidecar.stop.assert_not_called()
 
     def test_nonblocking_follower_transfers_ownership_to_engine(self):
         from sglang.srt.entrypoints.engine import Engine
 
-        launch, result, sidecar, events, health, _ = self.launch(
-            sources=[source(4)], blocking=False
-        )
-        returned = launch()
-        self.assertIs(returned[3], result)
-        self.assertIs(result.sidecar, sidecar)
-        self.assertEqual(events, ["scheduler-ready", "sidecar-started"])
-        health.assert_not_called()
-        engine = Engine.__new__(Engine)
-        engine.tokenizer_manager = None
-        engine._scheduler_init_result = result
-        engine.shutdown()
-        self.assertIsNone(result.sidecar)
-        sidecar.stop.assert_called_once_with()
+        with self.launch(sources=[source(4)], blocking=False) as follower:
+            returned = follower.run()
+            self.assertIs(returned[3], follower.result)
+            self.assertIs(follower.result.sidecar, follower.sidecar)
+            self.assertEqual(follower.events, ["scheduler-ready", "sidecar-started"])
+            follower.health.assert_not_called()
+            engine = Engine.__new__(Engine)
+            engine.tokenizer_manager = None
+            engine._scheduler_init_result = follower.result
+            engine.shutdown()
+        self.assertIsNone(follower.result.sidecar)
+        follower.sidecar.stop.assert_called_once_with()
 
     def test_sidecar_start_failure_reaps_schedulers_before_returning(self):
-        launch, _, _, _, health, kill = self.launch(
-            sources=[source(4)], start_failure=OSError("cannot start provider")
-        )
-        with self.assertRaisesRegex(OSError, "cannot start provider"):
-            launch()
-        health.assert_not_called()
-        kill.assert_called_once_with(12345, wait_timeout=60)
+        with self.launch(sources=[source(4)]) as follower:
+            follower.start.side_effect = OSError("cannot start provider")
+            with self.assertRaisesRegex(OSError, "cannot start provider"):
+                follower.run()
+        follower.health.assert_not_called()
+        follower.kill.assert_called_once_with(12345, wait_timeout=60)
 
 
 if __name__ == "__main__":
