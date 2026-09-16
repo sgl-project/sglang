@@ -102,11 +102,103 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-### Do not override the backends
+### For verified recipes, do not override the backends
 
 `--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them.
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
+
+### RTX PRO 6000 Blackwell Server Edition (SM120): preview notes
+
+These notes cover an **eight-GPU RTX PRO 6000 Blackwell Server Edition** bring-up,
+not another verified Deployment-panel recipe. SM120 is not the SM100-class
+datacenter kernel target, and the GB300 backend choices above are not a recipe
+for this GPU. The observations below are from a pinned preview integration;
+they do not establish stock-release or current-main-branch support.
+
+**Prerequisites and status (2026-09-16).** The measured SGLang preview was
+[`da64c5cbb8cf6bfd39be19da43573fdfd484c43a`](https://github.com/sgl-project/sglang/commit/da64c5cbb8cf6bfd39be19da43573fdfd484c43a),
+with additional integration changes. Pinning that commit alone is not a complete
+SM120 installation recipe:
+
+- FlashInfer 0.6.18 lacks the sparse-prefill extra-cache page-size 128/256
+  instantiations needed here. Native prefill was exercised with the changes from
+  [FlashInfer #5121](https://github.com/flashinfer-ai/flashinfer/pull/5121), still
+  open, pinned at `24804035ad9d8372e5883007f2d391986f17314d` and rebuilt;
+  merely changing Python dispatch does not update an old prebuilt kernel cache.
+- Low-ratio indexer schedule metadata and unsupported-prefill fallback are
+  separate, already-proposed upstream fixes:
+  [SGLang #38970](https://github.com/sgl-project/sglang/pull/38970) and
+  [#38969](https://github.com/sgl-project/sglang/pull/38969), respectively, both
+  still open. Dense-FP8 tuning does not implement or replace either fix.
+- On the measured preview, set `SGLANG_SM120_FLASHMLA_BACKEND=flashinfer` and
+  enable `--enable-deepseek-v4-fp4-indexer`. The latter builds the SM120
+  indexer's required DeepGEMM schedule metadata; do not disable DeepGEMM JIT
+  using settings copied from older recipes. `b12x` was not a recognized
+  sparse-attention selector in that build and silently chose its fallback.
+- Decode CUDA graphs worked. **Full-model prefill graphs remain disabled**, even
+  with native FlashInfer prefill; capturing the attention kernel alone does not
+  remove the engine's prefill capture-pool memory constraints.
+
+**Expert backend and placement.** `marlin` loaded and served the MXFP4 experts
+with direct TP8. Direct TP8 with `flashinfer_mxfp4` rejected the intermediate
+width: `2304 / 8 = 288` is not a multiple of its required 128-element alignment.
+This is a placement constraint, not evidence that all FlashInfer MoE is
+unsupported on SM120.
+
+The preview also served with `--tensor-parallel-size 8 --ep-size 8`,
+`--moe-runner-backend flashinfer_mxfp4` and `--moe-a2a-backend none`: attention
+remained TP8, while each rank held 48 whole experts of width 2304 (expert TP1).
+The standard dispatcher and output all-reduce were used, **not DeepEP**.
+This path uses **MXFP8 activations with MXFP4 weights**, whereas Marlin retains
+BF16 expert activations. It is not a drop-in precision-equivalent alternative;
+passing limited retrieval checks does not establish broad quality parity.
+Marlin remained the measured low-concurrency decode choice.
+
+**Dense block-FP8 decode tuning.** The SM120 dispatch reuses the existing portable
+Triton split-K implementation, with smaller tiles and measured split counts;
+it does not add a new kernel or require a runtime monkeypatch. The configuration
+files match the exact **RTX PRO 6000 Blackwell Server Edition** device name and
+32-by-32 weight blocks for these `(N, K)` shapes:
+
+| Weight shapes | Measured M points | Tuned dispatch domain |
+|---|---|---|
+| `(1792, 5120)`, `(4096, 1280)`, `(5120, 1024)`, `(576, 5120)`, `(5120, 288)` | 1, 4, 16, 32 | 1–32 |
+| `(25600, 6144)` | 1, 4; original path at 16, 32 | 1–10 via nearest-M lookup |
+
+`M` is the flattened activation-row count, not necessarily request concurrency.
+Existing nearest-M lookup selects among the measured configurations. The output
+projection switches to its original configuration at M=11; guard entries keep
+all six shapes on the generic path above M=32. Other shapes and devices
+do not acquire these device-specific settings. Split-K changes summation order,
+but does not introduce additional input or weight quantization.
+
+The original controlled comparison changed **only dense-FP8 dispatch** in the
+pinned preview, retaining TP8/Marlin, hybrid FlashInfer-decode/TileLang-prefill
+attention, decode graphs and the same server/workload settings. With short
+technical prompts and **1,536 output tokens per request**, unprofiled sustained
+aggregate output throughput was:
+
+| Concurrency | Before tuning (tokens/s) | After tuning (tokens/s) |
+|---:|---:|---:|
+| 1 | 35.73 | 94.46 |
+| 32 | 1,141.06 | 1,293.99 |
+
+These are preview-integration measurements, **not a full-server benchmark of
+this change on main**. Later native-prefill and peer-transport gains are separate
+experiments and are not attributed to dense-FP8 tuning.
+
+**Operational limits.** A cold approximately 117k-token request OOMed at static
+memory fraction `0.83`; cold C1 requests of that length passed at `0.80`.
+The configured 393,216-token ceiling was not validated, nor was C32 at long
+context. Treat allocator capacity and configured limits separately from tested
+request capacity.
+
+There is **no global NCCL setting change** associated with this tuning.
+`NCCL_P2P_LEVEL=PHB` is only a topology-specific option: consider it only after
+validating CUDA peer access on the actual GPU pairs, checking NCCL transport
+logs, and measuring correctness and performance on that topology. It is not an
+always-on recommendation for SM120 or for NVIDIA GPUs generally.
 
 ## 3. Advanced Usage
 
