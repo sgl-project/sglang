@@ -336,6 +336,8 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
+        *,
+        kv_checksum_enabled: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
@@ -414,6 +416,26 @@ class MetadataBuffers:
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
+        self.kv_checksum: torch.Tensor | None = None
+        if kv_checksum_enabled:
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # Width 8 (uint64) keeps the per-row size at the 64 B RDMA minimum.
+                self.kv_checksum = torch.zeros(
+                    (self.output_ids.shape[0], 8),
+                    dtype=self.bootstrap_room.dtype,
+                    device=self.bootstrap_room.device,
+                )
+
+    def set_kv_checksum(self, req: Req, value: int) -> None:
+        self.kv_checksum[req.metadata_buffer_index, 0] = value
+
+    def get_kv_checksum(self, idx: int) -> int:
+        return int(self.kv_checksum[idx, 0].item())
+
     def get_buf_infos(self):
         bufs = [
             self.output_ids,
@@ -432,6 +454,8 @@ class MetadataBuffers:
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
+        if self.kv_checksum is not None:
+            bufs.append(self.kv_checksum)
         bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
