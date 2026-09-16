@@ -831,6 +831,21 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+_ARTIFACT_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".safetensors": "application/octet-stream",
+}
+
+
+def _select_lidar_artifact_path(job: dict, variant: str | None) -> str | None:
+    """A joint camera/LiDAR job's extra artifact, addressed by its ``lidar.files`` key."""
+    lidar = job.get("lidar")
+    if not variant or not isinstance(lidar, dict):
+        return None
+    files = lidar.get("files")
+    return files.get(variant) if isinstance(files, dict) else None
+
+
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
     file_paths = job.get("file_paths")
     if file_paths:
@@ -860,7 +875,9 @@ async def download_video_content(
             detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
         )
 
-    file_path = _select_video_variant_path(job, variant)
+    file_path = _select_lidar_artifact_path(job, variant) or _select_video_variant_path(
+        job, variant
+    )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
@@ -868,7 +885,9 @@ async def download_video_content(
             status_code=404, detail=f"Video variant {variant} not found"
         )
 
-    media_type = "video/mp4"  # default variant
+    media_type = _ARTIFACT_MEDIA_TYPES.get(
+        os.path.splitext(file_path)[1].lower(), "video/mp4"
+    )
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )
