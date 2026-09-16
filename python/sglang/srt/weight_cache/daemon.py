@@ -313,7 +313,12 @@ class WeightCacheDaemon:
 
         # Refuse unsupported quant methods before creating distributed groups
         # or touching model weights.
-        check_ipc_quant_support(quant_method, quant_config, where="daemon")
+        check_ipc_quant_support(
+            quant_method,
+            quant_config,
+            where="daemon",
+            is_fp4_experts=getattr(model_config, "is_fp4_experts", False),
+        )
 
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.

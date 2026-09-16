@@ -102,7 +102,12 @@ class IpcModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        check_ipc_quant_support(
+            quant_method,
+            engine_quant_config,
+            where="client",
+            is_fp4_experts=getattr(model_config, "is_fp4_experts", False),
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config, device_config)
@@ -390,11 +395,12 @@ class IpcModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
                 f"mismatch between the IPC daemon and the meta-initialized model. "
-                f"The quantization method passed the IPC allowlist gate "
-                f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
-                f"case — it indicates the daemon's weight fingerprint is "
-                f"incomplete or the daemon/client configs drifted (a bug to fix), "
-                f"not merely uninitialized weights:\n" + "\n".join(mismatched)
+                f"The base quantization method passed the IPC allowlist gate "
+                f"(check_ipc_quant_support), but an unsupported post-load layout "
+                f"may have bypassed that gate. Otherwise, the daemon's weight "
+                f"fingerprint is incomplete or the daemon/client configs drifted "
+                f"(a bug to fix); this is not merely uninitialized weights:\n"
+                + "\n".join(mismatched)
             )
 
         # After mapping every daemon entry, any tensor still on the meta device
