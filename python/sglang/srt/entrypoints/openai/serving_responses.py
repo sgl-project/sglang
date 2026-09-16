@@ -388,10 +388,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             processed_messages: Optional[MessageProcessingResult] = None
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
-                    await self._run_request_conversion(
-                        self._make_request_with_harmony, request, prev_response
-                    )
+                (
+                    messages,
+                    request_prompts,
+                    engine_prompts,
+                ) = await self._run_request_conversion(
+                    self._make_request_with_harmony, request, prev_response
                 )
                 require_reasoning = self._is_thinking_enabled_for_request(request)
             else:

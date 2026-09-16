@@ -161,3 +161,7 @@ class TestRequestConversionExecutor(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(ValueError, "must be nonnegative"):
                 handle_other_validations(object())
+
+
+if __name__ == "__main__":
+    unittest.main()
