@@ -139,6 +139,7 @@ class Memory(msgspec.Struct):
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "page_unified",
             ],
         ),
     ] = "page_first"
@@ -197,6 +198,52 @@ class Memory(msgspec.Struct):
             ),
         ),
     ] = 8
+
+    hicache_storage_key_scheme: A[
+        str,
+        Arg(
+            help=(
+                "How L3 storage object keys encode what an object holds. "
+                "'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, "
+                "so only a bit-identical topology can reuse the cache. "
+                "'unified': keys carry topology-free grid coordinates (a "
+                "namespace digest plus absolute layer and head-group indices), "
+                "so any topology whose shards tile the same grid shares one "
+                "cache. Implies --hicache-mem-layout page_unified and "
+                "--hicache-io-backend kernel."
+            ),
+            choices=["rank-suffix", "unified"],
+        ),
+    ] = "rank-suffix"
+    hicache_storage_head_group: A[
+        Optional[int],
+        Arg(
+            help=(
+                "KV heads per L3 chunk under --hicache-storage-key-scheme "
+                "unified. A FLEET-WIDE agreement, not a local tuning knob: it "
+                "fixes chunk boundaries, and the boundaries are part of the key "
+                "namespace. Set it to total_kv_heads divided by the lcm of the "
+                "attention-TP sizes in the fleet, so every member's local head "
+                "count is a whole number of chunks. Unset, each deployment keys "
+                "to its own head count and shares only with its own TP size. "
+                "MLA-family models replicate KV across ranks and ignore it."
+            ),
+        ),
+    ] = None
+    hicache_storage_layer_partition: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Layers per L3 chunk under --hicache-storage-key-scheme "
+                "unified; the pipeline-parallel counterpart of "
+                "--hicache-storage-head-group and equally fleet-wide. Every "
+                "stage must START on a multiple of it; only the final stage may "
+                "end short, and that remainder forms the last chunk. Unset, "
+                "each stage stores its own layer range and shares only with an "
+                "identical split."
+            ),
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache

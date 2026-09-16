@@ -40,10 +40,15 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    namespace_digest,
+    normalize_dtype,
+    plan_unified_kv,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -730,6 +735,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        unified_suffixes = self._build_unified_suffixes(model_name, attn_cp_size)
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -746,7 +752,48 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            unified_suffixes=unified_suffixes,
         )
+
+    def _build_unified_suffixes(
+        self, model_name: Optional[str], attn_cp_size: int
+    ) -> Optional[List[str]]:
+        """This rank's topology-free chunk coordinates, or None for rank-suffix keys."""
+        memory = get_memory()
+        if memory.hicache_storage_key_scheme != "unified":
+            return None
+        host_pool = self.storage_host_pool
+        plan = plan_unified_kv(
+            model_id=model_name or "",
+            # Logical KV dtype, not the storage view: fp8 variants all store as
+            # uint8 but must land in distinct keyspaces.
+            dtype=normalize_dtype(self.mem_pool_device.dtype),
+            page_size=self.page_size,
+            rank_replicated=isinstance(self.mem_pool_device, MLATokenToKVPool),
+            local_kv_heads=getattr(host_pool, "head_num", 0),
+            attn_tp_rank=self.tp_rank,
+            attn_tp_size=self.tp_size,
+            attn_cp_size=attn_cp_size,
+            start_layer=host_pool.start_layer,
+            end_layer=host_pool.end_layer,
+            is_final_stage=self.pp_rank == self.pp_size - 1,
+            head_group=memory.hicache_storage_head_group,
+            layer_partition=memory.hicache_storage_layer_partition,
+        )
+        # The pool was sized from the same server arg before any backend
+        # attached; if the two disagree the objects would not match their keys.
+        pool_groups = getattr(host_pool, "head_group_num", 1)
+        if plan.head_group_num != pool_groups:
+            raise ValueError(
+                f"the unified plan cuts {plan.head_group_num} head groups but "
+                f"the host pool was allocated with {pool_groups}."
+            )
+        logger.info(
+            "HiCache unified L3 keys: namespace=%s chunks=%s",
+            namespace_digest(plan.namespace),
+            plan.suffixes,
+        )
+        return plan.suffixes
 
     def reset(self):
         self.storage_stop_event.set()
@@ -900,10 +947,10 @@ class HiCacheController:
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
-        """Keep CPU host indices only for page-first staged write-back."""
+        """Keep CPU host indices only for the staged write-back paths."""
         if (
             self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
+            and self.mem_pool_host.layout in ("page_first", "page_unified")
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
         ):
             return op.host_indices, op.device_indices, op.pool_transfers
