@@ -62,9 +62,11 @@ async fn main() -> Result<()> {
     let tokenizers =
         Arc::new(TokenizerRegistry::load_from_config(&config).context("load tokenizers")?);
 
+    // Create a gRPC client only when routing uses an external KV indexer.
+    let external_kv_indexer_client = create_external_kv_indexer_client(&config)?;
+
     // Monitor engine-reported KV-cache events and load statistics for routing.
-    let external_prefix_index = build_external_prefix_index(&config)?;
-    let engine_state = start_engine_state_monitor(external_prefix_index.is_some());
+    let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
     let routing_policies = Arc::new(
@@ -97,7 +99,7 @@ async fn main() -> Result<()> {
         routing_policies,
         local_inflight_requests,
         &engine_state,
-        external_prefix_index,
+        external_kv_indexer_client,
     )?;
     app_context.mark_ready();
 
@@ -184,7 +186,7 @@ fn log_startup(config: &Config) {
     );
 }
 
-fn build_external_prefix_index(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
+fn create_external_kv_indexer_client(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
     let endpoint = config
         .model
         .cache_aware
@@ -260,7 +262,7 @@ fn build_app_context(
     routing_policies: Arc<PolicyRegistry>,
     local_inflight_requests: Arc<ActiveLoadRegistry>,
     engine_state: &KvEventIndex,
-    external_prefix_index: Option<Arc<dyn PrefixIndex>>,
+    external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
@@ -276,7 +278,7 @@ fn build_app_context(
         routing_policies,
         local_inflight_requests,
     );
-    app_context.prefix_index = external_prefix_index;
+    app_context.prefix_index = external_kv_indexer_client;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
         && config
             .model
