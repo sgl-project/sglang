@@ -1594,8 +1594,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        # Left queued: check_hicache_events submits one D2H op per step for
-        # every node backed up during the step (all pools, all requests).
+        # Queued, not submitted: flush_pending_backups merges every node backed
+        # up in this step (all pools, all requests) into one D2H op.
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
@@ -3315,7 +3315,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
-        self.cache_controller.start_writing()
+        # Backups queued outside process_batch_result: the chunked-prefill stash
+        # in get_next_batch_to_run, abort_request, and the PD prefill release.
+        self.flush_pending_backups()
 
         (
             write_finish_count,
@@ -3349,6 +3351,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def flush_pending_backups(self) -> None:
+        """Submit the D2H ops queued while caching finished requests, so the
+        batch that produced them issues them instead of the next step."""
+        if self.linker is not None or self.cache_controller is None:
+            return
+        self.cache_controller.start_writing()
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

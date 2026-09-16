@@ -1108,6 +1108,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             self.assertEqual(controller.ack_write_queue, [])
 
             controller.start_writing()
+            # Every flush point (process_batch_result, check_hicache_events,
+            # write_back eviction) may run on a drained queue; a second ack
+            # here would commit nodes whose write never happened.
+            controller.start_writing()
 
         self.assertEqual(controller.write_queue, [])
         self.assertEqual(len(captured), 1)
