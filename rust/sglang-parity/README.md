@@ -38,6 +38,9 @@ The two platforms use different model formats; parity compares Python and Rust
 on the same platform, not MLX against CUDA. Both configs bound context length to
 2048, the token pool to 4096 and concurrent requests to four. CUDA requires the
 host prerequisites below; two-device DP cases remain uncovered on a single GPU.
+The CUDA config explicitly selects Triton attention, which supports both
+deterministic inference and radix caching; automatic backend selection can disable
+the cache needed by the cache-hit cases.
 Real NVIDIA acceptance of the CUDA configuration is still pending.
 
 The defaults contain no personal paths or forced offline settings. Model caching

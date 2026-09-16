@@ -1004,6 +1004,17 @@ fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_servic
                     .windows(2)
                     .any(|pair| pair == revision)
             );
+            if config.environment.backend == sglang_parity::environment::Backend::Cuda {
+                assert!(
+                    entry
+                        .profile
+                        .server
+                        .args
+                        .windows(2)
+                        .any(|pair| pair == ["--attention-backend", "triton"]),
+                    "CUDA defaults need deterministic attention with radix-cache support"
+                );
+            }
             assert_eq!(
                 entry.policy.incremental,
                 entry.profile.server.incremental_output()

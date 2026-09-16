@@ -14,7 +14,9 @@
       "2048",
       "--disable-cuda-graph",
       "--max-total-tokens",
-      "4096"
+      "4096",
+      "--attention-backend",
+      "triton"
     ],
     "env": {},
     "port": 30000,
@@ -37,7 +39,9 @@
           "--disable-cuda-graph",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       }
     },
@@ -58,7 +62,9 @@
           "--disable-cuda-graph",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ],
         "radix_cache": true
       }
@@ -76,7 +82,9 @@
           "--weight-version",
           "parity-v1",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       }
     },
@@ -94,7 +102,9 @@
           "parity-v1",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       }
     },
@@ -111,7 +121,9 @@
           "--reasoning-parser",
           "qwen3",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       }
     },
@@ -129,7 +141,9 @@
           "qwen3",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       }
     },
@@ -146,7 +160,9 @@
           "--dp-size",
           "2",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       },
       "requires": {
@@ -170,7 +186,9 @@
           "2",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ]
       },
       "requires": {
@@ -206,7 +224,9 @@
           "--disable-cuda-graph",
           "--incremental-streaming-output",
           "--max-total-tokens",
-          "4096"
+          "4096",
+          "--attention-backend",
+          "triton"
         ],
         "env": {
           "SGLANG_TEST_RETRACT": "true",
