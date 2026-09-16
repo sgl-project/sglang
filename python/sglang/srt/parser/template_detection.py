@@ -169,6 +169,13 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        name="glm53_always_think",
+        value=ReasoningToggleConfig(special_case="always"),
+        # GLM-5.3's generation prompt opens <think>, so the output carries no
+        # opening tag; lambda because _is_glm53 is defined below.
+        predicate=lambda ctx: _is_glm53(ctx),
+    ),
+    DetectionRule(
         name="mistral_reasoning_effort",
         value=ReasoningToggleConfig(special_case="mistral"),
         predicate=lambda ctx: (

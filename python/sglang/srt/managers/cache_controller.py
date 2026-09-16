@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -1099,8 +1100,8 @@ class HiCacheController:
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
-                if prefix_keys and len(prefix_keys) > 0:
-                    prefix_keys += batch_hashes
+                if prefix_keys is not None:
+                    prefix_keys = prefix_keys + batch_hashes
                 completed_pages += hit_pages
             ack = PrefetchAck(
                 rid=operation.request_id,
@@ -1142,7 +1143,7 @@ class HiCacheController:
                 for transfer in kv_derived_transfers
             ]
             sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers
+                current_kv_derived_transfers, extra_info=extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
 
@@ -1193,11 +1194,11 @@ class HiCacheController:
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
-        prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        prefix_keys = operation.prefix_keys
 
         storage_query_count = 0
         hash_value = []
-        page_hashes = self.get_hash_str(
+        page_hashes = get_storage_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
         operation.all_hash_values = page_hashes
@@ -1210,8 +1211,8 @@ class HiCacheController:
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
 
         return hash_value, storage_query_count
 
@@ -1297,8 +1298,8 @@ class HiCacheController:
                 )
                 break
 
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
     def backup_thread_func(self):
