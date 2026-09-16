@@ -163,6 +163,28 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _init_srt_moe_ep_group():
+    """SRT's MOE EP group for FusedMoE layers.
+
+    multimodal_gen has no expert parallelism: every rank keeps all experts
+    and TP shards the weights inside each expert (``_MOE_TP = _TP``). The EP
+    group must therefore be single-rank (``moe_ep_size=1``); aliasing
+    ``_MOE_EP`` to ``_TP`` would partition experts across ranks and break
+    FusedMoE dispatch.
+    """
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    world_size = torch.distributed.get_world_size()
+    return srt_parallel_state.init_model_parallel_group(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=get_world_group().local_rank,
+        backend=torch.distributed.get_backend(get_world_group().device_group),
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="moe_ep",
+    )
+
+
 def _sync_srt_tp_group() -> None:
     """Lend this package's TP group to `srt`, and state the widths it implies.
 
@@ -184,6 +206,10 @@ def _sync_srt_tp_group() -> None:
         srt_parallel_state._TP = _TP
     if srt_parallel_state._ATTN_TP is None:
         srt_parallel_state._ATTN_TP = _TP
+    if srt_parallel_state._MOE_TP is None:
+        srt_parallel_state._MOE_TP = _TP
+    if srt_parallel_state._MOE_EP is None:
+        srt_parallel_state._MOE_EP = _init_srt_moe_ep_group()
     if srt_parallel_state._ATTN_TP is _TP:
         get_parallel().override_permanently(
             **derive_parallel_widths(
@@ -207,6 +233,11 @@ def _clear_srt_tp_group() -> None:
         get_parallel().clear_derived_widths()
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
+    if srt_parallel_state._MOE_TP is _TP:
+        srt_parallel_state._MOE_TP = None
+    if srt_parallel_state._MOE_EP is not None:
+        srt_parallel_state._MOE_EP.destroy()
+        srt_parallel_state._MOE_EP = None
 
 
 def init_parallel_group_coordinator(
