@@ -12,7 +12,7 @@ path is exercised:
   * test_gsm8k — end-to-end task accuracy holds.
 
 NOTE: the int8 checkpoint is only engaged when a cached prefix is reused FROM the
-int8 pool, which requires ``--mamba-scheduler-strategy extra_buffer`` — the default
+int8 pool, which requires ``--mamba-radix-cache-strategy extra_buffer`` — the default
 ``no_buffer`` only snapshots the recurrent state at the full-sequence leaf, so a
 fixed-prefix / divergent-question workload reuses ~0 mamba state and the int8 path
 would never fire.
@@ -72,7 +72,7 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
         "--mem-fraction-static",
         "0.7",
         "--enable-int8-mamba-checkpoint",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
     ]
 
@@ -110,7 +110,10 @@ class TestUnifiedRadixTreeInt8MambaCheckpointE2E(TestInt8MambaCheckpointE2E):
                 cls.base_url,
                 timeout=cls.timeout,
                 other_args=cls.other_args,
-                env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+                env={
+                    "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                },
             )
 
     @classmethod

@@ -153,13 +153,13 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
     def test_the_flashinfer_version_guard_sees_a_split_launch(self):
         # The launcher runs before any publish, so it asks the record; the
         # member and the accessor answer the same pair.
-        args = ServerArgs.__new__(ServerArgs)
+        args = ServerArgs(model_path="dummy")
         for name, value in (
             ("attention_backend", None),
             ("prefill_attention_backend", None),
             ("decode_attention_backend", "flashinfer"),
         ):
-            object.__setattr__(args, name, value)
+            setattr(args, name, value)
         self.assertIn("flashinfer", attention_backends_of(resolved_view(args)))
 
     def test_support_triton_is_the_regression_being_guarded(self):
