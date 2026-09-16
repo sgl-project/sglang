@@ -12,7 +12,6 @@ from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
-    _dcp_comm_backend_default,
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
@@ -180,7 +179,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
-    run_post_process_pass(server_args, _dcp_comm_backend_default)
 
     # Model-arch prefill CUDA-graph default must land before cuda-graph
     # resolution (the declarative registry materializes too late to affect
@@ -243,7 +241,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_specific_adjustments, server_args)
     run_hook(default_unset_prefill_decode_interval, server_args)
-    run_hook(handle_decode_context_parallelism, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
 
@@ -301,6 +298,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Handle context parallelism.
     run_hook(handle_context_parallelism, server_args)
+
+    # Handle decode context parallelism. After the model overrides: the DSA
+    # check reads the resolved DSA backends, and Kimi-K3 reads the comm
+    # backend this declares through `dcp_comm_backend_of`.
+    run_hook(handle_decode_context_parallelism, server_args)
 
     # Handle MoE configurations.
     from sglang.srt.arg_groups.moe_hook import (

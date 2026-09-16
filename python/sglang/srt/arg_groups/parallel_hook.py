@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -123,6 +124,7 @@ def handle_context_parallelism(server_args: Any):
 def handle_decode_context_parallelism(server_args: Any):
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(

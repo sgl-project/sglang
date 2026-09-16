@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _is_mxfp4_pack_quantized,
     _register_for,
     attention_backends_of,
+    dcp_comm_backend_of,
     is_attention_backend_not_set,
     resolving_view,
 )
@@ -129,7 +130,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+        if cfg.dcp_replicate_q_proj is None and dcp_comm_backend_of(cfg) in (
             "a2a",
             "fi_a2a",
         ):
