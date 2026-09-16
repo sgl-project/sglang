@@ -207,24 +207,40 @@ async fn forwarding_opt_out_keeps_ingress_tokens_for_routing() {
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Array-only templates remain usable for routing, without forwarding generated IDs.
+/// Array-only deployments must opt out until Dynamo exposes its conversion flag.
 #[tokio::test]
-async fn array_only_template_blocks_forwarding() {
-    let (_dir, mut cfg) = template_config(json!({
+async fn array_only_template_opt_out_preserves_engine_processing() {
+    let (_dir, cfg) = template_config(json!({
         "chat_template": "{% for m in messages %}{% for part in m.content %}{{ part.text }}{% endfor %}{% endfor %}"
     }));
-    cfg.model.policy = PolicyKind::CacheAware;
-    cfg.model.cache_aware = Some(Default::default());
     let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let ctx = build_ctx_with_config(
+        mock.url.clone(),
+        without_forwarding(cfg, PolicyKind::CacheAware),
+    );
     let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
-    assert!(!ctx.tokenizers.can_forward_chat(MODEL));
     assert!(!ctx
         .tokenizers
         .encode_chat(MODEL, &request)
         .unwrap()
         .is_empty());
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
+}
+
+#[tokio::test]
+async fn template_with_date_helper_forwards_input_ids() {
+    // GPT-OSS uses strftime_now; a bare Jinja probe incorrectly blocks it.
+    let (_dir, cfg) = template_config(json!({
+        "chat_template": "{{ strftime_now('%Y-%m-%d') }}{% for m in messages %}{{ m.content }}{% endfor %}"
+    }));
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let expected = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    assert_eq!(send(ctx, request.clone()).await, StatusCode::OK);
+    let body = captured(&mock);
+    assert_eq!(body["input_ids"], json!(expected));
+    assert_eq!(body["messages"], request["messages"]);
 }
 
 #[tokio::test]

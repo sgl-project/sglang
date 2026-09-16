@@ -28,7 +28,7 @@ struct Case {
 }
 
 /// String-to-array conversion is a known parity gap, so these templates must
-/// remain excluded from forwarding. This fixture needs no cached model files.
+/// opt out of forwarding. This fixture needs no cached model files.
 #[test]
 fn array_only_template_content_parity() {
     let fixture: serde_json::Value =
