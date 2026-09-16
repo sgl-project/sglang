@@ -8,7 +8,7 @@ from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def test_filtered_support_matches_joint_top_k_top_p_support():
