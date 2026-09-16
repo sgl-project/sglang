@@ -6471,6 +6471,20 @@ class ServerArgs:
             if self.enable_single_batch_overlap or self.enable_two_batch_overlap:
                 raise ValueError("NCCL EP LL does not support single/two batch overlap")
             self._handle_nccl_ep_token_budget()
+            if resolved_view(self).moe_runner_backend == "triton":
+                unsupported = [
+                    name
+                    for name in (
+                        "enable_eplb",
+                        "enforce_shared_experts_fusion",
+                        "enable_lora",
+                    )
+                    if getattr(self, name)
+                ]
+                if unsupported:
+                    raise ValueError(
+                        "NCCL EP Triton does not support: " + ", ".join(unsupported)
+                    )
             if not self.enable_nccl_ep_cuda_graph:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED

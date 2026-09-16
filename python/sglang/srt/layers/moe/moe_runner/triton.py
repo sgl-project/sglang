@@ -172,6 +172,13 @@ class TritonRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.TRITON
 
 
+@register_fused_func("nccl_ep", "triton")
+def fused_experts_nccl_ep_to_triton(dispatch_output, quant_info, runner_config):
+    from sglang.srt.layers.moe.moe_runner.nccl_ep_triton import run_nccl_ep_triton
+
+    return run_nccl_ep_triton(dispatch_output, quant_info, runner_config)
+
+
 @register_fused_func("none", "triton")
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,
