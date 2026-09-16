@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -24,6 +25,15 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
+_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
+
 
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
@@ -33,6 +43,37 @@ def validate_response_store(server_args: Any) -> None:
             "--disaggregation-mode=prefill or decode; response storage must "
             "remain disabled in PD mode."
         )
+
+
+def check_pipeline_parallel_compat(
+    cfg: Any, *, model_architecture: Optional[str] = None
+) -> None:
+    """Validate features used with pipeline parallelism."""
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    if cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+        assert cfg.disaggregation_mode == "prefill", (
+            "PP + speculative decoding (MTP) is only supported on prefill nodes "
+            "(disaggregation-mode=prefill)"
+        )
+        assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
+            "PP + speculative decoding is only supported for DeepSeek/GLM models "
+            "whose last pipeline stage supplies the EAGLE draft embedding; got "
+            f"architecture={model_architecture}"
+        )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
 
 
 def check_server_args(server_args: Any):
@@ -60,33 +101,10 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        if get_platform().is_npu:
-            # NPU: allow PP + EAGLE speculative decoding
-            assert cfg.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
-            if cfg.speculative_algorithm is not None:
-                assert (
-                    cfg.speculative_algorithm.upper() == "EAGLE"
-                    and not cfg.enable_multi_layer_eagle
-                ), (
-                    "Pipeline parallelism currently only supports EAGLE "
-                    "(non-multi-layer) speculative decoding"
-                )
-                assert cfg.disaggregation_mode == "prefill", (
-                    "NPU PP + speculative decoding (MTP) is only supported "
-                    "on prefill nodes (disaggregation-mode=prefill)"
-                )
-        else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+        model_architecture = None
+        if cfg.speculative_algorithm is not None:
+            model_architecture = model_config_of(server_args).hf_config.architectures[0]
+        check_pipeline_parallel_compat(cfg, model_architecture=model_architecture)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"
