@@ -125,6 +125,22 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def _clear_sticky_cuda_error() -> None:
+    """Consume the sticky CUDA error left by failed cudart calls.
+
+    A failed cudaHostRegister leaves cudaErrorInvalidValue in the context's
+    last-error slot. torch wheels statically link cudart, so the error cannot
+    be cleared via ctypes; instead run an unrelated CUDA call so torch's error
+    check reads (and clears) it. Without this, the next torch CUDA op raises
+    the leftover error and looks like the failing party.
+    """
+    try:
+        torch.empty(1, device="cuda")
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
 def _register_chunk_with_retry(
     cudart, ptr: int, size: int, *, offset: int, total: int
 ) -> int:
@@ -143,6 +159,7 @@ def _register_chunk_with_retry(
         rc_obj = cudart.cudaHostRegister(ptr, size, 0)
     if int(rc_obj) == 0:
         if size < orig_size:
+            _clear_sticky_cuda_error()
             logger.warning(
                 "cudaHostRegister degraded: %d -> %d bytes at offset=%d "
                 "(total=%d, ptr=%#x)",
@@ -153,6 +170,7 @@ def _register_chunk_with_retry(
                 ptr,
             )
         return size
+    _clear_sticky_cuda_error()
     raise RuntimeError(
         f"cudaHostRegister failed for every chunk size down to 4 KiB "
         f"(last rc={int(rc_obj)}, {cudart.cudaGetErrorString(rc_obj)}) "

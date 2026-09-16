@@ -6,6 +6,7 @@ smaller registrations succeed. _register_chunk_with_retry halves the chunk
 until the driver accepts it instead of crashing the scheduler at startup.
 """
 
+from sglang.srt.mem_cache.pool_host import common
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_register,
     _register_chunk_with_retry,
@@ -51,16 +52,25 @@ class _FakeBuffer:
         return 1
 
 
-def test_retry_succeeds_on_first_try():
+def test_retry_succeeds_on_first_try(monkeypatch):
+    clear_calls = []
+    monkeypatch.setattr(
+        common, "_clear_sticky_cuda_error", lambda: clear_calls.append(1)
+    )
     cudart = _FakeCudart(fail_above=64 * MiB)
     size = _register_chunk_with_retry(
         cudart, ptr=0x1000, size=32 * MiB, offset=0, total=32 * MiB
     )
     assert size == 32 * MiB
     assert cudart.register_calls == [(0x1000, 32 * MiB)]
+    assert clear_calls == []
 
 
-def test_retry_halves_until_driver_accepts():
+def test_retry_halves_until_driver_accepts(monkeypatch):
+    clear_calls = []
+    monkeypatch.setattr(
+        common, "_clear_sticky_cuda_error", lambda: clear_calls.append(1)
+    )
     cudart = _FakeCudart(fail_above=4 * MiB)
     size = _register_chunk_with_retry(
         cudart, ptr=0x1000, size=32 * MiB, offset=0, total=32 * MiB
@@ -72,9 +82,16 @@ def test_retry_halves_until_driver_accepts():
         8 * MiB,
         4 * MiB,
     ]
+    # Degradation must clear the sticky error left by the failed attempts,
+    # otherwise the next torch CUDA op raises the leftover error instead.
+    assert clear_calls == [1]
 
 
-def test_retry_raises_with_context_when_nothing_works():
+def test_retry_raises_with_context_when_nothing_works(monkeypatch):
+    clear_calls = []
+    monkeypatch.setattr(
+        common, "_clear_sticky_cuda_error", lambda: clear_calls.append(1)
+    )
     cudart = _FakeCudart(fail_above=0)
     with pytest.raises(RuntimeError) as exc_info:
         _register_chunk_with_retry(
@@ -84,6 +101,7 @@ def test_retry_raises_with_context_when_nothing_works():
     assert "rc=1" in message
     assert "offset=64" in message
     assert f"total={128 * MiB}" in message
+    assert clear_calls == [1]
 
 
 def test_cuda_host_register_degrades_and_covers_whole_buffer(monkeypatch):
