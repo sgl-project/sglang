@@ -3,12 +3,16 @@
 Real FusedMoE path (NVFP4 checkpoint shards through the real weight_loader
 -> weight processing -> forward) per backend vs a dequantized torch MoE
 reference. Single GPU, tp=ep=1.
+
+W4A16 raw weight reloads also reuse the original destination buffers and a
+captured CUDA graph, comparing each update with a freshly loaded layer.
 """
 
 import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -23,7 +27,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
 
 E, H, I, TOPK, M = 8, 1024, 1024, 2, 32
 
@@ -151,6 +155,157 @@ class TestNvFp4MoeBackends(CustomTestCase):
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
+
+    def test_flashinfer_cutedsl_w4a16_weight_reload(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
+        def make_layer(device):
+            with torch.device(device):
+                return FusedMoE(
+                    num_experts=E,
+                    hidden_size=H,
+                    intermediate_size=I,
+                    layer_id=0,
+                    top_k=TOPK,
+                    params_dtype=torch.bfloat16,
+                    quant_config=ModelOptFp4Config(
+                        is_checkpoint_nvfp4_serialized=True, group_size=16
+                    ),
+                    gate_up_interleaved=False,
+                )
+
+        def checkpoint(seed):
+            torch.manual_seed(seed)
+            shards = []
+            for expert in range(E):
+                w13 = torch.randn(2, I, H, dtype=torch.bfloat16) / 10
+                gs13 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w13.abs().max().float()
+                for shard_id, weight in (
+                    ("w1", w13[0]),
+                    ("w3", w13[1]),
+                    ("w2", torch.randn(H, I, dtype=torch.bfloat16) / 10),
+                ):
+                    q, sf, gs, _ = quantize_nvfp4_shard(
+                        weight, gs=gs13 if shard_id != "w2" else None
+                    )
+                    prefix = "w2" if shard_id == "w2" else "w13"
+                    for suffix, value in (
+                        ("weight", q),
+                        ("weight_scale", sf),
+                        ("weight_scale_2", 1.0 / gs),
+                        ("input_scale", torch.tensor(1.0)),
+                    ):
+                        shards.append(
+                            (f"{prefix}_{suffix}", shard_id, expert, value.cpu())
+                        )
+            return shards
+
+        def load(layer, shards):
+            for name, shard_id, expert, value in shards:
+                param = getattr(layer, name)
+                layer.weight_loader(
+                    param, value.to(param.device), name, shard_id, expert
+                )
+
+        def forward(layer):
+            out = layer.forward(x, topk)
+            if isinstance(out, torch.Tensor):
+                return out
+            return out[0] if isinstance(out, tuple) else out.hidden_states
+
+        def pointers(layer):
+            tensors = [*layer.parameters(), *layer._cutedsl_scales]
+            tensors.append(layer._cutedsl_input_scale)
+            return [(t.data_ptr(), t.shape, t.dtype, t.device) for t in tensors]
+
+        with (
+            get_context().override_server_args(
+                model_path="dummy", chunked_prefill_size=M
+            ),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL
+            ),
+            get_parallel().override(
+                moe_ep_size=1,
+                moe_ep_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                tp_size=1,
+                tp_rank=0,
+            ),
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+            envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.override(False),
+            torch.no_grad(),
+        ):
+            a, b = checkpoint(31), checkpoint(57)
+            cpu = make_layer("cpu")
+            # Match a dummy CPU replica followed by pinned staging allocation.
+            for param in cpu.parameters():
+                param.fill_(1)
+            cpu.quant_method.process_weights_after_loading(cpu)
+            for param in cpu.parameters():
+                param.data = param.data.pin_memory()
+            raw = {
+                name: param
+                for name, param in cpu.named_parameters()
+                if hasattr(param, "weight_loader")
+            }
+            gpu = make_layer("cuda")
+            load(gpu, a)
+            gpu.quant_method.process_weights_after_loading(gpu)
+            # Retain the initial registered buffers across every update.
+            registered = {name: getattr(gpu, name).detach() for name in raw}
+            x = torch.randn(M, H, dtype=torch.bfloat16) / 10
+            topk = select_experts(
+                hidden_states=x,
+                router_logits=torch.randn(M, E, dtype=torch.float32),
+                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
+            )
+            baseline = forward(gpu).clone()
+            self.assertEqual(gpu._cutedsl_wrapper.quant_mode, "w4a16")
+            initial_pointers = pointers(gpu)
+            warmup = torch.cuda.Stream()
+            warmup.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup):
+                for _ in range(3):
+                    forward(gpu)
+            torch.cuda.current_stream().wait_stream(warmup)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = forward(gpu)
+
+            for state, shards in (("A1", a), ("B", b), ("A2", a)):
+                with self.subTest(state=state):
+                    load(cpu, shards)
+                    for name, source in raw.items():
+                        target = registered[name]
+                        self.assertEqual(
+                            (source.shape, source.dtype), (target.shape, target.dtype)
+                        )
+                        self.assertTrue(
+                            source.is_contiguous() and target.is_contiguous()
+                        )
+                        target.view(torch.uint8).view(-1).copy_(
+                            source.view(torch.uint8).view(-1)
+                        )
+                    gpu.quant_method.process_weights_after_loading(gpu)
+                    self.assertEqual(pointers(gpu), initial_pointers)
+                    graph_output.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    replay = graph_output.clone()
+                    eager = forward(gpu).clone()
+                    fresh = make_layer("cuda")
+                    load(fresh, shards)
+                    fresh.quant_method.process_weights_after_loading(fresh)
+                    expected = forward(fresh)
+                    torch.testing.assert_close(eager, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(replay, expected, rtol=0, atol=0)
+                    if state == "B":
+                        self.assertFalse(torch.equal(eager, baseline))
+                    else:
+                        torch.testing.assert_close(eager, baseline, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
