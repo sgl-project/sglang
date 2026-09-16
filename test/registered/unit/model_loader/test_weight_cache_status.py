@@ -15,7 +15,9 @@ from sglang.srt.environ import envs
 from sglang.srt.weight_cache import status as status_cli
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
 from sglang.srt.weight_cache.protocol import (
+    STATUS_VERSION,
     CacheConfig,
+    StatusReply,
     iter_daemon_device_uuids,
     recv_msg,
     send_msg,
@@ -94,7 +96,45 @@ def _exchange(daemon, request) -> dict:
         client_sock.close()
 
 
+# StatusReply fields per STATUS_VERSION; the record the daemon cannot see.
+# Added a field: extend the current entry.
+# Renamed or removed one: bump STATUS_VERSION and add a new entry.
+_STATUS_FIELDS = {
+    1: {
+        "status",
+        "status_version",
+        "pid",
+        "gpu_id",
+        "socket_path",
+        "ready_path",
+        "config",
+        "transport_backend",
+        "num_tensors",
+        "preloaded_weights_bytes",
+        "started_at",
+        "loaded_at",
+        "load_seconds",
+        "uptime_seconds",
+        "serve_count",
+        "mismatch_count",
+        "last_served_at",
+        "live_client_count",
+        "live_client_pids",
+    },
+}
+
+
 class TestStatusSnapshot(CustomTestCase):
+    def test_fields_match_status_version(self):
+        """A rename or removal must come with a STATUS_VERSION bump."""
+        self.assertEqual(
+            set(StatusReply.__struct_fields__), _STATUS_FIELDS[STATUS_VERSION]
+        )
+        self.assertEqual(
+            set(_exchange(_make_daemon(), {"type": "status"})),
+            _STATUS_FIELDS[STATUS_VERSION],
+        )
+
     def test_snapshot_renders_through_cli(self):
         """Snapshot field names are the CLI's contract: a rename on either side
         must fail here, not print zeros in production."""
@@ -149,6 +189,20 @@ class TestStatusSnapshot(CustomTestCase):
         self.assertEqual(live["live_client_count"], 1)
         self.assertEqual(dead._served_client_pids, {os.getpid()})
 
+    def test_status_version_skew_is_reported(self):
+        """A daemon on another status schema still renders, with a note, rather
+        than silently printing `.get()` defaults for renamed keys."""
+        row = {"label": "GPU-x", "socket_path": "/tmp/x.sock", "reachable": True}
+        row["status"] = "ok"
+        row["status_version"] = STATUS_VERSION
+        self.assertNotIn("version", status_cli.render_human([row]))
+        row["status_version"] = STATUS_VERSION + 1
+        self.assertIn(
+            f"daemon reports status v{STATUS_VERSION + 1}, this CLI understands "
+            f"v{STATUS_VERSION}",
+            status_cli.render_human([row]),
+        )
+
 
 class TestServeCounters(CustomTestCase):
     def test_fetch_state_counts_hits_and_mismatches(self):
@@ -183,10 +237,14 @@ class TestDaemonDiscovery(CustomTestCase):
         ):
             for uuid in ("GPU-aaaa", "GPU-bbbb"):
                 with open(os.path.join(tmp, f"wc_{uuid}.ready"), "w") as f:
-                    f.write("pid=123\n")
-            # An unrelated file must not be picked up.
+                    f.write(f"pid=123\ndevice_uuid={uuid}\n")
+            # An unrelated file must not be picked up, nor a ready file that
+            # does not say which GPU it serves.
             with open(os.path.join(tmp, "unrelated.txt"), "w") as f:
                 f.write("x")
+            # pid only, so the file parses as non-empty and reaches the uuid filter.
+            with open(os.path.join(tmp, "wc_GPU-cccc.ready"), "w") as f:
+                f.write("pid=456\n")
             self.assertEqual(iter_daemon_device_uuids(), ["GPU-aaaa", "GPU-bbbb"])
 
 

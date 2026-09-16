@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
 
 from .protocol import (
     CacheConfig,
+    StatusReply,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_env_stamp,
@@ -178,9 +179,9 @@ class WeightCacheDaemon:
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
 
-        device_uuid = current_platform.get_device_uuid(gpu_id)
-        self.socket_path = get_socket_path(device_uuid)
-        self.ready_path = get_ready_path(device_uuid)
+        self.device_uuid = current_platform.get_device_uuid(gpu_id)
+        self.socket_path = get_socket_path(self.device_uuid)
+        self.ready_path = get_ready_path(self.device_uuid)
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -519,6 +520,7 @@ class WeightCacheDaemon:
         # Write ready file
         with open(self.ready_path, "w") as f:
             f.write(f"pid={os.getpid()}\n")
+            f.write(f"device_uuid={self.device_uuid}\n")
             f.write(f"config={self.config.to_dict()}\n")
 
         logger.info(
@@ -639,28 +641,27 @@ class WeightCacheDaemon:
             pid for pid in self._served_client_pids if is_pid_alive(pid)
         }
         live_client_pids = sorted(self._served_client_pids)
-        return {
-            "status": "ok",
-            "pid": os.getpid(),
-            "gpu_id": self.gpu_id,
-            "socket_path": self.socket_path,
-            "ready_path": self.ready_path,
-            "config": self.config.to_dict() if self.config else None,
-            "transport_backend": (
+        return StatusReply(
+            pid=os.getpid(),
+            gpu_id=self.gpu_id,
+            socket_path=self.socket_path,
+            ready_path=self.ready_path,
+            config=self.config.to_dict() if self.config else None,
+            transport_backend=(
                 self.transport_backend.name if self.transport_backend else None
             ),
-            "num_tensors": len(self.state_entries),
-            "preloaded_weights_bytes": self.preloaded_weights_bytes,
-            "started_at": self._started_at,
-            "loaded_at": self._loaded_at,
-            "load_seconds": self._load_seconds,
-            "uptime_seconds": now - self._started_at,
-            "serve_count": self._serve_count,
-            "mismatch_count": self._mismatch_count,
-            "last_served_at": self._last_served_at,
-            "live_client_count": len(live_client_pids),
-            "live_client_pids": live_client_pids,
-        }
+            num_tensors=len(self.state_entries),
+            preloaded_weights_bytes=self.preloaded_weights_bytes,
+            started_at=self._started_at,
+            loaded_at=self._loaded_at,
+            load_seconds=self._load_seconds,
+            uptime_seconds=now - self._started_at,
+            serve_count=self._serve_count,
+            mismatch_count=self._mismatch_count,
+            last_served_at=self._last_served_at,
+            live_client_count=len(live_client_pids),
+            live_client_pids=live_client_pids,
+        ).to_dict()
 
     def shutdown(self):
         """Release GPU memory and clean up."""

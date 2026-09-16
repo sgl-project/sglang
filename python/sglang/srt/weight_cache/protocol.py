@@ -14,7 +14,7 @@ import pickle
 import signal
 import socket
 import struct
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import msgspec
 
@@ -417,29 +417,46 @@ def cleanup_stale_daemon_files(device_uuid: str, *, force: bool = False) -> None
 # ---------------------------------------------------------------------------
 # Daemon discovery + status query (used by the `status` CLI / monitoring)
 # ---------------------------------------------------------------------------
-def _split_uuid_template(env_field) -> Tuple[str, str]:
-    template = env_field.get()
-    # Reversing a path back to its uuid needs exactly one placeholder; a second
-    # one would leave the uuid ambiguous, so reject it here even though
-    # _format_daemon_path tolerates it.
-    if template.count("{device_uuid}") != 1:
-        raise ValueError(
-            f"{env_field.name}={template!r} must contain '{{device_uuid}}' "
-            f"exactly once."
-        )
-    head, _, tail = template.partition("{device_uuid}")
-    return head, tail
+# Schema version of the `status` reply; the daemon outlives CLI upgrades. Bump
+# when a StatusReply field is renamed, removed, or changes meaning; adding a
+# field needs no bump. test_weight_cache_status.py pins the field set per version.
+STATUS_VERSION = 1
+
+
+class StatusReply(msgspec.Struct, frozen=True, kw_only=True):
+    """The daemon's `status` reply. The CLI reads it as a plain dict so an older
+    daemon's reply still renders; a field the CLI shows must also be rendered in
+    status.py."""
+
+    status: str = "ok"
+    status_version: int = STATUS_VERSION
+    pid: int
+    gpu_id: int
+    socket_path: str
+    ready_path: str
+    config: Optional[Dict[str, Any]]
+    transport_backend: Optional[str]
+    num_tensors: int
+    preloaded_weights_bytes: int
+    started_at: float
+    loaded_at: Optional[float]
+    load_seconds: Optional[float]
+    uptime_seconds: float
+    serve_count: int
+    mismatch_count: int
+    last_served_at: Optional[float]
+    live_client_count: int
+    live_client_pids: List[int]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return msgspec.structs.asdict(self)
 
 
 def iter_daemon_device_uuids() -> List[str]:
-    """Discover every weight-cache daemon on this host from its ready-file glob."""
-    head, tail = _split_uuid_template(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE)
-    uuids = []
-    for path in sorted(glob.glob(f"{head}*{tail}")):
-        uuid = path[len(head) : len(path) - len(tail)]
-        if uuid:
-            uuids.append(uuid)
-    return uuids
+    """Discover every weight-cache daemon on this host from its ready files."""
+    pattern = _format_daemon_path(envs.SGLANG_WEIGHT_CACHE_READY_TEMPLATE, "*")
+    infos = (read_ready_file(path) for path in sorted(glob.glob(pattern)))
+    return [info["device_uuid"] for info in infos if info and "device_uuid" in info]
 
 
 def query_daemon_status(socket_path: str, *, timeout: float = 5.0) -> Dict[str, Any]:

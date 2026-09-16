@@ -30,6 +30,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.weight_cache.protocol import (
+    STATUS_VERSION,
     get_ready_path,
     get_socket_path,
     iter_daemon_device_uuids,
@@ -117,11 +118,24 @@ def render_human(rows: List[Dict[str, Any]]) -> str:
             out.append("")
             continue
 
+        # From the socket reply (dict or None); a .ready file's config, which can
+        # be a raw string if malformed, lands in ready_config and only in --json.
         cfg = row.get("config") or {}
         out.append(
             f"{label}  pid {row.get('pid')}  "
             f"up {_format_duration(row.get('uptime_seconds'))}"
         )
+        version = row.get("status_version", 1)
+        if version != STATUS_VERSION:
+            # `.get()` defaults below could pass for real values; say so.
+            out.append(
+                _field(
+                    "version",
+                    f"daemon reports status v{version}, this CLI understands "
+                    f"v{STATUS_VERSION}; fields may be missing or renamed -- "
+                    "restart the daemon and rerun from the same sglang checkout",
+                )
+            )
         fields = [
             (
                 "model",
