@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
@@ -110,6 +111,10 @@ def dequantize_k_cache_paged_v41(
     """
     layout = KVLayout.parse(layout)
     assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
+    if is_hip_runtime() or get_jit_cuda_arch().major < 10:
+        raise RuntimeError(
+            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer"
+        )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
 

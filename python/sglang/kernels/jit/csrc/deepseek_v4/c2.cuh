@@ -102,13 +102,16 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   const auto tx = threadIdx.x;
   // Verify gives each request a CTA column; decode a flat grid of one row each.
   const auto row = kVerify ? blockIdx.y * gridDim.x + blockIdx.x : blockIdx.x;
+  PDLWaitPrimary<kUsePDL>();
   // Slots fit in int32 whatever width the scheduler hands them in.
   const auto raw_out_loc = static_cast<int32_t>(static_cast<const LocT*>(params.raw_out_loc)[row]);
+  // CUDA graph padding is a completely inert row: do not read schedule, input,
+  // state, or RoPE data, and do not publish output or update the cache.
+  if (raw_out_loc == 0) return PDLTriggerSecondary<kUsePDL>();
   const auto pos = static_cast<const PosT*>(params.positions)[row];
   // A completing row reads the slot left by `pos - 1`;
   // a pending row writes its own slot, so reads and writes stay disjoint.
   const auto rid = params.req[row];
-  PDLWaitPrimary<kUsePDL>();
 
   fp32_vec_t kv_new, score_new;
   kv_new.load(params.kv_input + row * kStride, tx);
@@ -127,8 +130,6 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   score_old.load(partner, tx + kCTASize);
 
   if ((pos & 1) == 0) {
-    // padded case
-    if (raw_out_loc == 0) return PDLTriggerSecondary<kUsePDL>();
     kv_new.store(params.kv_state + write_row * kStride, tx);
     score_new.store(params.kv_state + write_row * kStride, tx + kCTASize);
     return PDLTriggerSecondary<kUsePDL>();
@@ -220,7 +221,6 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
     if constexpr (kLayout == KVLayout::V41_FP4) {
       // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
       // fake quantization, minus the dequantization.
-      if (raw_out_loc == 0) return;
       const int32_t out_loc = raw_out_loc >> 1;
       const auto kv_row = Paged::row(params.kvcache, out_loc);
       return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
@@ -244,8 +244,6 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
       }
     }
 
-    // padded case
-    if (raw_out_loc == 0) return;
     // `raw_out_loc / ratio`; ratio 2 makes it a shift.
     const int32_t out_loc = raw_out_loc >> 1;
     const auto kv_row = Paged::row(params.kvcache, out_loc);
