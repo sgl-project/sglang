@@ -8,6 +8,7 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -15,6 +16,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+
+logger = logging.getLogger(__name__)
 
 # State layer IDs are serialized as uint32 by the disaggregation protocols.
 # Reserve the value below PLE's request-wide sentinel for QSA's request-wide
@@ -26,6 +29,24 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
+# ``--qsa-indexer-dtype`` values. The compressed indexer key cache (and the index
+# Q the scoring kernels dot against it) are stored in this dtype; the pending
+# per-request key ring stays bf16 because it is the input of the group mean.
+QSA_INDEXER_DTYPE_CHOICES = ("auto", "bfloat16", "fp8_e4m3")
+
+
+def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
+    """Storage dtype of the compressed QSA indexer cache for a CLI value."""
+    if name in ("auto", "bfloat16"):
+        return torch.bfloat16
+    if name == "fp8_e4m3":
+        return torch.float8_e4m3fn
+    raise ValueError(
+        f"Unsupported --qsa-indexer-dtype {name!r}; expected one of "
+        f"{QSA_INDEXER_DTYPE_CHOICES}"
+    )
+
+
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
@@ -33,16 +54,24 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
     # lifecycle rides the full-KV allocator and radix tree.
     # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
+    # Pending-ring dtype: the raw keys of an incomplete group, averaged by the
+    # compress kernels, so it stays bf16 whatever the compressed cache stores.
     index_state_dtype = torch.bfloat16
 
     @classmethod
     def qsa_bytes_per_token(
-        cls, *, kv_heads: int, head_dim: int, compress_ratio: int, num_layers: int
+        cls,
+        *,
+        kv_heads: int,
+        head_dim: int,
+        compress_ratio: int,
+        num_layers: int,
+        compressed_dtype: torch.dtype = torch.bfloat16,
     ) -> int:
         """Per-token QSA index-cache cost: compressed keys only;
         the per-request pending ring is budgeted with the other per-request buffers."""
         index_k_bytes = _index_k_bytes(
-            kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
+            kv_heads=kv_heads, head_dim=head_dim, dtype=compressed_dtype
         )
         return index_k_bytes // compress_ratio * num_layers
 
@@ -68,6 +97,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        qsa_indexer_dtype: torch.dtype = torch.bfloat16,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -117,6 +147,19 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
+        if qsa_indexer_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError(
+                "QSA compressed indexer cache dtype must be bfloat16 or "
+                f"float8_e4m3fn, got {qsa_indexer_dtype}"
+            )
+        # Storage dtype of the compressed keys and of the index Q handed to the
+        # scoring kernels (both operands of the fp8 GEMM must agree).
+        self.qsa_compressed_dtype = qsa_indexer_dtype
+        logger.info(
+            "QSA compressed indexer cache dtype: %s (pending ring %s)",
+            self.qsa_compressed_dtype,
+            self.index_state_dtype,
+        )
         state_size = size + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
@@ -172,7 +215,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                     * self.qsa_index_kv_heads
                     * self.qsa_index_head_dim,
                 ),
-                dtype=self.index_state_dtype,
+                dtype=self.qsa_compressed_dtype,
                 device=device,
             )
         self.qsa_compressed_k_buffer_pool = [
