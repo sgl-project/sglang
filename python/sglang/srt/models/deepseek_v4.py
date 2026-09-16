@@ -1110,7 +1110,7 @@ class MQALayer(MqaAttentionBase):
 
         self.is_dsv41 = getattr(config, "model_type", None) == "deepseek_v41"
         if alt_streams is not None and (
-            (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            ((_is_cuda or _is_hip) and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         ):
             self.alt_streams = alt_streams[:3]
