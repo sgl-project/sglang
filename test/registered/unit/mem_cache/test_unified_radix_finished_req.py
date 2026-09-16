@@ -45,6 +45,7 @@ class TestUnifiedRadixFinishedReq(unittest.TestCase):
         )
         req = SimpleNamespace(
             rid="req-0",
+            session_id=None,
             origin_input_ids=array("q", range(19)),
             output_ids=array("q"),
             kv=kv,
