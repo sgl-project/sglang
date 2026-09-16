@@ -342,6 +342,84 @@ class TestAiterSparseLengthFoldPerStep(CustomTestCase):
 
 
 @unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
+class TestEagleDeviceMetadataHip(CustomTestCase):
+    def test_draft_extend_eager_and_replay_without_cpu_lengths(self):
+        device = torch.device("cuda")
+        backend = _make_backend(block_size=4, device=device)
+        backend.is_dspark = backend.is_dspark_draft = False
+        backend.enable_decoder_swa_bounded_replay = False
+        rows = backend.speculative_num_draft_tokens
+        bs = 2
+        backend.init_cuda_graph_state(max_bs=bs, max_num_tokens=bs * rows)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=bs,
+            req_pool_indices=torch.tensor([1, 4], device=device, dtype=torch.int32),
+            seq_lens=torch.tensor([130, 255], device=device, dtype=torch.int32),
+            seq_lens_cpu=None,
+            seq_lens_sum=None,
+            # Device-only EAGLE does not publish prefill CPU length lists.
+            extend_seq_lens_cpu=None,
+            extend_seq_lens=None,
+            out_cache_loc=torch.arange(bs * rows, device=device) + OUT_LOC_BASE,
+            positions=torch.zeros(bs * rows, device=device, dtype=torch.int64),
+            encoder_swa_replay=False,
+        )
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        captured = backend.forward_metadata
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            device_built = backend.init_forward_metadata_draft_extend(
+                max_seq_len=MAX_CONTEXT,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=None,
+                num_tokens_per_req=rows,
+                out_cache_loc=batch.out_cache_loc,
+            )
+        for lengths, slots in (([130, 255], [1, 4]), ([257, 381], [4, 2])):
+            batch.seq_lens.copy_(torch.tensor(lengths, device=device))
+            batch.req_pool_indices.copy_(torch.tensor(slots, device=device))
+            batch.out_cache_loc.add_(bs * rows)
+            reference = backend.init_forward_metadata_draft_extend(
+                max_seq_len=MAX_CONTEXT,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=lengths,
+                num_tokens_per_req=rows,
+                out_cache_loc=batch.out_cache_loc,
+            )
+            graph.replay()
+            for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(device_built.core_metadata, name),
+                        getattr(reference.core_metadata, name),
+                    ),
+                    name,
+                )
+            backend.init_forward_metadata_out_graph(batch)
+            self.assertIs(backend.forward_metadata, captured)
+            for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(captured.core_metadata, name),
+                        getattr(reference.core_metadata, name),
+                    ),
+                    name,
+                )
+            backend.init_forward_metadata(batch)
+            for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(backend.forward_metadata.core_metadata, name),
+                        getattr(reference.core_metadata, name),
+                    ),
+                    name,
+                )
+
+
+@unittest.skipUnless(is_hip(), "HIP DeepSeek-V4 backend")
 class TestLowRatioTargetVerifyHip(CustomTestCase):
     def setUp(self):
         self.device = torch.device("cuda")
