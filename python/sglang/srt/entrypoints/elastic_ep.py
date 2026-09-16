@@ -41,6 +41,50 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=HTTPStatus.BAD_REQUEST,
         )
 
+    operation_id = body.get("operation_id")
+    if operation_id is not None and (
+        not isinstance(operation_id, str)
+        or not operation_id.strip()
+        or len(operation_id) > 128
+    ):
+        return ORJSONResponse(
+            {
+                "error": "operation_id must be a non-empty string of at most 128 characters"
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    expected_instance_id = body.get("expected_instance_id")
+    if expected_instance_id is not None and (
+        not isinstance(expected_instance_id, str) or not expected_instance_id.strip()
+    ):
+        return ORJSONResponse(
+            {"error": "expected_instance_id must be a non-empty string"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    expected_joining_member_ids = body.get("expected_joining_member_ids")
+    if expected_joining_member_ids is not None and (
+        not isinstance(expected_joining_member_ids, list)
+        or len(expected_joining_member_ids) != 1
+        or any(
+            not isinstance(member_id, str)
+            or not member_id.strip()
+            or len(member_id) > 256
+            for member_id in expected_joining_member_ids
+        )
+        or len(set(expected_joining_member_ids)) != len(expected_joining_member_ids)
+    ):
+        return ORJSONResponse(
+            {
+                "error": (
+                    "expected_joining_member_ids must contain exactly one "
+                    "non-empty string of at most 256 characters"
+                )
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
     from sglang.srt.entrypoints.http_server import _global_state
     from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 
@@ -51,16 +95,23 @@ async def scale_elastic_ep(raw_request: Request):
         )
 
     result = await _global_state.tokenizer_manager.scale_elastic_ep(
-        ScaleElasticEPReqInput(new_ep_size=new_ep_size)
+        ScaleElasticEPReqInput(
+            new_ep_size=new_ep_size,
+            operation_id=operation_id,
+            expected_instance_id=expected_instance_id,
+            expected_joining_member_ids=expected_joining_member_ids,
+        )
     )
 
     if not result.success:
         return ORJSONResponse(
-            {"error": result.message},
+            {
+                "error": result.message,
+                "instance_id": result.instance_id,
+                "operation_id": result.operation_id,
+            },
             status_code=(
-                HTTPStatus.CONFLICT
-                if result.pending_ep_size is not None
-                else HTTPStatus.BAD_REQUEST
+                HTTPStatus.CONFLICT if result.conflict else HTTPStatus.BAD_REQUEST
             ),
         )
 
@@ -69,6 +120,10 @@ async def scale_elastic_ep(raw_request: Request):
             "message": result.message,
             "old_ep_size": result.old_ep_size,
             "new_ep_size": result.new_ep_size,
+            "instance_id": result.instance_id,
+            "operation_id": result.operation_id,
+            "pending_ep_size": result.pending_ep_size,
+            "scale_phase": result.scale_phase,
         }
     )
 
