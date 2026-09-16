@@ -750,134 +750,56 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
-# (mount root, limit file, usage file), cgroup v2 before v1. A capped container
-# may run under either layout, and the cap can sit on a parent (systemd slice)
-# rather than the mount root -- reading only /sys/fs/cgroup/memory.max misses v1
-# and nested cgroups and silently falls back to host-wide memory.
-_CGROUP_MOUNTS = (
-    ("/sys/fs/cgroup", "memory.max", "memory.current"),
-    ("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
-)
-# An unlimited v1 cgroup reports a sentinel near 2**63 instead of omitting the
-# file; treat anything implausibly large as "no cap".
-_CGROUP_UNLIMITED_ABOVE = 1 << 62
-
-
-def _read_cgroup_int(path):
-    try:
-        with open(path) as f:
-            text = f.read().strip()
-    except OSError:
-        return None
-    if text == "max":
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-
-def _read_cgroup_limit(path):
-    # A cgroup memory limit in bytes, or None for "max"/unreadable/unlimited.
-    # v2 memory.max is plain bytes or "max"; v1 memory.limit_in_bytes is plain
-    # bytes with a near-2**63 sentinel when uncapped.
-    try:
-        with open(path) as f:
-            content = f.read().strip().lower()
-    except OSError:
-        return None
-    match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content)
-    if not match:
-        return None
-    value = int(match.group(1))
-    unit = match.group(2)
-    if unit and unit not in ("b", "bytes"):
-        value *= {
-            "k": 1024,
-            "kb": 1024,
-            "m": 1024**2,
-            "mb": 1024**2,
-            "g": 1024**3,
-            "gb": 1024**3,
-            "t": 1024**4,
-            "tb": 1024**4,
-        }[unit]
-    if value >= _CGROUP_UNLIMITED_ABOVE:
-        return None
-    return value
-
-
-def _own_cgroup_path():
-    # The cgroup path /proc reports for this process, or "" when it reports none.
-    try:
-        with open("/proc/self/cgroup") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        return ""
-    for line in lines:
-        fields = line.split(":", 2)
-        if len(fields) != 3:
-            continue
-        # v2 leaves the controller field empty; v1 lists memory among its own.
-        if not fields[1] or "memory" in fields[1].split(","):
-            return fields[2]
-    return ""
-
-
-def _cgroup_dirs(mount):
-    # This process's cgroup directory and its ancestors up to `mount`, leaf first.
-    # The /proc path is relative to the host cgroup root while the mount seen in a
-    # container is already the container's own cgroup, so the two do not simply
-    # concatenate; try progressively shorter suffixes to find the real leaf.
-    if not os.path.isdir(mount):
-        return []
-    parts = [p for p in _own_cgroup_path().split("/") if p]
-    leaf = mount
-    for start in range(len(parts)):
-        candidate = os.path.join(mount, *parts[start:])
-        if os.path.isdir(candidate):
-            leaf = candidate
-            break
-    dirs = [leaf]
-    while dirs[-1] != mount:
-        dirs.append(os.path.dirname(dirs[-1]))
-    return dirs
-
-
-def _cgroup_memory_limit_and_used():
-    # (limit, used) in bytes from the cgroup dir with the tightest cap, so the
-    # two are the same scope: memory.current at that dir already sums its
-    # descendants, so sibling children under a capped parent are counted. Checks
-    # v2 then v1; (None, None) when uncapped or unreadable.
-    limit = None
-    used = None
-    for mount, limit_file, usage_file in _CGROUP_MOUNTS:
-        for cgroup_dir in _cgroup_dirs(mount):
-            value = _read_cgroup_limit(os.path.join(cgroup_dir, limit_file))
-            if value is None or (limit is not None and value >= limit):
-                continue
-            limit = value
-            used = _read_cgroup_int(os.path.join(cgroup_dir, usage_file))
-    return limit, used
-
-
 def _read_cgroup_memory_max():
-    # This process's binding cgroup memory limit in bytes, or None when uncapped
-    # or unreadable. Only a real numeric limit means the process is memory-capped
-    # and should size against the cgroup rather than the host.
-    return _cgroup_memory_limit_and_used()[0]
+    # Return this cgroup's memory limit in bytes, or None when unlimited
+    # (memory.max == "max") or unreadable. Only a real numeric limit means the
+    # process is memory-capped and should size against the cgroup rather than
+    # the host.
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r") as f:
+            content = f.read().strip().lower()
+            # Match a number followed optionally by a unit (e.g., "512m", "2gb", "1024", "512b", "1024bytes")
+            match = re.fullmatch(r"(\d+)\s*([kmgt]b|[kmgt]|bytes|b)?", content)
+            if not match:
+                # "max" (no limit) or an unexpected value.
+                return None
+
+            value_str, unit = match.groups()
+            value = int(value_str)
+
+            # Map units to their respective multiplier (binary/1024-based)
+            # If no unit or unit is 'b'/'bytes', the value is already in bytes (multiplier = 1)
+            if unit and unit not in ("b", "bytes"):
+                multipliers = {
+                    "k": 1024,
+                    "kb": 1024,
+                    "m": 1024**2,
+                    "mb": 1024**2,
+                    "g": 1024**3,
+                    "gb": 1024**3,
+                    "t": 1024**4,
+                    "tb": 1024**4,
+                }
+                value *= multipliers[unit]
+            return value
+    except (PermissionError, FileNotFoundError, ValueError):
+        return None
 
 
 def get_used_cpu_memory():
-    # Usage in bytes of the cgroup dir that supplies the binding limit, so it is
-    # the same scope as _read_cgroup_memory_max (memory.current there already
-    # includes descendants). Falls back to host-wide psutil used only when no
-    # cgroup cap applies -- pairing it with the per-cgroup limit in
-    # get_available_gpu_memory() keeps the free estimate from going negative.
-    _limit, used = _cgroup_memory_limit_and_used()
-    if used is not None:
-        return used
-    return psutil.virtual_memory().used
+    # Current memory usage of this cgroup (bytes), read from
+    # /sys/fs/cgroup/memory.current. Falls back to the host-wide
+    # psutil.virtual_memory().used so it pairs with the same-scoped fallback in
+    # get_available_gpu_memory(): inside a cgroup-limited container both are
+    # container-scoped, on bare metal both are host-scoped. Using the host-wide
+    # value here while get_available_gpu_memory() returns the per-container
+    # limit would make the "free memory" estimate negative once a sibling
+    # container on the same host is also resident.
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            return int(f.read().strip())
+    except (PermissionError, FileNotFoundError, ValueError):
+        return psutil.virtual_memory().used
 
 
 _SYSFS_NODE_DIR = "/sys/devices/system/node/"
