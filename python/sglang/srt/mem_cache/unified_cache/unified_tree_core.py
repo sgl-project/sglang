@@ -393,6 +393,7 @@ class _InsertWalkState(msgspec.Struct):
     params: InsertParams
     priority: int
     result: InsertResult
+    replay_boundary: int = 0
     total_prefix_length: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
@@ -418,6 +419,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
+        self.external_swa_sparse_retention = False
+        self.external_swa_retention_interval = 0
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -1084,6 +1087,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             value=value,
             params=params,
             priority=priority,
+            replay_boundary=len(key),
             result=InsertResult(
                 prefix_len=0,
                 adopted_ranges={} if params.track_adopted_ranges else None,
@@ -1177,13 +1181,40 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.pending_actions = []
                 return InsertStepResult(actions=flushed)
 
-    @staticmethod
-    def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
+    def _is_deferrable_action(self, action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(
+        return (
+            self.enable_external_cache_linker and isinstance(action, BackupKV)
+        ) or isinstance(
             action,
             (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
         )
+
+    def _append_backup_action(
+        self,
+        actions: list[CacheAction | ComponentAction],
+        backup: BackupKV,
+    ) -> None:
+        if self.enable_external_cache_linker:
+            for index, action in enumerate(actions):
+                if isinstance(action, BackupKV):
+                    assert action.replay_boundary == backup.replay_boundary
+                    assert (
+                        action.include_prompt_boundary == backup.include_prompt_boundary
+                    )
+                    seen = set(action.node_ids)
+                    actions[index] = BackupKV(
+                        action.node_ids
+                        + [
+                            node_id
+                            for node_id in backup.node_ids
+                            if node_id not in seen
+                        ],
+                        replay_boundary=backup.replay_boundary,
+                        include_prompt_boundary=backup.include_prompt_boundary,
+                    )
+                    return
+        actions.append(backup)
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -1258,7 +1289,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
-            step_actions.append(self._build_backup_kv_action(node))
+            self._append_backup_action(
+                step_actions,
+                self._build_backup_kv_action(
+                    node, replay_boundary=state.replay_boundary
+                ),
+            )
         state.node = node
         state.total_prefix_length += prefix_len
         state.key = key[prefix_len:]
@@ -1317,6 +1353,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if self.external_swa_sparse_retention:
+            interval = self.external_swa_retention_interval
+            crossed_checkpoint = interval > 0 and (
+                state.params.prev_prefix_len // interval
+                < state.replay_boundary // interval
+            )
+            return (
+                (not state.params.chunked or crossed_checkpoint)
+                and state.target_node is not self.root_node
+                and not state.target_node.evicted
+            )
         if state.is_new_leaf:
             return self._inc_hit_count_and_check(
                 state.target_node, state.params.chunked
@@ -1341,8 +1388,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
 
         if self._should_backup_after_insert(state):
-            state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+            self._append_backup_action(
+                state.pending_actions,
+                self._build_backup_kv_action(
+                    state.target_node,
+                    replay_boundary=state.replay_boundary,
+                    include_prompt_boundary=not state.params.chunked,
+                ),
             )
 
     def _split_node(
@@ -2292,7 +2344,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return node.key.extra_key, node.key.cache_salt
 
     def _build_backup_kv_action(
-        self, node: UnifiedTreeNode, write_back: bool = False
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        *,
+        replay_boundary: int | None = None,
+        include_prompt_boundary: bool = True,
     ) -> BackupKV:
         """Build the backup action for a node and its not-yet-persisted ancestors."""
         chain = [node]
@@ -2301,8 +2358,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not ancestor.backuped
-                and not ancestor.external_cache_stored
+                and (
+                    self.external_swa_sparse_retention
+                    or not (ancestor.backuped or ancestor.external_cache_stored)
+                )
                 and (
                     not self.enable_external_cache_linker
                     or ancestor.write_through_pending_id is None
@@ -2312,7 +2371,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ancestor = ancestor.parent
             # write_through: Ancestors first to preserve backup invariant
             chain.reverse()
-        return BackupKV([target.id for target in chain])
+        return BackupKV(
+            [target.id for target in chain],
+            replay_boundary=replay_boundary,
+            include_prompt_boundary=include_prompt_boundary,
+        )
 
     def commit_hicache_transfers(
         self,

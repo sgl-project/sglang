@@ -951,9 +951,18 @@ class SWAComponent(TreeComponent):
         insert_params.swa_branching_seqlen = branching_seqlen
         return effective_cache_len
 
-    def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
+    def _free_out_of_window_slots(
+        self, req: Req, pre_len: int, *, checkpoint_floor: int | None = None
+    ) -> None:
         if self.sliding_window_size is None:
             return
+        retain_floor = self.cache.swa_retain_floor(req)
+        if checkpoint_floor is not None:
+            retain_floor = (
+                checkpoint_floor
+                if retain_floor is None
+                else min(retain_floor, checkpoint_floor)
+            )
         free_swa_out_of_window_slots(
             req,
             pre_len,
@@ -961,13 +970,28 @@ class SWAComponent(TreeComponent):
             page_size=self.cache.page_size,
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
-            retain_floor=self.cache.swa_retain_floor(req),
+            retain_floor=retain_floor,
         )
 
     def free_out_of_window_slots(
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
-        self._free_out_of_window_slots(req, pre_len)
+        checkpoint_floor = None
+        interval = self.tree_core.external_swa_retention_interval
+        if interval and self.sliding_window_size is not None:
+            # Keep the first newly crossed checkpoint until insertion transfers
+            # ownership to the tree and its offload locks. Older checkpoints are
+            # already tree-owned; do not pin the request's entire history.
+            boundary = (req.kv.cache_protected_len // interval + 1) * interval
+            end = (pre_len + 1) // self.cache.page_size * self.cache.page_size
+            if boundary <= end:
+                window = (
+                    (self.sliding_window_size + self.cache.page_size - 1)
+                    // self.cache.page_size
+                    * self.cache.page_size
+                )
+                checkpoint_floor = max(0, boundary - window)
+        self._free_out_of_window_slots(req, pre_len, checkpoint_floor=checkpoint_floor)
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
     def cleanup_after_caching_req(

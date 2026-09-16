@@ -665,6 +665,8 @@ class Envs:
     # Minimum local radix-node hit count before a direct external linker stores
     # the node.  Values above one avoid admitting one-shot prompt tails.
     SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD = EnvInt(1)
+    # 0 preserves dense admission; positive values retain periodic SWA windows.
+    SGLANG_EXTERNAL_LINKER_SWA_RETENTION_INTERVAL = EnvInt(0)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # Deprecated: the unified radix tree is the default tree cache now, so the

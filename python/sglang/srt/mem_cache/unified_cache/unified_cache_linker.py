@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     LinkerTransferPhase,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.swa_retention import retained_swa_ranges
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,7 @@ class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
     publish_node_ids: list[NodeId]
+    extra_locks: tuple[tuple[NodeId, DecLockRefParams], ...] = ()
 
 
 class _PendingLookup(NamedTuple):
@@ -229,6 +231,20 @@ class UnifiedCacheLinkerWrapper:
                 "SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD must be at least 1"
             )
         cache.write_through_threshold = write_through_threshold
+        self.swa_retention_interval = (
+            envs.SGLANG_EXTERNAL_LINKER_SWA_RETENTION_INTERVAL.get()
+        )
+        if (
+            self.swa_retention_interval < 0
+            or self.swa_retention_interval % cache.page_size
+        ):
+            raise ValueError(
+                "SWA retention interval must be nonnegative and page aligned"
+            )
+        cache.tree_core.external_swa_sparse_retention = bool(
+            self.swa_retention_interval
+        )
+        cache.tree_core.external_swa_retention_interval = self.swa_retention_interval
 
     def maybe_log_debug_stats(self) -> None:
         now = time.monotonic()
@@ -276,6 +292,40 @@ class UnifiedCacheLinkerWrapper:
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
             return result
+
+        if self.swa_retention_interval and logger.isEnabledFor(logging.DEBUG):
+            page = cache.page_size
+            query_end = device_hit_len + len(tail_hashes) * page
+            window = cache.sliding_window_size
+            assert window is not None
+            checkpoint_ranges = retained_swa_ranges(
+                device_hit_len,
+                query_end,
+                prompt_boundary=query_end,
+                window=window,
+                interval=self.swa_retention_interval,
+                page_size=page,
+            )
+            checkpoint_keys = [
+                (
+                    start,
+                    end,
+                    tail_hashes[
+                        (start - device_hit_len) // page : (end - device_hit_len)
+                        // page
+                    ],
+                )
+                for start, end in checkpoint_ranges
+            ]
+            logger.debug(
+                "External SWA query geometry: rid=%s first_key=%s "
+                "device_hit_len=%d query_end=%d checkpoints=%s",
+                req.rid,
+                tail_hashes[0],
+                device_hit_len,
+                query_end,
+                checkpoint_keys,
+            )
 
         lookup_transfers = []
         for component in self._components:
@@ -700,31 +750,137 @@ class UnifiedCacheLinkerWrapper:
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
-    def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
-        """Persist a write-through chain, skipping nodes already in the store."""
-        for node_id in node_ids:
-            transfers = self.cache.tree_core.build_external_linker_offload_transfers(
-                node_id
-            )
-            if transfers is not None:
-                if self._skip_swa:
-                    transfers = [t for t in transfers if t.name != PoolName.SWA]
-                self._offload_node(node_id, transfers)
-
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def offload_nodes(
+        self,
+        node_ids: Sequence[NodeId],
+        *,
+        replay_boundary: int | None = None,
+        include_prompt_boundary: bool = True,
+    ) -> None:
+        """Persist one write-through chain as one backend operation."""
         cache = self.cache
-        lock_params = cache.inc_lock_ref(node_id).to_dec_params()
-        try:
-            queued = self.cache_linker.offload(transfers)
-        except BaseException:
-            cache.dec_lock_ref(node_id, lock_params)
-            raise
-        if not queued:
-            cache.dec_lock_ref(node_id, lock_params)
+        refresh_windows = bool(
+            self.swa_retention_interval and replay_boundary is not None
+        )
+        pending_node_ids = [
+            node_id
+            for node_id in node_ids
+            if refresh_windows
+            or not cache.resolve_node_handle(node_id).external_cache_stored
+        ]
+        if not pending_node_ids:
             return
 
-        cache.tree_core.mark_external_linker_offload_pending(node_id)
-        self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        transfers_by_pool: dict[PoolName, list[PoolTransfer]] = {}
+        swa_source_nodes: set[NodeId] = set()
+        for node_id in pending_node_ids:
+            node = cache.resolve_node_handle(node_id)
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.OFFLOAD, node, None
+                )
+                if transfer is None:
+                    continue
+                assert transfer.keys is not None
+                assert transfer.device_indices is not None
+                if (
+                    self.swa_retention_interval
+                    and replay_boundary is not None
+                    and transfer.name == PoolName.SWA
+                ):
+                    node_end = 0
+                    ancestor = node
+                    while ancestor is not cache.tree_core.root_node:
+                        assert ancestor is not None and ancestor.key is not None
+                        node_end += len(ancestor.key)
+                        ancestor = ancestor.parent
+                    window = cache.sliding_window_size
+                    assert window is not None
+                    ranges = retained_swa_ranges(
+                        node_end - len(transfer.device_indices),
+                        node_end,
+                        prompt_boundary=replay_boundary,
+                        window=window,
+                        interval=self.swa_retention_interval,
+                        page_size=cache.page_size,
+                        include_prompt_boundary=include_prompt_boundary,
+                    )
+                    available_start = node_end - len(transfer.device_indices)
+                    transfer.device_indices, transfer.keys = self._select_adopted_pages(
+                        transfer.device_indices, ranges, node_end, transfer.keys
+                    )
+                    logger.debug(
+                        "External SWA retention: node=%s source_start=%d "
+                        "source_end=%d replay_boundary=%d ranges=%s keys=%s",
+                        node_id,
+                        available_start,
+                        node_end,
+                        replay_boundary,
+                        ranges,
+                        transfer.keys,
+                    )
+                    if not transfer.keys:
+                        continue
+                if transfer.name == PoolName.SWA:
+                    swa_source_nodes.add(node_id)
+                transfers_by_pool.setdefault(transfer.name, []).append(transfer)
+
+        transfers = []
+        for pool_transfers in transfers_by_pool.values():
+            transfer = pool_transfers[0]
+            assert all(
+                item.hit_policy == transfer.hit_policy
+                and item.indices_from_pool == transfer.indices_from_pool
+                for item in pool_transfers
+            )
+            if len(pool_transfers) > 1:
+                transfer.keys = [key for item in pool_transfers for key in item.keys]
+                transfer.device_indices = torch.cat(
+                    [item.device_indices for item in pool_transfers]
+                )
+            transfers.append(transfer)
+
+        anchor_node_id = pending_node_ids[-1]
+        lock_params = cache.inc_lock_ref(anchor_node_id).to_dec_params()
+        extra_locks = []
+        try:
+            # The anchor's SWA lock covers only its trailing window. Older
+            # checkpoint sources must remain resident until their DMA finishes.
+            for node_id in pending_node_ids:
+                if node_id != anchor_node_id and node_id in swa_source_nodes:
+                    extra_locks.append(
+                        (node_id, cache.inc_lock_ref(node_id).to_dec_params())
+                    )
+            queued = self.cache_linker.offload(transfers)
+        except BaseException:
+            for node_id, params in reversed(extra_locks):
+                cache.dec_lock_ref(node_id, params)
+            cache.dec_lock_ref(anchor_node_id, lock_params)
+            raise
+        if not queued:
+            for node_id, params in reversed(extra_locks):
+                cache.dec_lock_ref(node_id, params)
+            cache.dec_lock_ref(anchor_node_id, lock_params)
+            return
+
+        # Supplementary window puts own locks, not another operation's ack.
+        # Do not revoke an already persisted node if a supplement fails.
+        newly_persisted = [
+            node_id
+            for node_id in pending_node_ids
+            if not cache.resolve_node_handle(node_id).external_cache_stored
+            and cache.resolve_node_handle(node_id).write_through_pending_id is None
+        ]
+        publish_node_ids = cache.tree_core.mark_write_through_pending(
+            newly_persisted, ack_id=anchor_node_id
+        )
+        for node_id in publish_node_ids:
+            cache.resolve_node_handle(node_id).external_cache_stored = True
+        self.pending_offloads.append(
+            _PendingOffload(
+                anchor_node_id, lock_params, publish_node_ids, tuple(extra_locks)
+            )
+        )
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
@@ -768,6 +924,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
+            for node_id, params in reversed(pending.extra_locks):
+                self.cache.dec_lock_ref(node_id, params)
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
 
     def start_layer_wise_loading(self) -> int:
@@ -790,6 +948,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False
             )
+            for node_id, params in reversed(pending.extra_locks):
+                self.cache.dec_lock_ref(node_id, params)
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 

@@ -1282,7 +1282,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(action.node_ids)
+                self.linker.offload_nodes(
+                    action.node_ids,
+                    replay_boundary=action.replay_boundary,
+                    include_prompt_boundary=action.include_prompt_boundary,
+                )
             else:
                 self._execute_and_commit_kv_backup(action)
         else:
@@ -3296,9 +3300,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            lookup_count, load_count, offload_count = map(
-                int, finish_counts.tolist()
-            )
+            lookup_count, load_count, offload_count = map(int, finish_counts.tolist())
             self.linker.drain_lookups(lookup_count)
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
