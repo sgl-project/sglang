@@ -99,13 +99,13 @@ def topk_transform_bf16_small(
 
 
 @cache_once
-def _jit_amax_copy_module():
+def _jit_block_amax_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        make_name("amax_copy"),
+        make_name("block_amax"),
         *args,
-        cuda_files=["deepseek_v4/amax_copy.cuh"],
-        cuda_wrappers=[("amax8_varlen", f"AmaxCopyKernel<{args}>::amax8_varlen")],
+        cuda_files=["deepseek_v4/block_amax.cuh"],
+        cuda_wrappers=[("amax8_varlen", f"BlockAmaxKernel<{args}>::amax8_varlen")],
     )
 
 
@@ -132,7 +132,7 @@ def amax8_varlen(
         if max_seqlen == 0:
             max_seqlen = max_len
         out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
-    _jit_amax_copy_module().amax8_varlen(scores, seq_lens, out, topk)
+    _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
     return out
 
 
