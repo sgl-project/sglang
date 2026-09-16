@@ -14,17 +14,8 @@ materializes; ``idx == -1`` slots (EP: non-local expert) contribute nothing.
 Small-batch only: the whole ``[T, hidden]`` bf16 row view must fit one push
 slot (checked C++-side; :func:`fits_push_slot` lets callers pre-check).
 
-The un-normed result is what DeepSeek-V4.1 consumes (its consumer is the mHC
-post-split, not an RMSNorm), so ``norm_weight=None`` is the primary
-configuration; ``norm_weight`` + ``norm_eps`` give the K3-style fused norm.
-
-Geometry: one thread-block cluster per token row plus a bumper cluster that
-keeps the plane's phase counters uniform; ``cluster_size`` blocks share a
-row (``hidden / cluster_size`` dims each). :func:`default_cluster_size` holds
-the tuned default per hidden size and can be overridden per call.
-
 Needs :func:`register_comm` once per process (the CustomAllReduceV2
-``Communicator``); the ops key on ``world_size`` alone, like the K3 ones.
+``Communicator``); the ops key on ``world_size`` alone.
 """
 
 from __future__ import annotations
@@ -56,12 +47,8 @@ _COMM_MAP: dict[int, Communicator] = {}
 
 def register_comm(comm: Communicator) -> None:
     """Register the CustomAllReduceV2 communicator whose push plane the fused
-    kernel stages through.
-
-    ``world_size`` is the whole key (the custom op takes nothing else), so at
-    most one communicator per size may be registered in a process; a second
-    group of the same size would silently inherit the first one's peer
-    pointers and the symptom would be a hang, hence the assert.
+    kernel stages through. ``world_size`` is the whole key, so at most one
+    communicator per size may be registered in a process.
     """
     prev = _COMM_MAP.get(comm.world_size)
     assert prev is None or prev is comm, (
@@ -121,7 +108,7 @@ def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool
 # shared-add and norm variants are compiled into it and picked at call time.
 
 
-def _require_cluster_launch_arch() -> None:
+def require_cluster_launch_arch() -> None:
     if is_hip_runtime() or get_jit_cuda_arch().major < 9:
         raise RuntimeError(
             "fused all-reduce cluster kernels require CUDA SM90 or newer"
@@ -136,7 +123,7 @@ def _jit_module(
     cluster_size: int,
     weight_dtype: torch.dtype,
 ) -> Module:
-    _require_cluster_launch_arch()
+    require_cluster_launch_arch()
     assert cluster_size in valid_cluster_sizes(hidden_dim), (
         f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}; "
         f"choose from {valid_cluster_sizes(hidden_dim)}"
@@ -149,23 +136,6 @@ def _jit_module(
         *args,
         cuda_files=["distributed/all_reduce_fusion.cuh"],
         cuda_wrappers=[("run", f"MoeFinalizeAllReduceKernel<{args}>::run")],
-    )
-
-
-def compile_moe_finalize_all_reduce(
-    world_size: int,
-    hidden_dim: int,
-    top_k: int,
-    cluster_size: Optional[int] = None,
-    weight_dtype: torch.dtype = torch.bfloat16,
-) -> None:
-    """Warm the JIT module (tests / benches precompile in parallel)."""
-    _jit_module(
-        world_size,
-        hidden_dim,
-        top_k,
-        cluster_size or default_cluster_size(hidden_dim),
-        weight_dtype,
     )
 
 
@@ -225,17 +195,12 @@ def moe_finalize_all_reduce(
     :param shared_output: optional ``[T, hidden_dim]`` bf16 added before the reduce.
     :param norm_weight: optional ``[hidden_dim]`` bf16 RMSNorm weight; with
                         ``norm_eps`` it turns on the fused norm epilogue.
-    :param prefetch_metadata: let the kernel read the plane's phase counter and
-                              the routing metadata before its PDL wait. Under
-                              PDL the kernel may start as soon as the preceding
-                              kernel *triggers*, and nothing earlier in the
-                              stream is guaranteed complete until the wait: so
-                              this is only valid when the preceding kernel is
-                              not an all-reduce on the same plane AND the
-                              producers of ``expanded_idx_to_permuted_idx`` /
-                              ``expert_weights`` are known complete (a chain of
-                              early-triggering kernels such as the TRT-LLM MoE
-                              GEMMs is not). Defaults to False (wait first).
+    :param prefetch_metadata: read the plane's phase counter and the routing
+                              metadata before the PDL wait; valid only when the
+                              preceding kernel is not an all-reduce on the same
+                              plane and the producers of
+                              ``expanded_idx_to_permuted_idx`` /
+                              ``expert_weights`` are complete. Defaults to False.
     :returns: a new ``[T, hidden_dim]`` bf16 tensor (not in place).
     """
     num_tokens = expert_weights.shape[0]
