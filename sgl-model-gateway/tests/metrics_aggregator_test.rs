@@ -302,3 +302,66 @@ fn assert_eq_sorted(result: &str, expected: &str) {
     expected_lines.sort();
     assert_eq!(result_lines, expected_lines);
 }
+
+#[test]
+fn test_pd_roles_and_worker_addresses_remain_distinct() {
+    let packs = [
+        (
+            "prefill",
+            "http://10.0.0.1:8000",
+            "num_prefill_bootstrap_queue_reqs",
+        ),
+        (
+            "decode",
+            "http://10.0.0.2:8000",
+            "num_decode_transfer_queue_reqs",
+        ),
+    ]
+    .into_iter()
+    .map(|(role, addr, queue)| MetricPack {
+        labels: vec![("worker_addr".to_string(), addr.to_string())],
+        metrics_text: format!(
+            "# TYPE sglang:e2e_request_latency_seconds histogram\n\
+             sglang:e2e_request_latency_seconds_bucket{{engine_type=\"{role}\",le=\"+Inf\"}} 1\n\
+             sglang:e2e_request_latency_seconds_sum{{engine_type=\"{role}\"}} 2\n\
+             sglang:e2e_request_latency_seconds_count{{engine_type=\"{role}\"}} 1\n\
+             # TYPE sglang:{queue} gauge\n\
+             sglang:{queue}{{engine_type=\"{role}\"}} 0\n"
+        ),
+    })
+    .collect();
+    let result = aggregate_metrics(packs).unwrap();
+    let counts: Vec<_> = result
+        .lines()
+        .filter(|line| line.starts_with("sglang:e2e_request_latency_seconds_count{"))
+        .collect();
+    assert_eq!(counts.len(), 2);
+    for (role, addr) in [
+        ("prefill", "http://10.0.0.1:8000"),
+        ("decode", "http://10.0.0.2:8000"),
+    ] {
+        assert!(counts
+            .iter()
+            .any(|line| line.contains(&format!("engine_type=\"{role}\""))
+                && line.contains(&format!("worker_addr=\"{addr}\""))
+                && line.ends_with(" 1")));
+    }
+    assert!(result.contains("sglang:num_prefill_bootstrap_queue_reqs{"));
+    assert!(result.contains("sglang:num_decode_transfer_queue_reqs{"));
+}
+
+#[test]
+fn test_literal_colon_escape_is_not_rewritten() {
+    let pack = MetricPack {
+        labels: vec![("worker".into(), "hostxsmgcolon0z:8000".into())],
+        metrics_text: r#"# HELP sglang:test__smg_colon__ A __smg_colon__ literal.
+# TYPE sglang:test__smg_colon__ gauge
+sglang:test__smg_colon__{value="a__smg_colon__:xsmgcolon0z:b"} 1
+"#
+        .into(),
+    };
+    let text = aggregate_metrics(vec![pack]).unwrap();
+    assert!(text.contains("sglang:test__smg_colon__"));
+    assert!(text.contains("a__smg_colon__:xsmgcolon0z:b"));
+    assert!(text.contains("hostxsmgcolon0z:8000"));
+}

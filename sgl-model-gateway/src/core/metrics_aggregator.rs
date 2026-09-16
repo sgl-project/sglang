@@ -16,13 +16,28 @@ type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 /// metric is prefixed `sglang:`. Colons are swapped for this sentinel before
 /// parsing and restored in the rendered output, so `/engine_metrics` exposes the
 /// exact metric names and label values the engines exported.
-const COLON_SENTINEL: &str = "__smg_colon__";
+const COLON_SENTINEL: &str = "xsmgcolon0z";
 
 /// Aggregate Prometheus metrics scraped from multiple sources into a unified one
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {
+    // A literal sentinel can itself occur in a valid metric name, HELP text,
+    // or label. Pick an unused escape so restoring colons cannot corrupt it.
+    let mut colon_sentinel = COLON_SENTINEL.to_string();
+    let mut escape_index = 0;
+    while metric_packs.iter().any(|pack| {
+        pack.metrics_text.contains(&colon_sentinel)
+            || pack.labels.iter().any(|(key, value)| {
+                key.contains(&colon_sentinel) || value.contains(&colon_sentinel)
+            })
+    }) {
+        escape_index += 1;
+        // Only the first character is x, so adjacent escapes cannot overlap
+        // with a partial literal sentinel at an input boundary.
+        colon_sentinel = format!("xsmgcolon{escape_index}z");
+    }
     let mut expositions = vec![];
     for metric_pack in metric_packs {
-        let metrics_text = metric_pack.metrics_text.replace(':', COLON_SENTINEL);
+        let metrics_text = metric_pack.metrics_text.replace(':', &colon_sentinel);
 
         let exposition = match openmetrics_parser::prometheus::parse_prometheus(&metrics_text) {
             Ok(x) => x,
@@ -39,7 +54,7 @@ pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String
     }
 
     let text = try_reduce(expositions.into_iter(), merge_exposition)?
-        .map(|x| format!("{x}").replace(COLON_SENTINEL, ":"))
+        .map(|x| format!("{x}").replace(&colon_sentinel, ":"))
         .unwrap_or_default();
     Ok(text)
 }
