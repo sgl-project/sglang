@@ -152,23 +152,6 @@ def _jit_module(
     )
 
 
-def compile_moe_finalize_all_reduce(
-    world_size: int,
-    hidden_dim: int,
-    top_k: int,
-    cluster_size: Optional[int] = None,
-    weight_dtype: torch.dtype = torch.bfloat16,
-) -> None:
-    """Warm the JIT module (tests / benches precompile in parallel)."""
-    _jit_module(
-        world_size,
-        hidden_dim,
-        top_k,
-        cluster_size or default_cluster_size(hidden_dim),
-        weight_dtype,
-    )
-
-
 @register_custom_op(mutates_args=["out"])
 def _moe_finalize_all_reduce_op(
     world_size: int,
