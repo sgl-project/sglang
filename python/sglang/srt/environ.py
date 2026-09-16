@@ -943,7 +943,8 @@ class Envs:
     # HIP: fused decode glue launches (page table, index widening, image select); 0: torch
     SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
     # aiter_sparse decode: a pinned split-KV count keeps the fp32 combine order, hence the bits,
-    # the same at every batch size; 0 keeps aiter's cost model, which re-splits past 64 rows
+    # the same at every batch size; 0 enables batch-dependent AITER split selection
+    # and native 16-head attention for small decode batches.
     SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
 
     # ===================================================================

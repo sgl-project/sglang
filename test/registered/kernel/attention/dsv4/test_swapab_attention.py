@@ -5,10 +5,12 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.swapab_attention import swapab_attention
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_gfx95_supported
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def make_cache(page, pages=11):
@@ -60,8 +62,9 @@ def reference(q, values, ids, lengths, sink, extra=None):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "requires Blackwell SM100/SM103 tcgen05",
+    torch.cuda.is_available()
+    and (is_gfx95_supported() or torch.cuda.get_device_capability()[0] == 10),
+    "requires Blackwell SM100/SM103 or AMD gfx950",
 )
 class TestSwapABAttention(CustomTestCase):
     def check_case(self, b, page, nk, ne, graph=False):
@@ -170,6 +173,103 @@ class TestSwapABAttention(CustomTestCase):
                     )
                 g.replay()
                 check(replay_out)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and is_gfx95_supported(), "HIP backend dispatch"
+    )
+    def test_hip_backend_dispatch(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.test.kits.attention_unittest.attention_methods import (
+            dsv4_attention as kit,
+        )
+
+        case = kit.DSV4AttentionCase(
+            name="native_heads",
+            backend="dsv4",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=16,
+            page_size=256,
+            prefix_lens=(32, 64),
+            extend_lens=(1, 1),
+        )
+        fixture = kit.build_dsv4_attention_fixture(self, case, compression_ratios=[0])
+        self.addCleanup(fixture.runner._server_args_override.restore)
+        backend, batch = fixture.backend, fixture.forward_batch
+        pool = fixture.runner.token_to_kv_pool
+        backend.init_forward_metadata(batch)
+        backend.init_forward_metadata_in_graph(batch)
+        core = backend.forward_metadata.core_attn_metadata
+        raw = pool.get_swa_raw_buffer(0)
+        loc = torch.arange(
+            raw.shape[0] * pool.swa_page_size, device="cuda", dtype=torch.int32
+        )
+        pool.set_swa_key_buffer_radix_fused(
+            0, loc, torch.randn(len(loc), 512, device="cuda", dtype=torch.bfloat16)
+        )
+        q = torch.randn(2, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.25
+        sink = torch.randn(16, device="cuda")
+        decoded = dequantize_k_cache_paged(raw, loc, pool.swa_page_size).squeeze(1)
+        gold = reference(
+            q[:, None],
+            decoded,
+            core.swa_page_indices[:, None],
+            core.swa_topk_lengths,
+            sink,
+        )
+        for splits, calls in ((0, 1), (1, 0)):
+            with (
+                envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(splits),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.swapab_attention.swapab_attention",
+                    wraps=swapab_attention,
+                ) as native,
+            ):
+                actual = backend.forward(
+                    q,
+                    q,
+                    q,
+                    SimpleNamespace(layer_id=0, v_head_dim=512),
+                    batch,
+                    compress_ratio=0,
+                    save_kv_cache=False,
+                    attn_sink=sink,
+                )
+                self.assertEqual(native.call_count, calls)
+            torch.testing.assert_close(
+                actual.float(), gold.float(), atol=0.003, rtol=0.01
+            )
+
+    def test_fused_inverse_rope(self):
+        from sglang.srt.layers.attention.hip_flash_mla import _apply_inverse_rope
+
+        torch.manual_seed(103)
+        q = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.25
+        _, cache, _ = make_cache(32)
+        indices = torch.randint(352, (4, 128), device="cuda", dtype=torch.int32)
+        lengths = torch.full((4,), 128, device="cuda", dtype=torch.int32)
+        sink = torch.randn(16, device="cuda")
+        angles = torch.randn(16, 32, device="cuda")
+        freqs = torch.stack((angles.cos(), angles.sin()), dim=-1).flatten(1)
+        positions = torch.arange(4, device="cuda") + 7
+        for extra in (False, True):
+            kwargs = (
+                dict(extra_kv=cache, extra_indices=indices, extra_lengths=lengths)
+                if extra
+                else {}
+            )
+            expected = swapab_attention(q, cache, indices, lengths, sink, **kwargs)
+            _apply_inverse_rope(expected, (freqs, positions))
+            actual = swapab_attention(
+                q, cache, indices, lengths, sink, inv_rope=(freqs, positions), **kwargs
+            )
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_packed_pages_and_sink(self):
         for case in (

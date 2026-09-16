@@ -1,7 +1,7 @@
 """Small-head paged attention with KQ and VP transposed matrix products.
 
 The head dimension is the N dimension of both products. No dummy heads are
-computed. Partials stay FP32; inverse RoPE is performed by the existing caller.
+computed. Partials stay FP32; optional inverse RoPE is fused into their reduction.
 """
 
 import torch
@@ -16,6 +16,10 @@ def _combine(
     SUM,
     SINK,
     OUT,
+    FREQS,
+    POSITIONS,
+    FREQ_STRIDE: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     NT: tl.constexpr,
     ST: tl.constexpr,
     H: tl.constexpr,
@@ -38,6 +42,18 @@ def _combine(
     )
     out = tl.sum(vals * factor[:, None], 0) / denominator
     out = tl.where((denominator > 0) & (sink != float("inf")), out, 0.0)
+    out = out.to(OUT.dtype.element_ty)
+    if ROPE_DIM > 0:
+        x = out.to(tl.float32)
+        pos = tl.load(POSITIONS + b)
+        is_rope = d >= 512 - ROPE_DIM
+        freq_index = ((d - (512 - ROPE_DIM)) // 2) * 2
+        cos = tl.load(FREQS + pos * FREQ_STRIDE + freq_index, is_rope, 0)
+        sin = tl.load(FREQS + pos * FREQ_STRIDE + freq_index + 1, is_rope, 0)
+        signed = tl.where(d % 2 == 0, -x * sin, x * sin)
+        swapped = tl.reshape(tl.flip(tl.reshape(signed, (BD // 2, 2)), 1), (BD,))
+        rotated = tl.fma(x, cos, swapped)
+        out = tl.where(is_rope, rotated.to(OUT.dtype.element_ty), out)
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 
@@ -50,15 +66,19 @@ def swapab_attention(
     extra_kv=None,
     extra_indices=None,
     extra_lengths=None,
+    inv_rope=None,
 ):
-    """SM100 small-batch V4-layout attention on 16 actual TP4 heads.
+    """SM100/gfx950 small-batch V4-layout attention on 16 actual TP4 heads.
 
     Each CTA computes one 64-token split with the real heads on the MMA N
     dimension. The second kernel merges FP32 partials and adds the attention
     sink exactly once. Probability residual compensation keeps the PV product
     close to FP32 probabilities while using BF16 Tensor Core operands.
     """
-    from .swapab_gluon import partial_gluon
+    if torch.version.hip:
+        from .swapab_gluon_hip import partial_gluon
+    else:
+        from .swapab_gluon import partial_gluon
 
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
@@ -117,6 +137,15 @@ def swapab_attention(
         SWAP_AB=True,
         num_warps=4,
     )
+    if inv_rope is not None:
+        freqs, positions = inv_rope
+        assert freqs.dtype == torch.float32 and freqs.stride(1) == 1
+        assert positions.shape == (b,)
+        rope_dim = freqs.shape[1]
+        assert 0 < rope_dim <= 512 and rope_dim % 2 == 0
+    else:
+        freqs = positions = out
+        rope_dim = 0
     bd = 64 if ne else 512
     _combine[(b, h, triton.cdiv(512, bd))](
         partial,
@@ -124,6 +153,10 @@ def swapab_attention(
         sums,
         sink,
         out,
+        freqs,
+        positions,
+        FREQ_STRIDE=freqs.stride(0),
+        ROPE_DIM=rope_dim,
         NT=nt,
         ST=triton.next_power_of_2(nt),
         H=h,
