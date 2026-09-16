@@ -111,6 +111,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    filter_safetensors_files_by_weight_prefix,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
@@ -391,6 +392,13 @@ class DefaultModelLoader(BaseModelLoader):
         Used by checkpoints whose weights live in subfolders (e.g. the Cosmos3
         diffusers-style layout with ``transformer/`` and ``vision_encoder/``)."""
 
+        weight_prefixes: Optional[Tuple[str, ...]] = None
+        """If defined, only shards holding a tensor with one of these name
+        prefixes are read.
+
+        Used by a model that consumes a named slice of a bundled checkpoint,
+        such as a speculative draft head packed alongside its target."""
+
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
@@ -404,6 +412,7 @@ class DefaultModelLoader(BaseModelLoader):
                 allow_patterns_overrides=getattr(
                     model, "allow_patterns_overrides", None
                 ),
+                weight_prefixes=getattr(model, "checkpoint_weight_prefixes", None),
                 model_config=model_config,
             )
 
@@ -458,6 +467,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: Optional[str],
         fall_back_to_pt: bool,
         allow_patterns_overrides: Optional[list[str]] = None,
+        weight_prefixes: Optional[Tuple[str, ...]] = None,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -547,6 +557,13 @@ class DefaultModelLoader(BaseModelLoader):
                     allow_patterns if allow_patterns_overrides is not None else None
                 ),
             )
+            if weight_prefixes is not None:
+                hf_weights_files = filter_safetensors_files_by_weight_prefix(
+                    hf_weights_files,
+                    hf_folder,
+                    index_file,
+                    weight_prefixes,
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -592,6 +609,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.weight_prefixes,
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -760,6 +778,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.weight_prefixes,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(
