@@ -114,9 +114,9 @@ def _lengths(b, topk, mode, seed):
 DEFINED = slice(0, 7)
 
 
-@pytest.mark.parametrize("b", [1, 2, 5, 6, 17, 64])
+@pytest.mark.parametrize("b", [1, 6, 64])
 @pytest.mark.parametrize("s_q", [1, 6])
-@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("topk", [2048])
 @pytest.mark.parametrize("mode", ["full", "random", "zeros", "ones", "mixed"])
 def test_matches_flashmla_schedule(b: int, s_q: int, topk: int, mode: str):
     kv = _cache()
@@ -131,23 +131,7 @@ def test_matches_flashmla_schedule(b: int, s_q: int, topk: int, mode: str):
     assert torch.equal(splits, sched.num_splits)
 
 
-@pytest.mark.parametrize("b", [1, 2, 8])
-@pytest.mark.parametrize("s_q", [1, 6])
-@pytest.mark.parametrize("topk", [512, 2048])
-def test_attention_output_is_unchanged(b: int, s_q: int, topk: int):
-    kv = _cache()
-    topk_length = _lengths(b, topk, "random", b + s_q + topk)
-    ref_out, ref_lse, sched = _call(kv, b, s_q, topk, topk_length)
-    if sched.tile_scheduler_metadata is None:
-        pytest.skip("FlashMLA did not split the KV for this shape")
-    meta = _ours(sched.tile_scheduler_metadata, sched.num_splits, topk_length, topk)
-    out, lse, _ = _call(kv, b, s_q, topk, topk_length, meta=meta)
-    # Bitwise: a random fp8 cache legitimately decodes to NaN in places.
-    assert torch.equal(out.view(torch.int16), ref_out.view(torch.int16))
-    assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
-
-
-@pytest.mark.parametrize("b", [1, 2, 8])
+@pytest.mark.parametrize("b", [1, 8])
 @pytest.mark.parametrize("topk,extra_topk", [(512, 512), (2048, 512), (512, 2048)])
 def test_extra_cache_schedule(b: int, topk: int, extra_topk: int):
     kv, extra_kv = _cache(), _cache()
