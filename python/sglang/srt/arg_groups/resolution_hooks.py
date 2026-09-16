@@ -76,6 +76,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_xpu_backends",
         "handle_symm_mem_device_support",
         "handle_platform_defaults",
+        "handle_dllm_cuda_graph_compatibility",
         "handle_gpu_memory_settings",
         "handle_model_specific_adjustments",
         "handle_deterministic_inference",

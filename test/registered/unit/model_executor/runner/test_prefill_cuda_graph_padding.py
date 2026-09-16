@@ -49,6 +49,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             return_logprob=False,
             input_ids=list(range(num_tokens)),
             extend_prefix_lens_cpu=[0],
+            dllm_config=None,
             seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int64),
             seq_lens=torch.tensor([num_tokens], dtype=torch.int64),
         )

@@ -229,6 +229,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
+    from sglang.srt.arg_groups.dllm_hook import handle_dllm_cuda_graph_compatibility
+
+    # HIP dLLM graph incompatibility must be declared before memory sizing.
+    run_hook(handle_dllm_cuda_graph_compatibility, server_args)
+
     # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 
