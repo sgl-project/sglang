@@ -1,10 +1,12 @@
 //! The success path on the pump: the gates and the splice of a vetted snapshot.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
 use super::fallback::{fail_rank, resolve_gap};
+use super::probe::PendingProof;
 use super::{apply_batch, PumpState};
 use crate::state::kv_events::bootstrap::{BootstrapState, RankOutcome, VettedSnapshot};
 use crate::state::kv_events::tree::KvWorkerId;
@@ -38,7 +40,7 @@ pub(super) fn still_owed(st: &PumpState<'_>, rank: &KvWorkerId, epoch: u64) -> b
 pub(super) fn apply_snapshot(
     st: &PumpState<'_>,
     held: &mut HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>>,
-    awaiting_splice_proof: &mut HashMap<KvWorkerId, i64>,
+    awaiting_splice_proof: &mut HashMap<KvWorkerId, PendingProof>,
     obligations: &[(KvWorkerId, u64)],
     mut vetted: VettedSnapshot,
 ) {
@@ -115,7 +117,8 @@ pub(super) fn apply_snapshot(
             }
             Some(_) => {}
             None => {
-                awaiting_splice_proof.insert(rank.clone(), peer_cursor);
+                awaiting_splice_proof
+                    .insert(rank.clone(), PendingProof::new(peer_cursor, Instant::now()));
             }
         }
         // A held batch proves the splice now; an empty queue does not.

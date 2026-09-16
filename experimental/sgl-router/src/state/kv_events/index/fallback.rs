@@ -109,6 +109,26 @@ pub(super) fn resolve_gap(
     }
 }
 
+/// Resolve a gap a peer witnessed for a grafted rank that never proved its
+/// splice, through the same [`resolve_gap`] the first-batch check uses.
+///
+/// Not [`fail_rank`]: that one only acts on a rank still
+/// [`BootstrapState::Pending`], and this rank is `Recovered` — it was grafted
+/// and is serving, so it holds no batches.
+pub(super) fn demote_unproven_rank(
+    st: &PumpState<'_>,
+    held: &mut HashMap<KvWorkerId, VecDeque<(i64, KvEventBatch)>>,
+    rank: &KvWorkerId,
+) {
+    // Only a live, still-`Recovered` rank is ours to demote.
+    if st.bootstrap.state_of(rank) != Some(BootstrapState::Recovered)
+        || !st.live_workers.lock().contains(rank)
+    {
+        return;
+    }
+    resolve_gap(st, held, rank);
+}
+
 /// Resolve a `Pending` rank whose first held batch is its publisher's first
 /// batch ever (`STREAM_ORIGIN_SEQ`), without a snapshot.
 ///
