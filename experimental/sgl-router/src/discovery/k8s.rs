@@ -330,7 +330,13 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    // `peer_selector` drives a separate watch (`spawn_peer_watch`), not the
+    // worker stream this function serves.
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        peer_selector: _,
+    } = cfg;
 
     let client = Client::try_default()
         .await
