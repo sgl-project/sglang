@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from unittest.mock import patch
 
 import torch
@@ -260,6 +261,78 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_correctness_and_strides(self):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
+
+    def test_decode_fast_noncontiguous_tensors(self):
+        batch_size, context_length = 3, 4096
+
+        def make_view(tensor, layout):
+            if layout == "transpose":
+                return tensor.T.contiguous().T
+            if layout == "slice":
+                storage = torch.zeros(
+                    (tensor.shape[0] * 2, tensor.shape[1] * 2 + 1),
+                    dtype=tensor.dtype,
+                    device=self.device,
+                )
+                view = storage[::2, 1::2]
+                view.copy_(tensor)
+                return view
+            if layout == "expand":
+                return tensor[:1].expand_as(tensor)
+            if layout == "expand_columns":
+                return tensor[:, :1].expand_as(tensor)
+            return tensor
+
+        for operand in ("page_table", "topk_indices", "result"):
+            layouts = ("transpose", "slice", "expand", "expand_columns")
+            if operand == "result":
+                layouts = ("transpose", "slice")
+            for layout, index_dtype in product(layouts, (torch.int32, torch.int64)):
+                with self.subTest(operand=operand, layout=layout, dtype=index_dtype):
+                    page_table = self._make_page_table(batch_size, context_length)
+                    topk_indices = self._make_topk(batch_size, context_length).to(
+                        index_dtype
+                    )
+                    if operand == "page_table":
+                        page_table = make_view(page_table, layout)
+                    elif operand == "topk_indices":
+                        topk_indices = make_view(topk_indices, layout)
+
+                    expected = torch.gather(
+                        page_table, 1, topk_indices.long().clamp(min=0)
+                    )
+                    expected[topk_indices < 0] = -1
+                    result = None
+                    if operand == "result":
+                        result = make_view(torch.zeros_like(expected), layout)
+
+                    actual = transform_index_page_table_decode_fast(
+                        page_table, topk_indices, result=result
+                    )
+                    torch.cuda.synchronize()
+                    if result is not None:
+                        self.assertIs(actual, result)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_decode_fast_preserves_output_padding(self):
+        page_table = self._make_page_table(3, 4096)
+        topk_indices = self._make_topk(3, 4096)
+        sentinel = -123
+        storage = torch.full(
+            (6, TOPK * 2 + 1), sentinel, dtype=torch.int32, device=self.device
+        )
+        result = storage[::2, 1::2]
+        expected = torch.full_like(storage, sentinel)
+        values = torch.gather(page_table, 1, topk_indices.clamp(min=0))
+        values[topk_indices < 0] = -1
+        expected[::2, 1::2] = values
+
+        actual = transform_index_page_table_decode_fast(
+            page_table, topk_indices, result=result
+        )
+        torch.cuda.synchronize()
+        self.assertIs(actual, result)
+        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
 
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
