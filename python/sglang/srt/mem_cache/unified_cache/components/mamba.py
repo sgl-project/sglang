@@ -715,6 +715,12 @@ class MambaComponent(TreeComponent):
         """Drop the deferred CoW/clear staged by the match: the load-back
         writes the request's slot directly with a deeper state, and the
         deferred D2D copy is not ordered against that H2D."""
+        write_pos = self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
+        if write_pos is not None and req.kv.mamba_pool_idx is not None:
+            slot = self.cache.req_to_token_pool.translate_mamba_indices(
+                req.kv.mamba_pool_idx.unsqueeze(0)
+            )
+            write_pos[slot] = 0
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
 

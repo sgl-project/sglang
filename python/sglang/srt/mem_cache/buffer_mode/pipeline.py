@@ -985,7 +985,7 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.MAMBA and t.host_indices is not None
         )
-        if full_tokens == 0 and swa_tokens == 0:
+        if full_tokens == 0 and swa_tokens == 0 and mamba_slots == 0:
             self._resolve_device_covered(req, f)
             return True
         req.host_hit_length = full_tokens
