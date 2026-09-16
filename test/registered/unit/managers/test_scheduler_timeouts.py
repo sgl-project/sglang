@@ -17,6 +17,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -24,6 +28,7 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = None
         self.beam_group = None
         self._finished = is_finished
@@ -83,11 +88,13 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
-        s.tree_cache = MagicMock(spec=["release_aborted_request"])
+        s.tree_cache = MagicMock(spec=["finish"])
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
 
-        s.tree_cache.release_aborted_request.assert_called_once_with("candidate")
+        s.tree_cache.finish.assert_called_once_with(
+            candidate.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         self.assertEqual(s.waiting_queue, [])
 
 

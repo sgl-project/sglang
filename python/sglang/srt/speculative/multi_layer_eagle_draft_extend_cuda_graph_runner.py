@@ -180,6 +180,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Disable parent paths that don't apply.
         self.compile_bs = []
         self.record_nolora_graph = False
+        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -431,6 +432,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        attention_variant: Optional[str] = None,
     ):
         bs = size
 

@@ -64,7 +64,9 @@ class TestWaterfillEPLB(CustomTestCase):
             num_fused_shared_experts=1,
             routed_scaling_factor=1.0,
         )
-        dispatch_info = SimpleNamespace(num_physical_experts=264)
+        dispatch_info = SimpleNamespace(
+            num_physical_experts=264, ep_dispatch_algorithm="static"
+        )
 
         def fake_eplb_postprocess(
             ids, expert_location_dispatch_info, num_token_non_padded
@@ -104,7 +106,9 @@ class TestWaterfillEPLB(CustomTestCase):
             num_fused_shared_experts=1,
             routed_scaling_factor=1.0,
         )
-        dispatch_info = SimpleNamespace(num_physical_experts=264)
+        dispatch_info = SimpleNamespace(
+            num_physical_experts=264, ep_dispatch_algorithm="static"
+        )
 
         def fake_eplb_postprocess(
             ids, expert_location_dispatch_info, num_token_non_padded
