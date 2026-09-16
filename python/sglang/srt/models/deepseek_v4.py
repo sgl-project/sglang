@@ -463,14 +463,11 @@ def _apply_wo_a_bf16_matmul(
     fast_path: bool = False,
     fp8_grid: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
-    """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
+    """Compute BF16 wo_a: ``[T, G, D] @ [G, R, D] -> [T, G, R]``.
 
-    Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
-    verify batches up to 384 rows and large prefill batches write token-major
-    output directly to avoid the layout copy before wo_b. gfx950 also uses the
-    direct output for large prefill batches and 129–384 verify rows, plus
-    GEMV/split-K for one-token decode and 2–8 verify rows. Other ROCm decode can use
-    aiter batched GEMM with an optional fp8-grid operand; other cases use torch.einsum.
+    Supported shapes use native GEMV/split-K or write token-major output
+    directly. Other ROCm decode shapes can use AITER, optionally on the FP8
+    grid; unsupported cases fall back to torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     hip_decode_verify = (

@@ -2701,17 +2701,10 @@ class DeepseekV4HipRadixBackend(
         return o
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Resolve the SWA KV-store write target for the current forward.
+        """Return cached SWA write locations, or translate the current batch's locations.
 
-        Fast path: the per-forward value cached by init_forward_metadata_in_graph
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        translate at store time, matching the pre-cache behavior, for paths that
-        never run the in-graph init — eager idle (forward_idle skips attn init),
-        runners that only run the out-graph prep (e.g.
-        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Idle batches always translate because their metadata may be stale.
+        Missing or differently padded metadata also falls back to translation.
         """
         window = getattr(self.token_to_kv_pool, "request_window", None)
         if window is not None:

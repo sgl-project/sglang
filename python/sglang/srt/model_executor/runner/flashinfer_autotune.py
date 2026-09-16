@@ -343,14 +343,10 @@ def maybe_flashinfer_autotune_speculative_draft(
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
-    """Also autotune kernels at the prefill token ceiling.
+    """Autotune through the prefill token ceiling.
 
-    The decode-shaped autotune only covers token counts up to the decode
-    batch size, so larger prefill/extend batches fall outside the tuned
-    buckets and run flashinfer's default heuristic — which can be far
-    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
-    untuned at >=8k tokens on sm100). One extra forward at the largest
-    per-rank extend token count tunes all buckets up to it.
+    Decode warmup covers only small token counts; one prefill-sized forward
+    tunes the larger buckets instead of leaving them on default heuristics.
     """
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling

@@ -1,9 +1,8 @@
-"""The top-k gate of :mod:`rocm_router_gate` followed by aiter's MoE sorting in one launch, bitwise
-the two launches'.
+"""Fuse the ROCm top-k gate and AITER MoE sorting with matching output bits.
 
-One program per row runs the gate; program 0 sorts every ``(token, slot)`` entry once the other
-rows have published theirs through device-scope atomic ``int64`` slots (coherent across XCDs without
-an L2 writeback), trapping the wave if a row never publishes rather than sorting zeros for it."""
+Rows publish through device-scope atomic int64 slots; program zero sorts only
+after publication and traps if a row never publishes.
+"""
 
 from __future__ import annotations
 

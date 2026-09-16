@@ -666,7 +666,7 @@ class _HostTable:
 
 
 class EngramEmbedding(nn.Module):
-    """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
+    """Store one layer's FP8 hash table with e8m0 scales and dequantize lookups.
 
     Rows are sharded over the TP group in device memory; with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
