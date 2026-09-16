@@ -178,8 +178,8 @@ def _build(n: int, ratio: int, seed: int):
 def _reference(t, ratio: int):
     """Check numerics independently, then check byte-exact packing of actual latents."""
     from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-    from sglang.kernels.ops.attention.dsv4.rope_pack_indexer import (
-        rope_fake_quant_pack_indexer,
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        index_k_rope_pack,
     )
     from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
@@ -244,7 +244,7 @@ def _reference(t, ratio: int):
         type="flashmla",
     )
     index_cache = torch.zeros_like(t.index_cache)
-    rope_fake_quant_pack_indexer(
+    index_k_rope_pack(
         t.k_norm(projected[live]),
         t.freqs[group_pos[live]],
         ROPE_DIM,

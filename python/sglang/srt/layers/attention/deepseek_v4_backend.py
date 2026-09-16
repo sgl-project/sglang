@@ -3002,7 +3002,7 @@ class DeepseekV4AttnBackend(
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
         """
-        from sglang.kernels.ops.attention.dsv4.fp4_rope import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
@@ -3172,13 +3172,13 @@ class DeepseekV4AttnBackend(
                 and latent.dtype == torch.bfloat16
                 and layer.indexer.index_head_dim == 128
             ):
-                from sglang.kernels.ops.attention.dsv4.rope_pack_indexer import (
-                    rope_fake_quant_pack_indexer,
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                    index_k_rope_pack,
                 )
 
                 indexer = layer.indexer
                 k = indexer.k_norm(indexer.forward_wk(latent))
-                rope_fake_quant_pack_indexer(
+                index_k_rope_pack(
                     k,
                     freqs,
                     indexer.rope_head_dim,
@@ -3482,7 +3482,7 @@ class DeepseekV4AttnBackend(
             and x.dtype == torch.bfloat16
             and indexer.index_head_dim == 128
         ):
-            from sglang.kernels.ops.attention.dsv4.fp4_rope import (
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
                 index_q_rope_pack_weights,
             )
 
