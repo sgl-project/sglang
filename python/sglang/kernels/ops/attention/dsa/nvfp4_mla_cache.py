@@ -1,22 +1,40 @@
-"""Basic NVFP4 DSA main-cache gather/dequantization.
+"""NVFP4 DSA main-cache gather/dequantization.
 
 The persistent cache stores the 576-element MLA row as packed E2M1 data plus
-one E4M3 scale per block of 16 values.  TRTLLM-GEN sparse MLA consumes FP8, so
-this module gathers the union of selected physical rows, dequantizes it to a
-compact FP8 cache, and remaps every selected index into that cache.
-
-This is deliberately a correctness-first implementation.  ``torch.unique``
-and FlashInfer's generic NVFP4 dequantizer are separate launches and allocate
-dynamic eager tensors.  A follow-up should replace them with the persistent
-CUDA kernels from TensorRT-LLM's nvfp4MlaKvCacheGather implementation for CUDA
-Graph support and decode performance.
+one E4M3 scale per block of 16 values. TRTLLM-GEN sparse MLA consumes FP8, so
+the generation path uses a persistent CUDA kernel adapted from TensorRT-LLM to
+gather and convert selected rows into a compact FP8 cache. The context path
+retains its correctness-first deduplicating implementation for now.
 """
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.jit.utils import cache_once, load_jit
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
+logger = logging.getLogger(__name__)
+_cuda_gather_failed = False
+
+
+@cache_once
+def _jit_nvfp4_mla_gather_module() -> Module:
+    if torch.cuda.get_device_capability()[0] != 10:
+        raise RuntimeError("NVFP4 MLA CUDA gather requires SM100/SM103")
+    return load_jit(
+        "nvfp4_mla_cache_gather_sm10x",
+        cuda_files=["dsa/nvfp4_mla_cache_gather.cuh"],
+        cuda_wrappers=[("gather", "nvfp4_mla::GatherKernel::run")],
+        extra_cuda_cflags=["-O3", "-DNDEBUG"],
+    )
 
 
 @triton.jit
@@ -100,20 +118,79 @@ def gather_dequant_nvfp4_mla_cache_generation(
     *,
     head_dim: int,
     page_size: int,
+    output: torch.Tensor | None = None,
+    compact_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused generation gather/dequantization without cross-query deduplication."""
+    """Gather/dequantize generation rows without cross-query deduplication.
+
+    ``output`` and ``compact_indices`` allow the attention backend to reuse
+    stable scratch allocations across layers and CUDA Graph replays. The CUDA
+    implementation is the optimized persistent, asynchronously prefetched
+    TensorRT-LLM algorithm; the Triton kernel remains as a portability fallback.
+    """
+    global _cuda_gather_failed
+
+    if physical_indices.ndim != 2 or physical_indices.dtype != torch.int32:
+        raise ValueError("physical_indices must be contiguous int32 [rows, topk]")
+    physical_indices = physical_indices.contiguous()
     if data_cache.shape[-1] * 2 != head_dim:
         raise ValueError("NVFP4 data-cache width does not match head_dim")
     if scale_cache.shape[-1] * 16 != head_dim:
         raise ValueError("NVFP4 scale-cache width does not match head_dim")
     total_rows = physical_indices.numel()
     padded_rows = ((total_rows + page_size - 1) // page_size) * page_size
-    output = torch.empty(
-        (padded_rows, 1, head_dim),
-        dtype=torch.float8_e4m3fn,
-        device=data_cache.device,
-    )
-    compact_indices = torch.empty_like(physical_indices, dtype=torch.int32)
+    if output is None:
+        output = torch.empty(
+            (padded_rows, 1, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=data_cache.device,
+        )
+    else:
+        if (
+            output.dtype != torch.float8_e4m3fn
+            or output.device != data_cache.device
+            or output.ndim != 3
+            or output.shape[0] < padded_rows
+            or output.shape[1:] != (1, head_dim)
+        ):
+            raise ValueError("output scratch has incompatible shape, dtype, or device")
+        output = output[:padded_rows]
+    if compact_indices is None:
+        compact_indices = torch.empty_like(physical_indices, dtype=torch.int32)
+    else:
+        if (
+            compact_indices.dtype != torch.int32
+            or compact_indices.device != physical_indices.device
+            or compact_indices.numel() < total_rows
+        ):
+            raise ValueError(
+                "compact_indices scratch has incompatible dtype or capacity"
+            )
+        compact_indices = compact_indices.reshape(-1)[:total_rows].view_as(
+            physical_indices
+        )
+
+    if not _cuda_gather_failed and head_dim == 576:
+        try:
+            _jit_nvfp4_mla_gather_module().gather(
+                data_cache,
+                scale_cache,
+                physical_indices,
+                output,
+                compact_indices,
+                global_scale,
+            )
+            return output.view(-1, 1, page_size, head_dim), compact_indices
+        # Preserve the Triton implementation as a deployment fallback when a
+        # wheel/cache does not contain a usable JIT toolchain for this kernel.
+        except Exception as error:  # noqa: BLE001
+            _cuda_gather_failed = True
+            logger.warning(
+                "Falling back to the Triton NVFP4 MLA gather after the optimized "
+                "CUDA kernel failed to load or launch: %s",
+                error,
+            )
+
     block_dim = 256
     _gather_dequant_nvfp4_mla_generation_kernel[
         (total_rows, triton.cdiv(head_dim, block_dim))

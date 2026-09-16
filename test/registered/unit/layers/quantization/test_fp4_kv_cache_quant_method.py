@@ -494,6 +494,7 @@ class TestNVFP4DSAGather(CustomTestCase):
 
     @skip_if_no_blackwell_nvfp4
     def test_gather_dequant_deduplicates_and_remaps(self):
+        from sglang.kernels.ops.attention.dsa import nvfp4_mla_cache
         from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
             gather_dequant_nvfp4_mla_cache,
             gather_dequant_nvfp4_mla_cache_generation,
@@ -503,7 +504,8 @@ class TestNVFP4DSAGather(CustomTestCase):
         head_dim = 576
         page_size = 64
         source = torch.randn(8, 1, head_dim, dtype=torch.bfloat16, device="cuda")
-        global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        # Exercise the non-unit global-scale path used by real model scales.
+        global_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
         packed, scales, _ = NVFP4KVQuantizeUtil.quantize(source, global_scale)
         physical = torch.tensor(
             [[3, 1, 3, -1], [6, 1, -1, -1]],
@@ -520,6 +522,12 @@ class TestNVFP4DSAGather(CustomTestCase):
             page_size=page_size,
         )
 
+        generation_scratch = torch.empty(
+            (page_size, 1, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        index_scratch = torch.empty(page_size, dtype=torch.int32, device="cuda")
         generation, generation_remapped = gather_dequant_nvfp4_mla_cache_generation(
             packed.view(torch.uint8),
             scales.view(torch.uint8),
@@ -527,6 +535,8 @@ class TestNVFP4DSAGather(CustomTestCase):
             global_scale,
             head_dim=head_dim,
             page_size=page_size,
+            output=generation_scratch,
+            compact_indices=index_scratch,
         )
 
         self.assertEqual(compact.shape, (1, 1, page_size, head_dim))
@@ -535,7 +545,10 @@ class TestNVFP4DSAGather(CustomTestCase):
         self.assertEqual(remapped[0, 0].item(), remapped[0, 2].item())
         self.assertEqual(remapped[0, 1].item(), remapped[1, 1].item())
         self.assertTrue(torch.all(remapped[physical < 0] == -1))
+        self.assertFalse(nvfp4_mla_cache._cuda_gather_failed)
         self.assertEqual(generation.shape, (1, 1, page_size, head_dim))
+        self.assertEqual(generation.data_ptr(), generation_scratch.data_ptr())
+        self.assertEqual(generation_remapped.data_ptr(), index_scratch.data_ptr())
         self.assertTrue(torch.all(generation_remapped[physical < 0] == -1))
 
         direct = NVFP4KVQuantizeUtil.dequantize(

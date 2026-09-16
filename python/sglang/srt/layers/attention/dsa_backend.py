@@ -523,6 +523,13 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_born_q_sentinel: Optional[torch.Tensor] = None
         self._q8kv8_born_q_tbo = get_exec().overlap.enable_two_batch_overlap
 
+        # Per-stream, grow-only compact FP8 outputs for the NVFP4 generation
+        # gather. Every attention layer reuses the same storage in stream order;
+        # keying by stream keeps TBO and CUDA Graph capture streams independent.
+        self._nvfp4_generation_scratch: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
         )
@@ -3355,6 +3362,28 @@ class DeepseekSparseAttnBackend(
 
         return o
 
+    def _acquire_nvfp4_generation_scratch(
+        self, num_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return stable, grow-only FP8 and index scratch for this CUDA stream."""
+        padded_rows = (
+            (num_rows + self.real_page_size - 1) // self.real_page_size
+        ) * self.real_page_size
+        stream_key = torch.cuda.current_stream().cuda_stream
+        buffers = self._nvfp4_generation_scratch.get(stream_key)
+        if buffers is None or buffers[0].shape[0] < padded_rows:
+            fp8_scratch = torch.empty(
+                (padded_rows, 1, self.kv_cache_dim),
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            index_scratch = torch.empty(
+                padded_rows, dtype=torch.int32, device=self.device
+            )
+            buffers = (fp8_scratch, index_scratch)
+            self._nvfp4_generation_scratch[stream_key] = buffers
+        return buffers[0][:padded_rows], buffers[1][:num_rows]
+
     def _forward_trtllm(
         self,
         q: torch.Tensor,
@@ -3523,19 +3552,29 @@ class DeepseekSparseAttnBackend(
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
-            gather_fn = (
-                gather_dequant_nvfp4_mla_cache
-                if use_context_gather
-                else gather_dequant_nvfp4_mla_cache_generation
-            )
-            kv, page_table_1 = gather_fn(
-                data_cache,
-                scale_cache,
-                page_table_1,
-                global_scale,
-                head_dim=self.kv_cache_dim,
-                page_size=self.real_page_size,
-            )
+            if use_context_gather:
+                kv, page_table_1 = gather_dequant_nvfp4_mla_cache(
+                    data_cache,
+                    scale_cache,
+                    page_table_1,
+                    global_scale,
+                    head_dim=self.kv_cache_dim,
+                    page_size=self.real_page_size,
+                )
+            else:
+                output_scratch, index_scratch = self._acquire_nvfp4_generation_scratch(
+                    page_table_1.numel()
+                )
+                kv, page_table_1 = gather_dequant_nvfp4_mla_cache_generation(
+                    data_cache,
+                    scale_cache,
+                    page_table_1,
+                    global_scale,
+                    head_dim=self.kv_cache_dim,
+                    page_size=self.real_page_size,
+                    output=output_scratch,
+                    compact_indices=index_scratch,
+                )
         else:
             kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)

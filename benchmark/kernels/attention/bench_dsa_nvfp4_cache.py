@@ -79,8 +79,15 @@ def main() -> None:
         )
         flat = physical.reshape(-1)
         flat_long = flat.long()
+        padded_rows = ((physical.numel() + page_size - 1) // page_size) * page_size
+        nv_output = torch.empty(
+            (padded_rows, 1, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        nv_indices = torch.empty_like(physical)
 
-        def run_nvfp4(selected=physical):
+        def run_nvfp4(selected=physical, output=nv_output, compact_indices=nv_indices):
             return gather_dequant_nvfp4_mla_cache_generation(
                 nv_data.view(torch.uint8),
                 nv_scales.view(torch.uint8),
@@ -88,6 +95,8 @@ def main() -> None:
                 global_scale,
                 head_dim=head_dim,
                 page_size=page_size,
+                output=output,
+                compact_indices=compact_indices,
             )
 
         def run_flashmla(selected=flat):
