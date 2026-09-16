@@ -800,7 +800,71 @@ SGLang port. Use base MiniMax-H3 when output quality matters more than
 latency.
 </Note>
 
-## 7. Sampling and output controls
+## 7. VDN-H3: hybrid attention, 8-step distill
+
+[Video DeltaNet](https://openvdn.github.io/) (VDN) is a hybrid attention
+architecture that approaches the speed of linear attention while maintaining
+near-lossless quality. It splits the video-video attention into two
+complementary branches: a sliding-window softmax branch for local frame pairs
+(five consecutive latent frames form a chunk, and each chunk attends to
+itself, the previous chunk, and the following chunk; the first and last
+frames, text and audio stay dense) and a bidirectional linear branch, Video
+Delta Attention, for long-range context.
+[OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
+applies it to MiniMax-H3: the released `stage-dmd-step-250` checkpoint adds a
+4.3 GB linear branch and OpenVDN's own 8-step DMD2 LoRA on the unchanged H3
+backbone. It is the FL2VA partition, so it serves `t2va` and `fl2va` (first,
+last, or both keyframes); `ref2va` is rejected. The weights inherit the
+MiniMax-H3 Community License.
+
+Pass the repository directly to `--model-path`. On first launch a registered
+overlay prefuses both adapters into the transformer weights (a 62 GB write)
+and attaches the linear branch; the Qwen3-VL conditioner and the VAEs are
+hard-linked from `MiniMaxAI/MiniMax-H3`. Keep `SGLANG_DIFFUSION_CACHE_ROOT` on
+the same filesystem as the Hugging Face cache with at least 90 GB free.
+
+```bash 8×B200
+sglang serve \
+  --model-path OpenVDN/vdn-minimax-h3 \
+  --num-gpus 8 \
+  --attention-backend hybrid_window_attn_h3 \
+  --performance-mode speed \
+  --warmup-num-frames 345 \
+  --warmup-resolutions 1344x768 \
+  --port 30010
+```
+
+`--num-gpus 4`, `2` or `1` gives the smaller Ulysses recipes in the benchmark
+table; `sglang generate` takes the same flags. `--warmup-num-frames` /
+`--warmup-resolutions` warm up at the clip length and canvas you will serve;
+without them the first long request pays 2 to 3 s of allocator growth and
+kernel setup.
+
+Requests use the same video endpoint as the base model with `task: "t2va"`
+and `conditions: []`, or `task: "fl2va"` with the
+[keyframe conditions](#4-generate-video-and-audio), and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}` (the
+345-frame paper workload). The default `num_inference_steps: 9` is the only
+accepted value: nine sigma grid points, eight DiT forwards. Each keyframe adds
+about 2,000 dense rows, so an `fl2va` forward costs a little more than `t2va`.
+
+`hybrid_window_attn_h3` is required: a dense backend would silently skip the
+linear branch and the gates and produce the wrong model. On Blackwell
+(SM100 / SM103 / SM120) the transformer defaults to online MXFP8;
+`--quantization bf16` opts out. Before SM100, `--quantization fp8` is base
+H3's per-channel fp8 path, and SM80 runs the bf16 DiT (62 GB; budget for
+`--layerwise-offload-components`). Ampere and Ada are enabled but not
+benchmarked. Ulysses sequence parallelism is supported; `--model-variant`,
+`quality: "high"`, `--ring-degree` greater than 1, `torch.compile`, and
+breakable CUDA graph execution are rejected. The backend's
+`--attention-backend-config` keys are listed in
+[Attention Backends](/docs/sglang-diffusion/attention_backends).
+
+Measured latencies for 1, 2, 4 and 8 B200s are in
+[VDN-H3 on B200](#vdn-h3-on-b200); single-card and PCIe multi-card numbers
+for the RTX PRO 6000 are in [VDN-H3 on RTX PRO 6000](#vdn-h3-on-rtx-pro-6000).
+
+## 8. Sampling and output controls
 
 MiniMax-H3 supports more than one output per prompt. The video API accepts
 `num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
@@ -975,7 +1039,7 @@ has completed, but the `quality: "high"` path above remains fail-closed
 to the audited 4×H200 workload.
 </Warning>
 
-## 8. Feature contracts and advanced recipes
+## 9. Feature contracts and advanced recipes
 
 The generated command already contains the recommended topology and encoder
 setting. Use the detailed reference below only when applying an optional
@@ -1269,7 +1333,7 @@ fold decision is not node-boundary aware:
 
 </Tabs>
 
-## 9. Configuration notes
+## 10. Configuration notes
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
@@ -1288,7 +1352,7 @@ fold decision is not node-boundary aware:
 - `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 10. Benchmarks
+## 11. Benchmarks
 
 The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
 counts are properties of the selected recipes, not a claim that every platform
@@ -1305,7 +1369,7 @@ the configurations with collected measurements:
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | Ascend NPU | 8 NPUs, TP2 + SP4, Laser Attention | 4 NPUs, TP2 + SP2, Laser Attention |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
-| RTX 5090 | 2× TP2 + layerwise offload | — |
+| RTX 5090 | 1× layerwise offload, measured on a physical desktop | 2× TP2 + layerwise offload |
 | RTX 4090 24 GB | 1× layerwise offload + `kitchen_int8` | Approximate attention backends are opt-in |
 
 ### GB300 single-host
@@ -1452,6 +1516,95 @@ TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
 online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
 peak memory.
 
+### VDN-H3 on B200
+
+An 8× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
+on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
+102 latent frames, about 104k packed rows), `task: "t2va"`,
+`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`,
+eager, and the warmup run at the served clip shape
+(`--warmup-num-frames 345 --warmup-resolutions 1344x768`), so every forward
+of the served request is steady state; without those flags the first forward
+pays 2 to 3 s of allocator growth and kernel setup. "Steady
+s/NFE" is the mean of forwards 2 to 8. The OpenVDN reference rows ran the released
+inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
+and the same clip length, with its Ulysses layout (`parallel.softmax_ranks`)
+swept at every GPU count rather than assumed. Every row below comes from one
+campaign, one arm at a time on an otherwise idle node; a repeated arm moves by
+about 3% across nodes, so treat smaller differences as noise:
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| OpenVDN published, FP8, 8× B200 Ulysses 5+3 ([openvdn.github.io](https://openvdn.github.io/)) | 1.40 | 11.2 s | — | — |
+| OpenVDN reference, BF16 (`8nfe_tuned.yaml`), 1× B200 | 7.66 | 61.2 s | — | — |
+| OpenVDN reference, FP8, 1× B200 | 6.25 | 50.0 s | — | — |
+| OpenVDN reference, FP8, 2× B200 Ulysses (standard / 1+1 branch-parallel) | 4.87 / 5.04 | 39.0 / 40.3 s | — | — |
+| OpenVDN reference, FP8, 4× B200 Ulysses (3+1 branch-parallel) | 2.59 | 20.7 s | — | — |
+| OpenVDN reference, FP8, 8× B200 Ulysses (5+3 / 4+4 / standard) | 1.40 / 1.47 / 1.52 | 11.2 / 11.7 / 12.2 s | — | — |
+| SGLang, `--quantization bf16`, 1× B200 | 7.45 | 58.8 s | 8.8 s | 156,298 MB |
+| SGLang, `--quantization fp8` (→ online `mxfp8` on SM100+), 1× B200 | 6.03 | 47.6 s | 8.7 s | 128,418 MB |
+| SGLang default (online `mxfp8`), 2× B200 Ulysses2, `--performance-mode speed`, served-shape warmup | **3.30** | **25.9 s** | 4.7 s | 106,738 MB |
+| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | 2.06 | 16.2 s | 2.3 s | 108,434 MB |
+| SGLang default (online `mxfp8`), 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **1.67** | **13.1 s** | 2.4 s | 85,244 MB |
+| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.88** | **6.9 s** | 1.5 s | 79,972 MB |
+| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models; on SM100+ `--quantization fp8` resolves to `mxfp8`, so this arm selects the per-channel path explicitly), 8× B200 Ulysses8 | 0.98 | 7.7 s | 1.5 s | 79,504 MB |
+
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.88 s/NFE
+(7.0 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+branch-parallel layout; the whole request (text encoding, 8 forwards, joint
+decode) completes in about 8.7 s after warmup. At this GPU count the step is
+launch- and copy-bound in the linear branch rather than FLOP-bound, and the
+transformer runs online `mxfp8` by default (e4m3 with one E8M0 scale per 32
+elements into cuBLASLt's block-scaled GEMM, with the activation quant fused
+into the adaLN and SwiGLU producers).
+
+Against the published 8× B200 headline (1.40 s/NFE, 11.2
+GPU-seconds per NFE), the SGLang 4× B200 run spends 6.7 GPU-seconds per
+NFE, with half the GPUs and half the all-to-all fan-out. At equal GPU count
+SGLang is 1.48× faster at two cards (3.30 vs 4.87 s/NFE), 1.55× at four
+(1.67 vs 2.59) and 1.60× at eight (0.88 vs 1.40), while on one card the two
+stacks are within 4% of each other (6.03 vs 6.25 s/NFE quantized, 7.45 vs 7.66
+in BF16). The advantage is therefore parallel scaling rather than per-GPU
+kernel work: SGLang holds 86-91% parallel efficiency from 2 to 8 cards against
+the reference stack's 56-64%, and sweeping the reference stack's own layout
+does not close it (its best split is 8% better than standard Ulysses at eight
+cards, 1.40 against 1.52 s/NFE).
+
+On one B200 both single-GPU rows run with the DiT resident under the auto
+memory policy (128 GB peak quantized, 156 GB in BF16, of the card's 183 GB),
+so no `--layerwise-offload-components` flag is needed at this clip length and
+the single-GPU rows are compute-bound.
+
+### VDN-H3 on RTX PRO 6000
+
+The same paper workload (1344×768, 345 frames, 8 DiT forwards, seed 1000,
+`hybrid_window_attn_h3`, `--performance-mode speed`, served-shape warmup) on
+RTX PRO 6000 Blackwell Server Edition cards (SM120, 96 GB, PCIe, no NVLink).
+The window runs on FA4's sm120 kernel and the transformer defaults to online
+`mxfp8` (a cutlass sm120 block-scaled GEMM); `--quantization fp8` maps to it.
+One card needs `--layerwise-offload-components text_encoder`: the fp8 DiT
+(33 GB) and the bf16 text encoder (48 GB) do not both fit, and the whole-module
+`--text-encoder-cpu-offload` re-homes the encoder in one piece and runs out of
+memory when it is used. Multi-card Ulysses goes over PCIe; the all-to-all is
+the bulk of the step there (54% of GPU time at 8 cards), so the per-card
+efficiency drops with count. A 2-card run should use a pair on one PCIe
+switch (`nvidia-smi topo -m` shows `PIX`): a pair across the CPU root complex
+measured 15.7 to 17.0 s/NFE on a shared host.
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| 1× RTX PRO 6000, `--layerwise-offload-components text_encoder` (default `mxfp8`) | **20.27** | **160.0 s** | 20.6 s | 95,790 MB |
+| 1× RTX PRO 6000, same, per-channel `fp8` path (before this mapping) | 22.85 | 180.3 s | 20.7 s | 95,160 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch (default `mxfp8`) | 13.61 | 107.4 s | 10.6 s | 93,846 MB |
+| 2× RTX PRO 6000 Ulysses2, one PCIe switch, per-channel `fp8` | 14.97 | 118.1 s | 10.6 s | 94,700 MB |
+| 4× RTX PRO 6000 Ulysses4 (default `mxfp8`) | 7.98 | 63.0 s | 5.6 s | 82,178 MB |
+| 4× RTX PRO 6000 Ulysses4, per-channel `fp8` | 8.23 | 65.1 s | 5.6 s | 82,422 MB |
+| 8× RTX PRO 6000 Ulysses8 (default `mxfp8`) | 5.43 | 43.1 s | 3.5 s | 77,704 MB |
+| 8× RTX PRO 6000 Ulysses8, per-channel `fp8` | 5.47 | 43.4 s | 3.5 s | 77,236 MB |
+
+For comparison the same code on B200 measures 6.03 / 3.30 / 1.67 / 0.88 s/NFE
+at 1 / 2 / 4 / 8 cards (NVLink, 86% parallel efficiency at 8).
+
 ### H200 topology comparison
 
 The same four-card H200 host completed both lossless resident placements with
@@ -1553,9 +1706,11 @@ Ulysses2 was the fastest; TP4 used the least memory:
 | FSDP + Ulysses4 | 13.36 s | 57.01 GB |
 | TP4 + Ulysses1 | 13.86 s | 49.80 GB |
 
-### RTX 5090 capacity run
+### RTX 5090 capacity run (two cards)
 
-The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
+The single-card recipe is a different one — see *RTX 5090 single card, physical
+desktop* below; the twenty resident layers here are half a layer per GPU under
+TP2 and do not transfer to one card. The verified two-card RTX 5090 host used TP2 with layerwise offload. The full
 50-step, 1344×768, 5-second request completed in 559.67 seconds: 525.05
 seconds of denoising and 33.61 seconds of decoding, with a 26.3 GiB sampled
 peak per GPU.
@@ -1732,16 +1887,33 @@ Under that cap, Recipe A wins the whole request at every host size:
 Same GPU, same load window, unpruned bf16 checkpoints, outputs verified. All
 figures are anchored at 480P — activations grow with the pixel count, so at
 768P drop the resident DiT layers to 0 first, then `video_vae` to 24 if the
-decode still collides. And the host convention holds the weights in page
-cache; a physical 32 GB machine re-reads them from disk each step, so the
-page cache cannot hold the per-step weight sweep, so every step re-reads it
-from disk and the drive becomes the denoise clock: a real desktop 4090 with a
-990 Pro measured 38 s/step, reading 52.9 GB per step (faulted sequentially, so
-almost none of it shows in majflt — measure `read_bytes`, not major faults).
-Two things cut that read directly: resident DiT layers (~1 GB/step each — on a
-physically small host raise them as far as VRAM allows, the opposite of the
-capped-host guidance above), and more RAM (64 GB caches the sweep and returns
-to the quoted times). The
+decode still collides.
+
+One convention behind that table is the one a home machine does not share: the
+host sizes above are `psutil` patches on a 2 TB lab machine, so the kernel kept
+the whole checkpoint in page cache and nothing was read from disk. A physical
+host of that size re-reads the streamed weights every step, and what that costs
+is computable — `bytes per step = (50 - resident DiT layers - layers the host
+pin budget covered) x 1.23 GiB`. The courier overlaps that read with compute, so
+the drive stops being the denoise clock once its sequential rate exceeds those
+bytes divided by the card's step time. A 32 GB host covers roughly 13 layers,
+which puts a 24 GB card at ~38 GiB/step and a 12/16 GB card at ~46 GiB/step: a
+PCIe 4.0 NVMe (6–7 GiB/s) clears both, a PCIe 3.0 drive (~3.2 GiB/s) becomes the
+clock, and a SATA SSD is not usable for this model. Resident DiT layers remove
+1.23 GiB/step each, but only while the streamed set is larger than the pin
+budget — once the read fits under the step's compute time, more of them buy
+nothing and only cost VRAM.
+
+An earlier revision of this page recorded 38 s/step on a physical 4090 with a
+990 Pro, reading 52.9 GB per step — about 1.4 GB/s, and faulted sequentially, so
+almost none of it showed in `majflt` (measure `read_bytes`, not major faults).
+That rate was the old path, not the drive: the pinned-store pool rounded every
+block up to a power of two, so the pin budget over-committed and the machine had
+to run with pinning off, and the layers that stayed mapped faulted in 4 KiB at a
+time. Exact-size pinning and O_DIRECT reads through the courier removed both,
+and the physical 5090 run below shows the drive fully hidden behind compute. A
+4090 on a 32 GB host is derived to return to its compute wall (~8.5 s/step) on a
+PCIe 4.0 drive; that machine has not been re-measured. The
 VRAM axis holds too: capped at 16 GiB the same recipe wins ~250 vs 292–301 s,
 and at 24 GiB (with `--dit-layerwise-resident-layers 6` — measured at a
 22 GiB cap so a desktop's own allocations fit; a headless card can raise it
@@ -1758,7 +1930,9 @@ Stage by stage under the cap: text encoding is even (both stream the same
 48 GB Qwen3VL), the denoise leads at 32–48 GB hosts and sits within
 run-to-run variance of ComfyUI at 64 GB (162 vs 159 s), and the decode leads
 everywhere. Two ComfyUI notes that still matter: `--fast-disk` measured no
-faster than its default here, and stacking
+faster than its default on this lab host — though on a physical 60 GB desktop
+its default is OOM-killed while loading (55.6 GB of anonymous memory) and
+`--fast-disk` is what makes it run at all — and stacking
 `--novram --cache-none --disable-pinned-memory` made things strictly worse
 (69.1 GiB anonymous, 750 s requests) — the adaptive default is the right
 configuration on a small host.
@@ -1768,6 +1942,61 @@ The path ComfyUI ships for 12 GB cards uses
 i.e. an int8 DiT and an NVFP4 text encoder, and its pruned bf16 file is 40.2 GB
 against the unpruned 66.3 GB. Those are different weights, so it is not a
 like-for-like comparison with the recipes above.
+
+### RTX 5090 single card, physical desktop
+
+Every consumer figure above this point was measured with at least one axis
+simulated: a hard allocator cap standing in for VRAM, a `psutil` patch standing
+in for host RAM, and a lab machine whose page cache held the whole checkpoint.
+This run had none of that — an RTX 5090 (32 GB) in a Ryzen 9 9950X desktop with
+60 GB of RAM, an 8 GB swap file and a Samsung 9100 PRO on PCIe 5.0, on Ubuntu
+24.04. The workload matches the comparison above: FL2VA T2VA, 864×480, 124
+frames, 20 steps, cfg 1.0, euler_ancestral, sigma shift 12.0/3.0, same seeds and
+keyframes on both engines, unpruned bf16 weights on both sides.
+
+```bash 32 GB VRAM + 60 GB host, lossless
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder,vae \
+  --dit-layerwise-resident-layers 14 \
+  --layerwise-resident-layers video_vae=36 \
+  --warmup-resolutions 864x480 --warmup-num-frames 124
+```
+
+| | text encoding | denoise step | decode | request |
+| --- | ---: | ---: | ---: | ---: |
+| sglang | **4.2 s** | 5.14–5.17 s | **6.4 s** | **112.2 / 112.1 s** |
+| ComfyUI `--fast-disk --cache-none` | 11.3 s | 5.17–5.30 s | 7.2 s | 145.9 / 145.6 / 140.9 s |
+
+Three things a capped run cannot settle:
+
+**The denoise is at the card's compute wall, not the drive's.** The two engines
+are within noise of each other per step, and prefetch depth 2 and cuDNN SDPA
+each measured as no change. The 51.3 GiB the DiT reads from the drive per
+request is fully overlapped — across a whole request the compute thread waited
+0.9 s for the courier.
+
+**Host RAM decides how much traffic there is to hide.** At 60 GB the pin budget
+covers 34 of the 50 DiT layers, so only about two layers per step come off the
+disk. The 46 GiB text encoder is never pinned — streamed layers take the budget
+first — and is read whole, once per request, at the drive's sequential rate:
+that is the 4.2 s stage, against 12.1–12.9 s when the same bytes go through the
+page cache.
+
+**Neither engine's default command survives this machine.** ComfyUI's is
+OOM-killed during load (55.6 GB of anonymous memory) and needs `--fast-disk`;
+sglang's was too, until pinned stores were allocated at their exact size instead
+of the allocator's next power of two. Even now the automatic placement keeps no
+resident DiT layers and streams the VAE on every decode, so the flags above are
+what reach the numbers in the table.
+
+Two caveats to carry into your own machine. The run finished with its 8 GB swap
+file full, because the pin budget takes 95% of the memory available after
+loading and there is no smaller setting yet — on a machine that is also your
+desktop, expect that pressure and give the card more resident layers, since a
+resident layer is one the host no longer has to pin. And these are 480P figures:
+at 768P drop the resident DiT layers first, then `video_vae` to 24.
 
 ### RTX 4090 24 GB single-GPU run
 

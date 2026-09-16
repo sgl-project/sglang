@@ -73,11 +73,9 @@ with what the operator typed, not with what resolution decided.**
   `TokenizerManager.record_config_updates(source, **fields)`, a named wrapper
   over `get_context().override`. One process keeps one log: the request dumps
   ship `get_context().overrides_log()`, and `config_value(name)` /
-  `resolved_config_dict(base)` answer from the bags. The exposure ratchet
-  resolves the wrapper, so a field recorded through it joins the post-publish
-  override surface exactly like a direct `override` and needs the same ordering
-  judgment against any supplied-instance read of it
-  (`test_supplied_instance_exposure_ratchet.py`).
+  `resolved_config_dict(base)` answer from the bags. Fields recorded through
+  the wrapper follow the same ordering rules as a direct `override`: a later
+  read must observe the updated bag, not the startup record.
 - **`model_path` and `served_model_name` are answered off the manager.** Both are
   `NS` leaves and `override` accepts them, but the tokenizer-side weight reload
   records only `load_format` and writes the two path fields as `TokenizerManager`
@@ -154,8 +152,7 @@ bag to override at all.
   **retracted** — owner ruling (2026-08-15): a process holds at most one live
   config at a time (concurrent multi-Engine is unsupported; sequential rebuild
   stays legal, unit tests rely on it). Nothing in those files reads the instance
-  any more -- the exposure ratchet's pin set is empty, so the next such read is a
-  new entry that has to argue for itself. What
+  any more; review new instance reads against the raw-input contract. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
   `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
@@ -172,12 +169,9 @@ bag to override at all.
   attention pair and the encode-server `gpu_id` above are both this). The per-instance
   boundaries above are **not** exempt from this unless-clause (the multi-Engine
   exemption is retracted); each one gets its own disposition.
-  `test_supplied_instance_exposure_ratchet.py`
-  pins that set (empty today) — three spellings of the read: `server_args.field`,
-  literal-name `getattr(server_args, "field", default)`, and the parked form
-  (`self.x = server_args` in a method that takes the parameter, read as
-  `self.x.field` anywhere in the class) — and fails on a new one, so the
-  disposition gets picked when the read is written. Two shapes stay parameter-form on purpose: a helper the
+  Check direct attributes, `getattr`, and records stored on `self`; validate
+  the resolved value and any later overrides in behavior tests.
+  Two shapes stay parameter-form on purpose: a helper the
   *resolution pipeline* calls with a `resolved_view` (its parameter happens to be
   named `server_args`), and a factory whose contract is "build X from the record
   you are handed" (`create_kt_config_from_server_args`, `DllmConfig.from_server_args`).
@@ -402,12 +396,10 @@ through a view instead:
 - `resolved_view(server_args)` — snapshots the overlay when built, which is what
   a post-process pass wants: it reads the state at *its* slot.
 
-`test_resolution_reads_the_declarations` pins direct field reads at zero over the
-two scopes it can derive exactly (every `arg_groups` function taking a config,
-every `ServerArgs` handler the dispatcher reaches). Readers the pipeline calls
-from elsewhere (`ModelConfig`, the platform defaults, the spec-algo hook) have
-moved to the view as well — a field read there is the same bug, just one the
-derivation cannot enumerate.
+Resolution hooks and the helpers they call (`ModelConfig`, platform defaults,
+the spec-algo hook) must read through these views too. Keep coverage in
+`test_resolution_declarations.py`, `test_resolution_is_reproducible.py`, and
+`test_record_holds_the_raw_input.py` focused on the values callers observe.
 
 One consequence worth knowing: because the fields are the raw input, resolving a
 bare `dataclasses.replace` copy lands in the same place as the parent — the
