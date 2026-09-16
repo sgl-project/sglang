@@ -384,6 +384,11 @@ class TreeComponent(ABC):
         - Mamba: performs the copy-on-write into a per-request slot."""
         return result
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        """Constrain the combined effective cache length after every
+        component's `prepare_for_caching_req` truncation has been min'd."""
+        return cache_len
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
