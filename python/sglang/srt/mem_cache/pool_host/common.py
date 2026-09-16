@@ -141,21 +141,43 @@ def _clear_sticky_cuda_error() -> None:
         pass
 
 
+# Lower bound for chunk shrinking when no copy granularity is provided; keeps
+# the number of registration ranges bounded even for multi-GB host pools.
+_MIN_REGISTER_CHUNK_BYTES = 4 * 1024**2
+
+
 def _register_chunk_with_retry(
-    cudart, ptr: int, size: int, *, offset: int, total: int
+    cudart,
+    ptr: int,
+    size: int,
+    *,
+    offset: int,
+    total: int,
+    granularity: int | None,
 ) -> int:
-    """Register [ptr, ptr + size), halving the chunk on transient failures.
+    """Register [ptr, ptr + size), shrinking the chunk on transient failures.
 
     Single-shot cudaHostRegister calls of tens of GB were observed to fail
     intermittently with cudaErrorInvalidValue in processes under heavy GPU
     memory usage, while smaller registrations succeed. Returns the chunk size
-    that was actually registered. Raises RuntimeError when even a 4 KiB chunk
-    cannot be registered.
+    that was actually registered.
+
+    When a copy granularity is given, chunks only shrink in whole granularity
+    units, so every non-final boundary stays a multiple of the granularity
+    and a logical copy unit never spans two registrations (the failure mode
+    chunked registration was aligned for). Without a granularity, chunks
+    halve down to _MIN_REGISTER_CHUNK_BYTES; such buffers do not issue
+    page_first batch copies, so page-aligned splits are safe. Raises
+    RuntimeError when the smallest allowed chunk cannot be registered either.
     """
     orig_size = size
+    floor = granularity if granularity is not None else _MIN_REGISTER_CHUNK_BYTES
     rc_obj = cudart.cudaHostRegister(ptr, size, 0)
-    while int(rc_obj) != 0 and size > 4096:
-        size //= 2
+    while int(rc_obj) != 0 and size > floor:
+        if granularity is not None:
+            size = max(size // granularity // 2, 1) * granularity
+        else:
+            size = max(size // 2, floor)
         rc_obj = cudart.cudaHostRegister(ptr, size, 0)
     if int(rc_obj) == 0:
         if size < orig_size:
@@ -172,7 +194,7 @@ def _register_chunk_with_retry(
         return size
     _clear_sticky_cuda_error()
     raise RuntimeError(
-        f"cudaHostRegister failed for every chunk size down to 4 KiB "
+        f"cudaHostRegister failed for every chunk size down to {floor} bytes "
         f"(last rc={int(rc_obj)}, {cudart.cudaGetErrorString(rc_obj)}) "
         f"at offset={offset} size={orig_size} ptr={ptr:#x} (total={total}); "
         f"host buffer is not pinned and device transfers may silently return "
@@ -219,7 +241,12 @@ def _cuda_host_register(
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
             size = _register_chunk_with_retry(
-                cudart, ptr, size, offset=offset, total=total
+                cudart,
+                ptr,
+                size,
+                offset=offset,
+                total=total,
+                granularity=registration_granularity_bytes,
             )
             # Once a chunk had to be shrunk, keep the smaller size for the
             # remaining chunks instead of failing over and over again.
