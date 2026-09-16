@@ -9,30 +9,20 @@
 
 // Tile-scheduler metadata for FlashMLA's split-KV decode.
 //
-// FlashMLA computes this itself when it is handed no metadata, in a <<<1, 32>>>
-// kernel whose whole partition loop runs on thread 0 and stores each 32-byte
-// entry straight to global memory.  The loop is over `num_sm_parts`, which is
-// `num_sms / s_q`, so on GB300 a BS=1 draft step walks 152 iterations at global
-// store latency: 25.1 us measured, against 5.7 us for the 25 parts of a 6-row
-// verify.  Inside a cuda graph it is fully exposed on the critical path, and it
-// cannot be hoisted out because the schedule depends on the per-request
-// `topk_length` of the step being replayed.
+// FlashMLA computes this itself when handed no metadata, in a <<<1, 32>>> kernel
+// whose whole partition walk runs on thread 0 and stores each 32-byte entry
+// straight to global memory.  Inside a cuda graph that sits fully exposed on the
+// critical path, and it cannot be hoisted out because the schedule depends on
+// the per-request `topk_length` of the step being replayed.
 //
-// The walk itself is sequential -- each part starts where the last one stopped --
-// and moving its stores off global memory barely helps, because what it actually
-// costs is a chain of dependent shared loads run by one thread with no ILP to
-// hide them.  Two things fix that without changing a single output:
+// This kernel produces the same output with two changes to the walk:
 //
 //   * the request being consumed changes only `batch_size` times over the whole
 //     walk, so its three values live in registers and are reloaded on that event
 //     rather than re-read from shared memory once per partition;
 //   * the walk stops as soon as the last request is consumed.  Every partition
 //     after that one describes an empty range, all of them identical, and the
-//     whole block fills them in parallel.  At BS=1 that is most of them: 152
-//     partitions over 5 or 6 query rows leaves fewer than 50 doing any work.
-//
-// Feed the result to FlashMLA as the cached `tile_scheduler_metadata` /
-// `num_splits` and it skips its own kernel.
+//     whole block fills them in parallel.
 //
 // The shared-memory layout matches FlashMLA's exactly.  It has to: when the
 // walk finishes early it reads `first_block_idx_shared[batch_size]`, one past

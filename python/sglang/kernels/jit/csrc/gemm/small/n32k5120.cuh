@@ -39,7 +39,6 @@ struct N32K5120Trait {
   static_assert(M_SPLIT >= 1 && M_SPLIT <= kMaxMSplit, "M_SPLIT must be in [1, 8]");
   static constexpr uint32_t kVecSize = device::kMaxVecBytes / sizeof(bf16_t);
   // Ten warps preserve tiny_gemm's mapping: thread t owns [16t, 16t + 16).
-  // B200 measurements found no latency benefit from a 160-thread alternative.
   static constexpr uint32_t kBlockSize = 320;
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
   static constexpr uint32_t kNumVecs = K / (kVecSize * kBlockSize);  // vectors per thread
