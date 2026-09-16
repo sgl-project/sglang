@@ -10,7 +10,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa, is_kimi_k3
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -387,16 +387,7 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        # Read by decide_needs_cpu_seq_lens (OR over the spec-v2 attn backends)
-        # and by EagleWorkerV2 to gate the post-verify seq_lens D2H. DSA
-        # attention (npu_sparse_flash_attention / npu_lightning_indexer)
-        # consumes per-request KV lengths from the device-side seq_lens
-        # buffer, so graph-replay and eager metadata run without the host
-        # mirror. V4 keeps the legacy path: its graph-replay metadata asserts
-        # seq_lens_cpu (DeepseekV4AscendAttnBackend). Hybrid-SWA models stay
-        # on the legacy path because their replay metadata is sized from the
-        # host mirror (see _apply_cuda_graph_metadata).
-        self.needs_cpu_seq_lens = False
+        self.needs_cpu_seq_lens = envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -526,10 +517,8 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
                 self.device
             ).int()
-        if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.seq_lens_cpu is not None and self.needs_cpu_seq_lens:
             self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
-        else:
-            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens.int()
 
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
@@ -2295,13 +2284,12 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.num_token_non_padded_cpu]
-            seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
-            if seq_lens_cpu_int is None:
+            if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            elif seq_lens_cpu_int.device.type == "cpu":
-                actual_seq_lengths_kv = seq_lens_cpu_int.int().tolist()
             else:
-                actual_seq_lengths_kv = seq_lens_cpu_int.int()
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
