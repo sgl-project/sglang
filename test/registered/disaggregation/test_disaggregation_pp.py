@@ -48,7 +48,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--disable-overlap-schedule",
             "--enable-dynamic-chunking",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -69,7 +69,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--base-gpu-id",
             "4",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 6))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -125,7 +125,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "2",
             "--disable-overlap-schedule",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -148,7 +148,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--base-gpu-id",
             "4",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
