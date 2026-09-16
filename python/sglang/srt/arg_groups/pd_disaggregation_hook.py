@@ -119,7 +119,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if cfg.disaggregation_decode_extra_slots is None:
             extra_slots = 0
             if cfg.max_running_requests is not None:
-                per_worker = cfg.max_running_requests // max(1, cfg.dp_size)
+                per_worker = max(1, cfg.max_running_requests // max(1, cfg.dp_size))
                 if per_worker <= 32:
                     extra_slots = per_worker * 2
             declare_resolution(
