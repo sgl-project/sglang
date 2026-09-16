@@ -25,9 +25,6 @@ if str(PYTHON_DIR) not in sys.path:
 
 from sglang.srt.layers.moe.dwdp.dwdp_manager import DwdpManager
 from sglang.test.test_utils import CustomTestCase
-from sglang.test_internal.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=30, num_gpus=1)
 
 
 def _mn_major(E, n, sk, seed=0):

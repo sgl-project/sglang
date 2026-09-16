@@ -18,9 +18,6 @@ import unittest
 from safetensors.torch import save_file
 
 from sglang.test.test_utils import CustomTestCase
-from sglang.test_internal.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=60, num_gpus=1)
 
 import torch
 
