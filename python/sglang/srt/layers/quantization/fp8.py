@@ -1908,14 +1908,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_scale=layer.w2_weight_scale_inv,
                     input_scale=None,
                 )
-                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale_inv = Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale_inv = Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
+                copy_or_rebind_param(layer, "w13_weight", w13_weight)
+                copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_weight_scale)
+                copy_or_rebind_param(layer, "w2_weight", w2_weight)
+                copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_weight_scale)
                 layer.w13_input_scale = None
                 layer.w2_input_scale = None
             runner_is_aiter = (
@@ -1959,16 +1955,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 weight_scale=layer.w2_weight_scale_inv,
                 input_scale=None,
             )
-            # Reset the parameter
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w13_weight_scale_inv = torch.nn.Parameter(
-                w13_weight_scale, requires_grad=False
-            )
+            # Reset the parameter, keeping the Parameter objects so weight_loader
+            # (set by set_weight_attrs at creation) survives the fnuz normalization.
+            copy_or_rebind_param(layer, "w13_weight", w13_weight)
+            copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_weight_scale)
             layer.w13_input_scale = None
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-            layer.w2_weight_scale_inv = torch.nn.Parameter(
-                w2_weight_scale, requires_grad=False
-            )
+            copy_or_rebind_param(layer, "w2_weight", w2_weight)
+            copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_weight_scale)
             layer.w2_input_scale = None
             if _use_aiter:
                 layer.w13_weight.data = shuffle_weight(
@@ -2116,10 +2109,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         w13_q, w13_s = convert(layer.w13_weight.data, layer.w13_weight_scale_inv.data)
         w2_q, w2_s = convert(layer.w2_weight.data, layer.w2_weight_scale_inv.data)
-        layer.w13_weight = Parameter(w13_q, requires_grad=False)
-        layer.w2_weight = Parameter(w2_q, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
-        layer.w2_weight_scale_inv = Parameter(w2_s, requires_grad=False)
+        copy_or_rebind_param(layer, "w13_weight", w13_q)
+        copy_or_rebind_param(layer, "w2_weight", w2_q)
+        copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_s)
+        copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_s)
+        # The scales are block-128 float32 now, not UE8M0; the flag set at weight
+        # creation is stale and would survive because the Parameter object does.
+        layer.w13_weight_scale_inv.format_ue8m0 = False
+        layer.w2_weight_scale_inv.format_ue8m0 = False
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
