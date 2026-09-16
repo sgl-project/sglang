@@ -413,6 +413,19 @@ pub struct CacheAwareConfig {
     /// Raise it when the fleet's tree is large enough that one transfer +
     /// decode of the snapshot body no longer fits under the derived value.
     pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep proved siblings were present and
+    /// their tree could not be pulled, instead of serving cache-blind.
+    ///
+    /// Off by default. A NotReady pod is absent from the Service, so with this
+    /// on a failed seed STALLS a rolling update — the previous generation keeps
+    /// serving — rather than completing it with replicas that route
+    /// cache-blind and scatter the prefixes the warm replicas were keeping
+    /// consolidated. Only a `TimedOut` sweep over a non-empty candidate set
+    /// counts; a first deploy and a cold fleet are unaffected, and the hold is
+    /// bounded at three times `bootstrap_timeout_ms` so a simultaneous
+    /// fleet-wide restart degrades to a delay rather than an outage with no
+    /// exit.
+    pub bootstrap_seed_required: bool,
 }
 
 impl Default for CacheAwareConfig {
@@ -422,6 +435,7 @@ impl Default for CacheAwareConfig {
             kv_indexer_endpoint: None,
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
         }
     }
 }
