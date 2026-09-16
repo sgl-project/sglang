@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 from torch import nn
 
 import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_module
@@ -560,12 +561,75 @@ def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
     assert vision_model.embeddings.position_embedding.tp_size == 1
     assert layer.self_attn.tp_size == 1
     assert layer.self_attn.qkv_backend.flatten_batch is False
-    assert layer.mlp.fc1.tp_size == 1
-    assert layer.mlp.fc2.tp_size == 1
-    assert isinstance(layer.mlp.act, nn.GELU)
-    assert layer.mlp.act.approximate == "tanh"
+    assert layer.ffn.fc1.tp_size == 1
+    assert layer.ffn.fc2.tp_size == 1
+    assert isinstance(layer.ffn.act, nn.GELU)
+    assert layer.ffn.act.approximate == "tanh"
     assert model.device == vision_model.embeddings.patch_embedding.weight.device
     assert model.layer_names == ["vision_model.encoder.layers"]
+
+
+@pytest.mark.parametrize("checkpoint_member", ["mlp", "ffn"])
+def test_pi05_loads_siglip_ffn_and_preserves_language_mlp(tmp_path, checkpoint_member):
+    config = SimpleNamespace(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        layer_norm_eps=1e-6,
+        image_size=16,
+        patch_size=2,
+        num_channels=3,
+        hidden_act="gelu_pytorch_tanh",
+    )
+    with get_context().override_server_args():
+        vision = Pi05SiglipVisionModel(
+            config,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            qkv_backend="sdpa",
+            flatten_batch=False,
+            use_data_parallel=True,
+        )
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.runtime_role = "all"
+    model.core_model = nn.Module()
+    root = nn.Module()
+    model.core_model.paligemma_with_expert = root
+    root.paligemma = nn.Module()
+    root.paligemma.model = nn.Module()
+    root.paligemma.model.vision_tower = vision
+    # These Pi05-owned dense modules retain their original registration.
+    for parent, member in (
+        (root.paligemma.model, "language_model"),
+        (root, "gemma_expert"),
+    ):
+        decoder = nn.Module()
+        layer = nn.Module()
+        layer.mlp = nn.Module()
+        layer.mlp.gate_proj = nn.Linear(8, 16, bias=False)
+        decoder.layers = nn.ModuleList([layer])
+        parent.add_module(member, decoder)
+
+    expected = {}
+    checkpoint = {}
+    for index, (name, tensor) in enumerate(model.core_model.state_dict().items()):
+        value = torch.full_like(tensor, index + 1)
+        expected[name] = value
+        source = name.replace(".paligemma.model.", ".paligemma.")
+        if ".vision_tower." in source:
+            source = source.replace(".ffn.", f".{checkpoint_member}.")
+        checkpoint[source] = value
+        tensor.zero_()
+    path = tmp_path / "model.safetensors"
+    save_file(checkpoint, str(path))
+    model.manifest = Pi05CheckpointManifest(
+        model_path=str(tmp_path), safetensor_files=[str(path)]
+    )
+    model._load_weights()
+    for name, tensor in model.core_model.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
 
 
 def test_pi05_siglip_checkpoint_names_map_to_srt_layers():

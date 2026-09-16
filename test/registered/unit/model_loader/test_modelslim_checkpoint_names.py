@@ -2,20 +2,30 @@
 
 import copy
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from torch import nn
 
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.modelslim.modelslim import (
     ModelSlimConfig,
     ModelSlimFusedMoEMethod,
     ModelSlimLinearMethod,
 )
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimW8A8Int8
+from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimW4A4Int4,
+    ModelSlimW8A8Int8,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -23,6 +33,78 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestModelSlimCheckpointNames(unittest.TestCase):
+    def test_qwen3_mixed_precision_checkpoint_offsets(self):
+        quant = ModelSlimConfig(
+            {
+                "model.layers.0.mlp.gate_proj.weight": "W4A4_DYNAMIC",
+                "model.layers.0.mlp.up_proj.weight": "W4A4_DYNAMIC",
+                "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC",
+                "packed_modules_mapping": {
+                    "model": {"gate_up_proj": ["gate_proj", "up_proj"]}
+                },
+            }
+        )
+        quant.apply_weight_name_mapper(Qwen3ForCausalLM.hf_to_sglang_mapper)
+        ffn = nn.Module()
+        ffn.gate_up_proj = MergedColumnParallelLinear(
+            2,
+            [4, 4],
+            bias=False,
+            quant_config=quant,
+            prefix="model.layers.0.ffn.gate_up_proj",
+            params_dtype=torch.bfloat16,
+            tp_rank=0,
+            tp_size=1,
+        )
+        ffn.down_proj = RowParallelLinear(
+            4,
+            2,
+            bias=False,
+            quant_config=quant,
+            prefix="model.layers.0.ffn.down_proj",
+            params_dtype=torch.bfloat16,
+            tp_rank=0,
+            tp_size=1,
+        )
+        self.assertIsInstance(ffn.gate_up_proj.scheme, ModelSlimW4A4Int4)
+        self.assertIsInstance(ffn.down_proj.scheme, ModelSlimW8A8Int8)
+        self.assertTrue(ffn.down_proj.scheme.is_dynamic)
+        for projection in (ffn.gate_up_proj, ffn.down_proj):
+            self.assertEqual(projection.weight.dtype, torch.int8)
+            self.assertIn("weight_offset", dict(projection.named_parameters()))
+
+        model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(tie_word_embeddings=False)
+        model.model = nn.Module()
+        model.model.start_layer, model.model.end_layer = 0, 1
+        layer = nn.Module()
+        layer.ffn = ffn
+        model.model.layers = nn.ModuleList([layer])
+        weights = []
+        expected = {}
+        for parameter in ("weight_scale", "weight_offset"):
+            fused = getattr(ffn.gate_up_proj, parameter)
+            down = getattr(ffn.down_proj, parameter)
+            with torch.no_grad():
+                fused.zero_()
+                down.zero_()
+            gate_value = torch.full_like(fused[:4], 1)
+            up_value = torch.full_like(fused[4:], 2)
+            down_value = torch.full_like(down, 3)
+            weights.extend(
+                [
+                    (f"model.layers.0.mlp.gate_proj.{parameter}", gate_value),
+                    (f"model.layers.0.mlp.up_proj.{parameter}", up_value),
+                    (f"model.layers.0.mlp.down_proj.{parameter}", down_value),
+                ]
+            )
+            expected[f"gate_up_proj.{parameter}"] = torch.cat((gate_value, up_value))
+            expected[f"down_proj.{parameter}"] = down_value
+        model.load_weights(weights)
+        for name, value in expected.items():
+            torch.testing.assert_close(dict(ffn.named_parameters())[name], value)
+
     def test_checkpoint_schemes_use_registered_ffn_names(self):
         for model_cls in (DeepseekV2ForCausalLM, Qwen3MoeForCausalLM):
             for checkpoint_member in ("mlp", "ffn"):

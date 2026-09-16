@@ -585,6 +585,9 @@ class Pi05PolicyModel(nn.Module):
         if key == "paligemma_with_expert.gemma_expert.lm_head.weight":
             return []
 
+        if ".vision_tower." in key:
+            key = key.replace(".mlp.", ".ffn.")
+
         candidates = [key]
         replacements = {
             ".vision_tower.vision_model.": ".vision_tower.",
