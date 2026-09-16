@@ -147,7 +147,7 @@ pub enum RequestOutcome {
 }
 
 impl RequestOutcome {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
             Self::Error => "error",
