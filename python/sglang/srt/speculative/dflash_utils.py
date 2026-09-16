@@ -424,7 +424,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
-    if sliding_window is None and is_nemotron_35_draft_config(config):
+    if sliding_window is None:
         sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
@@ -433,6 +433,27 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 
     # HF sliding windows include the current token; SGLang stores window_left.
     return int(sliding_window) - 1
+
+
+def get_dflash_attention_causal_override(config: Any) -> Optional[bool]:
+    """Return an explicit DFlash causality override without changing defaults."""
+    causal = _get_dflash_config(config).get("causal", None)
+    if causal is None:
+        return None
+    if isinstance(causal, bool):
+        return causal
+    if isinstance(causal, Integral) and causal in (0, 1):
+        return bool(causal)
+    if isinstance(causal, str):
+        normalized = causal.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError(
+        "DFLASH dflash_config.causal must be a boolean or a boolean-like "
+        f"value, got {causal!r}."
+    )
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
