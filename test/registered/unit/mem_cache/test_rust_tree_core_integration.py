@@ -1,7 +1,6 @@
 """Integration tests driving the real compiled Rust mem_cache extension."""
 
 import hashlib
-import shutil
 import sys
 from array import array
 from types import SimpleNamespace
@@ -12,9 +11,6 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=17, suite="base-a-test-cpu")
-
-if shutil.which("cargo") is None:
-    pytest.skip("the rust backend builds with cargo", allow_module_level=True)
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -100,6 +96,8 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
         last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
         swa_branch_inserted=step.result.swa_branch_inserted,
+        rotation_tail_declined=step.result.rotation_tail_declined,
+        adopted_ranges=step.result.adopted_ranges,
         cache_actions=actions,
     )
 
@@ -151,6 +149,90 @@ def test_root_node_handle_is_namespace_independent():
         MatchPrefixParams(key=RadixKey(array("q", [9]), extra_key="chat"))
     )
     assert missed.best_match_node == root
+
+
+@pytest.mark.parametrize("is_eagle", [False, True])
+def test_rotation_decline_precedes_host_restore_and_respects_namespaces(is_eagle):
+    core = _tree_core(page_size=2, is_eagle=is_eagle, enable_kv_cache_events=True)
+    core.set_hicache_enabled()
+    tokens = array("q", range(9 if is_eagle else 8))
+    key = RadixKey(tokens, extra_key="adapter", cache_salt="tenant-a")
+    inserted = _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18),
+            rotation_base=1,
+        ),
+    )
+    leaf = inserted.last_device_node
+    core.commit_backup(leaf, torch.arange(100, 108), {})
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    core.take_events()
+
+    step = core.begin_insert(
+        InsertParams(
+            key=key,
+            value=torch.arange(20, 28),
+            rotation_base=3,
+            track_adopted_ranges=True,
+        )
+    )
+    assert step.result is not None
+    assert step.result.rotation_tail_declined
+    assert step.result.prefix_len == 8
+    assert step.result.last_device_node == leaf
+    assert step.result.adopted_ranges == {}
+    assert step.actions == []
+    assert not core.has_ongoing_insert()
+    assert core.end_insert() == []
+    assert core.is_full_device_evicted(leaf)
+    assert core.rotation_base_of(leaf) == 1
+    assert core.take_events() == []
+
+    other = _pump_insert(
+        core,
+        InsertParams(
+            key=RadixKey(tokens, extra_key="adapter", cache_salt="tenant-b"),
+            value=torch.arange(20, 28),
+            rotation_base=3,
+        ),
+    )
+    assert not other.rotation_tail_declined
+    assert core.rotation_base_of(other.last_device_node) == 3
+    assert core.rotation_base_of(core.root_node_handle()) is None
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize(
+    "config,evict_recent",
+    [
+        (None, True),
+        ({"protected_threshold": 4}, False),
+        ({"protected_threshold": 0}, False),
+    ],
+)
+def test_slru_config_changes_which_leaf_is_evicted(config, evict_recent):
+    core = _tree_core(eviction_policy="SLRU", eviction_policy_config=config)
+    for _ in range(3):
+        old = _insert(core, [1, 2], [10, 11]).last_device_node
+    recent = _insert(core, [3, 4], [12, 13]).last_device_node
+
+    core.evict_device_start(ComponentType.FULL, 2)
+    try:
+        step = core.evict_device_next_node(ComponentType.FULL, {})
+        assert step.node_id == (recent if evict_recent else old)
+    finally:
+        core.evict_device_end(ComponentType.FULL)
+
+
+@pytest.mark.parametrize(
+    "policy,config",
+    [("lru", {"protected_threshold": 4}), ("slru", {"unknown_option": 4})],
+)
+def test_eviction_config_rejects_unknown_constructor_options(policy, config):
+    with pytest.raises(TypeError):
+        _tree_core(eviction_policy=policy, eviction_policy_config=config)
 
 
 def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
@@ -927,6 +1009,63 @@ def test_drive_host_eviction_frees_the_demoted_leaf():
     core.sanity_check([], [])
 
 
+def test_host_duplicate_reclaim_override_preserves_normal_host_eviction():
+    core = _tree_core()
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    duplicate = _insert(core, [1], [10]).last_device_node
+    core.commit_backup(duplicate, torch.tensor([100], dtype=torch.int64), {})
+    core.insert_host(
+        core.root_node_handle(),
+        _key([2]),
+        torch.tensor([200], dtype=torch.int64),
+        ["h0"],
+    )
+
+    host_frees = {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(True):
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, host_frees
+        )
+    assert torch.cat(host_frees[ComponentType.FULL]).tolist() == [200]
+    assert core.is_backuped(duplicate)
+    core.sanity_check([], [])
+
+    # Read the override on every eviction call, including after construction.
+    host_frees = {}
+    with envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.override(False):
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, host_frees
+        )
+    assert torch.cat(host_frees[ComponentType.FULL]).tolist() == [100]
+    assert not core.is_backuped(duplicate)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backed_up", [False, True])
+def test_device_eviction_counts_only_full_tokens_without_a_host_copy(backed_up):
+    core = _mamba_tree_core()
+    core.set_hicache_enabled()
+    leaf = _mamba_insert(core, [1, 2, 3], [10, 11, 12], 7).last_device_node
+    if backed_up:
+        core.commit_backup(leaf, torch.tensor([100, 101, 102]), {})
+
+    step = core.evict_device_leaf(leaf, is_write_back=False)
+    unbacked_tokens = step.unbacked_tokens
+    tracker = {}
+    _accumulate_step(step, tracker, {}, {})
+    assert tracker == {ComponentType.FULL: 3, ComponentType.MAMBA: 1}
+    assert unbacked_tokens == (0 if backed_up else 3)
+
+    # Counters belong to a single step, never to the next eviction walk.
+    core.evict_device_start(ComponentType.FULL, 1)
+    step = core.evict_device_next_node(ComponentType.FULL, {})
+    assert step.unbacked_tokens == 0
+    _accumulate_step(step, {}, {}, {})
+    core.evict_device_end(ComponentType.FULL)
+    core.sanity_check([], [])
+
+
 def test_events_disabled_take_events_is_empty():
     core = _tree_core()
     _insert(core, [1, 2], [10, 11])
@@ -1490,6 +1629,110 @@ def test_swa_load_back_missing_value_raises_assertion_error():
         core.build_load_back_spec(node)
 
 
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_bigram):
+    core = _swa_tree_core(page_size=page_size, is_eagle=is_bigram)
+    key = RadixKey(
+        array("q", range(8 + is_bigram)),
+        extra_key="adapter-a",
+        cache_salt="tenant-a",
+        is_bigram=is_bigram,
+    )
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 8)]
+    values = torch.arange(50, 54, dtype=torch.int64)
+    assert core.attach_swa_window(key, 2, 6, values) == []
+    values.fill_(-1)
+
+    # Slicing and namespace conversion must retain logical bigram positions.
+    full_values = []
+    for end in (2, 6, 8):
+        _, node, _ = core.match_full_device_prefix(key[:end])
+        full_values.extend(
+            core.get_component_device_value(node, ComponentType.FULL).tolist()
+        )
+        swa = core.get_component_device_value(node, ComponentType.SWA)
+        if end == 6:
+            assert swa.tolist() == [50, 51, 52, 53]
+        else:
+            assert swa is None
+    assert full_values == list(range(10, 18))
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
+    assert core.swa_tombstone_ranges(key, 1, 7) == [(1, 2), (6, 7)]
+    for extra_key, cache_salt in (("adapter-b", "tenant-a"), ("adapter-a", "tenant-b")):
+        other_key = RadixKey(
+            key.token_ids,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            is_bigram=is_bigram,
+        )
+        assert core.swa_tombstone_ranges(other_key, 0, 8) == []
+    assert core.full_evictable_size() == 8
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
+def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
+    core = _swa_tree_core()
+    core.set_hicache_enabled()
+    key = _key(list(range(8)))
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    _, leaf, _ = core.match_full_device_prefix(key)
+    receipt = core.inc_lock_ref(leaf)
+    core.mark_write_through_pending([leaf], ack_id=leaf)
+    actions = core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    assert len(actions) == 2
+    for action in actions:
+        assert isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        assert action.ack_id == leaf
+        assert action.old_node_id == leaf
+        assert action.new_child_node_id == leaf
+    assert actions[0].new_node_id != actions[1].new_node_id
+    assert core.swa_protected_size() == 4
+    assert core.swa_evictable_size() == 0
+    core.finish_write_through([action.new_node_id for action in actions] + [leaf], leaf)
+    core.dec_lock_ref(leaf, receipt.to_dec_params())
+    assert core.swa_protected_size() == 0
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
+def test_swa_window_repair_rejects_invalid_publication_without_partial_changes():
+    core = _swa_tree_core()
+    key = _key(list(range(8)))
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    with pytest.raises(AssertionError, match="over live SWA"):
+        core.attach_swa_window(key, 0, 6, torch.arange(60, 66))
+    with pytest.raises(AssertionError, match="int64"):
+        core.attach_swa_window(key, 0, 2, torch.zeros(2, dtype=torch.int32))
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
 def test_swa_straddling_insert_crosses_the_boundary_actions():
     core = _swa_tree_core(window=8)
     _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
@@ -1695,6 +1938,7 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
     assert step.node_id is None
     assert step.made_progress
+    assert step.unbacked_tokens == 0  # Only an auxiliary state was dropped.
     _accumulate_step(step, tracker, device_frees, host_frees)
 
     step = core.evict_device_next_node(ComponentType.MAMBA, tracker)

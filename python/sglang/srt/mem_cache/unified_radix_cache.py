@@ -73,7 +73,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    create_tree_core,
+    resolve_tree_core_backend,
+)
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -203,7 +206,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+        self._tree_core_backend = resolve_tree_core_backend(
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), params
+        )
         self.tree_core = create_tree_core(
             name=self._tree_core_backend,
             params=params,
@@ -889,8 +894,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
-            isinstance(self.tree_core, UnifiedTreeCore)
-            and self.host_memory_mode == "cache"
+            self.host_memory_mode == "cache"
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )

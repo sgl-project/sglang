@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     StorageMedium,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -54,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
+from sglang.srt.mem_cache.utils import get_eviction_strategy
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 
 if TYPE_CHECKING:
@@ -224,6 +226,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
             mamba_exist=step.result.mamba_exist,
             swa_branch_inserted=step.result.swa_branch_inserted,
             host_insert_dropped=step.result.host_insert_dropped,
+            rotation_tail_declined=step.result.rotation_tail_declined,
             adopted_ranges=(
                 {
                     ComponentType(component_type): list(ranges)
@@ -290,6 +293,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     """A TreeCore backed by the Rust extension binding."""
 
     _bindings = bindings
+    supports_rotation_base = True
 
     def __init__(self, params: CacheInitParams):
         assert params.tree_components is not None
@@ -317,12 +321,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support component_registry_override"
             )
-        # The Rust core builds its own eviction strategy from the policy name
-        # alone, so a config would be dropped rather than applied.
-        if params.eviction_policy_config:
-            raise ValueError(
-                "Rust TreeCore does not support --radix-eviction-policy-config"
-            )
+        # Validate the same constructor options as Python before passing the
+        # SLRU threshold to the native strategy.
+        eviction_strategy = get_eviction_strategy(
+            params.eviction_policy, params.eviction_policy_config
+        )
         if ComponentType.SWA in self.tree_components and (
             params.sliding_window_size is None or params.sliding_window_size <= 0
         ):
@@ -355,6 +358,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
                 eviction_policy=params.eviction_policy,
+                slru_protected_threshold=getattr(
+                    eviction_strategy, "protected_threshold", 2
+                ),
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
@@ -408,9 +414,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def swa_tombstone_ranges(
         self, key: RadixKey, start: int, end: int
     ) -> list[tuple[int, int]]:
-        raise NotImplementedError(
-            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+        return self._binding.swa_tombstone_ranges(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            ),
+            start,
+            end,
         )
 
     def attach_swa_window(
@@ -419,10 +430,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-    ) -> list:
-        raise NotImplementedError(
-            "attach_swa_window: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+    ) -> list[CacheAction | ComponentAction]:
+        return _cache_actions_from_tagged(
+            self._binding.attach_swa_window(
+                self._bindings.MatchParamsBinding(
+                    key=_radix_key_buffer(key),
+                    extra_key=key.extra_key,
+                    cache_salt=key.cache_salt,
+                ),
+                window_start,
+                window_end,
+                swa_values,
+            )
         )
 
     def inc_lock_ref(
@@ -477,6 +496,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
             made_progress=binding_result.made_progress,
+            unbacked_tokens=binding_result.unbacked_tokens,
         )
         return _fill_evict_result(binding_result, result)
 
@@ -490,7 +510,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
-            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None
+            unbacked_tokens=binding_result.unbacked_tokens,
+            backup_kv=_cache_action_from_tagged(backup) if backup is not None else None,
         )
         return _fill_evict_result(binding_result, result)
 
@@ -625,6 +646,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 chunked=params.chunked,
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
+                rotation_base=params.rotation_base,
             )
         )
         return _insert_step_from_binding(step)
@@ -642,7 +664,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         binding_result = self._binding.drive_host_eviction(
-            int(component_type), num_tokens
+            int(component_type),
+            num_tokens,
+            envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
         return _fill_evict_result(binding_result, DriveHostEvictionResult())
 
@@ -870,6 +894,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         return self._binding.root_node_handle(extra_key)
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        return self._binding.rotation_base_of(node_id)
 
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return self._binding.dfs_weight_order(list(node_ids))

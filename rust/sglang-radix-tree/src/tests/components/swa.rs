@@ -4,6 +4,294 @@ use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_tree_core::CacheInitParams;
 
 #[test]
+fn swa_window_ranges_coalesce_clip_and_stop_only_without_full() {
+    let mut tc = swa_core(8, 1);
+    let nodes: [_; 6] = chain(&mut tc);
+    let key = vec![1, 2, 3, 4, 5, 6];
+    for node in nodes {
+        tc.arena
+            .set_device_value(node, FULL, Tensor::from_slice(&[10i64]));
+    }
+    set_swa_device(&mut tc, nodes[2]);
+    set_swa_device(&mut tc, nodes[5]);
+    set_swa_host(&mut tc, nodes[1]);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 1, 6)
+            .unwrap(),
+        vec![(1, 2), (3, 5)]
+    );
+    let before = tc.arena.node(nodes[0]).last_access_counter;
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 5)
+            .unwrap(),
+        vec![(0, 2), (3, 5)]
+    );
+    assert_eq!(tc.arena.node(nodes[0]).last_access_counter, before);
+    assert_eq!(tc.arena.len(), 7);
+    let _ = tc.arena.take_device_value(nodes[4], FULL);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 6)
+            .unwrap(),
+        vec![(0, 2), (3, 4)]
+    );
+    tc.arena
+        .set_host_value(nodes[4], FULL, Tensor::from_slice(&[10i64]));
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 6)
+            .unwrap(),
+        vec![(0, 2), (3, 5)]
+    );
+    assert!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 2, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        tc.swa_tombstone_ranges(&vec![9], Default::default(), 0, 1)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn swa_window_attach_splits_both_edges_preserving_full_and_pending_actions() {
+    let mut tc = swa_core(8, 2);
+    let key = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    tc.insert(&insert_params_swa(
+        &key,
+        &[10, 11, 12, 13, 14, 15, 16, 17],
+        0,
+        8,
+    ));
+    let leaf = child_of(&tc, tc.arena.root(), &[1, 2]);
+    let leaf_id = tc.arena.node(leaf).id;
+    tc.arena.node_mut(leaf).write_through_pending_id = Some(91);
+    tc.arena.node_mut(leaf).load_back_pending_id = Some(92);
+    tc.arena.node_mut(leaf).rotation_base = Some(7);
+    tc.arena.node_mut(leaf).external_cache_stored = true;
+    let mut values = Tensor::from_slice(&[50i64, 51, 52, 53]);
+    let actions = tc
+        .attach_swa_window(&key, Default::default(), 2, 6, &values)
+        .unwrap();
+    assert_eq!(actions.len(), 2);
+    for action in &actions {
+        assert!(
+            matches!(action, CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id: 91, old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
+        );
+    }
+    let head = child_of(&tc, tc.arena.root(), &[1, 2]);
+    let middle = child_of(&tc, head, &[3, 4]);
+    assert_eq!(child_of(&tc, middle, &[7, 8]), leaf);
+    for node in [head, middle, leaf] {
+        assert_eq!(tc.arena.node(node).rotation_base, Some(7));
+        assert_eq!(tc.arena.node(node).load_back_pending_id, Some(92));
+        assert_eq!(tc.arena.node(node).write_through_pending_id, Some(91));
+        assert!(tc.arena.node(node).external_cache_stored);
+    }
+    let full = Tensor::cat(
+        &[
+            tc.arena.device_value(head, FULL),
+            tc.arena.device_value(middle, FULL),
+            tc.arena.device_value(leaf, FULL),
+        ],
+        0,
+    );
+    assert!(full.equal(&Tensor::from_slice(&[10i64, 11, 12, 13, 14, 15, 16, 17])));
+    let _ = values.fill_(99);
+    assert!(
+        tc.arena
+            .device_value(middle, SWA)
+            .equal(&Tensor::from_slice(&[50i64, 51, 52, 53]))
+    );
+    assert_eq!(tc.swa_evictable_size(), 4);
+    assert_eq!(tc.swa_protected_size(), 0);
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 8)
+            .unwrap(),
+        vec![(0, 2), (6, 8)]
+    );
+}
+
+#[test]
+fn swa_window_attach_under_lock_restamps_lru_and_releases_accounting() {
+    let mut tc = swa_core(8, 1);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    let leaf_id = tc.arena.node(leaf).id;
+    tc.arena
+        .set_host_value(leaf, SWA, Tensor::from_slice(&[20i64, 21, 22, 23]));
+    tc.host_lru_list_mut(SWA).insert_mru(leaf);
+    let receipt = tc.inc_lock_ref(leaf_id, ComponentSet::EMPTY).unwrap();
+    tc.attach_swa_window(
+        &key,
+        Default::default(),
+        1,
+        3,
+        &Tensor::from_slice(&[51i64, 52]),
+    )
+    .unwrap();
+    let head = child_of(&tc, tc.arena.root(), &[1]);
+    let middle = child_of(&tc, head, &[2]);
+    assert_eq!(tc.swa_protected_size(), 2);
+    assert_eq!(tc.swa_evictable_size(), 0);
+    assert!(tc.device_lru_list(SWA).in_list(Some(middle)));
+    assert!(!tc.host_lru_list(SWA).in_list(Some(middle)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(head)));
+    assert!(tc.host_lru_list(SWA).in_list(Some(leaf)));
+    tc.dec_lock_ref(
+        leaf_id,
+        &DecLockRefParams {
+            node_id: receipt.node_id,
+            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+            skipped_lock_components: receipt.skipped_lock_components,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(tc.swa_protected_size(), 0);
+    assert_eq!(tc.swa_evictable_size(), 2);
+    for node in [head, middle, leaf] {
+        assert_eq!(tc.arena.device_lock_ref(node, SWA), 0);
+        assert_eq!(tc.arena.device_lock_ref(node, FULL), 0);
+    }
+}
+
+#[test]
+fn swa_window_attach_rejects_incomplete_or_live_spans_before_mutation() {
+    let mut tc = swa_core(8, 1);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    let leaf = child_of(&tc, tc.arena.root(), &[1]);
+    let (head, _) = tc.split_node_(leaf, 2);
+    tc.set_component_device_value_(leaf, SWA, Tensor::from_slice(&[52i64, 53]));
+    let count = tc.arena.len();
+    let error = tc
+        .attach_swa_window(
+            &key,
+            Default::default(),
+            1,
+            4,
+            &Tensor::from_slice(&[51i64, 52, 53]),
+        )
+        .err()
+        .unwrap();
+    assert!(error.contains("over live SWA"));
+    assert_eq!(tc.arena.len(), count);
+    assert!(!tc.arena.has_device_value(head, SWA));
+    assert_eq!(tc.swa_evictable_size(), 2);
+    let error = tc
+        .attach_swa_window(
+            &vec![1, 2, 9, 10],
+            Default::default(),
+            1,
+            4,
+            &Tensor::from_slice(&[51i64, 52, 53]),
+        )
+        .err()
+        .unwrap();
+    assert!(error.contains("covered 2"));
+    assert_eq!(tc.arena.len(), count);
+    assert!(!tc.arena.has_device_value(head, SWA));
+}
+
+#[test]
+fn swa_window_attach_validates_tensor_and_page_bounds_before_mutation() {
+    let mut tc = swa_core(8, 2);
+    let key = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 4));
+    for (start, end, values) in [
+        (1, 3, Tensor::from_slice(&[51i64, 52])),
+        (0, 4, Tensor::from_slice(&[51i64, 52])),
+        (
+            0,
+            4,
+            Tensor::from_slice(&[51i64, 52, 53, 54]).reshape([2, 2]),
+        ),
+        (0, 4, Tensor::from_slice(&[51f32, 52., 53., 54.])),
+        (4, 2, Tensor::from_slice(&[51i64, 52])),
+        (2, 6, Tensor::from_slice(&[51i64, 52, 53, 54])),
+    ] {
+        assert!(
+            tc.attach_swa_window(&key, Default::default(), start, end, &values)
+                .is_err()
+        );
+        assert_eq!(tc.arena.len(), 2);
+        assert_eq!(tc.swa_evictable_size(), 0);
+    }
+    assert!(
+        tc.attach_swa_window(
+            &key,
+            Default::default(),
+            0,
+            0,
+            &Tensor::from_slice::<i64>(&[])
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let mut full_only: UnifiedTreeCore<Vec<i64>> =
+        UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL]);
+    assert!(
+        full_only
+            .swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .is_err()
+    );
+    assert!(
+        full_only
+            .attach_swa_window(
+                &key,
+                Default::default(),
+                0,
+                4,
+                &Tensor::from_slice(&[51i64, 52, 53, 54])
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn swa_window_bigram_namespaces_preserve_atom_positions() {
+    let mut tc: UnifiedTreeCore<Vec<(i64, i64)>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 2,
+            ..swa_params_with_window(8)
+        },
+        vec![FULL, SWA],
+    );
+    let key = vec![(1, 2), (2, 3), (3, 4), (4, 5)];
+    let namespace = crate::node::KeyNamespaceRef::new(Some("adapter"), Some("tenant"));
+    let leaf = tc
+        .arena
+        .alloc_child_in_namespace(tc.arena.root(), key.clone(), 0, namespace)
+        .unwrap();
+    tc.arena
+        .set_device_value(leaf, FULL, Tensor::from_slice(&[10i64, 11, 12, 13]));
+    assert!(
+        tc.swa_tombstone_ranges(&key, Default::default(), 0, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, namespace, 1, 3).unwrap(),
+        vec![(1, 3)]
+    );
+    tc.attach_swa_window(&key, namespace, 2, 4, &Tensor::from_slice(&[52i64, 53]))
+        .unwrap();
+    assert_eq!(
+        tc.swa_tombstone_ranges(&key, namespace, 0, 4).unwrap(),
+        vec![(0, 2)]
+    );
+    assert!(
+        tc.arena
+            .device_value(leaf, SWA)
+            .equal(&Tensor::from_slice(&[52i64, 53]))
+    );
+    assert_eq!(tc.arena.node(leaf).key, vec![(3, 4), (4, 5)]);
+}
+
+#[test]
 fn component_type_is_swa() {
     let swa = SwaComponent::new(&swa_params());
     assert_eq!(
@@ -543,6 +831,7 @@ fn insert_params_swa<'k>(
     swa_evicted_seqlen: usize,
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
+        rotation_base: None,
         key,
         namespace: Default::default(),
         value: Tensor::from_slice(value),
@@ -739,6 +1028,7 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -806,6 +1096,7 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
         .node_mut(leaf)
         .set_lock_ref_(ValueSlotIdx::device(FULL), 1);
     let result = tc.insert(&InsertParams {
+        rotation_base: None,
         track_adopted_ranges: true,
         ..insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0)
     });
@@ -5509,6 +5800,7 @@ fn insert_reports_whether_it_reached_the_branch_boundary() {
     for (branching_seqlen, expected) in [(Some(3), true), (Some(4), false), (None, false)] {
         let mut tc = swa_hicache_core(/* window = */ 4, /* page_size = */ 1);
         let result = tc.insert(&InsertParams {
+            rotation_base: None,
             swa_branching_seqlen: branching_seqlen,
             ..insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0)
         });

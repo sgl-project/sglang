@@ -89,6 +89,7 @@ fn insert_overlap_default_consumes_nothing() {
         /* total_prefix_len = */ 0,
         Tensor::from_slice(&[0i64, 1, 2]),
         &InsertParams {
+            rotation_base: None,
             key: &vec![0, 1, 2],
             namespace: Default::default(),
             value: Tensor::from_slice(&[0i64, 1, 2]),
