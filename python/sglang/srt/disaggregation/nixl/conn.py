@@ -48,7 +48,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -568,6 +568,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
+            device_type=get_device().device,
         )
 
     def _init_staging_allocator(self):
@@ -578,6 +579,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.allocator = init_staging_allocator(
             self._register_staging_memory,
             self.kv_args,
+            device_type=get_device().device,
         )
 
     def _register_staging_memory(self, ptr: int, size: int):
@@ -589,16 +591,28 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"NIXL memory registration failed for staging buffer "
                 f"(ptr=0x{ptr:x}, size={size})"
             )
+        logger.info(
+            f"Registered staging memory with NIXL: "
+            f"ptr=0x{ptr:x}, size={size / (1024 * 1024):.1f} MB, "
+            f"gpu_id={self.kv_args.gpu_id}"
+        )
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
-        # NOTE: matches mooncake behavior -- staging buffers are now
-        # created in __init__ (per-worker), independent of the kv
-        # tensors. This setter only stashes the tensor metadata used by
-        # send_kvcache_staged().
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
+        # Staging buffers are created per-worker in __init__, independent of the
+        # kv tensors; this only stashes metadata used by send_kvcache_staged().
+        # slot_layer_ids is kept for signature parity with mooncake; NIXL staging
+        # is pp_size == 1 only (see prefill.py), so nothing reads it back.
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
+            "slot_layer_ids": list(slot_layer_ids or []),
         }
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
@@ -2065,16 +2079,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
-            self.kv_args.gpu_id,
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
             [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
-            dtype=np.int64,
+            dtype=np.uint64,
         )
         dst_reqs = np.array(
-            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.uint64
         )
 
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")

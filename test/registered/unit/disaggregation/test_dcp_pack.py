@@ -222,16 +222,14 @@ class TestTryDcpPack(CustomTestCase):
                 "get_ptr": lambda self: 0x1000,
                 "get_size": lambda self: pack.numel(),
                 "get_gather_stream": lambda self: gather_stream,
+                "producer_stream": lambda self: Mock(),
             },
         )()
         src = np.array([1, 5, 9, 13], dtype=np.int64)
         pack_offset = 2 * item_len
         with (
             patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"
-            ),
-            patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.stream",
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
                 return_value=nullcontext(),
             ),
             patch(

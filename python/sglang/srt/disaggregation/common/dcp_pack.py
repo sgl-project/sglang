@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
+from sglang.srt.utils import device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,8 @@ def try_pack_dcp_src(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
     gather_stream = pack_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(pack.device))
-    with torch.cuda.stream(gather_stream):
+    gather_stream.wait_stream(pack_buffer.producer_stream())
+    with device_stream_context(gather_stream):
         copy_mla_rows_into_pack(kv_data_ptrs, row_indices, pack, token_item_lens)
     gather_stream.synchronize()
 
