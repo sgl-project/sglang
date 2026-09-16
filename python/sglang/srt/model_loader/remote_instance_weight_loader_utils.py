@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import logging
 import time
+from bisect import bisect_left
 from typing import List
 
 import requests
@@ -151,11 +152,24 @@ def register_memory_region_v2(model, transfer_engine):
 
     import torch
 
+    sorted_weight_addresses = sorted(weight_addr_set) if torch.version.hip else []
     memory_snapshot = torch.cuda.memory.memory_snapshot()
     weight_blocks_for_reg_mr = []
     # Blocks in each segment have continuous physical addresses,
     # so they can be merged for memory registration.
     for segment in memory_snapshot:
+        if torch.version.hip:
+            # Mooncake's HIP transport exports this pointer with hipIpcGetMemHandle,
+            # which requires the allocation base rather than a suballocated block.
+            address = segment["address"]
+            size = segment["total_size"]
+            index = bisect_left(sorted_weight_addresses, address)
+            if (
+                index < len(sorted_weight_addresses)
+                and sorted_weight_addresses[index] < address + size
+            ):
+                weight_blocks_for_reg_mr.append((address, size))
+            continue
         current_weight_block = None
         blocks = segment.get("blocks", [])
         for block in blocks:
