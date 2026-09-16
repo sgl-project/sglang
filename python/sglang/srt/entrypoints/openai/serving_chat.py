@@ -1367,6 +1367,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # state finishes a request even under ignore_eos.
         glm_constraint = (
             self.tool_call_parser == "glm47"
+            and envs.SGLANG_ENABLE_GLM47_FULL_ASSISTANT_CONSTRAINT.get()
             and bool(effective_tools)
             and not any(tool.function.strict for tool in effective_tools)
         )
