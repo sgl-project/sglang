@@ -57,7 +57,8 @@ class KVLayout(str, enum.Enum):
 
     @property
     def cpp_name(self) -> str:
-        """The C++ enumerator, for JIT template arguments."""
+        """The C++ enumerator, for JIT template arguments. Bare, because it is
+        also part of the JIT module name; the headers `using enum` it in."""
         return self.name
 
     @classmethod

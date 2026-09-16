@@ -1,11 +1,18 @@
-"""Fused ratio-1 decode RMSNorm, RoPE, fp4 fake-quant and FlashMLA cache write.
+"""Fused ratio-1 and ratio-2 decode compressors: RMSNorm, RoPE and the FlashMLA
+cache write in one launch.
 
-The input is bf16 with no pooling. RoPE uses the token's own position, and the
-compressed slot equals the FULL slot; out_loc == 0 marks graph padding.
-The pre-RoPE latent is also returned for the index-key projection.
+Ratio 1 takes the bf16 ``wkv`` projection as is: RoPE uses the token's own
+position and the compressed slot equals the FULL slot. Ratio 2 pair-pools the
+token against the pending partner in the state ring first; its closed-form
+softmax and FMA contraction can differ from torch by fp32 ulps, so pooling is
+compared with a tolerance while stores from a given latent are bitwise.
+``out_loc == 0`` marks a padded graph row on both paths, and both return the
+pre-RoPE latent for the index-key projection.
 """
 
-from typing import Optional, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -19,6 +26,9 @@ from sglang.kernels.jit.utils import (
 from .kv_layout import KVLayout
 from .utils import make_name
 
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
+
 
 @cache_once
 def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayout):
@@ -30,11 +40,11 @@ def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayou
         is_arch_support_pdl(),
     )
     return load_jit(
-        make_name("c1"),
+        make_name("c1_decode"),
         *args,
         cuda_files=["deepseek_v4/c1.cuh"],
         cuda_wrappers=[
-            ("decode_fusion", f"FlashC1DecodeKernel<{args}>::run_decode_fusion"),
+            ("decode_fusion", f"FlashCompress1Kernel<{args}>::run_decode_fusion"),
         ],
     )
 
@@ -99,5 +109,85 @@ def c1_decode_norm_rope_store(
         out_loc,
         k_cache,
         float(eps),
+    )
+    return out
+
+
+@cache_once
+def _jit_c2_module(
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+) -> Module:
+    args = make_cpp_args(
+        head_dim,
+        rope_dim,
+        page_size,
+        layout.cpp_name,
+        is_arch_support_pdl(),
+    )
+    return load_jit(
+        make_name("c2_decode"),
+        *args,
+        cuda_files=["deepseek_v4/c2.cuh"],
+        cuda_wrappers=[
+            ("decode_fusion", f"FlashCompress2Kernel<{args}>::run_decode_fusion"),
+        ],
+    )
+
+
+def c2_decode_norm_rope_store(
+    kv_input: torch.Tensor,
+    kv_state: torch.Tensor,
+    norm_weight: torch.Tensor,
+    positions: torch.Tensor,
+    req: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    k_cache: torch.Tensor,
+    *,
+    page_size: int,
+    ring_size: int,
+    draft_len: int = 1,
+    layout: Union[KVLayout, str] = KVLayout.V4,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pair-pool ``kv_input`` against ``kv_state``, RMSNorm, and write the main KV slot.
+
+    ``out`` contains the pre-RoPE latent for the index-K branch's ``wk`` projection.
+    The cache store uses ``raw_out_loc // 2`` as its slot.
+
+    :param freqs_cis: ``[max_pos, rope_dim]`` fp32, real/imag interleaved --
+                      ``torch.view_as_real(freqs).flatten(-2)``. Indexed
+                      in-kernel at ``positions - 1``, the position the latent
+                      stands for, so there is no gather launch.
+    :param k_cache: the compressed KV pool buffer for this layer.
+    :param page_size: slots per page of that pool (``page_size // ratio``).
+    :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
+                   ``V41``) store the fp4 fake-quantized value; ``V41_FP4``
+                   stores the e2m1 codes themselves, rounding once.
+    """
+    num_tokens, fused_dim = kv_input.shape
+    head_dim = fused_dim // 2
+    if out is None:
+        out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
+
+    layout = KVLayout.parse(layout)
+    module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
+    module.decode_fusion(
+        kv_input,
+        kv_state,
+        out,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        freqs_cis,
+        k_cache,
+        ring_size,
+        draft_len,
     )
     return out
