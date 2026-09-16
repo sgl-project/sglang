@@ -3,11 +3,15 @@
 
 use std::net::SocketAddr;
 
-/// Reserves an ephemeral loopback port. The listener is dropped immediately,
-/// so callers that spawn a server should retain their connect-retry loop.
-pub fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+
+/// Binds an ephemeral loopback port and hands the socket to `serve_with_incoming`;
+/// reserving a port and releasing it loses it to another test binary.
+pub async fn bound_incoming() -> (SocketAddr, TcpListenerStream) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    (addr, TcpListenerStream::new(listener))
 }

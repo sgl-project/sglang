@@ -35,17 +35,17 @@ use sgl_kv_indexer::{
 };
 use test_id::nanos;
 use test_kv::{action, action_with_parent, apply_request, hbm};
-use test_net::free_addr;
+use test_net::bound_incoming;
 
 async fn start_backend(
     backend: InMemoryKvIndexerBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
     let svc = KvIndexerService::new(backend).into_server();
-    let addr = free_addr();
+    let (addr, incoming) = bound_incoming().await;
     tokio::spawn(async move {
         server_builder()
             .add_service(svc)
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .expect("server serve");
     });
@@ -103,11 +103,11 @@ async fn start_blocking_backend(
     backend: BlockingPrefixBackend,
 ) -> KvIndexerClient<tonic::transport::Channel> {
     let svc = KvIndexerService::with_prefix_query_max_inflight(backend, 2).into_server();
-    let addr = free_addr();
+    let (addr, incoming) = bound_incoming().await;
     tokio::spawn(async move {
         server_builder()
             .add_service(svc)
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .expect("server serve");
     });
@@ -551,11 +551,11 @@ async fn start_recording_deadlines(
             Ok(request)
         },
     );
-    let addr = free_addr();
+    let (addr, incoming) = bound_incoming().await;
     tokio::spawn(async move {
         Server::builder()
             .add_service(svc)
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .expect("server serve");
     });
