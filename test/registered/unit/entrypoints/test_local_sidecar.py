@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 import unittest
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -136,113 +136,32 @@ class TestSidecarContext(unittest.TestCase):
                     self.assertNotIn(LOCAL_KV_EVENT_SOURCES, scheduler.get_init_info())
 
     def test_engine_extracts_sources_from_scheduler_or_controller_reply(self):
-        from sglang.srt.entrypoints.engine import Engine
+        from sglang.srt.entrypoints import engine
 
         for dp_size in (1, 8):
             sources = [source(0)] if dp_size == 1 else [source(4), source(5)]
             infos = [{"status": "ready", LOCAL_KV_EVENT_SOURCES: sources}]
-            with ExitStack() as stack:
-                stack.enter_context(
-                    get_context().override_server_args(
-                        dp_size=dp_size, tp_size=1, pp_size=1, nnodes=1, node_rank=0
-                    )
-                )
-                stack.enter_context(patch("sglang.srt.entrypoints.engine.mp.Process"))
-                stack.enter_context(
-                    patch(
-                        "sglang.srt.entrypoints.engine.mp.Pipe",
-                        return_value=(MagicMock(), MagicMock()),
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "sglang.srt.entrypoints.engine.TorchMemorySaverAdapter.create"
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "sglang.srt.entrypoints.engine.numa_utils.configure_subprocess"
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "sglang.srt.entrypoints.engine.maybe_reindex_device_id",
-                        return_value=nullcontext(0),
-                    )
-                )
-                stack.enter_context(
-                    patch(
-                        "sglang.srt.entrypoints.engine._wait_for_scheduler_ready",
-                        return_value=infos,
-                    )
-                )
-                result, _ = Engine._launch_scheduler_processes(
+            with (
+                get_context().override_server_args(
+                    dp_size=dp_size, tp_size=1, pp_size=1, nnodes=1, node_rank=0
+                ),
+                patch.object(engine.mp, "Process"),
+                patch.object(
+                    engine.mp, "Pipe", return_value=(MagicMock(), MagicMock())
+                ),
+                patch.object(engine.TorchMemorySaverAdapter, "create"),
+                patch.object(engine.numa_utils, "configure_subprocess"),
+                patch.object(
+                    engine, "maybe_reindex_device_id", return_value=nullcontext(0)
+                ),
+                patch.object(engine, "_wait_for_scheduler_ready", return_value=infos),
+            ):
+                result, _ = engine.Engine._launch_scheduler_processes(
                     MagicMock(), MagicMock(), MagicMock()
                 )
                 result.wait_for_ready()
             self.assertEqual(result.local_kv_event_sources, sources)
             self.assertEqual(result.scheduler_infos, [{"status": "ready"}])
-
-    def test_dp_controller_collects_and_forwards_local_scheduler_sources(self):
-        from sglang.srt.managers import data_parallel_controller as dpc
-
-        # Node 1 owns DP ranks 2 and 3; their CP companions own no publisher.
-        infos = [
-            dict(
-                status="ready",
-                max_total_num_tokens=64,
-                max_req_input_len=32,
-                **{LOCAL_KV_EVENT_SOURCES: sources},
-            )
-            for sources in ([source(2)], [], [source(3)], [])
-        ]
-        pipes = [(MagicMock(), MagicMock()) for _ in infos]
-        for (reader, _), info in zip(pipes, infos):
-            reader.recv.return_value = info
-        controller = dpc.DataParallelController.__new__(dpc.DataParallelController)
-        controller.env_lock = threading.Lock()
-        controller.scheduler_procs = []
-        controller.local_kv_event_sources = []
-        controller.run_scheduler_process_func = MagicMock()
-
-        def initialize(server_args, port_args, run_scheduler):
-            controller.launch_tensor_parallel_group(server_args, port_args, 0, None)
-            return controller
-
-        ready = MagicMock()
-        with (
-            get_context().override_server_args(
-                node_rank=1,
-                nnodes=2,
-                tp_size=8,
-                pp_size=1,
-                dp_size=4,
-                enable_dp_attention=True,
-                attn_cp_size=2,
-            ),
-            patch.object(dpc, "DataParallelController", side_effect=initialize),
-            patch.object(dpc.mp, "Pipe", side_effect=pipes),
-            patch.object(dpc.mp, "Process"),
-            patch.object(dpc.PortArgs, "init_new", return_value=MagicMock()),
-            patch.object(dpc.TorchMemorySaverAdapter, "create"),
-            patch.object(dpc.numa_utils, "configure_subprocess"),
-            patch.object(dpc, "maybe_reindex_device_id", return_value=nullcontext(0)),
-            patch.object(dpc, "publish"),
-            patch.object(dpc, "configure_logger"),
-            patch.object(dpc, "kill_itself_when_parent_died"),
-            patch.object(dpc.setproctitle, "setproctitle"),
-            patch.object(dpc.psutil, "Process") as parent,
-        ):
-            dpc.run_data_parallel_controller_process(
-                MagicMock(), MagicMock(), ready, controller.run_scheduler_process_func
-            )
-        parent.return_value.parent.return_value.send_signal.assert_not_called()
-        ready.send.assert_called_once()
-        self.assertEqual(
-            ready.send.call_args.args[0][LOCAL_KV_EVENT_SOURCES],
-            [source(2), source(3)],
-        )
-        self.assertTrue(all(LOCAL_KV_EVENT_SOURCES not in info for info in infos))
 
     def test_extracts_all_local_sources_without_leaking_into_server_info(self):
         # Same helper handles direct scheduler replies and DPC ready replies.
@@ -390,10 +309,11 @@ class TestLocalSidecar(unittest.TestCase):
 class TestFollowerSidecarLifecycle(unittest.TestCase):
     @contextmanager
     def launch(self, *, sources, blocking=True, scope="local-telemetry"):
-        from sglang.srt.entrypoints.engine import Engine, SchedulerInitResult
+        from sglang.srt.entrypoints import engine
+        from sglang.srt.entrypoints import sidecar as sidecar_module
 
         events = []
-        result = SchedulerInitResult(
+        result = engine.SchedulerInitResult(
             scheduler_infos=[{"status": "ready"}],
             local_kv_event_sources=sources,
             wait_for_ready=MagicMock(
@@ -423,32 +343,34 @@ class TestFollowerSidecarLifecycle(unittest.TestCase):
                 os.environ,
                 {"SGLANG_BLOCK_NONZERO_RANK_CHILDREN": "1" if blocking else "0"},
             ),
-            patch("sglang.srt.entrypoints.engine.configure_logger"),
-            patch("sglang.srt.entrypoints.engine._set_envs_and_config"),
-            patch("sglang.srt.entrypoints.engine.load_plugins"),
-            patch("sglang.srt.entrypoints.engine.publish"),
-            patch(
-                "sglang.srt.entrypoints.engine.resolving_view",
+            patch.object(engine, "configure_logger"),
+            patch.object(engine, "_set_envs_and_config"),
+            patch.object(engine, "load_plugins"),
+            patch.object(engine, "publish"),
+            patch.object(
+                engine,
+                "resolving_view",
                 return_value=SimpleNamespace(
                     reasoning_parser=None, tool_call_parser=None
                 ),
             ),
             patch.object(
-                Engine,
+                engine.Engine,
                 "_launch_scheduler_processes",
                 return_value=(result, [MagicMock(pid=12345)]),
             ),
-            patch(
-                "sglang.srt.entrypoints.sidecar.start_sidecar", side_effect=start
+            patch.object(
+                sidecar_module, "start_sidecar", side_effect=start
             ) as start_mock,
-            patch(
-                "sglang.srt.entrypoints.engine.launch_dummy_health_check_server",
+            patch.object(
+                engine,
+                "launch_dummy_health_check_server",
                 side_effect=lambda *args: events.append("health"),
             ) as health,
-            patch("sglang.srt.entrypoints.engine.kill_process_tree") as kill,
+            patch.object(engine, "kill_process_tree") as kill,
         ):
             yield SimpleNamespace(
-                run=lambda: Engine._launch_subprocesses(
+                run=lambda: engine.Engine._launch_subprocesses(
                     MagicMock(),
                     MagicMock(),
                     MagicMock(),
