@@ -391,6 +391,21 @@ class UnifiedTreeCoreInterface(ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    @abstractmethod
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Return (matched tokens, deepest node, FULL tokens pinned by it)."""
+        ...
+
+    @abstractmethod
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only FULL device values on the node's root path."""
+        ...
+
+    @abstractmethod
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        """Release a pin acquired by inc_full_pin."""
+        ...
+
     def supports_fast_match_prefix(self) -> bool:
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False
@@ -498,6 +513,7 @@ class UnifiedTreeCoreInterface(ABC):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build a component's HiCache transfers for the given node and phase."""
