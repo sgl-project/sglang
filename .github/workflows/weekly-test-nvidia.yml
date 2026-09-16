@@ -3,8 +3,6 @@
 name: Weekly Test (Nvidia)
 
 on:
-  schedule:
-    - cron: '0 0 * * 0'  # Run every Sunday at midnight UTC
   workflow_dispatch:
     inputs:
       runner_filter:

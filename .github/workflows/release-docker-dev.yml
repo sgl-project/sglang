@@ -32,8 +32,6 @@ on:
         description: "Overlay output suffix appended to the base tag. EMPTY = overwrite the base tag(s); non-empty = append (e.g. 'msa')."
         required: false
         default: ""
-  schedule:
-    - cron: "0 0 * * *"
 
 concurrency:
   group: release-docker-dev-${{ inputs.tag || inputs.pr_number || 'nightly' }}

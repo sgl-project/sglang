@@ -9,8 +9,6 @@
 name: Weekly Test (CPU)
 
 on:
-  schedule:
-    - cron: '0 0 * * 0'  # Sunday 00:00 UTC, alongside the Nvidia weekly run
   workflow_dispatch:
 
 concurrency:

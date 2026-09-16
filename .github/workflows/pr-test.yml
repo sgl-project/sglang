@@ -8,8 +8,6 @@ run-name: >-
   }}
 
 on:
-  schedule:
-    - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
   workflow_dispatch:
     inputs:

@@ -21,8 +21,6 @@ on:
           - gfx950-rocm724
           - gfx942-rocm720
           - gfx950-rocm720
-  schedule:
-    - cron: '0 12 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels

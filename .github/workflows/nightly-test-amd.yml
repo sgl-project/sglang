@@ -1,8 +1,6 @@
 name: Nightly Test (AMD ROCm 7.0)
 
 on:
-  schedule:
-    - cron: '30 17 * * *'
   push:
     branches:
       - main

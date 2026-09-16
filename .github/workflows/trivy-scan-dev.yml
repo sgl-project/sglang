@@ -2,8 +2,6 @@ name: Trivy Scan Dev Docker Images
 
 on:
   # Run daily after nightly dev builds (which run at midnight UTC)
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       tag:

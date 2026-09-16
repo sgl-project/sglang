@@ -6,11 +6,13 @@ import argparse
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
@@ -24,6 +26,12 @@ VLLM_UBUNTU2404_NIGHTLY_TAG_RE = re.compile(
     r"^(nightly|nightly-[0-9a-f]{7,64})-ubuntu2404$"
 )
 AUTO_TAG_SPECS = {"version", "today-nightly"}
+DOCKER_HUB_API_HOSTS = ("hub.docker.com", "registry.hub.docker.com")
+DOCKER_HUB_RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
+DOCKER_HUB_USER_AGENT = (
+    "sglang-volcengine-image-sync/1.0 "
+    "(+https://github.com/bytedance-iaas/sglang)"
+)
 DEFAULT_VARIANT_RE = re.compile(
     r"^(latest|dev|nightly|nightly-[0-9a-f]{7,64}|nightly-dev-[0-9]{8}-[0-9a-f]{7,64}|v\d+\.\d+\.\d+(?:\.post\d+)?)$"
 )
@@ -65,7 +73,46 @@ def docker_hub_repository(image_name: str) -> str:
     return "/".join(parts)
 
 
-def fetch_docker_hub_tags(image_name: str, *, pages: int = 100) -> list[DockerTag]:
+def fetch_docker_hub_page(page_url: str, *, attempts: int = 3) -> dict:
+    parsed = urlparse(page_url)
+    if parsed.scheme != "https" or parsed.netloc not in DOCKER_HUB_API_HOSTS:
+        raise SystemExit(f"unsafe Docker Hub pagination URL: {page_url}")
+
+    errors: list[str] = []
+    for attempt in range(attempts):
+        # Docker Hub serves the same API on both names. Trying both avoids a
+        # transient edge/WAF denial on one hostname, which has returned 403 to
+        # the self-hosted Actions runner even though the public API is usable.
+        hosts = (parsed.netloc,) + tuple(
+            host for host in DOCKER_HUB_API_HOSTS if host != parsed.netloc
+        )
+        for host in hosts:
+            request_url = parsed._replace(netloc=host).geturl()
+            request = Request(
+                request_url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": DOCKER_HUB_USER_AGENT,
+                },
+            )
+            try:
+                with urlopen(request, timeout=30) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                errors.append(f"{request_url}: HTTP {error.code}")
+                if error.code not in DOCKER_HUB_RETRYABLE_STATUS_CODES:
+                    raise
+            except URLError as error:
+                errors.append(f"{request_url}: {error.reason}")
+        if attempt + 1 < attempts:
+            time.sleep(2**attempt)
+
+    raise SystemExit(
+        "Docker Hub tags API failed after retries: " + "; ".join(errors)
+    )
+
+
+def fetch_docker_hub_tags(image_name: str, *, pages: int = 10) -> list[DockerTag]:
     repository = docker_hub_repository(image_name)
     page_url = (
         "https://hub.docker.com/v2/repositories/"
@@ -73,11 +120,7 @@ def fetch_docker_hub_tags(image_name: str, *, pages: int = 100) -> list[DockerTa
     )
     tags: list[DockerTag] = []
     for _ in range(pages):
-        parsed = urlparse(page_url)
-        if parsed.scheme != "https" or parsed.netloc != "hub.docker.com":
-            raise SystemExit(f"unsafe Docker Hub pagination URL: {page_url}")
-        with urlopen(page_url, timeout=30) as response:
-            payload = json.load(response)
+        payload = fetch_docker_hub_page(page_url)
         for item in payload.get("results", []):
             name = item.get("name")
             last_updated = item.get("last_updated")
@@ -86,8 +129,11 @@ def fetch_docker_hub_tags(image_name: str, *, pages: int = 100) -> list[DockerTa
         page_url = payload.get("next")
         if not page_url:
             break
-    else:
-        raise SystemExit(f"Docker Hub pagination exceeded safety bound ({pages} pages)")
+    if page_url:
+        print(
+            f"Docker Hub tag discovery stopped after the {pages * 100} most "
+            "recent tags to stay within its anonymous pagination limit."
+        )
     return tags
 
 

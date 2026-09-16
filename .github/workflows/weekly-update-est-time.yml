@@ -1,8 +1,6 @@
 name: Weekly Update Est Time
 
 on:
-  schedule:
-    - cron: '0 0 * * 1'  # Monday 00:00 UTC
   workflow_dispatch: {}
 
 permissions:

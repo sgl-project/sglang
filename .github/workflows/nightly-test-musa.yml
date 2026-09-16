@@ -1,8 +1,6 @@
 name: Nightly Test (MUSA)
 
 on:
-  schedule:
-    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       job_filter:

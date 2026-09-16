@@ -22,9 +22,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    # Offset from the other nightly docker builds; this one runs long.
-    - cron: "0 10 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

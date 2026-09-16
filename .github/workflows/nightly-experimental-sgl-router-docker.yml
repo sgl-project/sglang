@@ -1,8 +1,6 @@
 name: Nightly Experimental sgl-router Docker Image
 
 on:
-  schedule:
-    - cron: '0 2 * * *'
   workflow_dispatch:
 
 concurrency:

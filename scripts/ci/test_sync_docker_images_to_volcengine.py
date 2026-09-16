@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from datetime import date
 from zoneinfo import ZoneInfo
 
+import sync_docker_images_to_volcengine as sync_module
 from sync_docker_images_to_volcengine import (
     DockerTag,
     SyncItem,
@@ -24,6 +28,74 @@ from sync_docker_images_to_volcengine import (
 
 
 class SyncDockerImagesToVolcengineTest(unittest.TestCase):
+    @patch.object(sync_module, "urlopen")
+    def test_docker_hub_api_uses_headers_and_falls_back_after_403(
+        self, mock_urlopen
+    ) -> None:
+        payload = (
+            b'{"results":[{"name":"latest",'
+            b'"last_updated":"2026-09-16T00:00:00Z"}],"next":null}'
+        )
+        mock_urlopen.side_effect = [
+            HTTPError(
+                "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags",
+                403,
+                "Forbidden",
+                {},
+                None,
+            ),
+            io.BytesIO(payload),
+        ]
+
+        tags = sync_module.fetch_docker_hub_tags("docker.io/lmsysorg/sglang")
+
+        self.assertEqual(tags, [DockerTag("latest", "2026-09-16T00:00:00Z")])
+        self.assertEqual(mock_urlopen.call_count, 2)
+        first_request = mock_urlopen.call_args_list[0].args[0]
+        fallback_request = mock_urlopen.call_args_list[1].args[0]
+        self.assertEqual(first_request.host, "hub.docker.com")
+        self.assertEqual(fallback_request.host, "registry.hub.docker.com")
+        self.assertEqual(first_request.get_header("Accept"), "application/json")
+        self.assertIn(
+            "sglang-volcengine-image-sync",
+            first_request.get_header("User-agent"),
+        )
+
+    def test_docker_hub_api_rejects_untrusted_pagination_host(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "unsafe Docker Hub pagination URL"):
+            sync_module.fetch_docker_hub_page(
+                "https://example.com/v2/repositories/lmsysorg/sglang/tags"
+            )
+
+    @patch.object(sync_module, "fetch_docker_hub_page")
+    def test_docker_hub_tag_scan_stops_before_anonymous_offset_limit(
+        self, mock_fetch_page
+    ) -> None:
+        def page(page_url: str) -> dict:
+            page_number = int(page_url.split("page=")[-1]) if "page=" in page_url else 1
+            return {
+                "results": [
+                    {
+                        "name": f"tag-{page_number}",
+                        "last_updated": "2026-09-16T00:00:00Z",
+                    }
+                ],
+                "next": (
+                    "https://hub.docker.com/v2/repositories/lmsysorg/sglang/"
+                    f"tags?page={page_number + 1}"
+                ),
+            }
+
+        mock_fetch_page.side_effect = page
+
+        tags = sync_module.fetch_docker_hub_tags(
+            "docker.io/lmsysorg/sglang", pages=10
+        )
+
+        self.assertEqual(len(tags), 10)
+        self.assertEqual(mock_fetch_page.call_count, 10)
+
+
     def test_builds_default_sglang_and_vllm_latest_plan(self) -> None:
         plan = build_sync_plan(
             registry="iaas-gpu-cn-beijing.cr.volces.com",

@@ -4,8 +4,6 @@ name: Nightly Test (GB200 72GPU)
 # Manual (workflow_dispatch) runs are gated by the gb200-ci environment
 # to prevent individuals from queuing arbitrary jobs on the shared GB200 cluster.
 on:
-  schedule:
-    - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
   workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
     inputs:
       image:

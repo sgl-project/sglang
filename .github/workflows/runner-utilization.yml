@@ -1,8 +1,6 @@
 name: Runner Utilization Report
 
 on:
-  schedule:
-    - cron: '0 8 * * *'  # Daily at 8 AM UTC
   pull_request:
     paths:
       - '.github/workflows/runner-utilization.yml'

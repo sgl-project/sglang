@@ -1,9 +1,6 @@
 name: Nightly Test (Intel)
 
 on:
-  schedule:
-    # 22:15 IST (UTC+5:30) → 16:45 UTC daily.
-    - cron: '45 16 * * *'
   push:
     branches:
       - main

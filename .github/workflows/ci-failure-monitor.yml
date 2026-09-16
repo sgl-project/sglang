@@ -1,8 +1,6 @@
 name: CI Failure Monitor
 
 on:
-  schedule:
-    - cron: '0 */12 * * *' # Every 12 hour
   workflow_dispatch:
 
 concurrency:

@@ -1,8 +1,6 @@
 name: AMD CI Job Monitor
 
 on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily at midnight UTC
   pull_request:
     paths:
       - '.github/workflows/amd-ci-job-monitor.yml'
