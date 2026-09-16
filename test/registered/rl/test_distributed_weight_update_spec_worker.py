@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -48,7 +47,7 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
     # Default selector ("all"): only the target (main model) owns the update group,
     # so it receives the broadcast once; that single weights object is then loaded
     # into every selected runner — receive once on the target, load into each.
-    weights = object()
+    weights = [("model.layers.0.weight", object())]
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
     draft_runner = Mock()
@@ -162,7 +161,9 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
     # post_load only when requested, always finalizes quant layout.
     import sglang.srt.model_executor.model_runner as mr
 
-    runner = SimpleNamespace(model=object(), device="cpu")
+    runner = SimpleNamespace(
+        model=object(), device="cpu", weight_updater=SimpleNamespace(_m2n_receivers={})
+    )
 
     with patch.object(mr, "restore_weight") as restore:
         mr.ModelRunner.begin_weight_update(runner)
@@ -219,6 +220,9 @@ def test_m2n_ipc_waves_and_residual_finalize_once(concurrent):
     import msgspec
 
     target = Mock()
+    target.weight_updater.receive_weights_from_distributed.return_value = [
+        ("residual.weight", object())
+    ]
     manager = _manager(
         SimpleNamespace(model_runner=target, iter_runners=lambda: [("", target)]), None
     )
@@ -239,17 +243,20 @@ def test_m2n_ipc_waves_and_residual_finalize_once(concurrent):
         assert manager.update_weights_from_distributed(decoded).success
         target.end_weight_update.assert_not_called()
     if concurrent:
-        assert target.receive_weights_from_m2n_groups.call_args_list == [
+        assert target.weight_updater.receive_weights_from_m2n_groups.call_args_list == [
             call(["pp0", "pp1"]),
             call(["pp2"]),
         ]
     else:
-        assert target.receive_weights_from_m2n.call_args_list == [
+        assert target.weight_updater.receive_weights_from_m2n.call_args_list == [
             call("pp0"),
             call("pp2"),
         ]
+    manager._weight_update_sync_base = False
+    assert not manager.update_weights_from_distributed(decoded).success
+    manager._weight_update_sync_base = True
     assert manager.update_weights_from_distributed(_distributed_req()).success
-    target.load_weights.assert_called_once()
+    target.weight_updater.load_weights.assert_called_once()
     with patch("torch.distributed.barrier"):
         assert manager.end_weight_update(EndWeightUpdateReqInput()).success
     target.end_weight_update.assert_called_once_with(run_post_load=True)
@@ -257,7 +264,9 @@ def test_m2n_ipc_waves_and_residual_finalize_once(concurrent):
 
 @pytest.mark.parametrize("failure", ["native", "process_group"])
 def test_m2n_teardown_is_native_first_and_retryable(failure):
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner_components.weight_updater import (
+        WeightUpdater,
+    )
 
     events = []
     receivers = {name: Mock() for name in ("pp0", "pp1")}
@@ -279,7 +288,7 @@ def test_m2n_teardown_is_native_first_and_retryable(failure):
             raise RuntimeError("process group failed")
 
     with patch("torch.distributed.destroy_process_group", side_effect=destroy):
-        assert not ModelRunner.destroy_weights_update_group(runner, "pp0")[0]
+        assert not WeightUpdater.destroy_weights_update_group(runner, "pp0")[0]
         assert events[:3] == [("sync", "pp0"), ("sync", "pp1"), ("native", "pp0")]
         if failure == "native":
             assert not any(kind == "pg" for kind, _ in events)
@@ -290,16 +299,24 @@ def test_m2n_teardown_is_native_first_and_retryable(failure):
         else:
             assert events[3:5] == [("native", "pp1"), ("pg", "pg0")]
             assert list(runner._m2n_receivers) == ["pp1"]
-        assert ModelRunner.destroy_weights_update_group(runner, "pp1")[0]
-        assert ModelRunner.destroy_weights_update_group(runner, "pp0")[0]
+        assert WeightUpdater.destroy_weights_update_group(runner, "pp1")[0]
+        assert WeightUpdater.destroy_weights_update_group(runner, "pp0")[0]
     assert runner._m2n_receivers == {}
     assert runner._model_update_group == {"residual": "residual"}
 
 
 @pytest.mark.parametrize(
-    "initial,restart", [("target", "target"), ("all", "target"), ("draft", "all")]
+    "initial,restart,sync_base",
+    [
+        ("target", "target", True),
+        ("all", "target", True),
+        ("draft", "all", True),
+        ("target", "target", False),
+    ],
 )
-def test_session_restart_keeps_original_selector_and_preparation(initial, restart):
+def test_session_restart_keeps_original_selector_and_preparation(
+    initial, restart, sync_base
+):
     target, draft = Mock(), Mock()
     manager = _session_manager(target, draft)
     manager._weight_update_in_progress = False
@@ -308,14 +325,15 @@ def test_session_restart_keeps_original_selector_and_preparation(initial, restar
         manager._weight_update_loaded = manager._weight_update_requires_post_load = True
         barrier.reset_mock()
         output = manager.begin_weight_update(
-            BeginWeightUpdateReqInput(selector=restart)
+            BeginWeightUpdateReqInput(selector=restart, sync_base=sync_base)
         )
-        assert output.success is (initial == restart)
+        same_session = initial == restart and sync_base
+        assert output.success is same_session
         assert manager._weight_update_selector == initial
         assert manager._weight_update_in_progress is True
-        assert manager._weight_update_loaded is (initial != restart)
-        assert manager._weight_update_requires_post_load is (initial != restart)
-        if initial != restart:
+        assert manager._weight_update_loaded is (not same_session)
+        assert manager._weight_update_requires_post_load is (not same_session)
+        if not same_session:
             barrier.assert_not_called()
         manager.end_weight_update(EndWeightUpdateReqInput())
     for role, runner in (("target", target), ("draft", draft)):
@@ -324,9 +342,8 @@ def test_session_restart_keeps_original_selector_and_preparation(initial, restar
 
 
 def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
-    import torch
-
     import sglang.srt.model_executor.model_runner as mr
+    import torch
 
     model = torch.nn.Module()
     model.weight = torch.nn.Parameter(
@@ -343,10 +360,12 @@ def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
     runner = SimpleNamespace(
         model=model,
         device="cpu",
-        _m2n_receivers={
-            str(pp): SimpleNamespace(manifest=manifest)
-            for pp, manifest in enumerate(manifests)
-        },
+        weight_updater=SimpleNamespace(
+            _m2n_receivers={
+                str(pp): SimpleNamespace(manifest=manifest)
+                for pp, manifest in enumerate(manifests)
+            }
+        ),
         _m2n_fp8_storage=None,
     )
 
@@ -359,7 +378,7 @@ def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
         storage = runner._m2n_fp8_storage
         # Replacing/retiring every communicator must not retire the original
         # graph buffers, even if begin is called again during recovery.
-        runner._m2n_receivers = {
+        runner.weight_updater._m2n_receivers = {
             "replacement": SimpleNamespace(
                 manifest={
                     "entries": [entry for m in manifests for entry in m["entries"]]
@@ -394,3 +413,27 @@ def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
     assert torch.all(graph_weight.float() == 2)
     assert torch.all(graph_scale == 3)
     assert model.scale.format_ue8m0 is True
+
+
+@pytest.mark.parametrize("cache", ["ipc", "derived"])
+def test_m2n_receive_respects_upstream_weight_cache_guards(cache):
+    from sglang.srt.model_executor.model_runner_components import weight_updater as wu
+
+    receiver = Mock()
+    updater = object.__new__(wu.WeightUpdater)
+    object.__setattr__(updater, "_m2n_receivers", {"pp0": receiver})
+    object.__setattr__(
+        updater,
+        "get_model_runner",
+        lambda: SimpleNamespace(
+            server_args=SimpleNamespace(
+                weight_cache_mode="attach" if cache == "ipc" else "off"
+            )
+        ),
+    )
+    with patch.object(
+        wu, "_unsupported_derived_weight_cache_error", return_value="derived cache"
+    ):
+        with pytest.raises(RuntimeError, match="weight_cache|derived cache"):
+            updater.receive_weights_from_m2n("pp0")
+    receiver.receive.assert_not_called()

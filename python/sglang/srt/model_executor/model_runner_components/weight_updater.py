@@ -63,6 +63,7 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
+    _m2n_receivers: dict = field(default_factory=dict)
 
     def init_weights_update_group(
         self,
@@ -72,6 +73,7 @@ class WeightUpdater:
         world_size,
         group_name,
         backend="nccl",
+        m2n_manifest=None,
     ):
         """Initialize the Torch process group for model parameter updates.
 
@@ -96,14 +98,57 @@ class WeightUpdater:
         )
 
         try:
+            if m2n_manifest is not None:
+                self._assert_m2n_update_allowed()
             na = NetworkAddress(master_address, master_port)
-            self._model_update_group[group_name] = init_custom_process_group(
+            pg_options = None
+            if m2n_manifest is not None:
+                pg_options = torch.distributed.ProcessGroupNCCL.Options()
+                pg_options.config.blocking = 1
+            pg = init_custom_process_group(
                 backend=backend,
                 init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                pg_options=pg_options,
             )
+            self._model_update_group[group_name] = pg
+            if m2n_manifest is not None:
+                from sglang.srt.distributed import (
+                    get_moe_tensor_parallel_rank,
+                    get_moe_tensor_parallel_world_size,
+                )
+                from sglang.srt.runtime_context import get_exec
+                from sglang.srt.weight_sync.nccl_m2n import NcclM2NReceiver
+
+                ps = self.get_model_runner().ps
+                moe = get_exec().moe
+                self._m2n_receivers[group_name] = NcclM2NReceiver(
+                    pg=pg,
+                    manifest=m2n_manifest,
+                    model=self.get_model(),
+                    device=torch.device(self.device),
+                    topology={
+                        "tp_rank": self.tp_rank,
+                        "tp_size": ps.tp_size,
+                        "moe_ep_rank": ps.moe_ep_rank,
+                        "moe_ep_size": ps.moe_ep_size,
+                        "moe_tp_rank": get_moe_tensor_parallel_rank(),
+                        "moe_tp_size": get_moe_tensor_parallel_world_size(),
+                        "dp_rank": ps.dp_rank or 0,
+                        "dp_size": ps.dp_size,
+                        "pp_rank": ps.pp_rank,
+                        "pp_size": ps.pp_size,
+                    },
+                    static_expert_placement=(
+                        not moe.enable_eplb
+                        and moe.elastic_ep_backend is None
+                        and moe.init_expert_location == "trivial"
+                        and moe.ep_num_redundant_experts == 0
+                    ),
+                )
+                return True, "Succeeded to initialize NCCL M2N process group."
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -112,16 +157,69 @@ class WeightUpdater:
 
     def destroy_weights_update_group(self, group_name):
         try:
-            if group_name in self._model_update_group:
-                pg = self._model_update_group.pop(group_name)
+            receiver = self._m2n_receivers.get(group_name)
+            pg = self._model_update_group.get(group_name)
+            if receiver is None and pg is None:
+                return True, "The custom process group is already absent."
+            if receiver is not None:
+                # M2N's native caches span every PP communicator in this
+                # process. Retire the whole M2N connection together, releasing
+                # those caches BEFORE destroying any cached NCCL communicator.
+                # Residual broadcast groups are independent and stay alive.
+                receivers = list(self._m2n_receivers.items())
+                for _, stage_receiver in receivers:
+                    stream = getattr(stage_receiver, "stream", None)
+                    if stream is not None:
+                        stream.synchronize()
+                for _, stage_receiver in receivers:
+                    stage_receiver.destroy()
+                for name, _ in receivers:
+                    stage_pg = self._model_update_group.get(name)
+                    if stage_pg is not None:
+                        torch.distributed.destroy_process_group(stage_pg)
+                    self._m2n_receivers.pop(name, None)
+                    self._model_update_group.pop(name, None)
+                return True, "Succeeded to destroy all NCCL M2N PP process groups."
+            if pg is not None:
                 torch.distributed.destroy_process_group(pg)
-                return True, "Succeeded to destroy custom process group."
-            else:
-                return False, "The group to be destroyed does not exist."
+            self._m2n_receivers.pop(group_name, None)
+            self._model_update_group.pop(group_name, None)
+            return True, "Succeeded to destroy custom process group."
         except Exception as e:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)
             return False, message
+
+    def receive_weights_from_m2n(self, group_name: str) -> None:
+        self._assert_m2n_update_allowed()
+        receiver = self._m2n_receivers.get(group_name)
+        if receiver is None:
+            raise RuntimeError(
+                f"Group {group_name!r} has no initialized NCCL M2N receiver"
+            )
+        receiver.receive()
+
+    def receive_weights_from_m2n_groups(self, group_names: List[str]) -> None:
+        from sglang.srt.weight_sync.nccl_m2n import NcclM2NReceiver
+
+        self._assert_m2n_update_allowed()
+        if not group_names or len(set(group_names)) != len(group_names):
+            raise ValueError("An M2N PP wave requires nonempty, distinct group names")
+        receivers = []
+        for group_name in group_names:
+            receiver = self._m2n_receivers.get(group_name)
+            if receiver is None:
+                raise RuntimeError(
+                    f"Group {group_name!r} has no initialized NCCL M2N receiver"
+                )
+            receivers.append(receiver)
+        NcclM2NReceiver.receive_many(receivers)
+
+    def _assert_m2n_update_allowed(self) -> None:
+        self._assert_weight_cache_inactive("receive_weights_from_m2n")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            raise RuntimeError(error)
 
     def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
         """Reject weight mutations while the CUDA IPC weight cache is active:
