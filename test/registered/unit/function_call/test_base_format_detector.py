@@ -1,5 +1,7 @@
 """Unit tests for BaseFormatDetector._ends_with_partial_token — no server, no model."""
 
+import unittest
+
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -43,3 +45,7 @@ class TestEndsWithPartialToken(CustomTestCase):
     def test_no_partial_returns_zero(self):
         self.assertEqual(self._partial("just some normal text", "<tool_call>"), 0)
         self.assertEqual(self._partial("", "<tool_call>"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
