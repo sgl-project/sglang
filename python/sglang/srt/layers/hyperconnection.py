@@ -46,6 +46,16 @@ class GroupedGemmaRMSNorm(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+                can_run_norm,
+                grouped_norm,
+            )
+
+            if can_run_norm(x, self.weight, self.group_size):
+                return grouped_norm(
+                    x, self.weight, self.group_size, self.variance_epsilon
+                )
         if (
             not _is_npu
             and x.is_cuda
@@ -193,6 +203,26 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+                    can_run_mix,
+                    mix,
+                )
+
+                if can_run_mix(
+                    hyper_input_normed,
+                    input_mix_weight_down,
+                    input_mix_weight_up,
+                    hc,
+                    hs,
+                ):
+                    return mix(
+                        hyper_input_normed,
+                        input_mix_weight_down,
+                        input_mix_weight_up,
+                        hc,
+                        hs,
+                    )
             input_mix_weight = F.silu(
                 F.linear(hyper_input_normed, input_mix_weight_down) / hc
             )
@@ -212,6 +242,23 @@ class GatedResidual(HyperConnectionBase):
             hc: int,
             hs: int,
         ) -> torch.Tensor:
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+                    can_run_combine,
+                    combine,
+                )
+
+                if can_run_combine(
+                    block_output, residual, normed_residual, block_inject_weight, hc, hs
+                ):
+                    return combine(
+                        block_output,
+                        residual,
+                        normed_residual,
+                        block_inject_weight,
+                        hc,
+                        hs,
+                    )
             R = residual.unflatten(-1, (hc, hs))
             block_inject_weight_out = 2 * torch.sigmoid(
                 F.linear(normed_residual, block_inject_weight) / hc
@@ -232,7 +279,8 @@ class GatedResidual(HyperConnectionBase):
         # an NPU backend then raises "No backend type associated with device
         # type npu". Thus fresh compilation succeeds, but a cached restart fails
         # in the extra timeout step, not in the compiled mix/combine operations.
-        # Run these two functions as ordinary Torch ops on NPU for now.
+        # Keep these functions outside torch.compile on NPU; supported vector
+        # operations can still dispatch to NPU Triton kernels.
         # Other platforms keep compilation; server NPU graph capture is unchanged.
         # TODO: Remove disable=_is_npu once dependency compatibility is verified
         # by both fresh-cache and cached-restart tests on NPU. Newer torch_npu
