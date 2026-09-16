@@ -409,7 +409,11 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
-        if not enable_two_batch_overlap:
+        if not enable_two_batch_overlap or (
+            get_moe_a2a_backend().is_nccl_ep()
+            and local_batch is not None
+            and not local_batch.forward_mode.is_cuda_graph()
+        ):
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
 
@@ -793,12 +797,13 @@ class TboForwardBatchPreparer:
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,
                 sampling_info=None,
-                # For logits and logprobs post processing, thus we do not care
+                # Logits/logprobs use the parent after child hidden states merge.
                 temperature=None,
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
+                extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
@@ -1092,6 +1097,13 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
                 NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nccl_ep():
+            from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+
+            self._inners = [
+                NcclEpDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
 
     @property

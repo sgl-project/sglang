@@ -1471,6 +1471,14 @@ class ModelRunner:
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+            if self.server_args.moe_a2a_backend == "nccl_ep":
+                # Graph admission needs the candidate split above. Once the
+                # batch falls back, drop TBO before preparing child batches or
+                # attention metadata. NCCL EP only supports full decode Graphs.
+                forward_batch.tbo_split_seq_index = None
+                forward_batch.global_forward_mode = None
+                forward_batch.tbo_children = None
+
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
             # early; split prefill, the prefill cuda graph, and the eager

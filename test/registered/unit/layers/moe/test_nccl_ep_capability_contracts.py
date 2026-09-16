@@ -122,14 +122,6 @@ def test_pp_dynamic_chunk_growth_is_rejected(model_path, supported_gpu):
         server_args(model_path, pp_size=2, enable_dynamic_chunking=True)
 
 
-@pytest.mark.parametrize("runner", ["triton", "deep_gemm"])
-def test_tbo_is_rejected(model_path, supported_gpu, runner):
-    with pytest.raises(ValueError, match="NCCL EP.*overlap"):
-        server_args(
-            model_path, moe_runner_backend=runner, enable_two_batch_overlap=True
-        )
-
-
 def test_triton_unavailable_fallback_uses_standard_dispatch(model_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 9))
     monkeypatch.setattr("sglang.srt.server_args._deepep_importable", lambda: True)

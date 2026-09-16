@@ -3394,6 +3394,10 @@ class BumpAllocator:
         self._pointer += size
         return output
 
+    def record_stream(self, stream: torch.cuda.Stream):
+        """Keep the backing storage alive while a stream uses allocated slices."""
+        self._buffer.record_stream(stream)
+
 
 def log_info_on_rank0(logger, msg):
 

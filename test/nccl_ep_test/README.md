@@ -101,18 +101,28 @@ See [the recorded validation](validation.md) for the tested snapshot and results
 
 ## Overlap stream regression
 
-Enable `--enable-single-batch-overlap` with NCCL EP LL to use an
-independent communication stream automatically. Overlap requires single-node
-CUDA, DeepSeek V2/V3 block-128 FP8 experts and the Triton MoE runner. TBO and
-EPLB migration are unsupported. Without SBO, NCCL EP retains serial execution
-on the current stream.
+Enable `--enable-two-batch-overlap` and/or `--enable-single-batch-overlap`
+with NCCL EP LL and `--enable-nccl-ep-cuda-graph` to use independent
+communication streams in full decode Graphs automatically. Dedicated Graph
+warmup and capture use overlap; serving eager prefill and decode fallbacks
+do not use SBO/TBO hooks, child batches or overlap streams.
+Overlap requires single-node CUDA, DeepSeek V2/V3 block-128 FP8 experts and
+the Triton MoE runner. EPLB migration is unsupported. Without SBO/TBO, NCCL
+EP retains serial execution on the current stream.
 
-Communication uses a separate CUDA stream while shared-expert computation
-stays on the current stream. Streams are initialized during warmup and reused
-during capture and replay. Graph replays and buckets remain serial.
+Each TBO lane retains its own communication stream, group, handle and scratch.
+With separate Triton attention children, attention TP=1 and dense TP=1, the
+existing staged executor also submits each lane's compute on a separate
+stream. Other attention backends keep compute on the existing stream because
+their children may share mutable workspace. A shared zero allocator keeps its
+backing storage alive across both streams; unsupported allocator types and
+TP collective paths retain the existing compute stream. Graph replays and
+buckets remain serial. Streams are initialized during warmup and reused
+during capture and replay.
 
-The tests cover producer/consumer ordering, captured tensor lifetimes,
-dynamic routing and the SBO model path:
+The tests cover producer/consumer ordering, independent lane completion,
+captured tensor lifetimes, shared allocator slices, dynamic routing and the
+existing staged model paths:
 
 ```bash
 PYTHONPATH=python:test python -m pytest -q \

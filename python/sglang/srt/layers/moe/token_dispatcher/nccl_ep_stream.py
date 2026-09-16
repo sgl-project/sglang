@@ -1,4 +1,4 @@
-"""A stream for NCCL EP communication during single-batch overlap.
+"""Streams for NCCL EP communication and eligible TBO compute lanes.
 
 The caller owns submission ordering. A send waits for its producer; completion
 joins back to the consumer. In particular, completion must NOT wait for work
@@ -37,11 +37,11 @@ class NcclEpStream:
         consumer.wait_stream(self.stream)
 
 
-def get_nccl_ep_stream(device):
+def get_nccl_ep_stream(device, instance_id=0, *, role="communication"):
     device = torch.device(device)
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = f"nccl_ep_stream_{device.index}"
+    key = f"nccl_ep_stream_{device.index}_{role}_{instance_id}"
     buffers = get_resources().buffers
     if key not in buffers:
         buffers[key] = NcclEpStream(device)

@@ -46,7 +46,8 @@ def model_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_public_overlap_modes(model_path, monkeypatch, graph):
+@pytest.mark.parametrize("sbo,tbo", [(True, False), (False, True), (True, True)])
+def test_public_overlap_modes(model_path, monkeypatch, graph, sbo, tbo):
     from nccl_ep_test.fake_ep import dispatcher_environment
 
     from sglang.srt.layers.moe.utils import initialize_moe_config
@@ -57,7 +58,8 @@ def test_public_overlap_modes(model_path, monkeypatch, graph):
         model_path,
         tp_size=2,
         enable_nccl_ep_cuda_graph=graph,
-        enable_single_batch_overlap=True,
+        enable_single_batch_overlap=sbo,
+        enable_two_batch_overlap=tbo,
     )
     # Restore every materialized flag, including flags changed by initialization.
     with get_flags().moe.override(**vars(get_flags().moe)):
@@ -73,7 +75,6 @@ def test_public_overlap_modes(model_path, monkeypatch, graph):
     [
         {"moe_runner_backend": "deep_gemm"},
         {"enable_eplb": True},
-        {"enable_two_batch_overlap": True},
     ],
 )
 def test_unsupported_overlap_is_rejected(model_path, monkeypatch, change):

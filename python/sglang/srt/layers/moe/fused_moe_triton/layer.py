@@ -146,8 +146,12 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         )
     elif a2a_backend.is_nccl_ep():
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
+        from sglang.srt.layers.moe.utils import is_tbo_enabled
 
-        return NcclEpDispatcher(
+        dispatcher_type = (
+            MaybeTboDeepEPDispatcher if is_tbo_enabled() else NcclEpDispatcher
+        )
+        return dispatcher_type(
             moe_runner_config=moe_runner_config,
             ep_group=get_tp_group(),
         )

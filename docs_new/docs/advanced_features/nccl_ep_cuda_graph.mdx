@@ -83,10 +83,10 @@ Prefill runs eagerly through LL. After DP divides the chunk size, SGLang limits
 each rank's chunk to `--nccl-ep-num-max-dispatch-tokens-per-rank` (default 1024),
 rounded down to a KV page boundary. Long prompts then run in multiple chunks.
 Unchunked prefill and PP dynamic chunking are unsupported. Decode-only
-disaggregation skips this prefill requirement. TBO remains unsupported.
+disaggregation skips this prefill requirement. TBO uses the same LL budget.
 
 Prefill Graphs, piecewise or breakable decode Graphs,
-speculative decoding, TBO, PDMux, elastic EP, multiple nodes, Torch
+speculative decoding, PDMux, elastic EP, multiple nodes, Torch
 compile and memory saver are outside this initial scope. Unsupported opt-in
 configurations raise an error during setup.
 
@@ -112,14 +112,39 @@ DeepEP's down-GEMM/combine signaling buffers. Leave
 `SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO` disabled; that alternate
 stream path is specific to the existing DeepEP integration. Shared-expert
 weights stay independent, and routed-expert scaling does not scale the shared
-output. Batches, layers and Graph buckets submit EP transactions serially.
+output. Without TBO, batches, layers and Graph buckets submit EP transactions serially.
+
+## Two-batch overlap
+
+For DeepSeek MoE models using the staged TBO execution path, add
+`--enable-two-batch-overlap`. The two subbatches use independent NCCL EP groups,
+handles and communication buffers. The existing TBO executor interleaves their
+dispatch, expert computation and combine stages. You can combine this with
+independent shared experts.
+
+Each subbatch uses its own communication stream automatically. Independent
+Triton attention children, attention TP=1 and dense TP=1 also allow separate
+compute streams. Shared attention workspaces, unsupported allocators and TP
+collective paths keep compute on the existing stream. Graph buckets and
+replays remain serialized.
+
+TBO runs only in full decode CUDA Graphs, including their dedicated warmup and
+capture. Prefill and decode fallbacks use eager LL without TBO splitting or
+overlap streams. Padded Graph subbatches mask inactive routes, including empty
+subbatches. Graph execution requires additional communication memory for the
+second subbatch.
+
+The measured DeepSeek-V2-Lite workload currently regresses against serial.
+The regression remains under active investigation and repair; enabling TBO
+does not guarantee an end-to-end speedup.
 
 ## Resource ownership
 
-Each capture generation owns one dedicated Graph group and one persistent LL
-handle. Compatible layers and batch-size buckets share those resources in strict
-serial order. This policy controls ownership of the group's shared communication
-state; the external API can create multiple handles.
+Each capture generation owns one dedicated Graph group and persistent LL handle
+per in-flight subbatch: one normally, two with TBO. Compatible layers and
+batch-size buckets reuse each subbatch's resources in strict serial order.
+Independent groups isolate mutable communication state between subbatches;
+the external API can create multiple handles within a group.
 
 Capture retains fixed-capacity storage for tokens, routing, weights and receive
 buffers. Bucket descriptors use the same base storage. `Handle.update` runs
@@ -128,9 +153,9 @@ without invoking the Python update path. Routing values can change while the
 captured operation structure and buffer addresses remain fixed.
 
 Stream ordering covers input writes, forward execution and already-queued output
-consumers. Concurrent host submissions are rejected. Eager execution uses a
-separate group. Recapture and shutdown wait for device work, release the Graph
-executables, then close their handle and group.
+consumers. Concurrent host submissions are rejected. Eager execution uses an
+unsplit group separate from the Graph groups. Recapture and shutdown wait for device work, release
+all Graph executables, then close their handles and groups.
 
 ## Validation scope
 
@@ -140,9 +165,9 @@ masked padding and controlled host capture failure. They compare against an
 independent CPU oracle using weighted synthetic experts. Full-model accuracy and
 real expert GEMM performance have not been evaluated for this Graph path.
 
-Local SBO tests run real Triton expert kernels, shared MLP and
+Local SBO and TBO tests run real Triton expert kernels, shared MLP and
 CUDA Graph replay with external EP replaced by a narrow test double. They cover
-dispatch/shared-expert ordering, dynamic routing, empty batches and resource ownership.
+staged ordering, dynamic routing, empty subbatches and per-lane resource ownership.
 Native two-GPU correctness and overlap profiling for these extensions remain
 pending; local passes do not establish native communication correctness or speedup.
 

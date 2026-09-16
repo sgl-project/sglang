@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_decode_registry,
@@ -38,12 +39,13 @@ class MetadataObserver:
     """Attention is outside this MoE experiment; observe its actual replay view."""
 
     use_captured_forward_metadata_for_breakable_cuda_graph = False
+    token_to_kv_pool = req_to_token_pool = None
 
     def __init__(self):
         self.views = []
 
-    def init_forward_metadata_out_graph(self, view):
-        self.views.append(view)
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        self.views.append(forward_batch)
 
     def init_forward_metadata(self, view):
         self.views.append(view)
@@ -59,6 +61,7 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
         backend_factory=None,
         share_inputs=False,
         capture_hidden_mode=CaptureHiddenMode.NULL,
+        tbo=False,
     ):
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.device_module = torch.cuda
@@ -78,9 +81,20 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
         self.ragged_verify_mode = False
         self.require_mlp_tp_gather = self.require_mlp_sync = False
         self.enable_pdmux = self.enable_two_batch_overlap = False
+        if tbo:
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                TboCudaGraphRunnerPlugin,
+            )
+
+            self.enable_two_batch_overlap = True
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
         self.is_encoder_decoder = self.is_dllm = self.disable_padding = False
         self.seq_len_fill_value = 1
         self.attn_backend = MetadataObserver()
+        if tbo:
+            from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+            self.attn_backend = TboAttnBackend.init_new(MetadataObserver)
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         self.buffers = DecodeInputBuffers.create(
             device=self.device,
@@ -125,6 +139,16 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
             for bucket in reversed(self.capture_bs):
                 self.buffers.num_token_non_padded.fill_(bucket)
                 batch = self.static_batch(bucket)
+                if self.enable_two_batch_overlap:
+                    from sglang.srt.model_executor.forward_context import (
+                        ForwardContext,
+                        forward_context,
+                    )
+
+                    with forward_context(
+                        ForwardContext(attn_backend=self.attn_backend)
+                    ):
+                        self.tbo_plugin.capture_one_batch_size(batch, num_tokens=bucket)
                 self.backend.capture_one(
                     self._make_graph_key(bucket),
                     lambda batch=batch: self.synthetic_forward(batch),
@@ -145,6 +169,9 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
             positions=buffers.positions[:bucket],
             num_token_non_padded=buffers.num_token_non_padded,
             capture_hidden_mode=self.capture_hidden_mode,
+            dp_padding_mode=(
+                DpPaddingMode.MAX_LEN if self.enable_two_batch_overlap else None
+            ),
         )
 
 

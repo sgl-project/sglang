@@ -4,8 +4,6 @@ Model initialization and router logits are fixtures. Shared MLP, dispatcher,
 MoeRunner, expert GEMMs, weighting and model composition execute production code.
 """
 
-from types import SimpleNamespace
-
 import torch
 
 from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
@@ -56,7 +54,11 @@ def make_moe(
     model.is_nextn = False
     model.num_fused_shared_experts = 0
     model.layer_id = config.layer_id
-    model.ep_size = dispatcher.world_size
+    model.ep_size = (
+        dispatcher._inners[0].world_size
+        if hasattr(dispatcher, "_inners")
+        else dispatcher.world_size
+    )
     model.routed_scaling_factor = scale
     model.gate = lambda x, **kwargs: torch.zeros(
         len(x), config.num_experts, device=x.device
@@ -64,26 +66,3 @@ def make_moe(
     model.experts = RoutedExperts(dispatcher, quant, config, fused_scaling)
     model.topk = router
     return model
-
-
-def metadata(mapping, *, ep_size=1, rank=0, device="cuda", num_logical=None):
-    from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-
-    physical = torch.tensor(mapping, dtype=torch.int64, device=device)
-    logical = num_logical or (max(max(row) for row in mapping) + 1)
-    inverse = torch.full(
-        (len(mapping), logical, len(mapping[0])), -1, dtype=torch.int64
-    )
-    for layer, row in enumerate(mapping):
-        for expert in range(logical):
-            slots = [slot for slot, value in enumerate(row) if value == expert]
-            inverse[layer, expert, : len(slots)] = torch.tensor(slots)
-    return ExpertLocationMetadata._init_raw(
-        server_args=SimpleNamespace(
-            ep_dispatch_algorithm="static", ep_join_mode=None, nnodes=1, ep_size=ep_size
-        ),
-        ep_size=ep_size,
-        physical_to_logical_map=physical,
-        logical_to_all_physical_map=inverse.to(device),
-        moe_ep_rank=rank,
-    )

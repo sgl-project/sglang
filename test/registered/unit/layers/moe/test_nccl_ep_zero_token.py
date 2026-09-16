@@ -124,7 +124,9 @@ def test_model_runner_votes_before_any_graph_or_eager_work(
     runner = SimpleNamespace(
         attn_backend=None,
         device="cuda",
-        server_args=SimpleNamespace(enable_nccl_ep_cuda_graph=True),
+        server_args=SimpleNamespace(
+            enable_nccl_ep_cuda_graph=True, moe_a2a_backend="nccl_ep"
+        ),
         decode_cuda_graph_runner=SimpleNamespace(
             can_run_graph=lambda batch: local_eligible,
             required_capture_hidden_mode=lambda batch: 0,
