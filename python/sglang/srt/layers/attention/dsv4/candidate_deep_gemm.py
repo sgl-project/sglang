@@ -6,10 +6,12 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_row_lens
-from sglang.kernels.ops.attention.dsv4.topk import (
+from sglang.kernels.ops.attention.dsv4.candidate_table import (
     amax8_varlen,
-    plan_topk_v2,
     sort_candidate_blocks,
+)
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
     topk_transform_bf16_small,
     topk_transform_paged_v2,
 )
@@ -35,17 +37,9 @@ class SparseBlockTable(CandidateMetadata):
     # top-k maps column j of the sparse row to slot phys_blocks[b, j // 8] * 8 + j % 8
     # with the plain page-table transform at page size 8
     phys_blocks: torch.Tensor
-    # [rows] int32: length of each row of the sparse logits (see `valid_lens`)
+    # [rows] int32: length of each row of the sparse logits: the published blocks
+    # laid out block by block, the newest possibly partial (`candidate_row_lens`)
     valid_lens: torch.Tensor
-
-
-def valid_lens(seq_lens: torch.Tensor, topk_blocks: int) -> torch.Tensor:
-    """Length of each row of the sparse logits: the published blocks laid out
-    block by block, the newest (highest) block possibly partial. Torch reference
-    of ``candidate_row_lens``; the decode path takes the kernel's value."""
-    block = CANDIDATE_BLOCK_SIZE
-    num = ((seq_lens + block - 1) // block).clamp_max(topk_blocks)
-    return block * (num - 1) + (seq_lens - 1) % block + 1
 
 
 def amax_topk_blocks(
@@ -159,17 +153,6 @@ def topk_transform_sparse(
     topk_transform_bf16_small(
         logits, valid_lens, table.phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
     )
-
-
-def warmup(rows: int, topk_blocks: int, page_size: int, q_dtype: torch.dtype, device):
-    """Build one schedule so DeepGEMM allocates its per-stream metadata workspace
-    outside any CUDA-graph capture."""
-    seq_lens = torch.full(
-        (rows,), CANDIDATE_BLOCK_SIZE, dtype=torch.int32, device=device
-    )
-    blocks = torch.zeros(rows, topk_blocks, dtype=torch.int32, device=device)
-    page_table = torch.zeros(rows, 1, dtype=torch.int32, device=device)
-    build_sparse_indexer_schedule(blocks, seq_lens, page_table, page_size, q_dtype)
 
 
 class DeepGemmCandidateIndexer:
