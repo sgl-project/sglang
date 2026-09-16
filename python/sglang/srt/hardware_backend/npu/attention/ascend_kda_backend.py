@@ -81,7 +81,6 @@ class _AscendKDAExtendKernel:
         # canonical contiguous [N, H, V, K] layout and scatter final_state back.
         num_sequences = query_start_loc.shape[0] - 1
         source_indices = cache_indices[:num_sequences].to(torch.long)
-        valid_state_mask = source_indices >= 0
         # Forward metadata may use -1 for a padded request.  index_select would
         # otherwise read the last cache slot and index_copy_ would overwrite it.
         # Slot 0 is a gather placeholder for that padded row; its computed result
@@ -127,11 +126,12 @@ class _AscendKDAExtendKernel:
                 return_intermediate_states=return_intermediate_states,
             )
 
-        valid_positions = valid_state_mask.nonzero(as_tuple=False).flatten()
+        num_valid_seqs = kwargs.get("num_valid_seqs")
+        num_valid = num_valid_seqs if num_valid_seqs is not None else num_sequences
         ssm_states.index_copy_(
             0,
-            source_indices.index_select(0, valid_positions),
-            final_state.index_select(0, valid_positions).to(dtype=ssm_states.dtype),
+            source_indices[:num_valid],
+            final_state[:num_valid].to(dtype=ssm_states.dtype),
         )
 
         if return_intermediate_states:
@@ -452,6 +452,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             dt_bias=extend_dt_bias,
             lower_bound=layer.lower_bound,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            num_valid_seqs=forward_batch._original_batch_size,
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
             return_intermediate_states=track_ssm,
             track_ssm_h_src=(

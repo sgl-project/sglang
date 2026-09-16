@@ -137,6 +137,11 @@ def chunk_kda_fwd_npu(
     del k, v
 
     # Phase 3: fused h + o kernel
+    # Transpose initial_state from V-major [N,H,V,K] to K-major [N,H,K,V]
+    # so the kernel runs with TRANSPOSE_STATE=False (optimal memory access
+    # on Ascend: stride=(V,1), order=(1,0) — V-contiguous).
+    if initial_state is not None:
+        initial_state = initial_state.transpose(-1, -2).contiguous()
     store_h = return_intermediate_states
     o, h, v_new, final_state = chunk_gated_delta_rule_fwd_h_o_fused(
         k=kg,
@@ -154,8 +159,15 @@ def chunk_kda_fwd_npu(
         chunk_size=chunk_size,
         store_h=store_h,
         save_new_value=False,
-        state_v_first=state_v_first,
+        state_v_first=False,
     )
+
+    # Transpose outputs back to V-major [N,H,V,K] to match the native
+    # ssm_states pool layout expected by downstream consumers.
+    if final_state is not None:
+        final_state = final_state.transpose(-1, -2).contiguous()
+    if h is not None and store_h:
+        h = h.transpose(-1, -2).contiguous()
 
     # Phase 4: cleanup intermediates
     del w, u, qg, kg, Aqk, g
