@@ -196,6 +196,47 @@ class TestAnthropicServing(unittest.TestCase):
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
 
+    def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
+        serving = self._serving()
+        for stream in (False, True):
+            request = self._anthropic_request(
+                stream=stream,
+                bootstrap_host="prefill.internal",
+                bootstrap_port=8998,
+                bootstrap_room=2**62 + 17,
+                routed_dp_rank=3,
+                disagg_prefill_dp_rank=2,
+                top_p=0.95,
+                thinking={"type": "adaptive"},
+                tools=[
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object", "properties": {}},
+                    }
+                ],
+            )
+            converted = serving._convert_to_chat_completion_request(request)
+            for field in (
+                "bootstrap_host",
+                "bootstrap_port",
+                "bootstrap_room",
+                "routed_dp_rank",
+                "disagg_prefill_dp_rank",
+            ):
+                self.assertEqual(getattr(converted, field), getattr(request, field))
+            self.assertEqual(converted.top_p, 0.95)
+            self.assertEqual(converted.tools[0].function.name, "lookup")
+            self.assertEqual(converted.stream, stream)
+
+    def test_messages_without_pd_keeps_default_rendezvous(self):
+        converted = self._serving()._convert_to_chat_completion_request(
+            self._anthropic_request()
+        )
+        self.assertIsNone(converted.bootstrap_host)
+        self.assertIsNone(converted.bootstrap_port)
+        self.assertIsNone(converted.bootstrap_room)
+
+
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
             [
