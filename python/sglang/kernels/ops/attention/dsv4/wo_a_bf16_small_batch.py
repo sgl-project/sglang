@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.layernorm.mxfp8_epilogue import ue8m0_scale
+
 
 @triton.jit
 def _wo_a_partial(X, W, P, M: tl.constexpr, SX: tl.constexpr):
@@ -63,14 +65,7 @@ def _wo_a_reduce_quant(P, Q, S, M: tl.constexpr):
     v = tl.load(P + split[:, None] * (M * 2048) + row * 2048 + i[None, :])
     y = tl.sum(v, 0).to(tl.bfloat16).to(tl.float32).reshape((8, 32))
     amax = tl.max(tl.abs(y), 1)
-    # FlashInfer's positive-rounding UE8M0 conversion, including subnormals.
-    normalized = amax * (1.0 / 448.0)
-    bits = normalized.to(tl.int32, bitcast=True)
-    exponent = (bits >> 23) & 255
-    mantissa = bits & 0x7FFFFF
-    bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
-    sf = tl.where(normalized <= 0, 0, tl.minimum(exponent + bump.to(tl.int32), 254))
-    inv = tl.where(sf == 0, 0, ((254 - sf) << 23)).to(tl.float32, bitcast=True)
+    sf, inv = ue8m0_scale(amax)
     quant = tl.minimum(tl.maximum(y * inv[:, None], -448.0), 448.0).to(tl.float8e4nv)
     tl.store(Q + row * 2048 + i, quant.reshape((256,)))
     col = tile * 8 + tl.arange(0, 8)

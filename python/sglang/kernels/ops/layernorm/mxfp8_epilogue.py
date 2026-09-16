@@ -20,6 +20,20 @@ import triton
 import triton.language as tl
 
 
+# FlashInfer's positive-rounding UE8M0 conversion of a per-group amax, subnormals
+# included: the scale byte and the multiplier that maps the group into e4m3 range.
+@triton.jit
+def ue8m0_scale(amax):
+    normalized = amax * (1.0 / 448.0)
+    bits = normalized.to(tl.int32, bitcast=True)
+    exponent = (bits >> 23) & 255
+    mantissa = bits & 0x7FFFFF
+    bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
+    sf = tl.where(normalized <= 0, 0, tl.minimum(exponent + bump.to(tl.int32), 254))
+    inv = tl.where(sf == 0, 0, ((254 - sf) << 23)).to(tl.float32, bitcast=True)
+    return sf, inv
+
+
 @triton.jit
 def _mxfp8_epilogue(
     y, row, Q, S, K: tl.constexpr, BLOCK: tl.constexpr, GROUPS: tl.constexpr, g_lo, g_hi
@@ -36,13 +50,7 @@ def _mxfp8_epilogue(
     idx = g[:, None] * 32 + e[None, :]
     v = tl.reshape(y.to(tl.float32), (GP, 32))
     amax = tl.max(tl.abs(v), 1)
-    normalized = amax * (1.0 / 448.0)
-    bits = normalized.to(tl.int32, bitcast=True)
-    exponent = (bits >> 23) & 255
-    mantissa = bits & 0x7FFFFF
-    bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
-    sf = tl.where(normalized <= 0, 0, tl.minimum(exponent + bump.to(tl.int32), 254))
-    scale = tl.where(sf == 0, 0, ((254 - sf) << 23)).to(tl.float32, bitcast=True)
+    sf, scale = ue8m0_scale(amax)
     q = tl.minimum(tl.maximum(v * scale[:, None], -448.0), 448.0).to(tl.float8e4nv)
     tl.store(Q + row * K + idx, q, gmask[:, None])
     off = (g // 4) * 512 + ((row % 32) * 4 + ((row // 32) % 4)) * 4 + (g % 4)
@@ -63,7 +71,6 @@ def _hc_combine_norm_mxfp8_kernel(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     GROUPS: tl.constexpr,
-    PARTS: tl.constexpr,
     SLICE: tl.constexpr,
 ):
     row, part = tl.program_id(0), tl.program_id(1)
@@ -85,8 +92,8 @@ def _hc_combine_norm_mxfp8_kernel(
     )
 
 
-def _parts_for(m: int, k: int) -> int:
-    """Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs."""
+def _parts_for(k: int) -> int:
+    # Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs.
     parts = 4
     while parts > 1 and (k % (parts * 32)):
         parts //= 2
@@ -110,7 +117,7 @@ def hc_combine_norm_mxfp8(
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)
-    parts = _parts_for(m, k)
+    parts = _parts_for(k)
     _hc_combine_norm_mxfp8_kernel[(m, parts)](
         x,
         pre,
@@ -124,7 +131,6 @@ def hc_combine_norm_mxfp8(
         K=k,
         BLOCK=triton.next_power_of_2(k),
         GROUPS=k // 32,
-        PARTS=parts,
         SLICE=k // parts,
         num_warps=8,
     )
@@ -176,7 +182,15 @@ def _rmsnorm_mxfp8_kernel(
         tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
 
 
-def rmsnorm_mxfp8(x, weight, eps, *, parts=1, num_warps=8):
+def rmsnorm_mxfp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    parts: int = 1,
+    num_warps: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
     assert 0 < m <= 8 and k % (parts * 32) == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
