@@ -199,7 +199,6 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   if (tx >= kNopeThreads) {
     // Match rope_tail()'s bf16 rounding before fake quantization.
     // Only odd positions reach here; the latent represents `pos - 1`.
-    freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
       const auto x_real = staged[i * 2 + 0];
