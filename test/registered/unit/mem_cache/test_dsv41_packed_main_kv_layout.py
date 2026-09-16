@@ -102,7 +102,7 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
         ):
             validate_deepseek_v41_features(object())
 
-    def test_sm90_direct_consumer_is_accepted(self):
+    def test_direct_consumer_rejects_non_sm90(self):
         from sglang.srt.arg_groups.deepseek_v4_hook import (
             validate_deepseek_v41_features,
         )
@@ -111,7 +111,6 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
             dsv41_main_kv_layout="packed_fp4",
             dsv41_main_kv_consumer="direct",
             dsv4_attn_backend="flashmla",
-            enable_encoder_swa_bounded_replay=False,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(model_type="deepseek_v41")
@@ -127,8 +126,9 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
             ),
             patch(
                 "sglang.srt.arg_groups.deepseek_v4_hook.get_platform",
-                return_value=SimpleNamespace(is_sm90=True),
+                return_value=SimpleNamespace(is_sm90=False),
             ),
+            self.assertRaisesRegex(ValueError, "requires SM90"),
         ):
             validate_deepseek_v41_features(object())
 
