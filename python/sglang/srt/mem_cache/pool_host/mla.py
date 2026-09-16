@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     to_device_no_sync,
     track_pinned_staging,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -288,6 +289,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 1,
                 self.kv_cache_dim,
             )
+        elif self.layout == "page_unified":
+            # Same bytes as page_first_direct -- MLA is rank-replicated, so the
+            # grid never cuts a head axis and there is nothing to permute. It
+            # is still its own layout so the L3 namespace, the transfer arms
+            # and the MHA side all name one thing.
+            self.page_unified_layout = PageUnifiedLayout(
+                page_size=self.page_size,
+                layer_num=self.layer_num,
+                head_num=1,
+                head_group_num=1,
+                head_dim=self.kv_cache_dim,
+                itemsize=self.dtype.itemsize,
+                is_mla=True,
+            )
+            dims = self.page_unified_layout.page_dims(self.page_num)
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
@@ -387,7 +403,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             allocator=self.allocator,
             registration_granularity_bytes=(
                 self.page_size * self.layout_dim
-                if self.layout in ("page_first", "page_first_direct")
+                if self.layout in ("page_first", "page_first_direct", "page_unified")
                 else None
             ),
         )

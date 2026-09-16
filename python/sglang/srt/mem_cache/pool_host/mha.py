@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -84,9 +85,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
+        head_group_num: int = 1,
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
+        # page_unified cuts the kv-head axis into this many groups, and the cut
+        # is part of the byte order, so it has to be known before the buffer is
+        # allocated in init_kv_buffer() below.
+        self.head_group_num = head_group_num
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -107,7 +113,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
+        if self.layout == "page_unified":
+            # No per-component per-layer view exists: a layer's K and V are
+            # interleaved inside each head group's block. The page_unified
+            # transfer kernels address the fused buffer directly instead.
+            self.k_data_refs = []
+            self.v_data_refs = []
+        elif self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)
@@ -117,15 +129,23 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = make_kernel_ptr_table(
-            self.k_data_refs,
-            self.device_pool.device,
-            host_memory_registered=self.pin_memory,
+        self.k_data_ptrs = (
+            make_kernel_ptr_table(
+                self.k_data_refs,
+                self.device_pool.device,
+                host_memory_registered=self.pin_memory,
+            )
+            if self.k_data_refs
+            else None
         )
-        self.v_data_ptrs = make_kernel_ptr_table(
-            self.v_data_refs,
-            self.device_pool.device,
-            host_memory_registered=self.pin_memory,
+        self.v_data_ptrs = (
+            make_kernel_ptr_table(
+                self.v_data_refs,
+                self.device_pool.device,
+                host_memory_registered=self.pin_memory,
+            )
+            if self.v_data_refs
+            else None
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -183,6 +203,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.head_dim,
             )
+        elif self.layout == "page_unified":
+            self.page_unified_layout = PageUnifiedLayout(
+                page_size=self.page_size,
+                layer_num=self.layer_num,
+                head_num=self.head_num,
+                head_group_num=self.head_group_num,
+                head_dim=self.head_dim,
+                itemsize=self.dtype.itemsize,
+            )
+            dims = self.page_unified_layout.page_dims(self.page_num)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
@@ -196,7 +226,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                self.page_size * self.layout_dim
+                # page_unified's block carries both components, so its page is
+                # twice page_size * layout_dim.
+                self.page_unified_layout.bytes_per_page
+                if self.layout == "page_unified"
+                else self.page_size * self.layout_dim
                 if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
