@@ -264,14 +264,3 @@ Pending update — a sample transcript will be added here once the weights are p
 ```
 
 </Accordion>
-
-### 2.3 FP8 QSA Indexer Cache
-
-The QSA block selector keeps a compressed indexer key per group of `compress_ratio` tokens and scores every query against that cache. By default those keys, and the index query they are dotted with, are bf16. `--qsa-indexer-dtype fp8_e4m3` stores the compressed keys as plain e4m3 (a direct cast, no scale, the rows are RMS-normed before storage) and runs the block-scoring GEMMs on the fp8 tensor-core path with fp32 accumulation, which halves the scoring bandwidth of the indexer on long contexts. The raw pending-key ring, the main KV cache, the selected-block attention and the logits are unaffected, so the option changes only which blocks are selected, not how they are attended to.
-
-```bash
-# Add to any NVIDIA recipe above (Hopper or Blackwell).
---qsa-indexer-dtype fp8_e4m3
-```
-
-Requirements: CUDA SM90+ (H100/H200, B200/B300/GB300) and a compressed-QSA checkpoint such as Qwen3.8-Flash-Next. Every other value (`auto`, `bfloat16`) keeps the bf16 indexer.
