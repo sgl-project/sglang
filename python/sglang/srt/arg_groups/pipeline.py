@@ -101,10 +101,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
+    run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
@@ -188,6 +190,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+        finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
     )
 
@@ -366,6 +369,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
     run_hook(handle_model_capability_adjustments, server_args)
+
+    finalize_cuda_graph_prefill_max_context(server_args)
 
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)

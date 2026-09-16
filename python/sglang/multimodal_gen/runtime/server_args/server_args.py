@@ -1466,9 +1466,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
