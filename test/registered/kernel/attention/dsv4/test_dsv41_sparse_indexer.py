@@ -68,7 +68,9 @@ class TestSparseIndexer(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
             candidate_row_lens,
         )
-        from sglang.kernels.ops.attention.dsv4.topk import sort_candidate_blocks
+        from sglang.kernels.ops.attention.dsv4.candidate_table import (
+            sort_candidate_blocks,
+        )
         from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
             amax_topk_blocks,
             valid_lens,
@@ -133,7 +135,7 @@ class TestSparseIndexer(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
             candidate_row_lens,
         )
-        from sglang.kernels.ops.attention.dsv4.topk import (
+        from sglang.kernels.ops.attention.dsv4.candidate_table import (
             sort_candidate_blocks,
         )
         from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (

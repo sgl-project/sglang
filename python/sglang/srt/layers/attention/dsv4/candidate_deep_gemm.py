@@ -6,10 +6,12 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_row_lens
-from sglang.kernels.ops.attention.dsv4.topk import (
+from sglang.kernels.ops.attention.dsv4.candidate_table import (
     amax8_varlen,
-    plan_topk_v2,
     sort_candidate_blocks,
+)
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
     topk_transform_bf16_small,
     topk_transform_paged_v2,
 )
