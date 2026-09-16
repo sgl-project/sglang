@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch
 import torch.distributed as dist
 import zmq
 from aiohttp import web
@@ -30,6 +31,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
 )
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -47,6 +49,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.common import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +308,113 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    # ------------------------------------------------------------------
+    # Layerwise KV transfer (device-agnostic)
+    # ------------------------------------------------------------------
+
+    def init_layerwise(self) -> None:
+        """Lazily create the dedicated transfer stream.  Called once on
+        the first layerwise forward; idempotent."""
+        if getattr(self, "_layerwise_initialized", False):
+            return
+        device = self.kv_args.kv_data_ptrs[0].device
+        self._transfer_stream = create_device_stream(device)
+        self._layerwise_device = device
+        self._layerwise_initialized = True
+        logger.info(
+            "Layerwise PD KV transfer enabled (stream overlap) "
+            "on %s (pp_size=%d, is_mla=%s).",
+            device,
+            self.pp_size,
+            self.is_mla_backend,
+        )
+
+    def build_layer_transfer_blocks(
+        self,
+        layer_id: int,
+        src_ptr: int,
+        dst_kv_ptrs_for_layer: int,
+        item_len: int,
+        precomputed_layout: Optional[Tuple[List, List]] = None,
+    ) -> List[Tuple[int, int, int]]:
+        """Build the ``(src_addr, dst_addr, length)`` tuples for a single
+        layer, mirroring ``set_transfer_blocks`` inside ``send_kvcache``.
+
+        ``precomputed_layout`` is the result of a prior
+        ``group_concurrent_contiguous`` call for the same page indices.
+        When provided, the NumPy diff/split work is skipped — the layout
+        is identical for every layer in one forward."""
+        if precomputed_layout is not None:
+            prefill_kv_blocks, dst_kv_blocks = precomputed_layout
+        else:
+            raise RuntimeError(
+                "build_layer_transfer_blocks requires precomputed_layout "
+                "(the sender caches group_concurrent_contiguous per-forward)"
+            )
+        transfer_blocks: List[Tuple[int, int, int]] = []
+        for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+            src_addr = src_ptr + int(prefill_index[0]) * item_len
+            dst_addr = dst_kv_ptrs_for_layer + int(decode_index[0]) * item_len
+            length = item_len * len(prefill_index)
+            transfer_blocks.append((src_addr, dst_addr, length))
+        return transfer_blocks
+
+    def submit_layerwise_transfer(
+        self,
+        session_id: str,
+        transfer_blocks: List[Tuple[int, int, int]],
+        compute_event: Optional[object],
+    ) -> None:
+        """Submit one layer's RDMA write on the transfer stream.
+
+        ``compute_event`` is recorded on the compute stream right after the
+        layer's attention op.  ``stream.wait_event`` inserts a *non-blocking*
+        dependency: the transfer stream will not execute the RDMA until the
+        compute stream has reached that event, but the calling (compute)
+        thread is **not** blocked — it returns immediately and can continue
+        submitting the next layer's compute kernels.
+        """
+        stream = self._transfer_stream
+        if compute_event is not None:
+            stream.wait_event(compute_event)
+        with device_stream_context(stream):
+            self._transfer_data(session_id, transfer_blocks)
+
+    def wait_compute_on_transfer(self) -> None:
+        """Make the compute stream wait for all queued transfer-stream work.
+
+        Inserts a non-blocking dependency: the compute stream will not
+        execute subsequent kernels until the transfer stream has drained.
+        Called before EP combine communication to avoid RDMA / network
+        resource contention.
+        """
+        if hasattr(self, "_transfer_stream"):
+            dev_mod = torch.get_device_module(self._layerwise_device)
+            dev_mod.current_stream().wait_stream(self._transfer_stream)
+
+    def finish_layerwise(self) -> None:
+        """Record completion event on the transfer stream (non-blocking).
+
+        Called right after the model forward loop ends.  Records an event on
+        the transfer stream so the actual CPU-side wait can be deferred to
+        :meth:`wait_layerwise_done`.
+        """
+        if hasattr(self, "_transfer_stream"):
+            if not hasattr(self, "_layerwise_done_event"):
+                dev_mod = torch.get_device_module(self._layerwise_device)
+                self._layerwise_done_event = dev_mod.Event()
+            self._layerwise_done_event.record(self._transfer_stream)
+
+    def wait_layerwise_done(self) -> None:
+        """Block the CPU until all transfer-stream RDMA writes have completed."""
+        event = getattr(self, "_layerwise_done_event", None)
+        if event is not None:
+            event.synchronize()
+
+    # ------------------------------------------------------------------
+    # End layerwise
+    # ------------------------------------------------------------------
 
     def _should_skip_cp_replicated_state_transfer(self) -> bool:
         """Whether this prefill rank should omit CP-replicated state.
@@ -1425,6 +1535,18 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
+        # Layerwise state
+        self._layerwise_enabled = bool(envs.SGLANG_DISAGG_LAYERWISE.get()) and (
+            not self.kv_mgr.is_dummy_cp_rank
+        )
+        self._layerwise_num_layers = 0
+        self._layerwise_prefill_kv_indices: Optional[npt.NDArray[np.int32]] = None
+        self._layerwise_dst_kv_indices: Optional[npt.NDArray[np.int32]] = None
+        self._layer_layout_cache: Optional[Tuple[List, List]] = None
+        self._pending_layerwise_layers: List[int] = []
+        self._layerwise_dispatched_count = 0
+        self._layerwise_send_waited = True
+        self._last_dispatched_layer: int = -1
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -1478,6 +1600,190 @@ class CommonKVSender(BaseKVSender):
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    # ------------------------------------------------------------------
+    # Layerwise KV transfer (device-agnostic)
+    # ------------------------------------------------------------------
+
+    @property
+    def is_layerwise_enabled(self) -> bool:
+        return self._layerwise_enabled
+
+    @property
+    def layerwise_kv_fully_dispatched(self) -> bool:
+        """True only if every expected layer was dispatched via save_kv_layer.
+        When False, the post-forward send path must fall back to a full
+        KV send so no layer's cache is lost."""
+        return (
+            self._layerwise_enabled
+            and self._layerwise_num_layers > 0
+            and self._layerwise_dispatched_count >= self._layerwise_num_layers
+        )
+
+    def set_layerwise_indices(
+        self,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> None:
+        """Cache the page indices for the upcoming layerwise forward."""
+        self._layerwise_prefill_kv_indices = prefill_kv_indices
+        self._layerwise_dst_kv_indices = dst_kv_indices
+
+    def start_layerwise_send(self, num_layers: int) -> None:
+        """Prepare the manager's transfer stream for the upcoming forward."""
+        if not self._layerwise_enabled:
+            return
+        self._layerwise_num_layers = num_layers
+        self._layer_layout_cache = None
+        self._pending_layerwise_layers = []
+        self._layerwise_dispatched_count = 0
+        self._layerwise_send_waited = False
+        self._last_dispatched_layer = -1
+        self.kv_mgr.init_layerwise()
+
+    def save_kv_layer(self, layer_id: int) -> None:
+        """Submit one layer's KV transfer on the transfer stream.
+
+        1. Record an event on the compute stream (marks KV write complete).
+        2. Submit the RDMA write on the transfer stream with a ``wait_event``
+           dependency — non-blocking for the CPU, the device handles overlap.
+
+        If bootstrap hasn't completed yet (transfer_infos empty), the layer
+        is buffered in ``_pending_layerwise_layers`` and flushed once
+        bootstrap becomes available in a later call or in
+        finalize_layerwise_send.
+        """
+        if not self._layerwise_enabled:
+            return
+        if self._layerwise_prefill_kv_indices is None:
+            return
+        # Guard against duplicate calls for the same layer_id.  MLA models
+        # (e.g. DeepSeek) have two RadixAttention instances per layer
+        # (attn_mqa + attn_mha) sharing one layer_id; the hook in
+        # RadixAttention.forward fires for both, but the KV for that layer
+        # should only be transferred once.
+        if layer_id == self._last_dispatched_layer:
+            return
+        self._last_dispatched_layer = layer_id
+        mgr = self.kv_mgr
+        transfer_infos = getattr(mgr, "transfer_infos", {})
+        room = self.bootstrap_room
+        room_infos = transfer_infos.get(room)
+        if not room_infos:
+            self._pending_layerwise_layers.append(layer_id)
+            return
+        compute_event = self._record_compute_event()
+        if self._pending_layerwise_layers:
+            for pending_id in self._pending_layerwise_layers:
+                self._dispatch_single_layer(
+                    pending_id, mgr, room_infos, compute_event
+                )
+                self._layerwise_dispatched_count += 1
+            self._pending_layerwise_layers = []
+        self._dispatch_single_layer(layer_id, mgr, room_infos, compute_event)
+        self._layerwise_dispatched_count += 1
+
+    def _dispatch_single_layer(
+        self,
+        layer_id: int,
+        mgr: "CommonKVManager",
+        room_infos: dict,
+        compute_event: Optional[object],
+    ) -> None:
+        """Build and submit one layer's RDMA write on the transfer stream."""
+        if self._layer_layout_cache is None:
+            self._layer_layout_cache = group_concurrent_contiguous(
+                self._layerwise_prefill_kv_indices,
+                self._layerwise_dst_kv_indices,
+            )
+        for tinfo in list(room_infos.values()):
+            if tinfo.is_dummy:
+                continue
+            decode_kv_args = mgr.decode_kv_args_table.get(tinfo.mooncake_session_id)
+            if decode_kv_args is None:
+                continue
+            if mgr.pp_size > 1:
+                rel_layer = layer_id - mgr.kv_args.prefill_start_layer
+                src_kv_ptrs, sliced_dst_kv_ptrs, _ = mgr.get_mla_kv_ptrs_with_pp(
+                    mgr.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
+                )
+                src_ptr = src_kv_ptrs[rel_layer]
+                dst_ptr = sliced_dst_kv_ptrs[rel_layer]
+                item_len = mgr.kv_args.kv_item_lens[rel_layer]
+            else:
+                src_ptr = mgr.kv_args.kv_data_ptrs[layer_id]
+                dst_ptr = decode_kv_args.dst_kv_ptrs[layer_id]
+                item_len = mgr.kv_args.kv_item_lens[layer_id]
+            blocks = mgr.build_layer_transfer_blocks(
+                layer_id,
+                src_ptr,
+                dst_ptr,
+                item_len,
+                precomputed_layout=self._layer_layout_cache,
+            )
+            mgr.submit_layerwise_transfer(
+                tinfo.mooncake_session_id, blocks, compute_event
+            )
+
+    def wait_compute_on_transfer(self) -> None:
+        """Make the compute stream wait for all queued transfer-stream work.
+
+        No-op if layerwise is disabled or no transfer was submitted."""
+        if not self._layerwise_enabled:
+            return
+        if self._layerwise_dispatched_count == 0 and not self._pending_layerwise_layers:
+            return
+        self.kv_mgr.wait_compute_on_transfer()
+
+    def finalize_layerwise_send(self) -> None:
+        """Prepare for post-forward KV transfer completion.
+
+        If bootstrap completed by end of forward, any layers buffered while
+        it was pending are flushed here.  If bootstrap is still not complete,
+        ``layerwise_kv_fully_dispatched`` returns False, causing the
+        post-forward send path to fall back to a full KV send."""
+        if not self._layerwise_enabled:
+            return
+        if self._pending_layerwise_layers:
+            mgr = self.kv_mgr
+            transfer_infos = getattr(mgr, "transfer_infos", {})
+            room_infos = transfer_infos.get(self.bootstrap_room)
+            if room_infos:
+                compute_event = self._record_compute_event()
+                for pending_id in self._pending_layerwise_layers:
+                    self._dispatch_single_layer(
+                        pending_id, mgr, room_infos, compute_event
+                    )
+                    self._layerwise_dispatched_count += 1
+                self._pending_layerwise_layers = []
+        self.kv_mgr.finish_layerwise()
+
+    def _record_compute_event(self):
+        """Record a device event on the current compute stream so the
+        transfer stream can wait for the KV write to land before issuing
+        RDMA."""
+        dev_mod = torch.get_device_module(self.kv_mgr._layerwise_device)
+        event = dev_mod.Event()
+        event.record()
+        return event
+
+    def wait_layerwise_send_done(self) -> None:
+        """Synchronize the transfer-stream event (deferred from
+        finalize_layerwise_send).
+
+        Called by the scheduler at a single sync point — after PP
+        batchSendRecv, before ``_pp_process_batch_result`` — so all PP
+        ranks wait at the same pipeline stage.  Idempotent within one
+        forward (guarded by ``_layerwise_send_waited``).
+        """
+        if not self._layerwise_enabled or self._layerwise_send_waited:
+            return
+        self._layerwise_send_waited = True
+        self.kv_mgr.wait_layerwise_done()
+
+    # ------------------------------------------------------------------
+    # End layerwise
+    # ------------------------------------------------------------------
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
