@@ -20,39 +20,19 @@ from transformers import PretrainedConfig
 _DEFAULT_ROPE_THETA = 10000.0
 
 
-def _default_rope_parameters() -> dict:
+def _normalize_rope_parameters(raw: Optional[dict]) -> dict:
+    """Return the per-layer-type RoPE dict: default RoPE on sliding layers, NoPE on full."""
+    raw = raw or {}
+    if raw.get("full_attention") is not None:
+        raise ValueError("full_attention must run without rotary embeddings")
+    sliding = raw.get("sliding_attention") or {}
+    if sliding.get("rope_type", "default") != "default":
+        raise ValueError("Beam supports only default RoPE")
     return {
         "sliding_attention": {
             "rope_type": "default",
-            "rope_theta": _DEFAULT_ROPE_THETA,
+            "rope_theta": float(sliding.get("rope_theta", _DEFAULT_ROPE_THETA)),
         },
-        "full_attention": None,
-    }
-
-
-def _normalize_rope_parameters(raw) -> dict:
-    """Normalize Beam's fixed sliding-RoPE and full-NoPE configuration."""
-    if raw is None:
-        return _default_rope_parameters()
-    if not isinstance(raw, dict):
-        raise TypeError(f"rope_parameters must be a dictionary: {raw!r}")
-    expected = {"sliding_attention", "full_attention"}
-    if set(raw) != expected:
-        raise ValueError(
-            f"rope_parameters must contain exactly {sorted(expected)}: {raw!r}"
-        )
-    if raw["full_attention"] is not None:
-        raise ValueError("full_attention must run without rotary embeddings")
-    sliding = raw["sliding_attention"]
-    if not isinstance(sliding, dict):
-        raise TypeError("sliding_attention rope parameters must be a dictionary")
-    if sliding.get("rope_type", "default") != "default":
-        raise ValueError("Beam supports only default RoPE")
-    theta = sliding.get("rope_theta", _DEFAULT_ROPE_THETA)
-    if isinstance(theta, bool) or not isinstance(theta, (int, float)):
-        raise TypeError(f"rope_theta must be a number: {theta!r}")
-    return {
-        "sliding_attention": {"rope_type": "default", "rope_theta": float(theta)},
         "full_attention": None,
     }
 

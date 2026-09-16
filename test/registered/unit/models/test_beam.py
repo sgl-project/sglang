@@ -261,8 +261,6 @@ class TestBeamConfig(CustomTestCase):
                         "full_attention": None,
                     }
                 )
-        with self.assertRaisesRegex(ValueError, "must contain exactly"):
-            BeamConfig(rope_parameters={"sliding_attention": {"rope_type": "default"}})
         with self.assertRaisesRegex(ValueError, "without rotary embeddings"):
             BeamConfig(
                 rope_parameters={
