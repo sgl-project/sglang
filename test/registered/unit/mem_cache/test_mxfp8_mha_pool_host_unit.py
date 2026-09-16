@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
 from sglang.srt.mem_cache.pool_host.mha import (
+    AsymmetricMHATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
@@ -81,10 +82,26 @@ def _make_host(k_rows, v_rows):
 class TestMXFP8MHATokenToKVPoolHost(CustomTestCase):
     def test_factory_selects_mxfp8_host_pool(self):
         mxfp8_pool = MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8)
+        mxfp8_pool.head_dim = mxfp8_pool.v_head_dim = 128
         plain_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
+        asymmetric_pool = SimpleNamespace(head_dim=128, v_head_dim=64)
 
         self.assertIs(get_mha_host_pool_cls(mxfp8_pool), MHATokenToKVPoolMXFP8Host)
         self.assertIs(get_mha_host_pool_cls(plain_pool), MHATokenToKVPoolHost)
+        self.assertIs(
+            get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
+        )
+
+    def test_factory_rejects_asymmetric_mxfp8_pool(self):
+        mxfp8_pool = MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8)
+        mxfp8_pool.head_dim = 128
+        mxfp8_pool.v_head_dim = 64
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "MXFP8 HiCache does not support asymmetric K/V head dimensions yet",
+        ):
+            get_mha_host_pool_cls(mxfp8_pool)
 
     def test_size_per_token_counts_scales(self):
         host = MHATokenToKVPoolMXFP8Host.__new__(MHATokenToKVPoolMXFP8Host)

@@ -1425,6 +1425,11 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
     if isinstance(device_pool, MHATokenToKVPoolMXFP8):
+        if device_pool.head_dim != device_pool.v_head_dim:
+            raise NotImplementedError(
+                "MXFP8 HiCache does not support asymmetric K/V head dimensions yet."
+            )
+
         from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
             MHATokenToKVPoolMXFP8Host,
         )
