@@ -2861,6 +2861,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # names a position no page can hold. Donate only where an h snapshot exists.
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
+        # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+        # mamba radix cache to track which seqlen this mamba state should store at.
         mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
         mask = (
             mamba_track_seqlen_aligned > prefix_len
@@ -2879,9 +2881,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
             mamba_track_seqlen = seq_end
-
-            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-            # mamba radix cache to track which seqlen this mamba state should store at.
 
             # A coarser checkpoint grid may not be a model-state boundary, so
             # force retrieval from the intermediate h state in that case.
