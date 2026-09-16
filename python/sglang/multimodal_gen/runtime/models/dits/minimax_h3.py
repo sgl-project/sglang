@@ -680,11 +680,6 @@ def _minimax_h3_attention_core_impl(
         return out
 
     if ring_active:
-        if attention._quant_attn_backend is not None and current_platform.is_npu():
-            raise NotImplementedError(
-                "MiniMax H3 MXFP8 attention does not support ring parallelism"
-                "FA-v2 does not return the softmax LSE used by ring merge"
-            )
         ring_ws, _ = get_ring_ctx()
         if attention._attention_backend_enum is not AttentionBackendEnum.FA:
             raise NotImplementedError(
@@ -776,17 +771,6 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
-        self.quant_config = quant_config
-        self._quant_attn_backend: AttentionBackendEnum | None = None
-
-        if current_platform.is_npu():
-            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
-                resolve_mx_fa_scheme,
-            )
-
-            if resolve_mx_fa_scheme(quant_config) is not None:
-                self._quant_attn_backend = AttentionBackendEnum.FA
-
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # attention initializes on the first real QKV tensors, after the
@@ -880,7 +864,6 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
-            quant_config=self.quant_config,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
