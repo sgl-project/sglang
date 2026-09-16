@@ -156,6 +156,15 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
+        if getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST:
+            # Fake-transfer warmups need their completed chunk KV next round,
+            # but must not insert those slots into the shared radix tree.
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : len(req.get_fill_ids())
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

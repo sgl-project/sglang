@@ -3,7 +3,7 @@
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -76,6 +76,75 @@ class _FakeLowRatioBackend:
 
 
 class TestDeepseekV41CPMultiStream(CustomTestCase):
+    def test_eager_cp_prefill_selects_multistream_for_large_chunks(self):
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+
+        class Selected(Exception):
+            pass
+
+        mode = SimpleNamespace(
+            is_extend=lambda: True,
+            is_decode=lambda: False,
+            is_target_verify=lambda: False,
+            is_decode_or_idle=lambda: False,
+        )
+        batch = SimpleNamespace(forward_mode=mode)
+        x = torch.zeros((1024, 4))  # Larger than the capture-time BS limit.
+        for ratio, method_name in (
+            (4, "_forward_prepare_multi_stream"),
+            (1, "_forward_prepare_low_ratio_multi_stream"),
+        ):
+            with self.subTest(ratio=ratio):
+                selected = Mock(side_effect=Selected)
+                layer = SimpleNamespace(
+                    is_dsv41=True,
+                    dsa_enable_prefill_cp=True,
+                    alt_streams=[object(), object(), object()],
+                    _multi_stream_bs_limit=128,
+                    compress_ratio=ratio,
+                    compressor=object(),
+                    _kernel_num_heads=lambda _: 1,
+                    n_local_heads=1,
+                    head_dim=128,
+                    _local_attn_sink=lambda _: None,
+                    **{method_name: selected},
+                )
+                with (
+                    patch.object(deepseek_v4, "_is_cuda", True),
+                    patch.object(deepseek_v4, "_is_hip", False),
+                    patch.object(deepseek_v4, "_is_npu", False),
+                    patch.object(deepseek_v4, "dsa_use_prefill_cp", return_value=True),
+                    patch.object(
+                        deepseek_v4, "get_is_capture_mode", return_value=False
+                    ),
+                    patch.object(
+                        deepseek_v4,
+                        "get_attn_tp_context",
+                        return_value=SimpleNamespace(input_scattered=False),
+                    ),
+                    patch.object(
+                        deepseek_v4,
+                        "get_attn_backend",
+                        return_value=SimpleNamespace(low_ratio_prefill_graph=False),
+                    ),
+                    patch.object(
+                        deepseek_v4,
+                        "get_platform",
+                        return_value=SimpleNamespace(is_blackwell=True),
+                    ),
+                    patch.object(
+                        deepseek_v4.envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP,
+                        "get",
+                        return_value=True,
+                    ),
+                    patch.object(env_gate, "is_unified_kv_triton", return_value=False),
+                ):
+                    with self.assertRaises(Selected):
+                        deepseek_v4.MQALayer.forward(
+                            layer, x, torch.arange(1024), batch
+                        )
+                selected.assert_called_once()
+
     def test_collectives_finish_before_low_ratio_worker_streams(self):
         log = []
         main_stream = _FakeStream("main", log)

@@ -317,18 +317,21 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # Prefill CP internally enables DP attention with dp_size=1. This is
+        # not multi-rank DP attention and is compatible with PD DSpark.
+        uses_cp = getattr(cfg, "enable_prefill_cp", False) or cfg.attn_cp_size > 1
+        invalid_cp_topology = uses_cp and cfg.disaggregation_mode != "prefill"
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
             or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
+            or invalid_cp_topology
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DP=1 and decode CP=1; prefill may use CP. Both servers must "
+                "enable DSpark with the same block size and KV layout."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -359,9 +362,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
+            # Prefill CP sets enable_dp_attention with DP=1 as an internal
+            # implementation detail; only real multi-rank DP is incompatible.
+            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:
