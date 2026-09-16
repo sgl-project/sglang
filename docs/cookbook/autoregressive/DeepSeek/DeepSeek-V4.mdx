@@ -51,11 +51,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260911`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260911`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260914`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260911
+docker pull lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260914
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +65,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260911 \
+    lmsysorg/sglang-rocm:v0.5.19-rocm720-{mi35x,mi30x}-20260914 \
     sglang serve <use args below>
 ```
 
@@ -395,7 +395,6 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 - **DSpark (MI355X Pro Official 0813)** — the 0813 checkpoint bundles the DSpark draft head. Prefer it over EAGLE on 0813 for ordinary serving: enable `--speculative-algorithm DSPARK` (low-latency) and see the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) for the long-context path. The one exception is **PD disaggregation**, where DSpark cannot run at all and the Playground strips it — there, fall back to the MTP 3-1-4 shape above, as in [§3.8](#3-8-pd-disaggregation-on-mi355x-mori-io).
 - **Kernels** — uses the Unified KV attention and the flydsl MoE.
 - **FP4 indexer (MI355X)** — FP4 C4 indexer is supported via `--enable-deepseek-v4-fp4-indexer` on top of the standard ROCm recipe.
-- **Agentic long-context (MI355X Pro Official FP4)** — TP-only serving adds `--prefill-decode-interval 10` for scheduler stability. The DP path additionally needs `--enable-dp-lm-head` (required for DSpark under DP attention), `--enable-prefill-delayer --prefill-delayer-token-usage-low-watermark 0.7` so a single long prefill does not monopolise the engine, plus the flags in the [MI355X agentic recipe](#3-7-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark).
 
 **MoRI EP (AMD expert parallelism)**
 
@@ -814,7 +813,7 @@ python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
   --tp 8 \
-  --prefill-decode-interval 10 \
+  --prefill-decode-interval 20 \
   --attention-backend dsv4 \
   --enable-deepseek-v4-fp4-indexer \
   --page-size 256 \
@@ -864,7 +863,7 @@ python3 -m sglang.launch_server \
   --enable-dp-attention-local-control-broadcast \
   --tokenizer-worker-num 8 \
   --stream-interval 20 \
-  --prefill-decode-interval 10 \
+  --prefill-decode-interval 20 \
   --prefill-delayer-token-usage-low-watermark 0.7 \
   --attention-backend dsv4 \
   --enable-deepseek-v4-fp4-indexer \
@@ -886,7 +885,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention.
+`--chunked-prefill-size` is a global budget divided by `--dp`, so this keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware` so multi-turn sessions land on the rank holding the longest radix/HiCache prefix; above concurrency 160 add `--balance-abs-threshold 32`.
 
 ### 3.8 PD Disaggregation on MI355X (MORI-IO)
 
@@ -903,7 +902,7 @@ docker run \
     --ulimit nofile=1048576:1048576 \
     --network host --ipc=host --shm-size 32g \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
-    lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260911 \
+    lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914 \
     python3 -m sglang.launch_server <role args below>
 ```
 
