@@ -143,10 +143,7 @@ def _jit_sort_idx_module():
         make_name("sort_idx"),
         *args,
         cuda_files=["deepseek_v4/sort_idx.cuh"],
-        cuda_wrappers=[
-            ("transform", f"SortIdxKernel<{args}>::transform"),
-            ("transform_pages", f"SortIdxKernel<{args}>::transform_pages"),
-        ],
+        cuda_wrappers=[("transform", f"SortIdxKernel<{args}>::transform")],
     )
 
 
@@ -169,28 +166,6 @@ def sort_candidate_blocks(
     if out_pages is None:
         out_pages = torch.empty_like(blocks)
     _jit_sort_idx_module().transform(blocks, seq_lens, page_table, out_pages, page_size)
-    return out_pages
-
-
-def transform_candidate_blocks(
-    blocks: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    *,
-    out_pages: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """The page transform of ``sort_candidate_blocks`` alone, for a block top-k
-    that already emits ascending ids: ``out_pages[b, t]`` is the pool slot / 8 of
-    ``blocks[b, t]`` for ``t < min(k, ceil(seq_lens[b] / 8))`` (which must be
-    valid block ids), ``INT32_MAX`` past that; ``blocks`` is not modified.
-    Returns ``out_pages``.
-    """
-    if out_pages is None:
-        out_pages = torch.empty_like(blocks)
-    _jit_sort_idx_module().transform_pages(
-        blocks, seq_lens, page_table, out_pages, page_size
-    )
     return out_pages
 
 
