@@ -1,8 +1,7 @@
 /**
  * \brief DeepSeek-V4.1's bf16 top-k kernel for short rows (<= 16384 scores)
  * Adapted from https://github.com/deepseek-ai/DeepSelect
- * We only tuned for 16384 in + k=512
- * Rewrite in SIMT for better architecture portability (AMD team should thank me)
+ * Plain SIMT (no tensor cores or clusters), tuned for 16384-wide rows with k = 512.
  */
 #pragma once
 
@@ -379,7 +378,7 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   // whatever shared memory held before.
   const uint32_t totals = smem.count_gt_eq;
   const uint32_t num_staged = (totals >> 16) + min(totals & 0xFFFFu, eq_total);
-  // TODO: pragma unroll this one, if real topk > 512
+  // TODO(perf): unroll once k regularly exceeds 512.
   for (uint32_t t = tx; t < topk; t += C::kBlockSize) {
     out[t] = t < num_staged ? transform(smem.stage[t]) : -1;
   }

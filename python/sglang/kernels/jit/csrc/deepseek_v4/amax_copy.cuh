@@ -23,7 +23,7 @@ namespace sglang {
 /// the row length. Rows with at most `topk` blocks are skipped entirely (every
 /// block is selected anyway; `topk = 0` disables the skip).
 struct AmaxConfig {
-  using DType = float;                         // TODO: support bf16
+  using DType = float;
   static constexpr uint32_t kBlockTokens = 8;  // scores per key
   static constexpr uint32_t kBlockSize = 512;
   static constexpr uint32_t kNumItems = 2;  // keys per thread
