@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import k3_ar_fusion
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -64,11 +65,9 @@ def _init_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.runtime_context import get_parallel, get_server_args
     from sglang.srt.utils.common import get_device_sm
 
-    server_args = get_server_args()
-    a2a = server_args.moe_a2a_backend
+    a2a = get_exec().moe.moe_a2a_backend
     group = get_parallel().attn_tp_group
     comm = group.ca_comm
     if (
@@ -77,7 +76,7 @@ def _init_state() -> Optional[_State]:
         or a2a not in ("megamoe", "deepep")
         or not isinstance(comm, CustomAllReduceV2)
         or comm.disabled
-        or comm.mc_base_ptr == 0
+        or not comm.has_multicast
     ):
         message = (
             "K3 SP collective requires SM103, TP4/TP8, MegaMoE/DeepEP, and "
@@ -105,8 +104,8 @@ def _init_state() -> Optional[_State]:
         )
         return None
 
-    sp_collective.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
-    attn_res.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
+    sp_collective.register_comm(comm.obj)
+    attn_res.register_comm(comm.obj)
     _STATE = _State(group, comm)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
@@ -394,7 +393,6 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
             state.group.world_size,
             tensor,
             output,
-            ws_mc_base=state.comm.mc_base_ptr,
             tuning=dispatch.tuning,
         )
     if dispatch.strategy == "direct":

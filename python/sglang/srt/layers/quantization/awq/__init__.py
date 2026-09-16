@@ -11,6 +11,7 @@ from .awq import (
     AWQLinearMethod,
     AWQMarlinConfig,
     AWQMoEMethod,
+    AWQXPUConfig,
 )
 from .schemes import (
     AWQAscendLinearScheme,
@@ -24,6 +25,7 @@ __all__ = [
     "AWQConfig",
     "AWQCPUConfig",
     "AWQMarlinConfig",
+    "AWQXPUConfig",
     "AWQLinearMethod",
     "AWQMoEMethod",
     "AWQLinearScheme",

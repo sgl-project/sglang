@@ -8,7 +8,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -46,8 +46,9 @@ class CustomOp(nn.Module):
         return self.forward_cuda(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> Any:
-        # By default, we assume that CPU ops are compatible with CUDA ops.
-        return self.forward_cuda(*args, **kwargs)
+        # By default, we assume that CPU ops are compatible with the
+        # PyTorch-native implementation.
+        return self.forward_native(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> Any:
         # By default, we assume that TPU ops are compatible with the
@@ -79,6 +80,8 @@ class CustomOp(nn.Module):
             return self.forward_xpu
         elif current_platform.is_musa():
             return self.forward_musa
+        elif current_platform.is_cpu():
+            return self.forward_cpu
         else:
             return self.forward_native
 

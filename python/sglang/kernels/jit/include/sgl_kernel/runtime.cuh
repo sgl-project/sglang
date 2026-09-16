@@ -46,7 +46,25 @@ cudaOccupancyAvailableDynamicSMemPerBlock(std::size_t* smem, const void* func, i
 #endif
 #endif
 
+namespace sglang {
+
 namespace host::runtime {
+
+inline void* get_device_accessible_ptr(const tvm::ffi::TensorView& tensor) {
+  void* ptr = tensor.data_ptr();
+  const auto tensor_device_type = tensor.device().device_type;
+  if (tensor_device_type != kDLCPU && tensor_device_type != kDLGPUHost) {
+    return ptr;
+  }
+
+  void* device_ptr = nullptr;
+#ifdef USE_ROCM
+  RuntimeDeviceCheck(::hipHostGetDevicePointer(&device_ptr, ptr, 0));
+#else
+  RuntimeDeviceCheck(::cudaHostGetDevicePointer(&device_ptr, ptr, 0));
+#endif
+  return device_ptr;
+}
 
 // Return the maximum number of active blocks per SM for the given kernel
 template <typename T>
@@ -99,3 +117,5 @@ inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int
 }
 
 }  // namespace host::runtime
+
+}  // namespace sglang

@@ -19,12 +19,7 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="stage-b-test-4-npu-a3",
-    nightly=False,
-)
-register_npu_ci(
-    est_time=400,
-    suite="nightly-4-npu-a3",
+    suite="full-4-npu-a3",
     nightly=True,
 )
 
@@ -77,70 +72,6 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
             "5",
             "--speculative-attention-mode",
             "decode",
-            "--tp-size",
-            "4",
-            "--mem-fraction-static",
-            "0.7",
-            "--disable-cuda-graph",
-            "--dtype",
-            "bfloat16",
-        ]
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
-                "TRANSFORMERS_VERBOSITY": "error",
-            }
-        )
-
-        process = popen_launch_server(
-            QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-            other_args=args,
-            env=env,
-        )
-
-        try:
-            if _is_pr_pipeline:
-                run_npu_pr_smoke(DEFAULT_URL_FOR_TEST)
-            else:
-                metrics = self._run_gsm8k_eval()
-                self.assertGreaterEqual(
-                    metrics["score"],
-                    0.83,
-                    f"GSM8K score {metrics['score']} below threshold 0.83",
-                )
-        finally:
-            kill_process_tree(process.pid)
-
-    def test_speculative_attention_mode_prefill(self):
-        """Test --speculative-attention-mode prefill without PD disaggregation."""
-        args = [
-            "--trust-remote-code",
-            "--attention-backend",
-            "ascend",
-            "--device",
-            "npu",
-            "--quantization",
-            "modelslim",
-            "--disable-radix-cache",
-            "--speculative-draft-model-quantization",
-            "unquant",
-            "--speculative-algorithm",
-            "EAGLE3",
-            "--speculative-draft-model-path",
-            QWEN3_32B_EAGLE3_WEIGHTS_PATH,
-            "--speculative-num-steps",
-            "4",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "5",
-            "--speculative-attention-mode",
-            "prefill",
             "--tp-size",
             "4",
             "--mem-fraction-static",

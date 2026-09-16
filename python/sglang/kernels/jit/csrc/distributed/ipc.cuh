@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace sglang {
+
 namespace host::distributed {
 
 struct AllocationRange {
@@ -192,3 +194,5 @@ inline void register_ipc_manager() {
       .def("batch_open_handles", &Class::batch_open_handles)
       .def("destroy", &Class::destroy);
 }
+
+}  // namespace sglang

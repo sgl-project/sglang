@@ -9,9 +9,11 @@ serving shape: K = V = 128, chunk 64.
 Scope: ordinary extend batches satisfying the kernel's fixed tensor contract.
 Correctness-sensitive cases stay on Triton:
 
-- track batches receive dense intermediate SSM states directly from the kernel
-  when the cache checkpoint stride is also 64 tokens. Other interior snapshots
-  stay on Triton; boundary-only tracking can still use the final state;
+- track batches carrying the fp32 snapshot buffer (``track_state``, the mamba
+  extra_buffer track path) stay on Triton — the kernel cannot write it.
+  Interior snapshots consumed as dense ``h`` still come from the kernel when
+  the cache checkpoint stride is also 64 tokens; boundary-only tracking uses
+  the final state either way;
 - spec-decode extends, which must stay rollback-able.
 
 Single-sequence token counts that are not a multiple of the kernel's 64-token
@@ -37,6 +39,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,12 @@ _PAD_GATE = -1000.0
 
 
 class PtxKDAKernel(LinearAttnKernelBase):
+    # Batches carrying the fp32 track snapshot buffer (track_state) route to
+    # the embedded Triton fallback, which forwards the snapshot arguments
+    # (the track_state check in extend -> _triton_extend); boundary-only
+    # tracking stays native.
+    supports_track_state_snapshot: bool = True
+
     def __init__(self):
         # tcgen05 + TMEM with sm_103a-only encodings: GB300 (SM103) only.
         self.supports_prefill = torch.cuda.is_available() and (
@@ -194,11 +203,8 @@ class PtxKDAKernel(LinearAttnKernelBase):
             # which may be larger (for example 256 for Nemotron-H). Returning
             # the raw 64-token rows in that case would silently select the
             # wrong boundary and compute wrong offsets for later sequences.
-            from sglang.srt.runtime_context import get_server_args
 
-            intermediate_stride_supported = (
-                get_server_args().mamba_cache_chunk_size == _CHUNK
-            )
+            intermediate_stride_supported = mamba_cache_chunk_size() == _CHUNK
         seq_lens = (
             [int(length) for length in seq_lens_cpu] if seq_lens_cpu is not None else []
         )
@@ -219,6 +225,11 @@ class PtxKDAKernel(LinearAttnKernelBase):
             )
         eligible = (
             not kwargs.get("is_spec_decode")
+            # The native kernel cannot write the fp32 track snapshot buffer;
+            # a batch carrying one must take the Triton fallback, which
+            # forwards the snapshot arguments (see _triton_extend). Leaving
+            # the buffer unwritten would corrupt prefix-cache track slots.
+            and kwargs.get("track_state") is None
             and intermediate_stride_supported
             and shape_known
             and supported_shape

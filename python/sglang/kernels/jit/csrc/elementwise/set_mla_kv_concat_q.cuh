@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
-namespace {
+namespace sglang {
 
 struct SetMlaKVConcatQParams {
   // KV scatter side (byte-typed: dtype-agnostic row copies).
@@ -604,4 +604,4 @@ struct SetMlaKVConcatQFp8Kernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
