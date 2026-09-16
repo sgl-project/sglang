@@ -1004,6 +1004,41 @@ class DeepseekV2MoE(nn.Module):
                 return logits_and_partials
         return self.gate(hidden_states, gemm_output_zero_allocator), None
 
+    def _all_reduce_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Post-experts all-reduce for the DeepSeek-V4 MoE. On ROCm a fused
+        all-reduce + mHC post serves the states the HIP boundary builds eagerly
+        (post/comb present, 1-8 rows); every other state takes the plain
+        reduction after starting the overlapped stats."""
+        from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
+
+        mhc = current_mhc_post_fusion()
+        if (
+            mhc is not None
+            and get_platform().is_hip
+            and not self._shared_expert_tp1
+            and not mhc.overlap_only
+            and mhc.post is not None
+            and 1 <= hidden_states.shape[0] <= 8
+        ):
+            from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
+                all_reduce_mhc_post,
+            )
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            mhc.output = all_reduce_mhc_post(
+                hidden_states,
+                mhc.residual,
+                mhc.post,
+                mhc.comb,
+                get_tp_group().ca_comm,
+            )
+            # The decoder consumes mhc.output. Keep the normal tensor
+            # return contract for its DP synchronization wrapper.
+            return hidden_states
+        if mhc is not None:
+            mhc.start_stats_before_all_reduce()
+        return post_experts_all_reduce(hidden_states)
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1241,14 +1276,9 @@ class DeepseekV2MoE(nn.Module):
                 and self.tp_size > 1
                 and not should_skip_post_experts_all_reduce(is_tp_path=True)
             ):
-                from sglang.srt.layers.moe.mhc_post_fusion import (
-                    current_mhc_post_fusion,
-                )
-
-                mhc = current_mhc_post_fusion()
-                if mhc is not None:
-                    mhc.start_stats_before_all_reduce()
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+                final_hidden_states = self._all_reduce_output(final_hidden_states)
+            else:
+                final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1436,12 +1466,9 @@ class DeepseekV2MoE(nn.Module):
             and self.tp_size > 1
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
-            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
-
-            mhc = current_mhc_post_fusion()
-            if mhc is not None:
-                mhc.start_stats_before_all_reduce()
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+            final_hidden_states = self._all_reduce_output(final_hidden_states)
+        else:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:

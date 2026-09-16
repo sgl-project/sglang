@@ -481,11 +481,11 @@ def hc_boundary(
     return new_residual, y, coefficients
 
 
-def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
+def _can_fuse_mhc(layer, residual, forward_batch):
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 
-    if not (
+    return (
         _is_gfx95_supported
         and envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.get()
         and 1 <= residual.shape[0] <= 8
@@ -498,21 +498,19 @@ def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
             or forward_batch.forward_mode.is_target_verify()
         )
         and get_parallel().attn_dp_size == 1
-        and get_parallel().tp_size == layer.self_attn.attn_tp_size == 4
-        and layer.self_attn.wo_b.reduce_results
+        and get_parallel().tp_size == 4
         and not layer.dsa_enable_prefill_cp
         and not get_forward().sp_active
         and not is_batch_invariant_mode_enabled()
         and not get_exec().deterministic.enable_deterministic_inference
-    ):
-        return None
+    )
 
+
+def _make_mhc_fusion(residual, coefficients, comm):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
-    from sglang.srt.distributed.parallel_state import get_attn_tp_group
     from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion
 
-    comm = get_attn_tp_group().ca_comm
     if not (
         isinstance(comm, CustomAllreduce)
         and not comm.disabled
@@ -524,6 +522,33 @@ def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
     return MhcPostFusion(
         residual, coefficients.post, coefficients.comb, None, pre=coefficients.pre
     )
+
+
+def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
+    if not (
+        _can_fuse_mhc(layer, residual, forward_batch)
+        and layer.self_attn.attn_tp_size == 4
+        and layer.self_attn.wo_b.reduce_results
+    ):
+        return None
+    from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+    return _make_mhc_fusion(residual, coefficients, get_attn_tp_group().ca_comm)
+
+
+def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if not (
+        _can_fuse_mhc(layer, residual, forward_batch)
+        and layer.mlp.tp_size == 4
+        and not layer.mlp._shared_expert_tp1
+        and get_moe_a2a_backend().is_none()
+    ):
+        return None
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
+    return _make_mhc_fusion(residual, coefficients, get_tp_group().ca_comm)
 
 
 def apply_attention_mhc(x, state):
@@ -597,10 +622,16 @@ def forward_hc_pre_from_prev_fused_boundary(
         layer.hc_ffn_base,
     )
     x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
-    x = layer._run_moe_ffn_dp_sync(
-        x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
-    )
+    mhc = moe_mhc_fusion(layer, residual, ffn_coefficients, forward_batch)
+    with use_mhc_post_fusion(mhc):
+        x = layer._run_moe_ffn_dp_sync(
+            x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+        )
     ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
+    if mhc is not None and mhc.output is not None:
+        # Reduction already applied post. The next boundary consumes this
+        # materialized residual, including when it would normally defer post.
+        return mhc.output, ffn_pre, None
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None
