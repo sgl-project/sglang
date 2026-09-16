@@ -279,10 +279,8 @@ def fused_k_norm_rope_flashmla(
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
 ) -> None:
-    """RMSNorm + RoPE ``kv`` and write it into the paged FlashMLA cache at ``out_loc``.
-
-    ``layout`` selects the page format: the 584-byte V4 layout, or the V4.1 fp8
-    (528 B) / fp4 (288 B) formats, in which every dim is quantized."""
+    """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
+    cache at ``out_loc``."""
     layout = KVLayout.parse(layout)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]

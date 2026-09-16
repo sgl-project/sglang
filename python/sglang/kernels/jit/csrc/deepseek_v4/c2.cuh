@@ -24,9 +24,8 @@ namespace sglang {
 /// `kv_output` is the pre-RoPE latent, for the index-K branch's `wk`.
 struct Compress2DecodeParams {
   const float* __restrict__ kv_input;  // [num_tokens, 2 * kHeadDim] fp32
-  /// `CompressStatePool`'s flat `KVAndScore` buffer, `[size, 2 * kHeadDim]`
-  /// fp32 with kv in the low half and score in the high half. A request's
-  /// pending pair lives at `req * ring_size + pos % ring_size`.
+  /// `CompressStatePool`'s flat `KVAndScore` buffer, `[size, 2 * kHeadDim]` fp32, kv in the low
+  /// half and score in the high half; a request's pending pair lives at `req * ring_size + pos % ring_size`.
   float* __restrict__ kv_state;
   bf16_t* __restrict__ kv_output;          // [num_tokens, kHeadDim] bf16, pre-RoPE
   const bf16_t* __restrict__ norm_weight;  // [kHeadDim] bf16
@@ -40,30 +39,23 @@ struct Compress2DecodeParams {
   float eps;
 };
 
-/// Elements per thread; 256 threads per token was measured fastest on B200 decode batches.
-/// The launcher and launch bounds share this value. At head_dim 512, the nope/rope split
-/// is (512 - 64) / 2 = 224 threads, keeping the fp8 amax reduction's full-warp mask valid.
+/// Elements per thread; 256 threads per token measured fastest on B200 decode batches.
+/// At (512, 64) it also keeps the nope/rope split warp-aligned, as the fp8 amax reduction requires.
 constexpr uint32_t kC2VecSize = 2;
 
 /// \brief grid = num_tokens, block = kHeadDim / kC2VecSize.
 ///
-/// An odd position completes a group with its even predecessor; an even one
-/// parks itself in the state.
+/// An odd position completes a group with its even predecessor; an even one parks in the state.
 ///
-/// Target-verify runs that same schedule with `draft_len` consecutive positions
-/// per request instead of one, so a row's partner is usually the row before it
-/// in `kv_input` rather than the ring. That is the whole difference, and a 2D
-/// grid answers it without arithmetic: `blockIdx.x` is the position inside the
-/// block, `blockIdx.y` the request.
+/// Under target-verify, `draft_len` consecutive positions per request: `blockIdx.x` is the
+/// position inside the block, `blockIdx.y` the request, and every row but the first takes its
+/// partner from the previous `kv_input` row instead of the ring.
 ///
-/// The three reductions below have three different widths and are not
-/// interchangeable: the RMSNorm statistic spans the row, an fp8 store scale
-/// spans 64 elements, an fp4 block spans 16. All asserted.
+/// The three reductions have different widths and are not interchangeable: the RMSNorm
+/// statistic spans the row, an fp8 store scale 64 elements, an fp4 block 16.
 ///
-/// kLayout is the cache's page format. V4 (584 B/token) and V41 (528 B/token,
-/// fp8 with per-32 scales) store the fake-quantized value; V41_FP4 (288 B/token)
-/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding
-/// happens once and no fp8 rounding follows it.
+/// kLayout is the cache's page format: V4 and V41 store the fake-quantized value; V41_FP4
+/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding happens once.
 template <
     bool kVerify,
     int64_t kHeadDim,
@@ -151,8 +143,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
     staged[i] = (kv_old[i] * scale_0 + kv_new[i] * scale_1) / (1.0f + scale);
   }
 
-  // `finish` casts to bf16 before the norm, so the sum of squares has to see
-  // the rounded values.
+  // `finish` casts to bf16 before the norm, so the sum of squares must see the rounded values.
   float local_sqrsum = 0.0f;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -187,7 +178,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   PDLTriggerSecondary<kUsePDL>();
 
-  // ---- main-KV branch: RoPE tail, fp4 fake-quant, 584-byte store ----
+  // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
   // Match finish()'s bf16 rounding before RoPE.
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
@@ -213,8 +204,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   }
 
   if constexpr (kLayout == KVLayout::V41_FP4) {
-    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
-    // fake quantization, minus the dequantization.
+    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
     const int32_t out_loc = raw_out_loc >> 1;
     const auto kv_row = Paged::row(params.kvcache, out_loc);
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
@@ -291,8 +281,7 @@ struct FlashCompress2Kernel {
     return loc_i32 ? kernel<kVerify, int64_t, int32_t> : kernel<kVerify, int64_t, int64_t>;
   }
 
-  // The sum of squares is reduced through a fixed-size shared array, so the CTA
-  // has to be a whole number of warps.
+  // The sum of squares reduces through a fixed-size shared array, so the CTA must be whole warps.
   static_assert(kHeadDim % (4 * device::kWarpThreads) == 0, "head_dim must be a multiple of 128");
   static_assert(std::has_single_bit(kPageSize), "the page/slot split needs a power-of-two page");
 
