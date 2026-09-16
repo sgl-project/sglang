@@ -35,6 +35,7 @@ def _fake_attn(backend: str, rocm_fused_decode_mla: bool = True):
     return SimpleNamespace(
         current_attention_backend=backend,
         rocm_fused_decode_mla=rocm_fused_decode_mla,
+        use_glm_bf16_prefill_fp8_decode=False,
     )
 
 
@@ -61,6 +62,17 @@ class TestDispatchMLASubtype(CustomTestCase):
         with mock.patch.object(abh, "_is_hip", True):
             method = abh._dispatch_mla_subtype(
                 _fake_attn("aiter"), _fake_forward_batch(is_decode=False)
+            )
+        self.assertEqual(method, AttnForwardMethod.MLA)
+
+    def test_hip_hybrid_decode_stays_plain_mla(self):
+        # The hybrid path needs the normal ROCm MLA method so decode can select
+        # its FP8 absorb weights instead of bypassing them in the fused method.
+        attn = _fake_attn("aiter")
+        attn.use_glm_bf16_prefill_fp8_decode = True
+        with mock.patch.object(abh, "_is_hip", True):
+            method = abh._dispatch_mla_subtype(
+                attn, _fake_forward_batch(is_decode=True)
             )
         self.assertEqual(method, AttnForwardMethod.MLA)
 
