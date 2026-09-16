@@ -2351,48 +2351,107 @@ class AscendAttnBackend(AttentionBackend):
                 q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
                 q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=block_table,
-                block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-            )
-            attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="TND",
-                scale=layer.scaling,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=block_table,
-                block_size=self.page_size,
-                sparse_mode=3,
-                atten_mask=self.mtp_mask,
-                actual_seq_lengths=actual_seq_lengths,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                workspace=workspace,
-                out=[attn_output, softmax_lse],
-            )
+            num_query_heads = q_nope.shape[1]
+            if self.use_fias_v2_bsnd:
+                # The existing paged MLA cache is [block, KV_N, page, D].
+                # V2 consumes it with BNSD queries; keep the cache unchanged.
+                batch_size = len(actual_seq_lengths_kv)
+                query_seq_len = self.speculative_num_draft_tokens
+                assert q_nope.shape[0] == batch_size * query_seq_len, (
+                    "FIAS V2 target verify requires one fixed draft block per request"
+                )
+                if batch_size == 0:
+                    attn_output = torch.empty_like(q_nope)
+                else:
+                    q_nope_bnsd = (
+                        q_nope.view(
+                            batch_size,
+                            query_seq_len,
+                            num_query_heads,
+                            self.kv_lora_rank,
+                        )
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+                    q_rope_bnsd = (
+                        q_rope.view(
+                            batch_size,
+                            query_seq_len,
+                            num_query_heads,
+                            self.qk_rope_head_dim,
+                        )
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        q_nope_bnsd,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope_bnsd,
+                        key_rope=k_rope_cache,
+                        num_query_heads=num_query_heads,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BNSD",
+                        softmax_scale=layer.scaling,
+                        block_table=block_table,
+                        block_size=self.page_size,
+                        sparse_mode=3,
+                        atten_mask=self.mtp_mask,
+                        actual_seq_qlen=[query_seq_len] * batch_size,
+                        actual_seq_kvlen=actual_seq_lengths_kv,
+                        pre_tokens=FULL_ATTENTION_WINDOW,
+                        next_tokens=0,
+                    )
+                    attn_output = (
+                        attn_output.transpose(1, 2)
+                        .contiguous()
+                        .reshape(-1, num_query_heads, self.kv_lora_rank)
+                    )
+            else:
+                workspace = (
+                    torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                        q_nope,
+                        c_kv_cache,
+                        c_kv_cache,
+                        query_rope=q_rope,
+                        key_rope=k_rope_cache,
+                        num_heads=num_query_heads,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="TND",
+                        scale=layer.scaling,
+                        antiquant_mode=0,
+                        antiquant_scale=None,
+                        block_table=block_table,
+                        block_size=self.page_size,
+                        sparse_mode=3,
+                        atten_mask=self.mtp_mask,
+                        actual_seq_lengths=actual_seq_lengths,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    )
+                )
+                attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+                softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+                torch_npu.npu_fused_infer_attention_score.out(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=num_query_heads,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    scale=layer.scaling,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    block_table=block_table,
+                    block_size=self.page_size,
+                    sparse_mode=3,
+                    atten_mask=self.mtp_mask,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    workspace=workspace,
+                    out=[attn_output, softmax_lse],
+                )
             attn_output = attn_output[:, : layer.tp_q_head_num, :]
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (

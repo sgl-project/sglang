@@ -131,6 +131,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
+        self.use_fias_v2_bsnd = (
+            envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
+            and model_runner.spec_algorithm.is_dspark()
+        )
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -156,6 +160,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
 
+    def _uses_v2_seq_len_update(self):
+        # IDLE DP ranks replay the same target-verify graph as active ranks.
+        # Select the handler from the captured graph, not the runtime mode;
+        # a V1 update key is ignored by V2 and leaves stale KV lengths behind.
+        return self.if_use_v2 or (
+            self.use_fias_v2_bsnd and self.capture_forward_mode.is_target_verify()
+        )
+
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         if self.enable_torch_compile:
             skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
@@ -175,12 +187,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
-        if self.if_use_v2:
+        if self._uses_v2_seq_len_update():
             return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
-        if self.if_use_v2:
+        if self._uses_v2_seq_len_update():
             return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
