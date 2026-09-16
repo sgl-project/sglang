@@ -1707,16 +1707,27 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             use_routed_topk=True,
         )
     elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
-        if dispatch_output.hidden_states.dtype != torch.bfloat16:
-            raise TypeError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
-                f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
-            )
-        if dispatch_output.hidden_states_scale is not None:
-            raise ValueError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
-                "the BF16 dispatch payload must not carry activation scales."
-            )
+        mxfp8_dispatch = (
+            quant_info.use_mxfp8
+            and dispatch_output.hidden_states.dtype == torch.float8_e4m3fn
+        )
+        if mxfp8_dispatch:
+            if dispatch_output.hidden_states_scale is None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen MXFP8 MoE requires activation "
+                    "scales alongside the FP8 dispatch payload."
+                )
+        else:
+            if dispatch_output.hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
+                    f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
+                )
+            if dispatch_output.hidden_states_scale is not None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
+                    "the BF16 dispatch payload must not carry activation scales."
+                )
         result = fused_experts_none_to_flashinfer_trtllm_fp8(
             dispatch_output,
             quant_info,
