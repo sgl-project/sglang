@@ -215,12 +215,12 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
         )
-        self.mlp = Glm5NextVisionMLP(
+        self.ffn = Glm5NextVisionMLP(
             dim,
             intermediate_dim,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             use_data_parallel=use_data_parallel,
             swiglu_limit=swiglu_limit,
         )
@@ -630,10 +630,10 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Glm5NextMoE(
+            self.ffn = Glm5NextMoE(
                 config=config,
                 quant_config=moe_quant_config_override or quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
@@ -643,12 +643,12 @@ class Glm5NextDecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = Glm5NextMLP(
+            self.ffn = Glm5NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=config.swiglu_limit,
@@ -809,12 +809,12 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch
         )
 
-        if isinstance(self.mlp, Glm5NextMLP):
+        if isinstance(self.ffn, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
         if (
-            isinstance(self.mlp, Glm5NextMoE)
-            and not self.mlp.experts.moe_runner_config.inplace
+            isinstance(self.ffn, Glm5NextMoE)
+            and not self.ffn.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
@@ -828,7 +828,7 @@ class Glm5NextDecoderLayer(nn.Module):
             mlp_reduce_scatter=use_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
+                hidden_states = self.ffn(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
@@ -910,13 +910,13 @@ class Glm5NextModel(nn.Module):
                 [
                     1
                     for i in range(len(self.layers))
-                    if isinstance(self.layers[i].mlp, Glm5NextMoE)
+                    if isinstance(self.layers[i].ffn, Glm5NextMoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if isinstance(self.layers[i].mlp, Glm5NextMoE):
+                if isinstance(self.layers[i].ffn, Glm5NextMoE):
                     a2a_backend = get_moe_a2a_backend()
                     is_a2a_moe = (
                         a2a_backend.is_deepep()
@@ -1152,9 +1152,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (
                 {
-                    layer_id: layer.mlp.get_moe_weights()
+                    layer_id: layer.ffn.get_moe_weights()
                     for layer_id, layer in enumerate(self.model.layers)
-                    if isinstance(layer.mlp, Glm5NextMoE)
+                    if isinstance(layer.ffn, Glm5NextMoE)
                 }
                 if self.model is not None
                 else {}
@@ -1211,7 +1211,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
-                moe_prefix = f"model.layers.{layer_id}.mlp"
+                moe_prefix = f"model.layers.{layer_id}.ffn"
                 if quant_config.is_layer_excluded(
                     f"{moe_prefix}.shared_experts"
                 ) and not quant_config.is_layer_excluded(f"{moe_prefix}.experts"):
@@ -1366,6 +1366,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1443,10 +1444,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
             weight_names.append(name)
 
-            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            if self.num_fused_shared_experts > 0 and "ffn.shared_experts" in name:
                 name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.n_routed_experts}",
+                    "ffn.shared_experts",
+                    f"ffn.experts.{self.config.n_routed_experts}",
                 )
 
             if not is_nextn:
@@ -1482,7 +1483,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
                 if (
@@ -1499,6 +1500,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = candidate
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -1513,6 +1515,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1564,6 +1567,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(

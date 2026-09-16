@@ -419,10 +419,10 @@ class MoonVitEncoderLayer(nn.Module):
         use_tensor_parallel = not use_data_parallel
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.mlp = MLP2(
+        self.ffn = MLP2(
             [hidden_dim, mlp_dim, hidden_dim],
             activation,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             use_data_parallel=use_data_parallel,
             use_tensor_parallel=use_tensor_parallel,
         )
@@ -466,7 +466,7 @@ class MoonVitEncoderLayer(nn.Module):
         hidden_states = residual + attn_out.view(residual.shape)
 
         residual = hidden_states
-        hidden_states = self.mlp(self.norm1(hidden_states))
+        hidden_states = self.ffn(self.norm1(hidden_states))
         hidden_states = residual + hidden_states
         return hidden_states
 

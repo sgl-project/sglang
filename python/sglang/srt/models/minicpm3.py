@@ -300,12 +300,12 @@ class MiniCPM3DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = MiniCPM3MLP(
+        self.ffn = MiniCPM3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -334,7 +334,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states * (
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
         )
@@ -444,6 +444,7 @@ class MiniCPM3ForCausalLM(nn.Module):
         return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -477,6 +478,7 @@ class MiniCPM3ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -486,6 +488,7 @@ class MiniCPM3ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -496,6 +499,7 @@ class MiniCPM3ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

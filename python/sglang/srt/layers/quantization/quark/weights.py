@@ -57,6 +57,10 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
     :class:`QuarkW4A8MXFp4MoE`. Down-proj bias is loaded only on
     ``moe_tp_rank == 0`` to avoid double-counting after all-reduce.
     """
+
+    def map_weight_name(name):
+        return name.replace(".mlp.", ".ffn.")
+
     params_dict = dict(model.named_parameters())
     loaded_params: set[str] = set()
     mxfp4_block = 32
@@ -117,7 +121,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
             narrow_gate = weight[0::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
             narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             intermediate_pad = param.data.shape[1] // 2
             g0, g1 = narrow_gate.shape
             u0, u1 = narrow_up.shape
@@ -129,7 +133,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 intermediate_pad : intermediate_pad + u0,
                 :u1,
             ].copy_(narrow_up.to(param.data.dtype))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "down_proj.weight":
             # Handle MLP down projection weights
@@ -141,12 +145,12 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 moe_tp_rank_start // 2 : moe_tp_rank_end // 2,
             ]
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             d0, d1 = narrow_weight.shape
             param.data[local_expert_id, :d0, :d1].copy_(
                 narrow_weight.to(param.data.dtype)
             )
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "gate_up_proj.weight_scale":
             # Handle MLP gate and up projection weight scales
@@ -155,7 +159,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
             narrow_gate = weight[0::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
             narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             intermediate_pad = param.data.shape[1] // 2
             g0, g1 = narrow_gate.shape
             u0, u1 = narrow_up.shape
@@ -167,7 +171,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 intermediate_pad : intermediate_pad + u0,
                 :u1,
             ].copy_(narrow_up.to(param.data.dtype))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "down_proj.weight_scale":
             # Handle MLP down projection weight scales
@@ -179,12 +183,12 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 moe_tp_rank_start // mxfp4_block : moe_tp_rank_end // mxfp4_block,
             ]
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             d0, d1 = narrow_weight.shape
             param.data[local_expert_id, :d0, :d1].copy_(
                 narrow_weight.to(param.data.dtype)
             )
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "gate_up_proj.bias":
             # Handle MLP gate and up projection biases
@@ -193,7 +197,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
             narrow_gate = weight[0::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
             narrow_up = weight[1::2][moe_tp_rank_start:moe_tp_rank_end].contiguous()
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             intermediate_pad = param.data.shape[1] // 2
             param.data[local_expert_id, : narrow_gate.shape[0]].copy_(
                 narrow_gate.to(param.data.dtype)
@@ -202,7 +206,7 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 local_expert_id,
                 intermediate_pad : intermediate_pad + narrow_up.shape[0],
             ].copy_(narrow_up.to(param.data.dtype))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "down_proj.bias":
             # Handle MLP down projection bias
@@ -213,31 +217,31 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
                 narrow_weight = torch.zeros_like(narrow_weight)
 
             new_name = f"{prefix}.w2_weight_bias"
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             d0 = narrow_weight.shape[0]
             param.data[local_expert_id, :d0].copy_(narrow_weight.to(param.data.dtype))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "gate_up_proj.input_scale":
             # Handle MLP gate/up FP8 activation scale (per-tensor scalar)
             new_name = f"{prefix}.w13_input_scale"
-            if new_name not in params_dict:
+            if map_weight_name(new_name) not in params_dict:
                 # Scheme didn't allocate the parameter (e.g. W4A16); skip.
                 continue
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             param.data[local_expert_id].copy_(weight.to(param.data.dtype).reshape(()))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
         elif dispatch_key == "down_proj.input_scale":
             # Handle MLP down FP8 activation scale (per-tensor scalar)
             new_name = f"{prefix}.w2_input_scale"
-            if new_name not in params_dict:
+            if map_weight_name(new_name) not in params_dict:
                 # Scheme didn't allocate the parameter (e.g. W4A16); skip.
                 continue
 
-            param = params_dict[new_name]
+            param = params_dict[map_weight_name(new_name)]
             param.data[local_expert_id].copy_(weight.to(param.data.dtype).reshape(()))
-            loaded_params.add(new_name)
+            loaded_params.add(map_weight_name(new_name))
 
     return loaded_params

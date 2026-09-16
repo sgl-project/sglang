@@ -277,10 +277,10 @@ class Siglip2EncoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = Siglip2MLP(
+        self.ffn = Siglip2MLP(
             config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -310,7 +310,7 @@ class Siglip2EncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -550,6 +550,7 @@ class Siglip2Model(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # VisionAttention uses attn.qkv_proj for fused Q/K/V
@@ -603,5 +604,6 @@ class Siglip2Model(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         return loaded_params

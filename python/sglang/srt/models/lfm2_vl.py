@@ -291,6 +291,12 @@ class Lfm2VlForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from HuggingFace format."""
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("feed_forward.", "ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         # Collect weights by destination
         vision_weights = []
         projector_weights = []
@@ -328,9 +334,10 @@ class Lfm2VlForConditionalGeneration(nn.Module):
         # Load projector weights
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in projector_weights:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

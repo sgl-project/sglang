@@ -243,12 +243,12 @@ class BaiChuanDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = BaiChuanMLP(
+        self.ffn = BaiChuanMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -276,7 +276,7 @@ class BaiChuanDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -391,6 +391,7 @@ class BaiChuanBaseForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -418,6 +419,7 @@ class BaiChuanBaseForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -426,6 +428,7 @@ class BaiChuanBaseForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

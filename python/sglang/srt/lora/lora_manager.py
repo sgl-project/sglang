@@ -1068,9 +1068,9 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
-                    if module_name.startswith("model.meta_mlp."):
+                    if module_name.startswith("model.meta_ffn."):
                         raise ValueError(
-                            "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
+                            "LoRA on Intern-S2-Mobius model.meta_ffn routed banks "
                             "is not supported by the baseline; remove routed-expert "
                             "targets or use a future bank-aware LoRA implementation."
                         )

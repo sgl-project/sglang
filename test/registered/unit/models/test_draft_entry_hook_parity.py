@@ -9,16 +9,26 @@ and its weights are laid out for the other layout. That shipped once: the DSV4
 DSpark draft skipped its bundled shared-expert tensors until #33312 gave it the
 gate.
 
-This case asks the invariant directly instead: **presence parity between a draft
-entry class and its target**. Identity is deliberately not required -- a draft
-that delegates with adapted arguments (the Qwen3.5 MTP unwraps `text_config` and
-substitutes the MTP quantization config) is exactly right.
+For drafts with one target identifiable by name, check hook presence parity.
+Identity is deliberately not required -- a draft that delegates with adapted
+arguments (the Qwen3.5 MTP unwraps `text_config` and substitutes the MTP
+quantization config) is exactly right. Bailing shares one NextN entry across
+several target versions, so check its decisions with each target's config.
 """
 
 import re
 import unittest
+from itertools import product
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    draft_model_build_scope,
+    install_shared_experts_fusion_decision,
+)
 from sglang.srt.models.registry import ModelRegistry
+from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,6 +47,10 @@ DRAFT_SUFFIX = re.compile(r"(NextN|MTP|DSpark|DFlash|Standalone)$")
 
 def _target_of(arch: str, archs: dict):
     """The arch a draft entry class drafts for, if it is named after it."""
+    if arch == "BailingMoeForCausalLMNextN":
+        # V1/V2/V2.5/V3 share this entry. Their decisions are checked below;
+        # removing NextN would incorrectly pair every config with V1.
+        return None
     match = DRAFT_SUFFIX.search(arch)
     if not match:
         return None
@@ -48,6 +62,82 @@ def _target_of(arch: str, archs: dict):
 
 
 class TestDraftEntryHookParity(CustomTestCase):
+    def test_bailing_nextn_matches_each_target_configuration(self):
+        from sglang.srt.models import bailing_moe_v3
+
+        draft_arch = "BailingMoeForCausalLMNextN"
+        draft_cls = ModelRegistry.resolve_model_cls(draft_arch)[0]
+        # The four targets rewritten to this entry by ModelConfig.
+        targets = (
+            ("BailingMoeForCausalLM", "bailing_moe", False),
+            ("BailingMoeV2ForCausalLM", "bailing_moe", False),
+            ("BailingMoeV2_5ForCausalLM", "bailing_hybrid", False),
+            ("BailingMoeV3ForCausalLM", "bailing_hybrid", True),
+        )
+        quant_configs = (None, SimpleNamespace(get_name=lambda: "w4afp8"))
+        # Exercise both outcomes on CPU CI using supported-device metadata;
+        # the production gates and decision installer run without substitutes.
+        with (
+            patch.object(bailing_moe_v3, "_is_cuda", True),
+            patch.object(
+                bailing_moe_v3.torch.cuda, "get_device_capability", return_value=(9, 0)
+            ),
+        ):
+            for target, quant_config, user_disabled in product(
+                targets, quant_configs, (False, True)
+            ):
+                target_arch, model_type, use_kda = target
+                target_cls = ModelRegistry.resolve_model_cls(target_arch)[0]
+                config = dict(
+                    model_type=model_type,
+                    use_kda=use_kda,
+                    num_shared_experts=1,
+                    moe_intermediate_size=1024,
+                )
+                target_config = SimpleNamespace(architectures=[target_arch], **config)
+                draft_config = SimpleNamespace(architectures=[draft_arch], **config)
+                expected_disabled = user_disabled or (
+                    use_kda and quant_config is not None
+                )
+                moe = get_flags().moe
+                with (
+                    self.subTest(
+                        target=target_arch,
+                        quantized=quant_config is not None,
+                        user_disabled=user_disabled,
+                    ),
+                    get_context().override_server_args(
+                        disable_shared_experts_fusion=user_disabled
+                    ),
+                    patch.multiple(
+                        moe,
+                        a2a_backend=MoeA2ABackend.NONE,
+                        disable_shared_experts_fusion=None,
+                        speculative_disable_shared_experts_fusion=None,
+                        in_speculative_scope=False,
+                    ),
+                ):
+                    install_shared_experts_fusion_decision(
+                        target_cls, target_config, quant_config
+                    )
+                    self.assertEqual(
+                        moe.disable_shared_experts_fusion, expected_disabled
+                    )
+                    with draft_model_build_scope():
+                        install_shared_experts_fusion_decision(
+                            draft_cls, draft_config, quant_config
+                        )
+                        self.assertEqual(
+                            moe.disable_shared_experts_fusion, expected_disabled
+                        )
+                        self.assertEqual(
+                            moe.speculative_disable_shared_experts_fusion,
+                            expected_disabled,
+                        )
+                    self.assertEqual(
+                        moe.disable_shared_experts_fusion, expected_disabled
+                    )
+
     def test_a_draft_resolves_a_gate_exactly_when_its_target_does(self):
         archs = {}
         for arch in sorted(ModelRegistry.get_supported_archs()):

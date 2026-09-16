@@ -449,6 +449,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -468,9 +472,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -479,16 +484,18 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                     # adapt to VisionAttention
                     name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                 # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Remapping the name of FP8 kv-scale
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
     lora_pattern = re.compile(

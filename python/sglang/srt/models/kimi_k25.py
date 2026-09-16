@@ -107,11 +107,11 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
 
-        self.mlp = MLP2(
+        self.ffn = MLP2(
             [hidden_dim, mlp_dim, hidden_dim],
             activation,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.attn = VisionAttention(
@@ -154,7 +154,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -855,6 +855,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
         iterator reuses backing buffers — collecting tensors before consuming them
         would clobber prior tensors.
         """
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
@@ -876,9 +881,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
                         .replace("mm_projector.proj.0", "mm_projector.linear_1")
                         .replace("mm_projector.proj.2", "mm_projector.linear_2")
                     )
-                    if vname not in vision_params:
+                    registered_vname = map_weight_name(vname)
+                    if registered_vname not in vision_params:
                         raise ValueError(f"Weight {vname} not found in params_dict")
-                    param = vision_params[vname]
+                    param = vision_params[registered_vname]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

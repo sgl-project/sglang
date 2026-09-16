@@ -210,12 +210,12 @@ class NanbeigeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = NanbeigeMLP(
+        self.ffn = NanbeigeMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -230,7 +230,6 @@ class NanbeigeDecoderLayer(nn.Module):
         loop_idx: int,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -245,7 +244,7 @@ class NanbeigeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -491,6 +490,7 @@ class NanbeigeForCausalLM(nn.Module):
         assert False, "NanbeigeModel does not support split_prefill."
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -533,6 +533,7 @@ class NanbeigeForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]

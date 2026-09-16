@@ -178,11 +178,11 @@ class QWenBlock(nn.Module):
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = QWenMLP(
+        self.ffn = QWenMLP(
             config.hidden_size,
             config.intermediate_size // 2,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -204,7 +204,7 @@ class QWenBlock(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -324,6 +324,7 @@ class QWenLMHeadModel(nn.Module):
         return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w2", 0),
@@ -337,12 +338,14 @@ class QWenLMHeadModel(nn.Module):
                 if weight_name not in name:
                     continue
                 temp_name = name.replace(weight_name, param_name)
+
                 if temp_name not in params_dict:
                     continue
                 name = temp_name
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -352,6 +355,7 @@ class QWenLMHeadModel(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip visual encoder weights (e.g. Qwen-VL-Chat transformer.visual.*)
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]

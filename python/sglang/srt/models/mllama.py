@@ -218,8 +218,8 @@ class MllamaVisionEncoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             num_dummy_heads=num_dummy_heads,
         )
-        self.mlp = MllamaVisionMLP(
-            config, quant_config, prefix=add_prefix("mlp", prefix)
+        self.ffn = MllamaVisionMLP(
+            config, quant_config, prefix=add_prefix("ffn", prefix)
         )
 
         self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
@@ -247,7 +247,7 @@ class MllamaVisionEncoderLayer(nn.Module):
         # Feed forward
         residual = hidden_state
         hidden_state = self.post_attention_layernorm(hidden_state)
-        hidden_state = self.mlp(hidden_state)
+        hidden_state = self.ffn(hidden_state)
         gate_ffn = 1 if not self.is_gated else self.gate_ffn.tanh()
         hidden_state = residual + gate_ffn * hidden_state
 
@@ -617,17 +617,17 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.cross_attn_attn_gate = torch.nn.Parameter(torch.zeros(1))
 
-        self.mlp = LlamaMLP(
+        self.ffn = LlamaMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.cross_attn_mlp_gate = torch.nn.Parameter(torch.zeros(1))
+        self.cross_attn_ffn_gate = torch.nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -651,9 +651,9 @@ class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = full_text_row_masked_out_mask * hidden_states
-        hidden_states = residual + self.cross_attn_mlp_gate.tanh() * hidden_states
+        hidden_states = residual + self.cross_attn_ffn_gate.tanh() * hidden_states
         return hidden_states
 
 
@@ -1045,6 +1045,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("cross_attn_mlp_gate.", "cross_attn_ffn_gate.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1065,7 +1070,8 @@ class MllamaForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 updated_params.add(name)
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1074,7 +1080,8 @@ class MllamaForConditionalGeneration(nn.Module):
                 if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace("self_attn.o_proj", "self_attn.proj")
-                param = params_dict.pop(name)
+                registered_name = map_weight_name(name)
+                param = params_dict.pop(registered_name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

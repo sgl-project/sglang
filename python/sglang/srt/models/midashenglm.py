@@ -213,11 +213,11 @@ class DashengBlock(nn.Module):
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         )
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = DashengMlp(
+        self.ffn = DashengMlp(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.ls2 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -229,7 +229,7 @@ class DashengBlock(nn.Module):
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.ls1(self.attn(self.norm1(x), mask))
-        x = x + self.ls2(self.mlp(self.norm2(x)))
+        x = x + self.ls2(self.ffn(self.norm2(x)))
         return x
 
 
@@ -607,6 +607,8 @@ class MiDashengLMModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights."""
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         buffers_dict = dict(self.named_buffers())
         audio_encoder_loaded = []
@@ -641,6 +643,7 @@ class MiDashengLMModel(nn.Module):
             ):
                 skipped_weights.append(f"{original_name} (bias not in params/buffers)")
                 continue
+
             if name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

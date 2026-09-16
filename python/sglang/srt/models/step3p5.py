@@ -180,7 +180,6 @@ class Step3p5MoEMLP(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-
         if (
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
@@ -534,7 +533,7 @@ class Step3p5DecoderLayer(nn.Module):
                 config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
             # reduce_results=False: share_expert output stays unreduced and is
             # combined with the (also unreduced) MoE output, then a single
@@ -549,12 +548,12 @@ class Step3p5DecoderLayer(nn.Module):
             )
             self.use_moe = True
         else:
-            self.mlp = Step3p5MLP(
+            self.ffn = Step3p5MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 swiglu_limit=swiglu_limit_shared,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -633,7 +632,7 @@ class Step3p5DecoderLayer(nn.Module):
             if not fuse_mlp_allreduce and not mlp_reduce_scatter:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
             # Dense MLP uses reduce_results=True, so the output is already
             # all-reduced.  Do NOT set the fusion flag — otherwise the next
             # layer would all-reduce again, multiplying values by world_size.
@@ -886,6 +885,7 @@ class Step3p5ForCausalLM(nn.Module):
         # This implementation currently does NOT instantiate those nextn modules,
         # so we must safely skip them (or load them only when a corresponding
         # nextn model is implemented).
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
 
         def _get_layer_id_from_weight_name(weight_name: str) -> Optional[int]:
             # Expected format: "model.layers.<id>...."
@@ -965,6 +965,7 @@ class Step3p5ForCausalLM(nn.Module):
                 if "gate." not in name and "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 if name not in params_dict:
                     # Extra / unsupported weights (e.g. nextn) should not crash loading.
                     continue
@@ -1002,6 +1003,7 @@ class Step3p5ForCausalLM(nn.Module):
                         part_name = weight_name.split(".")[-2]
                         fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
+
                         if actual_param_name not in params_dict:
                             continue
                         param = params_dict[actual_param_name]

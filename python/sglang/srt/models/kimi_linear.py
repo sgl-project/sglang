@@ -595,17 +595,17 @@ class KimiDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 layer_idx=layer_idx,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
                 alt_stream=self.alt_stream,
             )
-            self.mlp = self.block_sparse_moe
+            self.ffn = self.block_sparse_moe
         else:
-            self.mlp = KimiMLP(
+            self.ffn = KimiMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -636,7 +636,7 @@ class KimiDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -872,6 +872,7 @@ class KimiLinearForCausalLM(nn.Module):
         return False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
@@ -928,7 +929,7 @@ class KimiLinearForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("ffn.experts." in name) and name not in params_dict:
                     continue
                 # Check if this mapping targets a fused projection (only apply fusion check to fused params)
                 if param_name in {".fused_qkvbfg_a_proj", ".fused_fg_b_proj"}:
@@ -947,6 +948,7 @@ class KimiLinearForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -958,6 +960,7 @@ class KimiLinearForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -980,11 +983,13 @@ class KimiLinearForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, **kwargs)
+
             loaded_params.add(name)
 
         self.post_load_weights()

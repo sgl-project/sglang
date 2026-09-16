@@ -69,9 +69,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
@@ -97,18 +95,6 @@ from sglang.srt.utils import (
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
-
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-
-elif not (_is_cpu and _is_cpu_amx_available):
-    from vllm._custom_ops import awq_dequantize
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and get_platform().is_sm100
@@ -992,32 +978,32 @@ class BailingMoELinearDecoderLayer(nn.Module):
             mlp_tp_rank, mlp_tp_size = None, None
 
         if self.expert_num == 1:
-            self.mlp = BailingMLP(
+            self.ffn = BailingMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
-                prefix=prefix,
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
         else:
             if is_nextn or self.layer_id >= config.first_k_dense_replace:
-                self.mlp = BailingMoE(
+                self.ffn = BailingMoE(
                     config,
                     quant_config=quant_config,
                     layer_id=self.layer_id,
-                    prefix=prefix,
+                    prefix=add_prefix("ffn", prefix),
                     num_fused_shared_experts=num_fused_shared_experts,
                     alt_stream=alt_stream,
                 )
             else:
-                self.mlp = BailingMLP(
+                self.ffn = BailingMLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=config.intermediate_size,
                     config=config,
                     quant_config=quant_config,
-                    prefix=prefix,
+                    prefix=add_prefix("ffn", prefix),
                     tp_rank=mlp_tp_rank,
                     tp_size=mlp_tp_size,
                 )
@@ -1107,7 +1093,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                 and (not self.is_layer_sparse)
                 and hidden_states.shape[0] == 0
             ):
-                hidden_states = self.mlp(
+                hidden_states = self.ffn(
                     hidden_states,
                     forward_batch=forward_batch,
                 )
@@ -1395,12 +1381,12 @@ class BailingMoeV3ForCausalLM(nn.Module):
             ignore = getattr(quant_config, "ignore", ())
             fused_mapping = getattr(quant_config, "packed_modules_mapping", {})
             shared_ignored = should_ignore_layer(
-                "model.layers.0.mlp.shared_experts.gate_proj",
+                "model.layers.0.ffn.shared_experts.gate_proj",
                 ignore=ignore,
                 fused_mapping=fused_mapping,
             )
             routed_ignored = should_ignore_layer(
-                "model.layers.0.mlp.experts.0.gate_proj",
+                "model.layers.0.ffn.experts.0.gate_proj",
                 ignore=ignore,
                 fused_mapping=fused_mapping,
             )
@@ -1501,6 +1487,18 @@ class BailingMoeV3ForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                # AWQ backends are only required for quantized KV weights.
+                if _is_cuda:
+                    from sglang.kernels.ops.quantization.awq_dequantize import (
+                        awq_dequantize,
+                    )
+                elif _is_hip:
+                    from sglang.kernels.ops.quantization.awq_triton import (
+                        awq_dequantize_triton as awq_dequantize,
+                    )
+                else:
+                    from vllm._custom_ops import awq_dequantize
+
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(
                         self_attn.kv_b_proj.qweight,
@@ -1723,11 +1721,14 @@ class BailingMoeV3ForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False
     ) -> Set[str]:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
+
         def load_linear_attn_weight(
             name: str, loaded_weight: torch.Tensor, self
         ) -> None:
             if is_pp_missing_parameter(name, self):
                 return
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", self.weight_direct_load)
             if "A_log" in name:
@@ -1806,10 +1807,10 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 name = rewritten
                 layer_idx = 0
 
-            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            if self.num_fused_shared_experts > 0 and "ffn.shared_experts" in name:
                 name = name.replace(
-                    "mlp.shared_experts",
-                    f"mlp.experts.{self.config.num_experts}",
+                    "ffn.shared_experts",
+                    f"ffn.experts.{self.config.num_experts}",
                 )
 
             weight_names.append(name)
@@ -1817,7 +1818,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
@@ -1851,6 +1852,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                         continue
 
                 new_name = name.replace(weight_name, param_name)
+
                 if new_name not in params_dict:
                     continue
 
@@ -1924,6 +1926,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+
                             if param_name not in params_dict:
                                 continue
                             param = params_dict[param_name]
@@ -1937,6 +1940,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     else:
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
+
                             if name not in params_dict:
                                 continue
                         if is_pp_missing_parameter(name, self):
@@ -1947,6 +1951,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                             and is_linear_layer(layer_idx, self.model.layer_group_size)
                         ):
                             load_linear_attn_weight(name, loaded_weight, self)
+
                             loaded_params.add(name)
                             continue
 
@@ -1955,6 +1960,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

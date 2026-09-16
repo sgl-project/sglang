@@ -216,6 +216,10 @@ class KimiVLForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         config = self.config.text_config
         _KEYS_TO_MODIFY_MAPPING = {
             # "language_model.lm_head": "lm_head",
@@ -290,16 +294,22 @@ class KimiVLForConditionalGeneration(nn.Module):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
+                    if ("mlp.experts." in name) and map_weight_name(
+                        name
+                    ) not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id, **kwargs)
                     break
@@ -313,10 +323,11 @@ class KimiVLForConditionalGeneration(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
+                        registered_name = map_weight_name(name)
+                        if registered_name not in params_dict:
                             continue
 
-                        param = params_dict[name]
+                        param = params_dict[registered_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -331,7 +342,7 @@ class KimiVLForConditionalGeneration(nn.Module):
                         use_default_weight_loading = True
             if use_default_weight_loading:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -341,7 +352,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                 # if is_pp_missing_parameter(name, self):
                 #     continue
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
         if self.language_model is not None:

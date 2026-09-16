@@ -59,7 +59,7 @@ _device_sm = get_device_sm()
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+        orig_to_new_substr={".block_sparse_moe.": ".ffn."}
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -345,6 +345,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         llm_stacked_params_mapping: list,
         expert_params_mapping: list,
     ) -> None:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         if "block_sparse_moe" in name:
             name = name.replace("block_sparse_moe", "mlp")
 
@@ -375,11 +379,15 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             if "mlp.experts." in name:
                 continue
             new_name = name.replace(weight_name, param_name)
-            if new_name.endswith(".bias") and new_name not in params_dict:
+            if (
+                new_name.endswith(".bias")
+                and map_weight_name(new_name) not in params_dict
+            ):
                 continue
-            if new_name not in params_dict:
+            registered_new_name = map_weight_name(new_name)
+            if registered_new_name not in params_dict:
                 continue
-            param = params_dict[new_name]
+            param = params_dict[registered_new_name]
             param.weight_loader(param, loaded_weight, shard_id)
             return
 
@@ -390,9 +398,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 continue
             is_expert_weight = True
             new_name = name.replace(weight_name, param_name)
-            if new_name not in params_dict:
+            registered_new_name = map_weight_name(new_name)
+            if registered_new_name not in params_dict:
                 continue
-            param = params_dict[new_name]
+            param = params_dict[registered_new_name]
             param.weight_loader(
                 param,
                 loaded_weight,
@@ -404,15 +413,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         if is_expert_weight:
             return
 
-        if name.endswith(".bias") and name not in params_dict:
+        if name.endswith(".bias") and map_weight_name(name) not in params_dict:
             return
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
-        if remapped not in params_dict:
+        registered_remapped = map_weight_name(remapped)
+        if registered_remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return
-        param = params_dict[remapped]
+        param = params_dict[registered_remapped]
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
         try:
             weight_loader(param, loaded_weight)

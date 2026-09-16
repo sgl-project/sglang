@@ -258,11 +258,11 @@ class CLIPEncoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             causal=causal,
         )
-        self.mlp = CLIPMLP(
+        self.ffn = CLIPMLP(
             config,
             act_layer=act_layer,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -271,7 +271,6 @@ class CLIPEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         # CLIP text model uses both `causal_attention_mask` and `attention_mask`
@@ -290,7 +289,7 @@ class CLIPEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -585,6 +584,7 @@ class CLIPModel(nn.Module):
         return input_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -601,6 +601,7 @@ class CLIPModel(nn.Module):
                 if shard_name not in name:
                     continue
                 name = name.replace(shard_name, param_name)
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

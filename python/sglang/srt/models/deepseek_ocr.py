@@ -39,7 +39,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    map_state_dict_names,
+)
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
@@ -610,7 +613,7 @@ class Block(nn.Module):
         )
 
         self.norm2 = norm_layer(dim)
-        self.mlp = MLPBlock(
+        self.ffn = MLPBlock(
             embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer
         )
 
@@ -630,7 +633,7 @@ class Block(nn.Module):
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
         x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.ffn(self.norm2(x))
 
         return x
 
@@ -833,7 +836,10 @@ def _build_sam(
     if checkpoint is not None:
         state_dict = torch.load(checkpoint)
         image_encoder.load_state_dict(
-            {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
+            map_state_dict_names(
+                {k[30:]: v for k, v in state_dict.items() if "vision_tower_high" in k},
+                lambda name: (name + ".").replace(".mlp.", ".ffn.")[:-1],
+            ),
             strict=True,
         )
     return image_encoder
@@ -1027,7 +1033,7 @@ class NoTPTransformerBlock(nn.Module):
         self.dim = cfg["hidden_size"]
         self.head_dim = cfg["hidden_size"] // cfg["num_attention_heads"]
         self.self_attn = NoTPAttention(cfg)
-        self.mlp = NoTPFeedForward(
+        self.ffn = NoTPFeedForward(
             cfg, dim=cfg["hidden_size"], hidden_dim=cfg["ffn_hidden_size"]
         )
         self.layer_id = layer_id
@@ -1041,7 +1047,7 @@ class NoTPTransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor):
         residual = self.self_attn.forward(self.layer_norm1(x))
         h = x + residual
-        out = h + self.mlp.forward(self.layer_norm2(h))
+        out = h + self.ffn.forward(self.layer_norm2(h))
         return out
 
 
@@ -1416,7 +1422,12 @@ def build_qwen2_decoder_as_encoder(
     )
     if checkpoint is not None:
         state_dict = torch.load(checkpoint)
-        decoder_as_encoder.load_state_dict(state_dict, strict=True)
+        decoder_as_encoder.load_state_dict(
+            map_state_dict_names(
+                state_dict, lambda name: (name + ".").replace(".mlp.", ".ffn.")[:-1]
+            ),
+            strict=True,
+        )
     return decoder_as_encoder
 
 
@@ -1795,6 +1806,10 @@ class DeepseekOCRForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1833,22 +1848,28 @@ class DeepseekOCRForCausalLM(nn.Module):
 
             if is_qwen2_weight:
                 target_name = name
-                if target_name not in params_dict:
+                registered_target_name = map_weight_name(target_name)
+                if registered_target_name not in params_dict:
                     if ".model.model." in target_name:
                         alt_name = target_name.replace(".model.model.", ".model.")
                     else:
                         alt_name = target_name.replace(".model.", ".model.model.", 1)
-                    if alt_name in params_dict:
+                    registered_alt_name = map_weight_name(alt_name)
+                    if registered_alt_name in params_dict:
                         target_name = alt_name
-                if target_name.endswith(".bias") and target_name not in params_dict:
+                if (
+                    target_name.endswith(".bias")
+                    and map_weight_name(target_name) not in params_dict
+                ):
                     continue
-                if target_name in params_dict:
-                    param = params_dict[target_name]
+                registered_target_name = map_weight_name(target_name)
+                if registered_target_name in params_dict:
+                    param = params_dict[registered_target_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(target_name)
+                    loaded_params.add(registered_target_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1856,30 +1877,33 @@ class DeepseekOCRForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip experts that are not assigned to this worker.
                 if (
                     "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
+                ) and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 # Skip experts that are not assigned to this worker.
                 if (
                     "mlp.experts." in name or "mlp.shared_experts." in name
-                ) and name not in params_dict:
+                ) and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             raise RuntimeError(
@@ -1910,9 +1934,9 @@ class DeepseekOCRForCausalLM(nn.Module):
                     if (
                         hasattr(self.model, "model")
                         and hasattr(self.model.model, "layers")
-                        and hasattr(self.model.model.layers[layer_id], "mlp")
+                        and hasattr(self.model.model.layers[layer_id], "ffn")
                     ):
-                        self_moe = self.model.model.layers[layer_id].mlp
+                        self_moe = self.model.model.layers[layer_id].ffn
                         if hasattr(self_moe, "w1") and hasattr(self_moe, "w2"):
                             _amx_process_weight_after_loading(self_moe, ["w1", "w2"])
 

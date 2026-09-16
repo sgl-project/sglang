@@ -525,7 +525,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-
         super().__init__()
         # Required for MTP: Glm4MoeLiteModelNextN bypasses Glm4MoeLiteForCausalLM.__init__
         config.moe_layer_freq = 1
@@ -567,10 +566,10 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Glm4MoeLiteSparseMoeBlock(
+            self.ffn = Glm4MoeLiteSparseMoeBlock(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
@@ -580,12 +579,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = Glm4MoeLiteMLP(
+            self.ffn = Glm4MoeLiteMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -676,7 +675,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -908,9 +907,9 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
+                layer_id: layer.ffn.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock)
+                if isinstance(layer.ffn, Glm4MoeLiteSparseMoeBlock)
             }
         )
         self.capture_aux_hidden_states = False
@@ -1033,6 +1032,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         is_nextn=False,
         params_dict=None,
     ):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1061,16 +1061,15 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-
                 pattern = re.compile(
-                    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
+                    "^model\\.layers\\.(\\d+)\\.ffn\\.shared_experts\\.(.+)$"
                 )
                 for name, weight in weights:
                     match = pattern.match(name)
                     if match:
                         layer_id = int(match.group(1))
                         suffix = match.group(2)
-                        name = f"model.layers.{layer_id}.mlp.experts.{self.config.n_routed_experts}.{suffix}"
+                        name = f"model.layers.{layer_id}.ffn.experts.{self.config.n_routed_experts}.{suffix}"
                     yield name, weight
 
             weights = iter_weights_with_fused_shared_experts(weights)
@@ -1151,12 +1150,13 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -1177,6 +1177,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         # Expert weight not on this rank, will be skipped below
                         continue
@@ -1233,6 +1234,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                                     "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
                                 )
                             )
+
                             if param_name not in params_dict:
                                 continue
                             param = params_dict[param_name]

@@ -174,7 +174,7 @@ class DotsVisionBlock(nn.Module):
             proj_bias=config.use_bias,
         )
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
-        self.mlp = DotsSwiGLUFFN(config, quant_config)
+        self.ffn = DotsSwiGLUFFN(config, quant_config)
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -190,7 +190,7 @@ class DotsVisionBlock(nn.Module):
             position_embeddings=rotary_pos_emb,
             forward_metadata=forward_metadata,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        hidden_states = hidden_states + self.ffn(self.norm2(hidden_states))
         return hidden_states
 
 
@@ -261,11 +261,11 @@ class DotsVisionTransformer(PreTrainedModel):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.blocks[0].mlp.fc2.weight.dtype
+        return self.blocks[0].ffn.fc2.weight.dtype
 
     @property
     def device(self) -> torch.device:
-        return self.blocks[0].mlp.fc2.weight.device
+        return self.blocks[0].ffn.fc2.weight.device
 
     def get_pos_ids_by_grid(self, grid_thw):
         pos_ids = []

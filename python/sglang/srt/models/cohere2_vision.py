@@ -199,6 +199,10 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         # The checkpoint stores tensors under ``model.language_model.``,
         # ``model.vision_tower.``, and ``model.multi_modal_projector.``
         # prefixes; re-map them to our SGLang module names, then dispatch.
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         lm_weights: List[Tuple[str, torch.Tensor]] = []
         vision_weights: List[Tuple[str, torch.Tensor]] = []
         projector_weights: List[Tuple[str, torch.Tensor]] = []
@@ -236,15 +240,18 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
             assert name.startswith("vision_tower.")
             stripped = name[len("vision_tower.") :]
             # Some HF versions still keep the ``vision_model.`` middle prefix.
-            if stripped not in vt_params and stripped.startswith("vision_model."):
+            if map_weight_name(stripped) not in vt_params and stripped.startswith(
+                "vision_model."
+            ):
                 stripped = stripped[len("vision_model.") :]
-            if stripped not in vt_params:
+            registered_stripped = map_weight_name(stripped)
+            if registered_stripped not in vt_params:
                 sample = sorted(vt_params.keys())[:3]
                 raise ValueError(
                     f"Unexpected vision tower weight: {name} (looked for "
                     f"{stripped!r}, sample params: {sample})"
                 )
-            vt_params[stripped].data.copy_(w)
+            vt_params[registered_stripped].data.copy_(w)
 
         # The HF checkpoint stores the merged ``linear_1`` as one [2*N, in]
         # tensor matching MergedColumnParallelLinear, so the param's own
@@ -253,9 +260,10 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         for name, w in projector_weights:
             assert name.startswith("multi_modal_projector.")
             stripped = name[len("multi_modal_projector.") :]
-            if stripped not in proj_params:
+            registered_stripped = map_weight_name(stripped)
+            if registered_stripped not in proj_params:
                 raise ValueError(f"Unexpected projector weight: {name}")
-            param = proj_params[stripped]
+            param = proj_params[registered_stripped]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, w)
 

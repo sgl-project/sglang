@@ -255,7 +255,11 @@ def _resolve_explicit_draft_quant_config(
     if model_config.quantization == "modelopt_fp4" and (
         isinstance(quant_config, ModelOptFp4Config)
         and quant_config.is_checkpoint_nvfp4_serialized
-        and quant_config.is_layer_excluded("mtp.layers.0.mlp.experts")
+        # This runs before model-specific checkpoint name mapping.
+        and any(
+            quant_config.is_layer_excluded(f"mtp.layers.0.{name}.experts")
+            for name in ("mlp", "ffn")
+        )
     ):
         return ModelOptFp4Config.for_online_weight_quantization(
             quant_config.packed_modules_mapping
@@ -284,7 +288,10 @@ def _quark_draft_online_quant_config(
     ):
         return None
     excluded = hf_quant_config.get("exclude") or []
-    if not any(str(name).startswith("mtp.layers.0.mlp.experts") for name in excluded):
+    if not any(
+        str(name).startswith(("mtp.layers.0.mlp.experts", "mtp.layers.0.ffn.experts"))
+        for name in excluded
+    ):
         return None
     from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 
@@ -1582,6 +1589,24 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     if not isinstance(x, torch.Tensor):
         x = x[:]
     return x
+
+
+def map_state_dict_names(state, map_name: Callable[[str], str]):
+    """Map checkpoint keys and module metadata before strict state loading."""
+
+    def map_items(items):
+        result = collections.OrderedDict()
+        for name, value in items:
+            target = map_name(name)
+            if target in result:
+                raise ValueError(f"Duplicate state_dict destination: {target}")
+            result[target] = value
+        return result
+
+    result = map_items(state.items())
+    if hasattr(state, "_metadata"):
+        result._metadata = map_items(state._metadata.items())
+    return result
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

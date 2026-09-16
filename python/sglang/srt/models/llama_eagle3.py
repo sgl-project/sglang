@@ -71,8 +71,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         else:
             inter_size = config.intermediate_size
 
-        self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+        self.ffn = LlamaMLP(
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -85,7 +89,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if self.is_input_layer:
             # Input layer consumes target hidden states; no carried residual to fuse.
             residual = hidden_states
@@ -106,7 +109,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -312,6 +315,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
@@ -349,6 +353,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                     continue
                 name = name.replace(weight_name, param_name)
                 param_name = f"model.{name}" if name not in params_dict else name
+
                 if param_name in params_dict:
                     param = params_dict[param_name]
                     weight_loader = getattr(
@@ -359,6 +364,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             else:
                 # Handle regular parameters
                 param_name = name if name in params_dict else f"model.{name}"
+
                 if param_name in params_dict:
                     param = params_dict[param_name]
                     weight_loader = getattr(

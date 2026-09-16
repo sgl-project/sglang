@@ -90,10 +90,10 @@ class Idefics2EncoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = Idefics2VisionMLP(
+        self.ffn = Idefics2VisionMLP(
             config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
@@ -120,7 +120,7 @@ class Idefics2EncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 

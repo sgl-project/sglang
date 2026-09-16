@@ -174,7 +174,7 @@ class ConformerEncoderLayer(nn.Module):
     ):
         super().__init__()
 
-        self.feed_forward_in = FeedForward(
+        self.ffn_in = FeedForward(
             d_model=d_model,
             d_inner=d_ffn,
             dropout_rate=dropout_rate,
@@ -211,7 +211,7 @@ class ConformerEncoderLayer(nn.Module):
             export=export,
         )
 
-        self.feed_forward_out = FeedForward(
+        self.ffn_out = FeedForward(
             d_model=d_model,
             d_inner=d_ffn,
             dropout_rate=dropout_rate,
@@ -243,7 +243,7 @@ class ConformerEncoderLayer(nn.Module):
                 bias added to attention logits w.r.t. relative positions
                 (1, n_head, time1, time2)
         """
-        x = x + 0.5 * self.feed_forward_in(x)
+        x = x + 0.5 * self.ffn_in(x)
         norm_x = self.layer_norm_att(x)
 
         x = x + self.self_attn(
@@ -256,7 +256,7 @@ class ConformerEncoderLayer(nn.Module):
             relative_attention_bias=relative_attention_bias,
         )
         x = x + self.conv(x)
-        x = x + 0.5 * self.feed_forward_out(x)
+        x = x + 0.5 * self.ffn_out(x)
 
         out = self.layer_norm(x)
 

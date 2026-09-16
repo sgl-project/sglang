@@ -268,12 +268,12 @@ class Qwen2DecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = Qwen2MLP(
+        self.ffn = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -305,9 +305,9 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual, quant_linear=self.mlp.gate_up_proj
+            hidden_states, residual, quant_linear=self.ffn.gate_up_proj
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -615,11 +615,17 @@ class Qwen2ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         from sglang.srt.environ import envs
 
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
+
         if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
             return self._load_weights_v2(weights)
         return self._legacy_load_weights(weights)
 
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -659,7 +665,10 @@ class Qwen2ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
+            if (
+                name.startswith("model.vision_tower")
+                and map_weight_name(name) not in params_dict
+            ):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -667,21 +676,23 @@ class Qwen2ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

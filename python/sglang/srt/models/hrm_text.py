@@ -250,12 +250,12 @@ class HrmTextDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = HrmTextMLP(
+        self.ffn = HrmTextMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         # Parameterless RMSNorm (HF HrmTextRMSNorm has no weight).
         self.input_layernorm = RMSNorm(
@@ -284,7 +284,7 @@ class HrmTextDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -463,10 +463,12 @@ class HrmTextForCausalLM(nn.Module):
         # Disk keys use `.attn.`; rename to our `.self_attn.`. The per-step
         # RadixAttention modules hold no params, and disk tensors are already
         # fused so no stacked_params_mapping is needed.
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if ".attn." in name:
                 name = name.replace(".attn.", ".self_attn.", 1)
+
             if name not in params_dict:
                 continue
             param = params_dict[name]

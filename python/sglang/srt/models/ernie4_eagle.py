@@ -141,6 +141,10 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         mtp_layer_found = False
         mtp_weight_patterns = [
             f"mtp_block.{self.mtp_layer_id}",
@@ -167,13 +171,15 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

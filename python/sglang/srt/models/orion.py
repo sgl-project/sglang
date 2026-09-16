@@ -178,12 +178,12 @@ class OrionDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=layer_id,
         )
-        self.mlp = OrionMLP(
+        self.ffn = OrionMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(
@@ -209,7 +209,7 @@ class OrionDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -325,6 +325,7 @@ class OrionForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -346,6 +347,7 @@ class OrionForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -359,6 +361,7 @@ class OrionForCausalLM(nn.Module):
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
+
             if name not in params_dict:
                 continue
             param = params_dict[name]

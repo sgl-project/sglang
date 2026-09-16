@@ -284,11 +284,11 @@ class SDARBlock(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.mlp = SDARMLP(
+        self.ffn = SDARMLP(
             config=config,
             quant_config=quant_config,
             reduce_results=True,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -335,7 +335,7 @@ class SDARBlock(nn.Module):
             forward_batch
         )
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -509,6 +509,7 @@ class SDARForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -564,6 +565,7 @@ class SDARForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

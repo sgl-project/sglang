@@ -235,17 +235,17 @@ class PerceptionEncoderVisionBlock(nn.Module):
         self.ln_1 = norm_layer(d_model)
         self.ln_2 = norm_layer(d_model)
         hidden_dim = int(d_model * mlp_ratio)
-        self.mlp = PerceptionEncoderMLP(
+        self.ffn = PerceptionEncoderMLP(
             d_model,
             hidden_dim,
             act_layer,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
         )
 
     def forward(self, x: torch.Tensor, grid_hw: tuple[int, int]):
         x = x + self.ls_1(self.attn(self.ln_1(x), position_embeddings=grid_hw))  # hacky
-        x = x + self.ls_2(self.mlp(self.ln_2(x)))
+        x = x + self.ls_2(self.ffn(self.ln_2(x)))
         return x
 
 
@@ -595,6 +595,11 @@ class StepVLForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
+
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         weights = list(weights)
 
         # Separate vision tower weights and language model weights
@@ -618,9 +623,10 @@ class StepVLForConditionalGeneration(nn.Module):
         vision_state_dict = dict(vision_weights)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
             weight_loader(param, loaded_weight)

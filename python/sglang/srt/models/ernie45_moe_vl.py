@@ -411,19 +411,19 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
             and layer_id >= min_moe_layer_start_index
             and layer_id <= max_moe_layer_end_index
         ):
-            self.mlp = Ernie4_5_VLMoeMoE(
+            self.ffn = Ernie4_5_VLMoeMoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = Ernie4_5_VLMoeMLP(
+            self.ffn = Ernie4_5_VLMoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -454,10 +454,10 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if isinstance(self.mlp, Ernie4_5_VLMoeMoE):
-            hidden_states = self.mlp(hidden_states, visual_token_mask, **kwargs)
+        if isinstance(self.ffn, Ernie4_5_VLMoeMoE):
+            hidden_states = self.ffn(hidden_states, visual_token_mask, **kwargs)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 

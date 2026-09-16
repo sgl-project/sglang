@@ -127,12 +127,12 @@ class SiglipEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = SiglipMLP(
+        self.ffn = SiglipMLP(
             config,
             act_layer=act_layer,
             use_data_parallel=use_data_parallel,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -141,7 +141,6 @@ class SiglipEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         # Siglip text model uses both `causal_attention_mask` and `attention_mask`
@@ -160,7 +159,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 

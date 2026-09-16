@@ -380,7 +380,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
-            self.mlp = Cohere2MoeMLP(
+            self.ffn = Cohere2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=getattr(
                     config, "prefix_dense_intermediate_size", config.intermediate_size
@@ -388,14 +388,14 @@ class Cohere2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 # Folded into the decoder layer's single all-reduce.
                 reduce_results=False,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = Cohere2MoeSparseMoeBlock(
+            self.ffn = Cohere2MoeSparseMoeBlock(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         norm_eps = getattr(config, "layer_norm_eps", 1e-5)
@@ -427,7 +427,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
             current_stream = torch.cuda.current_stream()
             self.mlp_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.mlp_stream):
-                mlp_out = self.mlp(hidden_states)
+                ffn_out = self.ffn(hidden_states)
             attn_out = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -441,8 +441,8 @@ class Cohere2MoeDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            mlp_out = self.mlp(hidden_states)
-        combined = attn_out + mlp_out
+            ffn_out = self.ffn(hidden_states)
+        combined = attn_out + ffn_out
         if self.tp_size > 1:
             combined = tensor_model_parallel_all_reduce(combined)
         return residual + combined
@@ -545,6 +545,7 @@ class Cohere2MoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -581,12 +582,13 @@ class Cohere2MoeForCausalLM(nn.Module):
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 new_name = name.replace(shard_name, param_name)
                 if new_name.endswith(".bias") and new_name not in params_dict:
                     matched = True
                     break
+
                 if new_name not in params_dict:
                     matched = True
                     break
@@ -605,6 +607,7 @@ class Cohere2MoeForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 new_name = name.replace(weight_name, param_name)
+
                 if new_name not in params_dict:
                     continue
                 param = params_dict[new_name]
@@ -625,6 +628,7 @@ class Cohere2MoeForCausalLM(nn.Module):
             # lm_head is tied with embed_tokens; skip if missing.
             if "lm_head.weight" in name:
                 continue
+
             if name not in params_dict:
                 continue
             param = params_dict[name]

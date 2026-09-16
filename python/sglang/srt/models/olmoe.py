@@ -220,14 +220,14 @@ class OlmoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = OlmoeMoE(
+        self.ffn = OlmoeMoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
@@ -254,7 +254,7 @@ class OlmoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -343,6 +343,7 @@ class OlmoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -375,12 +376,13 @@ class OlmoeForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -394,6 +396,7 @@ class OlmoeForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -413,6 +416,7 @@ class OlmoeForCausalLM(nn.Module):
                         remapped_kv_scale_name = name.replace(
                             ".kv_scale", ".attn.kv_scale"
                         )
+
                         if remapped_kv_scale_name not in params_dict:
                             print_warning_once(
                                 "Found kv scale in the checkpoint "

@@ -492,11 +492,11 @@ class MoEVisionBlock(nn.Module):
             and config.pyramid_num_routed[layer_number] > 0
         )
         if is_moe and config.enable_fp8_moe:
-            self.mlp = MoESwiGLUFFNFP8(config, layer_number)
+            self.ffn = MoESwiGLUFFNFP8(config, layer_number)
         elif is_moe:
-            self.mlp = MoESwiGLUFFN(config, layer_number)
+            self.ffn = MoESwiGLUFFN(config, layer_number)
         else:
-            self.mlp = DotsSwiGLUFFN(
+            self.ffn = DotsSwiGLUFFN(
                 config.embed_dim, config.intermediate_size, bias=config.use_bias
             )
 
@@ -510,7 +510,7 @@ class MoEVisionBlock(nn.Module):
         hidden_states = hidden_states + self.attn(
             self.norm_1(hidden_states), cu_seqlens, max_seqlen, rotary_pos_emb
         )
-        hidden_states = hidden_states + self.mlp(self.norm_2(hidden_states))
+        hidden_states = hidden_states + self.ffn(self.norm_2(hidden_states))
         return hidden_states
 
 
@@ -657,10 +657,10 @@ class DotsMoEVitModel(PreTrainedModel):
 
     @property
     def dtype(self) -> torch.dtype:
-        mlp = self.blocks[0].mlp
-        if isinstance(mlp, DotsSwiGLUFFN):
-            return mlp.fc13.weight.dtype
-        expert = mlp.experts[0]
+        ffn = self.blocks[0].ffn
+        if isinstance(ffn, DotsSwiGLUFFN):
+            return ffn.fc13.weight.dtype
+        expert = ffn.experts[0]
         return expert.fc13.weight.dtype
 
     @property

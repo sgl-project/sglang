@@ -240,12 +240,12 @@ class Glm4DecoderLayer(nn.Module):
         )
 
         # MLP
-        self.mlp = Glm4MLP(
+        self.ffn = Glm4MLP(
             config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -255,7 +255,7 @@ class Glm4DecoderLayer(nn.Module):
         self.post_self_attn_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_ffn_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -279,8 +279,8 @@ class Glm4DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        hidden_states = self.post_ffn_layernorm(hidden_states)
 
         return hidden_states, residual
 
@@ -552,6 +552,11 @@ class Glm4ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("post_mlp_layernorm.", "post_ffn_layernorm.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -592,21 +597,23 @@ class Glm4ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

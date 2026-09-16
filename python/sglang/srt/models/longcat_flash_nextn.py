@@ -144,12 +144,12 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             alt_stream=self.alt_stream,
         )
 
-        self.mlp = LongcatFlashMLP(
+        self.ffn = LongcatFlashMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix(f"mlps", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -179,7 +179,6 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -194,7 +193,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -481,11 +480,11 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     module.weight, module.weight_scale_inv, weight_block_size
                 )
 
-        mlp = layer.mlps
-        assert isinstance(mlp, LongcatFlashMLP)
+        ffn = layer.ffn
+        assert isinstance(ffn, LongcatFlashMLP)
         for module in [
-            mlp.gate_up_proj,
-            mlp.down_proj,
+            ffn.gate_up_proj,
+            ffn.down_proj,
         ]:
             if hasattr(module, "weight_scale_inv"):
                 requant_weight_ue8m0_inplace(
@@ -493,6 +492,11 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                 )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlps.", "ffns.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -590,13 +594,19 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     # name will be updated to mlp.experts[0].gate_up_proj, which
                     # will then be updated below in expert_params_mapping
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
+                    if ("mlp.experts." in name) and map_weight_name(
+                        name
+                    ) not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     futures.append(
                         executor.submit(weight_loader, param, loaded_weight, shard_id)
@@ -604,7 +614,10 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
@@ -646,7 +659,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
-                            param = params_dict[param_name]
+                            registered_param_name = map_weight_name(param_name)
+                            param = params_dict[registered_param_name]
 
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
@@ -657,21 +671,22 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-                        if (
-                            "k_scale" in name or "v_scale" in name
-                        ) and name not in params_dict:
+                        if ("k_scale" in name or "v_scale" in name) and map_weight_name(
+                            name
+                        ) not in params_dict:
                             # modelopt attn kv scale is named differently
                             for scale in ["k_scale", "v_scale"]:
                                 if scale in name:
                                     name = name.replace(f"{scale[0]}_proj", "attn_mqa")
                                     break
-                        if name not in params_dict:
+                        registered_name = map_weight_name(name)
+                        if registered_name not in params_dict:
                             # modelopt ckpt contains not needed weights for MTP module:
                             # model.decoder.self_attn.attn_mqa.v_scale and
                             # model.decoder.self_attn.attn_mqa.k_scale
                             logger.warning(f"{name} not found in params_dict.")
                             continue
-                        param = params_dict[name]
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

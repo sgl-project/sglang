@@ -475,20 +475,20 @@ class ExaoneMoEDecoderLayer(nn.Module):
         )
 
         if config.is_moe_layer[layer_id]:
-            self.mlp = ExaoneMoESparseMoEBlock(
+            self.ffn = ExaoneMoESparseMoEBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = ExaoneMoEMLP(
+            self.ffn = ExaoneMoEMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -517,7 +517,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -650,9 +650,9 @@ class ExaoneMoEForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, ExaoneMoESparseMoEBlock)
+                if isinstance(self.model.layers[layer_id].ffn, ExaoneMoESparseMoEBlock)
             }
         )
 
@@ -755,6 +755,7 @@ class ExaoneMoEForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -801,12 +802,13 @@ class ExaoneMoEForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -820,6 +822,7 @@ class ExaoneMoEForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

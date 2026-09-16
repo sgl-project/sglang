@@ -425,19 +425,19 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 raise ValueError(
                     "Sparse MLP requested but num_experts <= 0 in Mellum config"
                 )
-            self.mlp = Qwen3MoeSparseMoeBlock(
+            self.ffn = Qwen3MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=cfg,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = MellumMLP(
+            self.ffn = MellumMLP(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
                 hidden_act=cfg.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         is_previous_layer_sparse = _is_sparse(layer_id - 1)

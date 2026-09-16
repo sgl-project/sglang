@@ -453,25 +453,25 @@ class AfmoeDecoderLayer(nn.Module):
             use_moe = layer_id >= base and (layer_id - base) % freq == 0
 
         if use_moe:
-            self.mlp = AfmoeMoE(
+            self.ffn = AfmoeMoE(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = AfmoeMLP(
+            self.ffn = AfmoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         eps = getattr(config, "rms_norm_eps", 1e-5)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=eps)
-        self.pre_mlp_layernorm = RMSNorm(config.hidden_size, eps=eps)
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=eps)
+        self.pre_ffn_layernorm = RMSNorm(config.hidden_size, eps=eps)
+        self.post_ffn_layernorm = RMSNorm(config.hidden_size, eps=eps)
 
     def forward(
         self,
@@ -486,9 +486,9 @@ class AfmoeDecoderLayer(nn.Module):
         hidden_states = attn_residual + hidden_states
 
         mlp_residual = hidden_states
-        hidden_states = self.pre_mlp_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = self.pre_ffn_layernorm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        hidden_states = self.post_ffn_layernorm(hidden_states)
         hidden_states = mlp_residual + hidden_states
 
         return hidden_states
@@ -589,6 +589,12 @@ class AfmoeForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("post_mlp_layernorm.", "post_ffn_layernorm.")
+            name = name.replace("pre_mlp_layernorm.", "pre_ffn_layernorm.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -619,11 +625,12 @@ class AfmoeForCausalLM(nn.Module):
 
                 new_name = name.replace(weight_name, param_name)
                 # Skip if parameter doesn't exist (e.g., bias for layers without bias)
-                if new_name not in params_dict:
+                registered_new_name = map_weight_name(new_name)
+                if registered_new_name not in params_dict:
                     handled = True
                     break
 
-                param = params_dict[new_name]
+                param = params_dict[registered_new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 handled = True
@@ -633,8 +640,9 @@ class AfmoeForCausalLM(nn.Module):
                 continue
 
             # Load remaining weights directly
-            if name in params_dict:
-                param = params_dict[name]
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

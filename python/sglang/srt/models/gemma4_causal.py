@@ -573,12 +573,12 @@ class Gemma4DecoderLayer(nn.Module):
             2 if use_double_wide_mlp else 1
         )
 
-        self.mlp = Gemma4MLP(
+        self.ffn = Gemma4MLP(
             hidden_size=self.hidden_size,
             intermediate_size=layer_intermediate_size,
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -695,7 +695,7 @@ class Gemma4DecoderLayer(nn.Module):
             moe_input = residual
 
             # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
+            hidden_states_1 = self.ffn(hidden_states)
 
             # MoE branch: router sees residual (= post_attn_out + old_residual)
             router_logits = self.router(moe_input)
@@ -735,7 +735,7 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
 
         if (
             not self.has_ple
@@ -1193,6 +1193,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
         }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1302,6 +1303,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 if weight_name not in orig_name:
                     continue
                 name = orig_name.replace(weight_name, param_name)
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -1324,6 +1326,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1340,6 +1343,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+
                         if name not in params_dict:
                             continue
                         param = params_dict[name]
@@ -1356,6 +1360,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         name = maybe_remap_kv_scale_name(name, params_dict)
                         if name is None:
                             continue
+
                         if name not in params_dict:
                             continue
                         param = params_dict[name]

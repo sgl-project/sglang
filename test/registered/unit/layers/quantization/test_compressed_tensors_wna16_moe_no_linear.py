@@ -19,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _WNA16_MOE_SCHEMES = (CompressedTensorsWNA16MoE, CompressedTensorsWNA16TritonMoE)
-EXPERTS_LAYER = "model.layers.0.mlp.experts"
+EXPERTS_LAYER = "model.layers.0.ffn.experts"
 PER_LAYER_EXPERT_TARGETS = [
     f"{EXPERTS_LAYER}.0.gate_proj",
     f"{EXPERTS_LAYER}.0.up_proj",
@@ -46,7 +46,7 @@ def _make_wna16_moe_config(targets, num_bits, **weight_overrides):
                 "input_activations": None,
             }
         },
-        "ignore": ["lm_head", "re:.*self_attn.*", "re:.*mlp.gate$"],
+        "ignore": ["lm_head", "re:.*self_attn.*", "re:.*ffn.gate$"],
     }
 
 
@@ -63,11 +63,11 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self.assertEqual(scheme.group_size, 128)
 
     def test_regex_expert_targets_int4(self):
-        config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
+        config = _make_wna16_moe_config(["re:.*ffn.experts.*"], num_bits=4)
         self._assert_wna16_moe(config, expected_bits=4)
 
     def test_regex_expert_targets_int8(self):
-        config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=8)
+        config = _make_wna16_moe_config(["re:.*ffn.experts.*"], num_bits=8)
         self._assert_wna16_moe(config, expected_bits=8)
 
     def test_per_layer_fqn_expert_targets_int4(self):
@@ -79,7 +79,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             with self.subTest(group_size=group_size):
                 quant_config = CompressedTensorsConfig.from_config(
                     _make_wna16_moe_config(
-                        ["re:.*mlp.experts.*"],
+                        ["re:.*ffn.experts.*"],
                         num_bits=4,
                         group_size=group_size,
                     )
@@ -110,7 +110,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             with self.subTest(name=name):
                 quant_config = CompressedTensorsConfig.from_config(
                     _make_wna16_moe_config(
-                        ["re:.*mlp.experts.*"], num_bits=4, **overrides
+                        ["re:.*ffn.experts.*"], num_bits=4, **overrides
                     )
                 )
                 with (
@@ -130,7 +130,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
 
     def test_explicit_triton_rejects_unvalidated_layout(self):
         quant_config = CompressedTensorsConfig.from_config(
-            _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4, symmetric=False)
+            _make_wna16_moe_config(["re:.*ffn.experts.*"], num_bits=4, symmetric=False)
         )
 
         with (
@@ -145,7 +145,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
 
     def test_blackwell_explicit_marlin_is_preserved(self):
         quant_config = CompressedTensorsConfig.from_config(
-            _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
+            _make_wna16_moe_config(["re:.*ffn.experts.*"], num_bits=4)
         )
 
         with (
@@ -164,7 +164,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
 
     def test_blackwell_int8_auto_keeps_marlin(self):
         quant_config = CompressedTensorsConfig.from_config(
-            _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=8)
+            _make_wna16_moe_config(["re:.*ffn.experts.*"], num_bits=8)
         )
 
         with (

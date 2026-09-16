@@ -332,11 +332,11 @@ class GraniteMoeDecoderLayer(nn.Module):
             if config.model_type in SHARED_MOE_MODEL_TYPES
             else 0
         )
-        self.shared_mlp = (
+        self.shared_ffn = (
             None
             if shared_intermediate_size == 0
             else GraniteMoeSharedMLP(
-                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+                config, quant_config=quant_config, prefix=f"{prefix}.shared_ffn"
             )
         )
 
@@ -364,11 +364,11 @@ class GraniteMoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * self.residual_multiplier
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.shared_mlp is None:
+        if self.shared_ffn is None:
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             # Routed experts consume `hidden_states`, so compute shared first
-            shared_output = self.shared_mlp(hidden_states)
+            shared_output = self.shared_ffn(hidden_states)
             hidden_states = self.block_sparse_moe(hidden_states) + shared_output
         hidden_states = residual + hidden_states * self.residual_multiplier
 
@@ -501,6 +501,10 @@ class GraniteMoeForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("shared_mlp.", "shared_ffn.")
+            return name
+
         weights = granitemoe_split_expert_weights(
             self.hf_to_sglang_mapper.apply(weights)
         )
@@ -509,7 +513,9 @@ class GraniteMoeForCausalLM(nn.Module):
             expert_params_mapping=self._split_expert_params_mapping(),
             params_dict=dict(self.named_parameters()),
         )
-        mixtral.MixtralForCausalLM.load_weights(self, weights)
+        mixtral.MixtralForCausalLM.load_weights(
+            self, ((map_weight_name(name), weight) for name, weight in weights)
+        )
 
 
 class GraniteMoeSharedForCausalLM(GraniteMoeForCausalLM):

@@ -2403,20 +2403,20 @@ class KimiK3DecoderLayer(nn.Module):
 
         # MLP / MoE
         if self._is_moe_layer:
-            self.mlp = KimiK3MoE(
+            self.ffn = KimiK3MoE(
                 config=config,
                 quant_config=quant_config,
                 layer_idx=layer_idx,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
             )
         else:
-            self.mlp = KimiK3MLP(
+            self.ffn = KimiK3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
             )
@@ -2434,7 +2434,7 @@ class KimiK3DecoderLayer(nn.Module):
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.ffn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attention_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
@@ -2442,12 +2442,12 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.self_attention_res_proj",
             )
-            self.mlp_res_proj = ReplicatedLinear(
+            self.ffn_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
                 bias=False,
                 quant_config=None,
-                prefix=f"{prefix}.mlp_res_proj",
+                prefix=f"{prefix}.ffn_res_proj",
             )
 
         if self._sp_moe:
@@ -2629,7 +2629,7 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, allow_scatter=False
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        hidden_states = self.ffn(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual, False
 
     def _forward_attn_residual(
@@ -2715,8 +2715,8 @@ class KimiK3DecoderLayer(nn.Module):
                 fused_rs = attn_res.forward_sp_reduce_scatter(
                     hidden_states,
                     prefix_sum,
-                    self.mlp_res_proj,
-                    self.mlp_res_norm,
+                    self.ffn_res_proj,
+                    self.ffn_res_norm,
                     self.post_attention_layernorm,
                     rows=fused_rows,
                 )
@@ -2753,15 +2753,15 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, prefix_sum = attn_res.forward(
                 hidden_states,
                 prefix_sum,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
+                self.ffn_res_proj,
+                self.ffn_res_norm,
                 self.post_attention_layernorm,
                 rows=rows,
             )
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
-        out = self.mlp(
+        out = self.ffn(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
         )
         if shard_lo >= 0:
@@ -3123,6 +3123,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_res_norm.", "ffn_res_norm.")
+            name = name.replace("mlp_res_proj.", "ffn_res_proj.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
@@ -3208,8 +3214,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     ".kv_a_proj_with_mqa.", ".fused_qkv_a_proj_with_mqa."
                 )
                 fused_name = _maybe_map_fp8_pb_scale_name(fused_name, params_dict)
-                if fused_name in params_dict:
-                    param = params_dict[fused_name]
+                registered_fused_name = map_weight_name(fused_name)
+                if registered_fused_name in params_dict:
+                    param = params_dict[registered_fused_name]
                     if fused_name.endswith(".weight_scale_inv"):
                         offset = 0 if is_q_a else _cdiv(self.config.q_lora_rank, 128)
                         param.data[offset : offset + loaded_weight.shape[0]].copy_(
@@ -3220,7 +3227,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     else:
                         q_lora_rank = self.config.q_lora_rank or 0
                         param.data[q_lora_rank:].copy_(loaded_weight)
-                    loaded_params.add(fused_name)
+                    loaded_params.add(registered_fused_name)
                     continue
 
             if "rotary_emb.inv_freq" in name:
@@ -3231,7 +3238,9 @@ class KimiK3LinearForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("mlp.experts." in name) and map_weight_name(
+                    name
+                ) not in params_dict:
                     continue
                 # Fused projections only apply to KDA layers
                 if param_name in {
@@ -3250,10 +3259,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 name = _maybe_map_fp8_pb_scale_name(name, params_dict)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -3267,9 +3277,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # Skip experts of layers outside a truncated config (e.g.
                     # num_hidden_layers override), mirroring the non-expert
                     # `name not in params_dict` guard below.
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         break
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -3282,7 +3293,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 else:
                     if (
                         name.endswith(".bias")
-                        and name not in params_dict
+                        and map_weight_name(name) not in params_dict
                         and not self.config.is_linear_attn
                     ):
                         continue
@@ -3290,9 +3301,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name is None:
                         continue
                     name = _maybe_map_fp8_pb_scale_name(name, params_dict)
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                     if name.endswith(".b_proj.weight_scale_inv"):
                         # All TP ranks share K3's single beta output-scale block.
                         param.data.copy_(loaded_weight)
@@ -3301,7 +3313,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight, **kwargs)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
         self.post_load_weights()
         return loaded_params
@@ -3348,7 +3361,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if layer.use_attn_residuals:
                 _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
-                _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
+                _warm_cw(layer.ffn_res_proj, layer.ffn_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
@@ -3359,13 +3372,13 @@ class KimiK3LinearForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if isinstance(layer.mlp, KimiK3MoE):
-                layer.mlp._merge_front_weights()
+            if isinstance(layer.ffn, KimiK3MoE):
+                layer.ffn._merge_front_weights()
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
                 # kernel per MoE layer per step.
-                bias = layer.mlp.gate.e_score_correction_bias
+                bias = layer.ffn.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
@@ -3434,7 +3447,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "language_model.layers.": "language_model.model.layers.",
         },
         orig_to_new_substr={
-            "block_sparse_moe": "mlp",
+            "block_sparse_moe": "ffn",
+            ".mlp.": ".ffn.",
+            r"mlp\.": r"ffn\.",
         },
     )
 
@@ -3783,6 +3798,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_res_norm.", "ffn_res_norm.")
+            name = name.replace("mlp_res_proj.", "ffn_res_proj.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
@@ -3798,10 +3819,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 if "vision_tower" in name or "mm_projector" in name:
                     if vision_params is None:
                         continue
-                    if name not in vision_params:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in vision_params:
                         logger.warning("Unmapped vision weight: %s", name)
                         continue
-                    param = vision_params[name]
+                    param = vision_params[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

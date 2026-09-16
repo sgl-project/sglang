@@ -50,10 +50,10 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
             PPMissingLayer(),
             PPMissingLayer(),
             SimpleNamespace(
-                mlp=SimpleNamespace(num_fused_shared_experts=1),
+                ffn=SimpleNamespace(num_fused_shared_experts=1),
             ),
             SimpleNamespace(
-                mlp=SimpleNamespace(num_fused_shared_experts=1),
+                ffn=SimpleNamespace(num_fused_shared_experts=1),
             ),
         ]
 
@@ -68,7 +68,7 @@ class TestQwen3_5PipelineParallel(CustomTestCase):
     def test_get_num_fused_shared_experts_returns_zero_without_local_fusion(self):
         layers = [
             PPMissingLayer(),
-            SimpleNamespace(mlp=SimpleNamespace()),
+            SimpleNamespace(ffn=SimpleNamespace()),
         ]
 
         num_fused_shared_experts = self._get_num_fused_shared_experts(

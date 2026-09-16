@@ -119,6 +119,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = -1,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -159,10 +160,15 @@ class HunYuanSparseMoeBlock(nn.Module):
             reduce_results=False,
             layer_id=layer_id,
             quant_config=quant_config,
+            prefix=f"{prefix}.experts",
         )
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, config.num_experts, bias=False, quant_config=None
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
             # Get layer_id num_shared_expert if config.num_shared_expert is a list
@@ -173,15 +179,16 @@ class HunYuanSparseMoeBlock(nn.Module):
             else:
                 num_shared_expert = config.num_shared_expert
 
-            self.shared_mlp = HunYuanMLP(
+            self.shared_ffn = HunYuanMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size * num_shared_expert,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=f"{prefix}.shared_ffn",
             )
         else:
-            self.shared_mlp = None
+            self.shared_ffn = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -189,8 +196,8 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
-        if self.shared_mlp is not None:
-            shared_output = self.shared_mlp(hidden_states)
+        if self.shared_ffn is not None:
+            shared_output = self.shared_ffn(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -431,19 +438,20 @@ class HunYuanDecoderLayer(nn.Module):
             layer_id=layer_id,
         )
         if _is_moe(config):
-            self.mlp = HunYuanSparseMoeBlock(
+            self.ffn = HunYuanSparseMoeBlock(
                 config=config,
                 quant_config=quant_config,
                 layer_id=layer_id,
+                prefix=f"{prefix}.ffn",
             )
         else:
-            self.mlp = HunYuanMLP(
+            self.ffn = HunYuanMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 bias=getattr(config, "mlp_bias", False),
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -473,7 +481,7 @@ class HunYuanDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual, ori_kv_states
 
 
@@ -623,6 +631,11 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
         # return qkv.reshape((num_kv_heads, num_key_value_groups+2 , attention_head_dim, hidden_size)).permute((1,0,2,3)).reshape((-1, hidden_size)),
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("shared_mlp.", "shared_ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         cla_factor = _get_cla_factor(self.config)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -693,10 +706,11 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                             continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
 
@@ -710,13 +724,14 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
                 assert loaded_weight.shape[0] % den == 0
                 units = loaded_weight.shape[0] // den
 
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 offset = 0
                 for shard_id, num in split_param:
@@ -732,7 +747,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
@@ -740,7 +755,8 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip layers on other devices.
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
@@ -759,7 +775,8 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
                     if "mlp.gate.wg." in name:
                         name = name.replace("wg.", "")
 
-                    param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    param = params_dict[registered_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )

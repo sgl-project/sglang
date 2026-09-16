@@ -1488,6 +1488,10 @@ class QuantizedRLModelLoader(DefaultModelLoader):
 
         # Copy back to original FP8 memory locations and update scales
         all_params = dict(model.named_parameters())
+        quantized_scales = {
+            name.replace(".mlp.", ".ffn."): scale
+            for name, scale in quantized_scales.items()
+        }
 
         for name in updated_param_names:
             if name not in all_params or name not in current_param_data:
@@ -1588,6 +1592,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
                     name = name.replace(weight_name, param_name)
+                    name = name.replace(".mlp.", ".ffn.")
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     updated_params.add(name)
@@ -1595,6 +1600,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     break
 
             if not mapped:
+                name = name.replace(".mlp.", ".ffn.")
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name in params_dict:
@@ -3094,6 +3100,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     r"attn.qkv.", r"attn.qkv_proj."
                 )
 
+            if not any(
+                path in quant_param_name
+                for path in ("merger.mlp.", "resampler.mlp.", "resampler_model.mlp.")
+            ):
+                quant_param_name = quant_param_name.replace(".mlp.", ".ffn.")
             if quant_param_name not in param_dict:
                 raise ValueError(
                     f"Parameter {quant_param_name} not found in the model."

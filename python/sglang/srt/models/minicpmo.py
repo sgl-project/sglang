@@ -1866,6 +1866,12 @@ class MiniCPMO(MiniCPMBaseModel):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            if "resampler.mlp." in name:
+                return name
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1894,11 +1900,12 @@ class MiniCPMO(MiniCPMBaseModel):
                     name = name.replace(
                         ".weight_v", ".parametrizations.weight.original1"
                     )
-                elif ".weight" in name and name not in params_dict:
+                elif ".weight" in name and map_weight_name(name) not in params_dict:
                     param_name = name.replace(
                         ".weight", ".parametrizations.weight.original0"
                     )
-                    if param_name in params_dict:
+                    registered_param_name = map_weight_name(param_name)
+                    if registered_param_name in params_dict:
                         name = param_name
 
             # adapt to VisionAttention
@@ -1918,7 +1925,8 @@ class MiniCPMO(MiniCPMBaseModel):
                 or ("tts" in name and "self_attn" in name)
                 or ("tts.model.layers" in name and ".mlp" in name)
             ):
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 continue
@@ -1929,17 +1937,19 @@ class MiniCPMO(MiniCPMBaseModel):
                     continue
                 name = name.replace(weight_name, param_name)
                 # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

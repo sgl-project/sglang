@@ -439,20 +439,20 @@ class LagunaDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = LagunaMoE(
+            self.ffn = LagunaMoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = LagunaMLP(
+            self.ffn = LagunaMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=True,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -508,7 +508,7 @@ class LagunaDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(
+            hidden_states = self.ffn(
                 hidden_states,
                 forward_batch=forward_batch,
             )
@@ -677,9 +677,9 @@ class LagunaForCausalLM(nn.Module):
         # Only walk this rank's local layers — out-of-range entries can be PPMissingLayer.
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, LagunaMoE)
+                if isinstance(self.model.layers[layer_id].ffn, LagunaMoE)
             }
         )
 
@@ -727,6 +727,7 @@ class LagunaForCausalLM(nn.Module):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -768,10 +769,10 @@ class LagunaForCausalLM(nn.Module):
 
             # HF stores the router correction bias under the experts namespace;
             # our parameter lives on the gate. Remap before dispatch.
-            if name.endswith("mlp.experts.e_score_correction_bias"):
+            if name.endswith("ffn.experts.e_score_correction_bias"):
                 name = name.replace(
-                    "mlp.experts.e_score_correction_bias",
-                    "mlp.gate.e_score_correction_bias",
+                    "ffn.experts.e_score_correction_bias",
+                    "ffn.gate.e_score_correction_bias",
                 )
 
             # Stacked dense (QKV / gate_up). The `mlp.experts.` guard stops
@@ -780,11 +781,12 @@ class LagunaForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mlp.experts." in name:
+                if "ffn.experts." in name:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
                 if name_mapped.endswith(".bias") and name_mapped not in params_dict:
                     continue
+
                 if name_mapped not in params_dict:
                     continue
                 param = params_dict[name_mapped]
@@ -799,6 +801,7 @@ class LagunaForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
+
                 if name_mapped not in params_dict:
                     continue
                 param = params_dict[name_mapped]
@@ -818,6 +821,7 @@ class LagunaForCausalLM(nn.Module):
 
             if name.endswith(".bias") and name not in params_dict:
                 continue
+
             if name not in params_dict:
                 if ".g_proj." in name:
                     raise RuntimeError(

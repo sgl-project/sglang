@@ -63,7 +63,7 @@ class TestGetLmHeadScheme(CustomTestCase):
     layer name; module-type targets and ignored heads stay unquantized."""
 
     def test_regex_target_resolves(self):
-        config = _config(["re:.*lm_head", "re:.*mlp\\.down_proj$"])
+        config = _config(["re:.*lm_head", "re:.*ffn\\.down_proj$"])
         head = _Head()
         with patch(_GET_LINEAR_SCHEME, return_value="scheme") as mock_resolve:
             scheme = config.get_lm_head_scheme(head, "lm_head")

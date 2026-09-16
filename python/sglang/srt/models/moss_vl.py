@@ -153,13 +153,13 @@ class MossVLVisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        self.mlp = MossVLVisionMLP(
+        self.ffn = MossVLVisionMLP(
             dim,
             intermediate_dim,
             hidden_act=hidden_act,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
         )
 
     def forward(
@@ -180,8 +180,8 @@ class MossVLVisionBlock(nn.Module):
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
         norm2 = self.norm2(x)
-        mlp = self.mlp(norm2)
-        x = x + mlp
+        ffn = self.ffn(norm2)
+        x = x + ffn
         return x
 
 
@@ -573,6 +573,11 @@ class MossVLVisionModel(nn.Module):
         return x
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("cross_attn_mlp_gate.", "cross_attn_ffn_gate.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             ("attn.qkv.", "attn.q.", "q"),
             ("attn.qkv.", "attn.k.", "k"),
@@ -586,15 +591,18 @@ class MossVLVisionModel(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -791,12 +799,12 @@ class MossVLCrossAttentionDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.cross_attn_attn_gate = nn.Parameter(torch.zeros(1))
 
-        self.mlp = MossVLTextMLP(
+        self.ffn = MossVLTextMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.is_first_cross_attention_layer = (
             bool(config.cross_attention_layers)
@@ -805,7 +813,7 @@ class MossVLCrossAttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.cross_attn_mlp_gate = nn.Parameter(torch.zeros(1))
+        self.cross_attn_ffn_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -832,9 +840,9 @@ class MossVLCrossAttentionDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = full_text_row_masked_out_mask * hidden_states
-        hidden_states = residual + self.cross_attn_mlp_gate.tanh() * hidden_states
+        hidden_states = residual + self.cross_attn_ffn_gate.tanh() * hidden_states
         return hidden_states
 
 
@@ -988,12 +996,12 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = MossVLTextMLP(
+        self.ffn = MossVLTextMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         norm_kwargs = (
             dict(
@@ -1048,7 +1056,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -1672,6 +1680,11 @@ class MossVLForConditionalGeneration(nn.Module):
     # ---- Weight Loading ----
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("cross_attn_mlp_gate.", "cross_attn_ffn_gate.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1709,11 +1722,15 @@ class MossVLForConditionalGeneration(nn.Module):
                     if weight_name not in name:
                         continue
                     mapped_name = name.replace(weight_name, param_name)
-                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
+                    if (
+                        mapped_name.endswith(".bias")
+                        and map_weight_name(mapped_name) not in params_dict
+                    ):
                         handled = True
                         break
-                    if mapped_name in params_dict:
-                        param = params_dict[mapped_name]
+                    registered_mapped_name = map_weight_name(mapped_name)
+                    if registered_mapped_name in params_dict:
+                        param = params_dict[registered_mapped_name]
                         param.weight_loader(param, loaded_weight, shard_id)
                         handled = True
                     break
@@ -1721,11 +1738,12 @@ class MossVLForConditionalGeneration(nn.Module):
             if handled:
                 continue
 
-            if name.endswith(".bias") and name not in params_dict:
+            if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                 continue
 
-            if name in params_dict:
-                param = params_dict[name]
+            registered_name = map_weight_name(name)
+            if registered_name in params_dict:
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             else:

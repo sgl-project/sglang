@@ -407,19 +407,19 @@ class Llama4DecoderLayer(nn.Module):
         is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
-            self.feed_forward = Llama4MoE(
+            self.ffn = Llama4MoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("feed_forward", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.feed_forward = LlamaMLP(
+            self.ffn = LlamaMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size_mlp,
                 hidden_act="silu",
                 quant_config=quant_config,
-                prefix=add_prefix("feed_forward", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -447,7 +447,7 @@ class Llama4DecoderLayer(nn.Module):
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
 
     def get_intermediate_size(self) -> int:
-        if isinstance(self.feed_forward, Llama4MoE):
+        if isinstance(self.ffn, Llama4MoE):
             return self.config.intermediate_size
         else:
             return self.config.intermediate_size_mlp
@@ -481,7 +481,7 @@ class Llama4DecoderLayer(nn.Module):
 
         # Fully Connected
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.feed_forward(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )

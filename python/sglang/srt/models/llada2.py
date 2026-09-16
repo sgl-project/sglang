@@ -631,23 +631,23 @@ class LLaDA2MoeBlock(nn.Module):
         self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
 
         if self.is_layer_sparse:
-            self.mlp = LLaDA2MoeSparseMoeBlock(
+            self.ffn = LLaDA2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = LLaDA2MoeMLP(
+            self.ffn = LLaDA2MoeMLP(
                 intermediate_size=config.intermediate_size,
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -697,7 +697,7 @@ class LLaDA2MoeBlock(nn.Module):
         )
 
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states=hidden_states,
@@ -874,6 +874,7 @@ class LLaDA2MoeModelLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -916,12 +917,13 @@ class LLaDA2MoeModelLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -935,6 +937,7 @@ class LLaDA2MoeModelLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -951,6 +954,7 @@ class LLaDA2MoeModelLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     if name not in params_dict:
                         continue
 
@@ -965,10 +969,10 @@ class LLaDA2MoeModelLM(nn.Module):
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(
                 lambda: {
-                    layer_id: layer.mlp.get_moe_weights()
+                    layer_id: layer.ffn.get_moe_weights()
                     for layer_id, layer in enumerate(self.model.layers)
                     if not isinstance(layer, PPMissingLayer)
-                    and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+                    and isinstance(layer.ffn, LLaDA2MoeSparseMoeBlock)
                 }
             )
 

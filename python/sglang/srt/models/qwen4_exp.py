@@ -1306,7 +1306,7 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
-        self.mlp_hyper_connection = GatedResidual(
+        self.ffn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
@@ -1354,7 +1354,7 @@ class Qwen4ExpLayerExtensionMixin:
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.ffn_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1369,7 +1369,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not self.config.num_experts:
-            return self.mlp(hidden_states)
+            return self.ffn(hidden_states)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
@@ -1391,7 +1391,7 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn(hidden_states, forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
@@ -1420,7 +1420,7 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        hidden_states = self.ffn_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
 
@@ -1794,6 +1794,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         buffers: dict,
         loaded_buffers: Set[str],
     ) -> bool:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_hyper_connection.", "ffn_hyper_connection.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         if ".ple.ple_embedding." not in name:
             return False
         buffer_name = name.rsplit(".", 1)[-1]
@@ -1808,7 +1813,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             "weight_scale",
         }:
             return False
-        buffer = buffers.get(name)
+        registered_name = map_weight_name(name)
+        buffer = buffers.get(registered_name)
         if buffer is None:
             return False
         if buffer.shape != loaded_weight.shape:
@@ -1821,6 +1827,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp_hyper_connection.", "ffn_hyper_connection.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -1872,9 +1883,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_id: str,
             num_experts: int,
         ) -> bool:
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 return False
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = param.weight_loader
             for expert_id in range(num_experts):
                 weight_loader(
@@ -1944,7 +1956,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 del old_weight_data
                 # params_dict was snapshotted before the loop; drop the stale
                 # entry or it pins the old bf16 storage until load end.
-                params_dict.pop(f"{mod_prefix}.ngram_embedding.weight", None)
+                params_dict.pop(
+                    map_weight_name(f"{mod_prefix}.ngram_embedding.weight"), None
+                )
                 torch.cuda.empty_cache()
             if (
                 emb.weight.dtype == torch.float8_e4m3fn
@@ -1965,7 +1979,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
-            loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+            loaded_shard_params.add(
+                map_weight_name(f"{mod_prefix}.ngram_embedding.weight")
+            )
             return True
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -2049,12 +2065,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 mapped_name = name.replace(weight_name, param_name)
                 if (
                     mapped_name.endswith(ignore_suffixes)
-                    and mapped_name not in params_dict
+                    and map_weight_name(mapped_name) not in params_dict
                 ):
                     continue
-                if mapped_name not in params_dict:
+                registered_mapped_name = map_weight_name(mapped_name)
+                if registered_mapped_name not in params_dict:
                     continue
-                param = params_dict[mapped_name]
+                param = params_dict[registered_mapped_name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 name = mapped_name
                 break
@@ -2104,10 +2121,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         if (
                             mapped_name.endswith(ignore_suffixes)
-                            and mapped_name not in params_dict
+                            and map_weight_name(mapped_name) not in params_dict
                         ):
                             continue
-                        param = params_dict[mapped_name]
+                        registered_mapped_name = map_weight_name(mapped_name)
+                        param = params_dict[registered_mapped_name]
                         weight_loader = param.weight_loader
                         weight_loader(
                             param,
@@ -2124,15 +2142,22 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if "visual" in name:
                         name = name.replace("attn.qkv.", "attn.qkv_proj.")
                         name = name.replace("model.visual.", "visual.")
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                    if (
+                        name.endswith(ignore_suffixes)
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
-                    if name.endswith("_scale") and name not in params_dict:
+                    if (
+                        name.endswith("_scale")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         assert abs(loaded_weight.item() - 1.0) < 1e-6, (
                             f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         )
                         continue
-                    if name in params_dict:
-                        param = params_dict[name]
+                    registered_name = map_weight_name(name)
+                    if registered_name in params_dict:
+                        param = params_dict[registered_name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -2143,10 +2168,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             name,
                         )
                         continue
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
 
-        loaded_params.update(loaded_buffers)
-        loaded_params.update(loaded_shard_params)
+        loaded_params.update({map_weight_name(name) for name in (loaded_buffers)})
+        loaded_params.update({map_weight_name(name) for name in (loaded_shard_params)})
 
         if skipped_visual_count > 0:
             logger.info(

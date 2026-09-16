@@ -191,23 +191,23 @@ class Ernie4DecoderLayer(nn.Module):
             moe_layer_start_index <= layer_id <= moe_layer_end_index
             and (layer_id - moe_layer_start_index) % config.moe_layer_interval == 0
         ):
-            self.mlp = Ernie4Moe(
+            self.ffn = Ernie4Moe(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = Ernie4MLP(
+            self.ffn = Ernie4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -238,7 +238,7 @@ class Ernie4DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -344,6 +344,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
@@ -352,6 +353,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -372,6 +374,7 @@ class Ernie4_5_ForCausalLM(nn.Module):
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -395,9 +398,10 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("ffn.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -408,6 +412,7 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = param.weight_loader

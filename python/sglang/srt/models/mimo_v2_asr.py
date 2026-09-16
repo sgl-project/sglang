@@ -97,6 +97,10 @@ class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
         deferred: List[Tuple[str, torch.Tensor]] = []
 
@@ -106,12 +110,13 @@ class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
             name = self.remap_audio_weight_name(name)
 
             if name.startswith(_AUDIO_NAME_PREFIXES):
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     logger.warning(
                         f"Audio param {name} not found in params_dict, skipping"
                     )
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if name.startswith("speech_embeddings."):
                     weight_loader(param, loaded_weight[: param.shape[0], :])

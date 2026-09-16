@@ -64,6 +64,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
+    WeightsMapper,
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -805,19 +806,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen3MoeSparseMoeBlock(
+            self.ffn = Qwen3MoeSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         else:
-            self.mlp = Qwen3MoeMLP(
+            self.ffn = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -841,7 +842,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -878,7 +878,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -969,6 +969,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".mlp.": ".ffn."},
+        orig_to_new_suffix={".mlp": ".ffn"},
+    )
+
     # Mapping from fused module names to their component weight names.
     # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify
     # which layers should be skipped based on the exclude_modules/ignore list.
@@ -1002,9 +1007,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         # IPC loading bypasses load_weights(), so initialize the EPLB descriptor here.
         self.routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
+                if isinstance(self.model.layers[layer_id].ffn, Qwen3MoeSparseMoeBlock)
             }
         )
 
@@ -1135,6 +1140,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1193,12 +1199,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if "ffn.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
 
@@ -1219,6 +1226,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     is_expert_weight = True
 
                     name = name.replace(weight_name, param_name)
+
                     if name not in params_dict:
                         # Expert weight not on this rank, will be skipped below
                         continue
@@ -1241,6 +1249,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     if name not in params_dict:
                         continue
 
@@ -1256,10 +1265,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(
                 lambda: {
-                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                     for layer_id in range(self.start_layer, self.end_layer)
                     if isinstance(
-                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
+                        self.model.layers[layer_id].ffn, Qwen3MoeSparseMoeBlock
                     )
                 }
             )

@@ -103,12 +103,12 @@ class MiMoV2MTPLayer(nn.Module):
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
-        self.mlp = MiMoV2MLP(
+        self.ffn = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             tp_rank=mlp_tp_rank,
             tp_size=mlp_tp_size,
         )
@@ -136,7 +136,6 @@ class MiMoV2MTPLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -152,7 +151,7 @@ class MiMoV2MTPLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -281,6 +280,10 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -300,14 +303,18 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
+            if (
+                name.startswith("model.vision_tower")
+                and map_weight_name(name) not in params_dict
+            ):
                 continue
             name = self.map_model_name_to_mtp_param_name(name)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict:
+                    param = params_dict[registered_name]
                     load_mimo_v2_qkv_proj_weight(
                         name,
                         param,
@@ -325,15 +332,16 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     break
                 name = name.replace(f".{weight_name}.", f".{param_name}.")
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
                 if "mtp_block" not in name and (
@@ -345,8 +353,9 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                     and "final_layernorm" not in name
                 ):
                     continue
-                if name in params_dict.keys():
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict.keys():
+                    param = params_dict[registered_name]
                     if "attention_sink_bias" in name:
                         start = get_parallel().attn_tp_rank * param.numel()
                         param.data.copy_(loaded_weight[start : start + param.numel()])

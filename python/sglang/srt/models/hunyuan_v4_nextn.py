@@ -55,16 +55,16 @@ class HYV4MTPDecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = DeepseekV2MoE(
+        self.ffn = DeepseekV2MoE(
             config,
             0,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
             alt_stream=alt_stream,
             is_nextn=True,
         )
-        if hasattr(self.mlp, "shared_experts"):
-            self.mlp.shared_experts.swiglu_limit = None
+        if hasattr(self.ffn, "shared_experts"):
+            self.ffn.shared_experts.swiglu_limit = None
 
     def forward(
         self,
@@ -96,7 +96,7 @@ class HYV4MTPDecoderLayer(nn.Module):
         else:
             topk_indices = None
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        hidden_states = self.ffn(hidden_states, forward_batch)
         return hidden_states, residual, topk_indices
 
 
@@ -175,7 +175,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model = HYV4ModelNextN(
             config, nextn_quant_config, prefix=f"{prefix}.model"
         )
-        self.num_fused_shared_experts = self.model.decoder.mlp.num_fused_shared_experts
+        self.num_fused_shared_experts = self.model.decoder.ffn.num_fused_shared_experts
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

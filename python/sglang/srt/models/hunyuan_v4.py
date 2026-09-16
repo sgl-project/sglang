@@ -545,25 +545,25 @@ class HYV4DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         if config.mlp_layer_types[layer_id] == "dense":
-            self.mlp = DeepseekV2MLP(
+            self.ffn = DeepseekV2MLP(
                 config.hidden_size,
                 config.intermediate_size,
                 config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
             )
         else:
-            self.mlp = DeepseekV2MoE(
+            self.ffn = DeepseekV2MoE(
                 config,
                 layer_id,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
                 alt_stream=alt_stream,
             )
-            if hasattr(self.mlp, "shared_experts"):
-                self.mlp.shared_experts.swiglu_limit = None
+            if hasattr(self.ffn, "shared_experts"):
+                self.ffn.shared_experts.swiglu_limit = None
         self.hc_attn_layer = HYV4HCLayer(config, f"{prefix}.hc_attn_layer")
-        self.hc_mlp_layer = HYV4HCLayer(config, f"{prefix}.hc_mlp_layer")
+        self.hc_ffn_layer = HYV4HCLayer(config, f"{prefix}.hc_ffn_layer")
 
     def forward(
         self,
@@ -600,14 +600,14 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states,
             residual,
             post,
-            self.hc_mlp_layer,
+            self.hc_ffn_layer,
             self.post_attention_layernorm,
         )
-        if isinstance(self.mlp, DeepseekV2MoE):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+        if isinstance(self.ffn, DeepseekV2MoE):
+            hidden_states = self.ffn(hidden_states, forward_batch)
         else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post)
+            hidden_states = self.ffn(hidden_states)
+        hidden_states = self.hc_ffn_layer.post(hidden_states, residual, post)
         return hidden_states, topk_indices
 
 
@@ -679,9 +679,9 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model = HYV4Model(config, quant_config, f"{prefix}.model")
         self.num_fused_shared_experts = max(
             (
-                layer.mlp.num_fused_shared_experts
+                layer.ffn.num_fused_shared_experts
                 for layer in self.model.layers
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                if isinstance(layer.ffn, DeepseekV2MoE)
             ),
             default=0,
         )

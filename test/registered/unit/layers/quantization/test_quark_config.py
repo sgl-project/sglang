@@ -107,17 +107,17 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
             "model.language_model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"},
             "model.language_model.layers.0.self_attn.v_proj": {"quant_algo": "FP8"},
             "model.language_model.layers.0.self_attn.o_proj": {"quant_algo": "FP8"},
-            "model.language_model.layers.0.mlp.shared_expert.gate_proj": {
+            "model.language_model.layers.0.ffn.shared_expert.gate_proj": {
                 "quant_algo": "FP8"
             },
-            "model.language_model.layers.0.mlp.shared_expert.down_proj": {
+            "model.language_model.layers.0.ffn.shared_expert.down_proj": {
                 "quant_algo": "FP8"
             },
-            "model.language_model.layers.0.mlp.experts": {
+            "model.language_model.layers.0.ffn.experts": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
             },
-            "model.language_model.layers.1.mlp.experts": {
+            "model.language_model.layers.1.ffn.experts": {
                 "quant_algo": "NVFP4",
                 "group_size": 16,
             },
@@ -149,7 +149,7 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
         # hit the fp4 target, not fall through to the global config
         quark_config = self._build_bare_config()
         matched = quark_config._find_matched_config(
-            "model.layers.0.mlp.experts", torch.nn.Module()
+            "model.layers.0.ffn.experts", torch.nn.Module()
         )
         self.assertEqual(matched["weight"]["dtype"], "fp4")
         self.assertEqual(matched["weight"]["group_size"], 32)
@@ -158,8 +158,8 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
         quark_config = self._build_bare_config()
         for name in (
             "model.layers.0.self_attn.o_proj",
-            "model.layers.0.mlp.shared_expert.gate_proj",
-            "model.layers.0.mlp.shared_expert.down_proj",
+            "model.layers.0.ffn.shared_expert.gate_proj",
+            "model.layers.0.ffn.shared_expert.down_proj",
         ):
             matched = quark_config._find_matched_config(name, torch.nn.Module())
             self.assertEqual(matched["weight"]["dtype"], "fp8_e4m3", msg=name)
@@ -203,7 +203,7 @@ class TestParseNvfp4Excludes(CustomTestCase):
         self.assertTrue(check_equal_or_regex_match("mtp.layers.0.foo", excludes))
         # A quantized layer stays un-excluded.
         self.assertFalse(
-            check_equal_or_regex_match("model.layers.0.mlp.experts", excludes)
+            check_equal_or_regex_match("model.layers.0.ffn.experts", excludes)
         )
 
 

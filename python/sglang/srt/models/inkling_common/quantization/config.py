@@ -76,10 +76,12 @@ def _map_exclude_modules(exclude_modules: list[str]) -> list[str]:
             new_exclude_modules.add(module)
             continue
         module = module.removeprefix("model.")
+        renamed = {"mlp": "ffn", "mlp_norm": "ffn_norm", "mlp_sconv": "ffn_sconv"}
+        module = ".".join(renamed.get(part, part) for part in module.split("."))
         # Dense (non-MoE) MLP linears and the unembedding use different names in
         # the sglang module tree; translate so exclusion matches their prefixes.
-        module = module.replace(".mlp.w13_dn", ".mlp.gate_up_proj").replace(
-            ".mlp.w2_md", ".mlp.down_proj"
+        module = module.replace(".ffn.w13_dn", ".ffn.gate_up_proj").replace(
+            ".ffn.w2_md", ".ffn.down_proj"
         )
         if module == "unembed":
             module = "lm_head"

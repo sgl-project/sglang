@@ -467,7 +467,7 @@ class MuseGlimmerDecoderLayer(nn.Module):
         self.self_attn = MuseGlimmerAttention(args, layer_idx)
         self.post_attn_norm = nn.RMSNorm(args.hidden_size, args.post_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
-        self.mlp = MuseGlimmerMLP(args)
+        self.ffn = MuseGlimmerMLP(args)
         self.post_ffn_norm = nn.RMSNorm(args.hidden_size, args.post_norm_eps)
 
     def __call__(
@@ -481,7 +481,7 @@ class MuseGlimmerDecoderLayer(nn.Module):
         x = x + self.post_attn_norm(
             self.self_attn(self.input_layernorm(x), mask, cache)
         )
-        return x + self.post_ffn_norm(self.mlp(self.post_attention_layernorm(x)))
+        return x + self.post_ffn_norm(self.ffn(self.post_attention_layernorm(x)))
 
 
 class MuseGlimmerModel(nn.Module):
@@ -626,7 +626,9 @@ class Model(nn.Module):
                     f"{'...' if len(stray) > 4 else ''}; the marker belongs "
                     "on packaged artifacts only — repackage from the raw HF export"
                 )
-            return weights
+            return {
+                name.replace(".mlp.", ".ffn."): value for name, value in weights.items()
+            }
 
         # No marker: a raw HF export, possibly in the RC multimodal layout —
         # normalize that to the raw schema first.
@@ -709,7 +711,7 @@ class Model(nn.Module):
                     [w.reshape(H, D, hidden), g.reshape(H, D, hidden)], axis=1
                 ).reshape(2 * H * D, hidden)
 
-            new_weights[name] = w
+            new_weights[name.replace(".mlp.", ".ffn.")] = w
 
         return new_weights
 

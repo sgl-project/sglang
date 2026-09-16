@@ -94,7 +94,8 @@ class ExpertBackupClient:
 
         self.transfer_engine = get_mooncake_transfer_engine()
 
-        self.params_dict = dict(self._get_model().named_parameters())
+        model = self._get_model()
+        self.params_dict = dict(model.named_parameters())
         for name, param in self.params_dict.items():
             param_data = param.data
             ret_value = self.transfer_engine.engine.register_memory(
@@ -137,6 +138,7 @@ class ExpertBackupClient:
                     raise RuntimeError(f"Unknown weight name {weight_name}")
 
                 name = name.replace(f"experts.{expert_id}.{weight_name}.", param_name)
+                name = name.replace(".mlp.", ".ffn.")
                 weight_param = self.params_dict[name]
 
                 physical_expert_ids = (

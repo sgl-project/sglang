@@ -247,13 +247,13 @@ class ApertusDecoderLayer(nn.Module):
             bias=attention_bias,
             bias_o_proj=bias_o_proj,
         )
-        self.mlp = ApertusMLP(
+        self.ffn = ApertusMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             bias=getattr(config, "mlp_bias", False),
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.feedforward_layernorm = RMSNorm(
@@ -281,7 +281,7 @@ class ApertusDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.feedforward_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -565,6 +565,7 @@ class ApertusForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -612,6 +613,7 @@ class ApertusForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -625,6 +627,7 @@ class ApertusForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
+
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(

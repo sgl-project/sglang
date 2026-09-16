@@ -162,17 +162,22 @@ class NVILALiteForConditionalGeneration(nn.Module):
         return vision_features
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> None:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
-                if name not in params_dict and name.startswith(
+                if map_weight_name(name) not in params_dict and name.startswith(
                     "vision_tower.vision_model."
                 ):
                     name = "vision_tower." + name[len("vision_tower.vision_model.") :]
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(
                     param, "weight_loader", weight_utils.default_weight_loader
                 )

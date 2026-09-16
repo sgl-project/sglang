@@ -182,12 +182,12 @@ class MiMoVisionBlock(nn.Module):
             window_size=window_size,
             use_data_parallel=use_data_parallel,
         )
-        self.mlp = Qwen2_5_VLMLP(
+        self.ffn = Qwen2_5_VLMLP(
             dim,
             intermediate_dim,
             hidden_act=hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             use_data_parallel=use_data_parallel,
         )
 
@@ -224,8 +224,8 @@ class MiMoVisionBlock(nn.Module):
         x_after_add = x_after_add_2d.reshape(S, B, H)
 
         # MLP and final residual
-        mlp_out = self.mlp(x_norm)
-        x = x_after_add + mlp_out
+        ffn_out = self.ffn(x_norm)
+        x = x_after_add + ffn_out
         return x
 
 
@@ -359,7 +359,7 @@ class MiMoVisionTransformer(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self.blocks[0].mlp.gate_up_proj.weight.device
+        return self.blocks[0].ffn.gate_up_proj.weight.device
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []

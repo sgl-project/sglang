@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimLinearScheme,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -108,15 +109,15 @@ class ModelSlimConfig(QuantizationConfig):
                 for k, v in quant_config.items()
             }
 
-        # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the original,
+        # Add an ffn.* alias for each block_sparse_moe.* key but KEEP the original,
         # so both module namings resolve
         for k in list(quant_config.keys()):
             if not isinstance(k, str):
                 continue
             if "block_sparse_moe" in k:
                 quant_config[
-                    k.replace("block_sparse_moe.experts", "mlp.experts").replace(
-                        "block_sparse_moe.shared_experts", "mlp.shared_experts"
+                    k.replace("block_sparse_moe.experts", "ffn.experts").replace(
+                        "block_sparse_moe.shared_experts", "ffn.shared_experts"
                     )
                 ] = quant_config[k]
 
@@ -145,7 +146,7 @@ class ModelSlimConfig(QuantizationConfig):
         # this transformation in sync with
         # DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name.  Merely
         # replacing ``mtp`` with ``stages`` is insufficient: it silently
-        # misses ModelSlim lookups such as stages.0.mlp.experts and
+        # misses ModelSlim lookups such as stages.0.ffn.experts and
         # stages.0.self_attn.
         dspark_quant_aliases = {}
         for name, scheme in quant_config.items():
@@ -172,8 +173,6 @@ class ModelSlimConfig(QuantizationConfig):
                 mapped_rest = rest
                 if mapped_rest.startswith("attn."):
                     mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-                elif mapped_rest.startswith("ffn."):
-                    mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
                 elif mapped_rest.startswith("attn_norm."):
                     mapped_rest = "input_layernorm." + mapped_rest.removeprefix(
                         "attn_norm."
@@ -201,21 +200,27 @@ class ModelSlimConfig(QuantizationConfig):
 
         self.quant_description = quant_config
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        self.quant_description = hf_to_sglang_mapper.apply_dict(self.quant_description)
+        self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+        if "ignore" in self.quant_description:
+            self.quant_description["ignore"] = self.ignore
+
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
     def _quant_prefix_candidates(self, prefix: str) -> List[str]:
         """Return checkpoint-name variants without copying the large config.
 
-        Kimi-K3's upstream model uses ``mlp`` internally while its ModelSlim
+        Kimi-K3's upstream model uses ``ffn`` internally while its ModelSlim
         checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
         Some multimodal checkpoints also keep the outer ``language_model``
         prefix.  Resolve those layout-only differences at the quantization
         boundary.
         """
         candidates = [prefix]
-        if ".mlp." in prefix:
-            candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+        if ".ffn." in prefix:
+            candidates.append(prefix.replace(".ffn.", ".block_sparse_moe."))
 
         for candidate in list(candidates):
             if candidate.startswith("language_model."):

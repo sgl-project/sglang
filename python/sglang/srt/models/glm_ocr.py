@@ -100,12 +100,12 @@ class GlmOcrVisionBlock(nn.Module):
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
         )
-        self.mlp = GlmOcrVisionMLP(
+        self.ffn = GlmOcrVisionMLP(
             dim,
             intermediate_dim,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             use_data_parallel=use_data_parallel,
         )
 
@@ -140,8 +140,8 @@ class GlmOcrVisionBlock(nn.Module):
         x_after_add = x_after_add_2d.reshape(S, B, H)
 
         # MLP and final residual
-        mlp_out = self.mlp(x_norm)
-        x = x_after_add + mlp_out
+        ffn_out = self.ffn(x_norm)
+        x = x_after_add + ffn_out
         return x
 
 
@@ -326,6 +326,10 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -413,13 +417,14 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -430,13 +435,17 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
 
                 try:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias")
+                        and map_weight_name(name) not in params_dict
+                    ):
                         continue
 
-                    if name not in params_dict:
+                    registered_name = map_weight_name(name)
+                    if registered_name not in params_dict:
                         continue
 
-                    param = params_dict[name]
+                    param = params_dict[registered_name]
                 except KeyError:
                     print(params_dict.keys())
                     raise

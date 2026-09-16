@@ -165,11 +165,11 @@ class GPTJBlock(nn.Module):
             quant_config,
             prefix=add_prefix("attn", prefix),
         )
-        self.mlp = GPTJMLP(
+        self.ffn = GPTJMLP(
             inner_dim,
             config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -185,7 +185,7 @@ class GPTJBlock(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        mlp_output = self.mlp(hidden_states)
+        mlp_output = self.ffn(hidden_states)
         hidden_states = attn_output + mlp_output + residual
         return hidden_states
 
@@ -275,6 +275,7 @@ class GPTJForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -290,6 +291,7 @@ class GPTJForCausalLM(nn.Module):
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
                 # Loading kv cache quantization scales
+
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = (
@@ -305,6 +307,7 @@ class GPTJForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -316,6 +319,7 @@ class GPTJForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

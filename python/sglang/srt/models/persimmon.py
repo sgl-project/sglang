@@ -29,14 +29,23 @@ from sglang.srt.utils import add_prefix, make_layers
 
 class PersimmonMLP(nn.Module):
     def __init__(
-        self, config: PersimmonConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: PersimmonConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dense_h_to_4h = ColumnParallelLinear(
-            config.hidden_size, config.intermediate_size, quant_config=quant_config
+            config.hidden_size,
+            config.intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_h_to_4h", prefix),
         )
         self.dense_4h_to_h = RowParallelLinear(
-            config.intermediate_size, config.hidden_size, quant_config=quant_config
+            config.intermediate_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_4h_to_h", prefix),
         )
         self.act = get_act_fn(config.hidden_act)
 
@@ -157,7 +166,9 @@ class PersimmonDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PersimmonMLP(config, quant_config=quant_config)
+        self.ffn = PersimmonMLP(
+            config, quant_config=quant_config, prefix=add_prefix("ffn", prefix)
+        )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
@@ -184,7 +195,7 @@ class PersimmonDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         hidden_states = hidden_states + residual
 
@@ -297,10 +308,12 @@ class PersimmonForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
             if name not in params_dict:
                 if name == "lm_head.weight":
                     continue

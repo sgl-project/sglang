@@ -40,6 +40,10 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
             self.config._name_or_path,
@@ -85,7 +89,8 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                registered_name = map_weight_name(name)
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

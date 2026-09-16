@@ -222,7 +222,7 @@ class GLMBlock(nn.Module):
         )
 
         # MLP
-        self.mlp = GLMMLP(config, quant_config, prefix=add_prefix("mlp", prefix))
+        self.ffn = GLMMLP(config, quant_config, prefix=add_prefix("ffn", prefix))
 
     def forward(
         self,
@@ -257,7 +257,7 @@ class GLMBlock(nn.Module):
         else:
             residual = layernorm_input
 
-        output = self.mlp(layernorm_output) + residual
+        output = self.ffn(layernorm_output) + residual
 
         return output
 
@@ -406,6 +406,7 @@ class ChatGLMForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_pos_emb.inv_freq" in name:
@@ -415,6 +416,7 @@ class ChatGLMForCausalLM(nn.Module):
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)

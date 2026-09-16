@@ -227,6 +227,10 @@ class LlavaVidForCausalLM(nn.Module):
         # Load clip vision model by cfg['mm_vision_tower']:
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
+        def map_weight_name(name: str) -> str:
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         vision_path = self.config.mm_vision_tower
         device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
@@ -274,8 +278,9 @@ class LlavaVidForCausalLM(nn.Module):
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
-                if name in params_dict:
-                    param = params_dict[name]
+                registered_name = map_weight_name(name)
+                if registered_name in params_dict:
+                    param = params_dict[registered_name]
                 else:
                     print(f"Warning: {name} not found in the model")
                     continue

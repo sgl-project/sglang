@@ -188,12 +188,12 @@ class GlmImageVisionBlock(nn.Module):
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
-        self.mlp = GlmImageVisionMLP(
+        self.ffn = GlmImageVisionMLP(
             in_features=config.hidden_size,
             hidden_features=config.intermediate_size,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
     def forward(
@@ -214,8 +214,8 @@ class GlmImageVisionBlock(nn.Module):
         x = x + attn
 
         hidden_states = self.norm2(x)
-        mlp = self.mlp(hidden_states)
-        x = x + mlp
+        ffn = self.ffn(hidden_states)
+        x = x + ffn
         return x
 
 
@@ -776,13 +776,17 @@ class GlmImageTextRotaryEmbedding(nn.Module):
 
     def load_weights(self, weights: Any) -> set[str]:
         # Copied from LlamaModel.load_weights but adapted
+        def map_weight_name(name: str) -> str:
+            name = name.replace("post_mlp_layernorm.", "post_ffn_layernorm.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         def _load_with_shard_id(
             weight_loader, param, loaded_weight: torch.Tensor, shard_id
         ) -> None:
-
             try:
                 weight_loader(param, loaded_weight, shard_id)
                 return
@@ -839,22 +843,25 @@ class GlmImageTextRotaryEmbedding(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
 
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 _load_with_shard_id(weight_loader, param, loaded_weight, shard_id)
                 break
             else:
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-            loaded_params.add(name)
+            registered_name = map_weight_name(name)
+            loaded_params.add(registered_name)
         return loaded_params
 
 
@@ -881,12 +888,12 @@ class GlmImageTextDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = GlmImageTextMLP(
+        self.ffn = GlmImageTextMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
+            prefix=f"{prefix}.ffn",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -895,7 +902,7 @@ class GlmImageTextDecoderLayer(nn.Module):
         self.post_self_attn_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_ffn_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -905,7 +912,6 @@ class GlmImageTextDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -926,8 +932,8 @@ class GlmImageTextDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        hidden_states = self.post_ffn_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states, None
@@ -1149,6 +1155,11 @@ class GlmImageForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("post_mlp_layernorm.", "post_ffn_layernorm.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -1180,11 +1191,12 @@ class GlmImageForConditionalGeneration(nn.Module):
                 if "visual" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1193,12 +1205,13 @@ class GlmImageForConditionalGeneration(nn.Module):
                     # Map fused attn.qkv -> attn.qkv_proj for QKVParallelLinear
                     name = name.replace("attn.qkv.", "attn.qkv_proj.")
 
-                if name.endswith(".bias") and name not in params_dict:
+                if name.endswith(".bias") and map_weight_name(name) not in params_dict:
                     continue
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 

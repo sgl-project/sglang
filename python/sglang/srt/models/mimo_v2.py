@@ -830,10 +830,10 @@ class MiMoV2DecoderLayer(nn.Module):
         is_next_layer_sparse = self.is_moe_layer(layer_id + 1)
 
         if self.is_layer_sparse:
-            self.mlp = MiMoV2MoE(
+            self.ffn = MiMoV2MoE(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 layer_id=layer_id,
             )
         else:
@@ -841,12 +841,12 @@ class MiMoV2DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = MiMoV2MLP(
+            self.ffn = MiMoV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
@@ -915,7 +915,7 @@ class MiMoV2DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1248,9 +1248,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (
                 {
-                    layer_id: layer.mlp.get_moe_weights()
+                    layer_id: layer.ffn.get_moe_weights()
                     for layer_id, layer in enumerate(self.model.layers)
-                    if isinstance(layer.mlp, MiMoV2MoE)
+                    if isinstance(layer.ffn, MiMoV2MoE)
                 }
                 if self.model is not None
                 else {}
@@ -1444,6 +1444,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = (
+            (
+                name if ".merger.mlp." in name else name.replace(".mlp.", ".ffn."),
+                weight,
+            )
+            for name, weight in weights
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1499,6 +1506,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     ]:
                         if weight_name in name:
                             name = name.replace(weight_name, param_name)
+
                             if name not in params_dict:
                                 break
                             param = params_dict[name]
@@ -1508,6 +1516,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                             break
                     if audio_stacked:
                         continue
+
                 if name not in params_dict:
                     logger.warning(
                         f"Audio param {name} not found in params_dict, skipping"
@@ -1533,6 +1542,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name.endswith(".bias") and name not in params_dict:
                         match_stacked_vit = True
                         continue
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
@@ -1543,6 +1553,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -1617,7 +1628,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     continue
                 if weight_name not in name:
                     continue
-                if ("mlp.experts." in name) and name not in params_dict:
+                if ("ffn.experts." in name) and name not in params_dict:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -1639,6 +1650,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     # while Fp8MoEMethod registers them as *_weight_scale_inv.
                     if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
+
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

@@ -25,7 +25,18 @@ def _get_loop_num(hf_config: Any) -> int:
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
 
 
-def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+def compute_attention_and_moe_layers(
+    layer_model: Any,
+    *,
+    model: Any | None = None,
+) -> AttentionAndMoeLayers:
+    get_layer_ffn = None
+    if model is not None:
+        from sglang.srt.models.transformers import TransformersBase
+
+        if isinstance(model, TransformersBase):
+            get_layer_ffn = model.get_layer_ffn
+
     attention_layers: list[Any] = []
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
@@ -88,9 +99,14 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
 
         moe_block = None
         moe_fusion = None
-        if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-            moe_block = layer.mlp.experts
-            moe_fusion = layer.mlp
+        ffn = None
+        if get_layer_ffn is not None:
+            ffn = get_layer_ffn(layer)
+        elif hasattr(layer, "ffn"):
+            ffn = layer.ffn
+        if hasattr(ffn, "experts"):
+            moe_block = ffn.experts
+            moe_fusion = ffn
         if hasattr(layer, "block_sparse_moe") and hasattr(
             layer.block_sparse_moe, "experts"
         ):

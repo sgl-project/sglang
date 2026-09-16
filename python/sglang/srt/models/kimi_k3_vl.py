@@ -435,7 +435,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         self.norm0 = _make_norm(norm_type, hidden_dim)
         self.norm1 = _make_norm(norm_type, hidden_dim)
-        self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation, bias=linear_bias)
+        self.ffn = MLP2([hidden_dim, mlp_dim, hidden_dim], activation, bias=linear_bias)
         self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
         self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
         self.attention_backend = attention_backend
@@ -531,7 +531,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         return residual + hidden_states
 
 

@@ -71,11 +71,11 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
-        self.shared_mlp = (
+        self.shared_ffn = (
             None
             if getattr(config, "shared_intermediate_size", 0) == 0
             else GraniteMoeSharedMLP(
-                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+                config, quant_config=quant_config, prefix=f"{prefix}.shared_ffn"
             )
         )
 
@@ -111,7 +111,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.shared_mlp is None:
+        if self.shared_ffn is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
             # else: skip
@@ -120,10 +120,10 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             if self.block_sparse_moe is not None:
                 moe_hidden_states = hidden_states.clone()
                 moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
-                hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
+                hidden_states = moe_hidden_states + self.shared_ffn(hidden_states)
                 del moe_hidden_states
             else:
-                hidden_states = self.shared_mlp(hidden_states)
+                hidden_states = self.shared_ffn(hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
 
         return hidden_states, residual
@@ -257,11 +257,11 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
-        self.shared_mlp = (
+        self.shared_ffn = (
             None
             if getattr(config, "shared_intermediate_size", 0) == 0
             else GraniteMoeSharedMLP(
-                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+                config, quant_config=quant_config, prefix=f"{prefix}.shared_ffn"
             )
         )
 
@@ -289,7 +289,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.shared_mlp is None:
+        if self.shared_ffn is None:
             if self.block_sparse_moe is not None:
                 hidden_states = self.block_sparse_moe(hidden_states)
             # else: skip
@@ -298,10 +298,10 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
             if self.block_sparse_moe is not None:
                 moe_hidden_states = hidden_states.clone()
                 moe_hidden_states = self.block_sparse_moe(moe_hidden_states)
-                hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
+                hidden_states = moe_hidden_states + self.shared_ffn(hidden_states)
                 del moe_hidden_states
             else:
-                hidden_states = self.shared_mlp(hidden_states)
+                hidden_states = self.shared_ffn(hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
 
         return hidden_states, residual
@@ -542,6 +542,10 @@ class GraniteMoeHybridForCausalLM(
         ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def map_weight_name(name: str) -> str:
+            name = name.replace("shared_mlp.", "shared_ffn.")
+            return name
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -553,23 +557,26 @@ class GraniteMoeHybridForCausalLM(
         expert_params_mapping = self.get_expert_mapping()
 
         def _load(n, p):
-            param = params_dict[n]
+            registered_n = map_weight_name(n)
+            param = params_dict[registered_n]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, p)
-            loaded_params.add(n)
+            loaded_params.add(registered_n)
 
         def _load_shard(n, p, shard_id):
             # Skip layers on other devices.
-            param = params_dict[n]
+            registered_n = map_weight_name(n)
+            param = params_dict[registered_n]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, p, shard_id)
-            loaded_params.add(n)
+            loaded_params.add(registered_n)
 
         def _load_expert(n, p, name, shard_id, expert_id):
-            param = params_dict[n]
+            registered_n = map_weight_name(n)
+            param = params_dict[registered_n]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, p, name, shard_id=shard_id, expert_id=expert_id)
-            loaded_params.add(n)
+            loaded_params.add(registered_n)
 
         def _load_quant_expert(name, loaded_weight):
             for mapping in expert_params_mapping:
@@ -584,7 +591,8 @@ class GraniteMoeHybridForCausalLM(
                 # if is_pp_missing_parameter(name_mapped, self):
                 #     continue
 
-                param = params_dict[name_mapped]
+                registered_name_mapped = map_weight_name(name_mapped)
+                param = params_dict[registered_name_mapped]
                 weight_loader = param.weight_loader
                 success = False
 
@@ -615,7 +623,8 @@ class GraniteMoeHybridForCausalLM(
                     loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
                 )
                 _load(scale_name, loaded_weight)
-                loaded_params.add(scale_name)
+                registered_scale_name = map_weight_name(scale_name)
+                loaded_params.add(registered_scale_name)
                 continue
 
             if _load_quant_expert(n, p):

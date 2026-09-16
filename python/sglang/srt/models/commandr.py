@@ -273,10 +273,10 @@ class CohereDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        self.mlp = CohereMLP(
+        self.ffn = CohereMLP(
             config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = LayerNorm(
             param_shape=(config.hidden_size), eps=config.layer_norm_eps
@@ -297,7 +297,7 @@ class CohereDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states_mlp = self.mlp(hidden_states)
+        hidden_states_mlp = self.ffn(hidden_states)
         # Add everything together
         hidden_states = residual + hidden_states_attention + hidden_states_mlp
 
@@ -385,6 +385,7 @@ class CohereForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -403,6 +404,7 @@ class CohereForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -423,6 +425,7 @@ class CohereForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
 
 

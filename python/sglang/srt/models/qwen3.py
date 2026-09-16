@@ -32,7 +32,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
@@ -347,12 +347,12 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-        self.mlp = Qwen3MLP(
+        self.ffn = Qwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
 
         norm_kwargs = (
@@ -413,17 +413,17 @@ class Qwen3DecoderLayer(nn.Module):
             residual,
             forward_batch,
             cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                [self.ffn.gate_up_proj.weight, self.ffn.down_proj.weight]
                 if _is_npu
                 and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 and (
-                    hasattr(self.mlp.gate_up_proj, "weight")
-                    and hasattr(self.mlp.down_proj, "weight")
+                    hasattr(self.ffn.gate_up_proj, "weight")
+                    and hasattr(self.ffn.down_proj, "weight")
                 )
                 else None
             ),
         )
-        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        hidden_states = self.ffn(hidden_states, forward_batch=forward_batch)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -450,6 +450,11 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".mlp.": ".ffn."},
+        orig_to_new_suffix={".mlp": ".ffn"},
+    )
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -594,6 +599,7 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -648,6 +654,7 @@ class Qwen3ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -660,7 +667,7 @@ class Qwen3ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                if name in params_dict.keys():
+                if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

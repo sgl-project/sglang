@@ -135,17 +135,17 @@ class HYV3MoEFused(nn.Module):
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
-            self.shared_mlp = HYV3FeedForward(
+            self.shared_ffn = HYV3FeedForward(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size
                 * config.num_shared_experts,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.shared_mlp",
+                prefix=f"{prefix}.shared_ffn",
                 reduce_results=False,
             )
         else:
-            self.shared_mlp = None
+            self.shared_ffn = None
 
         self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
@@ -166,7 +166,7 @@ class HYV3MoEFused(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
             self.alt_stream is not None
-            and self.shared_mlp is not None
+            and self.shared_ffn is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
         ):
@@ -180,8 +180,8 @@ class HYV3MoEFused(nn.Module):
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
         topk_output = self.topk(hidden_states, router_logits)
-        if self.shared_mlp is not None:
-            shared_output = self.shared_mlp(hidden_states)
+        if self.shared_ffn is not None:
+            shared_output = self.shared_ffn(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
@@ -214,7 +214,7 @@ class HYV3MoEFused(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
 
-        shared_output = self.shared_mlp(hidden_states)
+        shared_output = self.shared_ffn(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
             router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
@@ -420,20 +420,20 @@ class HYV3DecoderLayer(nn.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
-            self.mlp = HYV3FeedForward(
+            self.ffn = HYV3FeedForward(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
             )
             self.block_type = "feedforward"
         else:
-            self.mlp = HYV3MoEFused(
+            self.ffn = HYV3MoEFused(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.ffn",
                 alt_stream=alt_stream,
             )
             self.block_type = "moe"
@@ -457,7 +457,7 @@ class HYV3DecoderLayer(nn.Module):
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         return hidden_states, residual
 
@@ -564,6 +564,11 @@ class HYV3ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def map_weight_name(name: str) -> str:
+            name = name.replace("shared_mlp.", "shared_ffn.")
+            name = name.replace("mlp.", "ffn.")
+            return name
+
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -605,9 +610,10 @@ class HYV3ForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name not in params_dict:
+                registered_name = map_weight_name(name)
+                if registered_name not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[registered_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 is_found = True
@@ -623,9 +629,10 @@ class HYV3ForCausalLM(nn.Module):
                     continue
                 is_expert_weight = True
                 name_mapped = name.replace(weight_name, param_name)
-                if name_mapped not in params_dict:
+                registered_name_mapped = map_weight_name(name_mapped)
+                if registered_name_mapped not in params_dict:
                     continue
-                param = params_dict[name_mapped]
+                param = params_dict[registered_name_mapped]
                 weight_loader = param.weight_loader
                 weight_loader(
                     param,
@@ -640,9 +647,10 @@ class HYV3ForCausalLM(nn.Module):
 
             if "router.gate." in name:
                 name = name.replace("router.", "")
-            if name not in params_dict:
+            registered_name = map_weight_name(name)
+            if registered_name not in params_dict:
                 continue
-            param = params_dict[name]
+            param = params_dict[registered_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 

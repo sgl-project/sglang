@@ -671,6 +671,8 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
             # Excluded MTP experts are unpacked, so an explicit draft request
             # replaces the serialized config with online weight quantization.
             ("explicit embedded draft", True, ["mtp.layers.0*"], False),
+            ("checkpoint mlp draft", True, ["mtp.layers.0.mlp.experts"], False),
+            ("registered ffn draft", True, ["mtp.layers.0.ffn.experts"], False),
             # MTP experts present in the serialized checkpoint stay serialized.
             ("explicit serialized draft", True, [], True),
             # Inherited target quantization does not override draft exclusions.
@@ -895,13 +897,13 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(
             quant_config._resolve_quant_algo(
-                "language_model.model.layers.3.mlp.experts"
+                "language_model.model.layers.3.ffn.experts"
             ),
             "NVFP4",
         )
         self.assertEqual(
             quant_config._resolve_quant_algo(
-                "language_model.model.layers.3.mlp.shared_experts.gate_up_proj"
+                "language_model.model.layers.3.ffn.shared_experts.gate_up_proj"
             ),
             "MXFP8",
         )
@@ -927,11 +929,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             {
                 "quant_algo": "MIXED_PRECISION",
                 "quantized_layers": {
-                    "model.language_model.layers.0.mlp.gate_proj": {
+                    "model.language_model.layers.0.ffn.gate_proj": {
                         "quant_algo": "W4A16_NVFP4",
                         "group_size": 16,
                     },
-                    "model.language_model.layers.0.mlp.up_proj": {
+                    "model.language_model.layers.0.ffn.up_proj": {
                         "quant_algo": "W4A16_NVFP4",
                         "group_size": 16,
                     },
@@ -960,7 +962,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
         self.assertEqual(
-            quant_config._resolve_quant_algo("model.layers.0.mlp.gate_up_proj"),
+            quant_config._resolve_quant_algo("model.layers.0.ffn.gate_up_proj"),
             "W4A16_NVFP4",
         )
         # Attention stays unfused whenever a quant_config is present, so q/k/v
@@ -1022,7 +1024,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                     "quant_algo": "MIXED_PRECISION",
                     "quantized_layers": {
                         "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
-                        "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+                        "model.language_model.layers.0.ffn.shared_expert.up_proj": {
                             "quant_algo": "W4A16_NVFP4",
                             "group_size": 16,
                         },
@@ -1200,14 +1202,14 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             {
                 "quant_algo": "MIXED_PRECISION",
                 "quantized_layers": {
-                    "model.language_model.layers.3.mlp.experts": {
+                    "model.language_model.layers.3.ffn.experts": {
                         "quant_algo": "NVFP4",
                         "group_size": 16,
                     },
                     "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
                         "quant_algo": "FP8"
                     },
-                    "mtp.layers.0.mlp.experts": {
+                    "mtp.layers.0.ffn.experts": {
                         "quant_algo": "FP8_BLOCK_SCALES",
                         "group_size": 128,
                     },
@@ -1218,17 +1220,17 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertEqual(quant_config.exclude_modules, [])
         moe = FusedMoE.__new__(FusedMoE)
         self.assertIsInstance(
-            quant_config.get_quant_method(moe, "mtp.layers.0.mlp.experts"),
+            quant_config.get_quant_method(moe, "mtp.layers.0.ffn.experts"),
             Fp8MoEMethod,
         )
         self.assertEqual(
             quant_config.get_quant_method(
-                moe, "mtp.layers.0.mlp.experts"
+                moe, "mtp.layers.0.ffn.experts"
             ).quant_config.weight_block_size,
             [128, 128],
         )
         self.assertEqual(
-            quant_config.resolve_quant_algo("model.layers.3.mlp.experts"), "NVFP4"
+            quant_config.resolve_quant_algo("model.layers.3.ffn.experts"), "NVFP4"
         )
         self.assertEqual(
             quant_config.resolve_quant_algo(
@@ -1240,7 +1242,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config.resolve_quant_algo("model.layers.1.ple.key_proj")
         )
         self.assertIsNone(
-            quant_config.resolve_quant_algo("model.layers.3.mlp.shared_expert")
+            quant_config.resolve_quant_algo("model.layers.3.ffn.shared_expert")
         )
 
 

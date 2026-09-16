@@ -445,12 +445,12 @@ class JetNemotronDecoderLayer(nn.Module):
             case _:
                 raise NotImplementedError
 
-        self.mlp = Qwen2MLP(
+        self.ffn = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -482,7 +482,7 @@ class JetNemotronDecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -548,6 +548,7 @@ class JetNemotronForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping: list[tuple[str, str, str | int]] = [
             # (param_name, shard_weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

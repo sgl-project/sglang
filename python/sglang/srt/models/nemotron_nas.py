@@ -115,12 +115,12 @@ class DeciLMDecoderLayer(nn.Module):
             intermediate_size = _ffn_mult_to_intermediate_size(
                 ffn_mult, config.hidden_size
             )
-            self.mlp = LlamaMLP(
+            self.ffn = LlamaMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
             )
             self.post_attention_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -134,7 +134,6 @@ class DeciLMDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-
         if self._is_no_op_attention:
             pass
         else:
@@ -154,7 +153,7 @@ class DeciLMDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.ffn(hidden_states)
         return hidden_states, residual
 
 
@@ -371,6 +370,7 @@ class DeciLMForCausalLM(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -395,6 +395,7 @@ class DeciLMForCausalLM(nn.Module):
                 scale_name := self.model.quant_config.get_cache_scale(name)
             ):
                 # Loading kv cache quantization scales
+
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = (
@@ -414,6 +415,7 @@ class DeciLMForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -424,6 +426,7 @@ class DeciLMForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(

@@ -327,10 +327,10 @@ class Gemma4VisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = Gemma4VisionMLP(
+        self.ffn = Gemma4VisionMLP(
             config,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
         )
         eps = config.rms_norm_eps
         hs = config.hidden_size
@@ -356,7 +356,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.ffn(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 

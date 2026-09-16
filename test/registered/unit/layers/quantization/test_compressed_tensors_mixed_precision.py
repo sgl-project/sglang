@@ -28,13 +28,13 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
+EXPERTS_LAYER = "model.language_model.layers.0.ffn.experts"
 GATE_PROJ = f"{EXPERTS_LAYER}.0.gate_proj"
-MLP_LAYER = "model.language_model.layers.0.mlp.gate_proj"
+MLP_LAYER = "model.language_model.layers.0.ffn.gate_proj"
 
 FP8_TARGET = "re:.*self_attn\\.(q|k|v|o)_proj$"
-NVFP4_TARGET = "re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"
-WNA16_TARGET = "re:.*mlp\\.(gate|up|down)_proj$"
+NVFP4_TARGET = "re:.*ffn\\.experts\\.\\d+\\.(gate|up|down)_proj$"
+WNA16_TARGET = "re:.*ffn\\.(gate|up|down)_proj$"
 
 # FP8 W8A8 attention projections.
 FP8_GROUP = {
@@ -140,7 +140,7 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         )
         self.assertFalse(
             check_equal_or_regex_match(
-                "model.layers.0.mlp.shared_expert_gate", ["gate"]
+                "model.layers.0.ffn.shared_expert_gate", ["gate"]
             )
         )
 

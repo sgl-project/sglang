@@ -38,7 +38,7 @@ class TestModelOptFp4AttentionExclusion(CustomTestCase):
         self.assertTrue(cfg.is_layer_excluded("model.layers.0.self_attn.qkv_proj"))
         self.assertTrue(cfg.is_layer_excluded("lm_head"))
         self.assertFalse(
-            cfg.is_layer_excluded("model.layers.0.mlp.experts.3.gate_up_proj")
+            cfg.is_layer_excluded("model.layers.0.ffn.experts.3.gate_up_proj")
         )
 
     def test_uniform_w4a4_checkpoint_quantizes_attention(self):

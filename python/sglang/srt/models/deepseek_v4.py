@@ -2091,10 +2091,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             else None
         )
-        self.mlp = deepseek_v2.DeepseekV2MoE(
+        self.ffn = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             layer_id=self.layer_id,
             alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
@@ -2576,7 +2576,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not get_moe_a2a_backend().is_none()
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
-        # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
+        # all_gatherv gather (in self.ffn's dp_gather) + reduce_scatterv combine.
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
         # the post-experts reduce is a SUM. reduce_scatterv does that sum+scatter
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
@@ -2618,8 +2618,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         _do_shared_local = (
             _SHARED_EXPERT_LOCAL
             and _use_tp_moe_gather
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
+            and getattr(self.ffn, "shared_experts", None) is not None
+            and getattr(self.ffn, "_shared_expert_tp1", False)
         )
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
@@ -2640,7 +2640,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                _shared_local = self.ffn._forward_shared_experts(local_hidden_states)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -2659,7 +2659,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(
+            hidden_states = self.ffn(
                 hidden_states,
                 forward_batch,
                 input_ids=input_ids,
@@ -2697,7 +2697,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
             # PoC: add the locally-computed shared-expert output to this rank's
-            # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
+            # reduce-scattered / dp-scattered local slice (skipped inside self.ffn
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
             if _shared_local is not None:
                 n = hidden_states.shape[0]
@@ -2718,7 +2718,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     # dispatch/combine with the other ubatch's attention + expert GEMM.
     # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
     # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
-    # as-is from ``self.mlp`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
+    # as-is from ``self.ffn`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
     # ------------------------------------------------------------------
     def op_mhc_prepare_attn(
         self,
@@ -2890,12 +2890,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         # global MoE via skip_shared_experts.
         do_shared_local = (
             _SHARED_EXPERT_LOCAL
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
+            and getattr(self.ffn, "shared_experts", None) is not None
+            and getattr(self.ffn, "_shared_expert_tp1", False)
         )
         state.do_shared_local = do_shared_local
         state.shared_local = (
-            self.mlp._forward_shared_experts(local)
+            self.ffn._forward_shared_experts(local)
             if (do_shared_local and local.shape[0] > 0)
             else None
         )
@@ -2931,7 +2931,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         global_hidden = state.pop("global_hidden")
         global_ids = fb._tbo_global_input_ids
         with get_forward().scoped(mlp_reduce_scatter=True):
-            state.global_expert_out = self.mlp(
+            state.global_expert_out = self.ffn(
                 global_hidden,
                 fb,
                 input_ids=global_ids,
@@ -3380,10 +3380,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.model.start_layer, self.model.end_layer)
                 if isinstance(
-                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                    self.model.layers[layer_id].ffn, deepseek_v2.DeepseekV2MoE
                 )
             }
         )
@@ -3605,7 +3605,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         if name.startswith("layers."):
             name = "model." + name
         name = name.replace(".attn.", ".self_attn.")
-        name = name.replace(".ffn.", ".mlp.")
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
@@ -3617,7 +3616,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
-        if "mlp" in name and name.endswith(".scale"):
+        if "ffn" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         return name
@@ -3791,11 +3790,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         continue
                     if (
                         self.num_fused_shared_experts > 0
-                        and "mlp.shared_experts" in name
+                        and "ffn.shared_experts" in name
                     ):
                         name = name.replace(
-                            "mlp.shared_experts",
-                            f"mlp.experts.{self.config.n_routed_experts}",
+                            "ffn.shared_experts",
+                            f"ffn.experts.{self.config.n_routed_experts}",
                         )
 
                     weight_names.append(name)
@@ -3838,7 +3837,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        if ("mlp.experts." in name) and name not in params_dict:
+                        if ("ffn.experts." in name) and name not in params_dict:
                             continue
                         name = name.replace(weight_name, param_name)
                         if name.endswith(".bias") and name not in params_dict:

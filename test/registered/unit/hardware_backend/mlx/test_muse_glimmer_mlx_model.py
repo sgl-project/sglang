@@ -253,10 +253,21 @@ class TestSanitize(CustomTestCase):
         self.assertFalse(any("vision" in k for k in out))
         self.assertFalse(any("language_model" in k for k in out))
 
-    def test_packaged_artifact_passes_through(self):
+    def test_packaged_artifact_preserves_tensors_with_canonical_ffn_names(self):
         model = self._model(muse_glimmer_mlx_format=1)
         packaged = {"model.embed_tokens.weight": mx.zeros((32, 8))}
-        self.assertIs(model.sanitize(packaged), packaged)
+        packaged["model.layers.0.mlp.up_proj.weight"] = mx.zeros((16, 8))
+        out = model.sanitize(packaged)
+        self.assertEqual(
+            set(out), {"model.embed_tokens.weight", "model.layers.0.ffn.up_proj.weight"}
+        )
+        self.assertIs(
+            out["model.embed_tokens.weight"], packaged["model.embed_tokens.weight"]
+        )
+        self.assertIs(
+            out["model.layers.0.ffn.up_proj.weight"],
+            packaged["model.layers.0.mlp.up_proj.weight"],
+        )
 
     def test_packaged_marker_with_raw_keys_rejected(self):
         model = self._model(muse_glimmer_mlx_format=1)

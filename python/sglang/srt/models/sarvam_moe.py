@@ -1026,11 +1026,11 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = SarvamMoESparseMoeBlock(
+            self.ffn = SarvamMoESparseMoeBlock(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 alt_stream=alt_stream,
             )
         else:
@@ -1038,12 +1038,12 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = SarvamMoEMLP(
+            self.ffn = SarvamMoEMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
+                prefix=add_prefix("ffn", prefix),
                 reduce_results=False,
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
@@ -1102,7 +1102,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            hidden_states = self.ffn(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
@@ -1325,6 +1325,7 @@ class SarvamMLAForCausalLM(nn.Module):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
     ) -> None:
+        weights = ((name.replace(".mlp.", ".ffn."), weight) for name, weight in weights)
         del is_nextn
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
@@ -1348,18 +1349,19 @@ class SarvamMLAForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            if ".mlp.gate.e_score_correction_bias" in name:
+            if ".ffn.gate.e_score_correction_bias" in name:
                 name = name.replace(
-                    ".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias"
+                    ".ffn.gate.e_score_correction_bias", ".ffn.e_score_correction_bias"
                 )
 
             is_stacked = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "mlp.experts" in name:
+                if weight_name not in name or "ffn.experts" in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
+
                 if mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
@@ -1375,6 +1377,7 @@ class SarvamMLAForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
+
                 if mapped_name not in params_dict:
                     continue
                 param = params_dict[mapped_name]
@@ -1393,6 +1396,7 @@ class SarvamMLAForCausalLM(nn.Module):
 
             if name.endswith(".bias") and name not in params_dict:
                 continue
+
             if name not in params_dict:
                 continue
             param = params_dict[name]
@@ -1402,9 +1406,9 @@ class SarvamMLAForCausalLM(nn.Module):
         self._set_mla_wkc_wvc()
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                layer_id: self.model.layers[layer_id].ffn.get_moe_weights()
                 for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, SarvamMoESparseMoeBlock)
+                if isinstance(self.model.layers[layer_id].ffn, SarvamMoESparseMoeBlock)
             }
 
     def _set_mla_wkc_wvc(self) -> None:
