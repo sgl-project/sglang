@@ -8,8 +8,9 @@ survives. Both sides coordinate only through files in ``<artifact>/control``:
 
 - the controller owns ``release.json`` (resume, plus the listen address to use)
   and ``abort``;
-- the engine owns ``scheduler.json``, ``ready.json``, ``canary.json``,
-  ``resumed`` and ``error.json``.
+- the engine owns ``scheduler.json`` (released state plus the canary it
+  sampled), ``ready.json``, ``resumed.json`` (what the restored engine observed)
+  and ``error.json``.
 
 Every wait carries a budget and every engine failure is reported through
 ``error.json``, so a controller that dies cannot leave the engine parked
@@ -23,7 +24,7 @@ import time
 import msgspec
 
 from sglang.srt.engine_snapshot.errors import SnapshotRuntimeFailure
-from sglang.srt.engine_snapshot.manifest import write_json_atomic
+from sglang.srt.engine_snapshot.manifest import SnapshotCanary, write_json_atomic
 
 CONTROL_DIRNAME = "control"
 
@@ -34,8 +35,7 @@ ABORT = "abort"
 # Engine -> controller.
 SCHEDULER = "scheduler.json"
 READY = "ready.json"
-CANARY = "canary.json"
-RESUMED = "resumed"
+RESUMED = "resumed.json"
 ERROR = "error.json"
 
 # How long an engine may stay parked waiting for the controller. The budget is
@@ -54,9 +54,17 @@ class ReleaseInfo(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
 
 
 class SchedulerInfo(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
-    """Written by the scheduler once weights and KV memory are released."""
+    """Written by the scheduler once weights, KV memory and the reload are proven."""
 
     gpu_uuid: str
+    canary: SnapshotCanary
+
+
+class ResumedInfo(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
+    """What the restored scheduler observed when it re-ran the canary."""
+
+    token_id: int
+    logprob: float
 
 
 class EngineInfo(msgspec.Struct, forbid_unknown_fields=True, frozen=True):

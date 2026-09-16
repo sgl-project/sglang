@@ -2,11 +2,11 @@ import json
 import unittest
 
 import msgspec
-from snapshot_fixtures import SnapshotArtifacts
+from snapshot_fixtures import CANARY_PROMPT, SnapshotArtifacts
 
 from sglang.srt.engine_snapshot import control
 from sglang.srt.engine_snapshot.errors import SnapshotRuntimeFailure
-from sglang.srt.engine_snapshot.manifest import write_json_atomic
+from sglang.srt.engine_snapshot.manifest import SnapshotCanary, write_json_atomic
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,12 +51,17 @@ class TestControlProtocol(SnapshotArtifacts, CustomTestCase):
     def test_release_round_trip_and_handshake_reset(self):
         write_json_atomic(
             self.control / control.SCHEDULER,
-            msgspec.to_builtins(control.SchedulerInfo(gpu_uuid="GPU-1")),
+            msgspec.to_builtins(
+                control.SchedulerInfo(
+                    gpu_uuid="GPU-1", canary=SnapshotCanary(CANARY_PROMPT, 42, -0.5)
+                )
+            ),
         )
         info = control.wait_and_read(
             self.control, control.SCHEDULER, control.SchedulerInfo, timeout_seconds=1
         )
         self.assertEqual(info.gpu_uuid, "GPU-1")
+        self.assertEqual(info.canary.token_id, 42)
 
         control.write_release(self.control, host="0.0.0.0", port=31111)
         release = control.read_json(self.control, control.RELEASE, control.ReleaseInfo)
@@ -68,7 +73,12 @@ class TestControlProtocol(SnapshotArtifacts, CustomTestCase):
         self.assertIsNone(release.host)
         self.assertIsNone(release.port)
 
-        (self.control / control.RESUMED).touch()
+        write_json_atomic(
+            self.control / control.RESUMED,
+            msgspec.to_builtins(control.ResumedInfo(token_id=42, logprob=-0.5)),
+        )
+        resumed = control.read_json(self.control, control.RESUMED, control.ResumedInfo)
+        self.assertEqual((resumed.token_id, resumed.logprob), (42, -0.5))
         self.assertIsNone(control.read_error(self.control))
         control.clear_handshake(self.control)
         for marker in (control.RELEASE, control.ABORT, control.RESUMED, control.ERROR):

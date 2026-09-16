@@ -437,29 +437,39 @@ class SnapshotRuntime:
         except BaseException as error:
             failures.append(f"{label}: {error_detail(error)}")
 
+    def _owns(self, pid, artifact_path):
+        """Whether ``pid`` carries this artifact's ownership marker.
+
+        The marker is inherited only by the captured engine tree and the helpers
+        this runtime starts for it, so it is what makes a process ours to signal.
+        """
+        marker = f"SGLANG_SNAPSHOT_DIR={artifact_path}".encode()
+        try:
+            environment = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            return False
+        return marker in environment
+
     def cleanup_tagged(self, artifact_path):
         """Kill every process carrying this artifact's marker.
 
-        Retained as the fallback owner check: the marker is inherited only by
-        the engine tree and the helpers this runtime starts for it.
+        Retained as the fallback owner check: a tree that could not be pinned is
+        not ours to signal through handles, but it still carries the marker.
         """
-        marker = f"SGLANG_SNAPSHOT_DIR={artifact_path}".encode()
         killed = []
         candidates = set()
         candidates.update(
             int(path.name) for path in Path("/proc").iterdir() if path.name.isdecimal()
         )
         for pid in sorted(candidates, reverse=True):
-            if pid <= 1 or pid == os.getpid():
+            if pid <= 1 or pid == os.getpid() or not self._owns(pid, artifact_path):
                 continue
             try:
-                if marker not in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
-                    continue
                 pidfd = os.pidfd_open(pid)
                 try:
-                    if marker not in Path(f"/proc/{pid}/environ").read_bytes().split(
-                        b"\0"
-                    ):
+                    # Re-check through the pinned handle: the PID may have been
+                    # recycled between the scan and pidfd_open.
+                    if not self._owns(pid, artifact_path):
                         continue
                     signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                     killed.append(pid)
@@ -523,12 +533,13 @@ class SnapshotRuntime:
             os.fsdecode(argument) for argument in payload.split(b"\0") if argument
         )
 
-    def pin_restored_tree(self, root_pid, pids):
+    def pin_restored_tree(self, artifact_path, root_pid, pids):
         """Take ownership of a restored tree, or refuse to signal it later.
 
-        The tree is only ours if every captured PID is alive, the artifact_path is the
-        session and process-group leader, its command line is this snapshot's
-        entry module, and no process joined or left the session meanwhile.
+        The tree is only ours if it carries this artifact's marker, every
+        captured PID is alive, the root process is the session and process-group leader,
+        its command line is this snapshot's entry module, and no process joined
+        or left the session meanwhile.
         """
         if root_pid in self._restored:
             raise SnapshotRuntimeFailure(f"restored tree {root_pid} is already pinned")
@@ -555,6 +566,10 @@ class SnapshotRuntime:
             ):
                 raise SnapshotRuntimeFailure(
                     "restored root process command does not match the snapshot barrier"
+                )
+            if not self._owns(root_pid, artifact_path):
+                raise SnapshotRuntimeFailure(
+                    "restored tree does not belong to this snapshot artifact"
                 )
             session = self._session_pids(root_pid)
             if sorted(session) != sorted(pids):
@@ -1032,7 +1047,7 @@ class SnapshotRuntime:
                 raise SnapshotRuntimeFailure(
                     "restored root process PID differs from manifest"
                 )
-            self.pin_restored_tree(manifest.root_pid, manifest.pids)
+            self.pin_restored_tree(artifact_path, manifest.root_pid, manifest.pids)
             self.cuda_action(manifest.cuda_pids, "restore", work, timeout)
             self.cuda_action(manifest.cuda_pids, "unlock", work, timeout)
         except BaseException as error:
