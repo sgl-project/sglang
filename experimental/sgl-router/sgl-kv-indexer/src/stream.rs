@@ -52,12 +52,11 @@ use tracing::{debug, info, warn};
 
 use crate::pb::ApplyExternalKvBatchRequest;
 use crate::service::{validate_actions, validate_worker_id};
-use crate::valkey_backend::{connect_conn, Conn, ValkeyConfig};
+use crate::valkey_backend::{connect_conn, workers_key, Conn, ValkeyConfig};
 use crate::KvIndexerBackend;
 
-/// Approximate stream length kept by `XADD MAXLEN ~`. One entry is one event
-/// batch (a few hundred bytes to a few KB), so this is a bounded replay window,
-/// not a full history; the keyspace already holds the current state.
+/// Approximate stream length kept by `XADD MAXLEN ~`, one entry per event batch:
+/// a bounded replay window, since the keyspace holds the current state.
 pub const DEFAULT_STREAM_MAXLEN: u64 = 1_000_000;
 /// Consumer group shared by Valkey-backed indexers.
 pub const DEFAULT_CONSUMER_GROUP: &str = "indexers";
@@ -86,8 +85,10 @@ pub fn stream_key(prefix: &str) -> String {
     format!("{prefix}events")
 }
 
-pub fn lease_key(prefix: &str) -> String {
-    format!("{prefix}lease:events")
+/// One lease per group: it serializes applies inside a group, and a rebuild
+/// group replaying the window must not stall the fleet's applier.
+pub fn lease_key(prefix: &str, group: &str) -> String {
+    format!("{prefix}lease:events:{group}")
 }
 
 /// Appends apply batches to the event stream.
@@ -183,6 +184,8 @@ struct Entry {
 pub struct StreamConsumer<B> {
     conn: Conn,
     key: String,
+    /// Read to tell a fresh deployment from an index the stream may skip ahead of.
+    workers_key: String,
     lease: String,
     config: StreamConsumerConfig,
     backend: B,
@@ -204,10 +207,12 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
         let valkey = valkey
             .clone()
             .with_request_timeout(READ_BLOCK * 3 + valkey.request_timeout);
+        let lease = lease_key(&valkey.key_prefix, &config.group);
         let mut consumer = Self {
             conn: connect_conn(&valkey).await?,
             key: stream_key(&valkey.key_prefix),
-            lease: lease_key(&valkey.key_prefix),
+            workers_key: workers_key(&valkey.key_prefix),
+            lease,
             config,
             backend,
             holds_lease: false,
@@ -249,8 +254,7 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
                 }
                 Ok(Tick::Standby) => self.config.lease_ttl.unwrap_or(READ_BLOCK) / 3,
                 // A flushed or restored Valkey loses the group; without
-                // recreating it the consumer retries NOGROUP forever and
-                // silently stops applying.
+                // recreating it the consumer retries NOGROUP forever.
                 Err(status) if status.message().contains("NOGROUP") => {
                     warn!(%status, "consumer group missing; recreating it");
                     drain_pending = true;
@@ -346,17 +350,27 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
     }
 
     async fn ensure_group(&mut self) -> Result<(), Status> {
-        let start = match self.config.start {
-            StreamStart::Tail => "$",
-            StreamStart::Beginning => "0",
-        };
+        // A group this process owns must start where it asked, so a name an
+        // unclean exit left behind is destroyed rather than resumed.
+        if self.config.destroy_group_on_exit {
+            let _ = self.destroy_group().await;
+        }
+        // An empty index is not a snapshot of anything: the tail would skip every
+        // event published before the first consumer existed.
+        let from_tail = self.config.start == StreamStart::Tail && !self.index_is_empty().await?;
+        let start = if from_tail { "$" } else { "0" };
         self.create_group(start).await
     }
 
-    /// Recreates a group that vanished under a running consumer. Starting at the
-    /// oldest retained entry rather than at the tail: entries published while the
-    /// group was missing are unread by anyone, and re-applying the window is
-    /// idempotent, while skipping it loses them for good.
+    async fn index_is_empty(&mut self) -> Result<bool, Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("EXISTS").arg(&self.workers_key);
+        let flags: Vec<i64> = self.conn.run(&pipe).await?;
+        Ok(flags.first() != Some(&1))
+    }
+
+    /// Recreates a group that vanished under a running consumer, at the oldest
+    /// retained entry: re-applying the window is idempotent, skipping it is not.
     async fn recreate_group(&mut self) -> Result<(), Status> {
         warn!(
             group = %self.config.group,
@@ -390,10 +404,8 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
         self.conn.run::<Vec<i64>>(&pipe).await.map(|_| ())
     }
 
-    /// Acquires the lease, or renews one this consumer still owns. `SET XX`
-    /// alone would only require the key to exist, so a lease that changed hands
-    /// between a read and the write would be stolen back; the renewal is a
-    /// compare-and-set on the holder name instead.
+    /// Acquires the lease, or renews one this consumer still owns. The renewal is
+    /// a compare-and-set on the holder name; `SET XX` would steal it back.
     async fn try_lease(&mut self, ttl: Duration) -> Result<bool, Status> {
         let ttl_ms = ttl.as_millis().max(1) as u64;
         let mut pipe = redis::pipe();
@@ -445,9 +457,8 @@ impl<B: KvIndexerBackend> StreamConsumer<B> {
         self.conn.run::<Vec<i64>>(&pipe).await.map(|_| ())
     }
 
-    /// Entries left pending, claimed from `self.claim_cursor` onwards. Carrying
-    /// the cursor across calls drains a pending list longer than one page in
-    /// stream order, instead of re-reading the first page forever.
+    /// Entries left pending, claimed from `self.claim_cursor` onwards; carrying
+    /// the cursor drains a multi-page pending list in stream order.
     async fn autoclaim(&mut self, idle: Duration) -> Result<Vec<Entry>, Status> {
         let cursor = self.claim_cursor.clone();
         let mut pipe = redis::pipe();
