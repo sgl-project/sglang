@@ -33,6 +33,14 @@ use tokio::{
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 
+// Main components started by this binary:
+// - Engine monitor (`KvEventIndex`): receives load statistics over ZMQ and, without a
+//   remote KV indexer, KV events to maintain a local radix tree. Remote prefix lookups
+//   use `GrpcPrefixIndex` over gRPC.
+// - Engine discovery (`spawn_discovery`): watches Kubernetes pods or loads static URLs,
+//   sending `DiscoveryEvent`s to `manager::run_with_config` to update `WorkerRegistry`.
+// - HTTP server (`axum::serve`): serves OpenAI APIs, health/readiness, and metrics
+//   through routes built by `build_router`, sharing state via `AppContext`.
 #[tokio::main]
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
