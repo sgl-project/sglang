@@ -88,7 +88,7 @@ class _Harness(deepseek_v4.MQALayer):
                 dtype=torch.bfloat16,
             )
         )
-        self.wo_b = lambda value: (value, None)
+        self.wo_b = lambda value, skip_all_reduce=False: (value, None)
         self.prepare_kwargs = None
 
     def _forward_prepare(
