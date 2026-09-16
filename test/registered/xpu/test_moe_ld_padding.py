@@ -172,8 +172,13 @@ class TestXpuMoePaddedWeightsNumerics(CustomTestCase):
         w13_pad.copy_(w13)
         w2_pad.copy_(w2)
 
-        out = fused_experts(x, w13, w2, topk_weights, topk_ids)
-        out_pad = fused_experts(x, w13_pad, w2_pad, topk_weights, topk_ids)
+        w13_col = w13.transpose(1, 2).contiguous()
+        w2_col = w2.transpose(1, 2).contiguous()
+        w13_pad_col = w13_pad.transpose(1, 2).contiguous()
+        w2_pad_col = w2_pad.transpose(1, 2).contiguous()
+
+        out = fused_experts(x, w13_col, w2_col, topk_weights, topk_ids)
+        out_pad = fused_experts(x, w13_pad_col, w2_pad_col, topk_weights, topk_ids)
         torch.xpu.synchronize()
         self.assertTrue(
             torch.equal(out, out_pad),
