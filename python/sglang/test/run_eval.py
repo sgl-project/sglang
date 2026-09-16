@@ -4,7 +4,9 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -20,6 +22,100 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
+
+
+def validate_per_example_evidence_args(args) -> None:
+    output = getattr(args, "per_example_output", None)
+    private_responses = getattr(args, "per_example_private_responses", None)
+    if private_responses and not output:
+        raise ValueError(
+            "--per-example-private-responses requires --per-example-output"
+        )
+    if not output:
+        return
+    if args.eval_name not in {"gpqa", "longbench_v2"}:
+        raise ValueError(
+            "per-example evidence is supported only for GPQA and LongBench-v2"
+        )
+    if getattr(args, "repeat", 1) != 1:
+        raise ValueError("per-example evidence requires --repeat 1")
+    for value in (output, private_responses):
+        if value and Path(value).exists():
+            raise FileExistsError(
+                f"refusing to overwrite per-example evidence: {value}"
+            )
+
+
+def write_per_example_evidence(
+    *,
+    result,
+    metrics: dict,
+    eval_name: str,
+    model: str,
+    output_path: str,
+    private_responses_path: str | None = None,
+) -> None:
+    if not result.examples:
+        raise ValueError(f"{eval_name} did not produce per-example evidence")
+    if len(result.examples) != len(result.convos):
+        raise ValueError("per-example evidence and conversations are misaligned")
+    question_ids = [example["question_id"] for example in result.examples]
+    if len(question_ids) != len(set(question_ids)):
+        raise ValueError("per-example evidence contains duplicate question IDs")
+    example_score = sum(bool(example["correct"]) for example in result.examples) / len(
+        result.examples
+    )
+    if "score" not in metrics or not math.isclose(
+        example_score, float(metrics["score"]), abs_tol=1e-12
+    ):
+        raise ValueError(
+            f"summary score {metrics.get('score')} does not match examples {example_score}"
+        )
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "eval_name": eval_name,
+        "model": model,
+        "summary": metrics,
+        "examples": result.examples,
+    }
+    with output.open("x") as destination:
+        json.dump(payload, destination, indent=2, sort_keys=True)
+        destination.write("\n")
+    output.chmod(0o444)
+    print(f"Writing per-example evidence to {output}")
+
+    if private_responses_path is None:
+        return
+    private_output = Path(private_responses_path)
+    private_output.parent.mkdir(parents=True, exist_ok=True)
+    private_fd = os.open(
+        private_output,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(private_fd, "w") as destination:
+        for example, convo in zip(result.examples, result.convos, strict=True):
+            response = convo[-1].get("content") or ""
+            response_sha256 = hashlib.sha256(response.encode()).hexdigest()
+            if response_sha256 != example["response_sha256"]:
+                raise ValueError(f"response hash mismatch for {example['question_id']}")
+            destination.write(
+                json.dumps(
+                    {
+                        "question_id": example["question_id"],
+                        "response": response,
+                        "response_sha256": response_sha256,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    private_output.chmod(0o600)
+    print(f"Writing private per-example responses to {private_output}")
 
 
 def get_thinking_kwargs(args):
@@ -66,15 +162,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
-    max_tokens = getattr(args, "max_tokens", None)
-    top_p = getattr(args, "top_p", None)
-    temperature = getattr(args, "temperature", None)
     common_kwargs = dict(
         model=getattr(args, "model", None),
-        max_tokens=2048 if max_tokens is None else max_tokens,
-        top_p=1.0 if top_p is None else top_p,
+        max_tokens=getattr(args, "max_tokens", 2048),
+        top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
-        temperature=0.0 if temperature is None else temperature,
+        temperature=getattr(args, "temperature", 0.0),
     )
 
     api_mode = getattr(args, "api", "chat")
@@ -122,55 +215,42 @@ def _run_sgl_eval(eval_name, args) -> dict:
     ).expanduser()
     out_parent.mkdir(parents=True, exist_ok=True)
 
-    model_preset_id = getattr(args, "load_preset_from_model_id", None)
     cmd = [
         "sgl-eval",
         "run",
         eval_name,
         "--base-url",
         base_url,
+        "--num-threads",
+        str(getattr(args, "num_threads", 64)),
+        "--temperature",
+        str(getattr(args, "temperature", 0.0)),
         "--out-dir",
         str(out_parent),
     ]
-    if model_preset_id:
-        cmd += ["--load-preset-from-model-id", model_preset_id]
     if getattr(args, "model", None):
         cmd += ["--model", args.model]
     if getattr(args, "num_examples", None) is not None:
         cmd += ["--num-examples", str(args.num_examples)]
-    if getattr(args, "num_threads", None) is not None:
-        cmd += ["--num-threads", str(args.num_threads)]
-    if getattr(args, "temperature", None) is not None:
-        cmd += ["--temperature", str(args.temperature)]
-    elif not model_preset_id:
-        cmd += ["--temperature", "0.0"]
     if getattr(args, "top_p", None) is not None:
         cmd += ["--top-p", str(args.top_p)]
-    elif not model_preset_id and getattr(args, "_sgl_eval_from_cli", False):
-        cmd += ["--top-p", "1.0"]
     # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
     if getattr(args, "seed", None) is not None:
         cmd += ["--seed", str(args.seed)]
-    # gpt-oss grades one score per effort tier, so dropping this collapses every
-    # tier onto the served model's default.
-    if getattr(args, "reasoning_effort", None) is not None:
-        cmd += ["--reasoning-effort", str(args.reasoning_effort)]
     if getattr(args, "repeat", None) is not None:
         cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
     if getattr(args, "max_tokens", None) is not None:
         cmd += ["--max-tokens", str(args.max_tokens)]
-    elif not model_preset_id:
+    else:
         cmd += ["--max-tokens", "2048"]
     # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
     # without --thinking their message.content is empty and sgl-eval scores 0.
-    sgl_eval_thinking = getattr(args, "sgl_eval_thinking", None)
-    if sgl_eval_thinking is None:
-        if not model_preset_id:
-            model_l = (getattr(args, "model", None) or "").lower()
-            if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
-                cmd += ["--thinking"]
-    elif sgl_eval_thinking:
+    if getattr(args, "sgl_eval_thinking", None) is None:
+        model_l = (getattr(args, "model", None) or "").lower()
+        if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
+            cmd += ["--thinking"]
+    elif args.sgl_eval_thinking:
         cmd += ["--thinking"]
 
     try:
@@ -255,6 +335,7 @@ def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
 
+    validate_per_example_evidence_args(args)
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
@@ -269,18 +350,52 @@ def run_eval(args):
         # caller's threshold has to be measured against it, not inherited.
         # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
+    elif args.eval_name == "math":
+        from sglang.test.simple_eval_math import MathEval
+
+        equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
+
+        filename = (
+            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
+        )
+        eval_obj = MathEval(
+            filename, equality_checker, args.num_examples, args.num_threads
+        )
+    elif args.eval_name == "mgsm":
+        from sglang.test.simple_eval_mgsm import MGSMEval
+
+        eval_obj = MGSMEval(args.num_examples, args.num_threads)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
-        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
-        # caller's threshold has to be measured against it, not inherited.
-        return _run_sgl_eval("gpqa", args)
+        from sglang.test.simple_eval_gpqa import GPQAEval
+
+        filename = args.gpqa_data_path or (
+            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
+        )
+        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "longbench_v2":
+        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
+
+        # Default to HuggingFace dataset, can be overridden with --dataset-path
+        data_source = args.dataset_path
+        categories = args.categories.split(",") if args.categories else None
+
+        eval_obj = LongBenchV2Eval(
+            model=getattr(args, "model", None),
+            data_source=data_source,
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            categories=categories,
+            max_context_length=getattr(args, "max_context_length", None),
+            min_context_length=getattr(args, "min_context_length", None),
+        )
     elif args.eval_name == "mmmu":
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -290,17 +405,14 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
-    elif args.eval_name in ("mmmu_pro", "mmmu-pro"):
-        # Canonical sgl-eval name for MMMU-Pro's standard 10-option split.
-        return _run_sgl_eval("mmmu_pro", args)
     elif args.eval_name == "mmmu_pro_vision":
         # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
         # simple_eval implementation to fall back to.
         return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
-        return _run_sgl_eval("aime25", args)
-    elif args.eval_name == "aime26":
-        return _run_sgl_eval("aime26", args)
+        from sglang.test.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot
@@ -422,6 +534,17 @@ def run_eval(args):
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
 
+    per_example_output = getattr(args, "per_example_output", None)
+    if per_example_output:
+        write_per_example_evidence(
+            result=result,
+            metrics=metrics,
+            eval_name=args.eval_name,
+            model=sampler.model,
+            output_path=per_example_output,
+            private_responses_path=getattr(args, "per_example_private_responses", None),
+        )
+
     if getattr(args, "return_latency", False):
         return metrics, latency
     return metrics
@@ -451,12 +574,6 @@ if __name__ == "__main__":
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
     parser.add_argument(
-        "--load-preset-from-model-id",
-        type=str,
-        default=None,
-        help="Load repository-maintained sgl-eval generation defaults for this model ID.",
-    )
-    parser.add_argument(
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
@@ -469,9 +586,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
-    parser.add_argument("--max-tokens", type=int, default=None)
-    parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
     )
@@ -486,6 +603,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
+        "--per-example-output",
+        type=str,
+        help="Write GPQA or LongBench-v2 hashes, parsed answers, and correctness without raw responses",
+    )
+    parser.add_argument(
+        "--per-example-private-responses",
+        type=str,
+        help="Explicitly write raw GPQA or LongBench-v2 responses to a mode-0600 JSONL file",
+    )
+    parser.add_argument(
         "--thinking-mode",
         default=None,
         type=str,
@@ -494,6 +621,34 @@ if __name__ == "__main__":
     )
 
     # LongBench-v2 specific arguments
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="THUDM/LongBench-v2",
+        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--gpqa-data-path",
+        type=str,
+        default=None,
+        help="Optional local GPQA-Diamond CSV; avoids downloading it during a run",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated list of categories to evaluate for LongBench-v2",
+    )
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        help="Maximum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--min-context-length",
+        type=int,
+        help="Minimum context length in characters for LongBench-v2",
+    )
     parser.add_argument(
         "--num-shots",
         type=int,
@@ -520,6 +675,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    args._sgl_eval_from_cli = True
 
     run_eval(args)
