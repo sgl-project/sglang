@@ -377,20 +377,6 @@ class LayerNorm(CustomOp):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-            # Lazy cache for ones vector (not a registered buffer to avoid FSDP/meta issues)
-            self._weight_fallback_cache = None
-
-    def _get_weight_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        wf = getattr(self, "_weight_fallback_cache", None)
-        if (
-            wf is None
-            or wf.device != x.device
-            or wf.dtype != x.dtype
-            or wf.numel() != self.hidden_size
-        ):
-            wf = torch.ones(self.hidden_size, device=x.device, dtype=x.dtype)
-            self._weight_fallback_cache = wf
-        return wf
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
