@@ -1,15 +1,11 @@
-"""Device probes that a launch configuration depends on.
-
-Not an operator group -- these answer "what will the hardware actually schedule",
-which a host-side dispatch needs before it can size a grid. Kept out of
-``ops/__init__``'s eager group import for that reason; import it directly.
-"""
+"""Occupancy probes a host-side dispatch needs before it can size a grid."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils.common import cache_once
+from sglang.kernels.jit.utils.compile import load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -20,8 +16,8 @@ __all__ = ["get_max_active_clusters"]
 @cache_once
 def _jit_probe_module() -> Module:
     return load_jit(
-        "misc_probe",
-        cuda_files=["misc/probe.cuh"],
+        "occupancy_cluster_probe",
+        cuda_files=["occupancy/cluster_probe.cuh"],
         cuda_wrappers=[("get_max_active_clusters", "get_max_active_clusters")],
     )
 
@@ -47,7 +43,7 @@ def get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
     argument), not the one it asks for.
 
     :param cluster_size: Blocks per cluster.
-    :param occupancy: Blocks per SM (``num_waves`` in ``csrc/misc/probe.cuh``).
+    :param occupancy: Blocks per SM (``num_waves`` in ``csrc/occupancy/cluster_probe.cuh``).
     :raises RuntimeError: On pre-sm90 devices, which have no clusters.
     :raises ValueError: If nothing is schedulable, which a real device should
                         never report for a cluster width it supports.
