@@ -10,7 +10,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
-    InitWeightsUpdateGroupReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
@@ -158,283 +157,6 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
     draft_runner.end_weight_update.assert_called_once_with(run_post_load=False)
 
 
-def test_m2n_receive_forces_post_load_even_after_residual_broadcast():
-    target_runner = Mock()
-    manager = _manager(
-        tp_worker=SimpleNamespace(
-            model_runner=target_runner,
-            iter_runners=lambda: [("", target_runner)],
-        ),
-        draft_worker=None,
-    )
-    req = _distributed_req(selector="target")
-    req.load_format = "nccl_m2n"
-
-    output = manager.update_weights_from_distributed(req)
-
-    assert output.success is True
-    target_runner.receive_weights_from_m2n.assert_called_once_with("weight_update_group")
-    assert manager._weight_update_requires_post_load is True
-
-    # A later residual broadcast uses load_weights(), but must not erase the
-    # model-level post-load requirement established by the direct M2N write.
-    manager._weight_update_loaded = True
-    with patch("torch.distributed.barrier"):
-        manager.end_weight_update(EndWeightUpdateReqInput())
-    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
-
-
-def test_concurrent_m2n_waves_finalize_once_after_residual_updates():
-    target_runner = Mock()
-    manager = _manager(
-        tp_worker=SimpleNamespace(
-            model_runner=target_runner,
-            iter_runners=lambda: [("", target_runner)],
-        ),
-        draft_worker=None,
-    )
-    for groups in (["pp0", "pp1"], ["pp2", "pp3"]):
-        req = _distributed_req(selector="target")
-        req.load_format = "nccl_m2n"
-        req.group_name = groups[0]
-        req.m2n_group_names = groups
-        assert manager.update_weights_from_distributed(req).success
-        target_runner.end_weight_update.assert_not_called()
-    assert target_runner.receive_weights_from_m2n_groups.call_args_list == [
-        call(["pp0", "pp1"]),
-        call(["pp2", "pp3"]),
-    ]
-    target_runner.receive_weights_from_m2n.assert_not_called()
-    # The residual path still follows the entire bulk update and finalizes once.
-    assert manager.update_weights_from_distributed(_distributed_req()).success
-    with patch("torch.distributed.barrier"):
-        assert manager.end_weight_update(EndWeightUpdateReqInput()).success
-    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
-
-
-@pytest.mark.parametrize("groups", [None, ["pp0", "pp1"]])
-def test_concurrent_m2n_groups_survive_scheduler_ipc(groups):
-    import msgspec
-
-    req = _distributed_req()
-    req.m2n_group_names = groups
-    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(req), type=type(req))
-    assert decoded.m2n_group_names == groups
-    assert decoded.group_name == req.group_name
-    assert decoded.flush_cache is False
-    # Fields are positional on the wire; older single-group messages should
-    # decode with the appended field's default, not shift existing fields.
-    legacy = msgspec.msgpack.decode(msgspec.msgpack.encode(req))[:-1]
-    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(legacy), type=type(req))
-    assert decoded.m2n_group_names is None
-    assert decoded.selector == req.selector
-
-
-@pytest.mark.parametrize("groups", [[], ["wrong-first-group"]])
-def test_concurrent_m2n_rejects_malformed_request_before_receive(groups):
-    target_runner = Mock()
-    manager = _manager(
-        tp_worker=SimpleNamespace(model_runner=target_runner), draft_worker=None
-    )
-    req = _distributed_req()
-    req.load_format = "nccl_m2n"
-    req.m2n_group_names = groups
-    output = manager.update_weights_from_distributed(req)
-    assert not output.success
-    target_runner.receive_weights_from_m2n_groups.assert_not_called()
-
-
-def test_concurrent_m2n_request_cannot_fall_through_to_broadcast():
-    target_runner = Mock()
-    manager = _manager(
-        tp_worker=SimpleNamespace(model_runner=target_runner), draft_worker=None
-    )
-    req = _distributed_req()
-    req.m2n_group_names = [req.group_name, "pp1"]
-    assert not manager.update_weights_from_distributed(req).success
-    target_runner.receive_weights_from_distributed.assert_not_called()
-
-
-def test_model_runner_resolves_complete_m2n_wave_before_receiving():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    receivers = {"pp0": Mock(), "pp1": Mock()}
-    runner = SimpleNamespace(_m2n_receivers=receivers)
-    with patch(
-        "sglang.srt.weight_sync.nccl_m2n.NcclM2NReceiver.receive_many"
-    ) as receive:
-        for groups in ([], ["pp0", "pp0"], ["pp0", "missing"]):
-            with pytest.raises((ValueError, RuntimeError)):
-                ModelRunner.receive_weights_from_m2n_groups(runner, groups)
-            receive.assert_not_called()
-        ModelRunner.receive_weights_from_m2n_groups(runner, ["pp0", "pp1"])
-        receive.assert_called_once_with([receivers["pp0"], receivers["pp1"]])
-
-
-def test_m2n_group_initialization_rejects_a_draft_runner():
-    tp_worker = Mock()
-    tp_worker.init_weights_update_group.return_value = (True, "Success")
-    tp_worker.destroy_weights_update_group.return_value = (True, "Success")
-    manager = _manager(
-        tp_worker=tp_worker,
-        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", Mock())]),
-    )
-    req = InitWeightsUpdateGroupReqInput(
-        master_address="127.0.0.1",
-        master_port=1234,
-        rank_offset=1,
-        world_size=2,
-        group_name="miles-m2n-test",
-        backend="nccl",
-        m2n_manifest={"schema_version": 1},
-    )
-
-    output = manager.init_weights_update_group(req)
-
-    assert output.success is False
-    tp_worker.destroy_weights_update_group.assert_called_once()
-
-
-def test_destroying_an_absent_update_group_is_idempotent():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    runner = SimpleNamespace(
-        _model_update_group={},
-        _m2n_receivers={},
-    )
-
-    success, message = ModelRunner.destroy_weights_update_group(
-        runner, "missing-legacy-group"
-    )
-
-    assert success is True
-    assert "already absent" in message
-
-
-def test_failed_update_group_destroy_remains_retryable():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    receiver = Mock()
-    receiver.destroy.side_effect = [RuntimeError("injected destroy failure"), None]
-    process_group = object()
-    runner = SimpleNamespace(
-        _model_update_group={"miles-m2n-old": process_group},
-        _m2n_receivers={"miles-m2n-old": receiver},
-    )
-
-    with patch("torch.distributed.destroy_process_group") as destroy_group:
-        success, message = ModelRunner.destroy_weights_update_group(
-            runner, "miles-m2n-old"
-        )
-
-        assert success is False
-        assert "injected destroy failure" in message
-        assert runner._m2n_receivers["miles-m2n-old"] is receiver
-        assert runner._model_update_group["miles-m2n-old"] is process_group
-
-        success, _ = ModelRunner.destroy_weights_update_group(
-            runner, "miles-m2n-old"
-        )
-
-    assert success is True
-    assert receiver.destroy.call_count == 2
-    destroy_group.assert_called_once_with(process_group)
-    assert runner._m2n_receivers == {}
-    assert runner._model_update_group == {}
-
-
-def test_failed_process_group_destroy_remains_retryable():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    receiver = Mock()
-    process_group = object()
-    runner = SimpleNamespace(
-        _model_update_group={"miles-m2n-old": process_group},
-        _m2n_receivers={"miles-m2n-old": receiver},
-    )
-
-    with patch(
-        "torch.distributed.destroy_process_group",
-        side_effect=[RuntimeError("injected process-group failure"), None],
-    ) as destroy_group:
-        success, message = ModelRunner.destroy_weights_update_group(
-            runner, "miles-m2n-old"
-        )
-
-        assert success is False
-        assert "injected process-group failure" in message
-        assert runner._model_update_group["miles-m2n-old"] is process_group
-        assert runner._m2n_receivers["miles-m2n-old"] is receiver
-
-        success, _ = ModelRunner.destroy_weights_update_group(
-            runner, "miles-m2n-old"
-        )
-
-    assert success is True
-    assert receiver.destroy.call_count == 2
-    assert destroy_group.call_count == 2
-    assert runner._model_update_group == {}
-    assert runner._m2n_receivers == {}
-
-
-def test_destroying_one_m2n_stage_retires_all_native_resources_before_any_group():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    events = []
-    receivers = {}
-    groups = {"residual": object()}
-    for stage in range(2):
-        name = f"miles-m2n-pp{stage}"
-        receiver = Mock()
-        receiver.stream.synchronize.side_effect = lambda stage=stage: events.append(
-            f"sync:{stage}"
-        )
-        receiver.destroy.side_effect = lambda stage=stage: events.append(
-            f"native:{stage}"
-        )
-        receivers[name] = receiver
-        groups[name] = name
-    runner = SimpleNamespace(_m2n_receivers=receivers, _model_update_group=groups)
-    with patch(
-        "torch.distributed.destroy_process_group",
-        side_effect=lambda pg: events.append(f"pg:{pg}"),
-    ):
-        success, _ = ModelRunner.destroy_weights_update_group(runner, "miles-m2n-pp0")
-        assert success
-        assert ModelRunner.destroy_weights_update_group(runner, "miles-m2n-pp1")[0]
-    assert events == [
-        "sync:0",
-        "sync:1",
-        "native:0",
-        "native:1",
-        "pg:miles-m2n-pp0",
-        "pg:miles-m2n-pp1",
-    ]
-    assert runner._m2n_receivers == {}
-    assert list(runner._model_update_group) == ["residual"]
-
-
-def test_partial_pp_group_teardown_can_resume_on_remaining_group():
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-    runner = SimpleNamespace(
-        _m2n_receivers={"pp0": Mock(), "pp1": Mock()},
-        _model_update_group={"pp0": "pg0", "pp1": "pg1"},
-    )
-    with patch(
-        "torch.distributed.destroy_process_group",
-        side_effect=[None, RuntimeError("PP1 destroy failed"), None],
-    ) as destroy:
-        success, message = ModelRunner.destroy_weights_update_group(runner, "pp0")
-        assert not success
-        assert "PP1 destroy failed" in message
-        assert list(runner._m2n_receivers) == ["pp1"]
-        assert ModelRunner.destroy_weights_update_group(runner, "pp1")[0]
-    assert destroy.call_args_list == [call("pg0"), call("pg1"), call("pg1")]
-    assert runner._m2n_receivers == {}
-    assert runner._model_update_group == {}
-
-
 def test_model_runner_begin_end_wire_to_loader_hooks():
     # ModelRunner.begin/end delegate to the loader: begin restores; end runs
     # post_load only when requested, always finalizes quant layout.
@@ -459,6 +181,146 @@ def test_model_runner_begin_end_wire_to_loader_hooks():
         mr.ModelRunner.end_weight_update(runner, run_post_load=False)
     post_load.assert_not_called()
     postprocess.assert_called_once()
+
+
+def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
+    # begin(selector="draft") opens the session on the draft only; the target is
+    # untouched, and the selector is recorded for end to reuse.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier"):
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+
+    target_runner.begin_weight_update.assert_not_called()
+    draft_runner.begin_weight_update.assert_called_once_with()
+    assert manager._weight_update_selector == "draft"
+
+
+def test_end_weight_update_reuses_session_selector_from_begin():
+    # end has no selector of its own; it finalizes exactly the set begin opened.
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _session_manager(target_runner, draft_runner)
+    manager._weight_update_in_progress = False
+
+    with patch("torch.distributed.barrier"):
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
+        manager.end_weight_update(EndWeightUpdateReqInput())
+
+    target_runner.end_weight_update.assert_not_called()
+    draft_runner.end_weight_update.assert_called_once()
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_m2n_ipc_waves_and_residual_finalize_once(concurrent):
+    import msgspec
+
+    target = Mock()
+    manager = _manager(
+        SimpleNamespace(model_runner=target, iter_runners=lambda: [("", target)]), None
+    )
+    for groups in (["pp0", "pp1"], ["pp2"]):
+        req = _distributed_req(selector="target")
+        req.load_format, req.group_name = "nccl_m2n", groups[0]
+        req.m2n_group_names = groups if concurrent else None
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(req), type=type(req))
+        assert decoded.m2n_group_names == req.m2n_group_names
+        # Old positional IPC requests still decode with the appended default.
+        legacy = msgspec.msgpack.decode(msgspec.msgpack.encode(req))[:-1]
+        assert (
+            msgspec.msgpack.decode(
+                msgspec.msgpack.encode(legacy), type=type(req)
+            ).m2n_group_names
+            is None
+        )
+        assert manager.update_weights_from_distributed(decoded).success
+        target.end_weight_update.assert_not_called()
+    if concurrent:
+        assert target.receive_weights_from_m2n_groups.call_args_list == [
+            call(["pp0", "pp1"]),
+            call(["pp2"]),
+        ]
+    else:
+        assert target.receive_weights_from_m2n.call_args_list == [
+            call("pp0"),
+            call("pp2"),
+        ]
+    assert manager.update_weights_from_distributed(_distributed_req()).success
+    target.load_weights.assert_called_once()
+    with patch("torch.distributed.barrier"):
+        assert manager.end_weight_update(EndWeightUpdateReqInput()).success
+    target.end_weight_update.assert_called_once_with(run_post_load=True)
+
+
+@pytest.mark.parametrize("failure", ["native", "process_group"])
+def test_m2n_teardown_is_native_first_and_retryable(failure):
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    events = []
+    receivers = {name: Mock() for name in ("pp0", "pp1")}
+    groups = {"pp0": "pg0", "pp1": "pg1", "residual": "residual"}
+    runner = SimpleNamespace(
+        _m2n_receivers=receivers.copy(), _model_update_group=groups.copy()
+    )
+    for name, receiver in receivers.items():
+        receiver.stream.synchronize.side_effect = lambda name=name: events.append(
+            ("sync", name)
+        )
+        receiver.destroy.side_effect = lambda name=name: events.append(("native", name))
+    if failure == "native":
+        receivers["pp1"].destroy.side_effect = RuntimeError("native failed")
+
+    def destroy(pg):
+        events.append(("pg", pg))
+        if failure == "process_group" and pg == "pg1" and events.count(("pg", pg)) == 1:
+            raise RuntimeError("process group failed")
+
+    with patch("torch.distributed.destroy_process_group", side_effect=destroy):
+        assert not ModelRunner.destroy_weights_update_group(runner, "pp0")[0]
+        assert events[:3] == [("sync", "pp0"), ("sync", "pp1"), ("native", "pp0")]
+        if failure == "native":
+            assert not any(kind == "pg" for kind, _ in events)
+            assert runner._m2n_receivers == receivers
+            receivers["pp1"].destroy.side_effect = lambda: events.append(
+                ("native", "pp1")
+            )
+        else:
+            assert events[3:5] == [("native", "pp1"), ("pg", "pg0")]
+            assert list(runner._m2n_receivers) == ["pp1"]
+        assert ModelRunner.destroy_weights_update_group(runner, "pp1")[0]
+        assert ModelRunner.destroy_weights_update_group(runner, "pp0")[0]
+    assert runner._m2n_receivers == {}
+    assert runner._model_update_group == {"residual": "residual"}
+
+
+@pytest.mark.parametrize(
+    "initial,restart", [("target", "target"), ("all", "target"), ("draft", "all")]
+)
+def test_session_restart_keeps_original_selector_and_preparation(initial, restart):
+    target, draft = Mock(), Mock()
+    manager = _session_manager(target, draft)
+    manager._weight_update_in_progress = False
+    with patch("torch.distributed.barrier") as barrier:
+        manager.begin_weight_update(BeginWeightUpdateReqInput(selector=initial))
+        manager._weight_update_loaded = manager._weight_update_requires_post_load = True
+        barrier.reset_mock()
+        output = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector=restart)
+        )
+        assert output.success is (initial == restart)
+        assert manager._weight_update_selector == initial
+        assert manager._weight_update_in_progress is True
+        assert manager._weight_update_loaded is (initial != restart)
+        assert manager._weight_update_requires_post_load is (initial != restart)
+        if initial != restart:
+            barrier.assert_not_called()
+        manager.end_weight_update(EndWeightUpdateReqInput())
+    for role, runner in (("target", target), ("draft", draft)):
+        assert runner.begin_weight_update.call_count == int(initial in ("all", role))
+        assert runner.end_weight_update.call_count == int(initial in ("all", role))
 
 
 def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
@@ -532,110 +394,3 @@ def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
     assert torch.all(graph_weight.float() == 2)
     assert torch.all(graph_scale == 3)
     assert model.scale.format_ue8m0 is True
-
-
-def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
-    # begin(selector="draft") opens the session on the draft only; the target is
-    # untouched, and the selector is recorded for end to reuse.
-    target_runner = Mock()
-    draft_runner = Mock()
-    manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_in_progress = False
-
-    with patch("torch.distributed.barrier"):
-        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
-
-    target_runner.begin_weight_update.assert_not_called()
-    draft_runner.begin_weight_update.assert_called_once_with()
-    assert manager._weight_update_selector == "draft"
-
-
-def test_end_weight_update_reuses_session_selector_from_begin():
-    # end has no selector of its own; it finalizes exactly the set begin opened.
-    target_runner = Mock()
-    draft_runner = Mock()
-    manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_in_progress = False
-
-    with patch("torch.distributed.barrier"):
-        manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
-        manager.end_weight_update(EndWeightUpdateReqInput())
-
-    target_runner.end_weight_update.assert_not_called()
-    draft_runner.end_weight_update.assert_called_once()
-
-
-@pytest.mark.parametrize("selector", ["all", "target", "draft"])
-def test_begin_weight_update_restarts_with_the_same_selector(selector):
-    target, draft = Mock(), Mock()
-    manager = _session_manager(target, draft)
-    manager._weight_update_in_progress = False
-
-    with patch("torch.distributed.barrier"):
-        manager.begin_weight_update(BeginWeightUpdateReqInput(selector=selector))
-        manager._weight_update_loaded = True
-        manager._weight_update_requires_post_load = True
-        output = manager.begin_weight_update(
-            BeginWeightUpdateReqInput(selector=selector)
-        )
-
-        assert output.success is True
-        assert manager._weight_update_selector == selector
-        assert manager._weight_update_in_progress is True
-        assert manager._weight_update_loaded is False
-        assert manager._weight_update_requires_post_load is False
-        manager.end_weight_update(EndWeightUpdateReqInput())
-
-    for role, runner in (("target", target), ("draft", draft)):
-        if selector in ("all", role):
-            # Retry must not restore an already loadable runner a second time.
-            runner.begin_weight_update.assert_called_once_with()
-            runner.end_weight_update.assert_called_once_with(run_post_load=True)
-        else:
-            runner.begin_weight_update.assert_not_called()
-            runner.end_weight_update.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "initial,restart",
-    [
-        (initial, restart)
-        for initial in ("all", "target", "draft")
-        for restart in ("all", "target", "draft")
-        if initial != restart
-    ],
-)
-def test_begin_weight_update_rejects_selector_changes_without_mutating_session(
-    initial, restart
-):
-    target, draft = Mock(), Mock()
-    manager = _session_manager(target, draft)
-    manager._weight_update_in_progress = False
-
-    with patch("torch.distributed.barrier") as barrier:
-        manager.begin_weight_update(BeginWeightUpdateReqInput(selector=initial))
-        manager._weight_update_loaded = True
-        manager._weight_update_requires_post_load = True
-        barrier.reset_mock()
-        output = manager.begin_weight_update(
-            BeginWeightUpdateReqInput(selector=restart)
-        )
-
-        assert output.success is False
-        assert "Cannot change the runner selector" in output.message
-        assert manager._weight_update_selector == initial
-        assert manager._weight_update_in_progress is True
-        assert manager._weight_update_loaded is True
-        assert manager._weight_update_requires_post_load is True
-        barrier.assert_not_called()
-        # The original transaction can still finalize exactly the runners
-        # prepared by its first begin, including the all -> target regression.
-        manager.end_weight_update(EndWeightUpdateReqInput())
-
-    for role, runner in (("target", target), ("draft", draft)):
-        if initial in ("all", role):
-            runner.begin_weight_update.assert_called_once_with()
-            runner.end_weight_update.assert_called_once_with(run_post_load=True)
-        else:
-            runner.begin_weight_update.assert_not_called()
-            runner.end_weight_update.assert_not_called()
