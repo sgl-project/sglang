@@ -12,7 +12,7 @@ use crate::policies::selection::{
 use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
 use crate::server::chat_forward::{forward, SelectedWorkers};
-use crate::server::chat_preparation::{parse_routing_fields, ChatRequest};
+use crate::server::chat_preparation::{parse_routing_fields, PreparedChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::workers::Worker;
@@ -57,7 +57,8 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     // Validate sampling parameters and render/tokenize when needed.
-    let request = ChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
+    let request =
+        PreparedChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(
@@ -85,7 +86,7 @@ fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
 
 async fn select_workers(
     ctx: &AppContext,
-    request: &ChatRequest,
+    request: &PreparedChatRequest,
     headers: &HeaderMap,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
@@ -176,7 +177,7 @@ fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 fn pick_prefill_worker(
     ctx: &AppContext,
-    request: &ChatRequest,
+    request: &PreparedChatRequest,
     policy: &dyn Policy,
     candidates: &[Arc<Worker>],
     routing: &RoutingContext<'_>,
@@ -191,7 +192,7 @@ fn pick_prefill_worker(
         body: Some(&request.body),
         routing_key: routing.routing_key,
         session_id: routing.session_id,
-        request_input_tokens: request.prefill_load as u64,
+        request_input_tokens: request.input_token_count as u64,
         request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
         external_prefix: routing.prefix_matches.as_ref(),
         load_snapshot: routing.load_snapshot.as_ref(),
@@ -209,7 +210,7 @@ fn pick_prefill_worker(
 
 fn pick_decode_worker(
     ctx: &AppContext,
-    request: &ChatRequest,
+    request: &PreparedChatRequest,
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
@@ -226,7 +227,7 @@ fn pick_decode_worker(
         model_id: &request.model,
         prefill_url: &prefill.url,
         decode_workers: &candidates,
-        request_input_tokens: request.prefill_load as u64,
+        request_input_tokens: request.input_token_count as u64,
         requested_max_output_tokens: request.max_output_tokens,
         ttft_slo_ms: routing.ttft_slo_ms,
         tps_slo: routing.tps_slo,
@@ -241,7 +242,7 @@ fn pick_decode_worker(
 /// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
 async fn lookup_prefix_matches(
     ctx: &AppContext,
-    request: &ChatRequest,
+    request: &PreparedChatRequest,
 ) -> Result<Option<ExternalPrefixSignal>, ApiError> {
     let signal = match (
         ctx.prefix_index.as_ref(),

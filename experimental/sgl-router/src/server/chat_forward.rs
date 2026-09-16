@@ -7,7 +7,7 @@ use crate::discovery::WorkerMode;
 use crate::policies::active_load::ActiveLoadGuard;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
-use crate::server::chat_preparation::{generate_room_id, BootstrapFields, ChatRequest};
+use crate::server::chat_preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
@@ -32,7 +32,7 @@ pub(crate) struct SelectedWorkers {
 
 pub(crate) async fn forward(
     ctx: &AppContext,
-    request: ChatRequest,
+    request: PreparedChatRequest,
     workers: SelectedWorkers,
     mut headers: HeaderMap,
     start: Instant,
@@ -55,7 +55,7 @@ pub(crate) async fn forward(
     let active_guard = ctx.active_load.register(
         prefill.id.clone(),
         prefill.url.clone(),
-        request.prefill_load,
+        request.input_token_count,
         0,
     );
     // PD requests keep using the prefill expiration token after dispatching decode.
@@ -208,7 +208,12 @@ struct DispatchMetrics {
 }
 
 impl DispatchMetrics {
-    fn new(ctx: &AppContext, request: &ChatRequest, worker: &Worker, start: Instant) -> Self {
+    fn new(
+        ctx: &AppContext,
+        request: &PreparedChatRequest,
+        worker: &Worker,
+        start: Instant,
+    ) -> Self {
         Self {
             registry: Arc::clone(&ctx.metrics),
             model: request.model.0.clone(),

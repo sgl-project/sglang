@@ -15,42 +15,47 @@ use serde::Deserialize;
 use serde_json::{json, Number, Value};
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
-pub(crate) struct ChatRequest {
+/// Validated routing inputs and the original body, ready for worker selection.
+pub(crate) struct PreparedChatRequest {
     pub(crate) model: ModelId,
     pub(crate) streaming: bool,
     pub(crate) max_output_tokens: Option<u64>,
     pub(crate) body: Bytes,
     pub(crate) tokens: Option<RequestTokens>,
-    pub(crate) prefill_load: usize,
-    value: Option<Value>,
-    sampling: Vec<(SamplingField, Number)>,
+    /// Token count for routing/load accounting; estimated from body size when unavailable.
+    pub(crate) input_token_count: usize,
+    parsed_body: Option<Value>,
+    sampling_defaults: Vec<(SamplingField, Number)>,
 }
 
-impl ChatRequest {
+impl PreparedChatRequest {
     pub(crate) fn prepare(
         ctx: &AppContext,
         model: ModelId,
         fields: RoutingFields,
         body: Bytes,
-        policy_needs_tokens: bool,
+        policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        let sampling =
-            apply_sampling_overrides(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let want_tokens = should_tokenize_request(
+        // Validate configured sampling rules and collect missing defaults for forwarding.
+        let sampling_defaults =
+            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let needs_tokens = should_tokenize_request(
             ctx.tokenizers.has_chat_formatter(&model.0),
-            policy_needs_tokens,
+            policy_needs_request_tokens,
             ctx.bucket_selector.is_enabled(),
         );
-        let value = want_tokens
+        // Parse the full body only when rendering or routing needs tokens.
+        let parsed_body = needs_tokens
             .then(|| serde_json::from_slice(&body))
             .transpose()
             .map_err(|_| invalid_request())?;
-        let tokens = value
+        let tokens = parsed_body
             .as_ref()
-            .and_then(|value| request_tokens_for(&ctx.tokenizers, &model, value));
-        let prefill_load = tokens
+            .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
+        // Keep load accounting available even when tokenization is unavailable.
+        let input_token_count = tokens
             .as_ref()
             .map(|tokens| tokens.ids.len().max(1))
             .unwrap_or_else(|| estimate_prefill_tokens(&body));
@@ -60,9 +65,9 @@ impl ChatRequest {
             max_output_tokens: fields.requested_max_output_tokens(),
             body,
             tokens,
-            prefill_load,
-            value,
-            sampling,
+            input_token_count,
+            parsed_body,
+            sampling_defaults,
         })
     }
 
@@ -71,26 +76,33 @@ impl ChatRequest {
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
     ) -> Result<Bytes, ApiError> {
-        let input_ids = match (self.tokens.as_ref(), self.value.as_ref()) {
-            (Some(tokens), Some(value))
-                if tokens.rendered_from_chat && input_ids_safe_to_forward(value) =>
+        // Routing tokens can replace engine tokenization only for supported chat templates.
+        let input_ids = match (self.tokens.as_ref(), self.parsed_body.as_ref()) {
+            (Some(tokens), Some(parsed_body))
+                if tokens.rendered_from_chat && can_forward_chat_tokens(parsed_body) =>
             {
                 Some(tokens.ids.as_slice())
             }
             _ => None,
         };
-        if ingress_tokenize_offload_failed(
+        if chat_tokenization_failed(
             ctx.tokenizers.has_chat_formatter(&self.model.0),
-            self.value.as_ref(),
+            self.parsed_body.as_ref(),
             self.tokens.as_ref(),
         ) {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
-        build_outgoing_body(&self.body, self.value, input_ids, bootstrap, &self.sampling)
+        build_outgoing_body(
+            &self.body,
+            self.parsed_body,
+            input_ids,
+            bootstrap,
+            &self.sampling_defaults,
+        )
     }
 }
 
-/// Reads routing and sampling fields without retaining unrelated client data.
+/// Routing and sampling fields retained by the lightweight request parser.
 #[derive(Debug, Default)]
 pub(crate) struct RoutingFields {
     stream: Option<bool>,
@@ -109,36 +121,39 @@ enum SamplingValue {
     Unusable,
 }
 
-/// Arbitrary; bounds the parse of a client-controlled string, and no real sampling literal is longer.
+/// Cap numeric-string parsing and its stack buffer at 64 bytes.
 const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
 
 /// Match engine coercion: trim ordinary numbers, but preserve whitespace for underscored ones.
-fn parse_as_engine_number(s: &str) -> Option<f64> {
-    let trimmed = s.trim();
+fn parse_engine_numeric_string(input: &str) -> Option<f64> {
+    let trimmed = input.trim();
     if trimmed.len() > MAX_SAMPLING_NUMERIC_LEN {
         return None;
     }
-    if let Ok(v) = trimmed.parse::<f64>() {
-        return Some(v);
+    if let Ok(number) = trimmed.parse::<f64>() {
+        return Some(number);
     }
-    if s.len() > MAX_SAMPLING_NUMERIC_LEN
-        || !s.contains('_')
-        || s.starts_with('_')
-        || s.ends_with('_')
-        || s.contains("__")
+    if input.len() > MAX_SAMPLING_NUMERIC_LEN
+        || !input.contains('_')
+        || input.starts_with('_')
+        || input.ends_with('_')
+        || input.contains("__")
     {
         return None;
     }
     // Bound numeric parsing and keep underscore removal on the stack.
-    let mut buf = [0u8; MAX_SAMPLING_NUMERIC_LEN];
-    let mut len = 0;
-    for &b in s.as_bytes() {
-        if b != b'_' {
-            buf[len] = b;
-            len += 1;
+    let mut normalized = [0u8; MAX_SAMPLING_NUMERIC_LEN];
+    let mut length = 0;
+    for &byte in input.as_bytes() {
+        if byte != b'_' {
+            normalized[length] = byte;
+            length += 1;
         }
     }
-    std::str::from_utf8(&buf[..len]).ok()?.parse().ok()
+    std::str::from_utf8(&normalized[..length])
+        .ok()?
+        .parse()
+        .ok()
 }
 
 impl<'de> Deserialize<'de> for SamplingValue {
@@ -164,10 +179,8 @@ impl<'de> Deserialize<'de> for SamplingValue {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<SamplingValue, E> {
-                Ok(
-                    parse_as_engine_number(v)
-                        .map_or(SamplingValue::Unusable, SamplingValue::Number),
-                )
+                Ok(parse_engine_numeric_string(v)
+                    .map_or(SamplingValue::Unusable, SamplingValue::Number))
             }
 
             fn visit_unit<E>(self) -> Result<SamplingValue, E> {
@@ -275,19 +288,19 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
         mut map: M,
     ) -> Result<RoutingFields, M::Error> {
         let mut fields = RoutingFields::default();
-        let mut seen = 0u8;
+        let mut seen_routing_keys = 0u8;
         while let Some(key) = map.next_key::<RequestKey>()? {
             match key {
-                RequestKey::Routing(r) => {
-                    if seen & r.bit() != 0 {
+                RequestKey::Routing(field) => {
+                    if seen_routing_keys & field.bit() != 0 {
                         return Err(serde::de::Error::custom(format_args!(
                             "duplicate field `{}`",
-                            r.wire_name()
+                            field.wire_name()
                         )));
                     }
-                    // Routing duplicates are ambiguous; sampling duplicates below use the last value.
-                    seen |= r.bit();
-                    match r {
+                    // Track keys separately so even a repeated null is rejected.
+                    seen_routing_keys |= field.bit();
+                    match field {
                         RoutingKey::Stream => fields.stream = map.next_value()?,
                         RoutingKey::Model => fields.model = map.next_value()?,
                         RoutingKey::MaxTokens => fields.max_tokens = map.next_value()?,
@@ -297,6 +310,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     }
                 }
                 RequestKey::Sampling(field) => {
+                    // Match the engine's last-value-wins behavior for sampling fields.
                     fields.sampling[field.index()] = if self.read_sampling {
                         map.next_value()?
                     } else {
@@ -305,6 +319,7 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     };
                 }
                 RequestKey::Other => {
+                    // Validate unrelated JSON without retaining its contents.
                     map.next_value::<IgnoredAny>()?;
                 }
             }
@@ -344,17 +359,18 @@ impl RoutingFields {
     }
 }
 
+/// Tokens support engine offload, cache-aware policies, and bucket size checks.
 fn should_tokenize_request(
     has_chat_formatter: bool,
     policy_needs_request_tokens: bool,
-    bucket_enabled: bool,
+    bucket_routing_enabled: bool,
 ) -> bool {
-    has_chat_formatter || policy_needs_request_tokens || bucket_enabled
+    has_chat_formatter || policy_needs_request_tokens || bucket_routing_enabled
 }
 
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     // Never 0: a zero-load entry is invisible to the cache-aware imbalance fast path.
-    (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
+    (body.len() / BYTES_PER_TOKEN_ESTIMATE).max(1)
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
@@ -369,7 +385,10 @@ pub(crate) struct BootstrapFields {
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
-fn splice_top_level(body: &Bytes, members: &[(SamplingField, Number)]) -> Option<Bytes> {
+fn append_sampling_defaults(
+    body: &Bytes,
+    sampling_defaults: &[(SamplingField, Number)],
+) -> Option<Bytes> {
     use std::io::Write as _;
 
     let open = body.iter().position(|&b| b == b'{')?;
@@ -380,66 +399,67 @@ fn splice_top_level(body: &Bytes, members: &[(SamplingField, Number)]) -> Option
     let has_members = body[open + 1..close]
         .iter()
         .any(|b| !b.is_ascii_whitespace());
-    let mut out = Vec::with_capacity(body.len() + 24 * members.len() + 1);
-    out.extend_from_slice(&body[..close]);
-    for (i, (field, value)) in members.iter().enumerate() {
+    let mut output = Vec::with_capacity(body.len() + 24 * sampling_defaults.len() + 1);
+    output.extend_from_slice(&body[..close]);
+    for (i, (field, value)) in sampling_defaults.iter().enumerate() {
         if has_members || i > 0 {
-            out.push(b',');
+            output.push(b',');
         }
-        write!(out, "\"{}\":{}", field.wire_name(), value).ok()?;
+        write!(output, "\"{}\":{}", field.wire_name(), value).ok()?;
     }
-    out.extend_from_slice(&body[close..]);
-    Some(Bytes::from(out))
+    output.extend_from_slice(&body[close..]);
+    Some(Bytes::from(output))
 }
 
-/// Reuse the parsed body when injecting tokens or bootstrap fields; splice sampling alone.
+/// Preserve original bytes where possible; reuse parsed JSON for token or bootstrap injection.
 fn build_outgoing_body(
     body: &Bytes,
-    value: Option<Value>,
+    parsed_body: Option<Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
-    sampling: &[(SamplingField, Number)],
+    sampling_defaults: &[(SamplingField, Number)],
 ) -> Result<Bytes, ApiError> {
-    let only_sampling = input_ids.is_none() && bootstrap.is_none();
-    if only_sampling && sampling.is_empty() {
+    let sampling_only = input_ids.is_none() && bootstrap.is_none();
+    if sampling_only && sampling_defaults.is_empty() {
+        // Cloning Bytes shares the original allocation when no injection is needed.
         return Ok(body.clone());
     }
-    if only_sampling {
-        if let Some(spliced) = splice_top_level(body, sampling) {
+    if sampling_only {
+        if let Some(spliced) = append_sampling_defaults(body, sampling_defaults) {
             return Ok(spliced);
         }
     }
-    let parsed = match value {
-        Some(v) => v,
+    let parsed = match parsed_body {
+        Some(cached_body) => cached_body,
         None => serde_json::from_slice(body).map_err(|_| invalid_request())?,
     };
-    let mut obj = match parsed {
+    let mut body_fields = match parsed {
         Value::Object(map) => map,
         _ => {
             return Err(invalid_request());
         }
     };
-    for (field, value) in sampling {
-        obj.insert(field.wire_name().into(), value.clone().into());
+    for (field, default) in sampling_defaults {
+        body_fields.insert(field.wire_name().into(), default.clone().into());
     }
-    if let Some(ids) = input_ids {
-        obj.insert("input_ids".into(), json!(ids));
+    if let Some(token_ids) = input_ids {
+        body_fields.insert("input_ids".into(), json!(token_ids));
     }
-    if let Some(b) = bootstrap {
-        obj.insert("bootstrap_host".into(), json!(b.host));
+    if let Some(bootstrap) = bootstrap {
+        body_fields.insert("bootstrap_host".into(), json!(bootstrap.host));
         // A missing port must be JSON null, not omitted; the engine's validator distinguishes them.
-        obj.insert("bootstrap_port".into(), json!(b.port));
-        obj.insert("bootstrap_room".into(), json!(b.room));
+        body_fields.insert("bootstrap_port".into(), json!(bootstrap.port));
+        body_fields.insert("bootstrap_room".into(), json!(bootstrap.room));
     }
-    let bytes = serde_json::to_vec(&obj).map_err(|e| {
+    let bytes = serde_json::to_vec(&body_fields).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize injected request body"))
     })?;
     Ok(Bytes::from(bytes))
 }
 
 /// Only forward tokens when the router replicated all template inputs.
-fn input_ids_safe_to_forward(value: &Value) -> bool {
-    if request_has_tools(value) || request_has_non_text_content(value) {
+fn can_forward_chat_tokens(request_body: &Value) -> bool {
+    if request_has_tools(request_body) || request_has_non_text_content(request_body) {
         return false;
     }
     // chat_template is blocked even though SGLang ignores it, so the offload stays correct on other engines.
@@ -450,41 +470,46 @@ fn input_ids_safe_to_forward(value: &Value) -> bool {
         "reasoning_effort",
         "task",
     ] {
-        if value.get(key).is_some_and(|v| !v.is_null()) {
+        if request_body.get(key).is_some_and(|v| !v.is_null()) {
             return false;
         }
     }
-    if value.get("continue_final_message").and_then(Value::as_bool) == Some(true) {
+    if request_body
+        .get("continue_final_message")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
         return false;
     }
-    !last_message_is_assistant(value)
+    !last_message_is_assistant(request_body)
 }
 
-fn ingress_tokenize_offload_failed(
+/// Count a failure only when a supported chat should have produced rendered tokens.
+fn chat_tokenization_failed(
     has_chat_formatter: bool,
-    request_value: Option<&Value>,
-    request_tokens: Option<&RequestTokens>,
+    parsed_body: Option<&Value>,
+    tokens: Option<&RequestTokens>,
 ) -> bool {
     has_chat_formatter
-        && request_value.is_some_and(|v| {
-            v.get("messages").is_some_and(Value::is_array) && input_ids_safe_to_forward(v)
+        && parsed_body.is_some_and(|v| {
+            v.get("messages").is_some_and(Value::is_array) && can_forward_chat_tokens(v)
         })
-        && !request_tokens.is_some_and(|t| t.rendered_from_chat)
+        && !tokens.is_some_and(|t| t.rendered_from_chat)
 }
 
-fn last_message_is_assistant(value: &Value) -> bool {
-    value
+fn last_message_is_assistant(request_body: &Value) -> bool {
+    request_body
         .get("messages")
         .and_then(Value::as_array)
-        .and_then(|msgs| msgs.last())
-        .and_then(|m| m.get("role"))
+        .and_then(|messages| messages.last())
+        .and_then(|message| message.get("role"))
         .and_then(Value::as_str)
         == Some("assistant")
 }
 
-fn request_has_tools(value: &Value) -> bool {
+fn request_has_tools(request_body: &Value) -> bool {
     let nonempty = |key: &str| {
-        value.get(key).is_some_and(|v| match v {
+        request_body.get(key).is_some_and(|v| match v {
             Value::Array(a) => !a.is_empty(),
             Value::Null => false,
             _ => true,
@@ -493,36 +518,38 @@ fn request_has_tools(value: &Value) -> bool {
     nonempty("tools") || nonempty("functions")
 }
 
-fn request_has_non_text_content(value: &Value) -> bool {
-    value
+fn request_has_non_text_content(request_body: &Value) -> bool {
+    request_body
         .get("messages")
         .and_then(Value::as_array)
-        .is_some_and(|msgs| {
-            msgs.iter()
-                .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| !matches!(message.get("content"), Some(Value::String(_))))
         })
 }
 
-fn apply_sampling_overrides(
+/// Validate supplied values and return exact defaults for missing or null parameters.
+fn resolve_sampling_defaults(
     overrides: &SamplingOverrides,
     fields: &RoutingFields,
     metrics: &MetricsRegistry,
 ) -> Result<Vec<(SamplingField, Number)>, ApiError> {
-    let mut inject = Vec::with_capacity(overrides.params.len());
+    let mut defaults = Vec::with_capacity(overrides.params.len());
     // Count every violated parameter, but report only the first to the client.
     let mut first_violation: Option<ApiError> = None;
     for (&field, spec) in &overrides.params {
-        let got = fields.sampling_field(field);
-        if got == SamplingValue::Absent {
+        let provided = fields.sampling_field(field);
+        if provided == SamplingValue::Absent {
             if let ParamSpec::Exact(value) = spec {
-                inject.push((field, value.clone()));
+                defaults.push((field, value.clone()));
             }
             continue;
         }
         if overrides.conflict == ConflictPolicy::Allow {
             continue;
         }
-        if let Some(detail) = sampling_violation(spec, got) {
+        if let Some(detail) = sampling_violation(spec, provided) {
             let param = field.wire_name();
             metrics.record_sampling_contract_rejection(param);
             first_violation.get_or_insert(ApiError::SamplingContract { param, detail });
@@ -530,23 +557,29 @@ fn apply_sampling_overrides(
     }
     match first_violation {
         Some(err) => Err(err),
-        None => Ok(inject),
+        None => Ok(defaults),
     }
 }
 
-fn sampling_violation(spec: &ParamSpec, got: SamplingValue) -> Option<String> {
-    match (spec, got) {
-        (ParamSpec::Exact(want), SamplingValue::Unusable) => Some(format!(
-            "expected {want} (or omit the field), got a non-numeric value"
+fn sampling_violation(spec: &ParamSpec, provided: SamplingValue) -> Option<String> {
+    match (spec, provided) {
+        (ParamSpec::Exact(expected), SamplingValue::Unusable) => Some(format!(
+            "expected {expected} (or omit the field), got a non-numeric value"
         )),
         (ParamSpec::Range { lo, hi }, SamplingValue::Unusable) => Some(format!(
             "must be a number between {lo} and {hi}, got a non-numeric value"
         )),
-        (ParamSpec::Exact(want), SamplingValue::Number(got)) if Some(got) != want.as_f64() => {
-            Some(format!("got {got}, expected {want} (or omit the field)"))
+        (ParamSpec::Exact(expected), SamplingValue::Number(provided))
+            if Some(provided) != expected.as_f64() =>
+        {
+            Some(format!(
+                "got {provided}, expected {expected} (or omit the field)"
+            ))
         }
-        (&ParamSpec::Range { lo, hi }, SamplingValue::Number(got)) if !(lo..=hi).contains(&got) => {
-            Some(format!("must be between {lo} and {hi}, got {got}"))
+        (&ParamSpec::Range { lo, hi }, SamplingValue::Number(provided))
+            if !(lo..=hi).contains(&provided) =>
+        {
+            Some(format!("must be between {lo} and {hi}, got {provided}"))
         }
         _ => None,
     }
@@ -557,6 +590,7 @@ pub(crate) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiErr
         Ok(fields) => return Ok(fields),
         Err(e) => e,
     };
+    // Retry without numeric conversion so sampling rules can handle values such as 1e400.
     if let Ok(fields) = parse_without_sampling_values(body) {
         return Ok(fields);
     }
@@ -674,14 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn input_ids_safe_to_forward_allows_plain_text_chat() {
-        assert!(input_ids_safe_to_forward(&json!({
+    fn can_forward_chat_tokens_allows_plain_text_chat() {
+        assert!(can_forward_chat_tokens(&json!({
             "messages": [{"role": "user", "content": "hello"}]
         })));
     }
 
     #[test]
-    fn input_ids_safe_to_forward_blocks_unreplicated_signals() {
+    fn can_forward_chat_tokens_blocks_unreplicated_signals() {
         let blockers = [
             json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
@@ -695,15 +729,15 @@ mod tests {
         ];
         for b in blockers {
             assert!(
-                !input_ids_safe_to_forward(&b),
+                !can_forward_chat_tokens(&b),
                 "must NOT forward input_ids for: {b}"
             );
         }
     }
 
     #[test]
-    fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
-        assert!(input_ids_safe_to_forward(&json!({
+    fn can_forward_chat_tokens_ignores_null_and_false_fields() {
+        assert!(can_forward_chat_tokens(&json!({
             "messages": [{"role": "user", "content": "hi"}],
             "chat_template": null,
             "reasoning_effort": null,
@@ -731,7 +765,7 @@ mod tests {
                 rendered_from_chat,
             });
             assert_eq!(
-                ingress_tokenize_offload_failed(formatter, value, tokens.as_ref()),
+                chat_tokenization_failed(formatter, value, tokens.as_ref()),
                 failed,
                 "formatter={formatter}, request={value:?}, rendered={rendered:?}"
             );
@@ -815,7 +849,7 @@ mod tests {
         let overrides = SamplingOverrides::default();
         let p = fields_of(r#"{"model":"x","temperature":0.7,"n":4}"#);
         assert_eq!(
-            apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
+            resolve_sampling_defaults(&overrides, &p, &metrics()).unwrap(),
             vec![]
         );
     }
@@ -830,7 +864,7 @@ mod tests {
 
     #[test]
     fn reject_mode_injects_missing_exact_values_but_not_ranges() {
-        let inject = apply_sampling_overrides(
+        let inject = resolve_sampling_defaults(
             &reject_overrides(),
             &fields_of(r#"{"model":"x","messages":[]}"#),
             &metrics(),
@@ -874,7 +908,7 @@ mod tests {
             ("n", "2", false),
         ] {
             let body = format!(r#"{{"model":"x","{field}":{value}}}"#);
-            let result = apply_sampling_overrides(&overrides, &fields_of(&body), &metrics());
+            let result = resolve_sampling_defaults(&overrides, &fields_of(&body), &metrics());
             if accepted {
                 let inject = result.unwrap_or_else(|error| panic!("{body}: {error:?}"));
                 assert!(
@@ -894,9 +928,9 @@ mod tests {
     fn exact_temperature_rejects_conflicts_and_injects_when_absent() {
         let exact = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
         let p = fields_of(r#"{"model":"x","temperature":0.6}"#);
-        assert!(apply_sampling_overrides(&exact, &p, &metrics()).is_err());
+        assert!(resolve_sampling_defaults(&exact, &p, &metrics()).is_err());
         assert_eq!(
-            apply_sampling_overrides(&exact, &fields_of(r#"{"model":"x"}"#), &metrics()).unwrap(),
+            resolve_sampling_defaults(&exact, &fields_of(r#"{"model":"x"}"#), &metrics()).unwrap(),
             vec![(SamplingField::Temperature, Number::from_f64(1.0).unwrap())]
         );
     }
@@ -918,7 +952,7 @@ mod tests {
             (r#"{"temperature":"abc","top_p":[1],"n":1}"#, vec![]),
         ] {
             let inject =
-                apply_sampling_overrides(&overrides, &fields_of(body), &metrics()).unwrap();
+                resolve_sampling_defaults(&overrides, &fields_of(body), &metrics()).unwrap();
             assert_eq!(
                 inject
                     .iter()
@@ -938,7 +972,7 @@ mod tests {
             ConflictPolicy::Reject,
             r#"{"top_p":0.95,"top_k":1000,"frequency_penalty":0.0,"presence_penalty":0.0,"n":1}"#,
         );
-        let inject = apply_sampling_overrides(
+        let inject = resolve_sampling_defaults(
             &overrides,
             &parse_routing_fields(&body).unwrap(),
             &metrics(),
@@ -960,10 +994,10 @@ mod tests {
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
 
         let p = fields_of(r#"{"model":"x","temperature":0.5,"temperature":1}"#);
-        assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
+        assert!(resolve_sampling_defaults(&overrides, &p, &metrics()).is_ok());
 
         let p = fields_of(r#"{"model":"x","temperature":1,"temperature":0.5}"#);
-        let err = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap_err();
+        let err = resolve_sampling_defaults(&overrides, &p, &metrics()).unwrap_err();
         assert!(
             format!("{err}").contains("got 0.5"),
             "must judge the last value; got {err}"
@@ -1001,11 +1035,11 @@ mod tests {
                 "a non-numeric value must collapse to Unusable"
             );
             let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
-            let inject = apply_sampling_overrides(&allow, &fields, &metrics()).unwrap();
+            let inject = resolve_sampling_defaults(&allow, &fields, &metrics()).unwrap();
             assert!(inject.is_empty(), "must not inject over a client value");
             let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
             assert!(
-                apply_sampling_overrides(&reject, &fields, &metrics()).is_err(),
+                resolve_sampling_defaults(&reject, &fields, &metrics()).is_err(),
                 "reject must refuse a value it cannot read as a number"
             );
         }
@@ -1035,7 +1069,7 @@ mod tests {
         let metrics = metrics();
         let p = fields_of(r#"{"model":"x","top_p":0.5}"#);
 
-        let err = apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        let err = resolve_sampling_defaults(&overrides, &p, &metrics).unwrap_err();
         let ApiError::SamplingContract { param, .. } = &err else {
             panic!("expected SamplingContract, got {err:?}");
         };
@@ -1043,7 +1077,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("top_p") && msg.contains("0.5"), "got {msg}");
 
-        apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
+        resolve_sampling_defaults(&overrides, &p, &metrics).unwrap_err();
         assert_rejections(&metrics, "top_p", 2);
     }
 
@@ -1073,7 +1107,7 @@ mod tests {
             ),
         ] {
             let body = Bytes::copy_from_slice(raw.as_bytes());
-            let inject = apply_sampling_overrides(&config, &fields_of(raw), &metrics()).unwrap();
+            let inject = resolve_sampling_defaults(&config, &fields_of(raw), &metrics()).unwrap();
             assert_eq!(inject.len(), 2);
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
                 let out = build_outgoing_body(&body, value, None, None, &inject).unwrap();
@@ -1097,7 +1131,7 @@ mod tests {
 
             let pinned_elsewhere = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 2}"#);
             assert!(
-                apply_sampling_overrides(&pinned_elsewhere, &fields, &metrics()).is_err(),
+                resolve_sampling_defaults(&pinned_elsewhere, &fields, &metrics()).is_err(),
                 "{body_value} differs from the pin and must be rejected"
             );
 
@@ -1106,7 +1140,7 @@ mod tests {
                 &format!(r#"{{"temperature": {engine_sees}}}"#),
             );
             assert!(
-                apply_sampling_overrides(&pinned_here, &fields, &metrics()).is_ok(),
+                resolve_sampling_defaults(&pinned_here, &fields, &metrics()).is_ok(),
                 "{body_value} IS the pinned value to the engine, so it must pass"
             );
         }
@@ -1182,10 +1216,10 @@ mod tests {
             ("1e400", Some(f64::INFINITY)),
         ];
         for &(input, want) in cases {
-            let got = parse_as_engine_number(input);
+            let got = parse_engine_numeric_string(input);
             match (got, want) {
                 (Some(g), Some(w)) if g.is_nan() && w.is_nan() => {}
-                _ => assert_eq!(got, want, "parse_as_engine_number({input:?})"),
+                _ => assert_eq!(got, want, "parse_engine_numeric_string({input:?})"),
             }
         }
     }
@@ -1194,11 +1228,11 @@ mod tests {
     fn overlong_numeric_string_is_not_normalized_and_is_refused() {
         let long = format!("1{}", "_0".repeat(MAX_SAMPLING_NUMERIC_LEN));
         assert!(long.len() > MAX_SAMPLING_NUMERIC_LEN);
-        assert_eq!(parse_as_engine_number(&long), None);
+        assert_eq!(parse_engine_numeric_string(&long), None);
 
         let fields = fields_of(&format!(r#"{{"model":"x","temperature":"{long}"}}"#));
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&overrides, &fields, &metrics()).is_err());
+        assert!(resolve_sampling_defaults(&overrides, &fields, &metrics()).is_err());
     }
 
     #[test]
@@ -1219,7 +1253,7 @@ mod tests {
             let metrics = metrics();
             let fields = fields_of(body);
 
-            let err = apply_sampling_overrides(&overrides, &fields, &metrics).unwrap_err();
+            let err = resolve_sampling_defaults(&overrides, &fields, &metrics).unwrap_err();
             match &err {
                 ApiError::SamplingContract { param, detail } => {
                     assert_eq!(*param, "temperature");
@@ -1251,11 +1285,11 @@ mod tests {
             SamplingValue::Unusable
         );
         let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&allow, &fields, &metrics())
+        assert!(resolve_sampling_defaults(&allow, &fields, &metrics())
             .unwrap()
             .is_empty());
         let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&reject, &fields, &metrics()).is_err());
+        assert!(resolve_sampling_defaults(&reject, &fields, &metrics()).is_err());
 
         for bad in [
             r#"{"model":"x","stream":true,"stream":false}"#,
@@ -1279,7 +1313,7 @@ mod tests {
         let metrics = metrics();
         let fields = fields_of(r#"{"model":"x","temperature":0.7,"top_p":0.8,"n":2}"#);
 
-        let err = apply_sampling_overrides(&overrides, &fields, &metrics).unwrap_err();
+        let err = resolve_sampling_defaults(&overrides, &fields, &metrics).unwrap_err();
         let ApiError::SamplingContract { param, .. } = &err else {
             panic!("expected SamplingContract, got {err:?}");
         };
@@ -1293,9 +1327,9 @@ mod tests {
     #[test]
     fn overlong_plain_numeric_string_is_not_parsed() {
         let long = "1".repeat(MAX_SAMPLING_NUMERIC_LEN + 1);
-        assert_eq!(parse_as_engine_number(&long), None);
+        assert_eq!(parse_engine_numeric_string(&long), None);
         assert_eq!(
-            parse_as_engine_number(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
+            parse_engine_numeric_string(&"1".repeat(MAX_SAMPLING_NUMERIC_LEN)),
             "1".repeat(MAX_SAMPLING_NUMERIC_LEN).parse::<f64>().ok(),
             "a value at the cap is still read"
         );
