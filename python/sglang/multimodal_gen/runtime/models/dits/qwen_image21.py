@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -84,17 +85,14 @@ def apply_rope(x, rope):
     return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
 
 
-class QwenImage21RMSNorm(nn.Module):
-    def __init__(self, dim, eps, zero_centered=False):
+class QwenImage21ZeroCenterRMSNorm(nn.Module):
+    def __init__(self, dim, eps):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.zeros(dim) if zero_centered else torch.ones(dim)
-        )
+        self.weight = nn.Parameter(torch.zeros(dim))
         self.eps = eps
-        self.zero_centered = zero_centered
 
     def forward(self, x):
-        scale = self.weight.float() + int(self.zero_centered)
+        scale = self.weight.float() + 1
         value = x.float()
         return (
             value
@@ -106,7 +104,7 @@ class QwenImage21RMSNorm(nn.Module):
 class QwenImage21TextProjection(nn.Module):
     def __init__(self, context_dim, dim, eps):
         super().__init__()
-        self.text_norm = QwenImage21RMSNorm(context_dim, eps, zero_centered=True)
+        self.text_norm = QwenImage21ZeroCenterRMSNorm(context_dim, eps)
         self.in_layer = nn.Linear(context_dim, dim, bias=False)
         self.out_layer = nn.Linear(dim, dim, bias=False)
 
@@ -189,8 +187,12 @@ class QwenImage21Attention(nn.Module):
                 )
             ]
         )
-        self.norm_q = QwenImage21RMSNorm(self.head_dim, ac.eps)
-        self.norm_k = QwenImage21RMSNorm(self.head_dim, ac.eps)
+        self.norm_q = RMSNorm(
+            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
+        )
+        self.norm_k = RMSNorm(
+            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
+        )
         backends = QwenImage21Transformer2DModel._supported_attention_backends
         self.local_attn = LocalAttention(
             self.heads, self.head_dim, supported_attention_backends=backends

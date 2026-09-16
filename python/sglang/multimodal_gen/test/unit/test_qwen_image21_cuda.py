@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
+from copy import deepcopy
+
 import pytest
 import torch
+from diffusers.models.normalization import RMSNorm as ReferenceRMSNorm
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
@@ -77,6 +80,17 @@ def inputs(seed, edit):
         prefix_caches=[[{} for _ in range(3)]],
         timestep=torch.tensor([700.0], device="cuda"),
     )
+
+
+def test_bf16_qk_norm_matches_reference(model):
+    norm = deepcopy(model.transformer_blocks[0].attn.norm_q).bfloat16()
+    reference = ReferenceRMSNorm(32, eps=1e-6).cuda().bfloat16()
+    weight = torch.linspace(0.3, 1.7, 32, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 8, 4, 32, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(weight)
+        reference.weight.copy_(weight)
+        torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("edit", [False, True])
