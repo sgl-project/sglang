@@ -1890,6 +1890,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return None
+        # A recompute after L2 eviction re-creates the node with backuped=False, so the
+        # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
+        if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2607,8 +2611,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Drop KV beliefs beyond the folded usable cut (rank-synced): the
         next insert then re-writes the node (all pools), healing stale
         positives and aux holes at the cut through one FULL check."""
-        if self.host_memory_mode != "buffer_only":
-            return
+        # Both host-memory modes keep write-side beliefs now (cache mode dedups
+        # in write_backup_storage), so both must heal them here.
         chain = operation.all_hash_values
         if chain is None:
             return
@@ -3019,6 +3023,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
                     self._write_behind_inflight.pop(operation.id, None)
+                    # Added unconditionally: completed_tokens can diverge across ranks on
+                    # backend failure and a divergent belief desyncs the rank collectives.
+                    if operation.hash_value:
+                        self.storage_existence_cache.add(
+                            PoolName.KV, operation.hash_value
+                        )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
