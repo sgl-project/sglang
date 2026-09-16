@@ -66,7 +66,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    torch_w8a8_block_fp8_linear,
     unshuffle_aiter_fp8_weight,
+    use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -798,6 +800,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
 
+        if (
+            is_xpu()
+            and self.w8a8_block_fp8_linear is torch_w8a8_block_fp8_linear
+            and self.weight_block_size in ([1, 128], [128, 128])
+            and layer.weight_scale_inv.ndim == 2
+        ):
+            # Keep the checkpoint's logical [N-blocks, K-blocks] shape, but use
+            # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+            # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+            # This avoids a per-forward contiguous/copy in either path.
+            scale = layer.weight_scale_inv.data
+            scale_b_is_contiguous = scale.t().is_contiguous()
+            if not scale_b_is_contiguous:
+                scale_reordered = torch.empty_strided(
+                    scale.shape,
+                    (1, scale.shape[0]),
+                    dtype=scale.dtype,
+                    device=scale.device,
+                )
+                scale_reordered.copy_(scale)
+                with torch.no_grad():
+                    layer.weight_scale_inv.set_(scale_reordered)
+
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
             return
@@ -934,7 +959,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
                         self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(qweight.shape[0]):
+                            qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
@@ -990,7 +1016,8 @@ class Fp8LinearMethod(LinearMethodBase):
                                 weight=weight,
                                 weight_scale=weight_scale,
                             )
-                        weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        if use_aiter_bpreshuffle_gemm(weight.shape[0]):
+                            weight = shuffle_weight(weight.contiguous(), (16, 16))
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -1028,6 +1055,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
+
+            if _is_cpu:
+                assert _is_cpu_amx_available, (
+                    "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                )
+                layer.weight = Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+                return
 
         if self.use_marlin:
             if self.block_quant:
@@ -1113,6 +1150,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
             )
+
+        if use_intel_amx_backend(layer):
+            output = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,  # is_vnni
+            )
+            return output.view(*x.shape[:-1], layer.weight.shape[0])
 
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
@@ -2502,6 +2550,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
+            moe_runner_backend.is_flashinfer_cutlass()
+            or moe_runner_backend.is_flashinfer_cutedsl()
+        ):
+            # Neither runner has an fp8 MoE path; they get pinned globally for
+            # NVFP4 experts on sm120, so run this layer's fp8 experts on triton.
+            logger.info(
+                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
+                moe_runner_backend.name,
+            )
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()

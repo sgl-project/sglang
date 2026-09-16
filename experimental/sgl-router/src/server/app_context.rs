@@ -6,10 +6,11 @@ use crate::config::Config;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
 use crate::policies::engine_load::EngineLoadTable;
-use crate::policies::kv_events::BlockSizeOracle;
+use crate::policies::kv_events::{BlockSizeOracle, KvIndexMetrics};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -36,6 +37,14 @@ pub struct AppContext {
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Read-only handles `/metrics` pulls the KV storage-tier series from on
+    /// scrape. `None` when this router maintains no local tree (external
+    /// Indexer), where those series would all be a structural zero — see
+    /// [`crate::policies::kv_events::KvEventIndex::metrics_source`].
+    pub kv_metrics: Option<KvIndexMetrics>,
+    /// Open HTTP exchanges, on every route. What axum's graceful shutdown
+    /// waits on — `active_load` sees only the proxied subset.
+    pub inflight_http: Arc<InflightHttp>,
     ready: AtomicBool,
 }
 
@@ -91,7 +100,9 @@ impl AppContext {
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
             engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -127,6 +138,7 @@ impl AppContext {
                     affinity: None,
                     fused: None,
                     eligibility: None,
+                    sampling_overrides: Default::default(),
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
@@ -146,7 +158,9 @@ impl AppContext {
             prefix_index: None,
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
             engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }

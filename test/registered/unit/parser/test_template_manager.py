@@ -136,6 +136,13 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
                     "glm47",
                 )
 
+    def test_glm53_effort_template_forces_reasoning(self):
+        vocab = ["<tool_call>", "<arg_key>", "<arg_value>", "<|user|>", "<|endoftext|>"]
+        force, config, _ = self._detect(_glm53_template("+"), vocab)
+
+        self.assertTrue(force)
+        self.assertEqual(config, ReasoningToggleConfig(special_case="always"))
+
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
         {% set default_thinking_sys %}...<think>...</think>{% endset %}
