@@ -918,7 +918,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
-                if self.enable_overlap and not req.pending_bootstrap:
+                if (
+                    self.enable_overlap
+                    and not req.pending_bootstrap
+                    and not self.server_args.disaggregation_defer_partial_kv_transfer
+                ):
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
@@ -1224,7 +1228,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif not self.server_args.disaggregation_defer_partial_kv_transfer:
                 self.send_kv_chunk(req)
 
         if self.chunked_req is not None or self.chunked_reqs:

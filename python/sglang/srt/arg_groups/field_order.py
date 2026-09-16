@@ -430,6 +430,7 @@ POSITIONAL_FIELD_ORDER = (
     "dllm_fdfo",
     "disaggregation_mode",
     "disaggregation_transfer_backend",
+    "disaggregation_defer_partial_kv_transfer",
     "disaggregation_bootstrap_port",
     "disaggregation_ib_device",
     "disaggregation_decode_enable_radix_cache",

@@ -136,6 +136,17 @@ def check_server_args(server_args: Any):
             "chunked_prefill_size must be divisible by page_size"
         )
 
+    if cfg.prefill_chunk_size_per_request is not None:
+        assert cfg.prefill_chunk_size_per_request > 0, (
+            "prefill_chunk_size_per_request must be positive"
+        )
+        assert cfg.chunked_prefill_size > 0, (
+            "prefill_chunk_size_per_request requires chunked prefill"
+        )
+        assert cfg.prefill_chunk_size_per_request % cfg.page_size == 0, (
+            "prefill_chunk_size_per_request must be divisible by page_size"
+        )
+
     # Check pdmux
     if cfg.enable_pdmux:
         assert cfg.pp_size == 1, (
