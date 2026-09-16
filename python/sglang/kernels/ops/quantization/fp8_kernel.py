@@ -1030,6 +1030,109 @@ def _w8a8_block_fp8_matmul(
 
 
 @triton.jit
+def _w8a8_block_fp8_matmul_k_groups(
+    # Pointers to inputs and output
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    # Shape for matmul
+    M,
+    N,
+    K,
+    # Block size for block-wise quantization
+    group_n,
+    group_k: tl.constexpr,
+    # Stride for inputs and output
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_As_m,
+    stride_As_k,
+    stride_Bs_k,
+    stride_Bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    needs_masking: tl.constexpr,
+):
+    """CUDA FP8 matmul with multiple separately scaled K groups per iteration."""
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+    As_ptrs = As + offs_am * stride_As_m
+    offs_bsn = offs_bn // group_n
+    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+
+    # Unroll whole groups, keeping each dot within one scale group.
+    SUB_K: tl.constexpr = group_k
+    SCALE_SPLIT: tl.constexpr = BLOCK_SIZE_K // SUB_K
+    offs_sk = tl.arange(0, SUB_K)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # BLOCK_SIZE_K > group_k: one K tile spans multiple quantization
+        # groups; advance the scale pointers per group and accumulate a
+        # sub-dot per group so every column block gets its own scale.
+        ka = k * BLOCK_SIZE_K + offs_sk
+        a_base = A + offs_am[:, None] * stride_am + ka[None, :] * stride_ak
+        b_base = B + ka[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        for sub in tl.static_range(SCALE_SPLIT):
+            if needs_masking:
+                kmask = (k * BLOCK_SIZE_K + sub * SUB_K + offs_sk) < K
+                a = tl.load(
+                    a_base + sub * SUB_K * stride_ak, mask=kmask[None, :], other=0.0
+                )
+                b = tl.load(
+                    b_base + sub * SUB_K * stride_bk, mask=kmask[:, None], other=0.0
+                )
+                # A K tile may overrun the last quantization group: invalid
+                # groups get a neutral scale and the masked loads above
+                # contribute nothing (0 * 1.0), never an out-of-bounds read.
+                svalid = (k * BLOCK_SIZE_K + sub * SUB_K) < K
+                a_s = tl.load(As_ptrs, mask=(offs_am >= 0) & svalid, other=1.0)
+                b_s = tl.load(Bs_ptrs, mask=(offs_bn >= 0) & svalid, other=1.0)
+            else:
+                a = tl.load(a_base + sub * SUB_K * stride_ak)
+                b = tl.load(b_base + sub * SUB_K * stride_bk)
+                a_s = tl.load(As_ptrs)
+                b_s = tl.load(Bs_ptrs)
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+            As_ptrs += stride_As_k
+            Bs_ptrs += stride_Bs_k
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
 def _w8a8_block_fp8_matmul_gfx1250(
     # Pointers to inputs and output
     A,
@@ -1309,6 +1412,23 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+def _validate_w8a8_block_fp8_config(block_k: int, config: Dict[str, Any]) -> None:
+    tile_k = config["BLOCK_SIZE_K"]
+    if block_k > 0 and tile_k > 0:
+        if block_k % tile_k == 0:
+            return
+        if (
+            _is_cuda
+            and block_k in (32, 64, 128)
+            and tile_k in (64, 128, 256)
+            and tile_k % block_k == 0
+        ):
+            return
+    raise ValueError(
+        f"Unsupported generic block-FP8 tile: BLOCK_SIZE_K={tile_k}, group_k={block_k}."
+    )
+
+
 @functools.lru_cache
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
@@ -1346,6 +1466,11 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
+            if cfg["BLOCK_SIZE_K"] <= 0:
+                raise ValueError(
+                    f"BLOCK_SIZE_K must be positive in {json_file_name} "
+                    f"at M={m_key}; got {cfg['BLOCK_SIZE_K']}."
+                )
             if cfg["BLOCK_SIZE_K"] < block_k and (
                 not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
             ):
@@ -1355,7 +1480,7 @@ def get_w8a8_block_fp8_configs(
         if clamped_ms:
             logger.warning(
                 "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
-                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
+                "(the smaller tile did not meet this platform's config constraints).",
                 block_k,
                 json_file_name,
                 clamped_ms,
@@ -1546,6 +1671,11 @@ def w8a8_block_fp8_matmul_triton(
     It takes two input tensors `A` and `B` with scales `As` and `Bs`.
     The output is returned in the specified `output_dtype`.
 
+    On CUDA, custom generic-kernel configs may unroll K groups using
+    BLOCK_SIZE_K in {64, 128, 256} that is a multiple of group_k in
+    {32, 64, 128}. This path requires FP32 scale storage. Each dot still
+    uses one group's scales; default configs keep one group per tile.
+
     Args:
         A: The input tensor, e.g., activation.
         B: The input tensor, e.g., weight.
@@ -1566,10 +1696,17 @@ def w8a8_block_fp8_matmul_triton(
     if configs:
         # If an optimal configuration map has been found, look up the
         # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        # Keep insertion-order tie breaking while allowing torch.compile to
+        # trace the selection (Dynamo does not support min(..., key=...)).
+        best_distance = float("inf")
+        for batch_size, candidate_config in configs.items():
+            distance = abs(batch_size - M)
+            if distance < best_distance:
+                config = candidate_config
+                best_distance = distance
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        # Default to one quantization group per K tile.
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_size[0],
@@ -1584,6 +1721,13 @@ def w8a8_block_fp8_matmul_triton(
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+
+    if kernel is _w8a8_block_fp8_matmul:
+        _validate_w8a8_block_fp8_config(block_k, config)
+        if config["BLOCK_SIZE_K"] > block_k:
+            if As.dtype != torch.float32 or Bs.dtype != torch.float32:
+                raise ValueError("Split-group FP8 tiles require FP32 scale storage.")
+            kernel = _w8a8_block_fp8_matmul_k_groups
 
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
