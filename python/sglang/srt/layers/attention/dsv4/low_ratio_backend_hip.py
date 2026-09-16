@@ -780,7 +780,14 @@ def store_index_k_norm_rope_split(pool, layer, latent, pos, out_loc, freqs_cis) 
 
 
 def low_ratio_index_topk_hip_extend(
-    backend, layer, x, q_lora, pos, forward_batch: ForwardBatch
+    backend,
+    layer,
+    x,
+    q_lora,
+    pos,
+    forward_batch: ForwardBatch,
+    *,
+    query_lens_cpu: Optional[List[int]] = None,
 ) -> None:
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
     candidate masks are published or applied per request, one paged top-k selects every row.
@@ -797,18 +804,18 @@ def low_ratio_index_topk_hip_extend(
         raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
-    # under decoder SWA bounded replay the late layers score each request's tail rows only
-    tail = metadata.late_layer_tail
-    extend_lens_cpu = (
-        tail.extend_seq_lens_cpu
-        if tail is not None
-        else _as_int_list(forward_batch.extend_seq_lens_cpu)
-    )
+    # CP counts are local; bounded replay counts cover only each request's tail.
+    if query_lens_cpu is not None:
+        extend_lens_cpu = query_lens_cpu
+    elif metadata.late_layer_tail is not None:
+        extend_lens_cpu = metadata.late_layer_tail.extend_seq_lens_cpu
+    else:
+        extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
     assert seq_lens_cpu is not None and extend_lens_cpu is not None
     lc_per_req = [s // ratio for s in seq_lens_cpu]
-    if not any(lc_per_req):
+    if pos.numel() == 0 or not any(lc_per_req):
         if indexer.is_candidate_source:
-            backend.candidate_masks = []
+            backend.candidate_masks = [None] * len(lc_per_req)
         return
 
     if backend.low_ratio_identity_skip:
