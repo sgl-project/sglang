@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::request::{generate_room_id, BootstrapFields, ChatRequest};
-use super::routing::SelectedWorkers;
+//! Plain and PD chat forwarding, including load tracking and streaming metrics.
+
 use crate::discovery::WorkerMode;
 use crate::policies::active_load::ActiveLoadGuard;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
+use crate::server::chat_request::{generate_room_id, BootstrapFields, ChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
@@ -22,7 +23,13 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 type LoadGuards = (LoadGuard, ActiveLoadGuard);
 
-pub(super) async fn forward(
+pub(crate) struct SelectedWorkers {
+    pub(crate) prefill: Arc<Worker>,
+    pub(crate) decode: Option<Arc<Worker>>,
+    pub(crate) timestamped: bool,
+}
+
+pub(crate) async fn forward(
     ctx: &AppContext,
     request: ChatRequest,
     workers: SelectedWorkers,

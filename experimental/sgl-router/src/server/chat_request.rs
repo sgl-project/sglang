@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+//! Chat request validation, optional tokenization, and outgoing body preparation.
+
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{request_tokens_for, RequestTokens};
@@ -13,19 +15,19 @@ use serde::Deserialize;
 
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-pub(super) struct ChatRequest {
-    pub(super) model: ModelId,
-    pub(super) streaming: bool,
-    pub(super) max_output_tokens: Option<u64>,
-    pub(super) body: Bytes,
-    pub(super) tokens: Option<RequestTokens>,
-    pub(super) prefill_load: usize,
+pub(crate) struct ChatRequest {
+    pub(crate) model: ModelId,
+    pub(crate) streaming: bool,
+    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) body: Bytes,
+    pub(crate) tokens: Option<RequestTokens>,
+    pub(crate) prefill_load: usize,
     value: Option<serde_json::Value>,
     sampling: Vec<(SamplingField, serde_json::Number)>,
 }
 
 impl ChatRequest {
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         ctx: &AppContext,
         model: ModelId,
         probe: RequestProbe,
@@ -64,7 +66,7 @@ impl ChatRequest {
         })
     }
 
-    pub(super) fn into_outgoing_body(
+    pub(crate) fn into_outgoing_body(
         self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
@@ -90,9 +92,9 @@ impl ChatRequest {
 
 /// Reads routing and sampling fields without retaining unrelated client data.
 #[derive(Debug, Default)]
-pub(super) struct RequestProbe {
+pub(crate) struct RequestProbe {
     stream: Option<bool>,
-    pub(super) model: Option<String>,
+    pub(crate) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     sampling: [ProbedValue; SamplingField::ALL.len()],
@@ -348,14 +350,14 @@ fn estimate_prefill_tokens(body: &Bytes) -> usize {
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
-pub(super) fn generate_room_id() -> u64 {
+pub(crate) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
-pub(super) struct BootstrapFields {
-    pub(super) host: String,
-    pub(super) port: Option<u16>,
-    pub(super) room: u64,
+pub(crate) struct BootstrapFields {
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) room: u64,
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
@@ -578,7 +580,7 @@ fn sampling_violation(spec: &ParamSpec, got: ProbedValue) -> Option<String> {
     }
 }
 
-pub(super) fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
+pub(crate) fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     let err = match serde_json::from_slice::<RequestProbe>(body) {
         Ok(probe) => return Ok(probe),
         Err(e) => e,
