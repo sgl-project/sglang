@@ -214,9 +214,14 @@ def handle_attention_backend_compatibility(server_args: Any):
     #      partial + LSE decode return, no extend prefix merge), so each rank
     #      would attend over its 1/dcp_size shard as if it were the whole context.
     #   2. The merge weights each rank's partial by its log-sum-exp, and the
-    #      kernels cannot supply one: flash_attn_with_kvcache leaves softmax_lse
-    #      zero-filled, flash_attn_varlen_func likewise, and flash_mla_decode has
-    #      no LSE output. Emitting it is an sgl-kernel-xpu change.
+    #      kernels cannot supply one: flash_attn_with_kvcache accepts
+    #      return_softmax_lse but never writes it, flash_attn_varlen_func likewise,
+    #      and flash_mla_decode has no LSE output. Emitting it is an sgl-kernel-xpu
+    #      change. Measured on sgl_kernel 0.1.8 (GQA 8q/2kv, D=128, page_size 64)
+    #      against a float32 reference of 5.19..5.70: zeros at num_splits 0 and 1,
+    #      uninitialized -25.7..+11.9 at num_splits 4, while the attention output
+    #      itself is correct to 0.0021 -- so a DCP merge would be weighted by zero
+    #      or by garbage and nothing would fail loudly.
     # Both prefill and decode are checked: the extend-with-prefix path merges by
     # LSE too, so an intel_xpu prefill under DCP is wrong for the same reasons.
     if cfg.dcp_size > 1 and "intel_xpu" in attention_backends_of(

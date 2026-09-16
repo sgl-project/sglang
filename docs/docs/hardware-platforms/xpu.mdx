@@ -439,10 +439,23 @@ Triton-only is a real cost. Two things block it today:
    wrong output.
 2. **No softmax LSE from the kernels.** The cross-rank merge weights each rank's
    partial by its log-sum-exp, and the kernels cannot supply one.
-   `flash_attn_with_kvcache` accepts `return_softmax_lse` but leaves the buffer
-   zero-filled (uninitialized when `num_splits` is set),
-   `flash_attn_varlen_func` likewise returns zeros, and `flash_mla_decode` has no
-   LSE output or flag at all.
+   `flash_attn_with_kvcache` accepts `return_softmax_lse` but never writes it, and
+   `flash_attn_varlen_func` likewise returns zeros, while both return a correct
+   attention output. `flash_mla_decode` has no LSE output or flag at all.
+
+   Measured on `sgl_kernel` 0.1.8, GQA 8 query / 2 KV heads, head_dim 128,
+   page_size 64, 128 KV tokens, against a float32 reference LSE:
+
+   | call | returned LSE | reference LSE |
+   |---|---|---|
+   | `flash_attn_with_kvcache`, `num_splits=0` (the default) | all zeros | 5.19 … 5.70 |
+   | `flash_attn_with_kvcache`, `num_splits=1` | ~1e-3 | 5.19 … 5.70 |
+   | `flash_attn_with_kvcache`, `num_splits=4` | uninitialized, -25.7 … +11.9 | 5.19 … 5.70 |
+   | `flash_attn_varlen_func`, causal | all zeros | -0.95 … 5.21 |
+
+   The attention output is correct in every one of those cases (max error 0.0021),
+   so nothing fails — a DCP merge would just weight each rank's partial by zero or
+   by garbage. That is why the rejection is a startup error and not a slow path.
 
 Lifting the restriction needs an
 [sgl-kernel-xpu](https://github.com/sgl-project/sgl-kernel-xpu) change to emit the
