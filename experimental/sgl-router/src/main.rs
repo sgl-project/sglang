@@ -215,6 +215,7 @@ async fn main() -> Result<()> {
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.engine_load = kv_index.engine_load();
     app_ctx.kv_metrics = kv_index.metrics_source();
+    app_ctx.kv_index = kv_index.snapshot_source();
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 

@@ -3,15 +3,16 @@
 
 //! Cache-management admin endpoints.
 
+use crate::policies::kv_events::bootstrap::PRODUCER_CACHE_TTL;
 use crate::server::app_context::AppContext;
 use crate::workers::worker::Worker;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +70,115 @@ impl FlushCacheResult {
             message,
         }
     }
+}
+
+/// Query string of `GET /internal/kv_snapshot`.
+///
+/// Every field optional, so a peer that sends nothing — an older router image,
+/// or a caller with no freshness requirement — is served rather than rejected.
+#[derive(Debug, Default, Deserialize)]
+pub struct SnapshotParams {
+    /// Oldest export the caller can use, in milliseconds. Named to match
+    /// [`crate::policies::kv_events::bootstrap::MAX_AGE_PARAM`].
+    max_age_ms: Option<u64>,
+    /// When true, answer with the cursor table alone and omit the tree.
+    ///
+    /// A splice probe reads one sequence number per rank and has no use for
+    /// nodes, so serving it a full export is the dominant cost of the
+    /// bootstrap path on a large fleet. Named to match
+    /// [`crate::policies::kv_events::bootstrap::CURSORS_ONLY_PARAM`].
+    ///
+    /// An older router image does not send this and is unaffected; an older
+    /// PRODUCER ignores it and answers with a full snapshot, so a
+    /// mixed-version fleet pays the old transfer cost instead of failing. Note
+    /// that an old producer's cursor table is NARROWER than this path's — the
+    /// full export filters it to ranks still carrying tree nodes (see
+    /// `KvEventIndex::peer_cursors_body`) — so it loses exactly the witnesses
+    /// the new path would uniquely know, never ones an old fleet could report.
+    cursors_only: Option<bool>,
+}
+
+/// `GET /internal/kv_snapshot` — serve this replica's cache-aware tree so a
+/// newly started sibling can bootstrap from it instead of routing cache-blind.
+///
+/// `404 NOT_FOUND` when this router maintains no local tree (cache-aware
+/// KV indexing disabled, or an external Indexer is the routing signal). The
+/// consumer treats that identically to an unreachable peer, which is also what
+/// an older router image returns for an unknown path — so a mixed-version
+/// fleet degrades to cold boots rather than errors.
+///
+/// The body always reports `producer_ready`, so a peer that has nothing worth
+/// copying is skipped by the consumer rather than propagating a cold tree.
+/// Snapshot construction is single-flighted and briefly cached; see
+/// [`crate::policies::kv_events::KvEventIndex::peer_snapshot_body`].
+///
+/// `?max_age_ms=N` states how stale an export the caller can use, which is a
+/// correctness input for a bootstrapping consumer rather than a preference —
+/// see [`PRODUCER_CACHE_TTL`]. Omitting it accepts whatever is cached within
+/// that default, which is what an older router image does. A splice probe
+/// sends neither: `?cursors_only=true` is answered from the live cursor map
+/// and never goes near the export cache.
+///
+/// # Exposure
+///
+/// Unauthenticated, on the main listener, like `/flush_cache` — the router has
+/// no auth middleware, so reachability is already the trust boundary for its
+/// admin surface. The body is block hashes and worker URLs: no prompt text and
+/// no token ids.
+pub async fn kv_snapshot(
+    State(ctx): State<Arc<AppContext>>,
+    Query(params): Query<SnapshotParams>,
+) -> Response {
+    let Some(index) = ctx.kv_index.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "cache-aware KV indexing is not enabled on this router",
+            })),
+        )
+            .into_response();
+    };
+    if params.cursors_only.unwrap_or(false) {
+        // No `max_age_ms` negotiation on this path: the cursors are read live,
+        // so the answer beats any freshness a caller could state. Both
+        // parameters sent → the live read wins, silently. (`?cursors_only`
+        // with no value never reaches here: serde rejects a valueless bool as
+        // a 400 — the probe always sends `=true`.)
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            axum::body::Body::from(index.peer_cursors_body()),
+        )
+            .into_response();
+    }
+    let max_age = params
+        .max_age_ms
+        .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
+    // Pre-encoded and cached by the producer, so a boot herd does not
+    // re-serialise one identical multi-megabyte tree per request. Handing
+    // `Bytes` to the body is a refcount bump, not a copy.
+    let body = index.peer_snapshot_body(max_age).await;
+    if body.is_empty() {
+        // The encode failed (see `peer_snapshot_body`). Must NOT be a 200: the
+        // consumer would fail to decode it, and a decode failure is
+        // indistinguishable from a peer whose transport is broken. A
+        // non-success status reads as "no snapshot here", which is what this
+        // is, and earns the consumer's per-peer cooldown rather than turning a
+        // booting sibling into a retry loop against a multi-megabyte body.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "snapshot could not be encoded",
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from(body),
+    )
+        .into_response()
 }
 
 /// `POST /flush_cache` — fan SGLang's `/flush_cache` admin call out to every
@@ -379,5 +489,217 @@ mod tests {
         let mut expected = [p_url.as_str(), d_url.as_str()];
         expected.sort_unstable();
         assert_eq!(succeeded, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // GET /internal/kv_snapshot
+    // -----------------------------------------------------------------------
+
+    use crate::policies::kv_events::bootstrap::{
+        PeerSnapshot, CURSORS_ONLY_PARAM, MAX_AGE_PARAM, SNAPSHOT_PATH,
+    };
+    use crate::policies::kv_events::{KvEventIndex, KvWorkerId};
+    use axum::http::header;
+
+    /// An `AppContext` whose snapshot route is live, holding one block for one
+    /// rank and a cursor for a second rank it no longer carries — the shape
+    /// that makes the cursors-only table a strict superset of the export's.
+    fn ctx_with_seeded_index() -> Arc<AppContext> {
+        let index = KvEventIndex::new();
+        index.block_size_oracle().try_set(64).unwrap();
+        index.block_size_oracle().set_bigram(false);
+        index.seed_stored_block_for_test(&KvWorkerId::new("http://carrier:30000".into(), 0), 41, 7);
+        index.seed_cursor_only_for_test(&KvWorkerId::new("http://witness:30000".into(), 0), 12);
+        let mut ctx = AppContext::stub();
+        ctx.kv_index = index.snapshot_source();
+        Arc::new(ctx)
+    }
+
+    async fn get_snapshot(ctx: Arc<AppContext>, uri: &str) -> Response {
+        crate::server::app::build_router(ctx)
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn parse_snapshot(resp: Response) -> PeerSnapshot {
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).expect("snapshot body must be parseable")
+    }
+
+    #[tokio::test]
+    async fn kv_snapshot_route_serves_parseable_json() {
+        let resp = get_snapshot(ctx_with_seeded_index(), SNAPSHOT_PATH).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let snap = parse_snapshot(resp).await;
+        assert_eq!(snap.format, 1);
+        assert_eq!(snap.block_size, 64);
+        assert!(snap.producer_ready, "a seeded tree is worth copying");
+        assert_eq!(snap.nodes.len(), 1);
+        // Only the carrier appears: the full export's cursor table is filtered
+        // to ranks a graft recipient could actually get blocks from.
+        assert_eq!(snap.workers.len(), 1);
+        assert_eq!(snap.workers[0].url, "http://carrier:30000");
+        assert_eq!(snap.cursors, vec![(0, 41)]);
+    }
+
+    /// A router that maintains no local tree must answer 404, not an empty
+    /// snapshot: a consumer reads 404 the same way it reads an unreachable
+    /// peer, where an empty 200 would have to be distinguished from a peer
+    /// whose tree is genuinely empty.
+    #[tokio::test]
+    async fn kv_snapshot_route_is_absent_without_a_local_tree() {
+        let resp = get_snapshot(Arc::new(AppContext::stub()), SNAPSHOT_PATH).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Compression is the whole point of asking for gzip on the fetch side,
+    /// and it is route-scoped, so it has to be asserted on THIS route: a test
+    /// that mounts its own `CompressionLayer` proves tower-http works, not
+    /// that this endpoint is wired to it. Both directions matter — a consumer
+    /// that asks gets gzip, and one that does not (an image predating the
+    /// layer) still gets a body it can parse.
+    #[tokio::test]
+    async fn kv_snapshot_route_compresses_only_when_the_caller_accepts_gzip() {
+        use std::io::Read;
+
+        let ctx = ctx_with_seeded_index();
+        let gzipped = crate::server::app::build_router(Arc::clone(&ctx))
+            .oneshot(
+                Request::builder()
+                    .uri(SNAPSHOT_PATH)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gzipped.status(), StatusCode::OK);
+        assert_eq!(
+            gzipped
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "the snapshot route must compress for a caller that accepts gzip",
+        );
+        let compressed = gzipped.into_body().collect().await.unwrap().to_bytes();
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut inflated)
+            .expect("body must be valid gzip");
+        let _: PeerSnapshot = serde_json::from_slice(&inflated).unwrap();
+
+        let plain = get_snapshot(ctx, SNAPSHOT_PATH).await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert!(
+            plain.headers().get(header::CONTENT_ENCODING).is_none(),
+            "a caller that never asked for gzip must get identity",
+        );
+        let _ = parse_snapshot(plain).await;
+    }
+
+    /// `max_age_ms` is a correctness input for a bootstrapping consumer, and
+    /// an older image omits it entirely. Every shape must be served.
+    #[tokio::test]
+    async fn kv_snapshot_route_accepts_a_max_age_and_survives_its_absence() {
+        for uri in [
+            SNAPSHOT_PATH.to_string(),
+            format!("{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=0"),
+            format!("{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=30000"),
+        ] {
+            let resp = get_snapshot(ctx_with_seeded_index(), &uri).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let snap = parse_snapshot(resp).await;
+            assert_eq!(snap.nodes.len(), 1, "{uri}");
+        }
+    }
+
+    /// The probe path: cursors for every observed rank, and no tree. The
+    /// witness rank is present here and absent from the full export, which is
+    /// the asymmetry the two tables exist for.
+    #[tokio::test]
+    async fn kv_snapshot_route_serves_cursors_only_when_asked() {
+        let resp = get_snapshot(
+            ctx_with_seeded_index(),
+            &format!("{SNAPSHOT_PATH}?{CURSORS_ONLY_PARAM}=true"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let snap = parse_snapshot(resp).await;
+
+        assert!(
+            snap.nodes.is_empty(),
+            "a cursors-only body must be ungraftable by construction",
+        );
+        let mut seen: Vec<(String, i64)> = snap
+            .cursors
+            .iter()
+            .map(|&(i, seq)| (snap.workers[i as usize].url.clone(), seq))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("http://carrier:30000".to_string(), 41),
+                ("http://witness:30000".to_string(), 12),
+            ],
+            "every observed rank is a witness, carrier or not",
+        );
+        assert!(snap.producer_ready);
+    }
+
+    /// `?cursors_only=true` reads live, so it must not populate or consume the
+    /// export cache — otherwise a probe would either serve a stale answer or
+    /// poison the next bootstrap fetch with a node-less body.
+    #[tokio::test]
+    async fn cursors_only_neither_fills_nor_reads_the_export_cache() {
+        let ctx = ctx_with_seeded_index();
+        let cursors = get_snapshot(
+            Arc::clone(&ctx),
+            &format!("{SNAPSHOT_PATH}?{CURSORS_ONLY_PARAM}=true"),
+        )
+        .await;
+        assert!(parse_snapshot(cursors).await.nodes.is_empty());
+
+        // A generous max_age would happily reuse a cached entry, so a full
+        // export right after the probe proves the probe left none behind.
+        let full = get_snapshot(ctx, &format!("{SNAPSHOT_PATH}?{MAX_AGE_PARAM}=600000")).await;
+        assert_eq!(parse_snapshot(full).await.nodes.len(), 1);
+    }
+
+    /// An index that has not established both halves of its hashing config
+    /// must not advertise itself as a source: the recipient would graft blocks
+    /// hashed under an identity the body misreports, and never match one.
+    #[tokio::test]
+    async fn a_half_published_hash_config_is_not_a_bootstrap_source() {
+        let index = KvEventIndex::new();
+        index.block_size_oracle().try_set(64).unwrap(); // no bigram report yet
+        index.seed_stored_block_for_test(&KvWorkerId::new("http://carrier:30000".into(), 0), 1, 7);
+        let mut ctx = AppContext::stub();
+        ctx.kv_index = index.snapshot_source();
+
+        let snap = parse_snapshot(get_snapshot(Arc::new(ctx), SNAPSHOT_PATH).await).await;
+        assert!(
+            !snap.producer_ready,
+            "a half-published hash config must not be advertised as copyable",
+        );
+        assert!(!snap.nodes.is_empty(), "the tree itself is still reported");
+    }
+
+    /// An empty tree is not a source either, which is what keeps two replicas
+    /// in a rolling update from bootstrapping off each other and both
+    /// inheriting nothing.
+    #[tokio::test]
+    async fn an_empty_tree_is_not_a_bootstrap_source() {
+        let index = KvEventIndex::new();
+        index.block_size_oracle().try_set(64).unwrap();
+        index.block_size_oracle().set_bigram(false);
+        let mut ctx = AppContext::stub();
+        ctx.kv_index = index.snapshot_source();
+
+        let snap = parse_snapshot(get_snapshot(Arc::new(ctx), SNAPSHOT_PATH).await).await;
+        assert!(!snap.producer_ready);
+        assert!(snap.nodes.is_empty());
     }
 }

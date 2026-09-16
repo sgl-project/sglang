@@ -10,6 +10,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 /// Edge counters: `requests_total{route,method}` at entry (true intake, incl.
 /// requests parked/shed/cancelled before dispatch), `responses_total{...,
@@ -81,6 +82,35 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
+        )
+        .route(
+            crate::policies::kv_events::bootstrap::SNAPSHOT_PATH,
+            get(crate::server::routes::cache::kv_snapshot).layer(
+                // Scoped to THIS route, not the app. It is the only response
+                // here large enough to be worth compressing, and route-scoping
+                // means the hot proxy path pays no per-response predicate
+                // check at all and does not depend on tower-http's default
+                // predicate continuing to exempt `text/event-stream` for the
+                // SSE stream.
+                //
+                // Gzip only — the consumer asks with an explicit
+                // `Accept-Encoding: gzip`. Offering algorithms nothing asks
+                // for just widens the negotiation surface.
+                //
+                // `Fastest` on purpose. The body is a large, highly repetitive
+                // JSON document — the compressibility is in the per-node
+                // scaffolding, not the hashes themselves — so level 1 already
+                // shrinks it several-fold, and this runs on a replica that is
+                // simultaneously serving traffic during a boot herd. Spending
+                // seconds of CPU per request chasing a smaller body would
+                // trade one bootstrap failure mode for another.
+                CompressionLayer::new()
+                    .gzip(true)
+                    .no_br()
+                    .no_deflate()
+                    .no_zstd()
+                    .quality(CompressionLevel::Fastest),
+            ),
         )
         // After routing, so MatchedPath is set for every route.
         .layer(middleware::from_fn_with_state(ctx.clone(), count_requests))
