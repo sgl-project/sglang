@@ -538,6 +538,12 @@ class BaseRunner(ABC):
                 and mr.ps.attn_cp_size > 1
             ):
                 pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
+            elif mr.ps.pp_rank != 0 and mr.attn_tp_sequence_sharded(num_tokens):
+                # DP attention keeps PP boundary activations scattered across
+                # the attention TP group. Match the receiving stage's local
+                # token count so its TP all-gather has world_size * input
+                # elements available in the output buffer.
+                pp_hidden_tokens = num_tokens // mr.ps.attn_tp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )

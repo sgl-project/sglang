@@ -676,8 +676,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         buffers = self.buffers.pp_proxy_tensors
         if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
+        pp_hidden_tokens = num_tokens
+        if self.model_runner.attn_tp_sequence_sharded(num_tokens):
+            pp_hidden_tokens = num_tokens // self.model_runner.ps.attn_tp_size
         return PPProxyTensors(
-            {name: buffer[:num_tokens] for name, buffer in buffers.items()}
+            {name: buffer[:pp_hidden_tokens] for name, buffer in buffers.items()}
         )
 
     @contextmanager

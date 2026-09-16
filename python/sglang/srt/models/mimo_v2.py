@@ -1354,7 +1354,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            mm_forward_output = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1362,6 +1362,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 positions=positions,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # Non-last PP stages return PPProxyTensors from the language model;
+            # forward that proxy intact instead of unpacking its mapping keys as
+            # (hidden_states, hidden_states_before_norm).
+            if isinstance(mm_forward_output, PPProxyTensors):
+                return mm_forward_output
+            hidden_states, hidden_states_before_norm = mm_forward_output
         else:
             hidden_states, hidden_states_before_norm = self.model(
                 input_ids,

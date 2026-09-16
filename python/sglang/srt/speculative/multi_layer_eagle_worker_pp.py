@@ -16,8 +16,12 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleWorkerV2,
@@ -59,6 +63,11 @@ class MultiLayerEagleWorkerPP(MultiLayerEagleWorkerV2):
         # Draft-extend graphs are only meaningful on the stage that executes
         # the draft model. Target graphs remain initialized by the scheduler.
         if not get_pp_group().is_last_rank:
+            # PP first stages still build the MTP verify tree, so their draft
+            # worker may be called by ``forward_batch_generation``. They do
+            # not capture draft graphs, but must expose the same initialized
+            # attributes so ``draft()`` takes the eager path safely.
+            self.draft_worker.cuda_graph_runner = None
             self.draft_worker.cuda_graph_runner_for_draft_extend = None
             return
         super().init_cuda_graphs()
@@ -121,6 +130,20 @@ class MultiLayerEagleWorkerPP(MultiLayerEagleWorkerV2):
             return result
 
         if pp.is_first_rank:
+            # The first PP decode step has no draft state from a previous
+            # iteration. Mirror MultiLayerEagleWorkerV2's idle-input setup
+            # before asking the draft worker to build the verify tree.
+            if batch.spec_info is None:
+                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                    self.draft_worker.draft_runner
+                )
+                batch.spec_info = EagleDraftInput.create_idle_input(
+                    device=self.device,
+                    hidden_size=hidden_size,
+                    dtype=hidden_dtype,
+                    topk=self.topk * self.speculative_num_steps,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
