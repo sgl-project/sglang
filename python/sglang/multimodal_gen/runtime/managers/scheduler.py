@@ -90,8 +90,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         server_args: ServerArgs,
         gpu_id: int,
         port_args: PortArgs,
-        task_pipes_to_slaves: list = None,
-        result_pipes_from_slaves: list = None,
         local_rank: int | None = None,
     ):
         self.server_args = server_args
@@ -134,8 +132,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
-        self.task_pipes_to_slaves = task_pipes_to_slaves
-        self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -1299,21 +1295,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self.receiver.close()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
-
-    def _broadcast_task(self, payload: dict[str, Any]) -> None:
-        """Broadcast a task to all slave worker processes."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        task = {"method": method, "kwargs": kwargs}
-        for pipe in self.task_pipes_to_slaves:
-            pipe.send(task)
-
-    def _collect_slave_results(self) -> List[dict[str, Any]]:
-        """Collect results from all slave worker processes."""
-        results = []
-        for pipe in self.result_pipes_from_slaves:
-            results.append(pipe.recv())
-        return results
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
