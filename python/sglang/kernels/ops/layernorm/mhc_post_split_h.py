@@ -25,7 +25,9 @@ def _mhc_post_split_h_kernel(X, R, P, C, Y, H: tl.constexpr, B: tl.constexpr):
     tl.store(Y + (token * 4 + channel[:, None]) * H + h[None, :], acc, h[None, :] < H)
 
 
-def mhc_post_split_h(x, residual, post, comb):
+def mhc_post_split_h(
+    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+) -> torch.Tensor:
     """Same result as the TileLang post kernel for contiguous BF16 HC=4 inputs."""
     assert x.dtype == residual.dtype == torch.bfloat16
     assert post.dtype == comb.dtype == torch.float32

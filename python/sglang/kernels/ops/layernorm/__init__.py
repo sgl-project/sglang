@@ -527,6 +527,23 @@ for _mod, _fn, _bk in _PHASE25_KERNELS:
     )
 del _mod, _fn, _bk
 
+# Fused hyper-connection combine / norm kernels for small speculative batches.
+_HC_NORM_KERNELS = [
+    ("hc_combine_norm", "hc_combine_norm"),
+    ("mhc_post_split_h", "mhc_post_split_h"),
+    ("mxfp8_epilogue", "hc_combine_norm_mxfp8"),
+    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+]
+for _mod, _fn in _HC_NORM_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.layernorm.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn
+
 # The fused-rmsnorm variants physically live in the shared fused-pointwise
 # collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):

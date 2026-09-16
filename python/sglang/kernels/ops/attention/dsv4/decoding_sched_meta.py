@@ -38,15 +38,11 @@ def decoding_sched_meta(
 ) -> None:
     """Fill FlashMLA's split-KV tile-scheduler metadata in place.
 
-    Same schedule FlashMLA computes for itself when handed no metadata, but the
-    per-request pass and the write-out run over a whole block instead of one
-    warp, and the sequential partition walk writes to shared memory rather than
-    storing each 32-byte entry to global. At ``num_sm_parts = 152`` (a BS=1
-    draft step on GB300) that is the difference between 25.1 us and ~2 us, all
-    of it on the critical path inside the decode graph.
-
-    Pass the filled tensors to FlashMLA as the cached
-    ``tile_scheduler_metadata`` / ``num_splits`` and it skips its own kernel.
+    Produces the schedule FlashMLA computes for itself when handed no metadata,
+    so passing the filled tensors as the cached ``tile_scheduler_metadata`` /
+    ``num_splits`` lets it skip its own kernel. The schedule has to fit in 48 KB
+    of shared memory, ``4 * (5 * batch_size + 1 + 8 * num_sm_parts)`` bytes, so
+    a few thousand requests at most.
 
     Args:
         tile_scheduler_metadata: ``[num_sm_parts, 8]`` int32, written.
