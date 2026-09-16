@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
@@ -414,6 +415,13 @@ class PrefillBootstrapQueue:
         return True
 
     def add(self, req: Req, num_kv_heads: int) -> None:
+        # Rejected at intake: `set_finish_with_abort` left the verdict in
+        # `to_finish`, which `finished()` does not read, and swapped the prompt
+        # for a one-token stub. Bootstrapping it costs a handshake, a metadata
+        # buffer and a forward pass before anything unwinds it.
+        if is_unadmitted_reject(req):
+            self.scheduler.retire_unadmitted_request(req)
+            return
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
@@ -609,6 +617,7 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self._process_hicache_events()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
