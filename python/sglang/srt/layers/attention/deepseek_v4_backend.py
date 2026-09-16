@@ -4317,22 +4317,13 @@ class DeepseekV4AttnBackend(
         if self.token_to_kv_pool.request_window is not None:
             from sglang.srt.mem_cache.dsv41_request_window import window_layout
 
-            if self.encoder_replay:
-                starts = torch.ones_like(raw_positions, dtype=torch.bool)
-                starts[1:] = (
-                    req_pool_indices_repeated[1:] != req_pool_indices_repeated[:-1]
-                )
-                offset = torch.arange(
-                    raw_positions.numel(), device=raw_positions.device
-                )
-                group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
-                swa_replay_start = raw_positions - (offset - group_first)
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
+                replay=self.encoder_replay,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
