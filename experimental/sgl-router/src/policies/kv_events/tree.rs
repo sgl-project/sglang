@@ -81,6 +81,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
 /// Process-wide monotonic epoch used to derive cheap millisecond-resolution
@@ -257,6 +258,35 @@ impl Tiers {
     pub const fn union(self, other: Tiers) -> Tiers {
         Tiers(self.0 | other.0)
     }
+
+    /// Raw bits, for the one place a tier set crosses a process boundary:
+    /// [`SnapshotNode::tiers`].
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Read a [`SnapshotNode::tiers`] entry back, keeping only the tiers this
+    /// build ranks.
+    ///
+    /// Follows [`Self::for_store`]'s rule, not [`Self::for_remove`]'s, because
+    /// a restore *is* a store: a bit this build does not know is dropped, and
+    /// an entry naming only unknown bits comes back empty so
+    /// [`HashTree::restore_snapshot`] skips that carrier entirely. The two
+    /// alternatives are both worse than one cold prefill — folding an unknown
+    /// bit onto device turns a future tier's carrier into a preferred device
+    /// owner here, and widening to [`Self::ALL`] invents holdings the peer
+    /// never claimed.
+    ///
+    /// Zero reads as empty for the same reason. It cannot come from a
+    /// same-build producer (every exported carrier holds at least one bit),
+    /// so it is either a malformed peer or a carrier that holds only tiers
+    /// this build has no name for. Note the distinction from an *absent*
+    /// entry: a producer that predates tiering sends no `tiers` list at all,
+    /// and `restore_snapshot` reads that as device — the legacy meaning, and
+    /// what keeps the snapshot format stable in both directions.
+    pub const fn from_bits(bits: u8) -> Tiers {
+        Tiers(bits & Self::ALL.0)
+    }
 }
 
 /// Number of entries in [`Tiers::SLOTS`].
@@ -365,6 +395,111 @@ impl MatchResult {
     }
 }
 
+/// One node of a tree snapshot, as produced by
+/// [`HashTree::export_snapshot`] and consumed by
+/// [`HashTree::restore_snapshot`].
+///
+/// Records are parent-linked by their **index in the snapshot's node list**,
+/// not by block hash. That is deliberate: the same block hash legitimately
+/// occupies several tree positions (see the reverse-index module docs), so a
+/// hash-keyed replay would land in `resolve_parent`'s ambiguous branch and
+/// could graft a chain under the wrong node. Indices make placement exact.
+///
+/// `workers` are indices into the snapshot's worker table, kept sorted so a
+/// record's carrier list does not depend on hash-map iteration order. The
+/// order of the records themselves is DFS pre-order — only the
+/// backward-reference property is guaranteed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotNode {
+    /// Index of this node's parent record, or `None` when the node hangs
+    /// directly off the root. Always a backward reference: strictly less than
+    /// this record's own index.
+    pub parent: Option<u32>,
+    pub block_hash: i64,
+    pub workers: Vec<u32>,
+    /// Tier bits of each carrier, parallel to `workers` (`tiers[k]` describes
+    /// `workers[k]`), as [`Tiers::bits`]. Empty means every carrier holds the
+    /// node on device.
+    ///
+    /// That empty-means-device reading is what lets the snapshot format stay
+    /// fixed across the tiering change in *both* directions: a producer that
+    /// predates tiers omits the field and its carriers restore exactly as
+    /// they did before, and a consumer that predates tiers ignores the field
+    /// and reads the old meaning. `serde(default)` fills the gap.
+    #[serde(default)]
+    pub tiers: Vec<u8>,
+}
+
+impl SnapshotNode {
+    /// Keep the carriers `map` accepts, renumbering each to what it returns,
+    /// and keep their tier entries in lockstep.
+    ///
+    /// The only correct way to filter a record's carriers: `workers` and
+    /// `tiers` are parallel by index, so filtering one alone silently re-pairs
+    /// every later carrier with another carrier's tiers.
+    pub fn retain_carriers(&mut self, mut map: impl FnMut(u32) -> Option<u32>) {
+        let tiered = !self.tiers.is_empty();
+        let mut workers = Vec::with_capacity(self.workers.len());
+        let mut tiers = Vec::with_capacity(if tiered { self.workers.len() } else { 0 });
+        for (k, &w) in self.workers.iter().enumerate() {
+            let Some(kept) = map(w) else {
+                continue;
+            };
+            workers.push(kept);
+            if tiered {
+                tiers.push(self.tiers.get(k).copied().unwrap_or(Tiers::DEVICE.bits()));
+            }
+        }
+        self.workers = workers;
+        self.tiers = tiers;
+    }
+}
+
+/// Why a [`HashTree::restore_snapshot`] was rejected.
+///
+/// Snapshots arrive over the network from a peer replica, so their shape is
+/// validated rather than assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreError {
+    /// A record's `parent` pointed at itself or at a later record, so the
+    /// list is not in dependency order and placement cannot be resolved.
+    ForwardParentReference { index: usize },
+    /// A record referenced a worker-table slot that does not exist.
+    WorkerIndexOutOfRange { index: usize, worker: u32 },
+    /// A record's `tiers` was neither empty nor the same length as its
+    /// `workers`, so carriers cannot be paired with their tiers.
+    TierTableMismatch { index: usize },
+    /// A node could not be created because its parent vanished — a tree
+    /// invariant violation, not a bad snapshot. Already logged by
+    /// `create_child`.
+    TreeInvariant { index: usize },
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForwardParentReference { index } => write!(
+                f,
+                "snapshot node {index} has a non-backward parent reference",
+            ),
+            Self::WorkerIndexOutOfRange { index, worker } => write!(
+                f,
+                "snapshot node {index} references out-of-range worker index {worker}",
+            ),
+            Self::TierTableMismatch { index } => write!(
+                f,
+                "snapshot node {index} has a tiers list that does not pair with its workers",
+            ),
+            Self::TreeInvariant { index } => write!(
+                f,
+                "snapshot node {index} could not be grafted: parent missing",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
 /// Internal stable handle to a tree node.
 ///
 /// We use an arena (`HashMap<NodeId, Node>`) instead of `Arc<RwLock<Node>>`
@@ -454,6 +589,16 @@ struct TreeState {
 pub const ACCOUNTING_REASONS: [&str; 2] = ["missing_row", "underflow"];
 const REASON_MISSING_ROW: usize = 0;
 const REASON_UNDERFLOW: usize = 1;
+
+/// Snapshot records one [`HashTree::export_snapshot`] or
+/// [`HashTree::restore_snapshot`] pass holds the tree lock for before
+/// yielding it.
+///
+/// The tree is one lock, so an unchunked pass over a fleet-sized tree stalls
+/// the event pump — and therefore every publisher cursor — for its whole
+/// duration. 4096 keeps the lock hold in the tens of microseconds while
+/// costing one uncontended acquire per 4096 records.
+const SNAPSHOT_LOCK_CHUNK: usize = 4096;
 
 const ROOT_ID: NodeId = 0;
 /// Sentinel block_hash for the root. Real workers can in principle emit
@@ -1198,6 +1343,215 @@ impl HashTree {
     pub fn evict_lru(&self, max_size: usize) -> usize {
         let mut state = self.state.write();
         state.evict_lru(max_size)
+    }
+
+    /// Export every node as a flat, parent-linked list that
+    /// [`HashTree::restore_snapshot`] can rebuild an identical tree from.
+    ///
+    /// Returns `(worker_table, nodes)`. `nodes` is in DFS pre-order, so every
+    /// record's `parent` index is strictly less than its own — the
+    /// precondition `restore_snapshot` validates.
+    ///
+    /// WHY not full root-to-node hash paths (the obvious alternative): that is
+    /// quadratic in depth, and production chains run thousands of blocks deep.
+    /// Parent-by-index is linear and unambiguous.
+    ///
+    /// # Cost, and what bounds it
+    ///
+    /// The whole tree lives behind one lock, so a walk that held it start to
+    /// finish would stall the event pump for the length of the export — at
+    /// fleet scale, long enough to drag every publisher cursor into gap
+    /// detection. The walk therefore releases and re-takes the read lock every
+    /// [`SNAPSHOT_LOCK_CHUNK`] records. The result is a point-in-time
+    /// aggregate, not one consistent instant: a node pruned mid-walk is
+    /// skipped along with its unvisited descendants, which is exactly the
+    /// shape a consumer already tolerates (it grafts *beneath* a live delta
+    /// stream that will re-announce anything missed).
+    ///
+    /// It is still the expensive path. Callers that only need to know how far
+    /// a peer's stream has advanced should ask for the cursor table alone.
+    pub fn export_snapshot(&self) -> (Vec<KvWorkerId>, Vec<SnapshotNode>) {
+        let mut worker_table: Vec<KvWorkerId> = Vec::new();
+        let mut worker_index: HashMap<KvWorkerId, u32> = HashMap::new();
+        let mut nodes: Vec<SnapshotNode> = Vec::new();
+        // (node id, parent's index in `nodes`); `None` for the root's children.
+        let mut stack: Vec<(NodeId, Option<u32>)> = {
+            let st = self.state.read();
+            st.nodes
+                .get(&ROOT_ID)
+                .map(|root| root.children.values().map(|&id| (id, None)).collect())
+                .unwrap_or_default()
+        };
+        while !stack.is_empty() {
+            let st = self.state.read();
+            for _ in 0..SNAPSHOT_LOCK_CHUNK {
+                let Some((id, parent_idx)) = stack.pop() else {
+                    break;
+                };
+                let Some(node) = st.nodes.get(&id) else {
+                    continue;
+                };
+                let mut carriers: Vec<(u32, u8)> = node
+                    .workers
+                    .iter()
+                    .map(|(w, tiers)| {
+                        let idx = match worker_index.get(w) {
+                            Some(&idx) => idx,
+                            None => {
+                                let idx = worker_table.len() as u32;
+                                worker_table.push(w.clone());
+                                worker_index.insert(w.clone(), idx);
+                                idx
+                            }
+                        };
+                        (idx, tiers.bits())
+                    })
+                    .collect();
+                // Sorted by worker index so a record's carrier list does not
+                // depend on hash-map iteration order; tiers ride along.
+                carriers.sort_unstable();
+                let (workers, tiers): (Vec<u32>, Vec<u8>) = carriers.into_iter().unzip();
+                // Pushed before its children, so children get larger indices
+                // and the backward-reference invariant holds by construction.
+                let my_idx = nodes.len() as u32;
+                nodes.push(SnapshotNode {
+                    parent: parent_idx,
+                    block_hash: node.block_hash,
+                    workers,
+                    tiers,
+                });
+                for &child in node.children.values() {
+                    stack.push((child, Some(my_idx)));
+                }
+            }
+        }
+        (worker_table, nodes)
+    }
+
+    /// Rebuild tree state from a snapshot, typically one fetched from a warm
+    /// peer replica at boot.
+    ///
+    /// Grafts each record under its recorded parent: creates the node when
+    /// absent, unions the carrier's tiers when present, so restoring onto a
+    /// non-empty tree is well defined. A record with `parent == None` is
+    /// rooted where [`HashTree::insert`] would have put it, so a restored tree
+    /// routes identically to the tree it came from.
+    ///
+    /// Returns the number of records applied.
+    ///
+    /// # Untrusted input
+    ///
+    /// The node list arrives over the network, so its shape is validated up
+    /// front rather than assumed: `parent` must be a backward reference, every
+    /// worker index must be in range, and a `tiers` list must either be absent
+    /// or pair one-to-one with `workers`. Validation happens before any
+    /// mutation, so a rejected snapshot leaves the tree untouched.
+    ///
+    /// A carrier whose tier entry names nothing this build ranks is skipped
+    /// rather than restored — see [`Tiers::from_bits`]. The tree's
+    /// "no bits ⇒ no entry" invariant depends on that.
+    ///
+    /// `worker_table` must hold ids resolved against the local worker
+    /// registry, NOT ids deserialized straight off the wire — see the
+    /// provenance note on [`KvWorkerId`]. This method trusts the ids it is
+    /// handed, which is why it is module-internal.
+    ///
+    /// MUST run on the single writer (the KV-event pump), like every other
+    /// mutator. That is also what makes the chunked locking below safe: no
+    /// other writer can prune a parent recorded by an earlier chunk.
+    // The in-module tests are the only caller until the bootstrap consumer
+    // lands; `pub(super)` is the provenance boundary, not an oversight.
+    #[allow(dead_code)]
+    pub(super) fn restore_snapshot(
+        &self,
+        worker_table: &[KvWorkerId],
+        nodes: &[SnapshotNode],
+    ) -> Result<usize, RestoreError> {
+        // Validate before mutating. The backward-reference check is what makes
+        // the placement lookup below infallible; the bounds check keeps a
+        // malformed peer from silently dropping cache carriers.
+        for (i, rec) in nodes.iter().enumerate() {
+            if rec.parent.is_some_and(|p| p as usize >= i) {
+                return Err(RestoreError::ForwardParentReference { index: i });
+            }
+            if let Some(&worker) = rec
+                .workers
+                .iter()
+                .find(|&&w| w as usize >= worker_table.len())
+            {
+                return Err(RestoreError::WorkerIndexOutOfRange { index: i, worker });
+            }
+            if !rec.tiers.is_empty() && rec.tiers.len() != rec.workers.len() {
+                return Err(RestoreError::TierTableMismatch { index: i });
+            }
+        }
+
+        // Record index -> where it landed. Filled in order, so a parent is
+        // always placed before any child consults it.
+        let mut placed: Vec<NodeId> = Vec::with_capacity(nodes.len());
+        let now = now_millis();
+        let mut base = 0usize;
+        while base < nodes.len() {
+            let end = (base + SNAPSHOT_LOCK_CHUNK).min(nodes.len());
+            // Occupancy is booked once per (chunk, carrier) rather than once
+            // per node, the same amortisation `insert` does for a chain.
+            let mut booked: HashMap<u32, TierCounts> = HashMap::new();
+            let mut failed: Option<RestoreError> = None;
+            let mut st = self.state.write();
+            for (i, rec) in nodes.iter().enumerate().take(end).skip(base) {
+                let parent_id = match rec.parent {
+                    None => ROOT_ID,
+                    Some(p) => placed[p as usize],
+                };
+                let parent_block_hash = rec.parent.map(|p| nodes[p as usize].block_hash);
+                let existing = st
+                    .nodes
+                    .get(&parent_id)
+                    .and_then(|n| n.children.get(&rec.block_hash).copied());
+                let id = match existing {
+                    Some(id) => id,
+                    None => match st.create_child(parent_id, rec.block_hash, parent_block_hash) {
+                        Some(id) => id,
+                        None => {
+                            failed = Some(RestoreError::TreeInvariant { index: i });
+                            break;
+                        }
+                    },
+                };
+                if let Some(node) = st.nodes.get_mut(&id) {
+                    for (k, &w) in rec.workers.iter().enumerate() {
+                        // An absent entry (pre-tiering producer) reads as
+                        // device; a present one keeps only the tiers this
+                        // build ranks, and a carrier left holding none is
+                        // dropped rather than invented onto device.
+                        let tiers = match rec.tiers.get(k) {
+                            Some(&bits) => Tiers::from_bits(bits),
+                            None => Tiers::DEVICE,
+                        };
+                        if tiers.is_empty() {
+                            continue;
+                        }
+                        let added = add_tiers(&mut node.workers, &worker_table[w as usize], tiers);
+                        tally_tiers(booked.entry(w).or_default(), added);
+                    }
+                    node.last_used.store(now, Ordering::Relaxed);
+                }
+                placed.push(id);
+            }
+            // Book before surfacing the error: the tier bits of the records
+            // this chunk did apply are already in the nodes, so bailing
+            // without booking would leave the occupancy gauge permanently
+            // short by exactly those.
+            for (w, delta) in booked {
+                st.account_add(&worker_table[w as usize], delta);
+            }
+            drop(st);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            base = end;
+        }
+        Ok(nodes.len())
     }
 }
 
@@ -2036,5 +2390,456 @@ mod tests {
         let m = tree.match_prefix(None, &[1, 2, 3]);
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers(), workers(&[&b]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot export / restore
+    // -----------------------------------------------------------------------
+
+    /// Build a tree exercising the cases a real snapshot has to survive:
+    /// multi-worker shared prefixes, divergent branches, many sibling roots,
+    /// and the same block hash occupying more than one position.
+    fn populated_tree() -> (HashTree, Vec<KvWorkerId>) {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let c = worker("http://b", 1); // same url, different dp rank
+
+        // Shared prefix, divergent tails.
+        tree.insert(&a, None, &[1, 2, 3, 4]);
+        tree.insert(&b, None, &[1, 2, 5, 6]);
+        // Single-block chain.
+        tree.insert(&c, None, &[7]);
+        // Hash 2 reappears as a chain root elsewhere, and hash 3 as an
+        // interior block of a different chain — the ambiguity that makes
+        // hash-keyed replay wrong.
+        tree.insert(&a, None, &[2, 3, 9]);
+        // Many sibling roots.
+        for r in 0..32i64 {
+            tree.insert(&b, None, &[r * 4096 + 11, r * 4096 + 12]);
+        }
+        (tree, vec![a, b, c])
+    }
+
+    /// The queries a restored tree must answer identically to its source.
+    fn probe_queries() -> Vec<Vec<i64>> {
+        let mut q = vec![
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
+            vec![1, 2, 5],
+            vec![1, 2, 5, 6],
+            vec![7],
+            vec![2],
+            vec![2, 3],
+            vec![2, 3, 9],
+            vec![1, 2, 3, 4, 99],
+            vec![404],
+        ];
+        for r in 0..32i64 {
+            q.push(vec![r * 4096 + 11]);
+            q.push(vec![r * 4096 + 11, r * 4096 + 12]);
+        }
+        q
+    }
+
+    #[test]
+    fn export_restore_round_trips_identically() {
+        let (src, table) = populated_tree();
+        let (worker_table, nodes) = src.export_snapshot();
+
+        // The worker table must cover exactly the carriers in the tree.
+        let exported: HashSet<KvWorkerId> = worker_table.iter().cloned().collect();
+        assert_eq!(exported, table.iter().cloned().collect::<HashSet<_>>());
+
+        let dst = HashTree::new();
+        let applied = dst.restore_snapshot(&worker_table, &nodes).unwrap();
+        assert_eq!(applied, nodes.len());
+
+        assert_eq!(
+            dst.node_count(),
+            src.node_count(),
+            "restored tree must have the same node count",
+        );
+        for q in probe_queries() {
+            let want = src.match_prefix(None, &q);
+            let got = dst.match_prefix(None, &q);
+            assert_eq!(
+                (got.matched_blocks, got.workers()),
+                (want.matched_blocks, want.workers()),
+                "match_prefix diverged for {q:?}",
+            );
+        }
+    }
+
+    /// Occupancy must survive the round trip too. It is booked incrementally
+    /// per chunk, so a restore that placed the tier bits but skipped the
+    /// booking would pass every `match_prefix` assertion above and still
+    /// report the worker as publishing nothing on `/metrics`.
+    #[test]
+    fn export_restore_round_trips_occupancy() {
+        let (src, _) = populated_tree();
+        let (worker_table, nodes) = src.export_snapshot();
+        let dst = HashTree::new();
+        dst.restore_snapshot(&worker_table, &nodes).unwrap();
+
+        assert_eq!(dst.tier_occupancy(), src.tier_occupancy());
+        assert_eq!(dst.tier_occupancy(), dst.debug_recount_occupancy());
+        assert_eq!(dst.accounting_errors(), [0, 0]);
+    }
+
+    /// A restore must be exact even when a carrier was dropped from an
+    /// interior node but still holds a descendant — the state a `BlockRemoved`
+    /// for a mid-chain hash produces, and the case a chain-replay through
+    /// `insert` would silently "repair" by re-adding the ancestor.
+    #[test]
+    fn export_restore_preserves_interior_carrier_gaps() {
+        let src = HashTree::new();
+        let a = worker("http://a", 0);
+        src.insert(&a, None, &[10, 20, 30]);
+        // Drop the middle block only. Node 20 survives because it has a child.
+        src.remove(&a, &[20]);
+        assert!(!src.match_prefix(None, &[10, 20]).workers().contains(&a));
+
+        let (worker_table, nodes) = src.export_snapshot();
+        let dst = HashTree::new();
+        dst.restore_snapshot(&worker_table, &nodes).unwrap();
+
+        assert_eq!(dst.node_count(), src.node_count());
+        for q in [vec![10], vec![10, 20], vec![10, 20, 30]] {
+            let want = src.match_prefix(None, &q);
+            let got = dst.match_prefix(None, &q);
+            assert_eq!(
+                (got.matched_blocks, got.workers()),
+                (want.matched_blocks, want.workers()),
+                "interior carrier gap not preserved for {q:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn export_of_empty_tree_is_empty() {
+        let tree = HashTree::new();
+        let (worker_table, nodes) = tree.export_snapshot();
+        assert!(worker_table.is_empty());
+        assert!(nodes.is_empty());
+
+        let dst = HashTree::new();
+        assert_eq!(dst.restore_snapshot(&worker_table, &nodes).unwrap(), 0);
+        assert_eq!(dst.node_count(), 0);
+    }
+
+    #[test]
+    fn export_emits_only_backward_parent_references() {
+        let (src, _) = populated_tree();
+        let (_, nodes) = src.export_snapshot();
+        assert!(!nodes.is_empty());
+        for (i, rec) in nodes.iter().enumerate() {
+            if let Some(p) = rec.parent {
+                assert!(
+                    (p as usize) < i,
+                    "record {i} references parent {p}, not a backward reference",
+                );
+            }
+        }
+    }
+
+    /// Both passes release the tree lock every `SNAPSHOT_LOCK_CHUNK` records,
+    /// so the boundary is a real seam in the walk. A tree several chunks deep
+    /// must round-trip across it, including the parent references that span
+    /// two chunks.
+    #[test]
+    fn export_restore_round_trips_across_lock_chunks() {
+        let src = HashTree::new();
+        let a = worker("http://a", 0);
+        // One deep chain, so nearly every record's parent is the record
+        // before it and a chunk boundary always falls mid-chain.
+        let deep: Vec<i64> = (1..=(SNAPSHOT_LOCK_CHUNK as i64 * 2 + 37)).collect();
+        src.insert(&a, None, &deep);
+        assert!(src.node_count() > SNAPSHOT_LOCK_CHUNK * 2);
+
+        let (worker_table, nodes) = src.export_snapshot();
+        assert_eq!(nodes.len(), src.node_count());
+        let dst = HashTree::new();
+        assert_eq!(
+            dst.restore_snapshot(&worker_table, &nodes).unwrap(),
+            nodes.len(),
+        );
+
+        assert_eq!(dst.node_count(), src.node_count());
+        let m = dst.match_prefix(None, &deep);
+        assert_eq!(m.matched_blocks, deep.len());
+        assert_eq!(m.workers(), workers(&[&a]));
+        assert_eq!(dst.tier_occupancy(), src.tier_occupancy());
+    }
+
+    #[test]
+    fn restore_rejects_forward_parent_reference() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let nodes = vec![
+            SnapshotNode {
+                parent: Some(1), // forward
+                block_hash: 1,
+                workers: vec![0],
+                tiers: vec![],
+            },
+            SnapshotNode {
+                parent: None,
+                block_hash: 2,
+                workers: vec![0],
+                tiers: vec![],
+            },
+        ];
+        assert_eq!(
+            tree.restore_snapshot(&[a], &nodes),
+            Err(RestoreError::ForwardParentReference { index: 0 }),
+        );
+        // Rejected before any mutation.
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    #[test]
+    fn restore_rejects_self_parent_reference() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let nodes = vec![SnapshotNode {
+            parent: Some(0),
+            block_hash: 1,
+            workers: vec![0],
+            tiers: vec![],
+        }];
+        assert_eq!(
+            tree.restore_snapshot(&[a], &nodes),
+            Err(RestoreError::ForwardParentReference { index: 0 }),
+        );
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    #[test]
+    fn restore_rejects_out_of_range_worker_index() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let nodes = vec![
+            SnapshotNode {
+                parent: None,
+                block_hash: 1,
+                workers: vec![0],
+                tiers: vec![],
+            },
+            SnapshotNode {
+                parent: Some(0),
+                block_hash: 2,
+                workers: vec![7], // table has one entry
+                tiers: vec![],
+            },
+        ];
+        assert_eq!(
+            tree.restore_snapshot(&[a], &nodes),
+            Err(RestoreError::WorkerIndexOutOfRange {
+                index: 1,
+                worker: 7
+            }),
+        );
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    #[test]
+    fn restore_rejects_tiers_that_do_not_pair_with_workers() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1],
+            tiers: vec![Tiers::HOST.bits()], // one entry for two carriers
+        }];
+        assert_eq!(
+            tree.restore_snapshot(&[a, b], &nodes),
+            Err(RestoreError::TierTableMismatch { index: 0 }),
+        );
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    /// Tiers survive an export → restore round trip per carrier, so a replica
+    /// bootstrapped from a warm peer ranks device and host owners the same way
+    /// the peer did.
+    #[test]
+    fn snapshot_round_trip_preserves_tiers_per_carrier() {
+        let src = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        src.insert_tiered(&a, None, &[1, 2], Tiers::DEVICE);
+        src.insert_tiered(&a, None, &[1, 2], Tiers::HOST);
+        src.insert_tiered(&b, None, &[1, 2], Tiers::HOST);
+
+        let (table, nodes) = src.export_snapshot();
+        for n in &nodes {
+            assert_eq!(n.tiers.len(), n.workers.len(), "tiers pair with workers");
+        }
+        let dst = HashTree::new();
+        dst.restore_snapshot(&table, &nodes).unwrap();
+
+        let m = dst.match_prefix(None, &[1, 2]);
+        assert_eq!(m.workers(), workers(&[&a, &b]));
+        assert_eq!(
+            m.device_workers(),
+            workers(&[&a]),
+            "b was host-only on the peer",
+        );
+    }
+
+    /// A snapshot from a producer that predates tiers carries no `tiers`; its
+    /// carriers restore as device owners, which is what its `workers` list
+    /// meant when it was written.
+    #[test]
+    fn legacy_snapshot_without_tiers_restores_as_device() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0],
+            tiers: vec![],
+        }];
+        tree.restore_snapshot(std::slice::from_ref(&a), &nodes)
+            .unwrap();
+        assert_eq!(
+            tree.match_prefix(None, &[1]).device_workers(),
+            workers(&[&a]),
+        );
+    }
+
+    /// A carrier naming only tiers this build does not rank is dropped, not
+    /// folded onto device. Folding would make a future tier's carrier a
+    /// preferred device owner here — the same trade `Tiers::for_store` makes
+    /// for an unknown `medium`, and for the same reason.
+    #[test]
+    fn restore_drops_a_carrier_that_names_no_known_tier() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let unknown = !Tiers::ALL.bits(); // every bit this build has no name for
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1],
+            tiers: vec![Tiers::HOST.bits(), unknown],
+        }];
+        tree.restore_snapshot(&[a.clone(), b], &nodes).unwrap();
+
+        let m = tree.match_prefix(None, &[1]);
+        assert_eq!(m.workers(), workers(&[&a]), "b held no tier we rank");
+        assert!(tree.debug_no_empty_carrier());
+        assert_eq!(tree.accounting_errors(), [0, 0]);
+    }
+
+    /// A carrier holding a known tier AND an unknown one keeps the known half
+    /// rather than being dropped outright.
+    #[test]
+    fn restore_keeps_the_known_half_of_a_mixed_tier_entry() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let mixed = Tiers::HOST.bits() | !Tiers::ALL.bits();
+        let nodes = vec![SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0],
+            tiers: vec![mixed],
+        }];
+        tree.restore_snapshot(std::slice::from_ref(&a), &nodes)
+            .unwrap();
+
+        let m = tree.match_prefix(None, &[1]);
+        assert_eq!(m.workers(), workers(&[&a]));
+        assert!(
+            m.device_workers().is_empty(),
+            "the unknown bit must not read as device",
+        );
+    }
+
+    /// `retain_carriers` is the only correct way to filter a record's
+    /// carriers: workers and tiers are parallel by index, so dropping a worker
+    /// must drop its tier entry, not shift a neighbour's onto it.
+    #[test]
+    fn retain_carriers_keeps_tiers_aligned() {
+        let mut rec = SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1, 2],
+            tiers: vec![Tiers::DEVICE.bits(), Tiers::HOST.bits(), Tiers::ALL.bits()],
+        };
+        // Drop worker 1, renumber 2 → 1.
+        rec.retain_carriers(|w| match w {
+            0 => Some(0),
+            2 => Some(1),
+            _ => None,
+        });
+        assert_eq!(rec.workers, vec![0, 1]);
+        assert_eq!(rec.tiers, vec![Tiers::DEVICE.bits(), Tiers::ALL.bits()]);
+
+        // A legacy record stays legacy: no tiers are invented.
+        let mut legacy = SnapshotNode {
+            parent: None,
+            block_hash: 1,
+            workers: vec![0, 1],
+            tiers: vec![],
+        };
+        legacy.retain_carriers(|w| (w == 1).then_some(0));
+        assert_eq!(legacy.workers, vec![0]);
+        assert!(legacy.tiers.is_empty());
+    }
+
+    /// Restoring onto a tree that already holds live state must union
+    /// carriers, not duplicate nodes — the steady-state case when a rank's
+    /// buffered events land before its snapshot.
+    #[test]
+    fn restore_onto_populated_tree_unions_carriers() {
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+
+        let src = HashTree::new();
+        src.insert(&a, None, &[1, 2, 3]);
+        let (worker_table, nodes) = src.export_snapshot();
+
+        let dst = HashTree::new();
+        dst.insert(&b, None, &[1, 2, 3]);
+        let before = dst.node_count();
+        dst.restore_snapshot(&worker_table, &nodes).unwrap();
+
+        assert_eq!(dst.node_count(), before, "restore must not duplicate nodes");
+        let m = dst.match_prefix(None, &[1, 2, 3]);
+        assert_eq!(m.matched_blocks, 3);
+        assert_eq!(m.workers(), workers(&[&a, &b]));
+        assert_eq!(dst.tier_occupancy(), dst.debug_recount_occupancy());
+    }
+
+    /// Re-restoring the same snapshot must not double-book occupancy: the
+    /// second pass adds no tier bits, so `add_tiers` returns nothing and the
+    /// chunk's booking stays at zero.
+    #[test]
+    fn restore_is_idempotent() {
+        let (src, _) = populated_tree();
+        let (worker_table, nodes) = src.export_snapshot();
+        let dst = HashTree::new();
+        dst.restore_snapshot(&worker_table, &nodes).unwrap();
+        let after_first = dst.tier_occupancy();
+        dst.restore_snapshot(&worker_table, &nodes).unwrap();
+
+        assert_eq!(dst.node_count(), src.node_count());
+        assert_eq!(dst.tier_occupancy(), after_first);
+        assert_eq!(dst.tier_occupancy(), dst.debug_recount_occupancy());
+    }
+
+    /// The JSON wire tolerates a record written before `tiers` existed.
+    #[test]
+    fn snapshot_node_deserialises_without_tiers() {
+        let rec: SnapshotNode =
+            serde_json::from_str(r#"{"parent":null,"block_hash":7,"workers":[0]}"#).unwrap();
+        assert_eq!(rec.block_hash, 7);
+        assert_eq!(rec.workers, vec![0]);
+        assert!(rec.tiers.is_empty());
     }
 }
