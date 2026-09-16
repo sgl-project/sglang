@@ -16,8 +16,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.utils import (
-    get_dsv41_spec_layout,
     get_dsv4_request_state_indices,
+    get_dsv41_spec_layout,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_context
@@ -32,7 +32,7 @@ def make_layout():
         mla_compression_ratios=[0, 2, 1],
         kv_layer_ids=[1, 2],
         kv_item_lens=[512, 1024],
-        state_types=[StateType.SWA, StateType.C128_STATE, StateType.SWA],
+        state_types=[StateType.SWA, StateType.DSV4_REQUEST_STATE, StateType.SWA],
         state_item_lens=[[512], [32768], [512]],
     )
     with get_context().override_server_args(
@@ -89,6 +89,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             enable_hisparse=False,
             enable_unified_memory=False,
             enable_two_batch_overlap=False,
+            dsv4_attn_backend="triton",
             enable_dp_attention=True,
             enable_prefill_cp=True,
             enable_prefill_context_parallel=False,
@@ -283,7 +284,10 @@ class TestDSV41DSparkPD(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.vision = torch.nn.Identity()
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: False,
+                is_target_verify=lambda: False,
+            ),
             mm_inputs=[object()],
         )
         with (
@@ -378,7 +382,7 @@ class TestDSV41DSparkPD(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.deepseek_v4.is_cp_v2_active",
+                "sglang.srt.models.deepseek_v4.is_cp_active",
                 return_value=True,
             ),
             patch(
@@ -473,7 +477,7 @@ class TestDSV41DSparkPD(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.deepseek_v4.is_cp_v2_active",
+                "sglang.srt.models.deepseek_v4.is_cp_active",
                 return_value=True,
             ),
             patch(
@@ -481,7 +485,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                 return_value=torch.tensor([0, 2, 4, 6]),
             ),
             patch(
-                "sglang.srt.models.deepseek_v4.cp_round_robin_input_ids_v2",
+                "sglang.srt.models.deepseek_v4.cp_interleave_input_ids",
                 return_value=tail_global_input_ids,
             ) as reorder,
             patch(
@@ -561,7 +565,13 @@ class TestDSV41DSparkPD(CustomTestCase):
         with (
             patch(
                 "sglang.srt.model_executor.runner.eager_runner.cp_shard_model_inputs",
-                return_value=nullcontext((torch.ones(2, 4), forward_batch.positions)),
+                return_value=nullcontext(
+                    (
+                        torch.ones(2, 4),
+                        forward_batch.positions,
+                        forward_batch.input_ids,
+                    )
+                ),
             ),
             patch(
                 "sglang.srt.model_executor.runner.eager_runner.cp_gather_after_forward",
@@ -573,7 +583,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             ),
             patch("torch.cuda.current_stream", return_value=Mock()),
         ):
-            result = EagerRunner._execute_extend_cp_v2(
+            result = EagerRunner._execute_extend_cp(
                 runner,
                 forward_batch,
                 {"input_embeds": torch.ones(2, 4)},
