@@ -145,6 +145,13 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        # Fake-transfer warmups must not enter the shared radix tree, but a
+        # chunked request still needs its own completed KV on the next round.
+        # Keep cache_protected_len unchanged: these slots remain request-owned.
+        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(req.get_fill_ids())
+        ]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

@@ -915,9 +915,20 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
+            # Prefill CP factors the same model TP group into attention TP
+            # and CP ranks. MLA KV/state rows remain replicated over
+            # attention heads; the layout check above verifies their byte sizes,
+            # and rank mapping below pulls every CP shard into each decode rank.
+            same_tp_with_prefill_cp = (
+                info.attn_cp_size > 1
+                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+                and self.attn_cp_size == 1
+                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
+            )
+            if info.attn_tp_size != self.attn_tp_size and not same_tp_with_prefill_cp:
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
+                    "servers (including prefill CP ranks for MLA)"
                 )
 
         if self.dcp_size > 1:
