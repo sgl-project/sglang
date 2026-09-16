@@ -308,33 +308,21 @@ Reports start with the saved suite, streaming output mode, commit, backend, and
 check totals, then group diagnostics by test case. Each case shows its request,
 response validation, Python and Rust repeatability, parity, and related case
 equivalence. A valid response and a stable implementation can still disagree
-with the other implementation. For example, this excerpt shows one difference
-from a case with eight missing fields:
+with the other implementation. Default CLI output uses five lines per case:
 
 ```text
-greedy_stream
-POST /generate · SSE · cumulative · expected HTTP 200
-
-  Response validation       PASS  4/4 passed · 0 invalid · 0 unavailable/pending
-  python repeatability      PASS  0 differences
-  rust repeatability        PASS  0 differences
-  Python <-> Rust parity    FAIL  8 differences
-  With greedy_json (python) PASS  0 differences
-  With greedy_json (rust)   PASS  0 differences
-
-  Python <-> Rust parity · greedy_stream
-  Rust is missing fields present in Python (8 differences)
-  Compared: python / greedy_stream / attempt 1 <-> rust / greedy_stream / attempt 1
-
-  /meta_info/cached_tokens
-    Python: 0
-    Rust: <missing>
-
-  Details: <run-directory>/report.html#case-1
+greedy_stream · POST /generate · SSE · cumulative · expected HTTP 200
+  Response PASS · Repeat Python PASS / Rust PASS
+  Parity FAIL: 8 missing in Rust
+  Equivalence: 2/2 passed
+  Details: --case greedy_stream · report.html#case-1
 ```
 
-The default terminal output lists every difference path for failing checks;
-only long values are truncated at 120 characters, with an explicit marker.
+The compact view includes check statuses, a short parity reason, and a detail
+pointer. Long reason previews are explicitly marked as truncated; complete
+field differences, response diagnostics, and evidence remain available through
+`--case <name>` and HTML. Each case's HTML anchor refers to the report linked at
+the end of the CLI output. Long names and paths may wrap in narrow terminals.
 Parity difference counts exclude repeatability and equivalence differences.
 Equivalence is linked from both related cases but counted once; its HTML details
 live under the recorded left-hand case. Counts describe difference occurrences,

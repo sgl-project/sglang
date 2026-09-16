@@ -78,7 +78,7 @@ impl Comparison<'_> {
         }
     }
 
-    fn reasons(&self) -> Vec<String> {
+    fn difference_counts(&self) -> impl Iterator<Item = (DifferenceKind, usize)> + '_ {
         [
             DifferenceKind::MissingLeft,
             DifferenceKind::MissingRight,
@@ -93,9 +93,27 @@ impl Comparison<'_> {
                 .iter()
                 .filter(|d| d.kind == kind)
                 .count();
-            (count > 0).then(|| format!("{} ({count} differences)", self.reason(kind)))
+            (count > 0).then_some((kind, count))
         })
-        .collect()
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.difference_counts()
+            .map(|(kind, count)| format!("{} ({count} differences)", self.reason(kind)))
+            .collect()
+    }
+
+    fn short_reason(&self) -> String {
+        let [left, right] = self.labels();
+        self.difference_counts()
+            .map(|(kind, count)| match kind {
+                DifferenceKind::MissingLeft => format!("{count} missing in {left}"),
+                DifferenceKind::MissingRight => format!("{count} missing in {right}"),
+                DifferenceKind::TypeMismatch => format!("{count} type mismatches"),
+                DifferenceKind::ValueMismatch => format!("{count} value mismatches"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -255,7 +273,10 @@ impl<'a> ReportView<'a> {
         for (label, value) in self.totals() {
             writeln!(out, "{label:<26} {value}").unwrap();
         }
-        out.push_str("\nResponse validation checks each response; repeatability checks two runs of one implementation.\nParity compares Python with Rust; equivalence compares declared related cases.\nDifferences count occurrences, not independent bugs.\n<missing> = absent field; null = present null; <unavailable> = missing evidence.\n");
+        out.push_str("\nUse --case <name> or HTML for full differences and evidence.\n");
+        if case.is_some() {
+            out.push_str("<missing> = absent field; null = present null; <unavailable> = missing evidence.\n");
+        }
         for message in self.run_diagnostics() {
             writeln!(out, "\nRun diagnostic: {}", plain(&message)).unwrap();
         }
@@ -264,6 +285,10 @@ impl<'a> ReportView<'a> {
             if case.is_some_and(|name| name != result.name) {
                 continue;
             }
+            let Some(files) = &files else {
+                self.terminal_case_summary(&mut out, result, index, color);
+                continue;
+            };
             let title = plain(&result.name);
             writeln!(
                 out,
@@ -306,23 +331,7 @@ impl<'a> ReportView<'a> {
                 writeln!(out, "\n  {}", plain(&message)).unwrap();
             }
             for comparison in comparisons {
-                let detailed = files.is_some();
-                if !detailed && comparison.check.status == Status::Pass {
-                    continue;
-                }
-                if !detailed
-                    && comparison.kind == CheckKind::Equivalence
-                    && comparison.left.case != result.name
-                {
-                    writeln!(
-                        out,
-                        "\n  Equivalence details: report.html#{}",
-                        comparison.id
-                    )
-                    .unwrap();
-                    continue;
-                }
-                self.terminal_comparison(&mut out, comparison, files.as_ref());
+                self.terminal_comparison(&mut out, comparison, files);
             }
             writeln!(
                 out,
@@ -341,11 +350,96 @@ impl<'a> ReportView<'a> {
         Ok(out)
     }
 
+    fn terminal_case_summary(
+        &self,
+        out: &mut String,
+        case: &CaseResult,
+        index: usize,
+        color: bool,
+    ) {
+        let title = plain(&case.name);
+        writeln!(
+            out,
+            "\n{} · {}",
+            if color {
+                format!("\x1b[1m{title}\x1b[0m")
+            } else {
+                title
+            },
+            plain(&self.case_description(&case.name))
+        )
+        .unwrap();
+        let repeat = |side: &str| {
+            terminal_status(
+                status(
+                    case.implementations
+                        .get(side)
+                        .map(|s| s.repeatability.status)
+                        .unwrap_or(Status::NotRun),
+                ),
+                color,
+            )
+        };
+        let validation = Validation::for_cases(std::iter::once(case));
+        writeln!(
+            out,
+            "  Response {} · Repeat Python {} / Rust {}",
+            terminal_status(status(validation.status()), color),
+            repeat("python"),
+            repeat("rust")
+        )
+        .unwrap();
+        let comparisons = self.case_comparisons(&case.name);
+        let reason = comparisons
+            .iter()
+            .find(|c| c.kind == CheckKind::Parity)
+            .map(|c| {
+                self.check_diagnostic(c)
+                    .map(|s| {
+                        s.strip_prefix("Comparison skipped: ")
+                            .unwrap_or(s)
+                            .to_owned()
+                    })
+                    .unwrap_or_else(|| c.short_reason())
+            })
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "  Parity {}{}",
+            terminal_status(status(case.parity.status), color),
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", clipped(&reason, 45))
+            }
+        )
+        .unwrap();
+        let mut equivalent = comparisons
+            .iter()
+            .filter(|c| c.kind == CheckKind::Equivalence)
+            .peekable();
+        let mut summary = if equivalent.peek().is_none() {
+            "not configured".into()
+        } else {
+            counts(equivalent.map(|c| c.check.status))
+        };
+        for value in STATUSES {
+            summary = summary.replace(status(value), &terminal_status(status(value), color));
+        }
+        writeln!(out, "  Equivalence: {summary}").unwrap();
+        writeln!(
+            out,
+            "  Details: --case {} · report.html#case-{index}",
+            plain(&case.name)
+        )
+        .unwrap();
+    }
+
     fn terminal_comparison(
         &self,
         out: &mut String,
         comparison: &Comparison<'_>,
-        files: Option<&JsonFiles>,
+        files: &JsonFiles,
     ) {
         writeln!(
             out,
@@ -378,11 +472,7 @@ impl<'a> ReportView<'a> {
             .zip(&labels)
             {
                 let rule = value.and_then(|_| self.exception(side.case, &difference.path));
-                let text = if files.is_some() {
-                    plain(&value_text(value))
-                } else {
-                    short_value(value)
-                };
+                let text = plain(&value_text(value));
                 writeln!(
                     out,
                     "    {}: {text}{}",
@@ -394,37 +484,32 @@ impl<'a> ReportView<'a> {
                     }
                 )
                 .unwrap();
-                if let Some(files) = files {
-                    writeln!(
-                        out,
-                        "      reconstructed: {}",
-                        plain(&self.original(side, &difference.path, files))
-                    )
-                    .unwrap();
-                    if let Some(indices) = Self::sources(side, &difference.path) {
-                        writeln!(out, "      source event indices (zero-based): {indices:?}")
-                            .unwrap();
-                    }
-                    if let Some(rule) = rule {
-                        writeln!(out, "      value exception: {}", plain(rule)).unwrap();
-                    }
+                writeln!(
+                    out,
+                    "      reconstructed: {}",
+                    plain(&self.original(side, &difference.path, files))
+                )
+                .unwrap();
+                if let Some(indices) = Self::sources(side, &difference.path) {
+                    writeln!(out, "      source event indices (zero-based): {indices:?}").unwrap();
+                }
+                if let Some(rule) = rule {
+                    writeln!(out, "      value exception: {}", plain(rule)).unwrap();
                 }
             }
         }
-        if files.is_some() {
-            for side in [comparison.left, comparison.right] {
-                for (label, path) in self.evidence_paths(side) {
-                    if let Some(relative) = self.relative(&path) {
-                        let path = self.directory.join(relative);
-                        writeln!(
-                            out,
-                            "  {} {label}: {}{}",
-                            plain(&side.label()),
-                            plain(&path.display().to_string()),
-                            if path.is_file() { "" } else { " (unavailable)" }
-                        )
-                        .unwrap();
-                    }
+        for side in [comparison.left, comparison.right] {
+            for (label, path) in self.evidence_paths(side) {
+                if let Some(relative) = self.relative(&path) {
+                    let path = self.directory.join(relative);
+                    writeln!(
+                        out,
+                        "  {} {label}: {}{}",
+                        plain(&side.label()),
+                        plain(&path.display().to_string()),
+                        if path.is_file() { "" } else { " (unavailable)" }
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -1092,10 +1177,6 @@ fn value_text(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "<missing>".into())
 }
 
-fn short_value(value: Option<&Value>) -> String {
-    clipped(&value_text(value), 120)
-}
-
 fn plain(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for character in value.chars() {
@@ -1263,9 +1344,8 @@ mod tests {
             "0/2 passed · 2 FAIL",
             "0/1 passed · 1 FAIL",
             "2 FAIL · 4 differences",
-            "Rust is missing fields present in Python (2 differences)",
-            "stream is missing fields present in json (1 differences)",
-            "Python: null\n    Rust: <missing>",
+            "Parity FAIL: 2 missing in Rust",
+            "Equivalence: 0/1 passed · 1 FAIL",
             "Streaming mode: Unavailable",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
@@ -1273,7 +1353,14 @@ mod tests {
         assert!(!text.contains('\x1b'));
         assert!(!text.contains("WHY CHECKS DIFFER"));
         assert!(!text.contains("reconstructed: <unavailable>"));
-        assert_eq!(text.matches("\n  /time\n").count(), 3);
+        assert!(!text.contains("\n  /time\n"));
+        for case in &report.cases {
+            let block = text
+                .split("\n\n")
+                .find(|block| block.starts_with(&format!("{} · ", case.name)))
+                .unwrap();
+            assert_eq!(block.lines().count(), 5, "{block}");
+        }
         let html = view.html();
         assert_eq!(html.matches("id=\"equivalence-0\"").count(), 1);
         assert_eq!(html.matches("href=\"#equivalence-0\"").count(), 2);
@@ -1293,13 +1380,12 @@ mod tests {
             expanded.contains("Compared: rust / stream / attempt 1 <-> rust / stream / attempt 2")
         );
         assert!(expanded.contains("reconstructed: <unavailable>"));
+        assert!(expanded.contains("Python: null\n"));
+        assert!(expanded.contains("stream is missing fields present in json (1 differences)"));
         for (kind, message) in [
-            (DifferenceKind::ValueMismatch, "Field values differ"),
-            (DifferenceKind::TypeMismatch, "Field types differ"),
-            (
-                DifferenceKind::MissingLeft,
-                "Python is missing fields present in Rust",
-            ),
+            (DifferenceKind::ValueMismatch, "1 value mismatches"),
+            (DifferenceKind::TypeMismatch, "1 type mismatches"),
+            (DifferenceKind::MissingLeft, "1 missing in Python"),
         ] {
             let mut report = recorded();
             report.cases[0].parity.differences[0].kind = kind;
@@ -1411,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_preserves_all_paths_and_full_selected_values_with_safe_styling() {
+    fn compact_summaries_and_complete_selected_values_keep_safe_styling() {
         let mut report = recorded();
         let long = "語".repeat(160);
         report.cases[0].parity.differences = (0..5)
@@ -1427,9 +1513,10 @@ mod tests {
         let text = view.terminal(None, false).unwrap();
         let selected = view.terminal(Some("json"), false).unwrap();
         for difference in &report.cases[0].parity.differences {
-            assert!(text.contains(&difference.path));
+            assert!(!text.contains(&difference.path));
+            assert!(selected.contains(&difference.path));
         }
-        assert!(text.contains("[truncated]"));
+        assert!(text.contains("5 value mismatches"));
         assert!(!selected.contains("[truncated]"));
         assert!(selected.contains(&format!("Python: \"{long}\"")));
         assert!(!text.contains('\x1b'));
@@ -1480,7 +1567,29 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected}");
         }
-        assert_eq!(text.matches("bad type").count(), 1);
+        assert!(text.contains("a required response failed validation"));
+        let view = ReportView::new(&report, directory.path());
+        assert_eq!(
+            view.terminal(Some("json"), false)
+                .unwrap()
+                .matches("bad type")
+                .count(),
+            1
+        );
+        for state in STATUSES {
+            report.cases[0].parity.status = state;
+            let text = ReportView::new(&report, directory.path())
+                .terminal(None, false)
+                .unwrap();
+            let block = text
+                .split("\n\n")
+                .find(|block| block.starts_with("json · "))
+                .unwrap();
+            assert_eq!(block.lines().count(), 5, "{block}");
+            assert!(block.contains(&format!("Parity {}", status(state))));
+            assert!(block.contains("Response FAIL"));
+            assert!(block.contains("Python UNSTABLE"));
+        }
         assert_eq!(url_path(Path::new("a #?\"/b.json")), "a%20%23%3F%22/b.json");
         assert_eq!(plain("case\x1b[31m\n"), "case\\u{1b}[31m\\n");
         assert!(clipped(&"語".repeat(121), 120).ends_with("[truncated]"));
