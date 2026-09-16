@@ -573,10 +573,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 "target-verify cuda-graph replay requires host-resident seq_lens_cpu"
             )
             ndt = spec_info.draft_token_num
+            is_dflash_verify = (
+                spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            )
             self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
                 0, (bs + 1) * ndt, ndt, dtype=torch.int32
             )
-            self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
+            if is_dflash_verify:
+                # DFlash invariant: seq_lens_cpu already includes draft_token_num
+                # (added host-side before prepare_for_verify). Do not add ndt again.
+                self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs].to(torch.int32)
+            else:
+                self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
             self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 self.fast_plan_kv_len_arr_cpu[:bs], dim=0
             )
@@ -633,7 +641,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         ``.to("cpu")`` copies per call (qo_indptr / kv_indptr / kv_len_arr); on
         the graph-replay hot path each of those drains the whole GPU queue and
         stalls the scheduler CPU behind the in-flight draft graph. All three
-        arrays are host-derivable, so we feed ``fast_mla_decode_plan`` directly.
+        arrays are host-derivable, so we feed ``fast_mla_dflash_verify_plan``
+        directly.
+
+        Returns slices of the static ``fast_plan_*_cpu`` pinned buffers (filled
+        by ``_apply_cuda_graph_metadata`` just before this call) rather than
+        freshly allocated CPU tensors, so the verify hot path does not pay a
+        per-step ``torch.zeros`` / ``torch.arange`` allocation.
 
         Returns None when the slow (device-fed) plan must run instead: at
         capture (the real plan() populates ``_cached_module`` and the wrapper's
@@ -662,17 +676,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return None
         if get_parallel().dcp_enabled:
             return None
-        draft_token_num = int(spec_info.draft_token_num)
-        kv_len_arr_cpu = seq_lens_cpu[:bs].to(torch.int32)
-        kv_indptr_cpu = torch.zeros(bs + 1, dtype=torch.int32)
-        torch.cumsum(kv_len_arr_cpu, dim=0, out=kv_indptr_cpu[1:])
-        qo_indptr_cpu = torch.arange(
-            0, (bs + 1) * draft_token_num, draft_token_num, dtype=torch.int32
-        )
         return {
-            "qo_indptr_cpu": qo_indptr_cpu,
-            "kv_indptr_cpu": kv_indptr_cpu,
-            "kv_len_arr_cpu": kv_len_arr_cpu,
+            "qo_indptr_cpu": self.fast_plan_qo_indptr_cpu[: bs + 1],
+            "kv_indptr_cpu": self.fast_plan_kv_indptr_cpu[: bs + 1],
+            "kv_len_arr_cpu": self.fast_plan_kv_len_arr_cpu[:bs],
             "kv_indices_buf": self.cuda_graph_kv_indices,
         }
 
@@ -1110,7 +1117,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 causal=True,
             )
         elif fast_verify_plan_kwargs is not None:
-            fast_mla_decode_plan(
+            fast_mla_dflash_verify_plan(
                 wrapper_paged,
                 fast_verify_plan_kwargs["qo_indptr_cpu"],
                 fast_verify_plan_kwargs["kv_indptr_cpu"],
@@ -1413,3 +1420,55 @@ def fast_mla_prefill_plan(
         )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA prefill plan: {e}")
+
+
+def fast_mla_dflash_verify_plan(
+    self,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+    num_heads: int,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    page_size: int,
+    causal: bool,
+    sm_scale: float,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+) -> None:
+    """Sync-free plan for DFlash-family TARGET_VERIFY cuda-graph replay.
+
+    Like ``fast_mla_prefill_plan``, but skips the ``kv_indices`` device copy:
+    DFlash's ``generate_attn_arg_prefill(..., kv_indices_buf=...)`` already
+    writes page indices straight into the capture-stable
+    ``cuda_graph_kv_indices`` buffer, and ``kv_indices`` IS that buffer — a
+    ``copy_`` would be a full-buffer self-copy (``max_bs * max_context_len``)
+    with no benefit.
+
+    Still refreshes the small host-derived bound buffers (qo/kv indptr,
+    kv_len_arr, each O(bs)) so the wrapper's device mirrors stay in sync with
+    the static pinned ``fast_plan_*_cpu`` arrays filled by
+    ``_apply_cuda_graph_metadata``.
+    """
+    self._causal = causal
+    self._page_size = page_size
+    self._sm_scale = sm_scale
+    self._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=True)
+    self._kv_indptr_buf.copy_(kv_indptr_cpu, non_blocking=True)
+    self._kv_len_arr_buf.copy_(kv_len_arr_cpu, non_blocking=True)
+
+    try:
+        self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA dflash verify plan: {e}")
