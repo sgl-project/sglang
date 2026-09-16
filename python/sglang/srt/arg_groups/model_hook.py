@@ -885,6 +885,13 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
     if not view.uses_mamba_radix_cache:
+        # extra_buffer arms mamba-only ping-pong buffers that crash on a None
+        # buffer at decode. auto/no_buffer stay inert on a non-mamba arch.
+        if view.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy"):
+            raise ValueError(
+                f"--mamba-radix-cache-strategy={view.mamba_radix_cache_strategy} needs a model "
+                f"with mamba state, but {model_arch} has none. Use 'auto' (default) or 'no_buffer'."
+            )
         return
 
     if mamba_extra_buffer_of(view):
