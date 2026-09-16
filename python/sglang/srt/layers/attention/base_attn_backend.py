@@ -157,6 +157,9 @@ class AttentionBackend(ABC):
     # the EXTEND graph is a known serving-performance regression.
     prefer_eager_mixed_prefill_under_dp_attention: bool = False
 
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""
