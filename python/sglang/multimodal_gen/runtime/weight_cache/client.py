@@ -88,8 +88,7 @@ class WeightCacheClient:
         validate_response(response)
         return response
 
-    def manifest(self, expected_generation=None):
-        response = self.request("query_manifest")
+    def _validated_generation(self, response):
         if response["compatibility"] != self.plan.to_dict():
             raise ValueError(
                 f"Weight-cache compatibility mismatch: {plan_diff(self.plan.to_dict(), response['compatibility'])}"
@@ -99,6 +98,20 @@ class WeightCacheClient:
             raise ValueError(
                 "Weight-cache producer differs from authenticated socket peer"
             )
+        return generation
+
+    def status(self):
+        response = self.request("query_status")
+        self._validated_generation(response)
+        return {
+            "compatibility_digest": self.plan.digest,
+            "generation": response["generation"],
+            **response["cache_status"],
+        }
+
+    def manifest(self, expected_generation=None):
+        response = self.request("query_manifest")
+        generation = self._validated_generation(response)
         if expected_generation is not None and generation != expected_generation:
             raise ValueError("Weight-cache generation changed after launcher admission")
         manifest = StateManifest.from_dict(response["manifest"])

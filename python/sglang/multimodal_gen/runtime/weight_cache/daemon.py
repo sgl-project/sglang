@@ -5,6 +5,7 @@ Run with ``python -m sglang.multimodal_gen.runtime.weight_cache.daemon
 --model-path ...``. Scope is one resident, explicitly admitted native DiT.
 """
 
+import argparse
 import dataclasses
 import fcntl
 import hashlib
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.server_args import prepare_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.weight_cache.client import (
     PROTOCOL,
+    WeightCacheClient,
     decode_generation,
     peer_identity,
 )
@@ -97,6 +99,20 @@ class DiffusionWeightCacheDaemon:
             )
         generation = self.exporter.generation
         kind = request.get("type")
+        if kind == "query_status":
+            # Observation never exports handles, registers a consumer, or
+            # admits a worker. It remains available after budget exhaustion.
+            stats = self.exporter.stats()
+            return {
+                "compatibility": self.plan.to_dict(),
+                "generation": dataclasses.asdict(generation),
+                "cache_status": {
+                    **stats,
+                    "active_consumers": sum(p.is_alive() for p in self.consumers),
+                    "accepting_fetches": not stats["admission_stopped"]
+                    and not stats["budget_exhausted"],
+                },
+            }
         if kind == "query_manifest":
             if self.exporter.stats()["budget_exhausted"]:
                 raise RuntimeError(
@@ -266,7 +282,16 @@ class DiffusionWeightCacheDaemon:
 
 
 def main():
-    args = prepare_server_args([*sys.argv[1:], "--weight-cache-mode", "client"])
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--status", action="store_true")
+    command, remaining = parser.parse_known_args(sys.argv[1:])
+    args = prepare_server_args([*remaining, "--weight-cache-mode", "client"])
+    if command.status:
+        prepared = prepare_pipeline(resolve_pipeline_class(args), args, required=True)
+        plan = compatibility_plan(prepared, args)
+        with WeightCacheClient(plan, args) as client:
+            print(json.dumps(client.status(), sort_keys=True))
+        return
     owner = DiffusionWeightCacheDaemon(args)
     try:
         owner.run()

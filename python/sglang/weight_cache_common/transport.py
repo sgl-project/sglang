@@ -195,19 +195,26 @@ class CudaIpcExporter:
 
     def stats(self) -> dict:
         with self._lock:
+            count = len(self._views)
+            deliveries_left = self._max_deliveries - len(self._requests)
+            storage_exports_left = self._max_storage_exports - self._storage_exports
+            remaining = min(
+                deliveries_left,
+                storage_exports_left // count if count else deliveries_left,
+            )
             return {
                 "unique_storage_bytes": self.manifest.unique_storage_bytes,
+                "storage_count": count,
                 "deliveries_reserved": len(self._requests),
                 "storage_exports_reserved": self._storage_exports,
                 "failed_deliveries": self._failed_deliveries,
                 "max_deliveries": self._max_deliveries,
                 "max_storage_exports": self._max_storage_exports,
+                "deliveries_remaining": deliveries_left,
+                "storage_exports_remaining": storage_exports_left,
+                "fetches_remaining": remaining,
                 "admission_stopped": self._stopped,
-                "budget_exhausted": (
-                    len(self._requests) >= self._max_deliveries
-                    or self._storage_exports + len(self._views)
-                    > self._max_storage_exports
-                ),
+                "budget_exhausted": remaining == 0,
             }
 
 

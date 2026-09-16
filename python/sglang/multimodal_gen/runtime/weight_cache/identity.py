@@ -4,6 +4,7 @@
 import dataclasses
 import hashlib
 import importlib.metadata
+import logging
 import os
 import re
 from pathlib import Path
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.weight_cache.plan import (
     CacheCompatibilityPlan,
     PlannedRankContext,
 )
+from sglang.srt.environ import envs
 from sglang.srt.weight_cache.protocol import compute_env_stamp
 from sglang.weight_cache_common.checkpoint import (
     MANIFEST_FILENAME,
@@ -103,6 +105,63 @@ def checkpoint_identity(prepared, args, *, verify=False):
     return {**identity, "files": stamps}
 
 
+def dependency_identity(args):
+    # The dynamic Hugging Face FA3 loader can select artifacts outside the
+    # installed distributions. It has no audited publication receipt here.
+    if not envs.SGLANG_USE_SGL_FA3_KERNEL.get():
+        raise ValueError("Weight cache requires SGLANG_USE_SGL_FA3_KERNEL=1")
+    pip_fa4 = os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1"
+    providers = {"fa3": "sglang-kernel", "fa4": "pip" if pip_fa4 else "vendored"}
+    required = {
+        "torch",
+        "transformers",
+        "diffusers",
+        "sglang-kernel",
+        "triton",
+        "nvidia-cutlass-dsl",
+    }
+    if pip_fa4:
+        required.add("flash-attn-4")
+    distributions = {}
+    # Python import names are not distribution names: sgl_kernel is provided
+    # by sglang-kernel. Include native/JIT providers even when vendored FA4
+    # Python is already covered by source_digest.
+    names = required | {
+        "flash-attn-4",
+        "flashinfer-python",
+        "flashinfer-cubin",
+        "flashinfer-jit-cache",
+        "nvidia-cutlass-dsl-libs-base",
+        "nvidia-cutlass-dsl-libs-core",
+        "nvidia-cutlass-dsl-libs-cu12",
+        "nvidia-cutlass-dsl-libs-cu13",
+    }
+    for name in sorted(names):
+        try:
+            dist = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError as error:
+            if name in required:
+                raise ValueError(
+                    f"Weight-cache required provider is missing: {name}"
+                ) from error
+            distributions[name] = None
+            continue
+        record = dist.read_text("RECORD")
+        if not record:
+            if not args.weight_cache_allow_unverified_build:
+                raise ValueError(
+                    f"Weight-cache provider lacks published RECORD: {name}"
+                )
+            logging.getLogger(__name__).warning(
+                "Weight cache uses UNVERIFIED provider without RECORD: %s", name
+            )
+        distributions[name] = {
+            "version": dist.version,
+            "record": hashlib.sha256(record.encode()).hexdigest() if record else None,
+        }
+    return {"providers": providers, "distributions": distributions}
+
+
 def environment_identity(args):
     try:
         source = source_digest(Path(sglang.__file__).parent)
@@ -110,36 +169,17 @@ def environment_identity(args):
         if not args.weight_cache_allow_unverified_build:
             raise
         source = "UNVERIFIED-DEVELOPMENT-BUILD"
-    distributions = {}
+        logging.getLogger(__name__).warning("Weight cache uses %s", source)
     # RECORD is the installer's content manifest, including native binaries.
     # As with checkpoints, this assumes trusted published installations; manual
     # binary edits without republishing their RECORD are outside that contract.
-    for name in (
-        "torch",
-        "transformers",
-        "diffusers",
-        "sgl-kernel",
-        "flash-attn",
-        "flash-attn-3",
-        "flashinfer-python",
-    ):
-        try:
-            dist = importlib.metadata.distribution(name)
-        except importlib.metadata.PackageNotFoundError:
-            distributions[name] = None
-            continue
-        record = dist.read_text("RECORD")
-        distributions[name] = {
-            "version": dist.version,
-            "record": hashlib.sha256(record.encode()).hexdigest() if record else None,
-        }
     cap = current_platform.get_device_capability(local_device_index(args))
     if cap is None:
         raise ValueError("Cannot identify planned CUDA device capability")
     return {
         **compute_env_stamp(device_capability=f"{cap.major}.{cap.minor}"),
         "source": source,
-        "distributions": distributions,
+        **dependency_identity(args),
         "torch_git": torch.version.git_version,
         "cuda": torch.version.cuda,
     }

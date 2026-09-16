@@ -2047,14 +2047,19 @@ class ServerArgs(DisaggServerArgsMixin):
             "--weight-cache-mode",
             choices=["off", "client"],
             default="off",
-            help="Strict client of a standalone diffusion weight-cache daemon (Wan 1.3B, TP=1).",
+            help="Strict single-GPU transformer cache client: Wan2.1 1.3B, original Qwen-Image or native MiniMax-H3 FL2VA.",
         )
         parser.add_argument("--weight-cache-components", nargs="+", default=["dit"])
         parser.add_argument(
             "--weight-cache-fallback", choices=["error"], default="error"
         )
         parser.add_argument("--weight-cache-socket", default=None)
-        parser.add_argument("--weight-cache-timeout", type=float, default=1800.0)
+        parser.add_argument(
+            "--weight-cache-timeout",
+            type=float,
+            default=1800.0,
+            help="Timeout in seconds for each cache socket exchange; not an owner readiness wait.",
+        )
         parser.add_argument("--weight-cache-max-deliveries", type=int, default=128)
         parser.add_argument(
             "--weight-cache-allow-weak-checkpoint-identity", action="store_true"
