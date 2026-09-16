@@ -68,6 +68,29 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+## Chat rendering
+
+The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
+HF Jinja template from `tokenizer_config.json` or a sibling
+`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
+for template-less models. Cache-aware routing hashes the rendered tokens so its
+prefix queries match the blocks the engine caches. Models the engine encodes in
+code but dynamo-render cannot tokenize here (Inkling, Kimi K3) route via raw prompt
+text, as does any model whose template fails to load or render.
+
+Plain text chat requests (string `content`, no tools, no template kwargs or
+reasoning controls or historical `reasoning_content`, no assistant continuation,
+no consecutive users or non-leading system turns) additionally forward the
+rendered tokens to the engine as `input_ids`, retaining the original messages,
+so the engine skips re-tokenizing. Every other request shape is rendered for
+routing only: the router renders with dynamo-render and does not replicate
+SGLang's request normalization, so forwarding is enabled shape by shape as
+parity is verified. Use matching model files on the router and workers; worker
+template overrides and default kwargs are not observable from the request.
+
+The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
+with `--locked`, so rendered bytes cannot change without a reviewed diff.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should
