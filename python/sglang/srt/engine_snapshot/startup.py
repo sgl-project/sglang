@@ -23,6 +23,9 @@ from sglang.srt.engine_snapshot.manifest import (
 # weight reload; a mismatch means the reloaded engine computes different logits.
 CANARY_PROMPT = "The first month of the year is"
 _CANARY_MAX_NEW_TOKENS = 1
+# The regions the barrier releases and rebuilds: everything the engine
+# allocates after initialization and reads back from disk.
+_MEMORY_TAGS = ("weights", "kv_cache")
 
 _REQUIRED_SERVER_ARGS = {
     "tp_size": 1,
@@ -92,8 +95,8 @@ def validate_server_args(argv):
     return args
 
 
-def _run_canary_forward(scheduler):
-    """Run one greedy single-token prefill and return the sampled token id.
+def _run_canary(scheduler):
+    """Run one greedy single-token prefill and describe the token it sampled.
 
     Leaves no KV-cache slot, req-pool slot or queued request behind: the engine
     is dumped (create) or starts serving (restore) right after.
@@ -170,11 +173,13 @@ def _run_canary_forward(scheduler):
     batch.prefill_input_ids_cpu = None
     try:
         result = scheduler.model_worker.forward_batch_generation(batch)
+        logits_output = result.logits_output
         if result.delay_sample_func is not None:
             result = result.delay_sample_func()
         scheduler.device_module.synchronize()
         token_id = int(result.next_token_ids[0].item())
         req.output_ids.append(token_id)
+        logprob = _sampled_logprob(logits_output, token_id)
     finally:
         allocator = scheduler.token_to_kv_pool_allocator
         allocator.free_group_begin()
@@ -182,39 +187,82 @@ def _run_canary_forward(scheduler):
             release_kv_cache(req, scheduler.tree_cache, is_insert=False)
         finally:
             allocator.free_group_end()
-    return token_id
+    return SnapshotCanary(prompt=CANARY_PROMPT, token_id=token_id, logprob=logprob)
 
 
-def _record_canary(scheduler, control_dir):
-    token_id = _run_canary_forward(scheduler)
-    canary = SnapshotCanary(prompt=CANARY_PROMPT, token_id=token_id)
-    write_json_atomic(control_dir / control.CANARY, msgspec.to_builtins(canary))
+def _sampled_logprob(logits_output, token_id):
+    """Log-probability of the sampled token, from the raw next-token logits.
+
+    Read here rather than from the sampler because the canary asks for no
+    logprobs, and from the raw logits rather than the sampling distribution so
+    that both sides of the snapshot compute it the same way.
+    """
+    import torch
+
+    logits = getattr(logits_output, "next_token_logits", None)
+    if logits is None:
+        raise SnapshotRuntimeFailure("Snapshot canary produced no next-token logits")
+    return float(torch.log_softmax(logits[0].float(), dim=-1)[token_id].item())
 
 
-def _verify_canary(scheduler, artifact_path):
-    manifest = load_manifest(Path(artifact_path))
-    expected = manifest.canary.token_id
-    observed = _run_canary_forward(scheduler)
-    if observed != expected:
+def _verify_canary(scheduler, expected):
+    """Re-run the canary and require the reloaded engine to reproduce it."""
+    observed = _run_canary(scheduler)
+    if not expected.matches(observed.token_id, observed.logprob):
         raise SnapshotRuntimeFailure(
-            "Snapshot canary mismatch: reloaded engine sampled token "
-            f"{observed} but the snapshot recorded {expected}"
+            "Snapshot canary mismatch: the reloaded engine sampled token "
+            f"{observed.token_id} at logprob {observed.logprob:.6g}, but the "
+            f"snapshot recorded token {expected.token_id} at "
+            f"{expected.logprob:.6g}"
         )
+    return observed
+
+
+def _release_memory(scheduler):
+    """Wait for the device to settle, then give weights and KV memory back."""
+    from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+
+    scheduler.device_module.synchronize()
+    scheduler.weight_updater.release_memory_occupation(
+        ReleaseMemoryOccupationReqInput(tags=list(_MEMORY_TAGS))
+    )
+
+
+def _reload_and_verify(scheduler, server_args_view, expected):
+    """Rebuild the released state and prove the recorded canary still holds.
+
+    Shared by the create-time rehearsal and the restore path, so both sides
+    exercise one implementation of the state transition they must agree on.
+    """
+    from sglang.srt.managers.io_struct import (
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightFromDiskReqInput,
+    )
+
+    updater = scheduler.weight_updater
+    updater.resume_memory_occupation(
+        ResumeMemoryOccupationReqInput(tags=list(_MEMORY_TAGS))
+    )
+    result = updater.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(
+            model_path=server_args_view.model_path,
+            load_format=server_args_view.load_format,
+        )
+    )
+    if not result.success:
+        raise SnapshotRuntimeFailure(f"Snapshot weight reload failed: {result.message}")
+    scheduler.device_module.synchronize()
+    return _verify_canary(scheduler, expected)
 
 
 def scheduler_barrier(scheduler, artifact_path):
-    """Release weights and KV memory, park, then resume and re-check the canary.
+    """Rehearse the reload, park released, then resume and re-verify on restore.
 
     The barrier is where the engine becomes snapshot-safe: nothing is queued,
     scheduled or allocated after it, so the dumped process image resumes with a
     quiescent engine.
     """
     from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang.srt.managers.io_struct import (
-        ReleaseMemoryOccupationReqInput,
-        ResumeMemoryOccupationReqInput,
-        UpdateWeightFromDiskReqInput,
-    )
 
     control_dir = Path(artifact_path) / control.CONTROL_DIRNAME
     server_args_view = resolving_view(scheduler.server_args)
@@ -223,31 +271,32 @@ def scheduler_barrier(scheduler, artifact_path):
             raise SnapshotUsageError(
                 "Initialized snapshots require exactly one visible CUDA device"
             )
-        _record_canary(scheduler, control_dir)
-        updater = scheduler.weight_updater
-        tags = ["weights", "kv_cache"]
-        scheduler.device_module.synchronize()
-        updater.release_memory_occupation(ReleaseMemoryOccupationReqInput(tags=tags))
+        canary = _run_canary(scheduler)
+        _release_memory(scheduler)
+        # Rehearsal: prove before the capture that the released engine comes
+        # back to the same canary. A restore that would fail here fails while
+        # the source container and the model path are still known good; the
+        # engine is released again below, so the captured image stays quiescent.
+        _reload_and_verify(scheduler, server_args_view, canary)
+        _release_memory(scheduler)
         uuid = f"GPU-{scheduler.device_module.get_device_properties(0).uuid}"
         write_json_atomic(
             control_dir / control.SCHEDULER,
-            msgspec.to_builtins(control.SchedulerInfo(gpu_uuid=uuid)),
+            msgspec.to_builtins(control.SchedulerInfo(gpu_uuid=uuid, canary=canary)),
         )
         control.wait_for(control_dir, control.RELEASE)
-        updater.resume_memory_occupation(ResumeMemoryOccupationReqInput(tags=tags))
-        result = updater.update_weights_from_disk(
-            UpdateWeightFromDiskReqInput(
-                model_path=server_args_view.model_path,
-                load_format=server_args_view.load_format,
-            )
+        expected = load_manifest(Path(artifact_path)).canary
+        observed = _reload_and_verify(scheduler, server_args_view, expected)
+        # This run's evidence, so replacing a leftover marker is intended.
+        write_json_atomic(
+            control_dir / control.RESUMED,
+            msgspec.to_builtins(
+                control.ResumedInfo(
+                    token_id=observed.token_id, logprob=observed.logprob
+                )
+            ),
+            overwrite=True,
         )
-        if not result.success:
-            raise SnapshotRuntimeFailure(
-                f"Snapshot weight reload failed: {result.message}"
-            )
-        scheduler.device_module.synchronize()
-        _verify_canary(scheduler, artifact_path)
-        (control_dir / control.RESUMED).touch()
     except BaseException as exc:
         control.write_error(control_dir, exc)
         raise

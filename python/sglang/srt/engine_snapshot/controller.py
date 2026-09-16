@@ -22,7 +22,6 @@ from sglang.srt.engine_snapshot.errors import (
 )
 from sglang.srt.engine_snapshot.manifest import (
     MANIFEST_FORMAT,
-    SnapshotCanary,
     SnapshotManifest,
     artifact_bytes,
     created_at_now,
@@ -123,16 +122,12 @@ def _child_environment(launch_environment, artifact_path):
 
 
 def _assemble_manifest(
-    artifact_path,
-    engine_info,
-    inventory,
-    server_argv,
-    launch_environment,
-    runtime,
-    stdio,
+    artifact_path, engine_info, inventory, launch_environment, runtime, stdio
 ):
-    canary = control.read_json(
-        artifact_path / control.CONTROL_DIRNAME, control.CANARY, SnapshotCanary
+    scheduler_info = control.read_json(
+        artifact_path / control.CONTROL_DIRNAME,
+        control.SCHEDULER,
+        control.SchedulerInfo,
     )
     return SnapshotManifest(
         format=MANIFEST_FORMAT,
@@ -151,7 +146,7 @@ def _assemble_manifest(
         stdio=stdio,
         files=inventory.files,
         dev_shm=inventory.dev_shm,
-        canary=canary,
+        canary=scheduler_info.canary,
     )
 
 
@@ -194,7 +189,6 @@ def create_snapshot(artifact, server_argv, timeout=600, runtime=None):
                 artifact_path,
                 engine_info,
                 inventory,
-                server_argv,
                 launch_environment,
                 runtime,
                 stdio,
@@ -234,10 +228,15 @@ def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
         root_pid = None
         try:
             root_pid = runtime.restore(artifact_path, manifest, timeout)
+            # CRIU restore takes tens of seconds; re-check the address it is
+            # about to bind so a listener that appeared meanwhile is reported
+            # here instead of as a readiness timeout.
+            runtime.check_port_free(effective_host, effective_port)
             control.write_release(control_dir, host=host, port=port)
             runtime.wait_listener(
                 artifact_path, manifest, effective_host, effective_port, timeout
             )
+            _verify_resumed(manifest, control_dir)
             runtime.complete_restore(root_pid)
             return RestoreOutcome(root_pid, effective_host, effective_port)
         except BaseException as error:
@@ -251,6 +250,23 @@ def restore_snapshot(artifact, timeout=300, runtime=None, host=None, port=None):
                     + "; ".join(failures)
                 ) from error
             raise
+
+
+def _verify_resumed(manifest, control_dir):
+    """Require the restored engine's own canary report to match the artifact.
+
+    The engine compares the canary before it writes this marker; checking the
+    value here as well means the controller judges the evidence instead of
+    trusting that the comparison happened.
+    """
+    resumed = control.read_json(control_dir, control.RESUMED, control.ResumedInfo)
+    if not manifest.canary.matches(resumed.token_id, resumed.logprob):
+        raise SnapshotRuntimeFailure(
+            "Snapshot canary mismatch: the restored engine sampled token "
+            f"{resumed.token_id} at logprob {resumed.logprob:.6g}, but the "
+            f"artifact recorded token {manifest.canary.token_id} at "
+            f"{manifest.canary.logprob:.6g}"
+        )
 
 
 def inspect_snapshot(artifact, runtime=None):
