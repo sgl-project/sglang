@@ -223,3 +223,25 @@ def test_qwen3_multimodal_encoders_layerwise_offload_vision_blocks():
         condition.__name__ == "is_block"
         for condition in Qwen3VLArchConfig()._fsdp_shard_conditions
     )
+
+
+def test_vision_position_interpolation_preserves_bf16_rounding():
+    model = Qwen3VLVisionTransformer.__new__(Qwen3VLVisionTransformer)
+    nn.Module.__init__(model)
+    model.num_grid_per_side = 2
+    model.spatial_merge_size = 2
+    model.pos_embed = nn.Embedding.from_pretrained(
+        torch.tensor(
+            [[7.21875], [-3.359375], [2.078125], [-1.1171875]], dtype=torch.bfloat16
+        )
+    )
+    model.fp32_position_interpolation = False
+    positions = model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]]))
+    # (1, 1) has corner weights 4/9, 2/9, 2/9, 1/9 in merge order
+    assert positions.dtype == torch.bfloat16
+    assert positions[3, 0].item() == 2.8125
+    model.fp32_position_interpolation = True
+    assert (
+        model._interpolate_position_embeddings(torch.tensor([[1, 4, 4]])).dtype
+        == torch.float32
+    )

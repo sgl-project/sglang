@@ -62,6 +62,7 @@ class QwenImage21EncodingStage(PipelineStage):
             vae,
             scheduler,
         )
+        self.text_encoder.model.visual.fp32_position_interpolation = False
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
@@ -141,14 +142,9 @@ class QwenImage21EncodingStage(PipelineStage):
                     pixels = torch.frombuffer(
                         bytearray(image.tobytes()), dtype=torch.uint8
                     ).reshape(image.height, image.width, ac.in_channels)
-                    pixels = (
-                        pixels.permute(2, 0, 1)[None, :, None].to(
-                            device=device, dtype=torch.float32
-                        )
-                        / 127.5
-                        - 1
-                    )
-                    latent = vae.encode(pixels.to(torch.bfloat16)).mode()
+                    pixels = pixels.permute(2, 0, 1)[None, :, None].float() / 255.0
+                    pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
+                    latent = vae.encode(pixels).mode()
                     mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
                     std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
                     conditions.append(

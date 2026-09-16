@@ -184,6 +184,8 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3VLVisionTransformer(nn.Module):
+    fp32_position_interpolation = True
+
     def __init__(
         self,
         config: Any,
@@ -250,7 +252,14 @@ class Qwen3VLVisionTransformer(nn.Module):
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.spatial_merge_size,
         )
-        return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        if self.fp32_position_interpolation:
+            return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
+        # Transformers 4.57 rounds each corner and each addition in the weight dtype
+        corners = (
+            self.pos_embed(indices)
+            * weights.to(self.pos_embed.weight.dtype)[:, :, None]
+        )
+        return corners[0] + corners[1] + corners[2] + corners[3]
 
     def forward(
         self,
