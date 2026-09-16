@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union
 
 import torch
 
@@ -15,8 +15,10 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.marlin_utils import check_marlin_supported
 from sglang.srt.layers.quantization.utils import (
+    get_dynamic_override,
     get_linear_quant_method,
     get_scalar_types,
+    resolve_dynamic_fused_shards,
 )
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 _, scalar_types = get_scalar_types()
@@ -51,7 +54,181 @@ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
     )
 
 
-class GPTQConfig(QuantizationConfig):
+def _canonicalize_gptq_module_prefix(name: str) -> str:
+    """Normalize checkpoint and runtime wrapper prefixes without conflating MTP."""
+    name = name.lstrip(".").replace(".self_attn.", ".")
+    for wrapper in (
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+        "model.",
+    ):
+        if name.startswith(wrapper):
+            return name.removeprefix(wrapper)
+    return name
+
+
+class _CheckpointTensorManifest:
+    """Immutable index of dense vs GPTQ-quantized checkpoint modules.
+
+    ``__deepcopy__`` returns ``self`` in O(1) because ``get_linear_quant_method``
+    deep-copies the quantization config once per linear layer.
+    """
+
+    def __init__(
+        self,
+        weight_modules: Iterable[str],
+        qweight_modules: Iterable[str],
+    ) -> None:
+        self.weight_modules = frozenset(m.lstrip(".") for m in weight_modules if m)
+        self.qweight_modules = frozenset(m.lstrip(".") for m in qweight_modules if m)
+        self.canon_weight_modules = frozenset(
+            _canonicalize_gptq_module_prefix(m) for m in self.weight_modules
+        )
+        self.canon_qweight_modules = frozenset(
+            _canonicalize_gptq_module_prefix(m) for m in self.qweight_modules
+        )
+
+    @classmethod
+    def from_tensor_names(
+        cls, tensor_names: Iterable[str]
+    ) -> _CheckpointTensorManifest:
+        weight_modules: Set[str] = set()
+        qweight_modules: Set[str] = set()
+        for name in tensor_names:
+            if name.endswith(".weight"):
+                weight_modules.add(name.removesuffix(".weight"))
+            elif name.endswith(".qweight"):
+                qweight_modules.add(name.removesuffix(".qweight"))
+        return cls(weight_modules, qweight_modules)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _CheckpointTensorManifest:
+        return self
+
+    def with_weight_name_mapper(
+        self, hf_to_sglang_mapper: WeightsMapper
+    ) -> _CheckpointTensorManifest:
+        def _map_set(modules: frozenset[str]) -> Set[str]:
+            mapped_set = set(modules)
+            for mod in modules:
+                mapped = hf_to_sglang_mapper._map_name(f"{mod}.weight")
+                if mapped is not None and mapped.endswith(".weight"):
+                    mapped_set.add(mapped.removesuffix(".weight"))
+            return mapped_set
+
+        return _CheckpointTensorManifest(
+            _map_set(self.weight_modules),
+            _map_set(self.qweight_modules),
+        )
+
+    def classify_module(self, target: str) -> Optional[str]:
+        raw_target = target.lstrip(".")
+        has_dense = raw_target in self.weight_modules
+        has_quant = raw_target in self.qweight_modules
+        if has_dense and has_quant:
+            raise ValueError(
+                f"Checkpoint contains both dense '.weight' and quantized "
+                f"'.qweight' tensors for '{target}'."
+            )
+        if has_quant:
+            return "quantized"
+        if has_dense:
+            return "dense"
+
+        canon = _canonicalize_gptq_module_prefix(raw_target)
+        has_dense = canon in self.canon_weight_modules
+        has_quant = canon in self.canon_qweight_modules
+        if has_dense and has_quant:
+            raise ValueError(
+                f"Checkpoint contains both dense '.weight' and quantized "
+                f"'.qweight' tensors for '{target}'."
+            )
+        if has_quant:
+            return "quantized"
+        if has_dense:
+            return "dense"
+        return None
+
+
+class _GPTQCheckpointMixin:
+    """Shared checkpoint-manifest & packed-shard resolution for GPTQ configs."""
+
+    _checkpoint_tensor_manifest: Optional[_CheckpointTensorManifest] = None
+
+    def set_checkpoint_tensor_names(
+        self, tensor_names: Optional[Iterable[str]]
+    ) -> None:
+        if tensor_names is None:
+            self._checkpoint_tensor_manifest = None
+        else:
+            self._checkpoint_tensor_manifest = (
+                _CheckpointTensorManifest.from_tensor_names(tensor_names)
+            )
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper) -> None:
+        if self._checkpoint_tensor_manifest is not None:
+            self._checkpoint_tensor_manifest = (
+                self._checkpoint_tensor_manifest.with_weight_name_mapper(
+                    hf_to_sglang_mapper
+                )
+            )
+
+    def is_checkpoint_module_unquantized(self, prefix: str) -> bool:
+        manifest = getattr(self, "_checkpoint_tensor_manifest", None)
+        if not prefix or manifest is None:
+            return False
+
+        direct_state = manifest.classify_module(prefix)
+        if direct_state is not None:
+            return direct_state == "dense"
+
+        proj_name = prefix.rsplit(".", 1)[-1]
+        fused_shards = resolve_dynamic_fused_shards(self, proj_name)
+        if not fused_shards:
+            return False
+
+        parent = prefix[: -len(proj_name)]
+        shard_states = [
+            manifest.classify_module(f"{parent}{shard}") for shard in fused_shards
+        ]
+        if "dense" in shard_states and "quantized" in shard_states:
+            raise ValueError(
+                f"Detected mixed dense and quantized shards for fused layer "
+                f"'{prefix}' in checkpoint ({dict(zip(fused_shards, shard_states))}). "
+                "All shards of a fused layer must share the same precision."
+            )
+        return all(state == "dense" for state in shard_states)
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        return get_dynamic_override(
+            self, layer_name=prefix
+        ) is False or self.is_checkpoint_module_unquantized(prefix)
+
+    def _resolve_unquantized_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[bool, Optional[QuantizeMethodBase]]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedEmbeddingMethod,
+            UnquantizedLinearMethod,
+        )
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        parallel_lm_head_quantized = (
+            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+        )
+        if not (isinstance(layer, LinearBase) or parallel_lm_head_quantized):
+            return True, None
+        if self.is_linear_unquantized(prefix):
+            return True, (
+                UnquantizedEmbeddingMethod()
+                if parallel_lm_head_quantized
+                else UnquantizedLinearMethod()
+            )
+        return False, None
+
+
+class GPTQConfig(_GPTQCheckpointMixin, QuantizationConfig):
     """Config class for GPTQ.
 
     Reference: https://arxiv.org/abs/2210.17323
@@ -67,6 +244,7 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format: str = "",
         true_sequential: bool = False,
         static_groups: bool = False,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -92,6 +270,8 @@ class GPTQConfig(QuantizationConfig):
         #  r"-:.*\.moe\..*": {}, # negative match (skip) all `moe` layers
         # }
         super().__init__()
+        if packed_modules_mapping is not None:
+            self.packed_modules_mapping = packed_modules_mapping
         self.dynamic = dynamic
 
         self.weight_bits = weight_bits
@@ -161,6 +341,9 @@ class GPTQConfig(QuantizationConfig):
             config, ["true_sequential"], default=False
         )
         static_groups = cls.get_from_keys_or(config, ["static_groups"], default=False)
+        packed_modules_mapping = cls.get_from_keys_or(
+            config, ["packed_modules_mapping"], default=None
+        )
         return cls(
             weight_bits,
             group_size,
@@ -170,15 +353,36 @@ class GPTQConfig(QuantizationConfig):
             checkpoint_format,
             true_sequential,
             static_groups,
+            packed_modules_mapping=packed_modules_mapping,
         )
+
+    def _get_scheme_linear_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+
+        if not isinstance(layer, LinearBase):
+            return None
+        handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
+        if handled:
+            return unquant_method
+        quant_method = get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
+        if isinstance(quant_method, GPTQLinearMethod):
+            layer.scheme = quant_method.quant_config.get_linear_scheme(layer)
+        return quant_method
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
+        handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
+        if handled:
+            return unquant_method
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
         )
@@ -210,17 +414,13 @@ class GPTQAscendConfig(GPTQConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
             return GPTQMoEMethod(self)
-        if isinstance(layer, LinearBase):
-            layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
-        return None
+        return self._get_scheme_linear_quant_method(layer, prefix)
 
     def get_linear_scheme(self, layer: torch.nn.Module):
         return GPTQAscendLinearScheme(self)
@@ -241,17 +441,13 @@ class CPUGPTQConfig(GPTQConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if isinstance(layer, LinearBase):
-            layer.scheme = self.get_linear_scheme(layer)
-            return GPTQLinearMethod(self)
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer)
             return GPTQMoEMethod(self)
-        return None
+        return self._get_scheme_linear_quant_method(layer, prefix)
 
     def get_linear_scheme(self, layer: torch.nn.Module):
         from sglang.srt.layers.linear import LinearBase
@@ -280,13 +476,16 @@ class GPTQXPUConfig(GPTQConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[LinearMethodBase]:
+    ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
             raise NotImplementedError(
                 "GPTQ MoE is not yet supported on XPU (dense-only phase)."
             )
+        handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
+        if handled:
+            return unquant_method
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
         )
@@ -295,7 +494,7 @@ class GPTQXPUConfig(GPTQConfig):
         return GPTQXPULinearScheme(self)
 
 
-class GPTQMarlinConfig(QuantizationConfig):
+class GPTQMarlinConfig(_GPTQCheckpointMixin, QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
     # (num_bits, is_sym) -> quant_type
@@ -313,8 +512,11 @@ class GPTQMarlinConfig(QuantizationConfig):
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
         full_config: Dict[str, Any],
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         super().__init__()
+        if packed_modules_mapping is not None:
+            self.packed_modules_mapping = packed_modules_mapping
         if desc_act and group_size == -1:
             # In this case, act_order == True is the same as act_order == False
             # (since we have only one group per output channel)
@@ -404,6 +606,9 @@ class GPTQMarlinConfig(QuantizationConfig):
         desc_act = cls.get_from_keys(config, ["desc_act"])
         is_sym = cls.get_from_keys(config, ["sym"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
+        packed_modules_mapping = cls.get_from_keys_or(
+            config, ["packed_modules_mapping"], default=None
+        )
         return cls(
             weight_bits,
             group_size,
@@ -412,6 +617,7 @@ class GPTQMarlinConfig(QuantizationConfig):
             lm_head_quantized,
             dynamic,
             config,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     @classmethod
@@ -441,17 +647,36 @@ class GPTQMarlinConfig(QuantizationConfig):
             )
         return None
 
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        # Base implementation probes with LinearBase(1, 1), which fails Marlin
+        # tile alignment and would falsely report quantized layers as unquantized.
+        return super().is_linear_unquantized(prefix)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.marlin_utils import (
+            verify_marlin_supports_layer,
+        )
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
-        return get_linear_quant_method(
+        handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
+        if handled:
+            return unquant_method
+        quant_method = get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
         )
+        if isinstance(quant_method, GPTQMarlinLinearMethod) and isinstance(
+            layer, LinearBase
+        ):
+            verify_marlin_supports_layer(
+                layer, quant_method.quant_config.group_size, prefix=prefix
+            )
+        return quant_method
 
     def get_linear_scheme(self, layer: torch.nn.Module):
         return GPTQMarlinLinearScheme(self)
