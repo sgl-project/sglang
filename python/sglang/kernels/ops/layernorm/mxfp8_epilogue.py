@@ -149,55 +149,35 @@ def _rmsnorm_mxfp8_kernel(
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
-    PARTS: tl.constexpr,
     GROUPS: tl.constexpr,
-    SLICE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    if pid < M * PARTS:
-        row, part = pid // PARTS, pid % PARTS
+    row = tl.program_id(0)
+    if row < M:
         h = tl.arange(0, BLOCK)
         v = tl.load(X + row * SX + h, h < K, 0).to(tl.float32)
         weight = tl.load(W + h, h < K, 0).to(tl.float32)
         inv = tl.rsqrt(tl.sum(v * v, 0) / K + EPS)
         y = (v * inv * weight).to(tl.bfloat16)
-        tl.store(
-            Y + row * K + h, y, (h < K) & (h >= part * SLICE) & (h < (part + 1) * SLICE)
-        )
-        _mxfp8_epilogue(
-            y,
-            row,
-            Q,
-            S,
-            K,
-            BLOCK,
-            GROUPS,
-            part * (SLICE // 32),
-            (part + 1) * (SLICE // 32),
-        )
+        tl.store(Y + row * K + h, y, h < K)
+        _mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
     else:
         # Padding scale entries are disjoint from the live rows above.
-        off = (pid - M * PARTS) * 512 + tl.arange(0, 512)
+        off = (row - M) * 512 + tl.arange(0, 512)
         pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
         tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
 
 
 def rmsnorm_mxfp8(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    *,
-    parts: int = 1,
-    num_warps: int = 8,
+    x: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
-    assert 0 < m <= 8 and k % (parts * 32) == 0
+    assert 0 < m <= 8 and k % 32 == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty((k // 32) * 128, dtype=torch.uint8, device=x.device)
-    _rmsnorm_mxfp8_kernel[(m * parts + triton.cdiv(s.numel(), 512),)](
+    _rmsnorm_mxfp8_kernel[(m + triton.cdiv(s.numel(), 512),)](
         x,
         weight,
         y,
@@ -208,10 +188,8 @@ def rmsnorm_mxfp8(
         K=k,
         EPS=eps,
         BLOCK=triton.next_power_of_2(k),
-        PARTS=parts,
         GROUPS=k // 32,
-        SLICE=k // parts,
-        num_warps=num_warps,
+        num_warps=8,
         enable_fp_fusion=False,
     )
     return y, q, s
