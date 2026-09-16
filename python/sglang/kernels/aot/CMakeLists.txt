@@ -117,6 +117,9 @@ endif()
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
+    # cutlass_extensions/gemm/collective (the SM90 mixed-input collective) lives in the JIT
+    # include tree because the sglang wheel excludes kernels/aot/**; both builds share one copy.
+    ${PROJECT_SOURCE_DIR}/../jit/include
 )
 
 set(SGL_KERNEL_CUDA_FLAGS

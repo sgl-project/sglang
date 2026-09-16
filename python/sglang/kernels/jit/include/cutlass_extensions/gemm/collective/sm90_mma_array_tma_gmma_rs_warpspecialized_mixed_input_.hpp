@@ -44,8 +44,6 @@
 #include "cutlass/trace.h"
 #include "cutlass_extensions/detail/collective/mixed_input_utils.hpp"
 
-#define GROUP_SIZE 128
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective {
@@ -291,6 +289,18 @@ struct CollectiveMmaArrayMixedInput<
                                         KernelConversionMode == ConversionMode::ConvertAndScaleWithZero;
   static constexpr bool UseScaleLookupTable =
       KernelConversionMode == ConversionMode::ConvertAndScale && cutlass::detail::is_Array_v<ElementScale>;
+  using ElementScaleScalar = typename detail::packed_scale_traits<NonVoidElementScale>::element;
+  static constexpr int ScalePackedNum = detail::packed_scale_traits<NonVoidElementScale>::kNum;
+  // Recovered from the scale packing rather than hardcoded to 128, so MXFP4's group-32 scales
+  // reach the same collective; W4A8's Array<bfloat16_t, TileK/128> still yields exactly 128.
+  static constexpr int ScaleGroupSize = size<2>(TileShape{}) / ScalePackedNum;
+  static_assert(
+      ScaleGroupSize * ScalePackedNum == size<2>(TileShape{}),
+      "The packed scale width must divide TileShapeK.");
+  // E8M0 scales are exponent bytes, exact in bf16, so they are applied to the A fragment
+  // instead of to one accumulator per group -- see Utils::convert_A_kblock_scaled.
+  static constexpr bool UsePerElementScale =
+      KernelConversionMode == ConversionMode::ConvertAndScale && cute::is_same_v<ElementScaleScalar, uint8_t>;
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});
   static constexpr size_t SmemAlignmentScale = cute::max(SmemAlignmentA, SmemAlignmentB);
@@ -711,7 +721,7 @@ struct CollectiveMmaArrayMixedInput<
     } else if constexpr (ModeHasScales) {
       // The real scale_k that actually works
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScaleGroupSize;
 
       Tensor mS_mkl = mainloop_params.tma_load_scale.get_tma_tensor(make_shape(M, scale_k, L));  // (m,scale_k,l)
       Tensor gS_mkl = local_tile(mS_mkl, ScaleTileShape{}, make_coord(_, _));  // (BLK_M,BLK_Scale_K,m,scale_k,l)
@@ -994,13 +1004,27 @@ struct CollectiveMmaArrayMixedInput<
 
     multiply_add<ElementAccumulator> fma;
 
-    constexpr int NumMMAsPerChunk = GROUP_SIZE / cute::get<0, 1>(tCsB.shape())();
-    constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / GROUP_SIZE;
-    cute::array<decltype(make_fragment_like(accum)), NumChunksPerTileK> intermediate_array;
-
     constexpr int K_BLOCK_MAX = size<2>(tCrA_load);
     constexpr int K_WAIT_MAX = cute::min(K_BLOCK_MAX - 1, 7);
     static_assert(K_BLOCK_MAX >= 4, "Consider increasing TileShapeK");
+
+    // One accumulator per scale group, unless the scale was already folded into the A fragment;
+    // each group costs a full fp32 accumulator fragment, which is what caps the group count.
+    constexpr int NumChunksPerTileK = UsePerElementScale ? 1 : cute::size<1>(sA.shape())() / ScaleGroupSize;
+    constexpr int NumMMAsPerChunk = K_BLOCK_MAX / NumChunksPerTileK;
+    static_assert(NumMMAsPerChunk * NumChunksPerTileK == K_BLOCK_MAX);
+    cute::array<decltype(make_fragment_like(accum)), NumChunksPerTileK> intermediate_array;
+
+    // A scale already folded into the A fragment leaves nothing to rescale afterwards, so the wgmma
+    // accumulates straight into accum over every k tile and intermediate_array stays unused: one
+    // fewer fp32 fragment live and no per-tile fold.
+    auto mma_dst = [&](int chunk_id) -> decltype(auto) {
+      if constexpr (UsePerElementScale) {
+        return (accum);
+      } else {
+        return (intermediate_array[chunk_id]);
+      }
+    };
 
     ConsumerToken barrier_token = {BarrierStatus::WaitAgain};
     // First k tile
@@ -1023,7 +1047,13 @@ struct CollectiveMmaArrayMixedInput<
       }
 
       // src: tCrA_load, dst: tCrA_mma
-      Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+      Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, 0);
+
+      if constexpr (UsePerElementScale) {
+        // accum is the wgmma destination from here to the last k tile, so it must be fenced before
+        // the first async mma reads it, not only after each wait.
+        warpgroup_fence_operand(accum);
+      }
 
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
@@ -1037,7 +1067,7 @@ struct CollectiveMmaArrayMixedInput<
           warpgroup_arrive();
 
           // (V,M) x (V,N) => (V,M,N)
-          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), intermediate_array[chunk_id]);
+          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), mma_dst(chunk_id));
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
           warpgroup_commit_batch();
@@ -1053,36 +1083,40 @@ struct CollectiveMmaArrayMixedInput<
                 read_stage);
           }
           if (k_block < K_BLOCK_MAX - 1) {
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, k_block + 1);
           }
         }
       }
 
       warpgroup_wait<0>();
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
-        warpgroup_fence_operand(intermediate_array[chunk_id_]);
+      if constexpr (UsePerElementScale) {
+        warpgroup_fence_operand(accum);
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+          warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-        // Apply the group-wise scaling
-        // tCrS  ((4, _2, _2), MMA_M, _1)
-        // accum ((2, _2, _2), MMA_M, _1)
-        auto tCrS = cute::get<1>(partitioned_extra_info);
-        for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-          for (int m = 0; m < size<0, 1>(accum); m++) {
-            for (int n = 0; n < size<0, 2>(accum); n++) {
-              for (int e = 0; e < size<0, 0>(accum); e++) {
-                auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+          // Apply the group-wise scaling
+          // tCrS  ((4, _2, _2), MMA_M, _1)
+          // accum ((2, _2, _2), MMA_M, _1)
+          auto tCrS = cute::get<1>(partitioned_extra_info);
+          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+            for (int m = 0; m < size<0, 1>(accum); m++) {
+              for (int n = 0; n < size<0, 2>(accum); n++) {
+                for (int e = 0; e < size<0, 0>(accum); e++) {
+                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                if (chunk_id_ == 0) {
-                  accum(accum_coord) =
-                      intermediate_array[chunk_id_](accum_coord) * static_cast<float>(tCrS(scale_coord)[0]);
-                } else {
-                  accum(accum_coord) =
-                      fma(intermediate_array[chunk_id_](accum_coord),
-                          static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                          accum(accum_coord));
+                  if (chunk_id_ == 0) {
+                    accum(accum_coord) =
+                        intermediate_array[chunk_id_](accum_coord) * Utils::chunk_scale(tCrS, scale_coord, 0);
+                  } else {
+                    accum(accum_coord) =
+                        fma(intermediate_array[chunk_id_](accum_coord),
+                            Utils::chunk_scale(tCrS, scale_coord, chunk_id_),
+                            accum(accum_coord));
+                  }
                 }
               }
             }
@@ -1114,7 +1148,7 @@ struct CollectiveMmaArrayMixedInput<
             1,
             smem_pipe_read.index());
 
-        Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+        Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, 0);
       }
     }
 
@@ -1135,7 +1169,10 @@ struct CollectiveMmaArrayMixedInput<
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
       for (int chunk_id = 0; chunk_id < NumChunksPerTileK; ++chunk_id) {
-        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+        // Direct accumulation carries accum across k tiles, so only the very first mma zeroes it.
+        if constexpr (!UsePerElementScale) {
+          tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+        }
 
         CUTLASS_PRAGMA_UNROLL
         for (int mma_id = 0; mma_id < NumMMAsPerChunk; ++mma_id) {
@@ -1143,7 +1180,7 @@ struct CollectiveMmaArrayMixedInput<
 
           warpgroup_arrive();
           // (V,M) x (V,N) => (V,M,N)
-          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), intermediate_array[chunk_id]);
+          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), mma_dst(chunk_id));
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
           warpgroup_commit_batch();
 
@@ -1161,23 +1198,27 @@ struct CollectiveMmaArrayMixedInput<
 
             warpgroup_wait<0>();
 
-            CUTLASS_PRAGMA_UNROLL
-            for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
-              warpgroup_fence_operand(intermediate_array[chunk_id_]);
+            if constexpr (UsePerElementScale) {
+              warpgroup_fence_operand(accum);
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk_id_ = 0; chunk_id_ < NumChunksPerTileK; ++chunk_id_) {
+                warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-              // Apply the group-wise scaling
-              auto tCrS = cute::get<1>(partitioned_extra_info);
-              for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-                for (int m = 0; m < size<0, 1>(accum); m++) {
-                  for (int n = 0; n < size<0, 2>(accum); n++) {
-                    for (int e = 0; e < size<0, 0>(accum); e++) {
-                      auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                      auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                // Apply the group-wise scaling
+                auto tCrS = cute::get<1>(partitioned_extra_info);
+                for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+                  for (int m = 0; m < size<0, 1>(accum); m++) {
+                    for (int n = 0; n < size<0, 2>(accum); n++) {
+                      for (int e = 0; e < size<0, 0>(accum); e++) {
+                        auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                        auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
 
-                      accum(accum_coord) =
-                          fma(intermediate_array[chunk_id_](accum_coord),
-                              static_cast<float>(tCrS(scale_coord)[chunk_id_]),
-                              accum(accum_coord));
+                        accum(accum_coord) =
+                            fma(intermediate_array[chunk_id_](accum_coord),
+                                Utils::chunk_scale(tCrS, scale_coord, chunk_id_),
+                                accum(accum_coord));
+                      }
                     }
                   }
                 }
@@ -1203,7 +1244,7 @@ struct CollectiveMmaArrayMixedInput<
                 copy_partitions_extra_info,
                 1,
                 smem_pipe_read.index());
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, 0);
+            Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, 0);
           } else {
             if (k_block < K_BLOCK_MAX - 2) {
               Utils::copy_tensors_MK(
@@ -1215,7 +1256,7 @@ struct CollectiveMmaArrayMixedInput<
                   k_block + 2,
                   read_stage);
             }
-            Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+            Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, k_block + 1);
           }
         }
       }
@@ -1229,14 +1270,20 @@ struct CollectiveMmaArrayMixedInput<
 
       int read_stage = smem_pipe_read.index();
 
-      tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+      if constexpr (!UsePerElementScale) {
+        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+      }
 
       // Unroll the K mode manually to set scale D to 1
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
         warpgroup_arrive();
         // (V,M) x (V,N) => (V,M,N)
-        cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), intermediate);
+        if constexpr (UsePerElementScale) {
+          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), accum);
+        } else {
+          cute::gemm(tiled_mma, tCrA_mma(_, _, k_block), tCrB(_, _, k_block, read_stage), intermediate);
+        }
         tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         warpgroup_commit_batch();
 
@@ -1257,27 +1304,34 @@ struct CollectiveMmaArrayMixedInput<
               read_stage);
         }
         if (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load, tCrA_mma, k_block + 1);
+          Utils::convert_A_kblock_scaled(tCrA_load, tCrA_mma, partitioned_extra_info, k_block + 1);
         }
 
         if ((k_block + 1) % NumMMAsPerChunk == 0) {
-          tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+          if constexpr (UsePerElementScale) {
+            warpgroup_wait<0>();
+            warpgroup_fence_operand(accum);
+          } else {
+            tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 
-          warpgroup_wait<0>();
-          warpgroup_fence_operand(intermediate);
+            warpgroup_wait<0>();
+            warpgroup_fence_operand(intermediate);
 
-          // Apply the group-wise scaling
-          auto tCrS = cute::get<1>(partitioned_extra_info);
-          for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
-            for (int m = 0; m < size<0, 1>(accum); m++) {
-              for (int n = 0; n < size<0, 2>(accum); n++) {
-                for (int e = 0; e < size<0, 0>(accum); e++) {
-                  auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
-                  auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
-                  int scale_idx = k_block / NumMMAsPerChunk;
+            // Apply the group-wise scaling
+            auto tCrS = cute::get<1>(partitioned_extra_info);
+            for (int mma_m = 0; mma_m < size<1>(accum); mma_m++) {
+              for (int m = 0; m < size<0, 1>(accum); m++) {
+                for (int n = 0; n < size<0, 2>(accum); n++) {
+                  for (int e = 0; e < size<0, 0>(accum); e++) {
+                    auto accum_coord = make_coord(make_tuple(e, m, n), mma_m, 0);
+                    auto scale_coord = make_coord(make_tuple(0, m, 0), mma_m, 0);
+                    int scale_idx = k_block / NumMMAsPerChunk;
 
-                  accum(accum_coord) = fma(
-                      intermediate(accum_coord), static_cast<float>(tCrS(scale_coord)[scale_idx]), accum(accum_coord));
+                    accum(accum_coord) =
+                        fma(intermediate(accum_coord),
+                            Utils::chunk_scale(tCrS, scale_coord, scale_idx),
+                            accum(accum_coord));
+                  }
                 }
               }
             }
@@ -1416,7 +1470,7 @@ struct CollectiveMmaArrayMixedInput<
     if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
       NonVoidElementScale const* ptr_S = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScaleGroupSize;
       Tensor tensor_scale =
           make_tensor(detail::get_logical_ptr(ptr_S), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
       cute::detail::fill_tma_gmem_shape_stride(
@@ -1424,7 +1478,7 @@ struct CollectiveMmaArrayMixedInput<
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       ElementZero const* ptr_Z = nullptr;
       // auto scale_k = K / mainloop_params.chunk_size;
-      auto scale_k = K / GROUP_SIZE;
+      auto scale_k = K / ScaleGroupSize;
       Tensor tensor_zero =
           make_tensor(detail::get_logical_ptr(ptr_Z), make_shape(M, scale_k, Int<1>{}), mainloop_params.dS[next_group]);
       cute::detail::fill_tma_gmem_shape_stride(
