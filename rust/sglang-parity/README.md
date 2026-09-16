@@ -304,22 +304,54 @@ without these records remain readable and keep their saved verdicts.
 
 Interrupted runs preserve a partial report and the bytes received so far.
 
-The terminal summary separates response validation, each implementation's
-repeatability, Python/Rust parity, and declared case equivalence. For example,
-`0 invalid` with `Parity FAIL` means that individual responses satisfy their
-contracts but the two implementations disagree. `Py repeat PASS` only means
-Python returned the same result twice. `Parity diffs` counts differing JSON
-paths for that case; it excludes repeatability and equivalence differences.
-Grouped counts describe difference occurrences, not independent bugs.
+Reports start with the saved suite, streaming output mode, commit, backend, and
+check totals, then group diagnostics by test case. Each case shows its request,
+response validation, Python and Rust repeatability, parity, and related case
+equivalence. A valid response and a stable implementation can still disagree
+with the other implementation. For example, this excerpt shows one difference
+from a case with eight missing fields:
 
-Open `report.html` for grouped failure reasons, case links, complete differences,
-requests, original final JSON, saved comparison rules, and raw response/SSE/log
-links. Comparison values are labeled separately from original response values:
+```text
+greedy_stream
+POST /generate · SSE · cumulative · expected HTTP 200
+
+  Response validation       PASS  4/4 passed · 0 invalid · 0 unavailable/pending
+  python repeatability      PASS  0 differences
+  rust repeatability        PASS  0 differences
+  Python <-> Rust parity    FAIL  8 differences
+  With greedy_json (python) PASS  0 differences
+  With greedy_json (rust)   PASS  0 differences
+
+  Python <-> Rust parity · greedy_stream
+  Rust is missing fields present in Python (8 differences)
+  Compared: python / greedy_stream / attempt 1 <-> rust / greedy_stream / attempt 1
+
+  /meta_info/cached_tokens
+    Python: 0
+    Rust: <missing>
+
+  Details: <run-directory>/report.html#case-1
+```
+
+The default terminal output lists every difference path for failing checks;
+only long values are truncated at 120 characters, with an explicit marker.
+Parity difference counts exclude repeatability and equivalence differences.
+Equivalence is linked from both related cases but counted once; its HTML details
+live under the recorded left-hand case. Counts describe difference occurrences,
+not independent bugs. Skipped and unfinished checks include diagnostic reasons.
+
+Open `report.html` for the case directory, expanded failure details, requests,
+reconstructed final JSON, recorded comparison rules, and raw response/SSE/log
+links. Comparison values are labeled separately from reconstructed values:
 value exceptions may replace timestamps with `0`, but a missing field remains
 `<missing>`, distinct from JSON `null`. A missing artifact is shown as unavailable
 and does not change the recorded test verdict. JSON previews are limited to
-64 KiB, with links to complete artifacts. The HTML has no external dependencies;
-copy the entire run directory to preserve its relative evidence links.
+64 KiB, with links to complete artifacts. The HTML uses system fonts, follows
+the system's light/dark theme, and stacks comparison columns on narrow screens.
+Status labels remain meaningful without color. The page has no external
+dependencies; copy the entire run directory to preserve relative evidence links.
+Each report describes one run and one output mode; its page title identifies
+the suite and mode. Missing saved metadata is shown as unavailable.
 
 Existing results can be viewed without preparing an environment or starting a
 service, including after moving the run directory:
@@ -329,8 +361,9 @@ sglang-parity --report target/parity/<run-id>/report.json
 sglang-parity --report target/parity/<run-id>/report.json --case greedy_json
 ```
 
-Both commands regenerate the complete `report.html`; `--case` also expands that
-case's comparisons and evidence paths in the terminal. They use saved results
+Both commands regenerate the complete `report.html`; `--case` keeps the run totals
+and displays only the selected case, with untruncated comparison and reconstructed
+values, source event indices, value-exception rules, and evidence paths. They use saved results
 and rules, not the current suite. They return the recorded test exit code (or `2`
 if reading/writing the report fails). An unknown case is an error. Report options
 cannot be combined with run or environment-maintenance options. Redirected
@@ -364,7 +397,7 @@ comparison rules, and all artifacts; these do not depend on the CLI.
 | `src/http.rs`, `src/sse.rs` | HTTP capture and generic SSE framing. |
 | `src/compare.rs` | Strict JSON differences and declared scalar-value exceptions. |
 | `src/artifacts.rs` | Atomic artifact storage, without test decisions. |
-| `src/report.rs` | Shared diagnostic grouping, terminal summaries, and standalone HTML from recorded results. |
+| `src/report.rs` | Case diagnostics, terminal summaries, and standalone HTML from recorded results. |
 | `suites/native_generate/` | API cases, native response validation and reconstruction. |
 | `cli/main.rs` | Configuration loading, suite selection, presentation, exit status. |
 

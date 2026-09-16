@@ -4,14 +4,15 @@
 //! can be moved without changing its JSON report. Missing evidence is diagnostic;
 //! it never changes the recorded verdict or becomes a missing response field.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::artifacts::write_atomic;
-use crate::compare::{ComparisonScope, Difference, DifferenceKind};
+use crate::compare::{ComparisonScope, DifferenceKind};
+use crate::http::CaptureMode;
 use crate::runner::{Attempt, CaseResult, Check, HttpSuite, Report, Status};
 
 const PREVIEW_LIMIT: usize = 64 * 1024;
@@ -58,19 +59,100 @@ struct Comparison<'a> {
     right: Evidence<'a>,
 }
 
-struct Group<'a> {
-    category: String,
-    reason: &'static str,
-    differences: Vec<(usize, &'a Difference)>,
+impl Comparison<'_> {
+    fn labels(&self) -> [String; 2] {
+        match self.kind {
+            CheckKind::Parity => ["Python".into(), "Rust".into()],
+            CheckKind::Repeatability => ["Attempt 1".into(), "Attempt 2".into()],
+            CheckKind::Equivalence => [self.left.case.into(), self.right.case.into()],
+        }
+    }
+
+    fn reason(&self, kind: DifferenceKind) -> String {
+        let [left, right] = self.labels();
+        match kind {
+            DifferenceKind::MissingLeft => format!("{left} is missing fields present in {right}"),
+            DifferenceKind::MissingRight => format!("{right} is missing fields present in {left}"),
+            DifferenceKind::TypeMismatch => "Field types differ".into(),
+            DifferenceKind::ValueMismatch => "Field values differ".into(),
+        }
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        [
+            DifferenceKind::MissingLeft,
+            DifferenceKind::MissingRight,
+            DifferenceKind::TypeMismatch,
+            DifferenceKind::ValueMismatch,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            let count = self
+                .check
+                .differences
+                .iter()
+                .filter(|d| d.kind == kind)
+                .count();
+            (count > 0).then(|| format!("{} ({count} differences)", self.reason(kind)))
+        })
+        .collect()
+    }
 }
 
-impl Group<'_> {
-    fn check_count(&self) -> usize {
-        self.differences
-            .iter()
-            .map(|(i, _)| i)
-            .collect::<BTreeSet<_>>()
-            .len()
+#[derive(Default)]
+struct Validation {
+    valid: usize,
+    invalid: usize,
+    pending: usize,
+}
+
+impl Validation {
+    fn for_cases<'a>(cases: impl Iterator<Item = &'a CaseResult>) -> Self {
+        let mut result = Self::default();
+        for case in cases {
+            let mut attempted = 0;
+            for attempt in case
+                .implementations
+                .values()
+                .flat_map(|side| &side.attempts)
+            {
+                attempted += 1;
+                if !attempt.violations.is_empty() {
+                    result.invalid += 1;
+                } else if attempt.final_json.is_some()
+                    && attempt
+                        .observation
+                        .as_ref()
+                        .is_some_and(|o| o.transport_error.is_none())
+                {
+                    result.valid += 1;
+                } else {
+                    result.pending += 1;
+                }
+            }
+            result.pending += 4_usize.saturating_sub(attempted);
+        }
+        result
+    }
+
+    fn status(&self) -> Status {
+        if self.invalid > 0 {
+            Status::Fail
+        } else if self.pending > 0 || self.valid == 0 {
+            Status::NotRun
+        } else {
+            Status::Pass
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{}/{} passed · {} invalid · {} unavailable/pending",
+            self.valid,
+            self.valid + self.invalid + self.pending,
+            self.invalid,
+            self.pending
+        )
     }
 }
 
@@ -83,7 +165,6 @@ pub struct ReportView<'a> {
     directory: PathBuf,
     suite: Result<HttpSuite, String>,
     comparisons: Vec<Comparison<'a>>,
-    groups: Vec<Group<'a>>,
 }
 
 impl<'a> ReportView<'a> {
@@ -93,7 +174,6 @@ impl<'a> ReportView<'a> {
             directory: directory.to_owned(),
             suite: Err("Saved suite is unavailable".into()),
             comparisons: Vec::new(),
-            groups: Vec::new(),
         };
         view.suite = view.read_json(&report.effective_suite).and_then(|value| {
             serde_json::from_value(value.get("suite").cloned().unwrap_or(Value::Null))
@@ -146,34 +226,10 @@ impl<'a> ReportView<'a> {
                 right: lookup(&result.right),
             });
         }
-        let mut groups = BTreeMap::<(String, &str), Group<'a>>::new();
-        for (index, comparison) in view.comparisons.iter().enumerate() {
-            for difference in &comparison.check.differences {
-                let reason = match difference.kind {
-                    DifferenceKind::MissingLeft if comparison.kind == CheckKind::Parity => {
-                        "Python is missing fields present in Rust"
-                    }
-                    DifferenceKind::MissingRight if comparison.kind == CheckKind::Parity => {
-                        "Rust is missing fields present in Python"
-                    }
-                    kind => difference_reason(kind),
-                };
-                groups
-                    .entry((comparison.category.clone(), reason))
-                    .or_insert_with(|| Group {
-                        category: comparison.category.clone(),
-                        reason,
-                        differences: Vec::new(),
-                    })
-                    .differences
-                    .push((index, difference));
-            }
-        }
-        view.groups = groups.into_values().collect();
         view
     }
 
-    /// Render an overview, optionally followed by one case's complete diagnostics.
+    /// Render each case's checks, optionally selecting one case with full evidence.
     ///
     /// # Errors
     /// Returns an error if the requested case does not exist in this report.
@@ -184,189 +240,96 @@ impl<'a> ReportView<'a> {
             return Err(format!("unknown report case {name:?}"));
         }
         let mut out = String::new();
-        let verdict = self.verdict();
-        let styled = if color {
-            format!(
-                "\x1b[{}m{verdict}\x1b[0m",
-                if self.report.exit_code() == 0 {
-                    "32"
-                } else {
-                    "31"
-                }
-            )
-        } else {
-            verdict.into()
-        };
         writeln!(
             out,
-            "SGLang Parity — {styled}\nState: {} · exit code {}\n",
+            "SGLang Parity — {}\nState: {} · exit code {}",
+            terminal_status(self.verdict(), color),
             plain(&self.report.state),
             self.report.exit_code()
         )
         .unwrap();
+        for (label, value) in self.metadata() {
+            writeln!(out, "{label}: {}", plain(&value)).unwrap();
+        }
+        out.push('\n');
         for (label, value) in self.totals() {
             writeln!(out, "{label:<26} {value}").unwrap();
         }
-        out.push_str("\nRepeatability compares two runs of the same implementation.\nResponse validation checks each response; parity compares Python with Rust.\n");
-        if !self.groups.is_empty() {
-            out.push_str("\nWHY CHECKS DIFFER\n");
-            for group in &self.groups {
-                writeln!(
-                    out,
-                    "\n{} — {}\n  {} checks affected · {} field differences",
-                    group.category,
-                    group.reason,
-                    group.check_count(),
-                    group.differences.len()
-                )
-                .unwrap();
-                let mut paths = BTreeSet::new();
-                for &(index, difference) in &group.differences {
-                    if !paths.insert(&difference.path) {
-                        continue;
-                    }
-                    if paths.len() > 3 {
-                        break;
-                    }
-                    let comparison = &self.comparisons[index];
-                    writeln!(
-                        out,
-                        "  {} [{}]\n    left: {}\n    right: {}\n    comparison values: {} | {}",
-                        plain(&difference.path),
-                        plain(&comparison.name),
-                        plain(&comparison.left.label()),
-                        plain(&comparison.right.label()),
-                        short_value(difference.left.as_ref()),
-                        short_value(difference.right.as_ref())
-                    )
-                    .unwrap();
-                }
-            }
-            out.push_str("\nCounts are difference occurrences, not independent bugs.\nComparison values include declared replacements; use --case for reconstructed values, source events and rules.\n");
+        out.push_str("\nResponse validation checks each response; repeatability checks two runs of one implementation.\nParity compares Python with Rust; equivalence compares declared related cases.\nDifferences count occurrences, not independent bugs.\n<missing> = absent field; null = present null; <unavailable> = missing evidence.\n");
+        for message in self.run_diagnostics() {
+            writeln!(out, "\nRun diagnostic: {}", plain(&message)).unwrap();
         }
-        let diagnostics = self.diagnostics(case);
-        if !diagnostics.is_empty() {
-            out.push_str("\nVALIDATION / EXECUTION DIAGNOSTICS\n");
-            for diagnostic in diagnostics {
-                writeln!(out, "  {}", plain(&diagnostic)).unwrap();
+        let files = case.map(|name| self.final_files(Some(name)));
+        for (index, result) in self.report.cases.iter().enumerate() {
+            if case.is_some_and(|name| name != result.name) {
+                continue;
             }
-        }
-        out.push_str("\nCASES\n");
-        let width = self
-            .report
-            .cases
-            .iter()
-            .map(|case| plain(&case.name).chars().count())
-            .max()
-            .unwrap_or(4)
-            .max(4);
-        writeln!(
-            out,
-            "{:<width$}  {:<10}  {:<11}  {:<9} Parity diffs",
-            "Case", "Py repeat", "Rust repeat", "Parity"
-        )
-        .unwrap();
-        for case in &self.report.cases {
-            let repeat = |side| {
-                case.implementations
-                    .get(side)
-                    .map(|side| status(side.repeatability.status))
-                    .unwrap_or("NOT_RUN")
-            };
+            let title = plain(&result.name);
             writeln!(
                 out,
-                "{:<width$}  {:<10}  {:<11}  {:<9} {}",
-                plain(&case.name),
-                repeat("python"),
-                repeat("rust"),
-                status(case.parity.status),
-                case.parity.differences.len()
+                "\n{}\n{}",
+                if color {
+                    format!("\x1b[1m{title}\x1b[0m")
+                } else {
+                    title
+                },
+                plain(&self.case_description(&result.name))
             )
             .unwrap();
-        }
-        if !self.report.equivalence.is_empty() {
-            out.push_str("\nCASE EQUIVALENCE\n");
-            for comparison in self
-                .comparisons
+            let comparisons = self.case_comparisons(&result.name);
+            let width = comparisons
                 .iter()
-                .filter(|c| c.kind == CheckKind::Equivalence)
-            {
+                .map(|c| plain(&self.check_label(c, &result.name)).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(25);
+            let validation = Validation::for_cases(std::iter::once(result));
+            writeln!(
+                out,
+                "\n  {:<width$} {}  {}",
+                "Response validation",
+                terminal_status(status(validation.status()), color),
+                validation.summary()
+            )
+            .unwrap();
+            for comparison in &comparisons {
                 writeln!(
                     out,
-                    "  {} · {}: {} ({} differences)",
-                    comparison.category,
-                    plain(&comparison.name),
-                    status(comparison.check.status),
+                    "  {:<width$} {}  {} differences",
+                    plain(&self.check_label(comparison, &result.name)),
+                    terminal_status(status(comparison.check.status), color),
                     comparison.check.differences.len()
                 )
                 .unwrap();
             }
-        }
-        if let Some(name) = case {
-            let files = self.final_files(Some(name));
-            out.push_str(
-                "\nCASE DETAILS — values below are comparison values unless marked reconstructed\n",
-            );
-            for comparison in self
-                .comparisons
-                .iter()
-                .filter(|c| c.left.case == name || c.right.case == name)
-            {
-                writeln!(
-                    out,
-                    "\n{} · {}: {}\n  left: {}\n  right: {}",
-                    comparison.category,
-                    plain(&comparison.name),
-                    status(comparison.check.status),
-                    plain(&comparison.left.label()),
-                    plain(&comparison.right.label())
-                )
-                .unwrap();
-                for difference in &comparison.check.differences {
+            for message in self.case_diagnostics(result) {
+                writeln!(out, "\n  {}", plain(&message)).unwrap();
+            }
+            for comparison in comparisons {
+                let detailed = files.is_some();
+                if !detailed && comparison.check.status == Status::Pass {
+                    continue;
+                }
+                if !detailed
+                    && comparison.kind == CheckKind::Equivalence
+                    && comparison.left.case != result.name
+                {
                     writeln!(
                         out,
-                        "  {}: {}\n    {} | {}",
-                        plain(&difference.path),
-                        difference_reason(difference.kind),
-                        short_value(difference.left.as_ref()),
-                        short_value(difference.right.as_ref())
+                        "\n  Equivalence details: report.html#{}",
+                        comparison.id
                     )
                     .unwrap();
-                    for side in [comparison.left, comparison.right] {
-                        writeln!(
-                            out,
-                            "    {} reconstructed: {}",
-                            plain(side.implementation),
-                            clipped(&self.original(side, &difference.path, &files), 120)
-                        )
-                        .unwrap();
-                        if let Some(indices) = Self::sources(side, &difference.path) {
-                            writeln!(
-                                out,
-                                "    source event indices (zero-based): {}",
-                                clipped(&format!("{indices:?}"), 120)
-                            )
-                            .unwrap();
-                        }
-                        if let Some(rule) = self.exception(side.case, &difference.path) {
-                            writeln!(out, "    value exception: {}", plain(rule)).unwrap();
-                        }
-                    }
+                    continue;
                 }
-                for side in [comparison.left, comparison.right] {
-                    for (label, path) in self.evidence_paths(side) {
-                        if let Some(relative) = self.relative(&path) {
-                            writeln!(
-                                out,
-                                "  {} {label}: {}",
-                                plain(&side.label()),
-                                plain(&self.directory.join(relative).display().to_string())
-                            )
-                            .unwrap();
-                        }
-                    }
-                }
+                self.terminal_comparison(&mut out, comparison, files.as_ref());
             }
+            writeln!(
+                out,
+                "\n  Details: {}#case-{index}",
+                plain(&self.directory.join("report.html").display().to_string())
+            )
+            .unwrap();
         }
         writeln!(
             out,
@@ -376,6 +339,176 @@ impl<'a> ReportView<'a> {
         )
         .unwrap();
         Ok(out)
+    }
+
+    fn terminal_comparison(
+        &self,
+        out: &mut String,
+        comparison: &Comparison<'_>,
+        files: Option<&JsonFiles>,
+    ) {
+        writeln!(
+            out,
+            "\n  {} · {}",
+            plain(&comparison.category),
+            plain(&comparison.name)
+        )
+        .unwrap();
+        if let Some(reason) = self.check_diagnostic(comparison) {
+            writeln!(out, "  {reason}").unwrap();
+        }
+        for reason in comparison.reasons() {
+            writeln!(out, "  {}", plain(&reason)).unwrap();
+        }
+        writeln!(
+            out,
+            "  Compared: {} <-> {}",
+            plain(&comparison.left.label()),
+            plain(&comparison.right.label())
+        )
+        .unwrap();
+        let labels = comparison.labels();
+        for difference in &comparison.check.differences {
+            writeln!(out, "\n  {}", plain(&difference.path)).unwrap();
+            for ((side, value), label) in [
+                (comparison.left, difference.left.as_ref()),
+                (comparison.right, difference.right.as_ref()),
+            ]
+            .into_iter()
+            .zip(&labels)
+            {
+                let rule = value.and_then(|_| self.exception(side.case, &difference.path));
+                let text = if files.is_some() {
+                    plain(&value_text(value))
+                } else {
+                    short_value(value)
+                };
+                writeln!(
+                    out,
+                    "    {}: {text}{}",
+                    plain(label),
+                    if rule.is_some() {
+                        " [value exception applied]"
+                    } else {
+                        ""
+                    }
+                )
+                .unwrap();
+                if let Some(files) = files {
+                    writeln!(
+                        out,
+                        "      reconstructed: {}",
+                        plain(&self.original(side, &difference.path, files))
+                    )
+                    .unwrap();
+                    if let Some(indices) = Self::sources(side, &difference.path) {
+                        writeln!(out, "      source event indices (zero-based): {indices:?}")
+                            .unwrap();
+                    }
+                    if let Some(rule) = rule {
+                        writeln!(out, "      value exception: {}", plain(rule)).unwrap();
+                    }
+                }
+            }
+        }
+        if files.is_some() {
+            for side in [comparison.left, comparison.right] {
+                for (label, path) in self.evidence_paths(side) {
+                    if let Some(relative) = self.relative(&path) {
+                        let path = self.directory.join(relative);
+                        writeln!(
+                            out,
+                            "  {} {label}: {}{}",
+                            plain(&side.label()),
+                            plain(&path.display().to_string()),
+                            if path.is_file() { "" } else { " (unavailable)" }
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn metadata(&self) -> Vec<(&'static str, String)> {
+        let mut result = vec![
+            (
+                "Suite",
+                self.suite
+                    .as_ref()
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("Unavailable")
+                    .into(),
+            ),
+            (
+                "Streaming mode",
+                self.suite
+                    .as_ref()
+                    .map(|s| s.output_mode.as_str())
+                    .unwrap_or("Unavailable")
+                    .into(),
+            ),
+        ];
+        for (label, pointer) in [
+            ("Commit", "/plan/commit"),
+            ("Backend", "/plan/profile/backend"),
+        ] {
+            result.push((
+                label,
+                self.report
+                    .environment
+                    .as_ref()
+                    .and_then(|e| e.pointer(pointer))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unavailable")
+                    .into(),
+            ));
+        }
+        result
+    }
+
+    fn case_description(&self, name: &str) -> String {
+        let Ok(suite) = &self.suite else {
+            return "Request specification unavailable".into();
+        };
+        let Some(case) = suite.cases.iter().find(|c| c.name == name) else {
+            return "Request specification unavailable".into();
+        };
+        let response = match case.capture {
+            CaptureMode::Json => "JSON".into(),
+            CaptureMode::Sse => format!("SSE · {}", suite.output_mode),
+        };
+        format!(
+            "{} {} · {response} · expected HTTP {}",
+            case.method, case.path, case.expect_status
+        )
+    }
+
+    fn case_comparisons(&self, name: &str) -> Vec<&Comparison<'a>> {
+        let mut comparisons: Vec<_> = self
+            .comparisons
+            .iter()
+            .filter(|c| c.left.case == name || c.right.case == name)
+            .collect();
+        comparisons.sort_by_key(|c| match c.kind {
+            CheckKind::Repeatability => 0,
+            CheckKind::Parity => 1,
+            CheckKind::Equivalence => 2,
+        });
+        comparisons
+    }
+
+    fn check_label(&self, comparison: &Comparison<'_>, case: &str) -> String {
+        if comparison.kind == CheckKind::Equivalence {
+            let other = if comparison.left.case == case {
+                comparison.right.case
+            } else {
+                comparison.left.case
+            };
+            format!("With {other} ({})", comparison.left.implementation)
+        } else {
+            comparison.category.clone()
+        }
     }
 
     /// Atomically save a standalone HTML view beside the report's evidence.
@@ -396,33 +529,9 @@ impl<'a> ReportView<'a> {
     }
 
     fn totals(&self) -> Vec<(String, String)> {
-        let mut valid = 0;
-        let mut invalid = 0;
-        let mut attempted = 0;
-        for case in &self.report.cases {
-            for side in case.implementations.values() {
-                for attempt in &side.attempts {
-                    attempted += 1;
-                    if !attempt.violations.is_empty() {
-                        invalid += 1;
-                    } else if attempt.final_json.is_some()
-                        && attempt
-                            .observation
-                            .as_ref()
-                            .is_some_and(|o| o.transport_error.is_none())
-                    {
-                        valid += 1;
-                    }
-                }
-            }
-        }
-        let expected = self.report.cases.len() * 4;
         let mut totals = vec![(
             "Response validation".into(),
-            format!(
-                "{valid}/{expected} passed · {invalid} invalid · {} unavailable/pending",
-                expected.max(attempted) - valid - invalid
-            ),
+            Validation::for_cases(self.report.cases.iter()).summary(),
         )];
         for side in ["python", "rust"] {
             totals.push((
@@ -437,7 +546,15 @@ impl<'a> ReportView<'a> {
         }
         totals.push((
             "Python <-> Rust parity".into(),
-            counts(self.report.cases.iter().map(|case| case.parity.status)),
+            format!(
+                "{} · {} differences",
+                counts(self.report.cases.iter().map(|case| case.parity.status)),
+                self.report
+                    .cases
+                    .iter()
+                    .map(|case| case.parity.differences.len())
+                    .sum::<usize>()
+            ),
         ));
         totals.push((
             "Case equivalence".into(),
@@ -451,52 +568,38 @@ impl<'a> ReportView<'a> {
         totals
     }
 
-    fn diagnostics(&self, selected: Option<&str>) -> Vec<String> {
+    fn run_diagnostics(&self) -> Vec<String> {
         let mut messages = self.report.runtime_errors.clone();
         if let Err(error) = &self.suite {
             messages.push(error.clone());
         }
-        for case in &self.report.cases {
-            if selected.is_some_and(|name| name != case.name) {
-                continue;
-            }
-            for (side, result) in &case.implementations {
-                for (index, attempt) in result.attempts.iter().enumerate() {
-                    let label = format!("{side} / {} / attempt {}", case.name, index + 1);
-                    if let Some(error) = attempt
-                        .observation
-                        .as_ref()
-                        .and_then(|o| o.transport_error.as_ref())
-                    {
-                        messages.push(format!("{label}: transport error: {error}"));
-                    }
-                    for violation in &attempt.violations {
-                        messages.push(format!(
-                            "{label}: {}{}: {}",
-                            violation.path,
-                            violation
-                                .event
-                                .map(|event| format!(" (event {event})"))
-                                .unwrap_or_default(),
-                            violation.message
-                        ));
-                    }
+        messages
+    }
+
+    fn case_diagnostics(&self, case: &CaseResult) -> Vec<String> {
+        let mut messages = Vec::new();
+        for (side, result) in &case.implementations {
+            for (index, attempt) in result.attempts.iter().enumerate() {
+                let label = format!("{side} / {} / attempt {}", case.name, index + 1);
+                if let Some(error) = attempt
+                    .observation
+                    .as_ref()
+                    .and_then(|o| o.transport_error.as_ref())
+                {
+                    messages.push(format!("{label}: transport error: {error}"));
+                }
+                for violation in &attempt.violations {
+                    messages.push(format!(
+                        "{label}: {}{}: {}",
+                        violation.path,
+                        violation
+                            .event
+                            .map(|event| format!(" (event {event})"))
+                            .unwrap_or_default(),
+                        violation.message
+                    ));
                 }
             }
-        }
-        for comparison in &self.comparisons {
-            if selected
-                .is_some_and(|name| comparison.left.case != name && comparison.right.case != name)
-            {
-                continue;
-            }
-            let Some(reason) = self.check_diagnostic(comparison) else {
-                continue;
-            };
-            messages.push(format!(
-                "{} / {}: {reason}",
-                comparison.category, comparison.name
-            ));
         }
         messages
     }
@@ -680,212 +783,121 @@ impl<'a> ReportView<'a> {
 
     fn html(&self) -> String {
         let files = self.final_files(None);
+        let metadata = self.metadata();
         let mut out = format!(
-            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SGLang Parity — {}</title><style>{STYLE}</style><body><main><header><p class=\"eyebrow\">SGLANG · PARITY REPORT</p><h1>{}</h1><p>State: {} · Exit code: {}</p></header>",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>SGLang Parity — {} · {} — {}</title><style>{STYLE}</style></head><body><main><header><h1>SGLang Parity <span class=\"status {}\">{}</span></h1><p>State: {} · Exit code: {}</p><dl class=\"metadata\">",
+            escape(&metadata[0].1),
+            escape(&metadata[1].1),
             self.verdict(),
+            if self.report.exit_code() == 0 {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             self.verdict(),
             escape(&self.report.state),
             self.report.exit_code()
         );
-        if let Some(environment) = &self.report.environment {
-            for (label, pointer) in [
-                ("Commit", "/plan/commit"),
-                ("Backend", "/plan/profile/backend"),
-            ] {
-                if let Some(value) = environment.pointer(pointer) {
-                    write!(
-                        out,
-                        "<p>{label}: <code>{}</code></p>",
-                        escape(&value_text(Some(value)))
-                    )
-                    .unwrap();
-                }
-            }
+        for (label, value) in metadata {
+            write!(
+                out,
+                "<div><dt>{label}</dt><dd><code>{}</code></dd></div>",
+                escape(&value)
+            )
+            .unwrap();
         }
-        if let Ok(suite) = &self.suite {
-            write!(out, "<p>Suite: <code>{}</code></p>", escape(&suite.name)).unwrap();
-        }
-        out.push_str("<section class=\"totals\">");
+        out.push_str("</dl></header><section class=\"totals\" aria-label=\"Run totals\">");
         for (label, value) in self.totals() {
             write!(
                 out,
-                "<div><h3>{}</h3><p>{}</p></div>",
+                "<div><h2>{}</h2><p>{}</p></div>",
                 escape(&label),
                 escape(&value)
             )
             .unwrap();
         }
-        out.push_str("</section><p class=\"muted\">Response validation checks each response. Repeatability compares two runs of one implementation. Parity compares Python with Rust. Case equivalence compares declared related cases.</p><h2>Why checks differ</h2>");
-        if self.groups.is_empty() {
-            out.push_str("<p>No recorded field differences. Check validation and execution diagnostics below for skipped or incomplete work.</p>");
-        }
-        for group in &self.groups {
-            write!(
-                out,
-                "<section><h3>{}</h3><p>{}</p><p>{} checks affected · {} field differences</p><ul>",
-                escape(group.reason),
-                escape(&group.category),
-                group.check_count(),
-                group.differences.len()
-            )
-            .unwrap();
-            for index in group
-                .differences
-                .iter()
-                .map(|(i, _)| *i)
-                .collect::<BTreeSet<_>>()
-            {
-                let comparison = &self.comparisons[index];
-                write!(
-                    out,
-                    "<li><a href=\"#{}\">{}</a></li>",
-                    comparison.id,
-                    escape(&comparison.name)
-                )
-                .unwrap();
-            }
-            out.push_str("</ul></section>");
-        }
-        out.push_str(
-            "<p class=\"muted\">Counts are difference occurrences, not independent bugs.</p>",
-        );
-        let diagnostics = self.diagnostics(None);
+        out.push_str("</section><p class=\"muted\">Response validation checks each response. Repeatability compares two runs of one implementation. Parity compares Python with Rust. Case equivalence compares declared related cases. Differences count occurrences, not independent bugs.</p><p class=\"muted\">Comparison values include declared replacements. &lt;missing&gt; means an absent field; null is a present JSON value; &lt;unavailable&gt; means evidence could not be read. Reconstructed values come from final.json before value exceptions.</p>");
+        let diagnostics = self.run_diagnostics();
         if !diagnostics.is_empty() {
-            out.push_str("<h2>Validation and execution diagnostics</h2><ul>");
+            out.push_str("<section><h2>Run diagnostics</h2><ul>");
             for message in diagnostics {
                 write!(out, "<li>{}</li>", escape(&message)).unwrap();
             }
-            out.push_str("</ul>");
+            out.push_str("</ul></section>");
         }
-        out.push_str("<h2>Cases</h2><div class=\"scroll\"><table><thead><tr><th>Case</th><th>Python repeatability</th><th>Rust repeatability</th><th>Parity</th><th>Parity diffs</th></tr></thead><tbody>");
+        out.push_str("<nav aria-label=\"Test cases\"><h2>Cases</h2><ul class=\"case-index\">");
         for (index, case) in self.report.cases.iter().enumerate() {
             write!(
                 out,
-                "<tr><td><a href=\"#case-{index}\">{}</a></td>",
-                escape(&case.name)
-            )
-            .unwrap();
-            for side in ["python", "rust"] {
-                write!(
-                    out,
-                    "<td>{}</td>",
-                    badge(
-                        case.implementations
-                            .get(side)
-                            .map(|s| s.repeatability.status)
-                            .unwrap_or(Status::NotRun)
-                    )
-                )
-                .unwrap();
-            }
-            write!(
-                out,
-                "<td>{}</td><td>{}</td></tr>",
+                "<li><a href=\"#case-{index}\">{}</a><span>Parity {} · {} differences</span></li>",
+                escape(&case.name),
                 badge(case.parity.status),
                 case.parity.differences.len()
             )
             .unwrap();
         }
-        out.push_str("</tbody></table></div>");
+        out.push_str("</ul></nav>");
         for (index, case) in self.report.cases.iter().enumerate() {
+            write!(out, "<section id=\"case-{index}\" class=\"case\"><h2>{}</h2><p>{}</p><dl class=\"checks\">", escape(&case.name), escape(&self.case_description(&case.name))).unwrap();
+            let validation = Validation::for_cases(std::iter::once(case));
             write!(
                 out,
-                "<section id=\"case-{index}\"><h2>{}</h2>",
-                escape(&case.name)
+                "<div><dt>Response validation</dt><dd>{} {}</dd></div>",
+                badge(validation.status()),
+                validation.summary()
             )
             .unwrap();
-            if let Ok(suite) = &self.suite
-                && let Some(spec) = suite.cases.iter().find(|c| c.name == case.name)
-            {
+            let comparisons = self.case_comparisons(&case.name);
+            for comparison in &comparisons {
                 write!(
                     out,
-                    "<p><code>{} {}</code> · expected HTTP {} · {:?}</p>",
-                    escape(&spec.method),
-                    escape(&spec.path),
-                    spec.expect_status,
-                    spec.capture
-                )
-                .unwrap();
-            }
-            for comparison in self
-                .comparisons
-                .iter()
-                .filter(|c| c.left.case == case.name && c.kind != CheckKind::Equivalence)
-            {
-                self.html_comparison(&mut out, comparison, &files);
-            }
-            for comparison in self.comparisons.iter().filter(|c| {
-                c.kind == CheckKind::Equivalence
-                    && (c.left.case == case.name || c.right.case == case.name)
-            }) {
-                write!(
-                    out,
-                    "<p>Related: <a href=\"#{}\">{} · {}</a></p>",
+                    "<div><dt><a href=\"#{}\">{}</a></dt><dd>{} {} differences</dd></div>",
                     comparison.id,
-                    escape(&comparison.category),
-                    escape(&comparison.name)
+                    escape(&self.check_label(comparison, &case.name)),
+                    badge(comparison.check.status),
+                    comparison.check.differences.len()
                 )
                 .unwrap();
             }
-            out.push_str("<details><summary>Requests, original responses and logs</summary>");
-            for (implementation, result) in &case.implementations {
-                for (index, attempt) in result.attempts.iter().enumerate() {
-                    let side = Evidence {
-                        case: &case.name,
-                        implementation,
-                        repeat: index + 1,
-                        attempt: Some(attempt),
-                    };
-                    write!(out, "<h3>{}</h3><p>", escape(&side.label())).unwrap();
-                    for (label, path) in self.evidence_paths(side) {
-                        write!(out, "{} · ", self.link(label, &path)).unwrap();
-                    }
-                    out.push_str("</p>");
-                    self.html_preview(
-                        &mut out,
-                        "Request JSON",
-                        &self.read_json(&attempt.directory.join("request.json")),
-                    );
-                    if let Some(path) = &attempt.final_json
-                        && let Some(value) = files.get(path)
-                    {
-                        self.html_preview(
-                            &mut out,
-                            "Reconstructed JSON (before value exceptions)",
-                            value,
-                        );
-                    }
+            out.push_str("</dl>");
+            let diagnostics = self.case_diagnostics(case);
+            if !diagnostics.is_empty() {
+                out.push_str("<h3>Response diagnostics</h3><ul>");
+                for message in diagnostics {
+                    write!(out, "<li>{}</li>", escape(&message)).unwrap();
+                }
+                out.push_str("</ul>");
+            }
+            for comparison in comparisons {
+                if comparison.kind != CheckKind::Equivalence || comparison.left.case == case.name {
+                    self.html_comparison(&mut out, comparison, &files);
                 }
             }
-            out.push_str("</details></section>");
+            write!(
+                out,
+                "<p><a href=\"#rules\">Recorded comparison and response rules</a> · {}</p>",
+                self.link("Effective suite", &self.report.effective_suite)
+            )
+            .unwrap();
+            self.html_evidence(&mut out, case, &files);
+            out.push_str("</section>");
         }
-        out.push_str("<h2>Case equivalence</h2>");
-        for comparison in self
-            .comparisons
-            .iter()
-            .filter(|c| c.kind == CheckKind::Equivalence)
-        {
-            self.html_comparison(&mut out, comparison, &files);
-        }
-        out.push_str("<h2>Recorded comparison rules</h2>");
+        out.push_str("<section id=\"rules\"><h2>Recorded rules</h2>");
         if let Ok(suite) = &self.suite {
+            self.html_preview(
+                &mut out,
+                "Recorded comparison rules",
+                &Ok(serde_json::to_value(&suite.comparison).expect("serializable rules")),
+            );
             if let Some(policy) = &suite.response_policy {
                 self.html_preview(&mut out, "Recorded response policy", &Ok(policy.clone()));
             }
-            write!(
-                out,
-                "<pre>{}</pre>",
-                escape(
-                    &serde_json::to_string_pretty(&suite.comparison).expect("serializable rules")
-                )
-            )
-            .unwrap();
         } else {
             out.push_str("<p>Saved comparison rules unavailable.</p>");
         }
         write!(
             out,
-            "<footer>{} · {} · {}</footer></main></body></html>",
+            "</section><footer>{} · {} · {}</footer></main></body></html>",
             self.link(
                 "Machine-readable report",
                 &self.report.directory.join("report.json")
@@ -898,43 +910,64 @@ impl<'a> ReportView<'a> {
     }
 
     fn html_comparison(&self, out: &mut String, comparison: &Comparison<'_>, files: &JsonFiles) {
-        write!(out, "<details id=\"{}\"><summary>{} {} · {} · {} differences</summary><div class=\"comparison\"><p><strong>Left:</strong> {}<br><strong>Right:</strong> {}</p>", comparison.id, badge(comparison.check.status), escape(&comparison.category), escape(&comparison.name), comparison.check.differences.len(), escape(&comparison.left.label()), escape(&comparison.right.label())).unwrap();
+        write!(out, "<details id=\"{}\"{}><summary>{} {} · {} differences</summary><div class=\"comparison\"><p>Compared: {} &harr; {}</p>",
+            comparison.id, if comparison.check.status == Status::Pass { "" } else { " open" }, badge(comparison.check.status),
+            escape(&format!("{} · {}", comparison.category, comparison.name)), comparison.check.differences.len(),
+            escape(&comparison.left.label()), escape(&comparison.right.label())).unwrap();
         if let Some(reason) = self.check_diagnostic(comparison) {
             write!(out, "<p>{}</p>", escape(reason)).unwrap();
         }
+        for reason in comparison.reasons() {
+            write!(out, "<p><strong>{}</strong></p>", escape(&reason)).unwrap();
+        }
         for side in [comparison.left, comparison.right] {
-            if let Some(path) = side.attempt.and_then(|a| a.final_json.as_ref()) {
-                write!(
-                    out,
-                    "<p>{}</p>",
-                    self.link(&format!("{} — reconstructed response", side.label()), path)
-                )
-                .unwrap();
+            write!(out, "<p>{}: ", escape(&side.label())).unwrap();
+            for (index, (label, path)) in self.evidence_paths(side).iter().enumerate() {
+                if index > 0 {
+                    out.push_str(" · ");
+                }
+                out.push_str(&self.link(label, path));
             }
+            out.push_str("</p>");
         }
         if !comparison.check.differences.is_empty() {
-            out.push_str("<p class=\"muted\">Comparison values may contain declared replacements. &lt;missing&gt; means absent; null is a present JSON value. Reconstructed values come from final.json before value exceptions and may combine several events.</p><div class=\"scroll\"><table><thead><tr><th>Path / reason</th><th>Left</th><th>Right</th></tr></thead><tbody>");
+            let labels = comparison.labels();
+            write!(out, "<table class=\"differences\"><thead><tr><th scope=\"col\">Field / reason</th><th scope=\"col\">{}</th><th scope=\"col\">{}</th></tr></thead><tbody>", escape(&labels[0]), escape(&labels[1])).unwrap();
             for difference in &comparison.check.differences {
                 write!(
                     out,
-                    "<tr><td><code>{}</code><p>{}</p></td>",
+                    "<tr><th scope=\"row\"><code>{}</code><p>{}</p></th>",
                     escape(&difference.path),
-                    difference_reason(difference.kind)
+                    escape(&comparison.reason(difference.kind))
                 )
                 .unwrap();
-                for (side, value) in [
+                for ((side, value), label) in [
                     (comparison.left, difference.left.as_ref()),
                     (comparison.right, difference.right.as_ref()),
-                ] {
-                    write!(out, "<td><small>Comparison value</small><pre>{}</pre><details><summary>Reconstructed value</summary><pre>{}</pre></details>", escape(&value_text(value)), escape(&self.original(side, &difference.path, files))).unwrap();
-                    if let Some(reason) = self.exception(side.case, &difference.path) {
+                ]
+                .into_iter()
+                .zip(&labels)
+                {
+                    write!(out, "<td><strong class=\"side-label\" aria-hidden=\"true\">{}</strong><small>Comparison value</small>", escape(label)).unwrap();
+                    let text = value
+                        .map(|v| serde_json::to_string_pretty(v).expect("serializable JSON"))
+                        .unwrap_or_else(|| "<missing>".into());
+                    html_pre(out, &text);
+                    if let Some(reason) =
+                        value.and_then(|_| self.exception(side.case, &difference.path))
+                    {
                         write!(
                             out,
-                            "<p class=\"muted\">Declared value exception: {}</p>",
+                            "<p class=\"muted\">Value exception applied: {}</p>",
                             escape(reason)
                         )
                         .unwrap();
                     }
+                    out.push_str(
+                        "<details><summary>Reconstructed value (before exceptions)</summary>",
+                    );
+                    html_pre(out, &self.original(side, &difference.path, files));
+                    out.push_str("</details>");
                     if let Some(indices) = Self::sources(side, &difference.path) {
                         self.html_preview(
                             out,
@@ -946,9 +979,39 @@ impl<'a> ReportView<'a> {
                 }
                 out.push_str("</tr>");
             }
-            out.push_str("</tbody></table></div>");
+            out.push_str("</tbody></table>");
         }
         out.push_str("</div></details>");
+    }
+
+    fn html_evidence(&self, out: &mut String, case: &CaseResult, files: &JsonFiles) {
+        out.push_str("<details><summary>Requests, original responses and logs</summary>");
+        for (implementation, result) in &case.implementations {
+            for (index, attempt) in result.attempts.iter().enumerate() {
+                let side = Evidence {
+                    case: &case.name,
+                    implementation,
+                    repeat: index + 1,
+                    attempt: Some(attempt),
+                };
+                write!(out, "<h3>{}</h3><p>", escape(&side.label())).unwrap();
+                for (label, path) in self.evidence_paths(side) {
+                    write!(out, "{} · ", self.link(label, &path)).unwrap();
+                }
+                out.push_str("</p>");
+                self.html_preview(
+                    out,
+                    "Request JSON",
+                    &self.read_json(&attempt.directory.join("request.json")),
+                );
+                if let Some(path) = &attempt.final_json
+                    && let Some(value) = files.get(path)
+                {
+                    self.html_preview(out, "Reconstructed JSON (before value exceptions)", value);
+                }
+            }
+        }
+        out.push_str("</details>");
     }
 
     fn html_preview(&self, out: &mut String, label: &str, value: &Result<Value, String>) {
@@ -956,23 +1019,20 @@ impl<'a> ReportView<'a> {
             Ok(value) => serde_json::to_string_pretty(value).expect("serializable JSON"),
             Err(error) => error.clone(),
         };
-        let mut end = text.len().min(PREVIEW_LIMIT);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        write!(
-            out,
-            "<details><summary>{}</summary><pre>{}</pre>",
-            escape(label),
-            escape(&text[..end])
-        )
-        .unwrap();
-        if end < text.len() {
-            out.push_str(
-                "<p>Preview truncated at 64 KiB. Use the complete artifact link above.</p>",
-            );
-        }
+        write!(out, "<details><summary>{}</summary>", escape(label)).unwrap();
+        html_pre(out, &text);
         out.push_str("</details>");
+    }
+}
+
+fn html_pre(out: &mut String, text: &str) {
+    let mut end = text.len().min(PREVIEW_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    write!(out, "<pre>{}</pre>", escape(&text[..end])).unwrap();
+    if end < text.len() {
+        out.push_str("<p>Preview truncated at 64 KiB. Use the complete artifact link above.</p>");
     }
 }
 
@@ -1012,12 +1072,17 @@ fn counts(values: impl Iterator<Item = Status>) -> String {
     out
 }
 
-fn difference_reason(kind: DifferenceKind) -> &'static str {
-    match kind {
-        DifferenceKind::MissingLeft => "Field missing on the left",
-        DifferenceKind::MissingRight => "Field missing on the right",
-        DifferenceKind::TypeMismatch => "Field types differ",
-        DifferenceKind::ValueMismatch => "Field values differ",
+fn terminal_status(label: &str, color: bool) -> String {
+    let code = match label {
+        "PASS" => "32",
+        "FAIL" | "ERROR" => "31",
+        "UNSTABLE" => "33",
+        _ => return label.into(),
+    };
+    if color {
+        format!("\x1b[{code}m{label}\x1b[0m")
+    } else {
+        label.into()
     }
 }
 
@@ -1085,9 +1150,75 @@ fn badge(value: Status) -> String {
 }
 
 const STYLE: &str = "
-:root{color-scheme:light dark;--bg:#f5f7fa;--panel:#fff;--text:#182335;--muted:#566477;--line:#dce3ec;--link:#1657a1}
-@media(prefers-color-scheme:dark){:root{--bg:#111821;--panel:#1a2431;--text:#e2e9f2;--muted:#acb9ca;--line:#354255;--link:#8abfff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,sans-serif}main{max-width:1250px;margin:auto;padding:40px 28px}h1{font-size:42px;margin:0}h2{margin-top:32px}h3{font-size:16px}.eyebrow{font-size:12px;letter-spacing:.15em;color:var(--muted)}a{color:var(--link);overflow-wrap:anywhere}section,details{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin:12px 0}details details{padding:8px}summary{cursor:pointer;font-weight:600;overflow-wrap:anywhere}.totals{display:flex;flex-wrap:wrap;gap:12px;background:none;border:0;padding:0}.totals>div{flex:1 1 210px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 16px}.totals h3{margin:0}.muted,small{color:var(--muted)}table{border-collapse:collapse;width:100%;text-align:left}th,td{padding:12px;vertical-align:top;border-bottom:1px solid var(--line)}th{font-size:13px}td{min-width:120px}.scroll{overflow-x:auto}pre,code{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}pre{max-height:440px;overflow:auto}td pre{max-width:440px}.status{display:inline-block;border-radius:4px;padding:1px 7px;background:var(--bg);font-size:12px}.PASS{color:#16804a}.FAIL,.UNSTABLE{color:#ce4b42}.SKIPPED,.NOT_RUN{color:var(--muted)}footer{margin:32px 0;color:var(--muted)}:target{outline:2px solid var(--link);scroll-margin-top:16px}li{overflow-wrap:anywhere}
+:root {
+    color-scheme: light dark;
+    --bg: #f6f8fa; --panel: #fff; --text: #1f2328; --muted: #59636e;
+    --line: #d1d9e0; --link: #0969da;
+    --pass: #116329; --pass-bg: #dafbe1; --fail: #a40e26; --fail-bg: #ffebe9;
+    --unstable: #7d4e00; --unstable-bg: #fff8c5; --neutral-bg: #eff2f5;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0d1117; --panel: #151b23; --text: #f0f6fc; --muted: #b1bac4;
+        --line: #3d444d; --link: #79c0ff;
+        --pass: #7ee787; --pass-bg: #12261e; --fail: #ffa198; --fail-bg: #3b181c;
+        --unstable: #e3b341; --unstable-bg: #30270c; --neutral-bg: #212830;
+    }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 1rem/1.6 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+main { max-width: 1200px; margin: auto; padding: 2rem 24px; }
+h1, h2, h3 { font-weight: 600; line-height: 1.4; }
+h1 { font-size: 1.75rem; margin: 0; }
+h2 { font-size: 1.25rem; margin: 0 0 1rem; }
+h3 { font-size: 1rem; }
+p { margin: .75rem 0; }
+a { color: var(--link); text-decoration: underline; }
+a, summary, li, dt, dd, h2 { overflow-wrap: anywhere; }
+a:focus-visible, summary:focus-visible { outline: 3px solid var(--link); outline-offset: 3px; }
+section, nav { background: var(--panel); border: 1px solid var(--line); border-radius: .5rem; padding: 1rem; margin: 1.5rem 0; }
+details { border: 1px solid var(--line); border-radius: .375rem; margin: 1rem 0; padding: .75rem; min-width: 0; }
+summary { cursor: pointer; font-weight: 600; }
+summary .status { margin: 0 .5rem 0 .25rem; }
+.totals { display: flex; flex-wrap: wrap; gap: 1rem; background: none; border: 0; padding: 0; }
+.totals > div { flex: 1 1 200px; background: var(--panel); border: 1px solid var(--line); border-radius: .5rem; padding: 1rem; }
+.totals h2 { font-size: .875rem; margin: 0; }
+.totals p { margin-bottom: 0; }
+.metadata { display: flex; flex-wrap: wrap; gap: .75rem 2rem; font-size: .875rem; }
+.metadata div { min-width: 0; }
+dt { font-weight: 600; }
+dd { margin: 0; }
+.metadata dt, .muted, small { color: var(--muted); }
+.muted, small { font-size: .875rem; }
+small { display: block; }
+.checks > div { display: flex; flex-wrap: wrap; gap: .25rem 1rem; padding: .375rem 0; }
+.checks dt { flex: 0 1 270px; }
+.checks dd { flex: 1 1 260px; }
+.case-index { padding: 0; margin: 0; list-style: none; }
+.case-index li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem 1rem; padding: .5rem 0; border-bottom: 1px solid var(--line); }
+.case-index li:last-child { border: 0; }
+.case-index span { font-size: .875rem; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; text-align: left; }
+th, td { padding: .75rem; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+th { font-size: .875rem; font-weight: 600; }
+.differences tbody th p { font-weight: 400; }
+pre, code { font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; font-size: .875rem; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre { max-height: 440px; overflow: auto; margin: .5rem 0; font-weight: 400; }
+.side-label { display: none; }
+.status { display: inline-block; border-radius: .25rem; padding: .125rem .5rem; font-size: .875rem; font-weight: 600; color: var(--muted); background: var(--neutral-bg); }
+.PASS { color: var(--pass); background: var(--pass-bg); }
+.FAIL { color: var(--fail); background: var(--fail-bg); }
+.UNSTABLE { color: var(--unstable); background: var(--unstable-bg); }
+footer { margin: 2rem 0; font-size: .875rem; }
+:target { outline: 2px solid var(--link); scroll-margin-top: 1rem; }
+@media (max-width: 759px) {
+    main { padding: 1rem 16px; }
+    .differences, .differences tbody, .differences tr, .differences th, .differences td { display: block; width: 100%; }
+    .differences thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    .differences tr { border-top: 1px solid var(--line); padding: .75rem 0; }
+    .differences th, .differences td { border: 0; padding: .5rem 0; }
+    .side-label { display: block; margin-bottom: .25rem; }
+}
 ";
 
 #[cfg(test)]
@@ -1121,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_groups_occurrences_and_keeps_check_categories_distinct() {
+    fn cases_keep_check_categories_evidence_and_equivalence_counts_distinct() {
         let report = recorded();
         let directory = tempfile::tempdir().unwrap();
         let view = ReportView::new(&report, directory.path());
@@ -1131,20 +1262,36 @@ mod tests {
             "2/2 passed",
             "0/2 passed · 2 FAIL",
             "0/1 passed · 1 FAIL",
-            "2 checks affected · 4 field differences",
-            "1 checks affected · 1 field differences",
-            "null | <missing>",
-            "Parity diffs",
+            "2 FAIL · 4 differences",
+            "Rust is missing fields present in Python (2 differences)",
+            "stream is missing fields present in json (1 differences)",
+            "Python: null\n    Rust: <missing>",
+            "Streaming mode: Unavailable",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
         assert!(!text.contains('\x1b'));
+        assert!(!text.contains("WHY CHECKS DIFFER"));
+        assert!(!text.contains("reconstructed: <unavailable>"));
+        assert_eq!(text.matches("\n  /time\n").count(), 3);
+        let html = view.html();
+        assert_eq!(html.matches("id=\"equivalence-0\"").count(), 1);
+        assert_eq!(html.matches("href=\"#equivalence-0\"").count(), 2);
+        assert!(html.find("id=\"case-0\"").unwrap() < html.find("id=\"equivalence-0\"").unwrap());
+        assert!(html.find("id=\"equivalence-0\"").unwrap() < html.find("id=\"case-1\"").unwrap());
+        assert!(html.contains("id=\"parity-0\" open"));
+        assert!(!html.contains("id=\"repeat-0-1\" open"));
         assert!(view.terminal(None, true).unwrap().contains("\x1b[31mFAIL"));
         assert!(view.terminal(Some("unknown"), false).is_err());
         let expanded = view.terminal(Some("stream"), false).unwrap();
-        assert!(expanded.contains("left: python / json / attempt 1"));
-        assert!(expanded.contains("right: python / stream / attempt 1"));
-        assert!(expanded.contains("right: rust / stream / attempt 2"));
+        assert!(!expanded.contains("\njson\n"));
+        assert!(
+            expanded
+                .contains("Compared: python / json / attempt 1 <-> python / stream / attempt 1")
+        );
+        assert!(
+            expanded.contains("Compared: rust / stream / attempt 1 <-> rust / stream / attempt 2")
+        );
         assert!(expanded.contains("reconstructed: <unavailable>"));
         for (kind, message) in [
             (DifferenceKind::ValueMismatch, "Field values differ"),
@@ -1214,6 +1361,7 @@ mod tests {
         for expected in [
             "123.25",
             "Clock value varies",
+            "<title>SGLang Parity — example · example — FAIL</title>",
             "&lt;missing&gt;",
             "&lt;unavailable&gt;",
             "&lt;script&gt;",
@@ -1236,6 +1384,23 @@ mod tests {
         );
         assert_eq!(view.exception("json", "/12/nested/time"), None);
         assert_eq!(view.exception("json", "/time"), None);
+        for mode in ["cumulative", "incremental", "custom-output"] {
+            view.suite.as_mut().unwrap().output_mode = mode.into();
+            view.suite.as_mut().unwrap().cases[0].capture = CaptureMode::Sse;
+            assert!(
+                view.terminal(None, false)
+                    .unwrap()
+                    .contains(&format!("Streaming mode: {mode}"))
+            );
+            assert!(
+                view.html()
+                    .contains(&format!("example · {mode} — FAIL</title>"))
+            );
+            assert!(
+                view.case_description("json")
+                    .contains(&format!("SSE · {mode}"))
+            );
+        }
         view.write_html().unwrap();
         assert!(root.join("report.html").is_file());
         assert!(!root.join("report.html.pending").exists());
@@ -1243,6 +1408,47 @@ mod tests {
         let html = view.html();
         assert!(html.contains("reconstructed response (unavailable)"));
         assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn terminal_preserves_all_paths_and_full_selected_values_with_safe_styling() {
+        let mut report = recorded();
+        let long = "語".repeat(160);
+        report.cases[0].parity.differences = (0..5)
+            .map(|index| {
+                serde_json::from_value(json!({"path": format!("/{index}/a~1b/{long}"),
+                "kind": "value_mismatch", "left": long, "right": "\u{1b}[31m\n"}))
+                .unwrap()
+            })
+            .collect();
+        report.cases[1].name = "stream\u{1b}[31m\n".into();
+        let directory = tempfile::tempdir().unwrap();
+        let view = ReportView::new(&report, directory.path());
+        let text = view.terminal(None, false).unwrap();
+        let selected = view.terminal(Some("json"), false).unwrap();
+        for difference in &report.cases[0].parity.differences {
+            assert!(text.contains(&difference.path));
+        }
+        assert!(text.contains("[truncated]"));
+        assert!(!selected.contains("[truncated]"));
+        assert!(selected.contains(&format!("Python: \"{long}\"")));
+        assert!(!text.contains('\x1b'));
+        assert!(text.contains("stream\\u{1b}[31m\\n"));
+        let colored = view.terminal(None, true).unwrap();
+        let mut stripped = colored;
+        for sequence in ["\x1b[0m", "\x1b[1m", "\x1b[31m", "\x1b[32m", "\x1b[33m"] {
+            stripped = stripped.replace(sequence, "");
+        }
+        assert_eq!(stripped, text);
+        for (label, expected) in [
+            ("PASS", "\x1b[32mPASS\x1b[0m"),
+            ("FAIL", "\x1b[31mFAIL\x1b[0m"),
+            ("UNSTABLE", "\x1b[33mUNSTABLE\x1b[0m"),
+            ("SKIPPED", "SKIPPED"),
+            ("NOT_RUN", "NOT_RUN"),
+        ] {
+            assert_eq!(terminal_status(label, true), expected);
+        }
     }
 
     #[test]

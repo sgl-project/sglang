@@ -42,7 +42,10 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
         serde_json::to_value(&report).unwrap()
     );
     let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
-    assert!(html.contains("SGLang Parity — PASS"));
+    assert!(html.contains(&format!(
+        "<title>SGLang Parity — {} · {} — PASS</title>",
+        suite.name, suite.output_mode
+    )));
     assert!(html.contains("Recorded response policy"));
     // Re-render a moved run with no tools on PATH; the lifecycle must stay unchanged.
     let moved = fixture.directory.path().join("moved report");
@@ -63,12 +66,17 @@ async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("8/8 passed"));
-    assert!(text.contains("Parity diffs"));
+    assert!(text.contains("Python <-> Rust parity"));
+    assert!(text.contains(&format!("Streaming mode: {}", suite.output_mode)));
+    assert!(text.contains("\nunary\n"));
+    assert!(!text.contains("\nstreaming\n"));
     assert!(!text.contains('\x1b'));
     assert_eq!(fixture.lifecycle(), lifecycle_before);
     assert_eq!(fixture.preparations(), preparations_before);
     let html = fs::read_to_string(moved.join("report.html")).unwrap();
     assert!(html.contains("href=\"python/unary/1/final.json\""));
+    assert!(html.contains("id=\"case-1\""));
+    assert_eq!(html.matches("id=\"equivalence-0\"").count(), 1);
     fs::rename(&moved, &report.directory).unwrap();
     assert_eq!(report.equivalence.len(), 2);
     assert!(
