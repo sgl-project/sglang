@@ -441,10 +441,24 @@ class GPTQMarlinConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.marlin_utils import (
+            check_marlin_supports_layer,
+        )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
+        if isinstance(layer, LinearBase) and not check_marlin_supports_layer(
+            layer, self.group_size
+        ):
+            logger.info(
+                "Layer '%s' is not supported by GPTQMarlin (e.g. partition shape "
+                "not divisible by Marlin tile size 64). Falling back to UnquantizedLinearMethod.",
+                prefix,
+            )
+            return UnquantizedLinearMethod()
         return get_linear_quant_method(
             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
         )

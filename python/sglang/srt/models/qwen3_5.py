@@ -621,6 +621,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
         # checkpoint, which are loaded into the fused in_proj_ba parameter
         # via stacked_params_mapping with shard_id 0 and 1 respectively.
+        # In quantized checkpoints (e.g. GPTQ / Marlin), in_proj_b and in_proj_a
+        # are stored unquantized (bf16) when the output size per partition does
+        # not satisfy the quantizer's tile requirements (e.g. Marlin tile_n_size = 64).
+        actual_tp_size = (
+            tp_size
+            if tp_size is not None
+            else getattr(self, "attn_tp_size", get_parallel().attn_tp_size)
+        )
+        ba_out_per_part = (num_v_heads * 2) // actual_tp_size
+        if (
+            quant_config is not None
+            and getattr(quant_config, "get_name", lambda: "")()
+            in ("gptq", "gptq_marlin")
+            and ba_out_per_part % 64 != 0
+        ):
+            quant_config = None
+
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads, num_v_heads],

@@ -141,11 +141,21 @@ class Qwen3GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
+        ba_quant_config = quant_config
+        ba_out_per_part = (self.num_v_heads * 2) // self.attn_tp_size
+        if (
+            ba_quant_config is not None
+            and getattr(ba_quant_config, "get_name", lambda: "")()
+            in ("gptq", "gptq_marlin")
+            and ba_out_per_part % 64 != 0
+        ):
+            ba_quant_config = None
+
         self.in_proj_ba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[self.num_v_heads] * 2,
             bias=False,
-            quant_config=quant_config,
+            quant_config=ba_quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,

@@ -211,12 +211,36 @@ def check_marlin_supports_shape(
 
 
 def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    output_size_per_partition = (
-        getattr(layer, "output_size_per_partition", None) or layer.output_size
-    )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+    output_size_per_partition = getattr(layer, "output_size_per_partition", None)
+    input_size_per_partition = getattr(layer, "input_size_per_partition", None)
+
+    if output_size_per_partition is None or input_size_per_partition is None:
+        tp_size = getattr(layer, "tp_size", None)
+        if tp_size is None:
+            try:
+                from sglang.srt.distributed import get_parallel
+
+                tp_size = get_parallel().tp_size
+            except Exception:
+                tp_size = 1
+
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        if output_size_per_partition is None:
+            if isinstance(layer, ColumnParallelLinear):
+                output_size_per_partition = (
+                    layer.output_size // tp_size if tp_size else layer.output_size
+                )
+            else:
+                output_size_per_partition = layer.output_size
+
+        if input_size_per_partition is None:
+            if isinstance(layer, RowParallelLinear):
+                input_size_per_partition = (
+                    layer.input_size // tp_size if tp_size else layer.input_size
+                )
+            else:
+                input_size_per_partition = layer.input_size
 
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
