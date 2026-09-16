@@ -138,6 +138,7 @@ class QwenImage21EncodingStage(PipelineStage):
             with self.use_declared_component(
                 component_name="vae", module=self.vae
             ) as vae:
+                vae.use_tiling = config.vae_tiling
                 for image in resized:
                     pixels = torch.frombuffer(
                         bytearray(image.tobytes()), dtype=torch.uint8

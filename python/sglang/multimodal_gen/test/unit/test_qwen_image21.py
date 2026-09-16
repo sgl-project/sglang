@@ -123,7 +123,8 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels):
     torch.testing.assert_close(_unpatchify(_patchify(x, 2), 2), x)
 
 
-def test_condition_pixels_match_reference_preprocessing(monkeypatch):
+@pytest.mark.parametrize("tiling", [False, True])
+def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
     module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
     monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(f"{module}.set_forward_context", lambda **kwargs: nullcontext())
@@ -147,7 +148,11 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch):
         do_classifier_free_guidance=False,
         extra={},
     )
-    stage.forward(batch, SimpleNamespace(pipeline_config=QwenImage21PipelineConfig()))
+    stage.forward(
+        batch,
+        SimpleNamespace(pipeline_config=QwenImage21PipelineConfig(vae_tiling=tiling)),
+    )
+    assert vae.use_tiling is tiling
     expected = VaeImageProcessor(vae_scale_factor=16).preprocess(image).unsqueeze(2)
     torch.testing.assert_close(
         vae.encode.call_args.args[0], expected.bfloat16(), atol=0, rtol=0
