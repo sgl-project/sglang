@@ -381,14 +381,20 @@ class TestEagleDeviceMetadataHip(CustomTestCase):
             batch.seq_lens.copy_(torch.tensor(lengths, device=device))
             batch.req_pool_indices.copy_(torch.tensor(slots, device=device))
             batch.out_cache_loc.add_(bs * rows)
-            reference = backend.init_forward_metadata_draft_extend(
+            # Keep the old full-context builder as an independent reference.
+            reference = backend.init_forward_metadata_prefill(
                 max_seq_len=MAX_CONTEXT,
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=lengths,
-                num_tokens_per_req=rows,
+                extend_seq_lens=torch.full_like(batch.seq_lens, rows),
+                extend_seq_lens_cpu=[rows] * bs,
+                num_tokens=rows * bs,
+                need_compress=False,
                 out_cache_loc=batch.out_cache_loc,
             )
+            self.assertEqual(reference.core_metadata.page_table.shape[1], 2)
+            self.assertEqual(device_built.core_metadata.page_table.shape[1], 1)
             graph.replay()
             for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
                 self.assertTrue(
