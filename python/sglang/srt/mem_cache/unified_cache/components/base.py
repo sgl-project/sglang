@@ -73,12 +73,11 @@ class PrepareLoadBackResult:
 
 @dataclasses.dataclass(frozen=True)
 class PreparePrefetchResult:
-    """Outcome of prepare_prefetch; default = nothing to prepare."""
+    """Outcome of prepare_prefetch; default = the component takes no part."""
 
-    # Host pool exhausted; the caller aborts the prefetch.
-    alloc_failed: bool = False
-    # The component's pre-allocated host buffer (None = skip the build).
-    host_indices: Optional[torch.Tensor] = None
+    # Host staging the fetch needs from this component, in the component
+    # pool's units. Allocated at hit time, next to the KV staging; 0 = none.
+    staging_tokens: int = 0
 
 
 class CacheTransferPhase(str, Enum):
@@ -666,8 +665,12 @@ class TreeComponent(ABC):
         *,
         prefetch_tokens: int = 0,
     ) -> PreparePrefetchResult:
-        """Cache-level host pre-allocation before a prefetch builds its transfers."""
+        """Size the host staging a prefetch from node_id needs from this component."""
         return PreparePrefetchResult()
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
+        return None
 
     def build_hicache_transfers(
         self,
@@ -678,6 +681,7 @@ class TreeComponent(ABC):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.

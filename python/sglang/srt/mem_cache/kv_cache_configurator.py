@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.allocator.swa import (
     is_swa_req_ring,
 )
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
+    UnifiedSWAAllocatorBase,
 )
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
@@ -250,6 +250,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    unified_memory_pool_bytes: Optional[int] = None
     unified_total_bytes: Optional[int] = None
 
 
@@ -298,6 +299,23 @@ class KVCacheConfigurator:
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
+
+    def hybrid_swa_token_capacity(
+        self,
+        *,
+        allocator: BaseTokenToKVPoolAllocator,
+        full_capacity: Optional[int],
+        swa_capacity: Optional[int],
+    ) -> int:
+        if get_memory().enable_unified_memory:
+            capacity = allocator.size_full
+            max_total_tokens = get_schedule().max_total_tokens
+            return (
+                min(capacity, max_total_tokens)
+                if max_total_tokens is not None
+                else capacity
+            )
+        return full_capacity or swa_capacity
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -433,6 +451,10 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            # The target's byte envelope excludes the separate draft allocation.
+            unified_memory_pool_bytes=(
+                None if self.is_draft_worker else config.unified_memory_pool_bytes
+            ),
             c4_max_total_num_tokens=c4_max_total_num_tokens,
             c128_max_total_num_tokens=c128_max_total_num_tokens,
             c4_state_pool_size=c4_state_pool_size,
@@ -479,6 +501,7 @@ class KVCacheConfigurator:
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_memory_pool_bytes=sizes.unified_memory_pool_bytes,
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
@@ -507,7 +530,7 @@ class KVCacheConfigurator:
                 token_to_kv_pool_allocator,
                 (
                     UnifiedMambaTokenToKVPoolAllocator,
-                    UnifiedSWATokenToKVPoolAllocator,
+                    UnifiedSWAAllocatorBase,
                 ),
             ):
                 draft_virtual_id_space = (
@@ -530,7 +553,7 @@ class KVCacheConfigurator:
                 if (
                     isinstance(
                         token_to_kv_pool_allocator,
-                        UnifiedSWATokenToKVPoolAllocator,
+                        UnifiedSWAAllocatorBase,
                     )
                     and self.is_hybrid_swa
                 ):
@@ -831,8 +854,9 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
+        full_max_total_num_tokens: Optional[int] = None,
+        swa_max_total_num_tokens: Optional[int] = None,
+        unified_memory_pool_bytes: Optional[int] = None,
         unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
@@ -909,6 +933,12 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        total_bytes = unified_memory_pool_bytes
+        # An uncapped, draft-free pool owns the profiled budget, including bytes
+        # left over after rounding the FULL/SWA boot capacities to pages.
+        if unified_total_bytes is not None and self.spec_algorithm.is_none():
+            total_bytes = unified_total_bytes
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -925,6 +955,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
@@ -932,9 +963,6 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
-            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor inputs. `model_context_len` bounds the
             # sliding window term only -- the full-attention side is not
             # charged, see `_check_bs1_feasibility_floor`.
@@ -2136,7 +2164,7 @@ class KVCacheConfigurator:
                 else:
                     swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWATokenToKVPoolAllocator
+                    swa_allocator, UnifiedSWAAllocatorBase
                 )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
@@ -2379,9 +2407,8 @@ class KVCacheConfigurator:
             f"{config.max_total_num_tokens}"
         )
         if max_tokens != config.max_total_num_tokens:
-            # Token-capped re-derivation: the profiled budget no longer
-            # applies; the recalced config's unified_total_bytes stays None
-            # and the factories fall back to the token-count byte sum.
+            # Re-derive the capped budget: SWA carries unified_memory_pool_bytes;
+            # Mamba factories fall back to token-count sizing without unified_total_bytes.
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, get_schedule().page_size
             )
