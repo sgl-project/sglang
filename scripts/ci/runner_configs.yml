@@ -20,6 +20,7 @@ _anchors:
 runner_configs:
   1-gpu-small:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-5090 }
   1-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-h100 }
+  1-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-h200 }
   2-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 2-gpu-h100 }
   4-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: $b200_runner }
   4-gpu-gb300:       { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 4-gpu-gb300 }

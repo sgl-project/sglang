@@ -103,7 +103,8 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 |------|-------|
 | No GPU required | `base-a-test-cpu` |
 | Small GPU (fits 5090, 32GB) | `base-b-test-1-gpu-small` (most tests go here) |
-| Large GPU memory or Hopper features | `base-b-test-1-gpu-large` |
+| Large GPU memory or Hopper features | `base-b-test-1-gpu-large` (H100, 80GB) |
+| Single-GPU H200 | `base-b-test-1-gpu-h200` (H200, 141GB) |
 | JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
 | JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
 | Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
