@@ -29,6 +29,27 @@ DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
 
 
+def get_neo_attention_backends(config) -> dict[str, str]:
+    backends = {"neo_prefill_backend": "auto", "neo_denoise_backend": "auto"}
+    if config is None:
+        return backends
+    if not isinstance(config, dict):
+        raise ValueError("SenseNova attention backend config must be a dictionary")
+    for key, value in config.items():
+        if key not in backends or value not in (
+            "auto",
+            "legacy",
+            "torch",
+            "triton",
+            "fa3",
+        ):
+            raise ValueError(
+                f"Unsupported SenseNova attention backend config: {key}={value}"
+            )
+        backends[key] = value
+    return backends
+
+
 def is_sensenova_u1_model(model_path: str) -> bool:
     """Identify SenseNova-U1 Hub IDs and local base checkpoints."""
     if os.path.isdir(model_path):

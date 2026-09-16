@@ -21,7 +21,10 @@ from .modeling_fm_modules import (
     TimestepEmbedder,
 )
 from .modeling_neo_vit import NEOVisionModel
-from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
+from .modeling_qwen3 import (
+    Qwen3ForCausalLM,
+    create_neo_attention_mask,
+)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
@@ -565,7 +568,12 @@ class NEOChatModel(PreTrainedModel):
         w_idx = torch.zeros_like(t_idx)
         indexes = torch.stack([t_idx, h_idx, w_idx], dim=0)
 
-        attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+        attention_mask = {
+            "full_attention": create_neo_attention_mask(
+                indexes[0],
+                getattr(self.config.llm_config, "neo_prefill_backend", "auto"),
+            )
+        }
         return input_ids, indexes, attention_mask
 
     def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
@@ -766,7 +774,12 @@ class NEOChatModel(PreTrainedModel):
 
         indexes = self.get_thw_indexes(input_ids[0], grid_hw)
 
-        attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+        attention_mask = {
+            "full_attention": create_neo_attention_mask(
+                indexes[0],
+                getattr(self.config.llm_config, "neo_prefill_backend", "auto"),
+            )
+        }
 
         input_embeds = self.language_model.get_input_embeddings()(input_ids)
         B, N, C = input_embeds.shape

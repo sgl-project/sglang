@@ -28,6 +28,7 @@ _TRITON_KERNELS = [
     ("extend_attention", "extend_attention_fwd"),
     ("extend_attention", "build_unified_kv_indices"),
     ("prefill_attention", "context_attention_fwd"),
+    ("neo_unify_triton", "neo_unify_attention_triton"),
     ("merge_state", "merge_state_triton"),
     ("suffix_attention_merge", "merge_suffix_attention_in_place"),
     ("metadata", "get_num_kv_splits_triton"),

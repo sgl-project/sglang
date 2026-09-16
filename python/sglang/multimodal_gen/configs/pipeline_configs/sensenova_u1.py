@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.sensenova_u1 import get_neo_attention_backends
 
 
 def _is_runtime_option_requested(value) -> bool:
@@ -73,9 +74,10 @@ def _set_compatible_runtime_defaults(server_args) -> None:
 
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
-    """Native SenseNova-U1 text-to-image pipeline configuration."""
+    """Native SenseNova-U1 text/image-to-image pipeline configuration."""
 
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
+    skip_input_image_preprocess: bool = True
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
@@ -165,10 +167,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         ) and _is_runtime_option_requested(
             getattr(server_args, "attention_backend_config", None)
         ):
-            raise ValueError(
-                "SenseNovaU1Pipeline does not support attention backend config yet. "
-                "Please omit --attention-backend-config."
-            )
+            get_neo_attention_backends(server_args.attention_backend_config)
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
