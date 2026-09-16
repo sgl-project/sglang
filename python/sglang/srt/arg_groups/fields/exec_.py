@@ -357,6 +357,14 @@ class ExecMamba(msgspec.Struct):
         "interior states beyond the cap are removed while their full KV remains. "
         "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
     ] = -1
+    mamba_path_cap_drop_host: A[
+        bool,
+        "With --mamba-max-states-per-path and hierarchical cache, also free the host "
+        "(HiCache) copy of each Mamba state the cap evicts, and count host-only states "
+        "against the cap. Without it the cap only frees the device slot and the host "
+        "state cache still holds one full SSM state per cached node. Use with "
+        "--hicache-mamba-ratio to give the saved host memory to the KV pool.",
+    ] = False
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

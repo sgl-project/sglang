@@ -66,13 +66,14 @@ class _FakeUnifiedCache:
     tree_components = _FakeTreeCore.tree_components
 
 
-def _build_unified_chain(cap, length=3):
+def _build_unified_chain(cap, length=3, drop_host=False):
     cache = _FakeUnifiedCache()
     core = _FakeTreeCore()
     component = object.__new__(MambaComponent)
     component.cache = cache
     component.tree_core = core
     component.mamba_max_states_per_path = cap
+    component.mamba_path_cap_drop_host = drop_host
 
     nodes = []
     parent = core.root_node
@@ -171,6 +172,63 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
         self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
+
+    def test_drop_host_frees_host_backup_and_counts_host_only_states(self):
+        # cap=1: with --mamba-path-cap-drop-host the two interior states go on
+        # both layers (node 0 is host-only, node 1 has device + host); the tail
+        # keeps its state and full KV is untouched everywhere.
+        component, nodes, core, cache = _build_unified_chain(cap=1, drop_host=True)
+        n0 = nodes[0].component_data[ComponentType.MAMBA]
+        n0.value = None  # already demoted: host-only state
+        core.component_evictable_size_[ComponentType.MAMBA] -= 1
+        core.lru_lists[ComponentType.MAMBA].remove_node(nodes[0])
+        n0.host_value = torch.tensor([10])
+        core.host_lru_lists[ComponentType.MAMBA].insert_mru(nodes[0])
+        n1 = nodes[1].component_data[ComponentType.MAMBA]
+        n1.host_value = torch.tensor([11])
+        core.host_lru_lists[ComponentType.MAMBA].insert_mru(nodes[1])
+
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+
+        self.assertEqual(core.evicted, [nodes[0], nodes[1]])
+        self.assertIsNone(n0.host_value)
+        self.assertIsNone(n1.value)
+        self.assertIsNone(n1.host_value)
+        self.assertEqual(
+            sorted(v.item() for v in host_frees[ComponentType.MAMBA]), [10, 11]
+        )
+        self.assertEqual([v.item() for v in device_frees[ComponentType.MAMBA]], [1])
+        self.assertIsNotNone(nodes[-1].component_data[ComponentType.MAMBA].value)
+        self.assertFalse(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
+        self.assertTrue(
+            all(
+                node.component_data[ComponentType.FULL].value is not None
+                for node in nodes
+            )
+        )
+
+    def test_drop_host_respects_host_lock(self):
+        component, nodes, core, cache = _build_unified_chain(cap=1, drop_host=True)
+        n0 = nodes[0].component_data[ComponentType.MAMBA]
+        n0.host_value = torch.tensor([10])
+        core.host_lru_lists[ComponentType.MAMBA].insert_mru(nodes[0])
+        n0.host_lock_ref = 1  # e.g. a storage backup in flight
+
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
+
+        self.assertNotIn(nodes[0], core.evicted)
+        self.assertIsNotNone(n0.host_value)
+        self.assertIsNotNone(n0.value)
+        self.assertEqual(core.evicted, [nodes[1]])
+
+    def test_server_arg_drop_host_requires_cap(self):
+        args = ServerArgs(model_path="dummy", mamba_path_cap_drop_host=True)
+        with self.assertRaisesRegex(ValueError, "requires --mamba-max-states-per-path"):
+            handle_mamba_backend(args)
 
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, core, cache = _build_unified_chain(cap=-1)

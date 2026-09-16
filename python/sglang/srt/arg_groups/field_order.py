@@ -344,6 +344,7 @@ POSITIONAL_FIELD_ORDER = (
     "max_mamba_cache_size",
     "mamba_ssm_dtype",
     "mamba_max_states_per_path",
+    "mamba_path_cap_drop_host",
     "enable_mamba_cache_stochastic_rounding",
     "mamba_cache_philox_rounds",
     "mamba_full_memory_ratio",

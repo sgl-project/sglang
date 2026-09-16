@@ -75,6 +75,7 @@ class MambaComponent(TreeComponent):
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.mamba_path_cap_drop_host = get_exec().mamba.mamba_path_cap_drop_host
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -259,22 +260,28 @@ class MambaComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Evict shallow eligible device checkpoints beyond the path cap.
+        """Evict shallow eligible checkpoints beyond the path cap.
 
-        Full KV and any existing host backup are retained. The tail, forks,
-        locked nodes (including a pending backup chain's write-through locks),
-        and device leaves are preserved, so the cap is a best-effort soft
-        limit. Freed slots are collected into the caller's dicts.
+        Full KV is retained. By default only the device slot is freed and any
+        existing host backup is kept; with --mamba-path-cap-drop-host the host
+        copy is freed too and host-only states count against the cap, so the
+        cap also bounds the host state cache (one full SSM state per cached
+        node otherwise). The tail, forks, locked nodes (including a pending
+        backup chain's write-through and host locks), and device leaves are
+        preserved, so the cap is a best-effort soft limit. Freed slots are
+        collected into the caller's dicts.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
             return
 
         ct = self.component_type
+        drop_host = self.mamba_path_cap_drop_host
         holders = []
         node = tail
         while node is not None and node is not self.tree_core.root_node:
-            if node.component_data[ct].value is not None:
+            cd = node.component_data[ct]
+            if cd.value is not None or (drop_host and cd.host_value is not None):
                 holders.append(node)
             node = node.parent
 
@@ -286,7 +293,10 @@ class MambaComponent(TreeComponent):
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
-            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+            cd = node.component_data[ct]
+            if cd.lock_ref > 0 or len(node.children) != 1:
+                continue
+            if drop_host and cd.host_lock_ref > 0:
                 continue
             if node in self.tree_core.evictable_device_leaves:
                 continue
@@ -295,7 +305,7 @@ class MambaComponent(TreeComponent):
                 self,
                 device_frees,
                 host_frees,
-                target=EvictLayer.DEVICE,
+                target=EvictLayer.ALL if drop_host else EvictLayer.DEVICE,
                 tracker=tracker,
             )
             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)

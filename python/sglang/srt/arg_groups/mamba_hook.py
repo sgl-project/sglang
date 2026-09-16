@@ -25,6 +25,10 @@ def handle_mamba_backend(server_args: Any):
             "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
             f"integer, got {cfg.mamba_max_states_per_path}."
         )
+    if cfg.mamba_path_cap_drop_host and cfg.mamba_max_states_per_path < 0:
+        raise ValueError(
+            "--mamba-path-cap-drop-host requires --mamba-max-states-per-path."
+        )
 
     if cfg.enable_mamba_cache_stochastic_rounding:
         if cfg.mamba_ssm_dtype != "float16":
