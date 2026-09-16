@@ -247,6 +247,14 @@ pub struct CacheArgs {
     #[arg(long)]
     pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
 
+    /// Hold `/readyz` at 503 when peer bootstrap proved siblings were present
+    /// and their tree could not be pulled, so a failed seed stalls a rolling
+    /// update instead of completing it with cache-blind replicas. A first
+    /// deploy and a cold fleet are unaffected; the hold is bounded at three
+    /// times `--kv-bootstrap-timeout-ms`.
+    #[arg(long)]
+    pub kv_bootstrap_seed_required: bool,
+
     /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
     #[arg(long)]
     pub cache_affinity_min_matched_tokens: Option<u64>,
@@ -368,6 +376,7 @@ impl Cli {
         let circuit_breaker = self.routing.build_circuit_breaker()?;
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
+        let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
         let cache_aware = self.cache.into_config(self.routing.policy)?;
         // Peer bootstrap grafts into the router's OWN radix tree. With an
         // external Indexer as the prefix source there is no local tree to graft
@@ -381,20 +390,22 @@ impl Cli {
         if has_peer_selector
             || kv_bootstrap_timeout_ms.is_some()
             || kv_bootstrap_fetch_timeout_cap_ms.is_some()
+            || kv_bootstrap_seed_required
         {
             ensure!(
                 cache_aware.is_some(),
                 "--kv-peer-selector / --kv-bootstrap-timeout-ms / \
-                 --kv-bootstrap-fetch-timeout-cap-ms require --policy cache_aware"
+                 --kv-bootstrap-fetch-timeout-cap-ms / --kv-bootstrap-seed-required \
+                 require --policy cache_aware"
             );
             ensure!(
                 cache_aware
                     .as_ref()
                     .is_some_and(|c| c.prefix_provider == CachePrefixProvider::RadixTree),
                 "--kv-peer-selector / --kv-bootstrap-timeout-ms / \
-                 --kv-bootstrap-fetch-timeout-cap-ms require \
-                 --cache-prefix-provider radix_tree (there is no local tree to \
-                 bootstrap when an external Indexer is the prefix source)"
+                 --kv-bootstrap-fetch-timeout-cap-ms / --kv-bootstrap-seed-required \
+                 require --cache-prefix-provider radix_tree (there is no local tree \
+                 to bootstrap when an external Indexer is the prefix source)"
             );
         }
         // And the selector is what ENABLES bootstrap at all: without it the
@@ -403,10 +414,12 @@ impl Cli {
         ensure!(
             has_peer_selector
                 || (kv_bootstrap_timeout_ms.is_none()
-                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()),
-            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms \
-             require --kv-peer-selector, which is what enables peer bootstrap; \
-             without it every replica boots cold and these have no effect"
+                    && kv_bootstrap_fetch_timeout_cap_ms.is_none()
+                    && !kv_bootstrap_seed_required),
+            "--kv-bootstrap-timeout-ms / --kv-bootstrap-fetch-timeout-cap-ms / \
+             --kv-bootstrap-seed-required require --kv-peer-selector, which is \
+             what enables peer bootstrap; without it every replica boots cold \
+             and these have no effect"
         );
         // `Instant::now() + Duration::from_millis(n)` panics on overflow, so an
         // unbounded value would abort the process at startup instead of being
@@ -687,6 +700,7 @@ impl CacheArgs {
             bootstrap_fetch_timeout_cap_ms: self
                 .kv_bootstrap_fetch_timeout_cap_ms
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
+            bootstrap_seed_required: self.kv_bootstrap_seed_required,
         }))
     }
 }
@@ -1277,6 +1291,7 @@ mod tests {
     #[test]
     fn rejects_bootstrap_tuning_without_a_peer_selector() {
         for flag in [
+            vec!["--kv-bootstrap-seed-required"],
             vec!["--kv-bootstrap-timeout-ms", "20000"],
             vec!["--kv-bootstrap-fetch-timeout-cap-ms", "60000"],
         ] {
@@ -1294,6 +1309,73 @@ mod tests {
             assert!(
                 err.contains("require --kv-peer-selector"),
                 "{flag:?} must not be silently ignored; got: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn seed_required_is_off_by_default_and_opt_in() {
+        let base = [
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ];
+        let off = into_config_owned(with_model(&base)).unwrap();
+        assert!(
+            !off.model
+                .cache_aware
+                .as_ref()
+                .unwrap()
+                .bootstrap_seed_required
+        );
+
+        let mut args = base.to_vec();
+        args.push("--kv-bootstrap-seed-required");
+        let on = into_config_owned(with_model(&args)).unwrap();
+        assert!(
+            on.model
+                .cache_aware
+                .as_ref()
+                .unwrap()
+                .bootstrap_seed_required
+        );
+    }
+
+    #[test]
+    fn kv_bootstrap_fetch_timeout_cap_validates_its_range_and_plumbs() {
+        let base = [
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ];
+        for bad in ["4999", "600001"] {
+            let mut args = base.to_vec();
+            args.extend(["--kv-bootstrap-fetch-timeout-cap-ms", bad]);
+            let err = into_config_owned(with_model(&args))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("kv-bootstrap-fetch-timeout-cap-ms"),
+                "cap {bad} must be rejected; got: {err}",
+            );
+        }
+        for good in ["5000", "120000", "600000"] {
+            let mut args = base.to_vec();
+            args.extend(["--kv-bootstrap-fetch-timeout-cap-ms", good]);
+            let c = into_config_owned(with_model(&args))
+                .unwrap_or_else(|e| panic!("cap {good} must be accepted; got: {e}"));
+            assert_eq!(
+                c.model.cache_aware.unwrap().bootstrap_fetch_timeout_cap_ms,
+                good.parse::<u64>().unwrap(),
+                "the flag must reach CacheAwareConfig",
             );
         }
     }

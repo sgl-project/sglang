@@ -140,6 +140,30 @@ impl AppContext {
         }
     }
 
+    /// Whether cache-aware peer bootstrap has settled. Always true when this
+    /// router holds no KV index, or when peer bootstrap is not configured (the
+    /// tracker is then pre-settled).
+    pub fn kv_bootstrap_settled(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().settled())
+    }
+
+    /// Whether the seed-required gate permits readiness. See
+    /// [`BootstrapTracker::seed_gate_open`](crate::state::kv_events::BootstrapTracker::seed_gate_open).
+    pub fn kv_seed_gate_open(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().seed_gate_open())
+    }
+
+    /// Latch the seed gate open once this replica has served a ready 200.
+    pub fn mark_kv_seed_gate_passed(&self) {
+        if let Some(idx) = self.kv_index.as_ref() {
+            idx.bootstrap().mark_seed_gate_passed();
+        }
+    }
+
     /// Report bootstrap as finished, unless the pod has already begun draining.
     /// The `DRAINING` state is a one-way door (see [`Self::mark_not_ready`]),
     /// and a compare-exchange is what enforces it: a plain store would let any
