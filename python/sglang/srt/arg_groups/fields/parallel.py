@@ -157,6 +157,16 @@ class Parallel(msgspec.Struct):
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    enable_linear_attn_cp: A[
+        bool,
+        Arg(
+            help="(Derived) fold CP into the tensor-parallel width of "
+            "linear-attention (GDN/KDA) layers and gather the sequence at "
+            "each layer boundary; resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,

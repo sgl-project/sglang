@@ -38,6 +38,8 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.cp.utils import (
+    get_cp_strategy,
+    is_cp_active,
     is_mla_cp_active,
     is_mla_cp_enabled,
 )
@@ -529,6 +531,10 @@ class LayerCommunicator:
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
         _is_sp_variant: bool = False,
+        *,
+        is_linear_attention: bool = False,
+        # MLPs can leave their TP output partials to this communicator.
+        reduce_mlp_output: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -539,6 +545,12 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.reduce_mlp_output = reduce_mlp_output
+        self.linear_attn_cp = (
+            is_linear_attention
+            and get_parallel().enable_linear_attn_cp
+            and get_parallel().attn_cp_size > 1
+        )
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -843,6 +855,11 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
         )
+        if self.linear_attn_cp and is_cp_active(forward_batch):
+            # The recurrence needs every token; the residual stays CP-local.
+            hidden_states = get_cp_strategy().gather_hidden_states(
+                hidden_states, forward_batch
+            )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
@@ -871,6 +888,15 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
+        if self.linear_attn_cp and hidden_states.shape[0] > 0:
+            # Linear heads span TP * CP even during decode and short prefills.
+            # The normal path below supplies the remaining attention-TP sum.
+            hidden_states = get_parallel().attn_cp_group.all_reduce(hidden_states)
+            if is_cp_active(forward_batch):
+                hidden_states = get_cp_strategy().shard_hidden_states(
+                    hidden_states, forward_batch
+                )
+
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -896,6 +922,8 @@ class LayerCommunicator:
             return self._sp_variant.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        if self.reduce_mlp_output and self._context.tp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
