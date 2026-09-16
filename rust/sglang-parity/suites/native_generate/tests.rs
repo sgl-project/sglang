@@ -4,6 +4,15 @@ use sglang_parity::sse::{SseDecoder, SseEvent};
 
 use super::*;
 
+// Response-policy fixtures do not start services; profile bindings are covered
+// separately through the production load_plan entry point.
+fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), String> {
+    compile(
+        serde_json::from_str(spec).map_err(|error| error.to_string())?,
+        config,
+    )
+}
+
 fn config(incremental: bool) -> RunConfig {
     serde_json::from_value(json!({
         "server": {
@@ -107,9 +116,9 @@ fn modify_event(events: &mut [SseEvent], index: usize, edit: impl FnOnce(&mut Va
 }
 
 #[test]
-fn default_spec_has_five_explicit_stream_pairs() {
+fn default_spec_covers_all_scenarios_with_explicit_stream_pairs() {
     let (suite, _) = load(DEFAULT_SPEC, &config(false)).unwrap();
-    assert_eq!(suite.cases.len(), 10);
+    assert_eq!(suite.cases.len(), 24);
     assert_eq!(suite.comparison.per_result_value_exceptions.len(), 3);
     let mut groups = BTreeSet::new();
     for pair in suite.cases.chunks_exact(2) {
@@ -126,6 +135,23 @@ fn default_spec_has_five_explicit_stream_pairs() {
         right.as_object_mut().unwrap().remove("stream");
         assert_eq!(left, right);
     }
+    assert_eq!(
+        groups,
+        BTreeSet::from([
+            "greedy",
+            "one_token",
+            "batch",
+            "logprobs",
+            "sampling",
+            "input_logprobs",
+            "cached",
+            "versioned",
+            "reasoning",
+            "dp_rank_0",
+            "dp_rank_1",
+            "retractions",
+        ])
+    );
     assert_eq!(
         suite.cases[4].comparison_scope,
         ComparisonScope::TopLevelArrayItems
@@ -924,7 +950,7 @@ fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
                 "cumulative"
             }
         );
-        assert_eq!(entry.suite.cases.len(), 10);
+        assert_eq!(entry.suite.cases.len(), 24);
     }
     for binding in [json!([]), json!(["missing"]), json!(["default", "default"])] {
         let mut invalid = spec.clone();
@@ -937,21 +963,34 @@ fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
 }
 
 #[test]
-fn metadata_specs_resolve_for_both_platforms_without_starting_services() {
+fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_services() {
     for config in [
-        include_str!("../../examples/metadata-mlx.json"),
-        include_str!("../../examples/metadata-cuda.json"),
+        include_str!("../../examples/run-mlx.json"),
+        include_str!("../../examples/run.json"),
     ] {
         let config: RunConfig = serde_json::from_str(config).unwrap();
-        let plan = load_plan(include_str!("metadata.json"), &config).unwrap();
+        let plan = load_plan(DEFAULT_SPEC, &config).unwrap();
         assert_eq!(plan.profiles.len(), 12);
+        assert_eq!(
+            plan.profiles
+                .iter()
+                .map(|p| p.suite.cases.len())
+                .sum::<usize>(),
+            48
+        );
         for entry in &plan.profiles {
             assert_eq!(
                 entry.policy.incremental,
                 entry.profile.server.incremental_output()
             );
             for case in &entry.suite.cases {
-                assert!(!entry.policy.expectations[&case.name].is_empty());
+                let group = case.equivalence_group.as_deref().unwrap();
+                assert_eq!(
+                    entry.policy.expectations.contains_key(&case.name),
+                    !matches!(group, "one_token" | "batch" | "sampling"),
+                    "{}: scenario assertions must survive consolidation",
+                    case.name
+                );
                 if case.name.starts_with("cached_") {
                     assert!(entry.profile.server.radix_cache);
                     assert_eq!(case.isolation, Isolation::FreshProcess);

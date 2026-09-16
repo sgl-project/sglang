@@ -6,7 +6,9 @@ native HTTP `POST /generate`, including JSON and SSE responses.
 
 ## Run
 
-Provide a model and shared runtime options. By default, the runner prepares one
+Copy the platform configuration and set a fixed Qwen3 model snapshot for the
+reasoning cases (an MLX-compatible snapshot on Mac). Both examples define all
+startup profiles used by the suite. By default, the runner prepares one
 Python 3.12.8 environment and the Rust HTTP extension for both implementations.
 It tests a detached snapshot of the calling checkout's exact `HEAD`; commit source
 changes first. Python and Rust use the same source, dependencies, model, hardware
@@ -15,13 +17,17 @@ options, and request bytes.
 From the `rust/` workspace:
 
 ```sh
-cargo build -p sglang-parity
-# Use examples/run-mlx.json for the MLX backend settings.
+# CUDA: use run.json. On Apple Silicon, copy run-mlx.json instead.
 cp sglang-parity/examples/run.json /path/to/run.json
-# Edit the model and shared backend settings.
-cargo run -p sglang-parity -- --config /path/to/run.json --describe
-cargo run -p sglang-parity -- --config /path/to/run.json
+# Edit the model path and review the profile settings.
+cargo run --locked -p sglang-parity -- --config /path/to/run.json --describe
+cargo run --locked -p sglang-parity -- --config /path/to/run.json
 ```
+
+The command runs the complete [`native_generate` suite](suites/native_generate/suite.json),
+including metadata checks and both streaming modes. No `--suite-file` is needed.
+Existing configurations must define every profile referenced by the suite;
+missing profiles are configuration errors, not a request to run fewer tests.
 
 Relative `server.python`, `server.working_dir`, and `output_dir` paths resolve from
 the invocation directory; a bare executable name such as `python3` uses `PATH`.
@@ -37,23 +43,28 @@ non-Triton cache-allocation path while generation uses MLX and the deterministic
 flag remains enabled. Leaving those phases unspecified can select a CUDA backend
 during deterministic configuration and fail readiness on a Mac.
 
-The runner sets `--enable-deterministic-inference`, `--disable-radix-cache`,
-`--random-seed` (default 42), host `127.0.0.1`, and the configured port. These controls
-cannot be overridden through extra arguments or environment settings. Metrics and
-speculative decoding are outside this baseline. Requests are serial and never
+The runner sets `--enable-deterministic-inference`, `--random-seed` (default 42),
+host `127.0.0.1`, and the configured port. It sets `--disable-radix-cache` unless
+the profile declares `radix_cache: true`. These controls cannot be overridden
+through extra arguments or environment settings. Metrics and speculative
+decoding are outside the current suite. Requests are serial and never
 retried; the request timeout covers the whole response, including a stream.
 
-Python starts first with `SGLANG_RUST_SERVER=0`, runs each case twice, and stops.
-Rust then runs the same cases with `SGLANG_RUST_SERVER=1`. Readiness uses
+Within each profile, Python starts first with `SGLANG_RUST_SERVER=0`, runs each
+case twice, and stops. Rust then runs the same cases with `SGLANG_RUST_SERVER=1`.
+Cases can request a fresh process for each attempt. Readiness uses
 `/health_generate`. Normal shutdown sends TERM, then KILL after the configured
 grace period (at most 60 seconds). Cancelling the run kills the managed process
 group and reaps the direct child. The CLI handles both SIGINT and SIGTERM through
 this cleanup path. Managed execution supports macOS and Linux.
 
-The default suite has five scenarios, each with streaming off and on: greedy
-generation, one-token limit, a two-prompt batch, output logprobs, and fixed-seed
-sampling. Ten cases, repeated twice on each side, produce 40 generation requests
-plus readiness probes. This is a finite baseline, not exhaustive API coverage.
+The suite defines 24 cases: JSON/SSE pairs for greedy generation, one-token
+limits, batches, fixed-seed sampling, input/output logprobs, cache hits, weight
+versions, reasoning, DP ranks 0 and 1, and retractions. Explicit cumulative and
+incremental profile bindings produce 48 case executions. Each available execution
+runs twice per implementation, in addition to prerequisites and readiness probes.
+On MLX, 32 executions are available and 16 require CUDA. These are the currently
+declared scenarios; additional API behavior needs additional cases.
 Custom request fields are sent unchanged and their responses are compared in full.
 New API features may also require extending the suite's protocol validation and
 unit tests; matching responses alone do not prove every requested option was honored.
@@ -119,25 +130,20 @@ and can raise its device minimum. Backend exclusions are identified before setup
 CUDA device counts come from the environment probe. Unavailable cases remain in
 the report as uncovered, with their reason and exit code 2.
 
-### Metadata coverage
+### Scenario coverage
 
-Use [`suites/native_generate/metadata.json`](suites/native_generate/metadata.json)
-with [`examples/metadata-mlx.json`](examples/metadata-mlx.json) or
-[`examples/metadata-cuda.json`](examples/metadata-cuda.json). Copy the appropriate
-config and replace the model path with a fixed Qwen3 snapshot (an MLX-compatible
-snapshot on Mac). Both examples include cumulative and incremental profiles.
-From `rust/`:
-
-```sh
-cargo run --locked -p sglang-parity -- --config /path/to/metadata-run.json \
-  --suite-file sglang-parity/suites/native_generate/metadata.json --describe
-cargo run --locked -p sglang-parity -- --config /path/to/metadata-run.json \
-  --suite-file sglang-parity/suites/native_generate/metadata.json
-```
+All scenarios and their metadata assertions live in
+[`suites/native_generate/suite.json`](suites/native_generate/suite.json).
+Use [`examples/run-mlx.json`](examples/run-mlx.json) on Mac or
+[`examples/run.json`](examples/run.json) on CUDA. Both include every required
+profile, including cumulative and incremental settings.
 
 | Scenario | Required evidence | Availability |
 | --- | --- | --- |
-| Baseline | Explicit zero/null defaults, positive timestamp, default weight version and spans | MLX, CUDA |
+| Greedy generation | Explicit zero/null defaults, positive timestamp, default weight version and spans | MLX, CUDA |
+| One-token limit | A request limited to one generated token | MLX, CUDA |
+| Batch | Two prompts with independent results and stream routing | MLX, CUDA |
+| Sampling | Fixed-seed sampling with nonzero temperature and top-p | MLX, CUDA |
 | Output logprobs | Empty input top logprobs; positive length matching the output logprob array | MLX, CUDA |
 | Input logprobs | At least one input top-logprob entry with an actual numeric probability | CUDA; MLX currently rejects prompt logprobs |
 | Cache hit | Positive cached tokens and cache details after an identical long-prefix warmup | MLX, CUDA; fresh process per attempt |
@@ -148,7 +154,7 @@ cargo run --locked -p sglang-parity -- --config /path/to/metadata-run.json \
 
 Every scenario includes JSON and SSE and explicitly binds both output modes.
 The MLX example retains CUDA-only cases as unavailable coverage, so a full
-metadata invocation on Mac intentionally exits 2. This does not replace CUDA
+invocation on Mac intentionally exits 2. This does not replace CUDA
 acceptance. To run a deliberately narrower suite, edit the explicit bindings and
 cases; do not relabel unavailable checks as passing.
 
@@ -161,9 +167,9 @@ failure does not suppress comparison of a valid response: Rust can fail the
 positive-value assertion and also show the corresponding missing-field parity
 failure. Existing server differences are results, not expected passing answers.
 
-The default suite and command remain unchanged. Library callers use
-`run_plan(&config, &plan)` for profile bindings; `run(config, suite, policy)` is
-the default-only convenience entry into the same executor.
+Library callers use `run_plan(&config, &plan)` for profile bindings;
+`run(config, suite, policy)` is the default-only convenience entry into the same
+executor.
 
 ### Profile artifacts and review
 
@@ -313,9 +319,10 @@ not evidence of successful device execution or Python/Rust parity.
 ## Review the test contract
 
 Start with [`suites/native_generate/suite.json`](suites/native_generate/suite.json).
-It is the single source for request bodies, expected statuses, equivalence groups,
-and comparison rules. The compiled default and an external specification use the
-same loader:
+It is the single source for request bodies, profile bindings, prerequisites,
+scenario assertions, expected statuses, equivalence groups, and comparison rules.
+`--suite-file` optionally replaces this specification for custom tests; it does
+not add to the built-in suite. Both use the same loader:
 
 ```sh
 cargo run -p sglang-parity -- --config /path/to/run.json \
@@ -404,7 +411,9 @@ a protocol failure.
 
 ## Results
 
-Each run creates a unique directory under `output_dir` (default `target/parity`):
+Each run creates a unique directory under `output_dir` (default `target/parity`),
+using the profile layout shown above. Custom single-profile runs retain this
+layout:
 
 ```text
 <run-id>/
@@ -472,8 +481,9 @@ and does not change the recorded test verdict. JSON previews are limited to
 the system's light/dark theme, and stacks comparison columns on narrow screens.
 Status labels remain meaningful without color. The page has no external
 dependencies; copy the entire run directory to preserve relative evidence links.
-Each report describes one run and one output mode; its page title identifies
-the suite and mode. Missing saved metadata is shown as unavailable.
+Each report describes one run. Profile sections identify their cumulative or
+incremental output mode; a run can contain both. Missing saved metadata is shown
+as unavailable.
 
 Existing results can be viewed without preparing an environment or starting a
 service, including after moving the run directory:

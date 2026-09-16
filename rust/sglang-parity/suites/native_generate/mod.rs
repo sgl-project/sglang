@@ -184,19 +184,6 @@ const INPUT_LOGPROBS: [&str; 3] = [
     "input_token_ids_logprobs",
 ];
 
-/// Resolve the same specification for describe, execution, and reporting.
-///
-/// This performs no I/O or model initialization. Invalid configuration and
-/// request shapes whose result count cannot be determined are rejected.
-#[cfg(test)]
-pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), String> {
-    let spec: SuiteSpec = serde_json::from_str(spec).map_err(|error| error.to_string())?;
-    if spec.cases.iter().any(|c| c.profiles != ["default"]) {
-        return Err("profile bindings require load_plan".into());
-    }
-    compile(spec, config)
-}
-
 /// Compile one API policy per explicitly selected startup profile.
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<GeneratePolicy>, String> {
     let spec: SuiteSpec = serde_json::from_str(text).map_err(|e| e.to_string())?;

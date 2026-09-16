@@ -1,11 +1,17 @@
 {
   "environment": {
-    "backend": "auto",
+    "backend": "cuda",
     "setup_timeout_secs": 1800
   },
   "server": {
-    "model": "/path/to/model",
-    "args": [],
+    "model": "/path/to/fixed-qwen3-model-snapshot",
+    "args": [
+      "--max-running-requests",
+      "4",
+      "--context-length",
+      "2048",
+      "--disable-cuda-graph"
+    ],
     "env": {},
     "port": 30000,
     "seed": 42
@@ -13,5 +19,166 @@
   "startup_timeout_secs": 600,
   "request_timeout_secs": 120,
   "shutdown_timeout_secs": 60,
-  "output_dir": "target/parity"
+  "output_dir": "target/parity",
+  "profiles": {
+    "incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "cached_cumulative": {
+      "server": {
+        "radix_cache": true
+      }
+    },
+    "cached_incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--incremental-streaming-output"
+        ],
+        "radix_cache": true
+      }
+    },
+    "versioned_cumulative": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--weight-version",
+          "parity-v1"
+        ]
+      }
+    },
+    "versioned_incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--weight-version",
+          "parity-v1",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "reasoning_cumulative": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--reasoning-parser",
+          "qwen3"
+        ]
+      }
+    },
+    "reasoning_incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--reasoning-parser",
+          "qwen3",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "dp_cumulative": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--dp-size",
+          "2"
+        ]
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 2
+      }
+    },
+    "dp_incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--dp-size",
+          "2",
+          "--incremental-streaming-output"
+        ]
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 2
+      }
+    },
+    "retractions_cumulative": {
+      "server": {
+        "env": {
+          "SGLANG_TEST_RETRACT": "true",
+          "SGLANG_TEST_RETRACT_INTERVAL": "2"
+        }
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 1
+      }
+    },
+    "retractions_incremental": {
+      "server": {
+        "args": [
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--incremental-streaming-output"
+        ],
+        "env": {
+          "SGLANG_TEST_RETRACT": "true",
+          "SGLANG_TEST_RETRACT_INTERVAL": "2"
+        }
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 1
+      }
+    }
+  }
 }

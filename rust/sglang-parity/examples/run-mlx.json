@@ -1,6 +1,6 @@
 {
   "server": {
-    "model": "/path/to/model",
+    "model": "/path/to/fixed-qwen3-model-snapshot",
     "args": [
       "--device",
       "mps",
@@ -28,5 +28,247 @@
   "environment": {
     "backend": "mlx",
     "setup_timeout_secs": 1800
+  },
+  "profiles": {
+    "incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "cached_cumulative": {
+      "server": {
+        "radix_cache": true
+      }
+    },
+    "cached_incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--incremental-streaming-output"
+        ],
+        "radix_cache": true
+      }
+    },
+    "versioned_cumulative": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--weight-version",
+          "parity-v1"
+        ]
+      }
+    },
+    "versioned_incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--weight-version",
+          "parity-v1",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "reasoning_cumulative": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--reasoning-parser",
+          "qwen3"
+        ]
+      }
+    },
+    "reasoning_incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--reasoning-parser",
+          "qwen3",
+          "--incremental-streaming-output"
+        ]
+      }
+    },
+    "dp_cumulative": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--dp-size",
+          "2"
+        ]
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 2
+      }
+    },
+    "dp_incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--dp-size",
+          "2",
+          "--incremental-streaming-output"
+        ]
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 2
+      }
+    },
+    "retractions_cumulative": {
+      "server": {
+        "env": {
+          "SGLANG_TEST_RETRACT": "true",
+          "SGLANG_TEST_RETRACT_INTERVAL": "2"
+        }
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 1
+      }
+    },
+    "retractions_incremental": {
+      "server": {
+        "args": [
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--incremental-streaming-output"
+        ],
+        "env": {
+          "SGLANG_TEST_RETRACT": "true",
+          "SGLANG_TEST_RETRACT_INTERVAL": "2"
+        }
+      },
+      "requires": {
+        "backends": [
+          "cuda"
+        ],
+        "min_cuda_devices": 1
+      }
+    }
   }
 }

@@ -666,6 +666,9 @@ fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
 fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python() {
     let mut fixture = Fixture::new();
     fixture.config.server.python = Some(fixture.directory.path().join("missing-python"));
+    let example: RunConfig =
+        serde_json::from_str(include_str!("../examples/run-mlx.json")).unwrap();
+    fixture.config.profiles = example.profiles;
     let directory = &fixture.directory;
     let config_path = directory.path().join("run.json");
     fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
@@ -692,9 +695,17 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
         default.stderr.is_empty(),
         "describe must not emit run progress"
     );
-    assert_eq!(default_json["suite"]["cases"].as_array().unwrap().len(), 10);
+    let profiles = default_json["profiles"].as_array().unwrap();
+    assert_eq!(profiles.len(), 12);
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile["suite"]["cases"].as_array().unwrap().len())
+            .sum::<usize>(),
+        48
+    );
     assert_eq!(default_json["repeats_per_implementation"], 2);
-    let rules = default_json["suite"]["comparison"]["per_result_value_exceptions"]
+    let rules = profiles[0]["suite"]["comparison"]["per_result_value_exceptions"]
         .as_array()
         .unwrap();
     assert_eq!(
@@ -717,6 +728,14 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
         serde_json::from_slice::<Value>(&external.stdout).unwrap(),
         default_json
     );
+    // Missing profile definitions must fail, never silently reduce coverage.
+    let mut incomplete = serde_json::to_value(&fixture.config).unwrap();
+    incomplete["profiles"] = json!({});
+    fs::write(&config_path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+    let rejected = execute(None);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown or duplicate profile"));
+    fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();
     let mut invalid = read_json(&external_path);
     invalid["comparison"]["numeric_tolerance"] = json!(0.1);
     fs::write(&external_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
