@@ -43,7 +43,7 @@ _TEST_KINDS = {"unit", "kernel", "e2e", "accuracy", "perf", "stress"}
 
 # Flat vendor trees. Vendor-only coverage fits no kind above: no XPU/NPU suite
 # carries the `-kernel-` infix `kernel` needs, and these launch device work.
-_VENDOR_DIRS = {"amd", "mlx", "musa", "npu", "xpu"}
+_VENDOR_DIRS = {"amd", "mlx", "mps", "musa", "npu", "xpu"}
 
 
 def _defines_testcase(tree: ast.AST) -> bool:
