@@ -893,7 +893,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities.
         # Preserve that view before exposing rank-local NPU DCP write slots.
-        if _is_npu and get_parallel().dcp_enabled:
+        if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(
             ret.out_cache_loc,
