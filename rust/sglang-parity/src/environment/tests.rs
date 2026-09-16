@@ -198,7 +198,10 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
         .await
         .unwrap();
     assert_eq!(first.record["reused"], false);
-    assert_eq!(first.server.python.as_ref(), Some(&plan.python));
+    assert_eq!(
+        first.server(&fixture.config.server).python.as_ref(),
+        Some(&plan.python)
+    );
     assert_eq!(fixture.phases(), ["venv", "sync", "install", "probe"]);
     drop(first);
     let marker = fs::read(&ready).unwrap();
@@ -296,10 +299,10 @@ async fn a_prepared_environment_holds_its_lease_until_dropped() {
     let second_output = output.clone();
     let mut second = tokio::spawn(async move { prepare(&config, &plan, &output).await });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !second_output.join("uv-version.log").is_file() {
+    while !second_output.join("source.log").is_file() {
         assert!(
             Instant::now() < deadline,
-            "second setup did not finish preflight"
+            "second setup did not start source acquisition"
         );
         sleep(Duration::from_millis(10)).await;
     }

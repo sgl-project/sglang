@@ -221,32 +221,43 @@ pub fn describe(config: &RunConfig) -> Result<EnvironmentPlan, String> {
             .as_deref()
             .unwrap_or(&repo.join("rust/target/parity-environments")),
     )?;
-    let build_environment = build_environment(&config.server, profile.backend)?;
-    let mut identity = json!({
-        "commit": commit, "profile": profile, "lock": spec.sha256, "build": build_environment,
-    });
-    identity.sort_all_objects();
-    let identity = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
-    let key = format!("{:x}", Sha256::digest(identity));
-    let source_snapshot = cache.join("sources").join(&commit);
-    let environment_dir = cache.join("environments").join(&key);
-    let python = match &config.server.python {
-        Some(path) => python_path(path)?,
-        None => environment_dir.join("bin/python"),
-    };
-    Ok(EnvironmentPlan {
+    let plan = EnvironmentPlan {
         source_root: repo,
-        commit,
+        commit: commit.clone(),
         profile,
         lock_file: spec.path,
         lock_sha256: spec.sha256,
+        source_snapshot: cache.join("sources").join(&commit),
         cache_dir: cache,
-        source_snapshot,
-        environment_dir,
-        python,
+        environment_dir: PathBuf::new(),
+        python: PathBuf::new(),
         managed: config.server.python.is_none(),
-        build_environment,
-    })
+        build_environment: BTreeMap::new(),
+    };
+    for_server(&plan, &config.server)
+}
+
+/// Derive another installation key without observing the developer checkout again.
+pub(crate) fn for_server(
+    source: &EnvironmentPlan,
+    server: &ServerConfig,
+) -> Result<EnvironmentPlan, String> {
+    let mut plan = source.clone();
+    plan.build_environment = build_environment(server, plan.profile.backend)?;
+    let mut identity = json!({"commit": plan.commit, "profile": plan.profile,
+        "lock": plan.lock_sha256, "build": plan.build_environment});
+    identity.sort_all_objects();
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).map_err(|e| e.to_string())?)
+    );
+    plan.environment_dir = plan.cache_dir.join("environments").join(key);
+    plan.python = match &server.python {
+        Some(path) => python_path(path)?,
+        None => plan.environment_dir.join("bin/python"),
+    };
+    plan.managed = server.python.is_none();
+    Ok(plan)
 }
 
 struct Lease(File);
@@ -293,19 +304,39 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
     }
 }
 
-/// A prepared interpreter and its source/installation evidence.
-pub(crate) struct PreparedEnvironment {
-    pub server: ServerConfig,
-    pub record: Value,
+/// A single leased source snapshot shared by all installations in a run.
+pub(crate) struct PreparedSource {
     source_snapshot: PathBuf,
     commit: String,
     _lease: Lease,
-    _source_lease: Lease,
+}
+
+impl PreparedSource {
+    pub fn verify(&self) -> Result<(), String> {
+        verify_snapshot(&self.source_snapshot, &self.commit)
+    }
+}
+
+/// Installation state contains no model or serving arguments.
+pub(crate) struct PreparedEnvironment {
+    python: PathBuf,
+    environment: BTreeMap<String, String>,
+    pub record: Value,
+    pub record_path: PathBuf,
+    source: std::sync::Arc<PreparedSource>,
+    _lease: Lease,
 }
 
 impl PreparedEnvironment {
+    pub fn server(&self, config: &ServerConfig) -> ServerConfig {
+        let mut server = config.clone();
+        server.python = Some(self.python.clone());
+        server.env = self.environment.clone();
+        server
+    }
+
     pub fn verify_source(&self) -> Result<(), String> {
-        verify_snapshot(&self.source_snapshot, &self.commit)
+        self.source.verify()
     }
 }
 
@@ -377,11 +408,79 @@ async fn preflight(plan: &EnvironmentPlan, log: &Path, deadline: Instant) -> Res
     Ok(())
 }
 
-/// Prepare once, retaining a lease until both implementations finish.
-pub(crate) async fn prepare(
+/// Pin the described commit once, before preparing any profile environments.
+pub(crate) async fn prepare_source(
+    plan: &EnvironmentPlan,
+    output: &Path,
+    timeout: Duration,
+) -> Result<std::sync::Arc<PreparedSource>, String> {
+    let log = output.join("source.log");
+    fs::write(&log, format!("Pinning source {}\n", plan.commit)).map_err(|e| e.to_string())?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("source timeout is too large")?;
+    fs::create_dir_all(plan.cache_dir.join("sources")).map_err(|e| e.to_string())?;
+    let lease = track(
+        "Waiting for source cache access",
+        &log,
+        Lease::acquire(
+            &plan
+                .cache_dir
+                .join("sources")
+                .join(format!("{}.lock", plan.commit)),
+            deadline,
+        ),
+    )
+    .await?;
+    if !plan.source_snapshot.exists() {
+        let mut checkout = command("git", &BTreeMap::new());
+        checkout
+            .arg("-C")
+            .arg(&plan.source_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&plan.source_snapshot)
+            .arg(&plan.commit);
+        track(
+            "Creating source snapshot",
+            &log,
+            run_command(&mut checkout, &log, remaining(deadline)?),
+        )
+        .await?;
+    }
+    verify_snapshot(&plan.source_snapshot, &plan.commit).map_err(|error| {
+        format!(
+            "invalid cached source {}: {error}; remove this cached Git worktree before retrying",
+            plan.source_snapshot.display()
+        )
+    })?;
+    Ok(std::sync::Arc::new(PreparedSource {
+        source_snapshot: plan.source_snapshot.clone(),
+        commit: plan.commit.clone(),
+        _lease: lease,
+    }))
+}
+
+#[cfg(test)]
+async fn prepare(
     config: &RunConfig,
     plan: &EnvironmentPlan,
     output: &Path,
+) -> Result<PreparedEnvironment, String> {
+    let source = prepare_source(
+        plan,
+        output,
+        Duration::from_secs(config.environment.setup_timeout_secs),
+    )
+    .await?;
+    prepare_environment(config, plan, output, source).await
+}
+
+/// Prepare once, retaining a lease until both implementations finish.
+pub(crate) async fn prepare_environment(
+    config: &RunConfig,
+    plan: &EnvironmentPlan,
+    output: &Path,
+    source: std::sync::Arc<PreparedSource>,
 ) -> Result<PreparedEnvironment, String> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(config.environment.setup_timeout_secs))
@@ -396,7 +495,15 @@ pub(crate) async fn prepare(
         ),
     )
     .map_err(|e| e.to_string())?;
-    fs::copy(&plan.lock_file, output.join("environment.lock")).map_err(|e| e.to_string())?;
+    let lock_relative = plan
+        .lock_file
+        .strip_prefix(&plan.source_root)
+        .map_err(|e| e.to_string())?;
+    fs::copy(
+        plan.source_snapshot.join(lock_relative),
+        output.join("environment.lock"),
+    )
+    .map_err(|e| e.to_string())?;
     let copied_lock = fs::read(output.join("environment.lock")).map_err(|e| e.to_string())?;
     if format!("{:x}", Sha256::digest(&copied_lock)) != plan.lock_sha256 {
         return Err("dependency lock changed after configuration validation".into());
@@ -430,41 +537,8 @@ pub(crate) async fn prepare(
             ));
         }
     }
-    fs::create_dir_all(plan.cache_dir.join("sources")).map_err(|e| e.to_string())?;
     fs::create_dir_all(plan.cache_dir.join("environments")).map_err(|e| e.to_string())?;
-    let _source_lease = track(
-        "Waiting for source cache access",
-        &log,
-        Lease::acquire(
-            &plan
-                .cache_dir
-                .join("sources")
-                .join(format!("{}.lock", plan.commit)),
-            deadline,
-        ),
-    )
-    .await?;
-    if !plan.source_snapshot.exists() {
-        let mut checkout = command("git", &BTreeMap::new());
-        checkout
-            .arg("-C")
-            .arg(&plan.source_root)
-            .args(["worktree", "add", "--detach"])
-            .arg(&plan.source_snapshot)
-            .arg(&plan.commit);
-        track(
-            "Creating source snapshot",
-            &log,
-            run_command(&mut checkout, &log, remaining(deadline)?),
-        )
-        .await?;
-    }
-    verify_snapshot(&plan.source_snapshot, &plan.commit).map_err(|error| {
-        format!(
-            "invalid cached source {}: {error}; remove this cached Git worktree before retrying",
-            plan.source_snapshot.display()
-        )
-    })?;
+    source.verify()?;
     let snapshot_lock = lock::inspect_lock(&plan.source_snapshot, &plan.profile)?;
     if snapshot_lock.sha256 != plan.lock_sha256 {
         return Err("source snapshot dependency lock differs from the described commit".into());
@@ -673,17 +747,14 @@ pub(crate) async fn prepare(
         serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let mut server = config.server.clone();
-    server.python = Some(plan.python.clone());
-    server.env = environment;
     tracing::info!(reused, managed = plan.managed, "Environment ready");
     Ok(PreparedEnvironment {
-        server,
+        python: plan.python.clone(),
+        environment,
         record,
-        source_snapshot: plan.source_snapshot.clone(),
-        commit: plan.commit.clone(),
+        record_path: output.join("environment.json"),
+        source,
         _lease: lease,
-        _source_lease,
     })
 }
 

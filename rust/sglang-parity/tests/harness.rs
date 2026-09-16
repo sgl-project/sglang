@@ -758,9 +758,14 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
         "PARITY_FIXTURE_RELEASE".into(),
         release.to_string_lossy().into_owned(),
     );
+    fixture.config.profiles = serde_json::from_value(
+        json!({"second":{"server":{"env":{"ANOTHER_BUILD_SETTING":"yes"}}}}),
+    )
+    .unwrap();
     let config = fixture.config.clone();
     let suite = suite(vec![case("held", "/json", "wait_for_release")]);
-    let task = tokio::spawn(async move { run(&config, &suite, &EchoPolicy).await });
+    let plan = profile_plan(&config, vec![suite.clone(), suite]);
+    let task = tokio::spawn(async move { sglang_parity::run_plan(&config, &plan).await });
     assert!(
         wait_until(|| fixture
             .lifecycle()
@@ -774,6 +779,12 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
     );
     let marker = fixture.source().join("python/fixture-version.txt");
     fs::write(&marker, "new HEAD").unwrap();
+    let lock = fixture.source().join(if cfg!(target_os = "macos") {
+        "rust/sglang-parity/environments/mlx.lock"
+    } else {
+        "rust/sglang-parity/environments/cuda.lock"
+    });
+    fs::write(&lock, "changed dependency lock in developer checkout").unwrap();
     git(
         &fixture.source(),
         &["commit", "--quiet", "-am", "advance original"],
@@ -798,7 +809,14 @@ async fn both_servers_keep_the_prepared_head_when_original_checkout_changes() {
         .into_iter()
         .filter(|entry| entry["kind"] == "start")
         .collect();
-    assert_eq!(starts.len(), 2);
+    assert_eq!(starts.len(), 4);
+    assert_eq!(fixture.preparations().len(), 2);
+    for profile in report.profiles.values() {
+        assert_eq!(
+            read_json(profile.environment.as_ref().unwrap())["plan"]["commit"],
+            original_commit
+        );
+    }
     for start in starts {
         assert_eq!(start["python_path"], json!(snapshot.join("python")));
         assert_eq!(start["source_version"], "initial HEAD");
@@ -956,4 +974,221 @@ async fn cli_sigterm_cleans_managed_descendants_and_retains_an_interrupted_repor
         json!([])
     );
     assert_ne!(report["cases"][0]["parity"]["status"], "PASS");
+}
+
+fn profile_plan(
+    config: &RunConfig,
+    suites: Vec<sglang_parity::HttpSuite>,
+) -> sglang_parity::ExecutionPlan<EchoPolicy> {
+    let profiles = config.resolve_profiles().unwrap();
+    assert_eq!(profiles.len(), suites.len());
+    sglang_parity::ExecutionPlan {
+        profiles: profiles
+            .into_iter()
+            .zip(suites)
+            .map(|(profile, suite)| sglang_parity::ProfilePlan {
+                profile,
+                suite,
+                policy: EchoPolicy,
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn profiles_share_installations_without_sharing_serving_state_or_comparisons() {
+    let mut fixture = Fixture::new();
+    fixture.config.profiles = serde_json::from_value(json!({
+        "cached": {"server":{"args":["--incremental-streaming-output"],"radix_cache":true,"seed":7}},
+        "other_env": {"server":{"env":{"PROFILE_BUILD_FLAG":"different"}}}
+    })).unwrap();
+    let pair = || {
+        let mut a = case("json", "/json", "normal");
+        a["equivalence_group"] = json!("pair");
+        let mut b = case("stream", "/sse", "normal");
+        b["equivalence_group"] = json!("pair");
+        suite(vec![a, b])
+    };
+    let mut cached = pair();
+    cached.output_mode = "incremental".into();
+    let warmup = cached.cases[0].request.clone();
+    for case in &mut cached.cases {
+        case.isolation = sglang_parity::Isolation::FreshProcess;
+        case.before_each = vec![warmup.clone()];
+        // An unisolated second attempt would return 4 instead of 2.
+        case.request.body["behavior"] = json!("unstable");
+    }
+    let plan = profile_plan(&fixture.config, vec![pair(), cached, pair()]);
+    let mut stale = fixture.config.clone();
+    stale.server.seed += 1;
+    assert!(sglang_parity::describe_plan(&stale, &plan).is_err());
+    let described = sglang_parity::describe_plan(&fixture.config, &plan).unwrap();
+    assert!(fixture.preparations().is_empty());
+    assert_eq!(
+        described.profiles[0].environment.environment_dir,
+        described.profiles[1].environment.environment_dir
+    );
+    assert_ne!(
+        described.profiles[0].environment.environment_dir,
+        described.profiles[2].environment.environment_dir
+    );
+    let report = sglang_parity::run_plan(&fixture.config, &plan)
+        .await
+        .unwrap();
+    assert_eq!(report.exit_code(), 0, "{:?}", report.runtime_errors);
+    assert_eq!(fixture.preparations().len(), 2);
+    assert_eq!(report.cases.len(), 6);
+    assert_eq!(report.equivalence.len(), 6);
+    for result in &report.equivalence {
+        assert_eq!(result.check.status, Status::Pass);
+        assert_eq!(
+            result.left.split('/').next(),
+            result.right.split('/').next()
+        );
+    }
+    let starts: Vec<_> = fixture
+        .lifecycle()
+        .into_iter()
+        .filter(|e| e["kind"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 12);
+    for entry in &starts[2..10] {
+        let args = entry["argv"].as_array().unwrap();
+        assert!(args.contains(&json!("--incremental-streaming-output")));
+        assert!(!args.contains(&json!("--disable-radix-cache")));
+        assert!(
+            !args.contains(&json!("fixture")),
+            "argv must replace, not append"
+        );
+        assert!(
+            args.windows(2)
+                .any(|p| p == [json!("--random-seed"), json!("7")])
+        );
+    }
+    for case in &report.cases[2..4] {
+        for attempt in case.implementations.values().flat_map(|s| &s.attempts) {
+            assert_eq!(attempt.before_each.len(), 1);
+            assert_eq!(read_json(attempt.final_json.as_ref().unwrap())["value"], 2);
+            assert!(attempt.server_log.as_ref().unwrap().is_file());
+        }
+    }
+    let view = ReportView::new(&report, &report.directory);
+    let error = view.terminal(Some("json"), false).unwrap_err();
+    assert!(error.contains("default/json") && error.contains("cached/json"));
+    let text = view.terminal(Some("cached/json"), false).unwrap();
+    assert!(!text.contains("Scenario")); // Echo suite has no scenario assertions.
+    assert!(text.contains("cached/json"));
+    let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
+    assert!(html.contains("Profile cached"));
+    assert!(html.contains("profiles/cached/python/json/1/before_each/1/request.json"));
+    assert!(html.contains("profiles/cached/python/logs/server-1.log"));
+}
+
+#[tokio::test]
+async fn prerequisites_and_requirements_never_produce_false_coverage() {
+    let fixture = Fixture::new();
+    let mut blocked = case("blocked", "/json", "normal");
+    let request =
+        serde_json::from_value::<sglang_parity::HttpCase>(case("warmup", "/json", "wrong_status"))
+            .unwrap();
+    blocked["before_each"] = json!([request.request]);
+    let mut unsupported = case("unsupported", "/json", "normal");
+    unsupported["requires"] =
+        json!({"backends": [if cfg!(target_os="macos") {"cuda"} else {"mlx"}]});
+    let plan = profile_plan(
+        &fixture.config,
+        vec![suite(vec![
+            blocked,
+            unsupported,
+            case("following", "/json", "normal"),
+        ])],
+    );
+    let report = sglang_parity::run_plan(&fixture.config, &plan)
+        .await
+        .unwrap();
+    assert_eq!(report.exit_code(), 2);
+    assert!(report.cases[1].unavailable.is_some());
+    assert_eq!(report.cases[2].parity.status, Status::Pass);
+    for attempt in report.cases[0]
+        .implementations
+        .values()
+        .flat_map(|s| &s.attempts)
+    {
+        assert!(attempt.observation.is_none());
+        assert_eq!(attempt.before_each.len(), 1);
+        assert!(!attempt.before_each[0].violations.is_empty());
+    }
+    let requests: Vec<_> = fixture
+        .lifecycle()
+        .into_iter()
+        .filter(|e| e["kind"] == "request")
+        .collect();
+    assert_eq!(requests.len(), 8); // Four prerequisites and four following requests.
+    let text = ReportView::new(&report, &report.directory)
+        .terminal(Some("unsupported"), false)
+        .unwrap();
+    assert!(text.contains("Not covered"));
+}
+
+#[tokio::test]
+async fn scenario_failure_preserves_responses_comparisons_and_failure_exit_code() {
+    struct ScenarioPolicy;
+    impl sglang_parity::ResponsePolicy for ScenarioPolicy {
+        fn prepare(
+            &self,
+            case: &sglang_parity::HttpCase,
+            observation: &sglang_parity::HttpObservation,
+        ) -> Result<sglang_parity::runner::PreparedResponse, Vec<Violation>> {
+            let mut prepared =
+                sglang_parity::ResponsePolicy::prepare(&EchoPolicy, case, observation)?;
+            prepared
+                .assertions
+                .push(sglang_parity::runner::AssertionResult {
+                    name: "target_condition".into(),
+                    violations: vec![Violation::new(
+                        "/value",
+                        "expected target was not triggered",
+                    )],
+                });
+            Ok(prepared)
+        }
+    }
+    let fixture = Fixture::new();
+    let report = run(
+        &fixture.config,
+        &suite(vec![
+            case("same", "/json", "normal"),
+            case("different", "/json", "different"),
+        ]),
+        &ScenarioPolicy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.cases[0].parity.status, Status::Pass);
+    assert_eq!(report.cases[1].parity.status, Status::Fail);
+    for attempt in report
+        .cases
+        .iter()
+        .flat_map(|c| c.implementations.values())
+        .flat_map(|s| &s.attempts)
+    {
+        assert!(attempt.violations.is_empty());
+        assert!(attempt.final_json.as_ref().unwrap().is_file());
+        assert_eq!(attempt.assertions.len(), 1);
+    }
+    let text = ReportView::new(&report, &report.directory)
+        .terminal(None, false)
+        .unwrap();
+    assert!(text.contains("Scenario Python FAIL / Rust FAIL"));
+    assert!(
+        text.lines()
+            .filter(|l| l.contains("target was not triggered"))
+            .count()
+            == 0
+    );
+    let detailed = ReportView::new(&report, &report.directory)
+        .terminal(Some("same"), false)
+        .unwrap();
+    assert!(detailed.contains("expected target was not triggered"));
 }

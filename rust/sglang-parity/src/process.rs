@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
 
 /// Shared configuration for both implementations; lifecycle controls are reserved.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub python: Option<PathBuf>,
     pub model: String,
+    #[serde(default)]
+    pub radix_cache: bool,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -439,12 +441,12 @@ impl SglangProcess {
                 "--enable-deterministic-inference",
                 "--random-seed",
                 &config.seed.to_string(),
-                "--disable-radix-cache",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &config.port.to_string(),
-            ])
+            ]);
+        if !config.radix_cache {
+            command.arg("--disable-radix-cache");
+        }
+        command
+            .args(["--host", "127.0.0.1", "--port", &config.port.to_string()])
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);

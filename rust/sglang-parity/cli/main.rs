@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sglang_parity::environment::{self, Backend};
 use sglang_parity::report::ReportView;
-use sglang_parity::{Report, RunConfig, describe, run};
+use sglang_parity::{Report, RunConfig, describe, describe_plan, run, run_plan};
 
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
@@ -147,19 +147,29 @@ async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::
         .suite_file
         .map(std::fs::read_to_string)
         .transpose()?;
-    let (suite, policy) = native_generate::load(
+    let plan = native_generate::load_plan(
         external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC),
         &config,
     )
     .map_err(std::io::Error::other)?;
+    // Preserve the original single-profile review format and artifact layout.
+    let single = config.profiles.is_empty()
+        && plan.profiles.len() == 1
+        && plan.profiles[0].profile.id == "default";
     if arguments.describe {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&describe(&config, &suite)?)?
-        );
+        let value = if single {
+            serde_json::to_value(describe(&config, &plan.profiles[0].suite)?)?
+        } else {
+            serde_json::to_value(describe_plan(&config, &plan)?)?
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(0);
     }
-    let report = run(&config, &suite, &policy).await?;
+    let report = if single {
+        run(&config, &plan.profiles[0].suite, &plan.profiles[0].policy).await?
+    } else {
+        run_plan(&config, &plan).await?
+    };
     print!(
         "{}",
         ReportView::new(&report, &report.directory)

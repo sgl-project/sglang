@@ -19,6 +19,7 @@ pub mod artifacts;
 pub mod compare;
 pub mod environment;
 pub mod http;
+pub mod plan;
 pub mod process;
 mod progress;
 pub mod report;
@@ -26,6 +27,9 @@ pub mod runner;
 pub mod sse;
 
 pub use compare::{ComparisonRules, ComparisonScope, Difference, Violation, compare_json};
-pub use http::{CaptureMode, HttpCase, HttpObservation};
+pub use http::{CaptureMode, HttpCase, HttpObservation, HttpRequest, Isolation};
+pub use plan::{ExecutionPlan, ProfilePlan, ProfileSpec, Requirements, ResolvedProfile};
 pub use process::{Implementation, ServerConfig};
-pub use runner::{HttpSuite, Report, ResponsePolicy, RunConfig, RunError, describe, run};
+pub use runner::{
+    HttpSuite, Report, ResponsePolicy, RunConfig, RunError, describe, describe_plan, run, run_plan,
+};

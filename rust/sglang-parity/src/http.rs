@@ -21,19 +21,91 @@ pub enum CaptureMode {
     Sse,
 }
 
-/// One resolved request; transport mode and comparison scope come from its suite.
+/// A prerequisite request, interpreted by the same suite as the measured request.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct HttpCase {
-    pub name: String,
+pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub body: Value,
     pub expect_status: u16,
     pub capture: CaptureMode,
     pub comparison_scope: ComparisonScope,
+}
+
+impl HttpRequest {
+    /// Adapt a prerequisite for protocol validation, without a measured case name.
+    pub fn as_case(&self) -> HttpCase {
+        HttpCase {
+            name: String::new(),
+            assertions: Vec::new(),
+            request: self.clone(),
+            equivalence_group: None,
+            before_each: Vec::new(),
+            isolation: Isolation::Shared,
+            requires: crate::plan::Requirements::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        reqwest::Method::from_bytes(self.method.as_bytes()).map_err(|e| e.to_string())?;
+        if !self.path.starts_with('/')
+            || self.path.starts_with("//")
+            || self.path.contains(['#', '\\'])
+            || self
+                .path
+                .bytes()
+                .any(|c| c.is_ascii_whitespace() || c.is_ascii_control())
+        {
+            return Err("request requires an absolute local HTTP path".into());
+        }
+        if !(200..=599).contains(&self.expect_status) {
+            return Err("invalid final HTTP status".into());
+        }
+        Ok(())
+    }
+}
+
+/// Stateful scenarios can require a new service for each measured attempt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    #[default]
+    Shared,
+    FreshProcess,
+}
+
+/// One resolved request; transport mode and comparison scope come from its suite.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCase {
+    /// Names of scenario checks the API policy must return for this request.
+    #[serde(default)]
+    pub assertions: Vec<String>,
+    #[serde(default)]
+    pub before_each: Vec<HttpRequest>,
+    #[serde(default)]
+    pub isolation: Isolation,
+    #[serde(default)]
+    pub requires: crate::plan::Requirements,
+    pub name: String,
+    #[serde(flatten)]
+    pub request: HttpRequest,
     #[serde(default)]
     pub equivalence_group: Option<String>,
+}
+
+impl std::ops::Deref for HttpCase {
+    type Target = HttpRequest;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl std::ops::DerefMut for HttpCase {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
 }
 
 /// Captured bytes remain available even when a response is malformed or truncated.
@@ -63,7 +135,7 @@ pub(crate) fn client() -> Result<Client, reqwest::Error> {
 pub(crate) async fn capture(
     client: &Client,
     base_url: &str,
-    case: &HttpCase,
+    case: &HttpRequest,
     request: &[u8],
     raw_body: &Path,
     timeout: Duration,

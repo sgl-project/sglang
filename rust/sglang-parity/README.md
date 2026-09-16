@@ -58,6 +58,140 @@ Custom request fields are sent unchanged and their responses are compared in ful
 New API features may also require extending the suite's protocol validation and
 unit tests; matching responses alone do not prove every requested option was honored.
 
+## Multiple startup profiles in one run
+
+A **profile** names a SGLang startup configuration. A case explicitly lists its
+profiles; there is no implicit Cartesian product. One invocation runs all bound
+profile/case instances and produces one JSON/HTML report. Python and Rust receive
+the same settings and request bytes within each profile. Comparisons and JSON/SSE
+equivalence groups never cross profiles.
+
+`server` remains the base configuration and the implicit `default` profile.
+Named profiles override only `model`, `seed`, `args`, `env`, and `radix_cache`:
+
+```json
+{
+  "server": {"model": "/path/to/fixed-model-snapshot", "args": []},
+  "profiles": {
+    "cached": {"server": {"radix_cache": true}},
+    "incremental": {"server": {"args": ["--incremental-streaming-output"]}},
+    "dp": {"server": {"args": ["--dp-size", "2"]},
+           "requires": {"backends": ["cuda"], "min_cuda_devices": 2}}
+  }
+}
+```
+
+`args` replaces the entire base argument list; `env` overlays keys. Other settings
+inherit from the base. There is no profile-to-profile inheritance. `default` is
+reserved. Unknown/duplicate bindings and incomplete equivalence groups are
+configuration errors. Unreferenced profiles are not started. Execution follows
+`default`, then named profiles in key order, with cases in specification order.
+The response policy is compiled against each profile's actual streaming mode.
+
+A native case can declare prerequisites and scenario expectations:
+
+```json
+{
+  "name": "cached_json",
+  "profiles": ["cached"],
+  "isolation": "fresh_process",
+  "before_each": [{
+    "body": {"text": "A sufficiently long fixed prefix...",
+             "sampling_params": {"temperature": 0, "max_new_tokens": 1}},
+    "expect_status": 200
+  }],
+  "body": {"text": "A sufficiently long fixed prefix...",
+           "sampling_params": {"temperature": 0, "max_new_tokens": 8}, "stream": false},
+  "expect_status": 200,
+  "expectations": [{"check": "cached_tokens", "positive": true}]
+}
+```
+
+Omitted `profiles` means `["default"]`. `shared` isolation (the default) reuses a
+service across consecutive cases. `fresh_process` restarts it for **each attempt**,
+then runs `before_each` in order and sends the measured request. Prerequisites
+undergo the same protocol validation, without measured-case assertions or
+comparison. A failed prerequisite prevents that measured request; its response
+and diagnostics are retained. There are no automatic retries or recursive steps.
+
+Cases may also declare `requires`; it intersects the profile's backend requirement
+and can raise its device minimum. Backend exclusions are identified before setup;
+CUDA device counts come from the environment probe. Unavailable cases remain in
+the report as uncovered, with their reason and exit code 2.
+
+### Metadata coverage
+
+Use [`suites/native_generate/metadata.json`](suites/native_generate/metadata.json)
+with [`examples/metadata-mlx.json`](examples/metadata-mlx.json) or
+[`examples/metadata-cuda.json`](examples/metadata-cuda.json). Copy the appropriate
+config and replace the model path with a fixed Qwen3 snapshot (an MLX-compatible
+snapshot on Mac). Both examples include cumulative and incremental profiles.
+From `rust/`:
+
+```sh
+cargo run --locked -p sglang-parity -- --config /path/to/metadata-run.json \
+  --suite-file sglang-parity/suites/native_generate/metadata.json --describe
+cargo run --locked -p sglang-parity -- --config /path/to/metadata-run.json \
+  --suite-file sglang-parity/suites/native_generate/metadata.json
+```
+
+| Scenario | Required evidence | Availability |
+| --- | --- | --- |
+| Baseline | Explicit zero/null defaults, positive timestamp, default weight version and spans | MLX, CUDA |
+| Output logprobs | Empty input top logprobs; positive length matching the output logprob array | MLX, CUDA |
+| Input logprobs | At least one input top-logprob entry with an actual numeric probability | CUDA; MLX currently rejects prompt logprobs |
+| Cache hit | Positive cached tokens and cache details after an identical long-prefix warmup | MLX, CUDA; fresh process per attempt |
+| Weight version | `parity-v1` and matching contiguous spans through the final token | MLX, CUDA |
+| Reasoning | Positive reasoning count, no larger than completion count | Qwen3 with its reasoning parser |
+| DP routing | Explicit rank 0 and rank 1 requests return their selected rank | CUDA, at least two visible devices |
+| Retraction | At least one member of a four-request batch has a positive retraction count | CUDA; forced test retraction, fresh process per attempt |
+
+Every scenario includes JSON and SSE and explicitly binds both output modes.
+The MLX example retains CUDA-only cases as unavailable coverage, so a full
+metadata invocation on Mac intentionally exits 2. This does not replace CUDA
+acceptance. To run a deliberately narrower suite, edit the explicit bindings and
+cases; do not relabel unavailable checks as passing.
+
+Expectations are a finite native-suite vocabulary, implemented in
+[`expectations.rs`](suites/native_generate/expectations.rs), not a generic
+expression language. They run on the reconstructed response **before** value
+exceptions. A Python assertion passing on both attempts proves the target
+condition occurred. Rust assertions are checked independently. A scenario
+failure does not suppress comparison of a valid response: Rust can fail the
+positive-value assertion and also show the corresponding missing-field parity
+failure. Existing server differences are results, not expected passing answers.
+
+The default suite and command remain unchanged. Library callers use
+`run_plan(&config, &plan)` for profile bindings; `run(config, suite, policy)` is
+the default-only convenience entry into the same executor.
+
+### Profile artifacts and review
+
+The source snapshot is pinned once for the whole run. Installations are shared by
+the existing commit/platform/lock/build-environment key, never by profile name.
+Each service combines that prepared interpreter with its own profile settings.
+A later installation reads its lock from the pinned snapshot, even if the
+original checkout has since changed branches.
+
+```text
+<run>/
+  effective_plan.json
+  report.json / report.html
+  source.log
+  environments/<installation-key>/...
+  profiles/<profile>/<python|rust>/
+    logs/server-<number>.log
+    <case>/<attempt>/
+      request.json / response.body / final.json / events.json
+      before_each/<step>/...
+```
+
+Each attempt records its actual service log. Reports group by profile and retain
+the five-line default case summary. Scenario results remain separate from
+response validation and parity. `--case profile/case` selects an execution;
+an unqualified name works only when unique. Old reports and the original
+single-profile artifact layout remain readable.
+
 ## Reproducible environments
 
 Review [`environments/profiles.json`](environments/profiles.json) and the generated
@@ -361,8 +495,8 @@ final summary goes to stdout. `--describe` remains a JSON-only review operation.
 | Exit code | Meaning |
 | --- | --- |
 | 0 | All responses valid, stable, and equivalent. |
-| 1 | Protocol validation or parity/equivalence failure. |
-| 2 | Configuration, runtime, artifact I/O, cancellation, or repeatability problem. |
+| 1 | Protocol validation, scenario assertion, or parity/equivalence failure. |
+| 2 | Configuration, runtime, artifact I/O, cancellation, repeatability, prerequisite, or unavailable-coverage problem. |
 
 Code 2 takes precedence over code 1. Missing dependencies are not passing results.
 Differences exposed in the existing servers should be investigated independently;
@@ -377,6 +511,7 @@ comparison rules, and all artifacts; these do not depend on the CLI.
 
 | Location | Responsibility |
 | --- | --- |
+| `src/plan.rs` | Named startup overrides, requirements, explicit compiled profile/case plans. |
 | `src/runner.rs` | Lifecycle order, repeated execution, final comparisons, reports. |
 | `src/process.rs` | Shared SGLang configuration and process-group ownership for setup and services. |
 | `src/environment.rs` | Source snapshots, platform selection, environment preparation, cache leases and provenance. |

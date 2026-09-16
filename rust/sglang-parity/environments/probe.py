@@ -134,6 +134,7 @@ def verify_backend(backend: str) -> dict:
     return {
         "name": backend,
         "device": "cuda",
+        "device_count": torch.cuda.device_count(),
         "device_name": torch.cuda.get_device_name(),
         "capability": list(torch.cuda.get_device_capability()),
         "cuda_version": torch.version.cuda,

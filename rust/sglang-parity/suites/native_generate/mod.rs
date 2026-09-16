@@ -10,12 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sglang_parity::compare::{ComparisonRules, ComparisonScope, Violation};
-use sglang_parity::http::{CaptureMode, HttpCase, HttpObservation};
+use sglang_parity::http::{CaptureMode, HttpCase, HttpObservation, HttpRequest, Isolation};
+use sglang_parity::plan::{ExecutionPlan, ProfilePlan, Requirements};
+mod expectations;
+use expectations::Expectation;
 use sglang_parity::runner::{HttpSuite, PreparedResponse, ResponsePolicy, RunConfig};
 
 pub const DEFAULT_SPEC: &str = include_str!("suite.json");
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SuiteSpec {
     name: String,
@@ -26,16 +29,26 @@ struct SuiteSpec {
     cases: Vec<CaseSpec>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HttpSpec {
     method: String,
     path: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseSpec {
+    #[serde(default = "default_profiles")]
+    profiles: Vec<String>,
+    #[serde(default)]
+    requires: Requirements,
+    #[serde(default)]
+    isolation: Isolation,
+    #[serde(default)]
+    before_each: Vec<Prerequisite>,
+    #[serde(default)]
+    expectations: Vec<Expectation>,
     name: String,
     body: Value,
     expect_status: u16,
@@ -43,9 +56,21 @@ struct CaseSpec {
     equivalence_group: Option<String>,
 }
 
+fn default_profiles() -> Vec<String> {
+    vec!["default".into()]
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prerequisite {
+    body: Value,
+    expect_status: u16,
+}
+
 /// One interpretation of streaming output, shared by both implementations.
 pub struct GeneratePolicy {
     incremental: bool,
+    expectations: BTreeMap<String, Vec<Expectation>>,
     streaming: StreamingRules,
 }
 
@@ -163,8 +188,57 @@ const INPUT_LOGPROBS: [&str; 3] = [
 ///
 /// This performs no I/O or model initialization. Invalid configuration and
 /// request shapes whose result count cannot be determined are rejected.
+#[cfg(test)]
 pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), String> {
     let spec: SuiteSpec = serde_json::from_str(spec).map_err(|error| error.to_string())?;
+    if spec.cases.iter().any(|c| c.profiles != ["default"]) {
+        return Err("profile bindings require load_plan".into());
+    }
+    compile(spec, config)
+}
+
+/// Compile one API policy per explicitly selected startup profile.
+pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<GeneratePolicy>, String> {
+    let spec: SuiteSpec = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let resolved = config.resolve_profiles()?;
+    for case in &spec.cases {
+        let mut seen = BTreeSet::new();
+        if case.profiles.is_empty() {
+            return Err(format!("{}: profiles cannot be empty", case.name));
+        }
+        for id in &case.profiles {
+            if !seen.insert(id) || !resolved.iter().any(|p| &p.id == id) {
+                return Err(format!(
+                    "{}: unknown or duplicate profile {id:?}",
+                    case.name
+                ));
+            }
+        }
+    }
+    // Validate declarations even if filtering would otherwise conceal an error.
+    compile(spec.clone(), config)?;
+    let mut profiles = Vec::new();
+    for profile in resolved {
+        let mut selected = spec.clone();
+        selected.cases.retain(|c| c.profiles.contains(&profile.id));
+        if selected.cases.is_empty() {
+            continue;
+        }
+        let mut profile_config = config.clone();
+        profile_config.server = profile.server.clone();
+        let (suite, policy) = compile(selected, &profile_config)?;
+        profiles.push(ProfilePlan {
+            profile,
+            suite,
+            policy,
+        });
+    }
+    let plan = ExecutionPlan { profiles };
+    plan.validate()?;
+    Ok(plan)
+}
+
+fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), String> {
     if spec.name != "native_generate" {
         return Err("the native_generate implementation requires name=native_generate".into());
     }
@@ -183,6 +257,7 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
         return Err("HTTP error suites require an empty value-exception list".into());
     }
     let mut names = BTreeSet::new();
+    let mut expectations = BTreeMap::new();
     let mut cases = Vec::with_capacity(spec.cases.len());
     for case in spec.cases {
         if case.name.trim().is_empty() || !names.insert(case.name.clone()) {
@@ -238,14 +313,63 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
                 },
             )
         };
+        Expectation::validate_all(&case.expectations)?;
+        if negative && !case.expectations.is_empty() {
+            return Err("error cases cannot assert generation metadata".into());
+        }
+        let assertions = case
+            .expectations
+            .iter()
+            .map(|e| e.name().to_owned())
+            .collect();
+        if !case.expectations.is_empty() {
+            expectations.insert(case.name.clone(), case.expectations);
+        }
+        let mut before_each = Vec::new();
+        for step in case.before_each {
+            if step.expect_status != 200 {
+                return Err("native prerequisites must succeed with HTTP 200".into());
+            }
+            let shape = request_shape(&step.body)?;
+            let stream = match step.body.get("stream") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                _ => return Err("prerequisite stream must be a boolean".into()),
+            };
+            if stream && spec.streaming.is_none() {
+                return Err("streaming prerequisites require lifecycle rules".into());
+            }
+            before_each.push(HttpRequest {
+                method: spec.http.method.clone(),
+                path: spec.http.path.clone(),
+                body: step.body,
+                expect_status: step.expect_status,
+                capture: if stream {
+                    CaptureMode::Sse
+                } else {
+                    CaptureMode::Json
+                },
+                comparison_scope: if shape.batch {
+                    ComparisonScope::TopLevelArrayItems
+                } else {
+                    ComparisonScope::Root
+                },
+            });
+        }
         cases.push(HttpCase {
             name: case.name,
-            method: spec.http.method.clone(),
-            path: spec.http.path.clone(),
-            body: case.body,
-            expect_status: case.expect_status,
-            capture,
-            comparison_scope,
+            assertions,
+            before_each,
+            isolation: case.isolation,
+            requires: case.requires,
+            request: HttpRequest {
+                method: spec.http.method.clone(),
+                path: spec.http.path.clone(),
+                body: case.body,
+                expect_status: case.expect_status,
+                capture,
+                comparison_scope,
+            },
             equivalence_group: case.equivalence_group,
         });
     }
@@ -260,15 +384,15 @@ pub fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy
                 "cumulative"
             }
             .into(),
-            response_policy: spec
-                .streaming
-                .as_ref()
-                .map(|rules| serde_json::json!({"streaming": rules})),
+            response_policy: Some(
+                serde_json::json!({"streaming": spec.streaming, "expectations": expectations}),
+            ),
             comparison: spec.comparison,
             cases,
         },
         GeneratePolicy {
             incremental,
+            expectations,
             streaming: spec.streaming.unwrap_or_default(),
         },
     ))
@@ -376,10 +500,17 @@ impl ResponsePolicy for GeneratePolicy {
             return Ok(value.clone().into());
         }
         let shape = request_shape(&case.body).map_err(|error| vec![Violation::new("", error)])?;
-        match case.capture {
+        let mut prepared: PreparedResponse = match case.capture {
             CaptureMode::Json => prepare_json(case, observation, shape).map(Into::into),
             CaptureMode::Sse => self.prepare_stream(case, observation, shape),
+        }?;
+        if let Some(expectations) = self.expectations.get(&case.name) {
+            prepared.assertions = expectations
+                .iter()
+                .map(|e| e.evaluate(&prepared.value))
+                .collect();
         }
+        Ok(prepared)
     }
 }
 
@@ -569,7 +700,11 @@ impl GeneratePolicy {
         } else {
             values.remove(0)
         };
-        Ok(PreparedResponse { value, origins })
+        Ok(PreparedResponse {
+            value,
+            origins,
+            assertions: Vec::new(),
+        })
     }
 }
 
@@ -987,6 +1122,7 @@ impl ResultState {
                 .remove("index");
         }
         PreparedResponse {
+            assertions: Vec::new(),
             value,
             origins: self.origins,
         }

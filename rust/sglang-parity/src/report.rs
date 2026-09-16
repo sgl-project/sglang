@@ -182,6 +182,7 @@ pub struct ReportView<'a> {
     report: &'a Report,
     directory: PathBuf,
     suite: Result<HttpSuite, String>,
+    profile_suites: BTreeMap<String, HttpSuite>,
     comparisons: Vec<Comparison<'a>>,
 }
 
@@ -191,12 +192,38 @@ impl<'a> ReportView<'a> {
             report,
             directory: directory.to_owned(),
             suite: Err("Saved suite is unavailable".into()),
+            profile_suites: BTreeMap::new(),
             comparisons: Vec::new(),
         };
-        view.suite = view.read_json(&report.effective_suite).and_then(|value| {
-            serde_json::from_value(value.get("suite").cloned().unwrap_or(Value::Null))
-                .map_err(|error| format!("Saved suite is unavailable: {error}"))
-        });
+        match view.read_json(&report.effective_suite) {
+            Ok(value) if value.get("profiles").is_some() => {
+                let parsed = (|| {
+                    let profiles = value["profiles"]
+                        .as_array()
+                        .ok_or("saved profiles must be an array")?;
+                    for entry in profiles {
+                        let id = entry["profile"]["id"]
+                            .as_str()
+                            .ok_or("saved profile has no id")?;
+                        let suite: HttpSuite = serde_json::from_value(entry["suite"].clone())
+                            .map_err(|e| e.to_string())?;
+                        view.profile_suites.insert(id.into(), suite);
+                    }
+                    view.profile_suites
+                        .values()
+                        .next()
+                        .cloned()
+                        .ok_or("saved plan has no profiles".into())
+                })();
+                view.suite = parsed;
+            }
+            Ok(value) => {
+                view.suite =
+                    serde_json::from_value(value.get("suite").cloned().unwrap_or(Value::Null))
+                        .map_err(|error| format!("Saved suite is unavailable: {error}"))
+            }
+            Err(error) => view.suite = Err(error),
+        }
         for (index, case) in report.cases.iter().enumerate() {
             view.comparisons.push(Comparison {
                 kind: CheckKind::Parity,
@@ -252,11 +279,31 @@ impl<'a> ReportView<'a> {
     /// # Errors
     /// Returns an error if the requested case does not exist in this report.
     pub fn terminal(&self, case: Option<&str>, color: bool) -> Result<String, String> {
-        if let Some(name) = case
-            && !self.report.cases.iter().any(|case| case.name == name)
-        {
-            return Err(format!("unknown report case {name:?}"));
-        }
+        let case = case
+            .map(|name| {
+                if self.report.cases.iter().any(|c| c.name == name) {
+                    return Ok(name);
+                }
+                let matches: Vec<_> = self
+                    .report
+                    .cases
+                    .iter()
+                    .filter(|c| c.name.rsplit('/').next() == Some(name))
+                    .collect();
+                match matches.as_slice() {
+                    [only] => Ok(only.name.as_str()),
+                    [] => Err(format!("unknown report case {name:?}")),
+                    _ => Err(format!(
+                        "ambiguous case {name:?}; select {}",
+                        matches
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                }
+            })
+            .transpose()?;
         let mut out = String::new();
         writeln!(
             out,
@@ -281,9 +328,24 @@ impl<'a> ReportView<'a> {
             writeln!(out, "\nRun diagnostic: {}", plain(&message)).unwrap();
         }
         let files = case.map(|name| self.final_files(Some(name)));
+        let mut profile = None;
         for (index, result) in self.report.cases.iter().enumerate() {
             if case.is_some_and(|name| name != result.name) {
                 continue;
+            }
+            if !self.profile_suites.is_empty() && profile != Some(&result.profile_id) {
+                writeln!(
+                    out,
+                    "\nPROFILE {} · {}",
+                    plain(&result.profile_id),
+                    plain(
+                        self.profile_suites
+                            .get(&result.profile_id)
+                            .map_or("Unavailable", |s| s.output_mode.as_str())
+                    )
+                )
+                .unwrap();
+                profile = Some(&result.profile_id);
             }
             let Some(files) = &files else {
                 self.terminal_case_summary(&mut out, result, index, color);
@@ -390,19 +452,21 @@ impl<'a> ReportView<'a> {
         )
         .unwrap();
         let comparisons = self.case_comparisons(&case.name);
-        let reason = comparisons
-            .iter()
-            .find(|c| c.kind == CheckKind::Parity)
-            .map(|c| {
-                self.check_diagnostic(c)
-                    .map(|s| {
-                        s.strip_prefix("Comparison skipped: ")
-                            .unwrap_or(s)
-                            .to_owned()
-                    })
-                    .unwrap_or_else(|| c.short_reason())
-            })
-            .unwrap_or_default();
+        let reason = case.unavailable.clone().unwrap_or_else(|| {
+            comparisons
+                .iter()
+                .find(|c| c.kind == CheckKind::Parity)
+                .map(|c| {
+                    self.check_diagnostic(c)
+                        .map(|s| {
+                            s.strip_prefix("Comparison skipped: ")
+                                .unwrap_or(s)
+                                .to_owned()
+                        })
+                        .unwrap_or_else(|| c.short_reason())
+                })
+                .unwrap_or_default()
+        });
         writeln!(
             out,
             "  Parity {}{}",
@@ -426,7 +490,11 @@ impl<'a> ReportView<'a> {
         for value in STATUSES {
             summary = summary.replace(status(value), &terminal_status(status(value), color));
         }
-        writeln!(out, "  Equivalence: {summary}").unwrap();
+        if let Some(assertions) = self.assertion_summary(case) {
+            writeln!(out, "  {assertions} · Equivalence: {summary}").unwrap();
+        } else {
+            writeln!(out, "  Equivalence: {summary}").unwrap();
+        }
         writeln!(
             out,
             "  Details: --case {} · report.html#case-{index}",
@@ -534,6 +602,16 @@ impl<'a> ReportView<'a> {
                     .into(),
             ),
         ];
+        if !self.profile_suites.is_empty() {
+            result[1].1 = self
+                .profile_suites
+                .values()
+                .map(|suite| suite.output_mode.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
         for (label, pointer) in [
             ("Commit", "/plan/commit"),
             ("Backend", "/plan/profile/backend"),
@@ -552,11 +630,17 @@ impl<'a> ReportView<'a> {
         result
     }
 
-    fn case_description(&self, name: &str) -> String {
-        let Ok(suite) = &self.suite else {
-            return "Request specification unavailable".into();
+    fn case_suite(&self, name: &str) -> Option<(&HttpSuite, &crate::http::HttpCase)> {
+        let (suite, name) = if let Some((profile, case)) = name.split_once('/') {
+            (self.profile_suites.get(profile)?, case)
+        } else {
+            (self.suite.as_ref().ok()?, name)
         };
-        let Some(case) = suite.cases.iter().find(|c| c.name == name) else {
+        Some((suite, suite.cases.iter().find(|c| c.name == name)?))
+    }
+
+    fn case_description(&self, name: &str) -> String {
+        let Some((suite, case)) = self.case_suite(name) else {
             return "Request specification unavailable".into();
         };
         let response = match case.capture {
@@ -613,6 +697,44 @@ impl<'a> ReportView<'a> {
         }
     }
 
+    fn assertion_summary(&self, case: &CaseResult) -> Option<String> {
+        if self
+            .case_suite(&case.name)
+            .is_none_or(|(_, c)| c.assertions.is_empty())
+            && !case
+                .implementations
+                .values()
+                .flat_map(|s| &s.attempts)
+                .any(|a| !a.assertions.is_empty())
+        {
+            return None;
+        }
+        let side_status = |name| {
+            let Some(side) = case.implementations.get(name) else {
+                return Status::NotRun;
+            };
+            if side
+                .attempts
+                .iter()
+                .flat_map(|a| &a.assertions)
+                .any(|a| !a.violations.is_empty())
+            {
+                Status::Fail
+            } else if side.attempts.len() == 2
+                && side.attempts.iter().all(|a| !a.assertions.is_empty())
+            {
+                Status::Pass
+            } else {
+                Status::NotRun
+            }
+        };
+        Some(format!(
+            "Scenario Python {} / Rust {}",
+            status(side_status("python")),
+            status(side_status("rust"))
+        ))
+    }
+
     fn totals(&self) -> Vec<(String, String)> {
         let mut totals = vec![(
             "Response validation".into(),
@@ -662,7 +784,14 @@ impl<'a> ReportView<'a> {
     }
 
     fn case_diagnostics(&self, case: &CaseResult) -> Vec<String> {
-        let mut messages = Vec::new();
+        let mut messages: Vec<_> = case
+            .unavailable
+            .iter()
+            .map(|s| format!("Not covered: {s}"))
+            .collect();
+        if let Some(summary) = self.assertion_summary(case) {
+            messages.push(summary);
+        }
         for (side, result) in &case.implementations {
             for (index, attempt) in result.attempts.iter().enumerate() {
                 let label = format!("{side} / {} / attempt {}", case.name, index + 1);
@@ -672,6 +801,34 @@ impl<'a> ReportView<'a> {
                     .and_then(|o| o.transport_error.as_ref())
                 {
                     messages.push(format!("{label}: transport error: {error}"));
+                }
+                for assertion in &attempt.assertions {
+                    for violation in &assertion.violations {
+                        messages.push(format!(
+                            "{label}: scenario {} failed at {}: {}",
+                            assertion.name, violation.path, violation.message
+                        ));
+                    }
+                }
+                for (step, prerequisite) in attempt.before_each.iter().enumerate() {
+                    for violation in &prerequisite.violations {
+                        messages.push(format!(
+                            "{label}: prerequisite {}: {}: {}",
+                            step + 1,
+                            violation.path,
+                            violation.message
+                        ));
+                    }
+                    if let Some(error) = prerequisite
+                        .observation
+                        .as_ref()
+                        .and_then(|o| o.transport_error.as_ref())
+                    {
+                        messages.push(format!(
+                            "{label}: prerequisite {} transport error: {error}",
+                            step + 1
+                        ));
+                    }
                 }
                 for violation in &attempt.violations {
                     messages.push(format!(
@@ -785,8 +942,7 @@ impl<'a> ReportView<'a> {
     }
 
     fn exception(&self, case: &str, pointer: &str) -> Option<&str> {
-        let suite = self.suite.as_ref().ok()?;
-        let case = suite.cases.iter().find(|c| c.name == case)?;
+        let (suite, case) = self.case_suite(case)?;
         let relative = match case.comparison_scope {
             ComparisonScope::Root => pointer,
             ComparisonScope::TopLevelArrayItems => {
@@ -846,10 +1002,12 @@ impl<'a> ReportView<'a> {
         }
         paths.push((
             "server log",
-            self.report
-                .directory
-                .join(side.implementation)
-                .join("server.log"),
+            attempt.server_log.clone().unwrap_or_else(|| {
+                self.report
+                    .directory
+                    .join(side.implementation)
+                    .join("server.log")
+            }),
         ));
         paths
     }
@@ -922,7 +1080,43 @@ impl<'a> ReportView<'a> {
             .unwrap();
         }
         out.push_str("</ul></nav>");
+        let mut profile = None;
         for (index, case) in self.report.cases.iter().enumerate() {
+            if !self.profile_suites.is_empty() && profile != Some(&case.profile_id) {
+                write!(
+                    out,
+                    "<section><h2>Profile {}</h2><p>{}</p>",
+                    escape(&case.profile_id),
+                    escape(
+                        self.profile_suites
+                            .get(&case.profile_id)
+                            .map_or("Unavailable", |s| s.output_mode.as_str())
+                    )
+                )
+                .unwrap();
+                if let Ok(plan) = self.read_json(&self.report.effective_suite)
+                    && let Some(entry) = plan["profiles"].as_array().and_then(|ps| {
+                        ps.iter()
+                            .find(|p| p["profile"]["id"].as_str() == Some(&case.profile_id))
+                    })
+                {
+                    self.html_preview(
+                        &mut out,
+                        "Effective startup settings and requirements",
+                        &Ok(entry["profile"].clone()),
+                    );
+                }
+                if let Some(path) = self
+                    .report
+                    .profiles
+                    .get(&case.profile_id)
+                    .and_then(|p| p.environment.as_ref())
+                {
+                    write!(out, "<p>{}</p>", self.link("Verified environment", path)).unwrap();
+                }
+                out.push_str("</section>");
+                profile = Some(&case.profile_id);
+            }
             write!(out, "<section id=\"case-{index}\" class=\"case\"><h2>{}</h2><p>{}</p><dl class=\"checks\">", escape(&case.name), escape(&self.case_description(&case.name))).unwrap();
             let validation = Validation::for_cases(std::iter::once(case));
             write!(
@@ -968,17 +1162,32 @@ impl<'a> ReportView<'a> {
             out.push_str("</section>");
         }
         out.push_str("<section id=\"rules\"><h2>Recorded rules</h2>");
-        if let Ok(suite) = &self.suite {
+        let suites: Vec<_> = if self.profile_suites.is_empty() {
+            self.suite
+                .as_ref()
+                .ok()
+                .map(|s| ("default", s))
+                .into_iter()
+                .collect()
+        } else {
+            self.profile_suites
+                .iter()
+                .map(|(id, s)| (id.as_str(), s))
+                .collect()
+        };
+        for (id, suite) in suites {
             self.html_preview(
                 &mut out,
-                "Recorded comparison rules",
+                &format!("Recorded comparison rules — {id}"),
                 &Ok(serde_json::to_value(&suite.comparison).expect("serializable rules")),
             );
             if let Some(policy) = &suite.response_policy {
-                self.html_preview(&mut out, "Recorded response policy", &Ok(policy.clone()));
+                self.html_preview(
+                    &mut out,
+                    &format!("Recorded response policy and scenario assertions — {id}"),
+                    &Ok(policy.clone()),
+                );
             }
-        } else {
-            out.push_str("<p>Saved comparison rules unavailable.</p>");
         }
         write!(
             out,
@@ -1084,6 +1293,16 @@ impl<'a> ReportView<'a> {
                     write!(out, "{} · ", self.link(label, &path)).unwrap();
                 }
                 out.push_str("</p>");
+                for (step, prerequisite) in attempt.before_each.iter().enumerate() {
+                    write!(
+                        out,
+                        "<p>Prerequisite {}: {} · {}</p>",
+                        step + 1,
+                        self.link("request", &prerequisite.directory.join("request.json")),
+                        self.link("response", &prerequisite.directory.join("response.body"))
+                    )
+                    .unwrap();
+                }
                 self.html_preview(
                     out,
                     "Request JSON",

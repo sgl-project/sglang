@@ -230,6 +230,7 @@ impl ResponsePolicy for EchoPolicy {
             )]);
         }
         Ok(PreparedResponse {
+            assertions: Vec::new(),
             value,
             origins: if case.capture == CaptureMode::Sse {
                 [(String::new(), vec![0])].into()

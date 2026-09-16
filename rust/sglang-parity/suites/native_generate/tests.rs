@@ -899,3 +899,133 @@ fn streaming_rules_are_explicit_and_extension_values_remain_complete() {
     );
     assert_eq!(prepared.origins["/new~1field~0"], [0]);
 }
+
+#[test]
+fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
+    let mut config = config(false);
+    config.profiles = serde_json::from_value(json!({
+        "incremental":{"server":{"args":["--incremental-streaming-output"]}},
+        "unused":{"server":{"model":"not-started"}}
+    }))
+    .unwrap();
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    for case in spec["cases"].as_array_mut().unwrap() {
+        case["profiles"] = json!(["default", "incremental"]);
+    }
+    let plan = load_plan(&spec.to_string(), &config).unwrap();
+    assert_eq!(plan.profiles.len(), 2);
+    for (index, entry) in plan.profiles.iter().enumerate() {
+        assert_eq!(entry.policy.incremental, index == 1);
+        assert_eq!(
+            entry.suite.output_mode,
+            if index == 1 {
+                "incremental"
+            } else {
+                "cumulative"
+            }
+        );
+        assert_eq!(entry.suite.cases.len(), 10);
+    }
+    for binding in [json!([]), json!(["missing"]), json!(["default", "default"])] {
+        let mut invalid = spec.clone();
+        invalid["cases"][0]["profiles"] = binding;
+        assert!(load_plan(&invalid.to_string(), &config).is_err());
+    }
+    // A JSON/SSE equivalence pair must be complete within each profile.
+    spec["cases"][0]["profiles"] = json!(["default"]);
+    assert!(load_plan(&spec.to_string(), &config).is_err());
+}
+
+#[test]
+fn metadata_specs_resolve_for_both_platforms_without_starting_services() {
+    for config in [
+        include_str!("../../examples/metadata-mlx.json"),
+        include_str!("../../examples/metadata-cuda.json"),
+    ] {
+        let config: RunConfig = serde_json::from_str(config).unwrap();
+        let plan = load_plan(include_str!("metadata.json"), &config).unwrap();
+        assert_eq!(plan.profiles.len(), 12);
+        for entry in &plan.profiles {
+            assert_eq!(
+                entry.policy.incremental,
+                entry.profile.server.incremental_output()
+            );
+            for case in &entry.suite.cases {
+                assert!(!entry.policy.expectations[&case.name].is_empty());
+                if case.name.starts_with("cached_") {
+                    assert!(entry.profile.server.radix_cache);
+                    assert_eq!(case.isolation, Isolation::FreshProcess);
+                    assert_eq!(case.before_each.len(), 1);
+                    assert_eq!(case.body["text"], case.before_each[0].body["text"]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scenario_assertions_require_real_values_and_do_not_reject_valid_responses() {
+    use expectations::Expectation::*;
+    let passing = json!({"meta_info":{
+        "cached_tokens":128, "cached_tokens_details":{"device":128,"host":0}, "dp_rank":1,
+        "reasoning_tokens":1,"num_retractions":1,"completion_tokens":2,"response_sent_to_client_ts":123.5,
+        "weight_version":"v1","weight_versions":[{"start":0,"end":2,"version":"v1"}],
+        "input_top_logprobs":[null, [[-0.2,42,null]]], "output_token_logprobs_length":2,
+        "output_token_logprobs":[[-0.1,42,null],[-0.2,43,null]]
+    }});
+    let assertions = [
+        CachedTokens { positive: true },
+        CacheDetails { positive: true },
+        DpRank { value: Some(1) },
+        ReasoningTokens { positive: true },
+        Retractions { positive: true },
+        Timestamp,
+        WeightVersion { value: "v1".into() },
+        InputTopLogprobs { populated: true },
+        OutputLogprobsLength,
+    ];
+    for assertion in &assertions {
+        assert!(
+            assertion.evaluate(&passing).violations.is_empty(),
+            "{assertion:?}"
+        );
+        assert!(
+            !assertion
+                .evaluate(&json!({"meta_info":{}}))
+                .violations
+                .is_empty(),
+            "{assertion:?}"
+        );
+        assert!(!assertion.evaluate(&json!({"meta_info":{
+            "cached_tokens":0,"cached_tokens_details":null,"dp_rank":null,"reasoning_tokens":0,
+            "num_retractions":0,"response_sent_to_client_ts":0,"weight_version":"default",
+            "input_top_logprobs":[null],"output_token_logprobs_length":0
+        }})).violations.is_empty(), "{assertion:?}");
+    }
+    let mut zero = passing.clone();
+    zero["meta_info"]["num_retractions"] = json!(0);
+    assert!(
+        Retractions { positive: true }
+            .evaluate(&json!([zero, passing]))
+            .violations
+            .is_empty()
+    );
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    spec["cases"][0]["expectations"] = json!([{"check":"cached_tokens","positive":true}]);
+    let (suite, policy) = load(&spec.to_string(), &config(false)).unwrap();
+    let response = fixture();
+    let prepared = policy
+        .prepare(&suite.cases[0], &json_observation(response.clone()))
+        .unwrap();
+    assert_eq!(prepared.value, response);
+    assert_eq!(prepared.assertions.len(), 1);
+    assert!(!prepared.assertions[0].violations.is_empty());
+    // Preparation requests do not inherit the measured case's assertions.
+    let prepared = policy
+        .prepare(
+            &suite.cases[0].request.as_case(),
+            &json_observation(response),
+        )
+        .unwrap();
+    assert!(prepared.assertions.is_empty());
+}

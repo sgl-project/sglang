@@ -1,6 +1,6 @@
 //! Execute one resolved suite against both SGLang implementations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,59 +8,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::artifacts::Artifacts;
-use crate::compare::{ComparisonRules, Difference, Violation, compare_json, prepare_comparison};
-use crate::environment::{self, EnvironmentConfig, EnvironmentPlan, PreparedEnvironment};
-use crate::http::{self, CaptureMode, HttpCase, HttpObservation};
-use crate::process::{Implementation, ServerConfig, SglangProcess};
+use crate::compare::{Difference, Violation, compare_json, prepare_comparison};
+use crate::environment::{self, EnvironmentPlan, PreparedEnvironment};
+use crate::http::{self, CaptureMode, HttpCase, HttpObservation, Isolation};
+use crate::plan::{ExecutionPlan, ProfilePlan, ResolvedProfile};
+pub use crate::plan::{HttpSuite, RunConfig};
+use crate::process::{Implementation, SglangProcess};
 use crate::progress::track;
-
-/// Environment and lifecycle limits; comparison rules belong to [`HttpSuite`].
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunConfig {
-    pub server: ServerConfig,
-    #[serde(default)]
-    pub environment: EnvironmentConfig,
-    #[serde(default = "default_startup_timeout")]
-    pub startup_timeout_secs: u64,
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_secs: u64,
-    #[serde(default = "default_shutdown_timeout")]
-    pub shutdown_timeout_secs: u64,
-    #[serde(default = "default_output_dir")]
-    pub output_dir: PathBuf,
-}
-
-fn default_startup_timeout() -> u64 {
-    600
-}
-fn default_request_timeout() -> u64 {
-    120
-}
-fn default_shutdown_timeout() -> u64 {
-    60
-}
-fn default_output_dir() -> PathBuf {
-    PathBuf::from("target/parity")
-}
-
-/// The single resolved specification used by describe, execution, and reporting.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpSuite {
-    pub name: String,
-    pub response_implementation: String,
-    pub output_mode: String,
-    /// Opaque API rules retained for review; only the suite interprets them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_policy: Option<Value>,
-    pub comparison: ComparisonRules,
-    pub cases: Vec<HttpCase>,
-}
 
 /// A complete reconstructed response, before applying comparison exceptions.
 #[derive(Clone, Debug)]
 pub struct PreparedResponse {
+    /// Scenario checks never suppress comparison of an otherwise valid response.
+    pub assertions: Vec<AssertionResult>,
     pub value: Value,
     /// Result JSON pointers mapped to zero-based observation event indices.
     /// Descendants inherit their closest ancestor's sources.
@@ -72,6 +32,7 @@ impl From<Value> for PreparedResponse {
         Self {
             value,
             origins: BTreeMap::new(),
+            assertions: Vec::new(),
         }
     }
 }
@@ -91,89 +52,6 @@ pub trait ResponsePolicy {
     ) -> Result<PreparedResponse, Vec<Violation>>;
 }
 
-impl RunConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        self.server.validate()?;
-        if self.environment.setup_timeout_secs == 0
-            || self.startup_timeout_secs == 0
-            || self.request_timeout_secs == 0
-            || !(1..=60).contains(&self.shutdown_timeout_secs)
-        {
-            return Err(
-                "timeouts must be positive; shutdown timeout must be at most 60 seconds".into(),
-            );
-        }
-        if self.output_dir.as_os_str().is_empty() {
-            return Err("output_dir must not be empty".into());
-        }
-        Ok(())
-    }
-}
-
-impl HttpSuite {
-    pub fn validate(&self) -> Result<(), String> {
-        self.comparison.validate()?;
-        if self.name.trim().is_empty()
-            || self.response_implementation.trim().is_empty()
-            || self.output_mode.trim().is_empty()
-            || self.cases.is_empty()
-        {
-            return Err(
-                "suite identity, response implementation, output mode, and cases are required"
-                    .into(),
-            );
-        }
-        let mut names = BTreeSet::new();
-        let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
-        for case in &self.cases {
-            if case.name.is_empty()
-                || !case
-                    .name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-                || !names.insert(&case.name)
-            {
-                return Err(format!(
-                    "case name must be unique and contain only letters, digits, '_' or '-': {:?}",
-                    case.name
-                ));
-            }
-            reqwest::Method::from_bytes(case.method.as_bytes()).map_err(|e| e.to_string())?;
-            if !case.path.starts_with('/')
-                || case.path.starts_with("//")
-                || case.path.contains(['#', '\\'])
-                || case
-                    .path
-                    .bytes()
-                    .any(|c| c.is_ascii_whitespace() || c.is_ascii_control())
-            {
-                return Err(format!(
-                    "case {} requires an absolute local HTTP path",
-                    case.name
-                ));
-            }
-            if !(200..=599).contains(&case.expect_status) {
-                return Err(format!(
-                    "case {} has an invalid final HTTP status",
-                    case.name
-                ));
-            }
-            if let Some(group) = &case.equivalence_group {
-                if group.trim().is_empty() {
-                    return Err("equivalence group must not be empty".into());
-                }
-                *groups.entry(group).or_default() += 1;
-            }
-        }
-        if let Some((group, _)) = groups.iter().find(|(_, count)| **count < 2) {
-            return Err(format!(
-                "equivalence group {group:?} needs at least two cases"
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// The executable specification, also saved verbatim in the run artifacts.
 #[derive(Clone, Debug, Serialize)]
 pub struct EffectiveSuite {
@@ -189,6 +67,11 @@ pub struct EffectiveSuite {
 /// Returns a configuration error for invalid run settings or suite declarations.
 pub fn describe(config: &RunConfig, suite: &HttpSuite) -> Result<EffectiveSuite, RunError> {
     config.validate().map_err(RunError::Config)?;
+    if !config.profiles.is_empty() {
+        return Err(RunError::Config(
+            "named profiles require describe_plan/run_plan".into(),
+        ));
+    }
     suite.validate().map_err(RunError::Config)?;
     Ok(EffectiveSuite {
         environment: environment::describe(config).map_err(RunError::Config)?,
@@ -196,6 +79,66 @@ pub fn describe(config: &RunConfig, suite: &HttpSuite) -> Result<EffectiveSuite,
         repeats_per_implementation: 2,
         implementation_order: Implementation::ALL,
     })
+}
+
+/// One run's explicit profile bindings and pinned environment descriptions.
+#[derive(Clone, Debug, Serialize)]
+pub struct EffectivePlan {
+    pub profiles: Vec<EffectiveProfile>,
+    pub repeats_per_implementation: usize,
+    pub implementation_order: [Implementation; 2],
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EffectiveProfile {
+    pub profile: ResolvedProfile,
+    pub suite: HttpSuite,
+    pub environment: EnvironmentPlan,
+}
+
+/// Resolve every profile against one observed source revision without mutation.
+pub fn describe_plan<P>(
+    config: &RunConfig,
+    plan: &ExecutionPlan<P>,
+) -> Result<EffectivePlan, RunError> {
+    let declared = config.resolve_profiles().map_err(RunError::Config)?;
+    plan.validate().map_err(RunError::Config)?;
+    for entry in &plan.profiles {
+        if !declared.contains(&entry.profile) {
+            return Err(RunError::Config(format!(
+                "profile {} no longer matches RunConfig; recompile the plan",
+                entry.profile.id
+            )));
+        }
+    }
+    let source = environment::describe(config).map_err(RunError::Config)?;
+    let profiles = plan
+        .profiles
+        .iter()
+        .map(|entry| {
+            Ok(EffectiveProfile {
+                profile: entry.profile.clone(),
+                suite: entry.suite.clone(),
+                environment: environment::for_server(&source, &entry.profile.server)
+                    .map_err(RunError::Config)?,
+            })
+        })
+        .collect::<Result<_, RunError>>()?;
+    Ok(EffectivePlan {
+        profiles,
+        repeats_per_implementation: 2,
+        implementation_order: Implementation::ALL,
+    })
+}
+
+impl<T: ResponsePolicy + ?Sized> ResponsePolicy for &T {
+    fn prepare(
+        &self,
+        case: &HttpCase,
+        observation: &HttpObservation,
+    ) -> Result<PreparedResponse, Vec<Violation>> {
+        (**self).prepare(case, observation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,8 +158,21 @@ pub struct Check {
     pub differences: Vec<Difference>,
 }
 
+/// API-owned scenario evidence, distinct from response protocol validation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssertionResult {
+    pub name: String,
+    pub violations: Vec<Violation>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default)]
+    pub assertions: Vec<AssertionResult>,
+    #[serde(default)]
+    pub before_each: Vec<Attempt>,
+    #[serde(default)]
+    pub server_log: Option<PathBuf>,
     pub directory: PathBuf,
     pub observation: Option<HttpObservation>,
     pub final_json: Option<PathBuf>,
@@ -235,9 +191,14 @@ pub struct SideResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaseResult {
+    /// Unique execution identity: profile/case for plans, legacy case name otherwise.
+    #[serde(default = "default_profile")]
+    pub profile_id: String,
     pub name: String,
     pub implementations: BTreeMap<String, SideResult>,
     pub parity: Check,
+    #[serde(default)]
+    pub unavailable: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -247,6 +208,17 @@ pub struct EquivalenceResult {
     pub left: String,
     pub right: String,
     pub check: Check,
+}
+
+fn default_profile() -> String {
+    "default".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileResult {
+    pub state: String,
+    pub environment: Option<PathBuf>,
+    pub diagnostics: Vec<String>,
 }
 
 /// All completed and incomplete work, with paths to unmodified observations.
@@ -260,6 +232,8 @@ pub struct Report {
     pub runtime_errors: Vec<String>,
     pub cases: Vec<CaseResult>,
     pub equivalence: Vec<EquivalenceResult>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ProfileResult>,
 }
 
 impl Report {
@@ -285,6 +259,12 @@ impl Report {
         }
         if self.cases.iter().any(|case| {
             case.parity.status != Status::Pass
+                || case
+                    .implementations
+                    .values()
+                    .flat_map(|s| &s.attempts)
+                    .flat_map(|a| &a.assertions)
+                    .any(|a| !a.violations.is_empty())
                 || case
                     .implementations
                     .values()
@@ -370,256 +350,613 @@ pub async fn run(
     suite: &HttpSuite,
     policy: &impl ResponsePolicy,
 ) -> Result<Report, RunError> {
-    tracing::info!("Validating configuration and source revision");
     let effective = describe(config, suite)?;
+    let plan = ExecutionPlan {
+        profiles: vec![ProfilePlan {
+            profile: ResolvedProfile {
+                id: "default".into(),
+                server: config.server.clone(),
+                requires: Default::default(),
+            },
+            suite: suite.clone(),
+            policy,
+        }],
+    };
+    let resolved = EffectivePlan {
+        profiles: vec![EffectiveProfile {
+            profile: plan.profiles[0].profile.clone(),
+            suite: suite.clone(),
+            environment: effective.environment.clone(),
+        }],
+        repeats_per_implementation: 2,
+        implementation_order: Implementation::ALL,
+    };
+    execute(config, &plan, resolved, Some(effective)).await
+}
+
+/// Execute explicit profile/case bindings with one source snapshot and one report.
+pub async fn run_plan<P: ResponsePolicy>(
+    config: &RunConfig,
+    plan: &ExecutionPlan<P>,
+) -> Result<Report, RunError> {
+    let effective = describe_plan(config, plan)?;
+    execute(config, plan, effective, None).await
+}
+
+async fn execute<P: ResponsePolicy>(
+    config: &RunConfig,
+    plan: &ExecutionPlan<P>,
+    effective: EffectivePlan,
+    legacy: Option<EffectiveSuite>,
+) -> Result<Report, RunError> {
     let client = http::client()?;
     let artifacts = Artifacts::create(&config.output_dir)?;
-    tracing::info!(commit = %effective.environment.commit, backend = ?effective.environment.profile.backend, suite = %suite.name, cases = suite.cases.len(), "Starting parity run");
-    tracing::info!(directory = %artifacts.root().display(), "Run artifacts and logs");
-    let effective_path = artifacts.root().join("effective_suite.json");
-    artifacts.write_json(&effective_path, &effective)?;
-    let report = Report {
-        state: "preparing".into(),
-        directory: artifacts.root().to_owned(),
-        effective_suite: effective_path,
-        config: config.clone(),
-        environment: None,
-        runtime_errors: Vec::new(),
-        cases: suite
-            .cases
-            .iter()
-            .map(|case| CaseResult {
-                name: case.name.clone(),
+    let legacy_paths = legacy.is_some();
+    let effective_path = artifacts.root().join(if legacy_paths {
+        "effective_suite.json"
+    } else {
+        "effective_plan.json"
+    });
+    if let Some(legacy) = legacy {
+        artifacts.write_json(&effective_path, &legacy)?;
+    } else {
+        artifacts.write_json(&effective_path, &effective)?;
+    }
+    tracing::info!(directory = %artifacts.root().display(), profiles = plan.profiles.len(), "Run artifacts and logs");
+    let cases = plan
+        .profiles
+        .iter()
+        .flat_map(|entry| {
+            entry.suite.cases.iter().map(|case| CaseResult {
+                profile_id: entry.profile.id.clone(),
+                name: if legacy_paths {
+                    case.name.clone()
+                } else {
+                    format!("{}/{}", entry.profile.id, case.name)
+                },
                 implementations: Implementation::ALL
                     .into_iter()
-                    .map(|implementation| (implementation.as_str().into(), SideResult::default()))
+                    .map(|i| (i.as_str().into(), SideResult::default()))
                     .collect(),
                 parity: Check::default(),
+                unavailable: None,
             })
-            .collect(),
-        equivalence: Vec::new(),
-    };
+        })
+        .collect();
+    let profiles = plan
+        .profiles
+        .iter()
+        .map(|p| {
+            (
+                p.profile.id.clone(),
+                ProfileResult {
+                    state: "pending".into(),
+                    environment: None,
+                    diagnostics: Vec::new(),
+                },
+            )
+        })
+        .collect();
     let mut state = RunArtifacts {
         artifacts,
-        report: Some(report),
+        report: Some(Report {
+            state: "preparing".into(),
+            directory: PathBuf::new(),
+            effective_suite: effective_path,
+            config: config.clone(),
+            environment: None,
+            runtime_errors: Vec::new(),
+            cases,
+            equivalence: Vec::new(),
+            profiles,
+        }),
     };
+    state.report.as_mut().unwrap().directory = state.artifacts.root().to_owned();
     state.save()?;
-    let prepared =
-        match environment::prepare(config, &effective.environment, state.artifacts.root()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                tracing::error!(%error, "Environment preparation failed");
-                let report = state.report.as_mut().unwrap();
-                report
-                    .runtime_errors
-                    .push(format!("environment preparation: {error}"));
-                for case in &mut report.cases {
-                    case.parity.status = Status::Skipped;
-                }
-                report.state = "complete".into();
-                state.save()?;
-                return Ok(state.report.take().unwrap());
-            }
-        };
-    let report = state.report.as_mut().unwrap();
-    report.environment = Some(prepared.record.clone());
-    report.state = "running".into();
-    state.save()?;
+    let mut source = None;
+    let mut environments = BTreeMap::new();
+    let mut offset = 0;
     let mut source_valid = true;
-    let requests = suite
-        .cases
-        .iter()
-        .map(|case| serde_json::to_vec_pretty(&case.body))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(std::io::Error::from)?;
-    for implementation in Implementation::ALL {
-        if !state.verify_source(&prepared) {
-            source_valid = false;
-            break;
+    for (entry, resolved) in plan.profiles.iter().zip(&effective.profiles) {
+        let id = &entry.profile.id;
+        let range = offset..offset + entry.suite.cases.len();
+        offset = range.end;
+        let backend = resolved.environment.profile.backend;
+        // Backend-only exclusions need neither installation nor a running server.
+        for (index, case) in entry.suite.cases.iter().enumerate() {
+            let requirements = entry
+                .profile
+                .requires
+                .combine(&case.requires)
+                .map_err(RunError::Config)?;
+            let reason = requirements.unavailable(backend, Some(u32::MAX));
+            state.report.as_mut().unwrap().cases[range.start + index].unavailable = reason;
         }
-        let side_name = implementation.as_str();
-        let side_dir = state.artifacts.directory(side_name)?;
-        let server_log = side_dir.join("server.log");
-        let mut process = match track(
-            &format!("Starting {side_name} server; waiting for readiness"),
-            &server_log,
-            SglangProcess::start(
-                &prepared.server,
-                implementation,
-                &server_log,
-                Duration::from_secs(config.startup_timeout_secs),
-                Duration::from_secs(config.shutdown_timeout_secs),
-            ),
-        )
-        .await
+        if state.report.as_ref().unwrap().cases[range.clone()]
+            .iter()
+            .all(|c| c.unavailable.is_some())
         {
-            Ok(process) => process,
-            Err(error) => {
-                tracing::error!(implementation = side_name, %error, "Server startup failed");
-                state
-                    .report
-                    .as_mut()
-                    .unwrap()
-                    .runtime_errors
-                    .push(format!("{side_name} startup: {error}"));
-                source_valid = state.verify_source(&prepared);
-                state.save()?;
-                if !source_valid {
-                    break;
-                }
-                continue;
-            }
-        };
-        tracing::info!(implementation = side_name, "Server ready");
-        for (index, case) in suite.cases.iter().enumerate() {
-            for repeat in 1..=2 {
-                let directory = state
-                    .artifacts
-                    .directory(format!("{side_name}/{}/{repeat}", case.name))?;
-                std::fs::write(directory.join("request.json"), &requests[index])?;
-                let attempts = &mut state.report.as_mut().unwrap().cases[index]
-                    .implementations
-                    .get_mut(side_name)
-                    .unwrap()
-                    .attempts;
-                attempts.push(Attempt {
-                    directory: directory.clone(),
-                    observation: None,
-                    final_json: None,
-                    origins: BTreeMap::new(),
-                    violations: Vec::new(),
-                    comparison: None,
-                });
-                state.save()?;
-                // The only transport dispatch point; API interpretation follows capture.
-                let observation = track(
-                    &format!(
-                        "{side_name}: case {}/{} {}, repeat {repeat}/2",
-                        index + 1,
-                        suite.cases.len(),
-                        case.name
-                    ),
-                    &server_log,
-                    http::capture(
-                        &client,
-                        &process.base_url(),
-                        case,
-                        &requests[index],
-                        &directory.join("response.body"),
-                        Duration::from_secs(config.request_timeout_secs),
-                    ),
-                )
-                .await?;
-                if case.capture == CaptureMode::Sse {
-                    state
-                        .artifacts
-                        .write_json(&directory.join("events.json"), &observation.events)?;
-                }
-                let mut violations = observation.violations.clone();
-                let mut comparison = None;
-                let mut final_json = None;
-                let mut origins = BTreeMap::new();
-                if observation.transport_error.is_none() && violations.is_empty() {
-                    match policy.prepare(case, &observation) {
-                        Ok(prepared) => {
-                            let value = prepared.value;
-                            origins = prepared.origins;
-                            let path = directory.join("final.json");
-                            state.artifacts.write_json(&path, &value)?;
-                            final_json = Some(path);
-                            match prepare_comparison(
-                                &value,
-                                case.comparison_scope,
-                                &suite.comparison,
-                            ) {
-                                Ok(value) => comparison = Some(value),
-                                Err(errors) => violations.extend(errors),
-                            }
-                        }
-                        Err(errors) => {
-                            violations.extend(errors);
-                            if violations.is_empty() {
-                                violations.push(Violation::new(
-                                    "",
-                                    "response policy rejected the response without diagnostics",
-                                ));
-                            }
-                        }
-                    }
-                }
-                let side = state.report.as_mut().unwrap().cases[index]
-                    .implementations
-                    .get_mut(side_name)
-                    .unwrap();
-                if observation.transport_error.is_some() || !violations.is_empty() {
-                    tracing::warn!(implementation = side_name, case = %case.name, repeat, status = ?observation.status, error = ?observation.transport_error, violations = violations.len(), "Request failed validation; details retained in report");
-                }
-                *side.attempts.last_mut().unwrap() = Attempt {
-                    directory,
-                    observation: Some(observation),
-                    final_json,
-                    origins,
-                    violations,
-                    comparison,
-                };
-                state.save()?;
-            }
-            let side = state.report.as_mut().unwrap().cases[index]
-                .implementations
-                .get_mut(side_name)
-                .unwrap();
-            side.repeatability = match (&side.attempts[0].comparison, &side.attempts[1].comparison)
-            {
-                (Some(left), Some(right)) => check(left, right, Status::Unstable),
-                _ => Check {
-                    status: Status::Skipped,
-                    ..Check::default()
-                },
-            };
-            tracing::info!(implementation = side_name, case = %case.name, repeatability = ?side.repeatability.status, "Case complete");
-            state.save()?;
-        }
-        let shutdown = track(
-            &format!("Stopping {side_name} server"),
-            &server_log,
-            process.shutdown(),
-        )
-        .await;
-        source_valid = state.verify_source(&prepared);
-        if let Err(error) = shutdown {
-            tracing::error!(implementation = side_name, %error, "Server shutdown failed");
             state
                 .report
                 .as_mut()
                 .unwrap()
-                .runtime_errors
-                .push(format!("{side_name} shutdown: {error}"));
-            // A failed cleanup cannot justify starting another managed service.
+                .profiles
+                .get_mut(id)
+                .unwrap()
+                .state = "unavailable".into();
+            continue;
+        }
+        tracing::info!(profile = %id, mode = %entry.suite.output_mode, "Preparing profile");
+        if source.is_none() {
+            match environment::prepare_source(
+                &resolved.environment,
+                state.artifacts.root(),
+                Duration::from_secs(config.environment.setup_timeout_secs),
+            )
+            .await
+            {
+                Ok(prepared) => source = Some(prepared),
+                Err(error) => {
+                    state
+                        .report
+                        .as_mut()
+                        .unwrap()
+                        .runtime_errors
+                        .push(format!("source preparation: {error}"));
+                    break;
+                }
+            }
+        }
+        let env_key = &resolved.environment.environment_dir;
+        if !environments.contains_key(env_key) {
+            let output = if legacy_paths {
+                state.artifacts.root().to_owned()
+            } else {
+                state.artifacts.directory(
+                    PathBuf::from("environments")
+                        .join(env_key.file_name().expect("environment key")),
+                )?
+            };
+            let result = environment::prepare_environment(
+                config,
+                &resolved.environment,
+                &output,
+                source.as_ref().unwrap().clone(),
+            )
+            .await;
+            environments.insert(env_key.clone(), result);
+        }
+        let prepared = match &environments[env_key] {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let report = state.report.as_mut().unwrap();
+                report
+                    .runtime_errors
+                    .push(format!("profile {id} environment preparation: {error}"));
+                let profile = report.profiles.get_mut(id).unwrap();
+                profile.state = "failed".into();
+                profile.diagnostics.push(error.clone());
+                if source.as_ref().unwrap().verify().is_err() {
+                    source_valid = false;
+                    break;
+                }
+                state.save()?;
+                continue;
+            }
+        };
+        if !state.verify_source(prepared) {
+            source_valid = false;
             break;
         }
+        let devices = prepared
+            .record
+            .pointer("/probe/backend/device_count")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        let report = state.report.as_mut().unwrap();
+        if report.environment.is_none() {
+            report.environment = Some(prepared.record.clone());
+        }
+        let profile = report.profiles.get_mut(id).unwrap();
+        profile.environment = Some(prepared.record_path.clone());
+        profile.state = "running".into();
+        report.state = "running".into();
+        for (index, case) in entry.suite.cases.iter().enumerate() {
+            report.cases[range.start + index].unavailable = entry
+                .profile
+                .requires
+                .combine(&case.requires)
+                .map_err(RunError::Config)?
+                .unavailable(backend, devices);
+        }
         state.save()?;
-        if !source_valid {
+        let (safe, valid) = execute_profile(
+            &mut state,
+            &client,
+            config,
+            entry,
+            prepared,
+            range.start,
+            legacy_paths,
+        )
+        .await?;
+        source_valid &= valid;
+        let report = state.report.as_mut().unwrap();
+        report.profiles.get_mut(id).unwrap().state = if safe && source_valid {
+            "complete"
+        } else {
+            "interrupted"
+        }
+        .into();
+        state.save()?;
+        if !safe || !source_valid {
             break;
         }
     }
     let report = state.report.as_mut().unwrap();
+    let mut start = 0;
+    for entry in &plan.profiles {
+        let end = start + entry.suite.cases.len();
+        compare_profile(report, &entry.suite, start..end, source_valid);
+        start = end;
+    }
+    // Planned but unavailable/incomplete checks never look like passing coverage.
     for case in &mut report.cases {
+        if case.parity.status == Status::NotRun {
+            case.parity = skipped();
+        }
+        if !source_valid {
+            case.parity = skipped();
+        }
+    }
+    report.state = "complete".into();
+    state.save()?;
+    Ok(state.report.take().unwrap())
+}
+
+/// Run one profile's services; request capture and comparison stay shared.
+async fn execute_profile<P: ResponsePolicy>(
+    state: &mut RunArtifacts,
+    client: &reqwest::Client,
+    config: &RunConfig,
+    entry: &ProfilePlan<P>,
+    prepared: &PreparedEnvironment,
+    offset: usize,
+    legacy_paths: bool,
+) -> Result<(bool, bool), RunError> {
+    let id = &entry.profile.id;
+    let mut source_valid = true;
+    let server = prepared.server(&entry.profile.server);
+    let mut safe = true;
+    for implementation in Implementation::ALL {
+        let side = implementation.as_str();
+        let side_dir = if legacy_paths {
+            state.artifacts.directory(side)?
+        } else {
+            state.artifacts.directory(format!("profiles/{id}/{side}"))?
+        };
+        let mut active: Option<(SglangProcess, PathBuf)> = None;
+        let mut starts = 0;
+        'cases: for (local, case) in entry.suite.cases.iter().enumerate() {
+            let index = offset + local;
+            if state.report.as_ref().unwrap().cases[index]
+                .unavailable
+                .is_some()
+            {
+                continue;
+            }
+            for repeat in 1..=2 {
+                if case.isolation == Isolation::FreshProcess
+                    && !stop(&mut active, state, id, side).await?
+                {
+                    safe = false;
+                    break;
+                }
+                if active.is_none() {
+                    if !state.verify_source(prepared) {
+                        source_valid = false;
+                        safe = false;
+                        break;
+                    }
+                    starts += 1;
+                    let log = if legacy_paths && starts == 1 {
+                        side_dir.join("server.log")
+                    } else {
+                        let logs = side_dir.join("logs");
+                        std::fs::create_dir_all(&logs)?;
+                        logs.join(format!("server-{starts}.log"))
+                    };
+                    match track(
+                        &format!("{id}/{side}: starting server"),
+                        &log,
+                        SglangProcess::start(
+                            &server,
+                            implementation,
+                            &log,
+                            Duration::from_secs(config.startup_timeout_secs),
+                            Duration::from_secs(config.shutdown_timeout_secs),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(process) => {
+                            tracing::info!(profile = %id, implementation = side, "Server ready");
+                            active = Some((process, log));
+                        }
+                        Err(error) => {
+                            state
+                                .report
+                                .as_mut()
+                                .unwrap()
+                                .runtime_errors
+                                .push(format!("{id}/{side} startup: {error}"));
+                            break 'cases;
+                        }
+                    }
+                }
+                let (process, log) = active.as_ref().unwrap();
+                let directory = side_dir.join(&case.name).join(repeat.to_string());
+                std::fs::create_dir_all(&directory)?;
+                let attempt = Attempt::pending(directory.clone(), log.clone());
+                state.report.as_mut().unwrap().cases[index]
+                    .implementations
+                    .get_mut(side)
+                    .unwrap()
+                    .attempts
+                    .push(attempt);
+                state.save()?;
+                let capture = Capture {
+                    client,
+                    artifacts: &state.artifacts,
+                    policy: &entry.policy,
+                    rules: &entry.suite.comparison,
+                    timeout: Duration::from_secs(config.request_timeout_secs),
+                };
+                let mut ready = true;
+                for (step, request) in case.before_each.iter().enumerate() {
+                    let step_dir = directory.join("before_each").join((step + 1).to_string());
+                    let result = capture
+                        .request(&request.as_case(), &process.base_url(), &step_dir, log)
+                        .await?;
+                    ready = result.valid();
+                    state.report.as_mut().unwrap().cases[index]
+                        .implementations
+                        .get_mut(side)
+                        .unwrap()
+                        .attempts
+                        .last_mut()
+                        .unwrap()
+                        .before_each
+                        .push(result);
+                    state.save()?;
+                    if !ready {
+                        break;
+                    }
+                }
+                let mut attempt = if ready {
+                    track(
+                        &format!(
+                            "{id}/{side}: case {}/{} {}, repeat {repeat}/2",
+                            local + 1,
+                            entry.suite.cases.len(),
+                            case.name
+                        ),
+                        log,
+                        capture.request(case, &process.base_url(), &directory, log),
+                    )
+                    .await?
+                } else {
+                    let mut attempt = Attempt::pending(directory, log.clone());
+                    attempt.violations.push(Violation::new(
+                        "",
+                        "prerequisite failed; measured request was not sent",
+                    ));
+                    attempt
+                };
+                attempt.before_each = std::mem::take(
+                    &mut state.report.as_mut().unwrap().cases[index]
+                        .implementations
+                        .get_mut(side)
+                        .unwrap()
+                        .attempts
+                        .last_mut()
+                        .unwrap()
+                        .before_each,
+                );
+                *state.report.as_mut().unwrap().cases[index]
+                    .implementations
+                    .get_mut(side)
+                    .unwrap()
+                    .attempts
+                    .last_mut()
+                    .unwrap() = attempt;
+                state.save()?;
+                if case.isolation == Isolation::FreshProcess
+                    && !stop(&mut active, state, id, side).await?
+                {
+                    safe = false;
+                    break;
+                }
+            }
+            let side_result = state.report.as_mut().unwrap().cases[index]
+                .implementations
+                .get_mut(side)
+                .unwrap();
+            side_result.repeatability = match side_result.attempts.as_slice() {
+                [left, right] => match (&left.comparison, &right.comparison) {
+                    (Some(left), Some(right)) => check(left, right, Status::Unstable),
+                    _ => skipped(),
+                },
+                _ => skipped(),
+            };
+            state.save()?;
+            if !safe {
+                break;
+            }
+        }
+        safe &= stop(&mut active, state, id, side).await?;
+        source_valid &= state.verify_source(prepared);
+        if !safe || !source_valid {
+            break;
+        }
+    }
+    Ok((safe, source_valid))
+}
+
+impl Attempt {
+    fn pending(directory: PathBuf, server_log: PathBuf) -> Self {
+        Self {
+            directory,
+            server_log: Some(server_log),
+            observation: None,
+            final_json: None,
+            origins: BTreeMap::new(),
+            violations: Vec::new(),
+            assertions: Vec::new(),
+            before_each: Vec::new(),
+            comparison: None,
+        }
+    }
+    fn valid(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|o| o.transport_error.is_none())
+            && self.violations.is_empty()
+    }
+}
+
+struct Capture<'a, P> {
+    client: &'a reqwest::Client,
+    artifacts: &'a Artifacts,
+    policy: &'a P,
+    rules: &'a crate::compare::ComparisonRules,
+    timeout: Duration,
+}
+
+impl<P: ResponsePolicy> Capture<'_, P> {
+    async fn request(
+        &self,
+        case: &HttpCase,
+        base_url: &str,
+        directory: &std::path::Path,
+        log: &std::path::Path,
+    ) -> Result<Attempt, RunError> {
+        std::fs::create_dir_all(directory)?;
+        let request = serde_json::to_vec_pretty(&case.body).map_err(std::io::Error::from)?;
+        std::fs::write(directory.join("request.json"), &request)?;
+        let mut attempt = Attempt::pending(directory.to_owned(), log.to_owned());
+        let observation = http::capture(
+            self.client,
+            base_url,
+            case,
+            &request,
+            &directory.join("response.body"),
+            self.timeout,
+        )
+        .await?;
+        if case.capture == CaptureMode::Sse {
+            self.artifacts
+                .write_json(&directory.join("events.json"), &observation.events)?;
+        }
+        attempt.violations = observation.violations.clone();
+        if observation.transport_error.is_none() && attempt.violations.is_empty() {
+            match self.policy.prepare(case, &observation) {
+                Ok(prepared) => {
+                    let path = directory.join("final.json");
+                    self.artifacts.write_json(&path, &prepared.value)?;
+                    attempt.final_json = Some(path);
+                    attempt.origins = prepared.origins;
+                    attempt.assertions = prepared.assertions;
+                    if !case.assertions.is_empty() {
+                        let actual: std::collections::BTreeSet<_> =
+                            attempt.assertions.iter().map(|a| &a.name).collect();
+                        if actual.len() != attempt.assertions.len()
+                            || actual != case.assertions.iter().collect()
+                        {
+                            attempt.violations.push(Violation::new("", "response policy returned a different set of scenario assertions than declared"));
+                        }
+                    }
+                    // Prerequisites are protocol-checked, not compared or subjected
+                    // to measured-case assertions and value-exception requirements.
+                    if !case.name.is_empty() && attempt.violations.is_empty() {
+                        match prepare_comparison(&prepared.value, case.comparison_scope, self.rules)
+                        {
+                            Ok(value) => attempt.comparison = Some(value),
+                            Err(errors) => attempt.violations.extend(errors),
+                        }
+                    }
+                }
+                Err(errors) => {
+                    attempt.violations.extend(errors);
+                    if attempt.violations.is_empty() {
+                        attempt.violations.push(Violation::new(
+                            "",
+                            "response policy rejected the response without diagnostics",
+                        ));
+                    }
+                }
+            }
+        }
+        attempt.observation = Some(observation);
+        Ok(attempt)
+    }
+}
+
+async fn stop(
+    active: &mut Option<(SglangProcess, PathBuf)>,
+    state: &mut RunArtifacts,
+    profile: &str,
+    side: &str,
+) -> Result<bool, RunError> {
+    let Some((mut process, log)) = active.take() else {
+        return Ok(true);
+    };
+    if let Err(error) = track(
+        &format!("{profile}/{side}: stopping server"),
+        &log,
+        process.shutdown(),
+    )
+    .await
+    {
+        state
+            .report
+            .as_mut()
+            .unwrap()
+            .runtime_errors
+            .push(format!("{profile}/{side} shutdown: {error}"));
+        state.save()?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn skipped() -> Check {
+    Check {
+        status: Status::Skipped,
+        ..Check::default()
+    }
+}
+
+fn compare_profile(
+    report: &mut Report,
+    suite: &HttpSuite,
+    range: std::ops::Range<usize>,
+    source_valid: bool,
+) {
+    for case in &mut report.cases[range.clone()] {
         case.parity = match (
             source_valid,
             stable_value(&case.implementations["python"]),
             stable_value(&case.implementations["rust"]),
         ) {
             (true, Some(left), Some(right)) => check(left, right, Status::Fail),
-            _ => Check {
-                status: Status::Skipped,
-                ..Check::default()
-            },
+            _ => skipped(),
         };
     }
     let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (index, case) in suite.cases.iter().enumerate() {
         if let Some(group) = &case.equivalence_group {
-            groups.entry(group).or_default().push(index);
+            groups.entry(group).or_default().push(range.start + index);
         }
     }
     for (group, members) in groups {
@@ -633,10 +970,7 @@ pub async fn run(
                     stable_value(&right.implementations[implementation.as_str()]),
                 ) {
                     (true, Some(left), Some(right)) => check(left, right, Status::Fail),
-                    _ => Check {
-                        status: Status::Skipped,
-                        ..Check::default()
-                    },
+                    _ => skipped(),
                 };
                 report.equivalence.push(EquivalenceResult {
                     group: group.into(),
@@ -648,9 +982,6 @@ pub async fn run(
             }
         }
     }
-    report.state = "complete".into();
-    state.save()?;
-    Ok(state.report.take().unwrap())
 }
 
 fn stable_value(side: &SideResult) -> Option<&Value> {
