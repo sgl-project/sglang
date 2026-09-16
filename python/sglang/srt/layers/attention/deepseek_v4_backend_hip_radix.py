@@ -87,6 +87,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -2798,6 +2799,38 @@ class DeepseekV4HipRadixBackend(
             )
 
             backend = resolve_hip_flashmla_backend()
+            if (
+                backend == "aiter_sparse"
+                and is_gfx95_supported()
+                and 0 < q.shape[0] <= 8
+                and q.shape[1:] == (1, 16, 512)
+                and q.dtype == torch.bfloat16
+                and self.head_dim_v == 512
+                and self.softmax_scale == 512**-0.5
+                and swa_k_cache.shape[-1] == 584
+                and (extra_k_cache is None or extra_k_cache.shape[-1] == 584)
+                and envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() == 0
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+                    swapab_attention,
+                )
+
+                return swapab_attention(
+                    q,
+                    swa_k_cache,
+                    swa_page_indices,
+                    swa_topk_lengths,
+                    attn_sink,
+                    extra_k_cache,
+                    extra_indices,
+                    extra_topk_lengths,
+                    inv_rope=inv_rope,
+                )
             if backend == "aiter_sparse":
                 swa_page_indices, extra_indices = _fold_lengths_for_aiter_sparse(
                     core_attn_metadata,
