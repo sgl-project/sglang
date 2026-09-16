@@ -26,6 +26,11 @@
 //! | `w:<worker>`            | HASH | `addr` router-facing address, `spec` encoded `WorkerCacheSpec` |
 //! | `h:<worker>:<tier>`     | SET  | reverse holdings, drives `CLEAR_ALL_AT_TIER`            |
 //! | `hc`                    | HASH | `<hash>` = cumulative hit count                         |
+//! | `workers`               | SET  | every worker id that ever applied a batch               |
+//!
+//! The event log (`events` stream, `lease:events`) lives in `stream.rs` and the
+//! liveness keys (`alive:<worker>`, `hb:<worker>`) in `liveness.rs`, under the
+//! same prefix.
 //!
 //! Every field write is a single-key atomic command, so two bridges reporting
 //! the same popular block never clobber each other: each writes its own
@@ -81,7 +86,7 @@ use crate::pb::{
     ExternalKvActionType, ExternalKvNodeMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, HitCountEntry, MatchExternalKvPrefixRequest,
     MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
-    WorkerCacheSpec,
+    TierType, WorkerCacheSpec,
 };
 use crate::service::{compute_prefix_response, prefix_limit};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
@@ -172,14 +177,16 @@ impl ValkeyConfig {
     }
 }
 
+/// One multiplexed connection, standalone or cluster. Cheap to clone; every
+/// clone shares the underlying socket.
 #[derive(Clone)]
-enum Conn {
+pub(crate) enum Conn {
     Standalone(ConnectionManager),
     Cluster(ClusterConnection),
 }
 
 impl Conn {
-    async fn run<T: FromRedisValue>(&mut self, pipe: &Pipeline) -> Result<T, Status> {
+    pub(crate) async fn run<T: FromRedisValue>(&mut self, pipe: &Pipeline) -> Result<T, Status> {
         let result = match self {
             Conn::Standalone(conn) => pipe.query_async::<T>(conn).await,
             Conn::Cluster(conn) => pipe.query_async::<T>(conn).await,
@@ -187,13 +194,58 @@ impl Conn {
         result.map_err(valkey_error)
     }
 
-    async fn exec(&mut self, pipe: &Pipeline) -> Result<(), Status> {
+    pub(crate) async fn exec(&mut self, pipe: &Pipeline) -> Result<(), Status> {
         let result = match self {
             Conn::Standalone(conn) => pipe.exec_async(conn).await,
             Conn::Cluster(conn) => pipe.exec_async(conn).await,
         };
         result.map_err(valkey_error)
     }
+}
+
+/// Opens a connection per `config`, awaited so a bad URL fails at startup.
+pub(crate) async fn connect_conn(config: &ValkeyConfig) -> Result<Conn, Status> {
+    if config.cluster && !(config.key_prefix.contains('{') && config.key_prefix.contains('}')) {
+        return Err(Status::invalid_argument(
+            "valkey backend: cluster mode needs a {hash tag} in the key prefix so pipelines stay in one slot",
+        ));
+    }
+    if config.cluster {
+        let client = ClusterClientBuilder::new(cluster_nodes(&config.url))
+            .connection_timeout(config.connect_timeout)
+            .response_timeout(config.request_timeout)
+            .build()
+            .map_err(valkey_error)?;
+        Ok(Conn::Cluster(
+            client.get_async_connection().await.map_err(valkey_error)?,
+        ))
+    } else {
+        let client = redis::Client::open(config.url.as_str()).map_err(valkey_error)?;
+        // Three reconnect attempts, then commands fail as `Unavailable` and the
+        // next command starts a fresh attempt; the Router falls back meanwhile.
+        let manager = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(config.connect_timeout))
+            .set_response_timeout(Some(config.request_timeout))
+            .set_number_of_retries(3)
+            .set_max_delay(Duration::from_secs(1));
+        Ok(Conn::Standalone(
+            client
+                .get_connection_manager_with_config(manager)
+                .await
+                .map_err(valkey_error)?,
+        ))
+    }
+}
+
+pub(crate) fn cluster_nodes(url: &str) -> Vec<String> {
+    url.split(',')
+        .map(|node| node.trim().to_string())
+        .filter(|node| !node.is_empty())
+        .collect()
+}
+
+pub(crate) fn valkey_status(error: RedisError) -> Status {
+    valkey_error(error)
 }
 
 /// Transport failures are `Unavailable`, which the Router treats as "index
@@ -577,6 +629,9 @@ impl<'a> WriteBuilder<'a> {
     /// makes the worker unroutable and an absent spec returns it to legacy.
     fn worker_meta(&mut self, address: &str, spec: Option<&WorkerCacheSpec>) {
         let key = self.backend.worker_key(self.worker_id);
+        let mut cmd = redis::cmd("SADD");
+        cmd.arg(self.backend.workers_key()).arg(self.worker_id);
+        self.commands.push(cmd);
         let mut cmd = redis::cmd("HSET");
         cmd.arg(&key).arg("addr").arg(address);
         self.commands.push(cmd);
@@ -786,40 +841,7 @@ impl ValkeyKvIndexerBackend {
     /// awaited so a misconfigured URL fails at startup rather than on the first
     /// query.
     pub async fn connect(config: ValkeyConfig) -> Result<Self, Status> {
-        if config.cluster && !(config.key_prefix.contains('{') && config.key_prefix.contains('}')) {
-            return Err(Status::invalid_argument(
-                "valkey backend: cluster mode needs a {hash tag} in the key prefix so pipelines stay in one slot",
-            ));
-        }
-        let conn = if config.cluster {
-            let nodes: Vec<String> = config
-                .url
-                .split(',')
-                .map(|node| node.trim().to_string())
-                .filter(|node| !node.is_empty())
-                .collect();
-            let client = ClusterClientBuilder::new(nodes)
-                .connection_timeout(config.connect_timeout)
-                .response_timeout(config.request_timeout)
-                .build()
-                .map_err(valkey_error)?;
-            Conn::Cluster(client.get_async_connection().await.map_err(valkey_error)?)
-        } else {
-            let client = redis::Client::open(config.url.as_str()).map_err(valkey_error)?;
-            // Three reconnect attempts, then commands fail as `Unavailable` and
-            // the next command starts a fresh attempt; the Router falls back meanwhile.
-            let manager = ConnectionManagerConfig::new()
-                .set_connection_timeout(Some(config.connect_timeout))
-                .set_response_timeout(Some(config.request_timeout))
-                .set_number_of_retries(3)
-                .set_max_delay(Duration::from_secs(1));
-            Conn::Standalone(
-                client
-                    .get_connection_manager_with_config(manager)
-                    .await
-                    .map_err(valkey_error)?,
-            )
-        };
+        let conn = connect_conn(&config).await?;
         let backend = Self {
             conn,
             prefix: config.key_prefix,
@@ -827,6 +849,64 @@ impl ValkeyKvIndexerBackend {
         };
         backend.load_prune_script().await?;
         Ok(backend)
+    }
+
+    pub fn key_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub(crate) fn conn(&self) -> Conn {
+        self.conn.clone()
+    }
+
+    /// Every worker id that ever applied a batch.
+    pub async fn worker_ids(&self) -> Result<Vec<String>, Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("SMEMBERS").arg(self.workers_key());
+        let replies: Vec<Vec<String>> = self.conn.clone().run(&pipe).await?;
+        Ok(replies.into_iter().flatten().collect())
+    }
+
+    /// Revokes every placement of `worker_id` at every tier through the normal
+    /// apply path, keeping its address and spec. Returns false when the worker
+    /// holds nothing, so callers can log and count only real clears.
+    pub async fn clear_worker(&self, worker_id: &str) -> Result<bool, Status> {
+        let tiers = [TierType::TierHbm, TierType::TierDram, TierType::TierSsd];
+        let mut pipe = redis::pipe();
+        for tier in tiers {
+            pipe.cmd("SCARD")
+                .arg(self.holdings_key(worker_id, tier as i32));
+        }
+        let held: Vec<i64> = self.conn.clone().run(&pipe).await?;
+        if held.iter().sum::<i64>() == 0 {
+            return Ok(false);
+        }
+        let meta = self
+            .read_workers(&[worker_id.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let actions = tiers
+            .into_iter()
+            .map(|tier| ExternalKvAction {
+                r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+                tier: tier as i32,
+                hashes: Vec::new(),
+                component_masks: Vec::new(),
+                block_sizes: Vec::new(),
+                parent_block_hash: None,
+            })
+            .collect();
+        self.apply(ApplyExternalKvBatchRequest {
+            worker_id: worker_id.to_string(),
+            seq: 0,
+            actions,
+            worker_address: meta.address,
+            cache_spec: meta.spec,
+        })
+        .await?;
+        Ok(true)
     }
 
     /// `SCRIPT LOAD` is idempotent and routed to every primary in cluster mode.
@@ -855,6 +935,10 @@ impl ValkeyKvIndexerBackend {
 
     fn hits_key(&self) -> String {
         format!("{}hc", self.prefix)
+    }
+
+    fn workers_key(&self) -> String {
+        format!("{}workers", self.prefix)
     }
 
     fn placement_field(worker: &str, tier: i32) -> String {

@@ -9,15 +9,14 @@
 //! `KV_INDEXER_TEST_VALKEY_URL` pointing at a running server. Otherwise the
 //! tests print a skip line and pass, so CI without Valkey stays green.
 
-#[path = "common/id.rs"]
-mod test_id;
+#[allow(dead_code)]
 #[path = "common/kv.rs"]
 mod test_kv;
+#[allow(dead_code)]
+#[path = "common/valkey.rs"]
+mod test_valkey;
 
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType,
@@ -25,91 +24,16 @@ use sgl_kv_indexer::pb::{
     MatchExternalKvRequest, MatchExternalKvResponse, WorkerCacheSpec,
 };
 use sgl_kv_indexer::{
-    InMemoryKvIndexerBackend, KvIndexerBackend, ValkeyConfig, ValkeyKvIndexerBackend,
-    COMPONENT_FULL, COMPONENT_SWA,
+    InMemoryKvIndexerBackend, KvIndexerBackend, ValkeyKvIndexerBackend, COMPONENT_FULL,
+    COMPONENT_SWA,
 };
-use test_id::nanos;
 use test_kv::{
     action, action_with_parent, apply_request, component_report, component_report_with_parent,
     dram, hbm,
 };
+use test_valkey::{fresh_prefix, ValkeyServer};
 
 // ---- a Valkey to test against -------------------------------------------------
-
-struct ValkeyServer {
-    url: String,
-    child: Option<Child>,
-    dir: Option<PathBuf>,
-}
-
-impl ValkeyServer {
-    /// An external server from the environment, a freshly spawned one on a
-    /// unix socket, or `None` when neither is available.
-    fn start() -> Option<Self> {
-        if let Ok(url) = std::env::var("KV_INDEXER_TEST_VALKEY_URL") {
-            return Some(Self {
-                url,
-                child: None,
-                dir: None,
-            });
-        }
-        let binary = ["valkey-server", "redis-server"].into_iter().find(|name| {
-            Command::new(name)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-        })?;
-        let dir = std::env::temp_dir().join(format!("sgl-kv-indexer-test-{}", nanos()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let socket = dir.join("valkey.sock");
-        let child = Command::new(binary)
-            .args(["--port", "0", "--unixsocket"])
-            .arg(&socket)
-            .args(["--save", "", "--appendonly", "no", "--loglevel", "warning"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn valkey-server");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "valkey-server did not open its socket"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Some(Self {
-            url: format!("valkey+unix://{}", socket.display()),
-            child: Some(child),
-            dir: Some(dir),
-        })
-    }
-
-    async fn backend(&self, prefix: &str) -> ValkeyKvIndexerBackend {
-        ValkeyKvIndexerBackend::connect(ValkeyConfig::new(self.url.clone()).with_key_prefix(prefix))
-            .await
-            .expect("connect to test valkey")
-    }
-}
-
-impl Drop for ValkeyServer {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(dir) = self.dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-/// Unique per test so tests sharing one external server never see each other.
-fn fresh_prefix() -> String {
-    format!("{{t{}}}:", nanos())
-}
 
 macro_rules! require_valkey {
     () => {
@@ -879,7 +803,11 @@ async fn valkey_prunes_every_block_record_after_full_revoke() {
     keys.sort();
     assert_eq!(
         keys,
-        vec![format!("{prefix}w:a"), format!("{prefix}w:b")],
+        vec![
+            format!("{prefix}w:a"),
+            format!("{prefix}w:b"),
+            format!("{prefix}workers"),
+        ],
         "only worker records may remain"
     );
 }
