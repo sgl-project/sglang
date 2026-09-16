@@ -1681,22 +1681,17 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
 @register_fused_func("flashinfer", "flashinfer_trtllm")
 @register_fused_func("flashinfer", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm(
-    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput | StandardCombineInput:
+) -> FlashinferCombineInput:
     """Fused function for FlashInfer A2A + TRT-LLM Gen MoE.
 
-    Both one-sided decode and AG+RS prefill materialize routing IDs and weights,
-    so the regular and explicitly-routed backend names enter TRT-LLM's routed
-    kernel. The dispatch formats share the fields consumed by the implementation;
-    only the combine wrapper differs.
+    A2A dispatch materializes routing IDs and weights, so the regular and
+    explicitly-routed backend names both enter TRT-LLM's routed kernel.
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardDispatchOutput,
     )
 
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
@@ -1753,8 +1748,6 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             "FlashInfer A2A + TRT-LLM Gen FP8 MoE must return a BF16 combine "
             f"payload, got {result.hidden_states.dtype}."
         )
-    if isinstance(dispatch_output, StandardDispatchOutput):
-        return result
     return FlashinferCombineInput(hidden_states=result.hidden_states)
 
 
