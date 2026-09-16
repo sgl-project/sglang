@@ -28,6 +28,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 import aiohttp
 import msgspec
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -847,14 +848,17 @@ def terminate_and_kill_process_tree(
     and unpin the host memory during process reclaim, which can hold GPU memory
     for minutes on a busy host -- long enough to trip the per-class GPU-idle
     gate in the next ``setUpClass``. SIGTERM first so the server releases those
-    resources in userspace.
+    resources in userspace, then wait for the memory to come back:
+    a reaped tree does not mean the driver is done with it.
     """
+    pids = collect_process_tree_pids(process.pid)
     process.terminate()
     try:
         process.wait(timeout=terminate_timeout)
     except subprocess.TimeoutExpired:
         pass
     kill_process_tree(process.pid, **kill_kwargs)
+    wait_for_gpu_release(pids)
 
 
 def popen_launch_pd_server(
@@ -2001,6 +2005,9 @@ def maybe_stub_sgl_kernel():
 _GPU_IDLE_TIMEOUT_SECS = 30.0
 _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
+_GPU_RELEASE_TIMEOUT_SECS = 60.0
+_GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2095,6 +2102,95 @@ def _wait_for_gpu_idle_in_ci(
                 flush=True,
             )
             time.sleep(poll_interval)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def collect_process_tree_pids(pid: int, include_parent: bool = True) -> List[int]:
+    """Snapshot a process tree's pids, for a later ``wait_for_gpu_release``.
+
+    Call it BEFORE the kill; afterwards the tree cannot be walked.
+    """
+    try:
+        pids = [child.pid for child in psutil.Process(pid).children(recursive=True)]
+    except psutil.Error:
+        pids = []
+    if include_parent:
+        pids.append(pid)
+    return pids
+
+
+def _gpu_memory_holders(pynvml, gpu_indices: List[int], pids: set) -> List[str]:
+    reports = []
+    for index in gpu_indices:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except pynvml.NVMLError:
+            # No per-pid enumeration in this container; nothing to wait on.
+            continue
+        reports.extend(
+            f"GPU {index} pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+            for proc in procs
+            if proc.pid in pids
+        )
+    return reports
+
+
+def wait_for_gpu_release(
+    pids: List[int],
+    timeout: float = _GPU_RELEASE_TIMEOUT_SECS,
+    poll_interval: float = _GPU_RELEASE_POLL_INTERVAL_SECS,
+) -> None:
+    """Block until none of ``pids`` is still charged device memory.
+
+    Killing a server only queues the driver-side teardown,
+    so the next launch can OOM against memory charged to a reaped process.
+    Waiting on these pids, rather than on an idle GPU,
+    keeps this usable while other servers of the same test still run.
+    Best effort: a timeout or a dead NVML warns, never raises.
+    """
+    if not pids:
+        return
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        # Non-NVIDIA runner (CPU/AMD) or NVML unavailable; nothing to check.
+        return
+    try:
+        gpu_indices = _visible_gpu_indices(pynvml)
+        pending = set(pids)
+        start = time.monotonic()
+        deadline = start + timeout
+        while True:
+            holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
+            if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
+                return
+            if time.monotonic() >= deadline:
+                print(
+                    f"[CI GPU Release] Still charged after {timeout:.0f}s:"
+                    f" {'; '.join(holders)}",
+                    flush=True,
+                )
+                return
+            time.sleep(poll_interval)
+    except Exception as e:
+        # NVML can go away after a successful init (GPU lost, driver reset).
+        # Raising here would fail a teardown whose test already passed.
+        print(f"[CI GPU Release] Giving up, {type(e).__name__}: {e}", flush=True)
     finally:
         try:
             pynvml.nvmlShutdown()

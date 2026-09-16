@@ -13,12 +13,14 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,6 +47,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.processed_tokens_counter = 0
         scheduler.waiting_queue = []
         scheduler._prefetch_kvcache = MagicMock()
+        scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
@@ -107,7 +110,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.enable_priority_scheduling = False
                 scheduler.abort_on_priority_when_disabled = True
                 scheduler.enable_hicache_storage = True
-                scheduler.tree_cache = MagicMock(spec=["release_aborted_request"])
+                scheduler.tree_cache = MagicMock(spec=["finish"])
                 req = self._new_req(priority=10)
 
                 with patch(
@@ -116,8 +119,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 ):
                     scheduler._add_request_to_queue(req)
 
-                scheduler.tree_cache.release_aborted_request.assert_called_once_with(
-                    req.rid
+                scheduler.tree_cache.finish.assert_called_once_with(
+                    req.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 scheduler._prefetch_kvcache.assert_not_called()
                 self.assertEqual(scheduler.waiting_queue, [])
@@ -131,7 +134,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 del scheduler._abort_on_queued_limit  # Exercise the real queue check.
                 scheduler.max_queued_requests = 1
                 scheduler.enable_hicache_storage = True
-                scheduler.tree_cache = MagicMock(spec=["release_aborted_request"])
+                scheduler.tree_cache = MagicMock(spec=["finish"])
                 scheduler.beam_coordinator = MagicMock()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
@@ -145,8 +148,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                     scheduler._add_request_to_queue(incoming)
 
                 rejected = incoming if priority == 0 else queued
-                scheduler.tree_cache.release_aborted_request.assert_called_once_with(
-                    rejected.rid
+                scheduler.tree_cache.finish.assert_called_once_with(
+                    rejected.cache_request_handle, CacheRequestOutcome.ABORT
                 )
                 if priority == 0:
                     self.assertEqual(scheduler.waiting_queue, [queued])
@@ -228,11 +231,62 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.running_batch.reqs = []
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
         return queue
+
+    def test_prealloc_lora_slots_cover_inflight_microbatches_and_queues(self):
+        """In-flight requests retain their adapter slots."""
+        running, finished, transferring, waiting = [
+            self._new_decode_req(rid, 0)
+            for rid in ("running", "finished", "transferring", "waiting")
+        ]
+        reqs = [
+            self._new_decode_req("new", 3),
+            self._new_decode_req("blocked", 2),
+            self._new_decode_req("same-adapter", 1),
+        ]
+        for entry in [running, finished, transferring, waiting, *reqs]:
+            entry.req.lora_id = entry.req.rid
+            entry.req.finished = MagicMock(return_value=entry is finished)
+        reqs[2].req.lora_id = "running"
+
+        queue = self._new_queue(reqs)
+        queue.pp_size = 2
+        queue.transfer_queue.queue = [transferring]
+        scheduler = queue.scheduler
+        scheduler.running_batch.reqs = [finished.req]
+        scheduler.running_mbs = [
+            scheduler.running_batch,
+            SimpleNamespace(reqs=[running.req]),
+        ]
+        scheduler.waiting_queue = [waiting.req]
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_lora = True
+        scheduler.enable_lora_overlap_loading = False
+        scheduler.lora_drainer = None
+        scheduler.can_schedule_lora_req = Scheduler.can_schedule_lora_req.__get__(
+            scheduler
+        )
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.max_loras_per_batch = 5
+        manager.num_pinned_loras = 0
+        scheduler.tp_worker.model_runner.lora_manager = manager
+
+        preallocated, failed = queue.pop_preallocated(
+            pp_good_rids=[entry.req.rid for entry in reqs], pp_bad_rids=[]
+        )
+
+        self.assertEqual(preallocated, [reqs[0], reqs[2]])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [reqs[1]])
+        self.assertEqual(
+            [call.args[0] for call in queue._pre_alloc.call_args_list],
+            [reqs[0].req, reqs[2].req],
+        )
 
     def test_prealloc_queue_schedules_higher_priority_values_first_by_default(self):
         reqs = [

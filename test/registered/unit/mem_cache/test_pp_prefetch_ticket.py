@@ -5,17 +5,23 @@ import threading
 import unittest
 from array import array
 from queue import Queue
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.managers.cache_controller import PrefetchAck
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
+from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,16 +65,25 @@ class TestPPPrefetchTicket(unittest.TestCase):
         cache._all_reduce = Mock()
         cache.ongoing_prefetch = {}
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache.linker = None
         cache.root_node_handle = Mock(return_value=0)
-        cache.buffer_pipeline = Mock()
+        cache.buffer_pipeline = Mock(spec=BufferModePipeline)
         cache._handle_prefetch_result = Mock()
 
-    def submit(self, rid="hit", pools=None):
+    def submit(self, rid="hit", pools=None, attempt_id=0, assume_stored=False):
         key = RadixKey(
             array("q", range(9)), "adapter", is_bigram=True, cache_salt="tenant"
         )
         return self.c.submit_prefetch(
-            rid, key, "ab" * 32, ["prefix"], [10, 11, 12, 13], pools
+            CacheRequestHandle(rid, attempt_id),
+            key,
+            "ab" * 32,
+            ["prefix"],
+            [10, 11, 12, 13],
+            pools,
+            assume_stored=assume_stored,
         )
 
     def run_commands(self, *tickets):
@@ -97,20 +112,25 @@ class TestPPPrefetchTicket(unittest.TestCase):
         for hit in (0, 8):
             with self.subTest(hit=hit):
                 rid = str(hit)
+                handle = CacheRequestHandle(rid, 0)
                 c._storage_hit_query.return_value = ([], hit)
                 self.assertEqual(self.submit(rid).decision, bool(hit))
                 queries = c._storage_hit_query.call_count
                 for _ in range(2):
                     self.assertEqual(
-                        self.cache.prefetch_from_storage(rid, 0, []), bool(hit)
+                        self.cache.prefetch_from_storage(handle, 0, []), bool(hit)
                     )
                 self.assertEqual(c._storage_hit_query.call_count, queries)
                 if hit:
                     state = c.pp_prefetch_states[rid]
                     state.ready_event.set()
                     c.take_ready_pp_prefetch(rid)
-                    self.assertFalse(self.cache.prefetch_from_storage(rid, 0, []))
-                self.assertTrue(self.cache.check_prefetch_progress(rid))
+                    self.assertFalse(
+                        self.cache.prefetch_from_storage(
+                            CacheRequestHandle(rid, 1), 0, []
+                        )
+                    )
+                self.assertTrue(self.cache.check_prefetch_progress(handle))
                 self.assertFalse(c.release_pp_prefetch(rid))
                 self.assertIsNone(c.get_prefetch_submission(rid))
         self.assertEqual(c.pp_prefetch_command_queue.qsize(), 1)
@@ -123,11 +143,12 @@ class TestPPPrefetchTicket(unittest.TestCase):
             "join",
             side_effect=AssertionError("scheduler blocked"),
         ):
-            self.assertTrue(self.submit().decision)
+            self.assertTrue(self.submit(assume_stored=True).decision)
             self.assertTrue(self.submit("next").decision)
         self.assertEqual(c.pp_prefetch_command_queue.qsize(), 2)
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
         c.mem_pool_host.alloc.assert_not_called()
+        self.assertFalse(c.pp_prefetch_states["hit"].operation.assume_stored)
         self.assertEqual(
             c._all_reduce.call_args.args[1:], (torch.distributed.ReduceOp.MIN, ["tp"])
         )
@@ -139,23 +160,27 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def test_tp_only_preserves_normal_prefetch(self):
         c = self.c
         c.pp_prefetch_command_group = None
-        result = self.submit()
+        result = self.submit(attempt_id=3, assume_stored=True)
         self.assertIsNone(result.decision)
+        self.assertEqual(result.operation.handle, CacheRequestHandle("hit", 3))
+        self.assertTrue(result.operation.assume_stored)
         self.assertIs(c.prefetch_queue.get_nowait(), result.operation)
         c._storage_hit_query.assert_not_called()
 
     def test_downstream_request_and_ticket_order_preserves_pp0_admission(self):
         c, cache = self.c, self.cache
-        self.submit()
+        self.submit(attempt_id=3)
+        handle = CacheRequestHandle("hit", 3)
         ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
         ticket.last_hash = None
         c.pp_rank = 1
         c.pp_prefetch_states.clear()
         cache.bind_prefetch_ticket("hit")
-        self.assertFalse(cache.check_prefetch_progress("hit"))
+        self.assertFalse(cache.check_prefetch_progress(handle))
         c._storage_hit_query.reset_mock()
         self.run_commands(ticket)
         operation = c.prefetch_buffer.get_nowait()
+        self.assertEqual(operation.handle, handle)
         self.assertEqual(
             operation.hash_value, get_storage_hash_str(ticket.prefetch_key, page_size=4)
         )
@@ -165,11 +190,12 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.sync_acks(PrefetchAck("hit", operation, completed_tokens=8))
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
         self.sync_acks(PrefetchAck("hit", operation, completed_req=True))
-        self.assertFalse(cache.check_prefetch_progress("hit"))  # PP0 has not admitted.
+        self.assertFalse(cache.check_prefetch_progress(handle))  # PP0 has not admitted.
         cache._all_reduce.side_effect = lambda tensor, _: tensor.fill_(1)
-        self.assertTrue(cache.check_prefetch_progress("hit"))
+        self.assertTrue(cache.check_prefetch_progress(handle))
         cache._handle_prefetch_result.assert_called_once_with(operation)
-        key = cache.ongoing_prefetch["hit"].prefetch_key
+        cache.buffer_pipeline.try_lock_anchor.assert_called_once_with(handle, 8)
+        key = cache.ongoing_prefetch[handle].prefetch_key
         self.assertEqual((key.extra_key, key.cache_salt), ("adapter", "tenant"))
         self.assertTrue(key.is_bigram)
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
@@ -183,7 +209,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         )
         ticket = c.pp_prefetch_states.pop("hit").ticket
         following = pickle.loads(pickle.dumps(ticket))
-        following.rid = "next"
+        following.handle = CacheRequestHandle("next", 0)
         c.pp_rank = 1
         kv = torch.arange(8)
         c.mem_pool_host.alloc.side_effect = [
@@ -227,8 +253,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         ticket = c.pp_prefetch_states.pop("hit").ticket
         c.pp_rank = 1
         cache.bind_prefetch_ticket("hit")
-        self.assertTrue(c.release_pp_prefetch("hit"))
-        self.assertTrue(c.release_pp_prefetch("hit"))
+        cache.finish(ticket.handle, CacheRequestOutcome.ABORT)
+        cache.finish(ticket.handle, CacheRequestOutcome.ABORT)
         self.assertIs(c.pp_prefetch_decisions["hit"], PPPrefetchDecision.CANCELLED)
         self.run_commands(ticket)
         operation = c.prefetch_buffer.get_nowait()
@@ -242,6 +268,48 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(c.prefetch_tokens_occupied, 0)
         self.assertEqual(c.pp_prefetch_states, {})
         self.assertEqual(c.pp_prefetch_decisions, {})
+
+    def test_lazy_sidecars_use_hit_pages_and_pool_page_size(self):
+        c = self.c
+        c.mem_pool_host.get_pool.side_effect = lambda name: Mock(
+            page_size=1 if name == PoolName.MAMBA else 4
+        )
+        self.submit(
+            pools=[
+                PoolTransfer(PoolName.SWA, keys=["pending"] * 3),
+                PoolTransfer(PoolName.MAMBA, keys=["pending"]),
+                PoolTransfer(PoolName.DRAFT_SWA, indices_from_pool=PoolName.SWA),
+            ]
+        )
+        ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                c.pp_rank = rank
+                if rank:
+                    c.pp_prefetch_states.clear()
+                c.mem_pool_host.alloc.reset_mock()
+                self.run_commands(ticket)
+                operation = c.prefetch_buffer.get_nowait()
+                self.assertEqual(
+                    c.mem_pool_host.alloc.call_args_list,
+                    [
+                        call(8, pool=PoolName.KV),
+                        call(8, pool=PoolName.SWA),
+                        call(1, pool=PoolName.MAMBA),
+                    ],
+                )
+                swa, mamba, draft_swa = operation.pool_transfers
+                self.assertIs(draft_swa.host_indices, swa.host_indices)
+                self.assertEqual(mamba.host_indices.numel(), 1)
+
+        # Missing pool metadata also rolls back KV, before a failed-ticket ACK.
+        c.pp_prefetch_states.clear()
+        c.mem_pool_host.get_pool.side_effect = KeyError(PoolName.SWA)
+        with self.assertLogs(level="ERROR"):
+            self.run_commands(ticket)
+        self.assertTrue(c.prefetch_buffer.get_nowait().is_terminated())
+        self.assertEqual(c.mem_pool_host.free.call_count, 1)
+        self.assertEqual(c.mem_pool_host.free.call_args.kwargs["pool"], PoolName.KV)
 
     def test_failed_source_allocation_does_not_free_borrowed_sidecar_early(self):
         c = self.c
