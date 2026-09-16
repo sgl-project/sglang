@@ -623,7 +623,7 @@ impl MetricsRegistry {
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
-    /// Count encoder failures only for chats eligible for `input_ids`
+    /// Count formatter failures only for chats eligible for `input_ids`
     /// forwarding. Requests excluded by the guard are expected fallbacks.
     /// Pairs with the per-model WARN log in `encode_chat`.
     pub fn record_ingress_tokenize_error(&self, model_id: &str) {
@@ -1020,7 +1020,7 @@ impl MetricsRegistry {
 
         // ingress_tokenize_errors_total
         out.push_str(
-            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-encoder model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+            "# HELP sgl_router_ingress_tokenize_errors_total Plain text chat requests on a chat-formatter model whose ingress rendering or tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
         );
         out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
         let guard = self.ingress_tokenize_errors_total.lock();
