@@ -87,6 +87,7 @@ def _pad_intermediate_size(layer: Module) -> None:
         padded[:, :, :width] = param
         param.data = padded
 
+    layer.intermediate_size_per_partition = padded_size
     print_warning_once(
         f"flashinfer_mxfp4 MoE padded the local intermediate size from "
         f"{intermediate_size} to {padded_size} for 128-element kernel alignment "
