@@ -99,12 +99,13 @@ def _declared_kernarg_size(source_file):
 def _hip_lib():
     global _hip
     if _hip is None:
-        # ROCm 10 images carry two libamdhip64 of the same SONAME: torch loads
-        # the one under _rocm_sdk_core, while LD_LIBRARY_PATH points at the
-        # _rocm_sdk_devel copy. Binding the devel one still loads the module,
-        # but every launch on a torch stream then fails with
-        # hipErrorContextIsDestroyed (709). Initialize CUDA so torch's copy is
-        # mapped, then bind to that.
+        # ROCm 10 ships the HIP runtime (_rocm_sdk_core) and the toolchain
+        # (_rocm_sdk_devel) as separate wheels. Torch maps core's
+        # libamdhip64.so.7, which an unversioned CDLL("libamdhip64.so") does not
+        # match, so the loader takes devel's copy off LD_LIBRARY_PATH as a
+        # second HIP runtime and every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709). Initialize CUDA first so torch's
+        # copy is mapped, then bind to that one.
         torch.cuda.current_device()
         _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         _hip.hipModuleLoad.restype = ctypes.c_int
