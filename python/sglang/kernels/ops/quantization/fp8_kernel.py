@@ -1707,17 +1707,19 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
-    if _is_gfx1250:
-        config = {**config, "num_stages": 1}
-        kernel = _w8a8_block_fp8_matmul_gfx1250
-    else:
-        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
-
+    # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
+    # do not match the single-accumulator kernels bit-for-bit.
     hopper_tuned = get_platform().is_sm90 and (
         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
     )
     if hopper_tuned:
         kernel = _w8a8_block_fp8_matmul_hopper
+    elif _is_gfx1250:
+        config = {**config, "num_stages": 1}
+        kernel = _w8a8_block_fp8_matmul_gfx1250
+    else:
+        kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
+
     split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
     if split_k > 1:
         assert split_k & (split_k - 1) == 0
