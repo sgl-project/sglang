@@ -252,6 +252,60 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend):
                 run_dense_attention_case(self, case)
 
+    # Every other SWA case here keeps the extend length under BLOCK_M (64 or
+    # 128 on the architectures we build for), so `cur_block_m` is always 0 and
+    # the extend-KV loop always starts at tile 0. The kernel bounds that loop
+    # below by the sliding-window floor, and that bound is only reachable once
+    # a query tile starts past the window. These lengths are therefore load
+    # bearing: they must stay above BLOCK_M with a window well below it, or
+    # the bound goes unexercised and a wrong or missing one stays green.
+    MULTI_TILE_SWA_CASES = (
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_no_prefix",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(384, 321),
+            sliding_window_size=24,
+        ),
+        # Non-empty prefix so the prefix sweep runs too, and a window that is
+        # not a multiple of any BLOCK_N we use, which is where rounding the
+        # floor down to a tile boundary would show up.
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_with_prefix",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(48, 130),
+            extend_lens=(384, 300),
+            sliding_window_size=72,
+        ),
+        # Window exactly on a tile boundary: the floor lands on a tile start,
+        # so an off-by-one in the bound drops a tile that still contributes.
+        DenseAttentionCase(
+            name="swa_extend_multi_tile_window_tile_aligned",
+            backend="triton",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=8,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(448,),
+            sliding_window_size=128,
+        ),
+    )
+
+    def test_multi_tile_swa_extend_cases(self):
+        for case in self.MULTI_TILE_SWA_CASES:
+            with self.subTest(case=case.name, backend=case.backend):
+                # The kit defaults to 64, which these lengths exceed.
+                run_dense_attention_case(self, case, max_context_len=512)
+
     # Layout-robustness. See dense/test_triton.py for full rationale.
     # The default `shuffled_pages` layout is already exercised by
     # test_projected_swa_attention_cases; this method opts into the
