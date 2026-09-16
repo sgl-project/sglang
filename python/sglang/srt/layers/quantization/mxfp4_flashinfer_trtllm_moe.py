@@ -53,8 +53,7 @@ def _pad_intermediate_size(layer: Module) -> None:
     if padded_size == intermediate_size:
         return
 
-    # Pad after TP loading so checkpoint shard offsets retain the original width.
-    # Gate and up occupy separate halves and must each get their own zero tail.
+    # Gate and up occupy separate halves; each needs its own zero tail.
     for name, fill_value in (
         ("w13_weight", 0),
         ("w13_weight_scale_inv", 1),
@@ -88,6 +87,7 @@ def _pad_intermediate_size(layer: Module) -> None:
         padded[:, :, :width] = param
         param.data = padded
 
+    layer.intermediate_size_per_partition = padded_size
     print_warning_once(
         f"flashinfer_mxfp4 MoE padded the local intermediate size from "
         f"{intermediate_size} to {padded_size} for 128-element kernel alignment "

@@ -278,11 +278,8 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # autotune(cache=...) clears all file-loaded tactics on entry. In a
-        # speculative worker, loading the draft cache would then discard the
-        # target's prefill tactics after a restart (freshly profiled tactics
-        # live in a different cache and mask this on the first startup).
-        # The public load/save API merges the target and draft entries instead.
+        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
+        # the target's tactics when the draft worker loads; load and save them by hand.
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
@@ -345,7 +342,7 @@ def maybe_flashinfer_autotune_speculative_draft(
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
-    """Also autotune kernels at the prefill token ceiling.
+    """Also autotune one EXTEND-shaped dummy forward.
 
     The decode-shaped autotune only covers token counts up to the decode
     batch size, so larger prefill/extend batches fall outside the tuned
@@ -354,25 +351,14 @@ def maybe_flashinfer_autotune_extend(
     untuned at >=8k tokens on sm100). One extra forward at the largest
     per-rank extend token count tunes all buckets up to it.
     """
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+        return
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    # A model can warm up its prefill kernels without constructing a dummy
-    # attention batch. In particular, DSpark's ordinary dummy forward uses
-    # TARGET_VERIFY and cannot cover large prefill GEMMs. Keep the existing
-    # cross-rank tactic synchronization, cache and skip policy for this hook.
-    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
-    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
-        with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
-        if tuned:
-            return
-
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
-        return
     is_pd_prefill_target = (
         get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
     )
