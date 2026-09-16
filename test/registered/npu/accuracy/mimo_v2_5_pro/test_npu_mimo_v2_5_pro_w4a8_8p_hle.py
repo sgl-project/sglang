@@ -50,8 +50,6 @@ MIMO_V2_5_PRO_FP4_4P_OTHER_ARGS = [
     "ascend",
     "--device",
     "npu",
-    "--quantization",
-    "modelslim",
     "--mem-fraction-static",
     0.905,
     "--tp-size",
