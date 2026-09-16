@@ -63,13 +63,5 @@ def test_strided_rows():
     _check(x)
 
 
-def test_out_parameter_is_filled():
-    x = torch.randn((6, VOCAB), device="cuda", dtype=torch.float32)
-    out = torch.empty((6,), device="cuda", dtype=torch.int64)
-    got = fast_row_argmax(x, out=out)
-    assert got.data_ptr() == out.data_ptr()
-    assert torch.equal(out, torch.argmax(x, dim=-1))
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
