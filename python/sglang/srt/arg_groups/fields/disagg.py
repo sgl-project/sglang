@@ -108,6 +108,10 @@ class Disagg(msgspec.Struct):
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
+    enable_pd_role_switch: A[
+        bool,
+        "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
+    ] = False
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
