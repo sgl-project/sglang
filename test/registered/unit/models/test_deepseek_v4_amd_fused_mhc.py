@@ -363,7 +363,13 @@ class TestAmdFusedMhcNumerical(unittest.TestCase):
         res = (torch.randn(m, hc_mult, hidden, device=dev) * 0.02).bfloat16()
         post = torch.randn(m, hc_mult, device=dev) * 0.02
         comb = torch.randn(m, hc_mult, hc_mult, device=dev) * 0.02
-        fn = (torch.randn(hc_mult3, hc_mult * hidden, device=dev) * 0.02).bfloat16()
+        # The unpacked AITER kernel reads fn as FP32, matching model parameters.
+        # Passing BF16 here makes it read beyond the allocation, intermittently
+        # faulting depending on adjacent cached allocator blocks.
+        fn = (
+            torch.randn(hc_mult3, hc_mult * hidden, device=dev, dtype=torch.float32)
+            * 0.02
+        )
         scl = torch.ones(hc_mult3, device=dev)
         base = torch.zeros(hc_mult3, device=dev)
         nw = torch.ones(hidden, device=dev).bfloat16()
