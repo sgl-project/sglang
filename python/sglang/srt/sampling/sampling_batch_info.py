@@ -85,6 +85,10 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
+    # device avoids a scalar synchronization in the per-token sampling path.
+    npu_top_k_top_p_eligible: bool = False
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -221,6 +225,9 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            npu_top_k_top_p_eligible=all(
+                1 <= r.sampling_params.top_k <= 1024 for r in reqs
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -516,6 +523,7 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
 
         self.adjusted_merge_batch(other)
 
