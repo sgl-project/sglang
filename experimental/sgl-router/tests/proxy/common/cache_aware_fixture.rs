@@ -4,7 +4,7 @@
 //! Shared router config for the cache-aware proxy tests.
 //!
 //! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches the
-//! built-in V4 chat encoder — the engine-equivalent path — with no template fixture.
+//! built-in V4 chat formatter — the engine-equivalent path — with no template fixture.
 
 use sgl_router::config::{
     ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
@@ -20,6 +20,7 @@ pub fn config() -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
@@ -34,6 +35,7 @@ pub fn config() -> Config {
             sticky: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
