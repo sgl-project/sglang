@@ -7,7 +7,7 @@ import pytest
 import torch
 from flashinfer import mxfp8_quantize
 
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
     _quantize_partial,
     _wo_a_reduce,
     wo_a_bf16_small_batch,
@@ -36,8 +36,10 @@ STREAMS = 4
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: str):
-    from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
-    from sglang.kernels.ops.layernorm.mxfp8_epilogue import hc_combine_norm_mxfp8
+    from sglang.kernels.ops.layernorm.hc_combine_norm import (
+        hc_combine_norm,
+        hc_combine_norm_mxfp8,
+    )
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
     g = torch.Generator(device="cuda").manual_seed(m * 31 + int(scale * 1000))
