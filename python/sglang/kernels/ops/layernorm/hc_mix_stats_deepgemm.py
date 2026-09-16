@@ -42,9 +42,12 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((_NUM_SPLITS, m, 24), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((_NUM_SPLITS, m), dtype=torch.float32, device=dev)
-    unused_sq = torch.empty_like(sq)
     tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, _NUM_SPLITS)
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, unused_sq, _NUM_SPLITS)
+    # The row sum of squares depends only on x_flat, so the second projection
+    # recomputes exactly the same values; let it overwrite sq instead of
+    # allocating a (_NUM_SPLITS, m) fp32 scratch that is thrown away
+    # (4 MiB at m = 65536).
+    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, _NUM_SPLITS)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,
