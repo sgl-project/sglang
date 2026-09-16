@@ -485,8 +485,11 @@ def _split_kv_pages_to_64(
     SWA pool, -1 = invalid) is provided, only the source pages that actually
     contain a referenced token are copied. This avoids rewriting the entire KV
     pool on every decode step (only ~2*batch pages are touched vs the full
-    pool). The output buffer is persistent and reused across steps; untouched
-    dst pages simply retain their (unreferenced) stale data.
+    pool). The output buffer is persistent and reused across steps. Untouched
+    dst pages are never addressed by a valid index, but FlashInfer <= 0.6.18
+    clamps every masked (-1) candidate to slot 0 and gathers that slot's bytes,
+    so the buffer is zero-initialized instead of left as allocator garbage (see
+    the allocation below).
     """
     assert src_pbs % _PBS_DST == 0 and src_pbs >= _PBS_DST
     if src_pbs == _PBS_DST:
@@ -507,8 +510,23 @@ def _split_kv_pages_to_64(
         # The first allocation can happen under inference mode (autotune), but
         # the buffer is written again during CUDA graph capture outside
         # inference mode, where an inference tensor cannot be mutated.
+        #
+        # torch.zeros, not torch.empty: only the source pages a step references
+        # are copied into this grow-only scratch, so dst page 0 (slot 0) is
+        # written only when source page 0 is referenced. The FlashInfer SM120
+        # sparse-MLA prefill and decode kernels (<= 0.6.18: kv_cache_io.cuh
+        # io_bulk_gather_tile / io_gather_scales, prefill_kernel.cuh
+        # prefill_kv_entry_base, `idx = (idx >= 0) ? idx : 0`) clamp every
+        # masked (-1) candidate index to slot 0 and gather that slot's bytes
+        # with only the score masked, so NaN-encoded fp8 bytes recycled into
+        # page 0 by the caching allocator turn into P(0) * V(NaN) = NaN for
+        # every query row with -1 padding (DeepSeek-V4 on RTX PRO 6000: cold
+        # prompts of 65+ tokens returned garbage, 64 were correct). One memset
+        # per (re)allocation, no per-step cost. The kernel-side fix is
+        # flashinfer-ai/flashinfer#5075 (masked candidates gather a shared
+        # zero row), which is not in 0.6.18.
         with torch.inference_mode(False):
-            buf = torch.empty(
+            buf = torch.zeros(
                 num_dst_pages,
                 _BYTES_PER_DST_PAGE_PADDED,
                 dtype=torch.uint8,
@@ -613,8 +631,10 @@ def _flash_mla_flashinfer(
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
 
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
-    # Only the SWA pages actually referenced by `idx` are copied (the rest of
-    # the persistent dst buffer is left untouched and never read).
+    # Only the SWA pages actually referenced by `idx` are copied; the rest of
+    # the persistent dst buffer is left untouched. It is zero-initialized
+    # because FlashInfer <= 0.6.18 gathers slot 0 for every masked (-1)
+    # candidate (see _split_kv_pages_to_64).
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     kv_64 = (
