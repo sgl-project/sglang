@@ -158,7 +158,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def prefetch_from_storage(
         self,
-        handle: CacheRequestHandle,
+        request: CacheRequestHandle,
         last_host_node_id: NodeId,
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
@@ -166,9 +166,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ) -> None:
-        del last_hash, prefix_keys
-        req_id = handle.rid
+        del last_hash, prefix_keys, storage_hit_end
+        req_id = request.rid
         if req_id in self._external_flows:
             return
         local_tokens = list(matched_prefix_tokens or [])
