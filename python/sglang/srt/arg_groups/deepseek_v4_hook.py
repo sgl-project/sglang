@@ -256,7 +256,32 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
+        if cfg.dsv41_main_kv_layout != "auto" or cfg.dsv41_main_kv_consumer != "auto":
+            raise ValueError(
+                "--dsv41-main-kv-layout and --dsv41-main-kv-consumer require "
+                "DeepSeek-V4.1"
+            )
         return
+
+    if cfg.dsv41_main_kv_consumer != "auto":
+        raise ValueError(
+            "DeepSeek-V4.1 packed Main-KV consumers are not available in PR1; "
+            "leave --dsv41-main-kv-consumer=auto"
+        )
+    if cfg.dsv41_main_kv_layout == "packed_fp4":
+        raise ValueError(
+            "DeepSeek-V4.1 packed_fp4 Main KV has no attention consumer in PR1; "
+            "use --dsv41-main-kv-layout=auto until the staged or direct consumer lands"
+        )
+    if cfg.dsv41_main_kv_layout == "flashmla_fp8" and (
+        envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41"
+        or envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower() == "fp4"
+    ):
+        raise ValueError(
+            "--dsv41-main-kv-layout=flashmla_fp8 conflicts with "
+            "the explicitly configured V4.1/FP4 legacy KV environment"
+        )
+
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 

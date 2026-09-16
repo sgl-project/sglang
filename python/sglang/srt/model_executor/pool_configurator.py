@@ -39,7 +39,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
+    resolve_compressed_kv_layout,
+    select_dsv4_kv_layout,
 )
+from sglang.srt.mem_cache.dsv41_main_kv_layout import MainKVLayoutSpec
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -930,6 +933,32 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
+def get_dsv4_main_kv_physical_bytes_per_slot(
+    *,
+    ratio: int,
+    full_page_size: int,
+    kv_layout,
+    compressed_kv_layout: Optional[str],
+    packed_specs: Optional[dict[int, MainKVLayoutSpec]],
+) -> float:
+    if ratio not in (1, 2):
+        raise ValueError(
+            f"Main KV physical sizing only supports ratio 1/2, got {ratio}"
+        )
+    page_slots = full_page_size // ratio
+    if packed_specs is not None:
+        spec = packed_specs[ratio]
+        if spec.page_slots != page_slots:
+            raise ValueError(
+                f"ratio-{ratio} spec has {spec.page_slots} page slots, "
+                f"expected {page_slots}"
+            )
+        return spec.page_bytes / spec.page_slots
+
+    layout = resolve_compressed_kv_layout(kv_layout, ratio, compressed_kv_layout)
+    return layout.page_bytes(page_slots) / page_slots
+
+
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
     """The operator's --swa-full-tokens-ratio, or None when it was not given."""
     schedule = get_schedule()
@@ -1013,6 +1042,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.sliding_window_size = kvc.sliding_window_size
         self.page_size = kvc.page_size
+        layout_resolver = getattr(kvc, "resolve_dsv4_storage_layouts", None)
+        if layout_resolver is None:
+            self._dsv4_kv_layout, self._dsv4_compressed_kv_layout = (
+                select_dsv4_kv_layout()
+            )
+            self._dsv41_main_kv_layout_specs = None
+        else:
+            (
+                self._dsv4_kv_layout,
+                self._dsv4_compressed_kv_layout,
+                self._dsv41_main_kv_layout_specs,
+            ) = layout_resolver()
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.ps.attn_dp_size
@@ -1049,7 +1090,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.indexer_head_dim, use_fp4_indexer=True
         )
         self.low_ratio_bytes_per_full_token = sum(
-            (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
+            (
+                get_dsv4_main_kv_physical_bytes_per_slot(
+                    ratio=cfg.compress_ratios[l],
+                    full_page_size=self.page_size,
+                    kv_layout=self._dsv4_kv_layout,
+                    compressed_kv_layout=self._dsv4_compressed_kv_layout,
+                    packed_specs=self._dsv41_main_kv_layout_specs,
+                )
+                + low_ratio_index_bytes
+            )
+            / cfg.compress_ratios[l]
             for l in cfg.hf_config.kv_source_layer_ids
             if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             and cfg.compress_ratios[l] in (1, 2)
@@ -1089,8 +1140,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self._assert_ring_serves_draft_tokens(
                 max_speculative_num_draft_tokens() or 0
             )
-
-        from sglang.srt.runtime_context import get_exec
 
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0

@@ -6,6 +6,7 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/deepseek_v4/kv_layout_id.cuh>
 
 #include <cstdint>
 #ifndef USE_ROCM
@@ -32,8 +33,6 @@
 namespace sglang {
 
 namespace deepseek_v4 {
-
-enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2 };
 
 template <KVLayout kLayout>
 struct KVLayoutTraits;

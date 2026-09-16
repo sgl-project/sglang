@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import List, Literal, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -25,6 +25,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.dsv41_main_kv_layout import (
+    DSV41_MAIN_KV_LAYOUT,
+    MainKVLayoutSpec,
+    PackedMainKVView,
+    make_dsv41_packed_main_kv_spec,
+    validate_dsv41_packed_main_kv_spec,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -305,6 +312,114 @@ class DeepSeekV4SingleKVPool(KVCache):
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
+
+
+class DeepSeekV41PackedMainKVPool(KVCache):
+    """Versioned 384-byte Main-KV storage for DSV4.1 ratio-1/ratio-2 sources."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        *,
+        spec: Optional[MainKVLayoutSpec] = None,
+    ):
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=torch.uint8,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+        self.spec = spec or make_dsv41_packed_main_kv_spec(page_size)
+        validate_dsv41_packed_main_kv_spec(self.spec)
+        if self.spec.page_slots != page_size:
+            raise ValueError(
+                "packed Main KV spec page size does not match the pool: "
+                f"{self.spec.page_slots} != {page_size}"
+            )
+        self.kv_layout = self.spec.layout_id
+        self.kv_cache_total_dim = self.spec.bytes_per_slot
+        self.bytes_per_page_padded = self.spec.page_bytes
+
+        num_pages = (self.size + self.page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.kv_buffer = [
+                    torch.zeros(
+                        num_pages,
+                        self.spec.page_bytes,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def get_view(self, local_layer_id: int) -> PackedMainKVView:
+        return PackedMainKVView(self.kv_buffer[local_layer_id], self.spec)
+
+    def get_page_buffer(self, local_layer_id: int) -> torch.Tensor:
+        return self.kv_buffer[local_layer_id]
+
+    def get_payload(self, local_layer_id: int) -> torch.Tensor:
+        return self.get_view(local_layer_id).payload
+
+    def get_scales(self, local_layer_id: int) -> torch.Tensor:
+        return self.get_view(local_layer_id).scales
+
+    def get_rope(self, local_layer_id: int) -> torch.Tensor:
+        return self.get_view(local_layer_id).rope
+
+    def get_bytes_per_page(self) -> int:
+        return self.spec.page_bytes
+
+    def get_bytes_per_slot(self) -> int:
+        return self.spec.bytes_per_slot
+
+    def get_kv_size_bytes(self) -> int:
+        return sum(buffer.nbytes for buffer in self.kv_buffer)
+
+    def set_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+    ) -> None:
+        if freqs_cis is None:
+            raise ValueError(
+                "packed Main KV writer requires per-token RoPE frequencies"
+            )
+        from sglang.kernels.ops.attention.dsv4.packed_main_kv import (
+            pack_dsv41_main_kv_fp4,
+        )
+
+        pack_dsv41_main_kv_fp4(
+            latent=cache_k,
+            freqs_cis=freqs_cis,
+            slots=loc,
+            view=self.get_view(layer_id),
+        )
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError("Use get_view or get_page_buffer for packed Main KV.")
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError("Packed Main KV shares one typed K/V view.")
+
+    def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError("Packed Main KV shares one typed K/V view.")
+
+    def set_kv_buffer(self, *args, **kwargs) -> None:
+        raise NotImplementedError("Use set_key_buffer_fused for packed Main KV.")
 
 
 class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
@@ -707,12 +822,15 @@ class _CompressedPoolConfig(NamedTuple):
     indexer_size: Optional[int] = None
 
 
+CompressedKVPool = Union[DeepSeekV4SingleKVPool, DeepSeekV41PackedMainKVPool]
+
+
 class DeepSeekV4LayerItem(NamedTuple):
     compress_ratio: Literal[0, 1, 2, 4, 128]
     # Layer index inside compress_kv_pool. Ratios 1/2 share a pool layer across the
     # kv_source layer that writes it and the layers that read it.
     compress_layer_id: int
-    compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
+    compress_kv_pool: Optional[CompressedKVPool] = None
 
 
 # re-exported: the pool allocates the rows, but the kernels that write them own the
@@ -887,6 +1005,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        main_kv_layout_specs: Optional[Mapping[int, MainKVLayoutSpec]] = None,
     ):
         super().__init__(
             swa_size,
@@ -907,6 +1026,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             KVLayout.V41,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
+        self.main_kv_layout_specs = dict(main_kv_layout_specs or {})
+        if set(self.main_kv_layout_specs) - {1, 2}:
+            raise ValueError(
+                "packed Main KV specs are only valid for compression ratios 1 and 2"
+            )
+        if any(
+            spec.layout_id is not DSV41_MAIN_KV_LAYOUT
+            for spec in self.main_kv_layout_specs.values()
+        ):
+            raise ValueError("main_kv_layout_specs contains an unsupported layout")
         c4_logical_size = c128_size * 32
 
         logger.info(
@@ -1154,6 +1283,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
+        if any(
+            isinstance(pool, DeepSeekV41PackedMainKVPool)
+            for pool in self.kv_pools.values()
+        ):
+            raise NotImplementedError(
+                "packed Main KV transfer descriptors are introduced with PR2"
+            )
+
         if self._unified_kv_fp8:
             # The page-block transfer below prices one row as buf[0].nbytes and
             # ships a single pointer per layer. Under fp8 that covers the nope
@@ -1363,7 +1500,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         configs = self.compressed_pool_configs
         layer_counts = {ratio: stage_ratios.count(ratio) for ratio in configs}
         # Keep empty pools and allocation order for PP stages without a given ratio.
-        self.kv_pools: dict[int, Optional[DeepSeekV4SingleKVPool]] = {
+        self.kv_pools: dict[int, Optional[CompressedKVPool]] = {
             ratio: None for ratio in configs
         }
         # Ratio-1/2 kv_source layers of this stage (DeepSeek-V4.1), when the pool
@@ -1399,17 +1536,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
             for ratio, sources in low_ratio_sources.items():
-                self.kv_pools[ratio] = self._make_kv_pool(
-                    size=self.full_size // ratio,
-                    page_size=page_size // ratio,
-                    dtype=dtype,
-                    layer_num=len(sources),
-                    device=device,
-                    enable_memory_saver=enable_memory_saver,
-                    global_page_size=page_size,
-                    cls=kv_pool_cls,
-                    kv_layout=self.compressed_kv_layout(ratio),
-                )
+                if ratio in self.main_kv_layout_specs:
+                    self.kv_pools[ratio] = DeepSeekV41PackedMainKVPool(
+                        size=self.full_size // ratio,
+                        page_size=page_size // ratio,
+                        layer_num=len(sources),
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        spec=self.main_kv_layout_specs[ratio],
+                    )
+                else:
+                    self.kv_pools[ratio] = self._make_kv_pool(
+                        size=self.full_size // ratio,
+                        page_size=page_size // ratio,
+                        dtype=dtype,
+                        layer_num=len(sources),
+                        device=device,
+                        enable_memory_saver=enable_memory_saver,
+                        global_page_size=page_size,
+                        cls=kv_pool_cls,
+                        kv_layout=self.compressed_kv_layout(ratio),
+                    )
 
         self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
             ratio: self._make_indexer_pool(
@@ -1479,6 +1626,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """Layout of the compressed cache of ``compress_ratio``, see
         :func:`resolve_compressed_kv_layout`."""
+        main_kv_layout_specs = getattr(self, "main_kv_layout_specs", {})
+        if compress_ratio in main_kv_layout_specs:
+            return main_kv_layout_specs[compress_ratio].layout_id
         layout = resolve_compressed_kv_layout(
             self.kv_layout, compress_ratio, self.compressed_kv_layout_option
         )
@@ -1818,7 +1968,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             _, _, compress_kv_pool = self.layer_mapping[layer_id]
             assert compress_kv_pool is not None
             return compress_kv_pool.kv_cache_total_dim
-        return self.get_extra_key_layout(layer_id).bytes_per_token
+        layout = self.get_extra_key_layout(layer_id)
+        if layout.is_packed_main_kv:
+            raise TypeError(
+                "packed Main KV has no legacy FlashMLA bytes-per-token view; "
+                "use get_extra_key_view()"
+            )
+        return layout.bytes_per_token
 
     def get_swa_key_layout(self) -> KVLayout:
         return self.kv_layout
@@ -1835,7 +1991,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
+        if isinstance(compress_kv_pool, DeepSeekV41PackedMainKVPool):
+            raise TypeError(
+                "packed Main KV cannot be exposed through the legacy FlashMLA "
+                "buffer accessor; use get_extra_key_view()"
+            )
         return compress_kv_pool.get_key_buffer(compress_layer_id)
+
+    def get_extra_key_view(self, layer_id: int) -> PackedMainKVView:
+        self.wait_layer_transfer(layer_id)
+        _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        if not isinstance(compress_kv_pool, DeepSeekV41PackedMainKVPool):
+            raise TypeError(
+                f"layer {layer_id} does not use the packed DSV4.1 Main-KV layout"
+            )
+        return compress_kv_pool.get_view(compress_layer_id)
 
     def set_extra_key_buffer(
         self,
@@ -2053,16 +2223,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
 
-        For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, with
-        ``freqs_cis`` if it is not rotated yet: the kernel rounds to e2m1 once.
-        For the fp8 layouts ``cache_k`` is the finished (fake-quantized, rotated)
-        value, as today."""
+        For an fp4 cache (legacy ``V41_FP4`` or versioned packed Main KV), pass
+        the *un-quantized* latent with ``freqs_cis`` if it is not rotated yet:
+        the selected writer rounds to E2M1 once. For fp8 layouts ``cache_k`` is
+        the finished (fake-quantized, rotated) value, as today."""
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
-                "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
-            )
+            assert compress_kv_pool.kv_layout in (
+                KVLayout.V41_FP4,
+                DSV41_MAIN_KV_LAYOUT,
+            ), "in-kernel RoPE is for fp4 caches; fp8 caches take the finished value"
         return compress_kv_pool.set_key_buffer_fused(
             compress_layer_id, loc, cache_k, freqs_cis
         )
