@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from xgrammar import (
+    BatchGrammarMatcher,
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
@@ -33,6 +34,7 @@ from xgrammar import (
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     GrammarStats,
     InvalidGrammarObject,
 )
@@ -60,6 +62,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+XGRAMMAR_BATCH_MIN_SIZE = 16
+XGRAMMAR_BATCH_MAX_THREADS = 4
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -83,6 +87,7 @@ class XGrammarGrammar(BaseGrammarObject):
         override_stop_tokens: Optional[Union[List[int], int]],
         key_string: Optional[str] = None,
         grammar_stats: Optional[GrammarStats] = GrammarStats(),
+        batch_matcher: Optional[BatchGrammarMatcher] = None,
     ) -> None:
         super().__init__()
         self.matcher = matcher
@@ -92,6 +97,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.accepted_tokens = []
         self.key_string = key_string
         self.grammar_stats = grammar_stats
+        self.batch_matcher = batch_matcher
 
     def accept_token(self, token: int):
         if not self.is_terminated():
@@ -121,6 +127,24 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    def fill_vocab_mask_batched(
+        self, entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        if self.batch_matcher is None or len(entries) < XGRAMMAR_BATCH_MIN_SIZE:
+            return super().fill_vocab_mask_batched(entries, vocab_mask)
+        matchers = []
+        indices = []
+        for entry in entries:
+            if isinstance(entry.grammar, XGrammarGrammar):
+                matchers.append(entry.grammar.matcher)
+                indices.append(entry.row)
+            else:
+                entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
+        if matchers:
+            self.batch_matcher.batch_fill_next_token_bitmask(
+                matchers, vocab_mask, indices
+            )
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -162,6 +186,7 @@ class XGrammarGrammar(BaseGrammarObject):
             self.override_stop_tokens,
             self.key_string,
             grammar_stats,
+            self.batch_matcher,
         )
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
@@ -242,6 +267,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # The automatic pool scales with host CPUs, even for small decode batches.
+        self.batch_matcher = BatchGrammarMatcher(max_threads=XGRAMMAR_BATCH_MAX_THREADS)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -341,6 +368,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             self.override_stop_tokens,
             key_string,
             grammar_stats,
+            self.batch_matcher,
         )
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
