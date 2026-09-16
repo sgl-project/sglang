@@ -135,6 +135,59 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
     --policy cache_aware
   ```
 
+### Completion requests with token IDs
+
+The regular HTTP and OpenAI-compatible routers accept token IDs at
+`/v1/completions`. Set `prompt` to an integer array for one prompt, or an array
+of integer arrays for a batch. Text prompts remain supported. Token IDs must
+come from the tokenizer used by the selected model.
+
+For an SGLang worker, request integer token arrays and token ID logprobs with:
+
+```bash
+curl http://localhost:30000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "your-model",
+    "prompt": [1, 23, 456],
+    "max_tokens": 16,
+    "return_token_ids": true,
+    "logprobs": 2,
+    "return_tokens_as_token_ids": true
+  }'
+```
+
+Replace the example IDs with valid IDs for your model. For batched input, use
+`"prompt": [[1, 23, 456], [1, 78]]`.
+
+| Option | Effect |
+| --- | --- |
+| `return_token_ids: true` | Returns integer arrays in `choices[].token_ids` and `choices[].prompt_token_ids`. |
+| `return_tokens_as_token_ids: true` | Formats `logprobs.tokens` and `logprobs.top_logprobs` keys as `token_id:<id>`. Requires `logprobs` to be requested. |
+
+The two options are independent. The logprob option preserves distinct token
+IDs even when they decode to the same text. Omit it or set it to `false` to keep
+text-based logprobs. `choices[].text` remains text in either case.
+
+For streaming, add `"stream": true` and use `curl -N`. SGLang emits generated
+token IDs as deltas for each choice, includes prompt token IDs in that choice's
+first chunk, and terminates the stream with `data: [DONE]`.
+
+The gateway forwards the original completion request body to the worker;
+external workers must implement the requested token-output options. Raw
+completion forwarding is implemented for regular HTTP and OpenAI-compatible
+routing, not PD or gRPC routing. This does not add token prompts to
+`/v1/chat/completions`.
+
+### Model context lengths
+
+In OpenAI-compatible routing, `/v1/models` refreshes model information from
+the workers and includes their `max_model_len`. For the same model served by
+multiple workers, the gateway returns the smallest reported length. If no
+worker reports a length, the value is `null`. Workers that omit the length do
+not constrain this minimum. RouterManager delegates model listing to its
+default router.
+
 ### Prefill/Decode Disaggregation (PD)
 - **Rust binary**
   ```bash

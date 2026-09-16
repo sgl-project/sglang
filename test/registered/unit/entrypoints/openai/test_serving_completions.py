@@ -1,7 +1,7 @@
 """
 Unit-tests for the refactored completions-serving handler (no pytest).
 Run with:
-    python -m unittest tests.test_serving_completions_unit -v
+    python -m unittest discover -s test/registered/unit/entrypoints/openai -p test_serving_completions.py -v
 """
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -11,6 +11,8 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import json
 import unittest
 from http import HTTPStatus
+from itertools import product
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
@@ -18,7 +20,6 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -71,8 +72,9 @@ class ServingCompletionTestCase(unittest.TestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-        # build the mock TokenizerManager once for every test
-        tm = Mock(spec=TokenizerManager)
+        # Serving only needs this interface; importing the real tokenizer manager
+        # also imports GPU schedulers and model executors unrelated to these tests.
+        tm = SimpleNamespace()
 
         tm.tokenizer = Mock()
         tm.tokenizer.encode.return_value = [1, 2, 3, 4]
@@ -219,6 +221,361 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Should not have json_schema or structural_tag from response_format
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
+
+    def test_non_streaming_token_id_logprobs(self):
+        for option in (None, False, True):
+            with self.subTest(option=option):
+                req = CompletionRequest(
+                    model="x",
+                    prompt=[1],
+                    echo=True,
+                    logprobs=2,
+                    return_token_ids=True,
+                    return_tokens_as_token_ids=option,
+                )
+                ret = [
+                    {
+                        "text": " world",
+                        "output_ids": [2],
+                        "prompt_token_ids": [1],
+                        "meta_info": {
+                            "id": "test-id",
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "finish_reason": {"type": "stop"},
+                            "weight_version": "v1",
+                            "input_token_logprobs": [(None, 1, "hello")],
+                            "input_top_logprobs": [None],
+                            "output_token_logprobs": [(-0.1, 2, " world")],
+                            "output_top_logprobs": [
+                                [(-0.1, 2, " world"), (-0.2, 3, " world")]
+                            ],
+                        },
+                    }
+                ]
+                response = self.sc._build_completion_response(req, ret, 1234567890)
+                choice = response.choices[0]
+                self.assertEqual(
+                    choice.logprobs.tokens,
+                    ["token_id:1", "token_id:2"] if option else ["hello", " world"],
+                )
+                if option:
+                    self.assertEqual(
+                        choice.logprobs.top_logprobs[-1],
+                        {"token_id:2": -0.1, "token_id:3": -0.2},
+                    )
+                self.assertEqual(choice.token_ids, [2])
+                self.assertEqual(choice.prompt_token_ids, [1])
+
+    def test_streaming_token_id_logprobs_with_echo(self):
+        async def mock_generate(*args, **kwargs):
+            for index, text in enumerate([" world", " world!"]):
+                yield {
+                    "text": text,
+                    "output_ids": [2, 4][: index + 1],
+                    "prompt_token_ids": [1],
+                    "meta_info": {
+                        "id": "test-stream",
+                        "prompt_tokens": 1,
+                        "completion_tokens": index + 1,
+                        "output_token_logprobs_length": index + 1,
+                        "finish_reason": {"type": "stop"} if index else None,
+                        "input_token_logprobs": [(None, 1, "hello")],
+                        "input_top_logprobs": [None],
+                        "output_token_logprobs": [(-0.1, 2, " world"), (-0.3, 4, "!")][
+                            : index + 1
+                        ],
+                        "output_top_logprobs": [
+                            [(-0.1, 2, " world"), (-0.2, 3, " world")],
+                            [(-0.3, 4, "!")],
+                        ][: index + 1],
+                    },
+                }
+
+        self.sc.tokenizer_manager.generate_request = mock_generate
+        req = CompletionRequest(
+            model="x",
+            prompt=[1],
+            echo=True,
+            stream=True,
+            logprobs=2,
+            return_token_ids=True,
+            return_tokens_as_token_ids=True,
+        )
+        adapted, _ = self.sc._convert_to_internal_request(req)
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted, req, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect())
+        choices = [
+            json.loads(chunk[len("data: ") :])["choices"][0]
+            for chunk in chunks
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+        ]
+        self.assertEqual(
+            [choice["logprobs"]["tokens"] for choice in choices],
+            [["token_id:1", "token_id:2"], ["token_id:4"]],
+        )
+        self.assertEqual(
+            choices[0]["logprobs"]["top_logprobs"][-1],
+            {"token_id:2": -0.1, "token_id:3": -0.2},
+        )
+        self.assertEqual([choice["token_ids"] for choice in choices], [[2], [4]])
+        self.assertEqual(choices[0]["prompt_token_ids"], [1])
+
+    @staticmethod
+    def _token_logprob_result(index, step=1, incremental=False, finished=False):
+        prompt_id = 11 if index < 2 else 22
+        token_ids = [index * 100, index * 100 + 1]
+        rows = [(-0.1, token_ids[0], "a"), (-0.2, token_ids[1], "b")]
+        top_rows = [
+            [rows[0], (-0.3, token_ids[0] + 10, "a")],
+            [rows[1]],
+        ]
+        selection = slice(step, step + 1) if incremental else slice(0, step + 1)
+        if finished and incremental:
+            selection = slice(0, 0)
+        return {
+            "index": index,
+            "text": "".join(row[2] for row in rows[selection]),
+            "output_ids": token_ids[selection],
+            "prompt_token_ids": [prompt_id],
+            "meta_info": {
+                "id": "cmpl-token-logprobs",
+                "prompt_tokens": 1,
+                "completion_tokens": step + 1,
+                "cached_tokens": 0,
+                "weight_version": "v1",
+                "finish_reason": {"type": "stop"} if finished else None,
+                "input_token_logprobs": [(None, prompt_id, "prompt")],
+                "input_top_logprobs": [None],
+                "output_token_logprobs": rows[selection],
+                "output_top_logprobs": top_rows[selection],
+                "output_token_logprobs_length": step + 1,
+            },
+        }
+
+    def test_non_streaming_logprob_options_for_batched_parallel_sampling(self):
+        for flag, echo, logprobs, return_ids in product(
+            (None, False, True), (False, True), (None, 0, 2), (False, True)
+        ):
+            with self.subTest(
+                flag=flag, echo=echo, logprobs=logprobs, return_ids=return_ids
+            ):
+                request = CompletionRequest(
+                    model="x",
+                    prompt=[[11], [22]],
+                    n=2,
+                    echo=echo,
+                    logprobs=logprobs,
+                    return_tokens_as_token_ids=flag,
+                    return_token_ids=return_ids,
+                )
+                adapted, _ = self.sc._convert_to_internal_request(request)
+                self.assertEqual(adapted.input_ids, [[11], [22]])
+                self.assertEqual(adapted.sampling_params["n"], 2)
+                self.assertEqual(adapted.return_logprob, logprobs is not None)
+                self.assertEqual(adapted.return_prompt_token_ids, return_ids)
+                results = [
+                    self._token_logprob_result(i, finished=True) for i in range(4)
+                ]
+                if logprobs is None:
+                    for result in results:
+                        for key in list(result["meta_info"]):
+                            if "logprob" in key:
+                                del result["meta_info"][key]
+                elif logprobs == 0:
+                    for result in results:
+                        result["meta_info"]["output_top_logprobs"] = []
+                response = self.sc._build_completion_response(
+                    request, results, 1234567890
+                )
+                self.assertEqual(len(response.choices), 4)
+                for index, choice in enumerate(response.choices):
+                    prompt_id = 11 if index < 2 else 22
+                    ids = [index * 100, index * 100 + 1]
+                    self.assertEqual(choice.index, index)
+                    self.assertEqual(
+                        choice.text, ("decoded text" if echo else "") + "ab"
+                    )
+                    if logprobs is None:
+                        self.assertIsNone(choice.logprobs)
+                    else:
+                        expected = (
+                            [f"token_id:{token}" for token in ids]
+                            if flag
+                            else ["a", "b"]
+                        )
+                        if echo:
+                            expected.insert(
+                                0, f"token_id:{prompt_id}" if flag else "prompt"
+                            )
+                        self.assertEqual(choice.logprobs.tokens, expected)
+                        self.assertEqual(
+                            choice.logprobs.token_logprobs,
+                            ([None] if echo else []) + [-0.1, -0.2],
+                        )
+                        if logprobs == 2 and flag:
+                            self.assertEqual(
+                                choice.logprobs.top_logprobs[-2],
+                                {
+                                    f"token_id:{ids[0]}": -0.1,
+                                    f"token_id:{ids[0] + 10}": -0.3,
+                                },
+                            )
+                    encoded = choice.model_dump()
+                    if return_ids:
+                        self.assertEqual(encoded["token_ids"], ids)
+                        self.assertEqual(encoded["prompt_token_ids"], [prompt_id])
+                    else:
+                        self.assertNotIn("token_ids", encoded)
+                        self.assertNotIn("prompt_token_ids", encoded)
+
+    def test_streaming_logprob_options_keep_interleaved_choices_independent(self):
+        for incremental, flag, echo, return_ids, logprobs in product(
+            (False, True), (None, False, True), (False, True), (False, True), (0, 2)
+        ):
+            with (
+                self.subTest(
+                    incremental=incremental,
+                    flag=flag,
+                    echo=echo,
+                    return_ids=return_ids,
+                    logprobs=logprobs,
+                ),
+                get_context().override_server_args(
+                    incremental_streaming_output=incremental,
+                    stream_response_default_include_usage=True,
+                ),
+            ):
+                request = CompletionRequest(
+                    model="x",
+                    prompt=[[11], [22]],
+                    n=2,
+                    stream=True,
+                    echo=echo,
+                    logprobs=logprobs,
+                    return_tokens_as_token_ids=flag,
+                    return_token_ids=return_ids,
+                )
+                adapted, _ = self.sc._convert_to_internal_request(request)
+
+                async def generate(*args, **kwargs):
+                    for step in (0, 1):
+                        for index in (2, 0, 3, 1):
+                            result = self._token_logprob_result(
+                                index, step, incremental
+                            )
+                            if logprobs == 0:
+                                result["meta_info"]["output_top_logprobs"] = []
+                            yield result
+                    for index in (3, 1, 2, 0):
+                        yield self._token_logprob_result(
+                            index, 1, incremental, finished=True
+                        )
+
+                self.sc.tokenizer_manager.generate_request = generate
+
+                async def collect():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted, request, self.fastapi_request
+                        )
+                    ]
+
+                chunks = get_or_create_event_loop().run_until_complete(collect())
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                packets = [json.loads(chunk[len("data: ") :]) for chunk in chunks[:-1]]
+                for packet in packets:
+                    self.assertNotIn("error", packet)
+                self.assertEqual(packets[-1]["choices"], [])
+                self.assertEqual(packets[-1]["usage"]["completion_tokens"], 8)
+                for index in range(4):
+                    choices = [
+                        choice
+                        for packet in packets
+                        for choice in packet["choices"]
+                        if choice["index"] == index
+                    ]
+                    self.assertEqual(len(choices), 3)
+                    prompt_id = 11 if index < 2 else 22
+                    ids = [index * 100, index * 100 + 1]
+                    expected_first = [f"token_id:{ids[0]}" if flag else "a"]
+                    if echo:
+                        expected_first.insert(
+                            0, f"token_id:{prompt_id}" if flag else "prompt"
+                        )
+                    self.assertEqual(choices[0]["logprobs"]["tokens"], expected_first)
+                    self.assertEqual(
+                        choices[1]["logprobs"]["tokens"],
+                        [f"token_id:{ids[1]}" if flag else "b"],
+                    )
+                    self.assertIsNone(choices[2]["logprobs"])
+                    self.assertEqual(
+                        [choice["text"] for choice in choices],
+                        [("decoded text" if echo else "") + "a", "b", ""],
+                    )
+                    self.assertEqual(choices[2]["finish_reason"], "stop")
+                    if flag and logprobs == 2:
+                        self.assertEqual(
+                            choices[0]["logprobs"]["top_logprobs"][-1],
+                            {
+                                f"token_id:{ids[0]}": -0.1,
+                                f"token_id:{ids[0] + 10}": -0.3,
+                            },
+                        )
+                    if return_ids:
+                        self.assertEqual(
+                            [choice["token_ids"] for choice in choices],
+                            [[ids[0]], [ids[1]], []],
+                        )
+                        self.assertEqual(choices[0]["prompt_token_ids"], [prompt_id])
+                        self.assertNotIn("prompt_token_ids", choices[1])
+                    else:
+                        for choice in choices:
+                            self.assertNotIn("token_ids", choice)
+                            self.assertNotIn("prompt_token_ids", choice)
+
+    def test_token_id_logprob_flag_without_logprobs_does_not_require_metadata(self):
+        request = CompletionRequest(
+            prompt=[11], stream=True, return_tokens_as_token_ids=True
+        )
+        adapted, _ = self.sc._convert_to_internal_request(request)
+        self.assertFalse(adapted.return_logprob)
+
+        async def generate(*args, **kwargs):
+            yield {
+                "text": "a",
+                "meta_info": {
+                    "id": "test-no-logprobs",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+
+        self.sc.tokenizer_manager.generate_request = generate
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted, request, self.fastapi_request
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect())
+        packet = json.loads(chunks[0][len("data: ") :])
+        self.assertEqual(packet["choices"][0]["text"], "a")
+        self.assertIsNone(packet["choices"][0]["logprobs"])
+        self.assertNotIn("token_ids", packet["choices"][0])
 
     def test_non_streaming_response(self):
         req = CompletionRequest(

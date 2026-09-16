@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -108,6 +108,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Completion endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route a completion request with raw body (no deserialization).
+    /// Preserves all request fields for pass-through forwarding to workers.
+    async fn route_raw_completion(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &Bytes,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raw completion endpoint not implemented",
         )
             .into_response()
     }

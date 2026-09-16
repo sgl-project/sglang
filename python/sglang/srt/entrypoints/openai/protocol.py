@@ -359,6 +359,7 @@ class CompletionRequest(BaseModel):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_spec_tokens_details: bool = False
+    return_tokens_as_token_ids: Optional[bool] = None
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.

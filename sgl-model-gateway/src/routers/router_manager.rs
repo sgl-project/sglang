@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -438,12 +438,25 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let model_names = self.worker_registry.get_models();
+        // Delegate to inner router via default_router (e.g. OpenAIRouter)
+        let inner_router = {
+            let default = self
+                .default_router
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            default
+                .as_ref()
+                .and_then(|id| self.routers.get(id).map(|r| r.clone()))
+        };
+        if let Some(router) = inner_router {
+            return router.get_models(_req).await;
+        }
 
+        // Fallback: build minimal response from worker registry
+        let model_names = self.worker_registry.get_models();
         if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
-            // Convert model names to OpenAI-compatible model objects
             let models: Vec<Value> = model_names
                 .iter()
                 .map(|name| {
@@ -454,7 +467,6 @@ impl RouterTrait for RouterManager {
                     })
                 })
                 .collect();
-
             (
                 StatusCode::OK,
                 serde_json::json!({
@@ -589,6 +601,24 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_raw_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+        if let Some(router) = router {
+            router.route_raw_completion(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "Model not found or no router available",
             )
                 .into_response()
         }

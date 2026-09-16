@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -15,7 +15,7 @@ use axum::{
 use data_connector::{ConversationId, ListParams, ResponseId, SortOrder};
 use futures_util::future::join_all;
 use serde_json::{json, to_value, Value};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{
     context::{
@@ -214,8 +214,15 @@ impl OpenAIRouter {
                         if let Some(data) = json_response.get("data").and_then(|d| d.as_array()) {
                             let model_cards: Vec<ModelCard> = data
                                 .iter()
-                                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
-                                .map(ModelCard::new)
+                                .filter_map(|m| {
+                                    let id = m.get("id").and_then(|id| id.as_str())?;
+                                    let mut card = ModelCard::new(id);
+                                    card.context_length = m
+                                        .get("max_model_len")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u32);
+                                    Some(card)
+                                })
                                 .collect();
 
                             if !model_cards.is_empty() {
@@ -426,6 +433,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let mut all_models = Vec::new();
         let mut seen_models = HashSet::new();
+        let mut min_max_model_len: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for worker in &external_workers {
             for model_card in worker.models_snapshot() {
@@ -435,6 +444,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     .map(|p| format!("{:?}", p).to_lowercase())
                     .unwrap_or_else(|| "unknown".to_string());
 
+                // Track minimum max_model_len across all workers for each model
+                if let Some(len) = model_card.context_length {
+                    min_max_model_len
+                        .entry(model_card.id.clone())
+                        .and_modify(|v| *v = (*v).min(len))
+                        .or_insert(len);
+                }
+
                 if seen_models.insert(model_card.id.clone()) {
                     all_models.push(json!({
                         "id": &model_card.id,
@@ -443,6 +460,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         "owned_by": &owned_by,
                         "aliases": model_card.aliases,
                         "model_type": format!("{:?}", model_card.model_type),
+                        "max_model_len": model_card.context_length,
                     }));
                 }
 
@@ -456,6 +474,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             "primary_model": &model_card.id,
                         }));
                     }
+                }
+            }
+        }
+
+        // Apply minimum max_model_len across workers
+        for model in &mut all_models {
+            if let Some(id) = model.get("id").and_then(|v| v.as_str()) {
+                if let Some(min_len) = min_max_model_len.get(id) {
+                    model["max_model_len"] = json!(*min_len);
                 }
             }
         }
@@ -690,6 +717,49 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         response
+    }
+
+    async fn route_raw_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        let model = model_id.unwrap_or("unknown");
+        let auth_header = headers
+            .and_then(|h| h.get("Authorization"))
+            .or_else(|| headers.and_then(|h| h.get("authorization")));
+
+        let worker = match self.select_worker_for_model(model, auth_header).await {
+            Ok(w) => w,
+            Err(response) => return response,
+        };
+
+        let worker_url = worker.url();
+        let route = "/v1/completions";
+        let request_builder = self
+            .shared_components
+            .client
+            .post(format!("{}{}", worker_url, route))
+            .header("Content-Type", "application/json")
+            .body(body.to_vec());
+
+        match request_builder.send().await {
+            Ok(res) => {
+                let status = StatusCode::from_u16(res.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let mut response = Response::new(Body::from_stream(res.bytes_stream()));
+                *response.status_mut() = status;
+                response
+            }
+            Err(e) => {
+                error!("Raw completion forward failed: {}", e);
+                error_responses::service_unavailable(format!(
+                    "Failed to forward raw completion: {}",
+                    e
+                ))
+            }
+        }
     }
 
     async fn route_responses(

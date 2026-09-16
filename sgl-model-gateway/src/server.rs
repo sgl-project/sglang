@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -42,7 +43,6 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
@@ -195,11 +195,17 @@ async fn v1_chat_completions(
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    body: Bytes,
 ) -> Response {
+    // Extract model name from raw JSON to avoid strict deserialization
+    // that would reject prompt:list[int] and strip return_tokens_as_token_ids
+    let model_id = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("model")?.as_str().map(String::from));
+
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_raw_completion(Some(&headers), &body, model_id.as_deref())
         .await
 }
 

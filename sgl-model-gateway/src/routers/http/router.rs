@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -9,6 +9,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
+use serde_json::Value;
 use tracing::{debug, error};
 
 use crate::{
@@ -77,6 +78,212 @@ impl Router {
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
         })
+    }
+
+    fn extract_raw_completion_routing_text(json: &Value) -> Option<String> {
+        match json.get("prompt")? {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(items) => {
+                let first = items.first()?;
+                match first {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Number(_) if items.iter().all(Value::is_number) => {
+                        let mut encoded = String::new();
+                        for item in items {
+                            let token = item.as_u64()?;
+                            let token = u32::try_from(token).ok()?;
+                            encoded.push_str(&format!("{token:08x}|"));
+                        }
+                        (!encoded.is_empty()).then_some(encoded)
+                    }
+                    Value::Array(batch) => {
+                        let mut encoded = String::new();
+                        for item in batch {
+                            let token = item.as_u64()?;
+                            let token = u32::try_from(token).ok()?;
+                            encoded.push_str(&format!("{token:08x}|"));
+                        }
+                        (!encoded.is_empty()).then_some(encoded)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_raw_completion_hints(body: &[u8]) -> (bool, Option<String>) {
+        if let Ok(request) = serde_json::from_slice::<CompletionRequest>(body) {
+            let routing_text = request.extract_text_for_routing();
+            return (
+                request.is_stream(),
+                (!routing_text.is_empty()).then_some(routing_text),
+            );
+        }
+
+        let json: Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => return (false, None),
+        };
+
+        let is_stream = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        (is_stream, Self::extract_raw_completion_routing_text(&json))
+    }
+
+    async fn send_raw_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        route: &'static str,
+        worker: &Arc<dyn Worker>,
+        is_stream: bool,
+        load_guard: Option<WorkerLoadGuard>,
+    ) -> Response {
+        let worker_url = worker.url();
+        let api_key = worker.api_key().clone();
+
+        let mut request_builder = self
+            .client
+            .post(format!("{}{}", worker_url, route))
+            .header("Content-Type", "application/json")
+            .body(body.to_vec());
+
+        if let Some(key) = api_key {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
+        }
+
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "Failed to send raw request worker_url={} route={} error={}",
+                    worker_url, route, e
+                );
+                if is_stream {
+                    worker.record_outcome(false);
+                }
+                return error::bad_gateway("upstream_error", e.to_string());
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        if !is_stream {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let response = match res.bytes().await {
+                Ok(response_body) => {
+                    let mut response = Response::new(Body::from(response_body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => error::internal_error(
+                    "read_response_body_failed",
+                    format!("Failed to get response body: {}", e),
+                ),
+            };
+
+            if let Some(guard) = load_guard {
+                AttachedBody::wrap_response(response, guard)
+            } else {
+                response
+            }
+        } else {
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+
+            let mut tracked = BreakerTrackedStream::new(
+                res.bytes_stream(),
+                worker.clone(),
+                worker_url.to_string(),
+            );
+            if !status.is_success() {
+                tracked.mark_errored();
+            }
+
+            let mut response = Response::new(Body::from_stream(tracked));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+
+            if let Some(guard) = load_guard {
+                AttachedBody::wrap_response(response, guard)
+            } else {
+                response
+            }
+        }
+    }
+
+    async fn route_raw_completion_once(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        model_id: Option<&str>,
+        is_stream: bool,
+        routing_text: Option<&str>,
+    ) -> Response {
+        let worker = match self
+            .select_worker_for_model(model_id, routing_text, headers)
+            .await
+        {
+            Some(w) => w,
+            None => {
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let policy = self.policy_registry.get_policy_or_default(model);
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let forwarded_headers = Some(&headers_with_trace);
+
+        let response = self
+            .send_raw_request(
+                forwarded_headers,
+                body,
+                "/v1/completions",
+                &worker,
+                is_stream,
+                load_guard,
+            )
+            .await;
+
+        events::RequestReceivedEvent {}.emit();
+
+        let status = response.status();
+        if !is_stream {
+            worker.record_outcome(status.is_success());
+        }
+
+        if status.is_server_error() {
+            Metrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(status),
+            );
+        }
+
+        response
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
@@ -776,6 +983,81 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_raw_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        model_id: Option<&str>,
+    ) -> Response {
+        let start = Instant::now();
+        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        let (is_stream, routing_text) = Self::extract_raw_completion_hints(body);
+        let endpoint = route_to_endpoint("/v1/completions");
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_: u32| async {
+                let response = self
+                    .route_raw_completion_once(
+                        headers,
+                        body,
+                        model_id,
+                        is_stream,
+                        routing_text.as_deref(),
+                    )
+                    .await;
+
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    response.status().as_u16(),
+                    extract_error_code_from_response(&response),
+                );
+
+                response
+            },
+            |response, _attempt| is_retryable_status(response.status()),
+            |delay, attempt| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await;
+
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                start.elapsed(),
+            );
+        } else if !is_retryable_status(response.status()) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
@@ -855,6 +1137,65 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
+
+    #[test]
+    fn raw_completion_routing_hints_preserve_token_boundaries() {
+        for (prompt, expected) in [
+            (serde_json::json!([1, 23]), "00000001|00000017|"),
+            (serde_json::json!([12, 3]), "0000000c|00000003|"),
+            (serde_json::json!([[1, 23], [12, 3]]), "00000001|00000017|"),
+            (serde_json::json!([0, u32::MAX]), "00000000|ffffffff|"),
+        ] {
+            for stream in [false, true] {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "model": "test", "prompt": prompt, "stream": stream
+                }))
+                .unwrap();
+                assert_eq!(
+                    Router::extract_raw_completion_hints(&body),
+                    (stream, Some(expected.to_string()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_completion_invalid_hints_do_not_reject_raw_requests() {
+        for prompt in [
+            serde_json::json!([]),
+            serde_json::json!([-1]),
+            serde_json::json!([4294967296u64]),
+            serde_json::json!([1.5]),
+            serde_json::json!([1, "mixed"]),
+            serde_json::json!([[]]),
+            Value::Null,
+        ] {
+            let body = serde_json::to_vec(
+                &serde_json::json!({"model":"test", "prompt":prompt, "stream":true}),
+            )
+            .unwrap();
+            assert_eq!(Router::extract_raw_completion_hints(&body), (true, None));
+        }
+        for body in [b"{".as_slice(), b"null", b"[]"] {
+            assert_eq!(Router::extract_raw_completion_hints(body), (false, None));
+        }
+    }
+
+    #[test]
+    fn raw_completion_text_hints_match_typed_routing() {
+        for prompt in [
+            serde_json::json!("hello"),
+            serde_json::json!(["one", "two"]),
+        ] {
+            let body =
+                serde_json::to_vec(&serde_json::json!({"model":"test", "prompt":prompt})).unwrap();
+            let typed: CompletionRequest = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                Router::extract_raw_completion_hints(&body),
+                (false, Some(typed.extract_text_for_routing()))
+            );
+        }
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
