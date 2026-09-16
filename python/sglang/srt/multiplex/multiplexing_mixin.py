@@ -187,24 +187,49 @@ class SchedulerMultiplexMixin:
             return True, running_batch
         return False, running_batch
 
-    def _get_split_forward_count(self: Scheduler) -> int:
+    def _get_split_forward_count(
+        self: Scheduler, decode_batch: Optional[ScheduleBatch]
+    ) -> int:
         remaining_layers = (
             self.model_config.num_hidden_layers - self.split_prefill_batch.split_index
         )
 
         # Splitting only benefits decode work that can run between prefill
-        # intervals. Without decode work, finish prefill in one model call to
-        # avoid repeating the full scheduler/model-runner setup per layer.
-        if self.running_batch is None or self.running_batch.is_empty():
+        # intervals. maybe_prepare_mlp_sync_batch() returns a real or IDLE
+        # decode batch on every DP rank when any rank has decode work, so this
+        # decision is rank-consistent. Using the local running batch here can
+        # make one rank run all remaining prefill layers while a peer runs only
+        # a segment, which mismatches their model collectives and deadlocks.
+        decode_global_num_tokens = (
+            decode_batch.scheduler_global_num_tokens
+            if decode_batch is not None
+            else None
+        )
+        if decode_batch is None or (
+            decode_global_num_tokens is not None
+            and max(decode_global_num_tokens, default=0) <= 0
+        ):
             return remaining_layers
 
-        if self.split_prefill_batch.extend_num_tokens <= 0:
+        # The DP metadata gather installs the same token-count vector on both
+        # active and IDLE prefill batches. Size segments from its maximum so an
+        # IDLE rank (whose local extend_num_tokens is zero) advances by exactly
+        # the same layer count as the busiest active rank.
+        global_num_tokens = (
+            self.split_prefill_batch.scheduler_global_num_tokens
+        )
+        prefill_num_tokens = (
+            max(global_num_tokens, default=0)
+            if global_num_tokens is not None
+            else self.split_prefill_batch.extend_num_tokens
+        )
+        if prefill_num_tokens <= 0:
             return remaining_layers
 
         forward_count = max(
             1,
             self.pdmux_config.split_forward_token_budget
-            // self.split_prefill_batch.extend_num_tokens,
+            // prefill_num_tokens,
         )
         return min(forward_count, remaining_layers)
 
@@ -506,7 +531,7 @@ class SchedulerMultiplexMixin:
                     and not wait_prefill_kernel_done
                 ):
                     prefill_done = True
-                    forward_count = self._get_split_forward_count()
+                    forward_count = self._get_split_forward_count(decode_batch)
                     next_split_index = min(
                         self.split_prefill_batch.split_index + forward_count,
                         self.model_config.num_hidden_layers,

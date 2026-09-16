@@ -122,6 +122,7 @@ class TestPDMuxScheduler(unittest.TestCase):
         decode_empty,
         split_index=0,
         extend_num_tokens=128000,
+        scheduler_global_num_tokens=None,
         token_budget=65536,
     ):
         return SimpleNamespace(
@@ -131,20 +132,26 @@ class TestPDMuxScheduler(unittest.TestCase):
             split_prefill_batch=SimpleNamespace(
                 split_index=split_index,
                 extend_num_tokens=extend_num_tokens,
+                scheduler_global_num_tokens=scheduler_global_num_tokens,
             ),
         )
 
     def test_prefill_runs_remaining_layers_without_decode_work(self):
         scheduler = self._make_scheduler(decode_empty=True, split_index=7)
 
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler, decode_batch=None
+        )
 
         self.assertEqual(count, 54)
 
     def test_prefill_uses_token_budget_with_decode_work(self):
         scheduler = self._make_scheduler(decode_empty=False)
 
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            decode_batch=SimpleNamespace(scheduler_global_num_tokens=[1]),
+        )
 
         self.assertEqual(count, 1)
 
@@ -156,9 +163,51 @@ class TestPDMuxScheduler(unittest.TestCase):
             token_budget=65536,
         )
 
-        count = SchedulerMultiplexMixin._get_split_forward_count(scheduler)
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            decode_batch=SimpleNamespace(scheduler_global_num_tokens=[1]),
+        )
 
         self.assertEqual(count, 2)
+
+    def test_prefill_split_count_matches_on_active_and_idle_dp_ranks(self):
+        active_scheduler = self._make_scheduler(
+            decode_empty=False,
+            extend_num_tokens=16384,
+            scheduler_global_num_tokens=[16384, 0],
+        )
+        idle_scheduler = self._make_scheduler(
+            decode_empty=True,
+            extend_num_tokens=0,
+            scheduler_global_num_tokens=[16384, 0],
+        )
+
+        active_count = SchedulerMultiplexMixin._get_split_forward_count(
+            active_scheduler,
+            decode_batch=SimpleNamespace(scheduler_global_num_tokens=[0, 3]),
+        )
+        idle_count = SchedulerMultiplexMixin._get_split_forward_count(
+            idle_scheduler,
+            decode_batch=SimpleNamespace(scheduler_global_num_tokens=[0, 3]),
+        )
+
+        self.assertEqual(active_count, 4)
+        self.assertEqual(idle_count, active_count)
+
+    def test_idle_decode_participants_do_not_force_prefill_splitting(self):
+        scheduler = self._make_scheduler(
+            decode_empty=True,
+            split_index=7,
+            extend_num_tokens=16384,
+            scheduler_global_num_tokens=[16384, 0],
+        )
+
+        count = SchedulerMultiplexMixin._get_split_forward_count(
+            scheduler,
+            decode_batch=SimpleNamespace(scheduler_global_num_tokens=[0, 0]),
+        )
+
+        self.assertEqual(count, 54)
 
     def test_dsv4_prefill_admission_uses_planner_hard_limit(self):
         scheduler = SimpleNamespace(
