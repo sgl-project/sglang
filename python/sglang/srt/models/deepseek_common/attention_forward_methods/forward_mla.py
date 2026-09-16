@@ -99,7 +99,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "triton"}
 
 
 if _is_cuda:
@@ -758,14 +758,37 @@ class DeepseekMLAForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if is_dcp_mla_decode_phase(forward_batch):
+                # q/k were concatenated from the DCP-gathered q_nope_out/q_pe, so
+                # q already carries num_local_heads * dcp_size heads. Route through
+                # the widened layer (attn_mqa's tp_q_head_num is the pre-gather
+                # count and would mis-shape the output buffer) and take the
+                # per-rank LSE the merge below needs.
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
 
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):
