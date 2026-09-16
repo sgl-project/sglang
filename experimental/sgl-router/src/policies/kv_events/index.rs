@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
+use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::KvCacheEvent;
 use crate::policies::engine_load::EngineLoadTable;
@@ -68,6 +69,21 @@ fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
     (0..dp_size)
         .filter(|rank| port_base.saturating_add(*rank) <= u32::from(u16::MAX))
         .collect()
+}
+
+/// The read-only handles the `/metrics` scrape pulls the KV storage-tier
+/// series from. Narrower than an [`KvEventIndex`] handle on purpose: a route
+/// has no business calling `add_worker` / `remove_worker` / `shutdown`.
+#[derive(Clone)]
+pub struct KvIndexMetrics {
+    pub(crate) tree: Arc<HashTree>,
+    pub(crate) tally: Arc<EventTally>,
+}
+
+impl KvIndexMetrics {
+    pub fn new(tree: Arc<HashTree>, tally: Arc<EventTally>) -> Self {
+        Self { tree, tally }
+    }
 }
 
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
@@ -103,6 +119,9 @@ pub struct KvEventIndex {
     /// may legitimately have a fresh publisher whose sequence numbers
     /// restart from 1.
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+    /// Applied events by kind and storage medium, for the `/metrics` scrape.
+    /// Written only by the pump.
+    tally: Arc<EventTally>,
     /// Worker-sourced `page_size` shared with prefix providers.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
     /// establishes the value; subsequent workers that disagree are
@@ -162,11 +181,13 @@ impl KvEventIndex {
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
+        let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
             engine_load.clone(),
             cursors.clone(),
             live_workers.clone(),
+            Arc::clone(&tally),
             pump_cancel.clone(),
             rx,
         ));
@@ -182,6 +203,7 @@ impl KvEventIndex {
             http,
             live_workers,
             cursors,
+            tally,
             block_size_oracle,
         })
     }
@@ -196,6 +218,22 @@ impl KvEventIndex {
     /// returned handle as read-only.
     pub fn tree(&self) -> Arc<HashTree> {
         self.tree.clone()
+    }
+
+    /// Handles for the `/metrics` storage-tier series, or `None` when this
+    /// router does not maintain a local tree.
+    ///
+    /// In metadata-only mode (an external Indexer is the routing signal) no KV
+    /// subscription is opened, so every tier series would be a structural
+    /// zero — while their own HELP text tells the operator to read a zero
+    /// `CPU_PINNED` row as "the tier stream is not reaching the router". That
+    /// is a different fault with a different fix, so emit nothing rather than
+    /// a confidently wrong zero.
+    pub fn metrics_source(&self) -> Option<KvIndexMetrics> {
+        self.maintain_tree.then(|| KvIndexMetrics {
+            tree: Arc::clone(&self.tree),
+            tally: Arc::clone(&self.tally),
+        })
     }
 
     /// Shared accessor for the engine-load table. Load values are written solely by the pump
@@ -422,6 +460,7 @@ async fn pump_loop(
     engine_load: Arc<EngineLoadTable>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
+    tally: Arc<EventTally>,
     cancel: CancellationToken,
     mut rx: mpsc::Receiver<WorkerEvent>,
 ) {
@@ -480,6 +519,25 @@ async fn pump_loop(
                         );
                         continue;
                     }
+                    // The publisher's seq is dense, so a jump is exactly the
+                    // batches ZMQ dropped at its high-water mark. This became
+                    // worth counting with tier-tagged removals: a removal now
+                    // clears only its own tier, so losing the batch carrying a
+                    // block's LAST removal leaves the worker owning it until
+                    // the next AllBlocksCleared or teardown. The tree cannot
+                    // see that happened — only the sequence can. The
+                    // operator-visible signature is tree coverage above 1.
+                    let lost = (seq - p - 1) as u64;
+                    if lost > 0 {
+                        tally.record_lost_batches(lost);
+                        warn!(
+                            worker = ?worker,
+                            seq,
+                            last_applied = p,
+                            lost,
+                            "kv-events pump: sequence gap; batches were dropped in transit and the tree may hold stale tiers for this worker",
+                        );
+                    }
                 }
                 for event in &batch.events {
                     // The `medium` tag decides which tier a store lands on and
@@ -488,6 +546,11 @@ async fn pump_loop(
                     // — see the tree's "Storage tiers" docs.
                     match event {
                         KvCacheEvent::BlockStored(b) => {
+                            tally.record(
+                                EventKind::BlockStored,
+                                b.medium.as_deref(),
+                                b.block_hashes.len(),
+                            );
                             tree.insert_tiered(
                                 &worker,
                                 b.parent_block_hash,
@@ -496,6 +559,11 @@ async fn pump_loop(
                             );
                         }
                         KvCacheEvent::BlockRemoved(b) => {
+                            tally.record(
+                                EventKind::BlockRemoved,
+                                b.medium.as_deref(),
+                                b.block_hashes.len(),
+                            );
                             tree.remove_tiered(
                                 &worker,
                                 &b.block_hashes,
@@ -503,6 +571,7 @@ async fn pump_loop(
                             );
                         }
                         KvCacheEvent::AllBlocksCleared => {
+                            tally.record(EventKind::AllBlocksCleared, None, 0);
                             tree.clear_worker(&worker);
                         }
                     }
@@ -540,6 +609,7 @@ mod tests {
         tree: Arc<HashTree>,
         engine_load: Arc<EngineLoadTable>,
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
+        tally: Arc<EventTally>,
         #[allow(dead_code)]
         live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
         #[allow(dead_code)]
@@ -557,12 +627,14 @@ mod tests {
         let live_set: Arc<Mutex<HashSet<KvWorkerId>>> =
             Arc::new(Mutex::new(live.iter().cloned().collect()));
         let cancel = CancellationToken::new();
+        let tally = Arc::new(EventTally::new());
         let (tx, rx) = mpsc::channel(4);
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
             engine_load.clone(),
             cursors.clone(),
             live_set.clone(),
+            Arc::clone(&tally),
             cancel.clone(),
             rx,
         ));
@@ -570,6 +642,7 @@ mod tests {
             tree,
             engine_load,
             cursors,
+            tally,
             live_set,
             cancel,
             tx,
@@ -654,6 +727,104 @@ mod tests {
         assert_eq!(m.matched_blocks, 2, "host copy keeps the block routable");
         assert!(m.workers().contains(&id));
         assert!(!m.device_workers().contains(&id), "device copy is gone");
+    }
+
+    /// The metadata-only gate. Its whole justification is that a structural
+    /// zero would be read as "the tier stream is not reaching the router" — a
+    /// different fault with a different fix — so the gate itself needs pinning:
+    /// inverting it leaves every test green while `/metrics` starts lying.
+    #[tokio::test]
+    async fn metrics_source_is_none_only_without_a_local_tree() {
+        let http = reqwest::Client::builder().build().unwrap();
+        let with_tree =
+            KvEventIndex::new_with_http_and_oracle(http.clone(), BlockSizeOracle::new());
+        assert!(
+            with_tree.metrics_source().is_some(),
+            "a router maintaining its own tree must publish the tier series",
+        );
+        let metadata_only =
+            KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
+        assert!(
+            metadata_only.metrics_source().is_none(),
+            "an external-Indexer router must emit nothing rather than a structural zero",
+        );
+    }
+
+    /// Every applied event is tallied by kind and medium, blocks included, so
+    /// the scrape can show the tier stream the tree is consuming. An
+    /// out-of-order batch is filtered before the tally and must not count.
+    #[tokio::test]
+    async fn pump_tallies_applied_events_by_medium() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tally, tx, pump) = (h.tally, h.tx, h.pump);
+
+        let stored = |medium: Option<&str>, hashes: Vec<i64>| {
+            KvCacheEvent::BlockStored(BlockStored {
+                parent_block_hash: None,
+                block_hashes: hashes,
+                token_ids: vec![],
+                block_size: 64,
+                lora_id: None,
+                medium: medium.map(str::to_owned),
+            })
+        };
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 2,
+            batch: batch(vec![
+                stored(Some("GPU"), vec![10, 20, 30]),
+                stored(Some("CPU_PINNED"), vec![10, 20, 30]),
+                KvCacheEvent::BlockRemoved(BlockRemoved {
+                    block_hashes: vec![30],
+                    medium: Some("GPU".into()),
+                }),
+            ]),
+        })
+        .await
+        .unwrap();
+        // Out of order: filtered, must not be tallied.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 1,
+            batch: batch(vec![stored(None, vec![99])]),
+        })
+        .await
+        .unwrap();
+        // A gap: seq 3 and 4 were dropped in transit. Counted, because a
+        // tagged removal now clears only its own tier, so a lost batch can
+        // strand a tier the tree will never clear on its own.
+        tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 5,
+            batch: batch(vec![KvCacheEvent::AllBlocksCleared]),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        assert_eq!(tally.batches_lost(), 2, "seq 3 and 4 never arrived");
+        let rows = tally.snapshot();
+        let cell = |event: &str, medium: &str| {
+            rows.iter()
+                .find(|r| r.event == event && r.medium == medium)
+                .cloned()
+                .expect("cell rendered")
+        };
+        assert_eq!(cell("block_stored", "GPU").blocks, 3);
+        assert_eq!(cell("block_stored", "CPU_PINNED").blocks, 3);
+        assert_eq!(cell("block_removed", "GPU").events, 1);
+        assert_eq!(
+            cell("block_stored", "untagged").events,
+            0,
+            "the out-of-order batch was filtered before the tally",
+        );
+        assert_eq!(
+            cell("all_blocks_cleared", "untagged").events,
+            1,
+            "a clear carries no medium and lands on the untagged row",
+        );
     }
 
     /// A `WorkerEvent::Load` lands in the engine-load table (gauge, no
