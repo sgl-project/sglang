@@ -20,14 +20,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::bridge::{run_bridge_until, BridgeConfig, Sink};
-use sgl_kv_indexer::pb::{MatchExternalKvRequest, TierType};
+use sgl_kv_indexer::pb::{
+    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, MatchExternalKvRequest,
+    TierType,
+};
 use sgl_kv_indexer::{
     server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
     DEFAULT_STREAM_MAXLEN,
 };
 use test_net::free_addr;
 use test_valkey::{fresh_prefix, ValkeyServer};
-use test_zmq::{batch, removed, stored, FakePublisher};
+use test_zmq::{batch, batch_at, removed, stored, FakePublisher};
 
 const TOPIC: &str = "kv-events";
 
@@ -183,14 +186,17 @@ async fn a_sequence_reset_clears_the_worker_before_new_events() {
     let bridge = start_bridge(config(&publisher, &indexer, false)).await;
 
     publisher
-        .publish(10, batch(vec![stored(&[1, 2], None)]))
+        .publish(10, batch_at(100.0, vec![stored(&[1, 2], None)]))
         .await;
     publisher
-        .publish(11, batch(vec![stored(&[3], Some(2))]))
+        .publish(11, batch_at(101.0, vec![stored(&[3], Some(2))]))
         .await;
     wait_for(&backend, &[1, 2, 3], &[1, 2, 3], "before restart").await;
-    // The worker restarted: its publisher counts from zero and its cache is empty.
-    publisher.publish(0, batch(vec![stored(&[7], None)])).await;
+    // The worker restarted: its publisher counts from zero, its cache is empty,
+    // and its batches carry timestamps newer than anything already forwarded.
+    publisher
+        .publish(0, batch_at(200.0, vec![stored(&[7], None)]))
+        .await;
     wait_for(&backend, &[1, 2, 3, 7], &[7], "after restart").await;
     bridge.stop().await;
 }
@@ -243,4 +249,81 @@ async fn restarted_bridge_resumes_from_its_valkey_checkpoint() {
         Some(&2),
         "the restarted bridge resumed after its checkpoint"
     );
+}
+
+/// A batch that arrives twice - the connect-time replay and the live stream can
+/// cover the same sequence - must be recognised by its timestamp and skipped. If
+/// a sequence below the last one forwarded were taken for a publisher restart, an
+/// overlap would clear a healthy worker's whole placement set.
+#[tokio::test]
+async fn a_replayed_batch_arriving_again_is_not_mistaken_for_a_restart() {
+    let (backend, indexer) = start_indexer().await;
+    let mut publisher = FakePublisher::bind(TOPIC).await;
+    let bridge = start_bridge(config(&publisher, &indexer, false)).await;
+
+    publisher
+        .publish(5, batch_at(100.0, vec![stored(&[1, 2, 3], None)]))
+        .await;
+    wait_for(&backend, &[1, 2, 3], &[1, 2, 3], "first batch").await;
+
+    // Lower sequence, original timestamp: a batch this session already forwarded.
+    publisher
+        .publish(3, batch_at(50.0, vec![stored(&[9], None)]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        held(&backend, &[1, 2, 3, 9]).await,
+        vec![1, 2, 3],
+        "an already-forwarded batch must be skipped, and must not clear the worker"
+    );
+
+    // Lower sequence with a fresher timestamp is a real restart.
+    publisher
+        .publish(0, batch_at(200.0, vec![stored(&[7], None)]))
+        .await;
+    wait_for(&backend, &[1, 2, 3, 7], &[7], "after a real restart").await;
+    bridge.stop().await;
+}
+
+/// When the worker's bounded replay buffer has already dropped the batches the
+/// bridge missed, nothing will ever deliver them. Carrying the hole would leave
+/// the index claiming blocks the worker may no longer hold, so the bridge clears
+/// that worker instead.
+#[tokio::test]
+async fn a_replay_that_cannot_reach_our_sequence_clears_the_worker() {
+    let (backend, indexer) = start_indexer().await;
+    let publisher = FakePublisher::bind(TOPIC).await;
+    // The index already believes this worker holds blocks.
+    backend
+        .apply_external_kv_batch(ApplyExternalKvBatchRequest {
+            worker_id: "worker-0".to_string(),
+            seq: 1,
+            actions: vec![ExternalKvAction {
+                r#type: ExternalKvActionType::ActionReport as i32,
+                tier: TierType::TierHbm as i32,
+                hashes: vec![41, 42],
+                component_masks: Vec::new(),
+                block_sizes: Vec::new(),
+                parent_block_hash: None,
+            }],
+            worker_address: "http://127.0.0.1:30000".to_string(),
+            cache_spec: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(held(&backend, &[41, 42]).await, vec![41, 42]);
+
+    // The buffer starts at 5, but a bridge with no checkpoint asks from 0.
+    publisher.buffer_only(5, batch_at(100.0, vec![stored(&[50], None)]));
+    publisher.buffer_only(6, batch_at(101.0, vec![stored(&[51], Some(50))]));
+
+    let bridge = start_bridge(config(&publisher, &indexer, true)).await;
+    wait_for(
+        &backend,
+        &[41, 42, 50, 51],
+        &[],
+        "cleared after a replay that could not reach our sequence",
+    )
+    .await;
+    bridge.stop().await;
 }
