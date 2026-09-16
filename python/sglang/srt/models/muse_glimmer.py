@@ -58,12 +58,22 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+elif _is_cpu:
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
+        _fused_sigmoid_mul_cpu(x, gate)
+        return x
+
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +312,7 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.use_output_gate:
             gate, _ = self.output_gate_proj(hidden_states)
-            if _is_cuda:
+            if _is_cuda or _is_cpu:
                 attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
             else:
                 attn_out = torch.sigmoid(gate) * attn_out
