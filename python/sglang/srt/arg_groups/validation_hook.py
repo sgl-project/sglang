@@ -101,6 +101,16 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 

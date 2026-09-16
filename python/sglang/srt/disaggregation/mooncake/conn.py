@@ -786,7 +786,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        if self.enable_custom_mem_pool:
+        if (
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
+        ):
             futures = [
                 executor.submit(
                     process_layer,
@@ -957,6 +960,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            # The unified pool registers ONE region holding every layer's K and
+            # V inside each page envelope. The MHA branch would half-split that
+            # single region into K and V halves and compute num_kv_layers = 0,
+            # transferring nothing at all; the flat branch addresses the region
+            # as-is. MLA-unified already reaches the flat branch via
+            # is_mla_backend, so this only adds the MHA-unified peer.
+            force_flat=get_memory().enable_unified_memory,
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
@@ -1491,6 +1501,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            dst_item_lens,
                         )
                         or rc
                     )
@@ -1598,8 +1609,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
-                        force_flat=st
-                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                        # Two independent reasons to keep the flat layout.
+                        # QSA's per-layer list must not be half-split into K/V;
+                        # neither must a unified sub-pool's single region, which
+                        # holds every layer's K and V per slot envelope -- the
+                        # MHA branch would compute zero layers and ship nothing
+                        # (same reason as in `send_kvcache`).
+                        force_flat=(
+                            st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                            or get_memory().enable_unified_memory
+                        ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                     )
@@ -1689,6 +1708,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_state_item_lens: Optional[list[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1703,6 +1723,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
             length = src_state_item_lens[i]
+            if dst_state_item_lens and length != dst_state_item_lens[j]:
+                raise RuntimeError(
+                    "Prefill/Decode Mamba slot size mismatch "
+                    f"(src={length}, dst={dst_state_item_lens[j]}). "
+                    "Configure matching persistent state layouts on both peers."
+                )
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
@@ -1758,6 +1784,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+                dst_state_item_lens,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
