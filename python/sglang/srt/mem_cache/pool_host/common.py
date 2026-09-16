@@ -125,6 +125,43 @@ def get_allocator_type() -> str:
     return backend or "default"
 
 
+def _register_chunk_with_retry(
+    cudart, ptr: int, size: int, *, offset: int, total: int
+) -> int:
+    """Register [ptr, ptr + size), halving the chunk on transient failures.
+
+    Single-shot cudaHostRegister calls of tens of GB were observed to fail
+    intermittently with cudaErrorInvalidValue in processes under heavy GPU
+    memory usage, while smaller registrations succeed. Returns the chunk size
+    that was actually registered. Raises RuntimeError when even a 4 KiB chunk
+    cannot be registered.
+    """
+    orig_size = size
+    rc_obj = cudart.cudaHostRegister(ptr, size, 0)
+    while int(rc_obj) != 0 and size > 4096:
+        size //= 2
+        rc_obj = cudart.cudaHostRegister(ptr, size, 0)
+    if int(rc_obj) == 0:
+        if size < orig_size:
+            logger.warning(
+                "cudaHostRegister degraded: %d -> %d bytes at offset=%d "
+                "(total=%d, ptr=%#x)",
+                orig_size,
+                size,
+                offset,
+                total,
+                ptr,
+            )
+        return size
+    raise RuntimeError(
+        f"cudaHostRegister failed for every chunk size down to 4 KiB "
+        f"(last rc={int(rc_obj)}, {cudart.cudaGetErrorString(rc_obj)}) "
+        f"at offset={offset} size={orig_size} ptr={ptr:#x} (total={total}); "
+        f"host buffer is not pinned and device transfers may silently return "
+        f"stale data."
+    )
+
+
 def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
@@ -154,20 +191,21 @@ def _cuda_host_register(
         chunk_bytes = (
             chunk_limit_bytes // registration_granularity_bytes
         ) * registration_granularity_bytes
+    # Honor the chunk limit for every buffer, not only for callers that pass
+    # a copy granularity; oversized single-shot registrations are unreliable.
+    chunk_bytes = min(chunk_bytes, chunk_limit_bytes)
     registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
-            if rc != 0:
-                raise RuntimeError(
-                    f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
-                    f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
-                    f"pinned and device transfers may silently return stale data."
-                )
+            size = _register_chunk_with_retry(
+                cudart, ptr, size, offset=offset, total=total
+            )
+            # Once a chunk had to be shrunk, keep the smaller size for the
+            # remaining chunks instead of failing over and over again.
+            chunk_bytes = min(chunk_bytes, size)
             registered_ranges.append((ptr, size))
             offset += size
 
