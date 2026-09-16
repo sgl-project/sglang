@@ -4444,7 +4444,8 @@ class DeepseekV4Model(nn.Module):
             and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
             and self.pp_group.world_size == 1
             and not is_dp_attention_enabled()
-            and config.vision_n_layers == 0
+            # HIP preserves image-token rows after the prefetched projection.
+            and (_is_hip or config.vision_n_layers == 0)
             and config.hc_pre_from_prev_sublayer
             and self.start_layer <= 14 < self.end_layer
             and self.layers[14].engram is not None
