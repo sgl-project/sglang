@@ -327,6 +327,7 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
                 self.assertIsNot(
@@ -346,9 +347,13 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
             mea.MultiEndedAllocator,
             unified_mamba.UnifiedMambaTokenToKVPoolAllocator,
             unified_hybrid_swa.UnifiedSWATokenToKVPoolAllocator,
+            unified_hybrid_swa.UnifiedMambaSWATokenToKVPoolAllocator,
         ):
             with self.subTest(cls=cls.__name__):
-                self.assertIn("free_page_reps_group", inspect.getsource(cls))
+                alloc = object.__new__(cls)
+                alloc.free_group = None
+                alloc.free_group_begin()
+                self.assertEqual(alloc.free_page_reps_group, [])
 
 
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):

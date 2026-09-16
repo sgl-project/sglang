@@ -11,7 +11,6 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -161,34 +160,13 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
-        return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
-        available_size = allocator.available_size()
-        if available_size < num_tokens:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens - available_size)
-            )
-            _evict_until_allocatable(tree_cache, allocator, num_tokens)
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None, num_tokens: int
+) -> bool | None:
+    if tree_cache is not None and not tree_cache.is_chunk_cache():
+        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
+            tree_cache, num_tokens
+        )
 
 
 def _evict_until_allocatable(

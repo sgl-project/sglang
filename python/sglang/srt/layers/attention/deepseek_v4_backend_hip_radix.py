@@ -736,6 +736,9 @@ class DeepseekV4HipRadixBackend(
             exact_num_tokens = True
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
+        # output_size drops the implicit sum()'s D2H in the prefill-meta build.
+        # EAGLE verify faults without that sync.
+        exact_num_tokens = exact_num_tokens and self.is_dspark
         return self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
