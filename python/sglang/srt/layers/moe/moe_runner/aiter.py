@@ -103,15 +103,13 @@ _AITER_ACTIVATIONS = {
 }
 
 
-# aiter's ActivationType.Swiglu is SwiGLU-OAI (gpt-oss) with the alpha and the
-# `(up + beta)` bias baked in as compile-time constants.
+# aiter's ActivationType.Swiglu is SwiGLU-OAI with alpha and the (up + beta) bias baked in
 _AITER_SWIGLU_OAI_ALPHA = 1.702
 _AITER_SWIGLU_OAI_BETA = 1.0
 
 
 def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
-    """Clamp limit to pass aiter when ``config`` asks for exactly the SwiGLU-OAI
-    that ``ActivationType.Swiglu`` implements, else ``None``."""
+    """The clamp limit to pass aiter when `config` is exactly its baked-in SwiGLU-OAI, else None."""
     if config.activation != "silu" or not config.is_gated:
         return None
     if config.gemm1_alpha != _AITER_SWIGLU_OAI_ALPHA:
