@@ -2345,8 +2345,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
 
-    # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
-    # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
     # Forward-pass metrics
@@ -3735,6 +3733,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

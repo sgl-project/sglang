@@ -705,6 +705,7 @@ class TboForwardBatchPreparer:
 
         for key in [
             "req_pool_indices",
+            "req_pool_indices_cpu",
             "seq_lens",
             "seq_lens_cpu",
             "extend_seq_lens",
