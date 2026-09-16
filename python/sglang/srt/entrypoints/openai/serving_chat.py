@@ -1311,8 +1311,10 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        glm_constraint = (
+            self.tool_call_parser == "glm47"
+            and envs.SGLANG_ENABLE_GLM47_FULL_ASSISTANT_CONSTRAINT.get()
+            and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(

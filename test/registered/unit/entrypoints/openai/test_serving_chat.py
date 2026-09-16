@@ -821,6 +821,52 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed.require_reasoning)
 
+    def test_glm47_full_assistant_opt_out_preserves_required_fallback(self):
+        self.chat.tool_call_parser = "glm47"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        named = ToolChoice(function=ToolChoiceFuncName(name="weather"))
+        for enabled in (True, False):
+            for tools, choice in (
+                ([], "none"),
+                ([tool], "none"),
+                ([tool], "auto"),
+                ([tool], "required"),
+                ([tool], named),
+            ):
+                with (
+                    self.subTest(enabled=enabled, tools=bool(tools), choice=choice),
+                    envs.SGLANG_ENABLE_GLM47_FULL_ASSISTANT_CONSTRAINT.override(
+                        enabled
+                    ),
+                    patch(
+                        "sglang.srt.function_call.glm47_moe_detector._glm47_native_structural_tag_available",
+                        return_value=False,
+                    ),
+                ):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Weather?"}],
+                        input_ids=[1, 2, 3],
+                        tools=tools,
+                        tool_choice=choice,
+                    )
+                    processed = self.chat._process_messages(
+                        request, is_multimodal=False
+                    )
+                    constraint = processed.tool_call_constraint
+                    if enabled:
+                        self.assertEqual(constraint[0], "full_assistant_ebnf")
+                    elif choice == "required" or isinstance(choice, ToolChoice):
+                        self.assertEqual(constraint[0], "json_schema")
+                    else:
+                        self.assertIsNone(constraint)
+
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True

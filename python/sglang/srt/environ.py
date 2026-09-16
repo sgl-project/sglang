@@ -735,6 +735,7 @@ class Envs:
     SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+    SGLANG_ENABLE_GLM47_FULL_ASSISTANT_CONSTRAINT = EnvBool(True)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation
