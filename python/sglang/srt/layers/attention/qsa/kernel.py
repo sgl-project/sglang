@@ -283,7 +283,7 @@ def expand_qsa_block_indices(
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
     if _is_npu:
-        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.expansion import (
+        from sgl_kernel_npu.qwen3_8_flash_next.expansion import (
             can_run_block_expansion,
             expand_blocks,
         )
@@ -340,7 +340,7 @@ def qsa_sparse_attention(
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
     if _is_npu:
-        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.sparse_attention import (
+        from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import (
             can_run_sparse_attention,
             sparse_attention,
         )

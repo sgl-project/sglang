@@ -2,11 +2,11 @@
 
 import pytest
 import torch
-
-from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.sparse_attention import (
+from sgl_kernel_npu.qwen3_8_flash_next.sparse_attention import (
     can_run_sparse_attention,
     sparse_attention,
 )
+
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci

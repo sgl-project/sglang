@@ -400,7 +400,7 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
     if _is_npu:
-        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.mqa import (
+        from sgl_kernel_npu.qwen3_8_flash_next.mqa import (
             can_run_mqa_decode,
             mqa_decode,
         )

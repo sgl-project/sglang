@@ -2,11 +2,11 @@
 
 import pytest
 import torch
-
-from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.mqa import (
+from sgl_kernel_npu.qwen3_8_flash_next.mqa import (
     can_run_mqa_decode,
     mqa_decode,
 )
+
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci

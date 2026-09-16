@@ -47,7 +47,7 @@ class GroupedGemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+            from sgl_kernel_npu.qwen3_8_flash_next.hc import (
                 can_run_norm,
                 grouped_norm,
             )
@@ -204,7 +204,7 @@ class GatedResidual(HyperConnectionBase):
             hs: int,
         ) -> torch.Tensor:
             if _is_npu:
-                from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+                from sgl_kernel_npu.qwen3_8_flash_next.hc import (
                     can_run_mix,
                     mix,
                 )
@@ -243,7 +243,7 @@ class GatedResidual(HyperConnectionBase):
             hs: int,
         ) -> torch.Tensor:
             if _is_npu:
-                from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.hc import (
+                from sgl_kernel_npu.qwen3_8_flash_next.hc import (
                     can_run_combine,
                     combine,
                 )
