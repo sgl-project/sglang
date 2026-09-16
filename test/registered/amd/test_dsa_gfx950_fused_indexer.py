@@ -50,13 +50,13 @@ def _snr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     return float(10 * torch.log10(power / noise))
 
 
-# NOTE: skipped on every current CI run. The taxonomy check requires a
-# *-kernel-* suite for anything under test/registered/kernel/, and every AMD one
-# of those dispatches to linux-{mi300,mi325}-1gpu-sglang -- gfx942, where
-# _skip_reason() below skips the whole class because these kernels are gfx950
-# only. sglang has no gfx950 kernel-test lane today; adding mi35x to
-# runner_arch in pr-test-amd.yml would give this file one.
-register_amd_ci(est_time=120, suite="jit-kernel-unit-test-amd")
+# Lives under the amd vendor tree rather than test/registered/kernel/ so it can
+# name a gfx950 suite: the taxonomy check requires a *-kernel-* suite for the
+# kernel kind, and every AMD one of those dispatches to
+# linux-{mi300,mi325}-1gpu-sglang -- gfx942, where _skip_reason() below would
+# skip the whole class. stage-b runs on linux-mi35x-gpu-1, which is the hardware
+# these kernels are written for.
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipIf(SKIP is not None, SKIP or "")
