@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   schedule:
     - cron: '0 12 * * *'  # Run daily at 12:00 UTC
+  pull_request:
   workflow_dispatch:
     inputs:
       coverage_mode:
