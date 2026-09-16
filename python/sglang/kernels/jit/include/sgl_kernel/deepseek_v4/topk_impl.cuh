@@ -39,6 +39,15 @@ namespace device::topk {
 namespace cg = cooperative_groups;
 #endif
 
+/// Lanes in one hardware wave: 64 on CDNA, 32 on NVIDIA. Distinct from
+/// kWarpThreads, which sgl_kernel pins at 32 on every target, so on CDNA the
+/// shared warp helpers run two logical warps per wave.
+#ifdef USE_ROCM
+inline constexpr uint32_t kWaveThreads = 64u;
+#else
+inline constexpr uint32_t kWaveThreads = 32u;
+#endif
+
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
@@ -167,6 +176,46 @@ SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
 #endif
 }
 
+#ifdef USE_ROCM
+/// One step of a DPP scan: move `v` across lanes by `kCtrl` and add it back.
+template <int kCtrl, int kRowMask>
+SGL_DEVICE uint32_t dpp_shift_add(uint32_t v) {
+  const int moved = __builtin_amdgcn_update_dpp(0, static_cast<int>(v), kCtrl, kRowMask, 0xF, false);
+  return v + static_cast<uint32_t>(moved);
+}
+#endif
+
+/// Inclusive prefix sum across a whole hardware wave.
+///
+/// warp_inclusive_sum above is fixed at 32 lanes because kWarpThreads is 32
+/// everywhere, so on wave64 it scans two independent halves of the wave and
+/// needs a second pass through shared memory to join them. This one spans the
+/// real wave, which is what lets the radix select's prefix fit in a single wave.
+SGL_DEVICE uint32_t wave_inclusive_sum(uint32_t val) {
+#ifdef USE_ROCM
+  // Built from DPP-modified adds rather than __shfl_up. __shfl_up lowers to
+  // ds_bpermute, which routes the lane crossing through the LDS crossbar and
+  // pays LDS latency even though it touches no memory; a DPP modifier fetches
+  // the neighbouring lane during instruction issue, at plain VALU rate.
+  //
+  // A "row" is 16 lanes on CDNA, so the four row_shr steps scan each row on its
+  // own and the two row_bcast steps carry the row totals across the wave:
+  // row_bcast:15 adds row 0's total into row 1 and row 2's into row 3, then
+  // row_bcast:31 adds the first half's total into rows 2 and 3. Lanes that a
+  // row_mask disables, and lanes whose source is out of range, both resolve to
+  // `old` -- zero here, the identity for the add.
+  val = dpp_shift_add<0x111, 0xF>(val);  // row_shr:1
+  val = dpp_shift_add<0x112, 0xF>(val);  // row_shr:2
+  val = dpp_shift_add<0x114, 0xF>(val);  // row_shr:4
+  val = dpp_shift_add<0x118, 0xF>(val);  // row_shr:8
+  val = dpp_shift_add<0x142, 0xA>(val);  // row_bcast:15 -> rows 1 and 3
+  val = dpp_shift_add<0x143, 0xC>(val);  // row_bcast:31 -> rows 2 and 3
+  return val;
+#else
+  return warp_inclusive_sum(threadIdx.x % kWarpThreads, val);
+#endif
+}
+
 struct alignas(8) TieValue {
   float value;
   uint32_t idx;
@@ -237,7 +286,7 @@ struct TopKConfig {
     alignas(128) uint32_t counter_final;
     MatchBin match;
     uint32_t warp_sum[kNumWarps];
-    uint32_t histogram[2][kRadixSize];
+    alignas(16) uint32_t histogram[2][kRadixSize];
   };
 
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
@@ -249,7 +298,9 @@ struct TopKConfig {
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
-      TieHandleSmem* smem) {
+      TieHandleSmem* smem,
+      float v_lo,
+      float v_hi) {
     constexpr auto is_greater = [](const TieValue& a, const TieValue& b) {
       return (a.value > b.value) || (a.value == b.value && a.idx < b.idx);
     };
@@ -257,6 +308,17 @@ struct TopKConfig {
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
     static_assert(kNumWarps == kWarpSize);
+
+    // Every candidate satisfies v_lo <= value < v_hi, and extract_exact_bin is
+    // monotonic, so all of their keys agree on every bit above the highest bit
+    // where the two boundary keys differ. A 12-bit fp16 coarse bin spans exactly
+    // 2^17 fp32 values, which puts that bit at 17 and makes the radix select's
+    // first round -- bits 31..24 -- incapable of separating anything. Start at
+    // the lowest 8-bit round that still covers the varying bits. Degenerate bins
+    // (the +/-inf and saturated-NaN edges, where a boundary is +/-FLT_MAX) widen
+    // the span and fall back to the full four rounds on their own.
+    const uint32_t vary = extract_exact_bin(v_lo) ^ extract_exact_bin(v_hi);
+    const uint32_t start_shift = vary ? ((31u - __clz(vary)) / 8u) * 8u : 0u;
 
     if (num_ties <= topk) {
       for (uint32_t t = tx; t < num_ties; t += kBlockSize) {
@@ -322,11 +384,11 @@ struct TopKConfig {
       }
     } else if (num_ties <= kBlockSize) {
       // Common case: one candidate per thread.
-      radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem);
+      radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem, start_shift);
     } else {
       // Rare overflow case (kBlockSize < num_ties <= kMaxNumTie), kept out of
       // the common path so it alone pays the multi-item register cost.
-      radix_tie_select<kTieItems>(tie_buffer, problem, base, num_ties, topk, smem);
+      radix_tie_select<kTieItems>(tie_buffer, problem, base, num_ties, topk, smem, start_shift);
     }
   }
 
@@ -340,7 +402,8 @@ struct TopKConfig {
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
-      TieHandleSmem* smem) {
+      TieHandleSmem* smem,
+      uint32_t start_shift) {
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
@@ -364,9 +427,8 @@ struct TopKConfig {
     __syncthreads();
     uint32_t total_active = num_ties;
 
-#pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    uint32_t shift = start_shift;
+    for (uint32_t round = 0; round < 4; round++) {
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
 
@@ -374,26 +436,33 @@ struct TopKConfig {
       for (uint32_t i = 0; i < kItems; ++i) {
         if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (shift > 0 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
 
-      uint32_t hist_val = 0;
-      uint32_t warp_inc = 0;
-      if (tx < kRadixSize) {
-        hist_val = histogram[tx];
-        warp_inc = warp_inclusive_sum(lane_id, hist_val);
-        if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
-      }
-      __syncthreads();
-      if (tx < kRadixSize) {
-        const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
-        const auto prefix = inter + warp_inc;      // inclusive prefix through this bin
-        const auto above = total_active - prefix;  // elements in bins ABOVE this one
-        // 3. Find threshold bin
-        if (above < topk_remain && above + hist_val >= topk_remain) {
-          smem->match = {tx, above, hist_val};
+      // 3. Prefix the bins and find the threshold bin. One wave owns all
+      // kRadixSize of them, kPerLane contiguous bins each, so the running count
+      // crosses lanes through a single wave scan instead of a warp scan plus a
+      // trip through smem->warp_sum -- and the barrier that separated those two
+      // halves, which every wave in the block used to wait on, is gone.
+      constexpr uint32_t kPerLane = kRadixSize / kWaveThreads;
+      if (tx < kWaveThreads) {
+        uint32_t h[kPerLane];
+        uint32_t local = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < kPerLane; ++i) {
+          h[i] = histogram[tx * kPerLane + i];
+          local += h[i];
+        }
+        uint32_t run = wave_inclusive_sum(local) - local;  // bins below this lane's group
+#pragma unroll
+        for (uint32_t i = 0; i < kPerLane; ++i) {
+          run += h[i];                          // inclusive prefix through this bin
+          const auto above = total_active - run;  // elements in bins ABOVE this one
+          if (above < topk_remain && above + h[i] >= topk_remain) {
+            smem->match = {tx * kPerLane + i, above, h[i]};
+          }
         }
       }
       __syncthreads();
@@ -412,13 +481,14 @@ struct TopKConfig {
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (shift == 0) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // my_bin == thr && shift > 0: stay active for next round
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (shift == 0 || topk_remain == 0) break;
+      shift -= 8;
     }
 
 #pragma unroll
@@ -629,7 +699,7 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto equal_count = smem->count_eq;
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
     const auto tie_count = min(equal_count, kMaxNumTie);
-    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle, v_lo, v_hi);
   }
 };
 
@@ -701,7 +771,7 @@ struct TopKStreaming : TopKRegister<2> {
     const auto equal_count = smem->count_eq;
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
     const auto tie_count = min(equal_count, kMaxNumTie);
-    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle, v_lo, v_hi);
   }
 };
 
@@ -877,7 +947,7 @@ struct TopKCluster : TopKRadixBase<10> {
       const auto equal_count = smem->count_eq;
       const auto remain_topk = above_count < topk ? topk - above_count : 0;
       const auto tie_count = min(equal_count, kMaxNumTie);
-      handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+      handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle, v_lo, v_hi);
     }
   }
 };
