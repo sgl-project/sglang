@@ -91,20 +91,15 @@ async fn select_workers(
     candidates: &[Arc<Worker>],
     resolver: &PdPoolResolver,
 ) -> Result<SelectedWorkers, ApiError> {
-    // Find cached prompt prefixes; these are preferences, not final worker choices.
+    // Find cached prompt prefixes and capture engine load info.
     let prefix_matches = lookup_prefix_matches(ctx, request).await?;
-
-    // Reuse one snapshot of available engine load for both prefill and decode decisions.
     let load_snapshot = capture_load_snapshot(ctx, policy, candidates);
+    let routing_context = RoutingContext::new(ctx, headers, prefix_matches, load_snapshot)?;
 
-    // Read optional bucket latency/throughput targets and session-affinity headers.
-    let routing = RoutingContext::new(ctx, headers, prefix_matches, load_snapshot)?;
-
-    // Apply the policy, bucket constraints, and load checks to choose a plain/prefill worker.
-    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing)?;
-
-    // PD additionally chooses a decode peer; plain mode returns None.
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing)?;
+    // Select a plain or prefill worker.
+    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
+    // Select a decode peer for PD mode.
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
     Ok(SelectedWorkers {
         prefill,
         decode,
@@ -243,6 +238,7 @@ fn pick_decode_worker(
     Ok(Some(decode))
 }
 
+/// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
 async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &ChatRequest,
@@ -252,6 +248,7 @@ async fn lookup_prefix_matches(
         request.tokens.as_ref(),
         ctx.block_size_oracle.get(),
     ) {
+        // Remote indexer: hash tokens into blocks and match against the KV index.
         (Some(index), Some(tokens), Some(block_size)) => {
             let hashes = if ctx.block_size_oracle.is_bigram() {
                 compute_block_hashes_bigram(&tokens.ids, block_size as usize)
@@ -269,6 +266,7 @@ async fn lookup_prefix_matches(
                 query_blocks,
             })
         }
+        // Without usable indexer inputs, try the in-process radix tree.
         _ => ctx
             .radix_tree_prefix_provider
             .as_ref()
