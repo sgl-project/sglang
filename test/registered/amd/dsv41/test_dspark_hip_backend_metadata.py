@@ -592,6 +592,167 @@ class TestLowRatioPrepareStreams(CustomTestCase):
 
 @unittest.skipUnless(is_hip(), "HIP context-parallel prefill")
 class TestLowRatioContextParallel(CustomTestCase):
+    def test_tail_preserves_rank_ownership_and_restores_full_batch(self):
+        from unittest.mock import patch
+
+        from sglang.srt.layers.cp import base as cp_base
+        from sglang.srt.layers.cp.interleave import (
+            InterleaveContextParallelMetadata,
+            InterleaveCPStrategy,
+            interleave_rows_per_request,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_local_dp_buffer_len,
+            set_local_dp_buffer_len,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        device = "cuda"
+        backend = _make_backend(
+            block_size=5, device=device, low_ratios=(1, 2), is_dspark_draft=False
+        )
+        backend.token_to_kv_pool.get_index_k_page_size = lambda ratio: 64
+        backend.dsa_topk_backend = SimpleNamespace(should_use_topk_v2=lambda: False)
+        # Unequal tail ownership, a request absent on some ranks, and a single request.
+        for extend in ([257, 1, 130], [257]):
+            with self.subTest(extend=extend):
+                req = torch.tensor([4, 1, 3][: len(extend)], device=device)
+                seq = [e + 13 for e in extend]
+                lengths = torch.tensor(extend, device=device, dtype=torch.int32)
+                positions = torch.cat([torch.arange(13, s, device=device) for s in seq])
+                requests = req.repeat_interleave(lengths.long())
+                out_loc = backend.req_to_token[requests, positions].long()
+                n = sum(extend)
+                padded = (n + 3) // 4 * 4
+                batch = SimpleNamespace(
+                    batch_size=len(extend),
+                    input_ids=torch.arange(padded, device=device),
+                    positions=positions,
+                    req_pool_indices=req,
+                    seq_lens=torch.tensor(seq, device=device, dtype=torch.int32),
+                    seq_lens_cpu=torch.tensor(seq),
+                    extend_seq_lens_cpu=extend,
+                    out_cache_loc=out_loc,
+                    forward_mode=ForwardMode.EXTEND,
+                    attn_cp_metadata=None,
+                )
+                global_tail = backend._build_late_layer_tail_metadata(batch)
+                tail_indices = torch.cat(
+                    [
+                        torch.arange(
+                            start + max(e - SWA_WINDOW, 0), start + e, device=device
+                        )
+                        for start, e in zip(
+                            [0, *torch.tensor(extend).cumsum(0).tolist()], extend
+                        )
+                    ]
+                )
+                gathered = []
+                for rank in range(4):
+                    original_cp = InterleaveContextParallelMetadata(
+                        per_rank_actual_token=[padded // 4] * 4, total_seq_lens=n
+                    )
+                    batch.attn_cp_metadata = original_cp
+                    with (
+                        get_parallel().override(attn_cp_size=4, attn_cp_rank=rank),
+                        patch.object(
+                            cp_base, "_STRATEGY", InterleaveCPStrategy(cp_size=4)
+                        ),
+                    ):
+                        full = backend.init_forward_metadata_prefill(
+                            max_seq_len=max(seq),
+                            req_pool_indices=req,
+                            seq_lens=batch.seq_lens,
+                            seq_lens_cpu=seq,
+                            out_cache_loc=out_loc,
+                            num_tokens=n,
+                            extend_seq_lens=lengths,
+                            extend_seq_lens_cpu=extend,
+                            cp_metadata=original_cp,
+                        )
+                        tail_metadata = backend._build_late_layer_tail_metadata(batch)
+                        tail = tail_metadata.late_layer_tail
+                        selected = tail_indices[tail_indices % 4 == rank]
+                        local_rows = torch.arange(rank, padded, 4, device=device)
+                        torch.testing.assert_close(tail.real_rows(local_rows), selected)
+                        gathered.append(tail.rows(local_rows))
+                        torch.testing.assert_close(
+                            tail.positions[: len(selected)], positions[selected]
+                        )
+                        self.assertTrue((tail.positions[len(selected) :] == 0).all())
+                        for field in global_tail.core_metadata._CP_REINDEX_FIELDS:
+                            expected = getattr(global_tail.core_metadata, field)
+                            actual = getattr(tail_metadata.core_metadata, field)
+                            torch.testing.assert_close(
+                                actual[: len(selected)],
+                                expected[tail_indices % 4 == rank],
+                            )
+                        torch.testing.assert_close(
+                            tail.swa_out_cache_loc,
+                            global_tail.late_layer_tail.swa_out_cache_loc,
+                        )
+                        # Last index source published distinct values for each local query.
+                        for ratio in (1, 2):
+                            for get_buffer in (
+                                "sparse_page_indices",
+                                "sparse_raw_indices",
+                                "sparse_topk_lengths",
+                            ):
+                                buf = getattr(full.core_metadata, get_buffer)(ratio)
+                                buf.copy_(
+                                    local_rows.to(buf.dtype)
+                                    .view(-1, *([1] * (buf.ndim - 1)))
+                                    .expand_as(buf)
+                                )
+                        local_lens = interleave_rows_per_request(extend, rank, 4)
+                        masks = list(local_rows[: sum(local_lens)].split(local_lens))
+                        backend.forward_metadata = full
+                        backend.candidate_masks = masks
+                        backend.tail_forward_metadata = tail_metadata
+                        previous_len = get_local_dp_buffer_len()
+                        set_local_dp_buffer_len(padded)
+                        try:
+                            saved = backend.enter_late_layer_tail(batch)
+                            self.assertIs(batch.attn_cp_metadata, tail.cp_metadata)
+                            self.assertEqual(
+                                get_local_dp_buffer_len(),
+                                len(tail.rows(local_rows)) * 4,
+                            )
+                            torch.testing.assert_close(
+                                torch.cat(backend.candidate_masks), selected
+                            )
+                            for ratio in (1, 2):
+                                for get_buffer in (
+                                    "sparse_page_indices",
+                                    "sparse_raw_indices",
+                                    "sparse_topk_lengths",
+                                ):
+                                    buf = getattr(
+                                        tail_metadata.core_metadata, get_buffer
+                                    )(ratio)
+                                    expected = (
+                                        selected.to(buf.dtype)
+                                        .view(-1, *([1] * (buf.ndim - 1)))
+                                        .expand_as(buf[: len(selected)])
+                                    )
+                                    torch.testing.assert_close(
+                                        buf[: len(selected)], expected
+                                    )
+                                    if get_buffer != "sparse_topk_lengths":
+                                        self.assertTrue(
+                                            (buf[len(selected) :] == -1).all()
+                                        )
+                            backend.exit_late_layer_tail(saved, batch)
+                            self.assertIs(backend.forward_metadata, full)
+                            self.assertIs(backend.candidate_masks, masks)
+                            self.assertIs(batch.attn_cp_metadata, original_cp)
+                            self.assertEqual(get_local_dp_buffer_len(), padded)
+                        finally:
+                            set_local_dp_buffer_len(previous_len)
+                torch.testing.assert_close(
+                    torch.cat(gathered)[tail.cp_metadata.gather_index], tail_indices
+                )
+
     def test_local_indexer_matches_global_rows(self):
         for extend in ([5, 1, 6], [4, 1, 6]):
             with self.subTest(extend=extend):
