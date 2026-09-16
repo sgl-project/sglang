@@ -148,39 +148,71 @@ struct NormTraits<NormMode::RMSNormGated> : NormTraitsBase {
 #endif
 };
 
-template <NormMode M, typename scalar_t, int D>
-struct NormReduce;
-
 #if defined(CPU_CAPABILITY_AVX512)
-template <NormMode M, int D>
-struct NormReduce<M, at::BFloat16, D> {
+template <typename scalar_t>
+inline std::tuple<__m512, __m512> load_32_as_float(const scalar_t* __restrict__ input) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    return std::make_tuple(_mm512_loadu_ps(input), _mm512_loadu_ps(input + 16));
+  } else {
+    const __m512i input_16 = _mm512_loadu_si512(input);
+    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+      return std::make_tuple(
+          CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 0)),
+          CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 1)));
+    } else {
+      static_assert(std::is_same_v<scalar_t, at::Half>);
+      return std::make_tuple(
+          CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 0)),
+          CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 1)));
+    }
+  }
+}
+
+template <typename scalar_t>
+inline void store_32_from_float(scalar_t* __restrict__ output, __m512 value0, __m512 value1) {
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    _mm512_storeu_ps(output, value0);
+    _mm512_storeu_ps(output + 16, value1);
+  } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+    _mm512_storeu_si512(output, (__m512i)(_mm512_cvtne2ps_pbh(value1, value0)));
+  } else {
+    static_assert(std::is_same_v<scalar_t, at::Half>);
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(output), _mm512_cvtps_ph(value0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i*>(output + 16),
+        _mm512_cvtps_ph(value1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+  }
+}
+
+template <NormMode M, typename input_t, typename weight_t, typename bias_t, int D>
+struct NormReduce {
   static inline void apply(
-      at::BFloat16* __restrict__ out,
-      const at::BFloat16* __restrict__ input,
-      const at::BFloat16* __restrict__ gate,
+      input_t* __restrict__ out,
+      const input_t* __restrict__ input,
+      const input_t* __restrict__ gate,
       const NormParams& params) {
     static_assert(D % 32 == 0);
     constexpr int COLS = D / 32;
 
     const bool use_bias = params.bias != nullptr;
 
-    __m512bh va[COLS];
+    __m512 va0[COLS], va1[COLS];
     __m512 vmean, vrscale;
     const __m512 vshift = _mm512_set1_ps(params.shift);
 
-    // step 1: load input and do reduce with avx512-bf16
     __m512 vsum = _mm512_set1_ps(0.f);
     __m512 vsum2 = _mm512_set1_ps(0.f);
     Unroll<COLS>{}([&](auto col) {
-      va[col] = (__m512bh)(_mm512_loadu_si512(input + col * 32));
+      std::tie(va0[col], va1[col]) = load_32_as_float(input + col * 32);
       if constexpr (NormTraits<M>::has_mean) {
-        vsum = _mm512_add_ps(vsum, CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)va[col], 0)));
-        vsum = _mm512_add_ps(vsum, CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)va[col], 1)));
+        vsum = _mm512_add_ps(vsum, va0[col]);
+        vsum = _mm512_add_ps(vsum, va1[col]);
       }
-      vsum2 = _mm512_dpbf16_ps(vsum2, va[col], va[col]);
+      vsum2 = _mm512_fmadd_ps(va0[col], va0[col], vsum2);
+      vsum2 = _mm512_fmadd_ps(va1[col], va1[col], vsum2);
     });
 
-    // compute mean (if has_mean) and rscale
     float sum2 = _mm512_reduce_add_ps(vsum2);
     float variance = sum2 / D;
     if constexpr (NormTraits<M>::has_mean) {
@@ -192,65 +224,57 @@ struct NormReduce<M, at::BFloat16, D> {
     float rscale = 1.f / std::sqrt(variance + params.eps);
     vrscale = _mm512_set1_ps(rscale);
 
-    // step 2: apply scale to output
     Unroll<COLS>{}([&](auto col) {
-      __m512i a16 = (__m512i)va[col];
-      __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 0));
-      __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(a16, 1));
+      __m512 value0 = va0[col];
+      __m512 value1 = va1[col];
       if constexpr (NormTraits<M>::has_mean) {
-        va0 = _mm512_sub_ps(va0, vmean);
-        va1 = _mm512_sub_ps(va1, vmean);
+        value0 = _mm512_sub_ps(value0, vmean);
+        value1 = _mm512_sub_ps(value1, vmean);
       }
-      va0 = _mm512_mul_ps(va0, vrscale);
-      va1 = _mm512_mul_ps(va1, vrscale);
+      value0 = _mm512_mul_ps(value0, vrscale);
+      value1 = _mm512_mul_ps(value1, vrscale);
       if constexpr (NormTraits<M>::has_weight) {
         // TODO: need to block B to hide weight reload
-        const at::BFloat16* weight = static_cast<const at::BFloat16*>(params.weight);
-        __m512i w16 = (__m512i)(_mm512_loadu_si512(weight + col * 32));
-        __m512 w0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 0));
-        __m512 w1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(w16, 1));
+        const weight_t* weight = static_cast<const weight_t*>(params.weight);
+        auto [weight0, weight1] = load_32_as_float(weight + col * 32);
         if constexpr (NormTraits<M>::has_shift) {
-          w0 = NormTraits<M>::apply_shift(w0, vshift);
-          w1 = NormTraits<M>::apply_shift(w1, vshift);
+          weight0 = NormTraits<M>::apply_shift(weight0, vshift);
+          weight1 = NormTraits<M>::apply_shift(weight1, vshift);
         }
-        va0 = NormTraits<M>::apply_weight(va0, w0);
-        va1 = NormTraits<M>::apply_weight(va1, w1);
+        value0 = NormTraits<M>::apply_weight(value0, weight0);
+        value1 = NormTraits<M>::apply_weight(value1, weight1);
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
-          const at::BFloat16* bias = static_cast<const at::BFloat16*>(params.bias);
-          __m512i b16 = (__m512i)(_mm512_loadu_si512(bias + col * 32));
-          __m512 vbias0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(b16, 0));
-          __m512 vbias1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(b16, 1));
-          va0 = NormTraits<M>::apply_bias(va0, vbias0);
-          va1 = NormTraits<M>::apply_bias(va1, vbias1);
+          const bias_t* bias = static_cast<const bias_t*>(params.bias);
+          auto [bias0, bias1] = load_32_as_float(bias + col * 32);
+          value0 = NormTraits<M>::apply_bias(value0, bias0);
+          value1 = NormTraits<M>::apply_bias(value1, bias1);
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        __m512i g16 = (__m512i)(_mm512_loadu_si512(gate + col * 32));
-        __m512 vgate0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(g16, 0));
-        __m512 vgate1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(g16, 1));
-        va0 = NormTraits<M>::apply_gate(va0, vgate0);
-        va1 = NormTraits<M>::apply_gate(va1, vgate1);
+        auto [gate0, gate1] = load_32_as_float(gate + col * 32);
+        value0 = NormTraits<M>::apply_gate(value0, gate0);
+        value1 = NormTraits<M>::apply_gate(value1, gate1);
       }
-      _mm512_storeu_si512(out + col * 32, (__m512i)(_mm512_cvtne2ps_pbh(va1, va0)));
+      store_32_from_float(out + col * 32, value0, value1);
     });
   }
 };
 #endif
 
-template <NormMode M, typename scalar_t, bool has_residual>
+template <NormMode M, typename input_t, bool has_residual, typename weight_t = input_t, typename bias_t = input_t>
 struct NormReduceGeneric {
   static inline void apply(
-      scalar_t* __restrict__ out,
-      const scalar_t* __restrict__ input,
-      const scalar_t* __restrict__ gate,
-      scalar_t* __restrict__ residual,
+      input_t* __restrict__ out,
+      const input_t* __restrict__ input,
+      const input_t* __restrict__ gate,
+      input_t* __restrict__ residual,
       const NormParams& params,
       int D) {
-    using bVec = at::vec::Vectorized<scalar_t>;
+    using bVec = at::vec::Vectorized<input_t>;
     using fVec = at::vec::Vectorized<float>;
-    constexpr int kVecSize = bVec::size();
+    constexpr int kVecSize = 2 * fVec::size();
 
     const bool use_bias = params.bias != nullptr;
     fVec sum_fvec{0.f}, sum2_fvec{0.f};
@@ -305,7 +329,12 @@ struct NormReduceGeneric {
         auto [r_fvec0, r_fvec1] = load_float_vec2(residual + d);
         x_fvec0 += r_fvec0;
         x_fvec1 += r_fvec1;
-        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(residual + d);
+        if constexpr (std::is_same_v<input_t, float>) {
+          x_fvec0.store(residual + d);
+          x_fvec1.store(residual + d + fVec::size());
+        } else {
+          convert_from_float_ext<input_t>(x_fvec0, x_fvec1).store(residual + d);
+        }
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_fvec0 = x_fvec0 - mean_fvec;
@@ -314,7 +343,7 @@ struct NormReduceGeneric {
       x_fvec0 = x_fvec0 * scale_fvec;
       x_fvec1 = x_fvec1 * scale_fvec;
       if constexpr (NormTraits<M>::has_weight) {
-        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.weight) + d);
+        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const weight_t*>(params.weight) + d);
         if constexpr (NormTraits<M>::has_shift) {
           w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
           w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
@@ -324,32 +353,37 @@ struct NormReduceGeneric {
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
-          auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const scalar_t*>(params.bias) + d);
+          auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const bias_t*>(params.bias) + d);
           x_fvec0 = NormTraits<M>::apply_bias(x_fvec0, b_fvec0);
           x_fvec1 = NormTraits<M>::apply_bias(x_fvec1, b_fvec1);
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        auto [g_fvec0, g_fvec1] = load_float_vec2(static_cast<const scalar_t*>(gate) + d);
+        auto [g_fvec0, g_fvec1] = load_float_vec2(static_cast<const input_t*>(gate) + d);
         x_fvec0 = NormTraits<M>::apply_gate(x_fvec0, g_fvec0);
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
       }
-      bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-      out_bvec.store(out + d);
+      if constexpr (std::is_same_v<input_t, float>) {
+        x_fvec0.store(out + d);
+        x_fvec1.store(out + d + fVec::size());
+      } else {
+        bVec out_bvec = convert_from_float_ext<input_t>(x_fvec0, x_fvec1);
+        out_bvec.store(out + d);
+      }
     }
 #pragma GCC unroll 4
     for (; d < D; ++d) {
       float x_val = static_cast<float>(input[d]);
       if constexpr (has_residual) {
         x_val += static_cast<float>(residual[d]);
-        residual[d] = static_cast<scalar_t>(x_val);
+        residual[d] = static_cast<input_t>(x_val);
       }
       if constexpr (NormTraits<M>::has_mean) {
         x_val -= mean;
       }
       x_val *= rsqrt_var;
       if constexpr (NormTraits<M>::has_weight) {
-        float w_val = static_cast<float>(static_cast<const scalar_t*>(params.weight)[d]);
+        float w_val = static_cast<float>(static_cast<const weight_t*>(params.weight)[d]);
         if constexpr (NormTraits<M>::has_shift) {
           w_val = NormTraits<M>::apply_shift(w_val, params.shift);
         }
@@ -357,15 +391,15 @@ struct NormReduceGeneric {
       }
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
-          float b_val = static_cast<float>(static_cast<const scalar_t*>(params.bias)[d]);
+          float b_val = static_cast<float>(static_cast<const bias_t*>(params.bias)[d]);
           x_val = NormTraits<M>::apply_bias(x_val, b_val);
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        float g_val = static_cast<float>(static_cast<const scalar_t*>(gate)[d]);
+        float g_val = static_cast<float>(static_cast<const input_t*>(gate)[d]);
         x_val = NormTraits<M>::apply_gate(x_val, g_val);
       }
-      out[d] = static_cast<scalar_t>(x_val);
+      out[d] = static_cast<input_t>(x_val);
     }
   }
 };
@@ -385,38 +419,35 @@ struct NormReduceGeneric {
 #define LAUNCH_PARALLEL_LOOP_HD(DIM)                                                              \
   case DIM:                                                                                       \
     LAUNCH_PARALLEL_LOOP(                                                                         \
-        const scalar_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {  \
+        const input_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {   \
           gate_ptr = gate + p.output_offset(b, h, t);                                             \
-        } NormReduce<M, scalar_t, DIM>::                                                          \
+        } NormReduce<M, input_t, weight_t, bias_t, DIM>::                                         \
             apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, p)); \
     return
 
-template <NormMode M, typename scalar_t>
+template <NormMode M, typename input_t, typename weight_t = input_t, typename bias_t = input_t>
 void norm4d_kernel_impl(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ input,
+    input_t* __restrict__ out,
+    const input_t* __restrict__ input,
     const NormParams& p,
-    const scalar_t* __restrict__ gate = nullptr) {
+    const input_t* __restrict__ gate = nullptr) {
 #if defined(CPU_CAPABILITY_AVX512)
-  // fast path only applies to bfloat16 when D in {32, 64, 128, 256, 512}
-  if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
-    switch (p.D) {
-      LAUNCH_PARALLEL_LOOP_HD(32);
-      LAUNCH_PARALLEL_LOOP_HD(64);
-      LAUNCH_PARALLEL_LOOP_HD(128);
-      LAUNCH_PARALLEL_LOOP_HD(256);
-      LAUNCH_PARALLEL_LOOP_HD(512);
-      default:
-        break;
-    }
+  switch (p.D) {
+    LAUNCH_PARALLEL_LOOP_HD(32);
+    LAUNCH_PARALLEL_LOOP_HD(64);
+    LAUNCH_PARALLEL_LOOP_HD(128);
+    LAUNCH_PARALLEL_LOOP_HD(256);
+    LAUNCH_PARALLEL_LOOP_HD(512);
+    default:
+      break;
   }
 #endif
 
   // generic path
   LAUNCH_PARALLEL_LOOP(
-      const scalar_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {
+      const input_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {
         gate_ptr = gate + p.output_offset(b, h, t);
-      } NormReduceGeneric<M, scalar_t, false>::
+      } NormReduceGeneric<M, input_t, false, weight_t, bias_t>::
           apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, nullptr, p, p.D));
 }
 
@@ -641,6 +672,15 @@ inline void CHECK_INPUT_ND(const at::Tensor& tensor) {
   TORCH_CHECK(dim_ok, "Expected input dim to match template constraints, got ", dim);
 }
 
+inline void CHECK_NORM_PARAMETER(const at::Tensor& tensor, int64_t hidden_size) {
+  TORCH_CHECK(tensor.sizes() == at::IntArrayRef{hidden_size}, "Expected parameter shape [", hidden_size, "]");
+  TORCH_CHECK(
+      tensor.scalar_type() == at::kHalf || tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat,
+      "Expected parameter dtype to be float16, bfloat16, or float32, got ",
+      tensor.scalar_type());
+  CHECK_INPUT(tensor);
+}
+
 // input : {batch_size, hidden_size}
 at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   const auto st = input.scalar_type();
@@ -738,9 +778,13 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   const auto st = input.scalar_type();
   const int64_t hidden_size = input.size(-1);
   CHECK_INPUT_ND<2, 3>(input);
-  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, st);
+  TORCH_CHECK(
+      st == at::kHalf || st == at::kBFloat16 || st == at::kFloat,
+      "Expected input dtype to be float16, bfloat16, or float32, got ",
+      st);
+  CHECK_NORM_PARAMETER(weight, hidden_size);
   if (bias.has_value()) {
-    CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, st);
+    CHECK_NORM_PARAMETER(bias.value(), hidden_size);
   }
 
   NormParams p{input, static_cast<float>(eps)};
@@ -748,8 +792,21 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
   at::Tensor output = at::empty_like(input);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "layernorm_kernel", [&] {
-    norm4d_kernel_impl<NormMode::LayerNorm, scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "layernorm_input", [&] {
+    using input_t = scalar_t;
+    AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, weight.scalar_type(), "layernorm_weight", [&] {
+      using weight_t = scalar_t;
+      if (bias.has_value()) {
+        AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, bias.value().scalar_type(), "layernorm_bias", [&] {
+          using bias_t = scalar_t;
+          norm4d_kernel_impl<NormMode::LayerNorm, input_t, weight_t, bias_t>(
+              output.data_ptr<input_t>(), input.data_ptr<input_t>(), p);
+        });
+      } else {
+        norm4d_kernel_impl<NormMode::LayerNorm, input_t, weight_t, weight_t>(
+            output.data_ptr<input_t>(), input.data_ptr<input_t>(), p);
+      }
+    });
   });
   return output;
 }
