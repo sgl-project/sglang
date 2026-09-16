@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -175,6 +174,8 @@ class NPUSituMXFP8Quant(BaseActivation):
 
 class NPUGeluAndMul(BaseActivation):
     def __init__(self):
+        from sglang.srt.layers.activation import GeluAndMul
+
         self._gelu = GeluAndMul()
 
     def _apply_activation(self, hidden_states: torch.Tensor):
