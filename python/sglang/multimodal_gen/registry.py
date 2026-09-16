@@ -57,6 +57,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
+    HiDreamO1ImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
@@ -133,6 +136,9 @@ from sglang.multimodal_gen.configs.sample.helios import (
     HeliosDistilledSamplingParams,
     HeliosMidSamplingParams,
     HeliosT2VSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
+    HiDreamO1ImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
@@ -363,6 +369,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "hidream-ai/hidream-o1-image": "HiDreamO1ImagePipeline",
 }
 
 
@@ -1210,6 +1217,12 @@ def _register_configs():
         sampling_param_cls=GlmImageSamplingParams,
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=HiDreamO1ImageSamplingParams,
+        pipeline_config_cls=HiDreamO1ImagePipelineConfig,
+        hf_model_paths=["HiDream-ai/HiDream-O1-Image"],
+        model_detectors=[lambda hf_id: "hidream-o1-image" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=Hunyuan3DSamplingParams,
