@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
     ModelOptNvFp4FusedMoEMethod,
 )
+from sglang.srt.utils.common import get_device
 
 # chunk to avoid too high GPU memory peak
 CHUNK_NUMEL = 64 * 1024 * 1024
@@ -102,7 +103,7 @@ class Fp8BlockComparable(ComparableWeight):
     def iter_chunks(self):
         s, block_size = self._scale_and_block_size()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
-            q, s_chunk = q.cuda(), s_chunk.cuda()
+            q, s_chunk = q.to(get_device()), s_chunk.to(get_device())
             if self.is_shuffled:
                 q = unshuffle_fp8_weight(q)
             yield (
@@ -132,7 +133,7 @@ class RawComparable(ComparableWeight):
     def iter_chunks(self):
         flat = self.tensor.reshape(-1)
         for start in range(0, flat.numel(), CHUNK_NUMEL):
-            yield flat[start : start + CHUNK_NUMEL].cuda(), None
+            yield flat[start : start + CHUNK_NUMEL].to(get_device()), None
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
