@@ -375,11 +375,12 @@ class EagerRunner(BaseRunner):
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         with cp_shard_model_inputs(
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
@@ -422,7 +423,7 @@ class EagerRunner(BaseRunner):
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
-            forward_batch.input_ids,
+            input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
