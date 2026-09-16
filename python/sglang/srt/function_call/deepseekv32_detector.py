@@ -94,6 +94,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return self.bot_token in text or "<｜DSML｜invoke" in text
 
     @staticmethod
+    def _text_before_dsml(text: str) -> str:
+        """Prose preceding the first DSML tag, with the trailing blank line the
+        chat template inserts before a tool call removed."""
+        idx = text.find("｜DSML｜")
+        if idx == -1:
+            return text
+        if idx >= 2 and text[idx - 2 : idx] == "</":
+            idx -= 2
+        elif idx >= 1 and text[idx - 1] == "<":
+            idx -= 1
+        return text[:idx].removesuffix("\n\n")
+
+    @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
         """Returns (name, body, is_complete) for an invoke_regex match.
 
@@ -184,7 +197,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     func_name, invoke_content, _ = self._unpack_invoke_match(
                         invoke_match
                     )
-                    func_args = self._parse_parameters_from_xml(invoke_content)
+                    try:
+                        func_args = self._parse_parameters_from_xml(invoke_content)
+                    except ValueError as e:
+                        logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
+                        continue
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
@@ -195,8 +212,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+            # Fail closed: keep the prose, never surface DSML as content.
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
@@ -224,7 +241,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             and not potentially_dsml
             and not ends_with_prefix
         ):
-            self._buffer = ""
+            # Trailing whitespace may be the blank line ahead of a DSML block;
+            # hold it so it is trimmed with the preamble or dropped with the block.
+            stripped = current_text.rstrip()
+            if not stripped:
+                return StreamingParseResult()
+            self._buffer = current_text[len(stripped) :]
+            current_text = stripped
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
@@ -252,19 +275,28 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not is_tool_end:
                     break
 
-                current_params = self._parse_parameters_from_xml(invoke_content)
-
-                # Initialize state if this is the first tool call
+                # Initialize state on the first complete invoke, malformed or
+                # not: the preamble is released once and the trailing DSML is
+                # withheld by finish() either way.
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+                    self.streamed_args_for_tool = []
                     call_start = invoke_match.start()
                     bot_pos = current_text.rfind(self.bot_token, 0, call_start)
                     if bot_pos != -1:
                         call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
                     preamble = current_text[:call_start].removesuffix("\n\n")
+
+                try:
+                    current_params = self._parse_parameters_from_xml(invoke_content)
+                except ValueError as e:
+                    # Fail closed: drop this invoke, keep going for the next one.
+                    logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
+                    self._buffer = current_text[invoke_match.end() :]
+                    current_text = self._buffer
+                    continue
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -297,14 +329,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Re-emit verbatim rather than swallowing the turn; the preamble is
-            # still inside current_text unless a completed call advanced past it.
-            # Calls are dropped on purpose: the failure can land between a tool's
-            # name and its arguments, and a half-formed call is worse than none.
+            # Fail closed: drop the buffer, keep any prose ahead of the DSML,
+            # and never surface DSML as content.
             self._buffer = ""
-            if not current_text.startswith(preamble):
-                current_text = preamble + current_text
-            return StreamingParseResult(normal_text=current_text, calls=all_calls)
+            if self.current_tool_id == -1:
+                preamble = self._text_before_dsml(current_text)
+            return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
         if not self._buffer:
@@ -315,15 +345,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.current_tool_id != -1:
             return StreamingParseResult()
 
-        starts = [
-            index
-            for marker in (self.bot_token, "<｜DSML｜invoke")
-            if (index := buffered.find(marker)) != -1
-        ]
-        normal_text = (
-            buffered[: min(starts)].removesuffix("\n\n") if starts else buffered
-        )
-        return StreamingParseResult(normal_text=normal_text)
+        return StreamingParseResult(normal_text=self._text_before_dsml(buffered))
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
