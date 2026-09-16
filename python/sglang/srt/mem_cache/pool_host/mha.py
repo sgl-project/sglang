@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
+    can_use_page_unified_write_back_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
@@ -20,6 +21,9 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_all_layer_staged_lf_page_unified as jit_transfer_hicache_all_layer_staged_lf_page_unified,
+)
+from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_staged_lf_pf as jit_transfer_hicache_all_layer_staged_lf_pf,
 )
 from sglang.kernels.ops.kvcache.hicache import (
@@ -27,6 +31,9 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+)
+from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_one_layer_page_unified_lf as jit_transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
@@ -39,6 +46,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -84,9 +92,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         mtp_draft_device_pools: Sequence[MHATokenToKVPool] = (),
         pool_label: str = "kv",
+        head_group_num: int = 1,
     ):
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
         self.target_layer_num = device_pool.layer_num
+        # page_unified cuts the kv-head axis into this many groups, and the cut
+        # is part of the byte order, so it has to be known before the buffer is
+        # allocated in init_kv_buffer() below.
+        self.head_group_num = head_group_num
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -107,7 +120,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
+        if self.layout == "page_unified":
+            # No per-component per-layer view exists: a layer's K and V are
+            # interleaved inside each head group's block. The page_unified
+            # transfer kernels address the fused buffer directly instead.
+            self.k_data_refs = []
+            self.v_data_refs = []
+        elif self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)
@@ -117,15 +136,23 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = make_kernel_ptr_table(
-            self.k_data_refs,
-            self.device_pool.device,
-            host_memory_registered=self.pin_memory,
+        self.k_data_ptrs = (
+            make_kernel_ptr_table(
+                self.k_data_refs,
+                self.device_pool.device,
+                host_memory_registered=self.pin_memory,
+            )
+            if self.k_data_refs
+            else None
         )
-        self.v_data_ptrs = make_kernel_ptr_table(
-            self.v_data_refs,
-            self.device_pool.device,
-            host_memory_registered=self.pin_memory,
+        self.v_data_ptrs = (
+            make_kernel_ptr_table(
+                self.v_data_refs,
+                self.device_pool.device,
+                host_memory_registered=self.pin_memory,
+            )
+            if self.v_data_refs
+            else None
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -183,6 +210,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.head_dim,
             )
+        elif self.layout == "page_unified":
+            self.page_unified_layout = PageUnifiedLayout(
+                page_size=self.page_size,
+                layer_num=self.layer_num,
+                head_num=self.head_num,
+                head_group_num=self.head_group_num,
+                head_dim=self.head_dim,
+                itemsize=self.dtype.itemsize,
+            )
+            dims = self.page_unified_layout.page_dims(self.page_num)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
@@ -196,20 +233,65 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
             registration_granularity_bytes=(
-                self.page_size * self.layout_dim
+                # page_unified's block carries both components, so its page is
+                # twice page_size * layout_dim.
+                self.page_unified_layout.bytes_per_page
+                if self.layout == "page_unified"
+                else self.page_size * self.layout_dim
                 if self.layout in ("page_first", "page_first_direct")
                 else None
             ),
         )
         return buffer
 
+    def _page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """Page ids of a page-aligned transfer's token runs.
+
+        The page-unified write-back addresses whole pages. Write-back is only
+        ever issued for complete pages, so taking every page_size-th token is
+        the page list, not a subsample.
+        """
+        return token_indices[:: self.page_size] // self.page_size
+
+    def _init_page_unified_staging(self) -> None:
+        """Device-side scratch the write-back relayouts into before the D2H.
+
+        Sized in whole pages: the copy that follows moves one contiguous page
+        block per page, which is what keeps it on the copy engine.
+        """
+        geometry = self.page_unified_layout
+        self.can_use_write_back_jit = (
+            _is_cuda or _is_hip
+        ) and can_use_page_unified_write_back_jit_kernel(
+            group_bytes=geometry.group_bytes
+        )
+        if not self.can_use_write_back_jit:
+            raise ValueError(
+                "the 'page_unified' host layout requires the staged "
+                "write-back JIT kernel, which could not be built for a "
+                f"{geometry.group_bytes}-byte head-group row."
+            )
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_buffer = torch.empty(
+            geometry.page_dims(self.staging_page_capacity),
+            dtype=self.dtype,
+            device=self.device_pool.device,
+        )
+
     def _init_write_back_staging_buffers(self):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
+        self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if _is_npu or _is_xpu or _is_mps:
+            return
+        if self.layout == "page_unified":
+            self._init_page_unified_staging()
+            return
+        if self.layout != "page_first":
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
@@ -311,6 +393,17 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
                     )
+            elif self.layout == "page_unified":
+                # Both directions read one byte order, so a loaded page is the
+                # page the write-back left, whichever side produced it.
+                jit_transfer_hicache_one_layer_page_unified_lf(
+                    device_pool.k_buffer[device_layer_id],
+                    device_pool.v_buffer[device_layer_id],
+                    self.kv_buffer,
+                    host_indices,
+                    device_indices,
+                    host_layer_id,
+                )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -461,6 +554,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
                     )
+            elif self.layout == "page_unified":
+                jit_transfer_hicache_all_layer_staged_lf_page_unified(
+                    device_k_data_ptrs,
+                    device_v_data_ptrs,
+                    self._page_ids(device_indices),
+                    self._page_ids(host_indices),
+                    self.staging_buffer,
+                    self.kv_buffer,
+                )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_k_data_ptrs,

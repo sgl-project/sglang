@@ -38,6 +38,10 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Unified key scheme: the topology-free chunk coordinates this rank owns,
+    # layer-major / head-minor. When set, backends MUST key objects by these
+    # instead of by the writer's rank.
+    unified_suffixes: Optional[List[str]] = None
 
 
 @dataclass
@@ -371,32 +375,45 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
+    def _init_config_suffix(self, storage_config: HiCacheStorageConfig) -> None:
+        """Derive the per-deployment key suffix from the storage config."""
+        if storage_config.unified_suffixes is not None:
+            # The chunk coordinate replaces the whole rank/pp/cp suffix family;
+            # model identity lives inside the namespace digest. This backend
+            # stores one object per page, so a fan-out plan is refused here
+            # rather than silently storing only its first chunk.
+            if len(storage_config.unified_suffixes) != 1:
+                raise NotImplementedError(
+                    f"the file backend stores one object per page, so it cannot "
+                    f"serve a {len(storage_config.unified_suffixes)}-chunk "
+                    f"unified grid; drop --hicache-storage-head-group and "
+                    f"--hicache-storage-layer-partition, or use mooncake."
+                )
+            self.config_suffix = f"_{storage_config.unified_suffixes[0]}"
+            return
+        model_name = storage_config.model_name
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        self.config_suffix = f"_{model_name}"
+        if not storage_config.is_mla_model:
+            self.config_suffix += f"_{storage_config.tp_rank}_{storage_config.tp_size}"
+        if storage_config.pp_size > 1:
+            self.config_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+        # Under NSA context parallel each CP rank holds a disjoint slice of
+        # every page, so give each rank its own file key to avoid a cross-rank
+        # write race.
+        if storage_config.attn_cp_size > 1:
+            self.config_suffix += (
+                f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+            )
+
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
-        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
-            storage_config.tp_rank,
-            storage_config.tp_size,
-            storage_config.pp_rank,
-            storage_config.pp_size,
-            storage_config.model_name,
-            storage_config.is_mla_model,
-        )
+        self._init_config_suffix(storage_config)
+        tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-        attn_cp_size = storage_config.attn_cp_size
-        model_name = "-".join(model_name.split("/")) if model_name else ""
-        enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -436,7 +453,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_mla_model=storage_config.is_mla_model,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
