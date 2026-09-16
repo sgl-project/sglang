@@ -50,6 +50,8 @@ def _manager() -> TokenizerManager:
     manager.elastic_pending_ep_size = None
     manager.elastic_scale_phase = "idle"
     manager.elastic_last_error = None
+    manager.elastic_runtime_health = "healthy"
+    manager.elastic_runtime_error = None
     manager.elastic_joining_rank_offset = None
     manager.elastic_joining_rank_count = 0
     manager.elastic_ready_rank_count = 0
@@ -242,6 +244,41 @@ class TestElasticEPLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["target_ep_size"], 8)
         manager.scale_elastic_ep_communicator.assert_awaited_once()
 
+    async def test_recovery_failure_does_not_overwrite_completed_operation(self):
+        manager = _manager()
+        request = ScaleElasticEPReqInput(new_ep_size=8, operation_id="grow-1")
+        await manager.scale_elastic_ep(request)
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=True,
+                effective_ep_size=8,
+                operation_id="grow-1",
+                scale_phase="serving_expanded",
+            )
+        )
+
+        manager.forward_elastic_scale_update(
+            ElasticScaleUpdateReq(
+                success=False,
+                terminal=False,
+                effective_ep_size=8,
+                operation_update=False,
+                runtime_health="recovery_unsupported",
+                runtime_error="rank recovery requires a restart",
+            )
+        )
+
+        retry = await manager.scale_elastic_ep(request)
+        status = manager.get_elastic_ep_state()
+        self.assertTrue(retry.success)
+        self.assertTrue(retry.terminal)
+        self.assertEqual(status["operation_id"], "grow-1")
+        self.assertTrue(status["operation_succeeded"])
+        self.assertEqual(status["scale_phase"], "serving_expanded")
+        self.assertIsNone(status["last_error"])
+        self.assertEqual(status["runtime_health"], "recovery_unsupported")
+        self.assertEqual(status["runtime_error"], "rank recovery requires a restart")
+
 
 class TestElasticEPCohortBinding(unittest.TestCase):
     def test_cohort_inherits_operation_and_runtime_identity(self):
@@ -388,6 +425,45 @@ class TestElasticEPSchedulerIdempotency(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.conflict)
         self.assertIn("already targets EP size 8", result.message)
+
+    def test_recovery_failure_preserves_completed_operation_result(self):
+        state = ElasticEPState(
+            active_ranks=None,
+            last_active_ranks=None,
+            active_ranks_cpu=None,
+            effective_ep_size=4,
+            pending_ep_size=8,
+            scale_phase="syncing_new_world",
+            runtime_instance_id="runtime-1",
+            operation_id="grow-1",
+            operation_target_ep_size=8,
+            operation_expected_joining_member_ids=[],
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        request = ScaleElasticEPReqInput(
+            new_ep_size=8,
+            operation_id="grow-1",
+            runtime_instance_id="runtime-1",
+        )
+
+        with (
+            patch.object(ElasticEPStateManager, "_instance", state),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(max_ep_size=16),
+            ),
+        ):
+            ElasticEPStateManager.commit_scale()
+            ElasticEPStateManager.fail_recovery("rank recovery requires a restart")
+            result = scheduler.handle_scale_elastic_ep(request)
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.terminal)
+        self.assertEqual(result.scale_phase, "serving_expanded")
+        self.assertEqual(state.runtime_health, "recovery_unsupported")
+        self.assertEqual(state.runtime_error, "rank recovery requires a restart")
+        self.assertTrue(state.operation_succeeded)
+        self.assertIsNone(state.last_error)
 
 
 if __name__ == "__main__":
