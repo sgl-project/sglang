@@ -1,5 +1,7 @@
 """C2 graph-padding rows must leave every destination untouched."""
 
+import sys
+
 import pytest
 import torch
 
@@ -36,3 +38,7 @@ def test_padded_even_and_odd_rows_are_inert() -> None:
 
     assert torch.equal(result, out_before)
     assert torch.equal(kv_state, state_before)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
