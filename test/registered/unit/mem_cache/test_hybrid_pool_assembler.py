@@ -183,8 +183,11 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
+        seen_prefixes = []
+
         class FailingStorage:
-            def batch_get_v2(self, transfers):
+            def batch_get_v2(self, transfers, *, extra_info=None):
+                seen_prefixes.append(extra_info.prefix_keys)
                 raise ValueError("sidecar read failed")
 
         self.addCleanup(reset_context)
@@ -204,6 +207,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                     pool_transfers=[PoolTransfer(name=PoolName.SWA)],
                 )
                 operation.hash_value = ["h0"]
+                operation.prefix_keys = ["prefix"]
                 if unified:
                     with self.assertLogs(level="ERROR"):
                         cc._page_transfer_sidecar(operation, kv_completed_pages=1)
@@ -214,6 +218,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "sidecar read failed"):
                         cc._page_transfer_sidecar(operation, kv_completed_pages=1)
                 self.assertTrue(cc.prefetch_sync_queue.empty())
+        self.assertEqual(seen_prefixes, [["prefix"], ["prefix"]])
 
     def test_shorter_prefetch_reserves_full_and_swa_without_mutating_probe_keys(self):
         page_size = 4
