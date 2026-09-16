@@ -5,11 +5,11 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import torch_quant as tq
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
