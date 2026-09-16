@@ -142,6 +142,8 @@ elif phase == 'probe':
     source = pathlib.Path(args[args.index('--source') + 1])
     assert os.environ['PATH'].split(os.pathsep)[0] == str(pathlib.Path(sys.argv[0]).parent)
     assert os.environ['PYTHONPATH'] == str(source / 'python')
+    assert os.environ.get('PYTHONDONTWRITEBYTECODE') is None
+    assert pathlib.Path(os.environ['PYTHONPYCACHEPREFIX']).is_dir()
     assert os.environ['SGLANG_RUST_BUILD_MODE'] == 'auto'
     output = pathlib.Path(args[args.index('--output') + 1])
     arguments = dict(zip(args[1::2], args[2::2]))
@@ -204,6 +206,18 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
         Some(&plan.python)
     );
     let server = first.server(&fixture.config.server);
+    assert_eq!(
+        server.env["PYTHONPYCACHEPREFIX"],
+        plan.environment_dir
+            .with_extension("pycache")
+            .to_str()
+            .unwrap()
+    );
+    assert!(!server.env.contains_key("PYTHONDONTWRITEBYTECODE"));
+    assert_eq!(
+        first.record["bytecode_cache"],
+        server.env["PYTHONPYCACHEPREFIX"]
+    );
     let mut paths = std::env::split_paths(&server.env["PATH"]);
     assert_eq!(paths.next().as_deref(), plan.python.parent());
     assert_eq!(
@@ -217,6 +231,10 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
         .await
         .unwrap();
     assert_eq!(reused.record["reused"], true);
+    assert_eq!(
+        reused.environment["PYTHONPYCACHEPREFIX"],
+        server.env["PYTHONPYCACHEPREFIX"]
+    );
     assert_eq!(
         fixture.phases(),
         ["venv", "sync", "install", "probe", "probe"]
@@ -267,6 +285,61 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn bytecode_is_reused_without_writing_into_an_external_environment() {
+    let mut fixture = Fixture::new();
+    let external = fixture.directory.path().join("external");
+    fs::create_dir(&external).unwrap();
+    let python = external.join("python");
+    fs::write(&python, TOOL).unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.config.server.python = Some(python);
+    let module = external.join("sample.py");
+    fs::write(&module, "value = 42\n").unwrap();
+    let plan = describe(&fixture.config).unwrap();
+    let prepared = prepare(&fixture.config, &plan, &fixture.output("external-run"))
+        .await
+        .unwrap();
+    assert_eq!(fixture.phases(), ["probe"]);
+    let import = |reuse: bool| {
+        let output = command("python3", &prepared.environment)
+            .args([
+                "-c",
+                r#"
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('sample', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+if sys.argv[2] == 'true':
+    def unexpected_compile(*args, **kwargs):
+        raise AssertionError('cached import recompiled source')
+    spec.loader.source_to_code = unexpected_compile
+spec.loader.exec_module(module)
+print(json.dumps({'value': module.value, 'cache': module.__cached__}))
+"#,
+            ])
+            .arg(&module)
+            .arg(reuse.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let first = import(false);
+    let cache = Path::new(first["cache"].as_str().unwrap());
+    assert!(cache.is_file());
+    assert!(cache.starts_with(&prepared.environment["PYTHONPYCACHEPREFIX"]));
+    assert_eq!(import(true), first);
+    // Source changes invalidate the cache instead of preserving stale values.
+    fs::write(&module, "value = 123\n").unwrap();
+    assert_eq!(import(false)["value"], 123);
+    assert!(!external.join("__pycache__").exists());
+    assert!(!plan.source_snapshot.join("python/__pycache__").exists());
 }
 
 #[tokio::test]

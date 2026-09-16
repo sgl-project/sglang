@@ -579,7 +579,14 @@ pub(crate) async fn prepare_environment(
     );
     environment.insert("PYTHONSAFEPATH".into(), "1".into());
     environment.insert("PYTHONNOUSERSITE".into(), "1".into());
-    environment.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    // Warm bytecode during verification and reuse it in each service process.
+    // Keep generated files outside the pinned source and user-owned interpreters.
+    let bytecode_cache = plan.environment_dir.with_extension("pycache");
+    fs::create_dir_all(&bytecode_cache).map_err(|e| e.to_string())?;
+    environment.insert(
+        "PYTHONPYCACHEPREFIX".into(),
+        bytecode_cache.to_string_lossy().into_owned(),
+    );
     environment.insert("SGLANG_RUST_BUILD_MODE".into(), "auto".into());
     environment
         .entry("SGLANG_CACHE_DIR".into())
@@ -752,7 +759,7 @@ pub(crate) async fn prepare_environment(
             ));
         }
     }
-    let record = json!({"plan": plan, "uv_version": plan.managed.then_some(&plan.profile.uv), "reused": reused, "probe": probe});
+    let record = json!({"plan": plan, "uv_version": plan.managed.then_some(&plan.profile.uv), "reused": reused, "probe": probe, "bytecode_cache": bytecode_cache});
     if plan.managed && !reused {
         let pending = ready.with_extension("pending");
         fs::write(

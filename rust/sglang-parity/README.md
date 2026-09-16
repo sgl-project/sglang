@@ -284,6 +284,15 @@ the tested source.
 Environments are keyed by source commit, profile, lock digest, and shared build
 settings. Source and environment leases serialize reuse and remain held through
 both implementations.
+Python bytecode is stored in a sibling `<installation-key>.pycache` directory via
+`PYTHONPYCACHEPREFIX`. Environment verification warms the modules it imports;
+later service processes reuse them and cache additional modules on first import.
+The cache shares the installation's commit, Python, dependency and build identity,
+and Python validates cached files against their source before reuse. This also
+accelerates existing installations without reinstalling packages. Source snapshots
+and user-provided Python environments receive no bytecode files. Removing the
+bytecode directory only causes it to be regenerated. Its path is recorded in
+`environment.json`; `--describe` does not create it.
 The venv is created at its final path; only successful verification writes the
 completion marker. The next attempt rebuilds an incomplete managed venv.
 Completed environments are validated without reinstalling dependencies; failed
