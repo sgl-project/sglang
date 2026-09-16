@@ -546,7 +546,46 @@ class TestLowRatioPrepareStreams(CustomTestCase):
         self.assertIs(call[4], pos)
 
     def test_graph_replay_joins_kv_and_source_streams(self):
+        from unittest.mock import patch
+
+        from sglang.srt.environ import envs
         from sglang.srt.models.deepseek_v4 import MQALayer
+        from sglang.srt.runtime_context import get_parallel
+
+        config = SimpleNamespace(
+            model_type="deepseek_v41",
+            hidden_size=32,
+            head_dim=128,
+            qk_rope_head_dim=64,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            o_groups=1,
+            q_lora_rank=32,
+            o_lora_rank=32,
+            max_position_embeddings=128,
+            compress_ratios=[2],
+            rope_scaling={"original_max_position_embeddings": 128, "factor": 1.0},
+            rope_theta=10000,
+            compress_rope_theta=40000,
+            rms_norm_eps=1e-6,
+            q_head_norm=True,
+            kv_source_layer_ids=[],
+            index_source_layer_ids=[],
+        )
+        with (
+            get_parallel().override(
+                tp_size=1, tp_rank=0, attn_tp_rank=0, attn_tp_size=1
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_device",
+                return_value=SimpleNamespace(device="cuda"),
+            ),
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(True),
+            envs.SGLANG_OPT_FUSE_WQA_WKV.override(True),
+        ):
+            layer = MQALayer(
+                config, 0, alt_streams=[torch.cuda.Stream(), torch.cuda.Stream()]
+            )
 
         x = torch.randn(6, 32, device="cuda")
         compressed, indexed, kv = (torch.empty_like(x) for _ in range(3))
@@ -557,17 +596,13 @@ class TestLowRatioPrepareStreams(CustomTestCase):
             if run_indexer:
                 indexed.copy_(compressed + q_lora)
 
-        layer = SimpleNamespace(
-            alt_streams=[torch.cuda.Stream(), torch.cuda.Stream()],
-            compressor=object(),
-            indexer=object(),
-            fuse_wqa_wkv=True,
-            wqkv_a=lambda x: (x * 4, None),
-            _compute_q_a=lambda x, **kw: (x + 1, x + 1),
-            _compute_q_b=lambda q, positions, q_out: q * 3,
-            _compute_kv_to_cache=lambda x, positions, batch, backend, qkv_a: kv.copy_(
-                qkv_a + 5
-            ),
+        layer.compressor = object()
+        layer.indexer = object()
+        layer.wqkv_a.forward = lambda x: (x * 4, None)
+        layer._compute_q_a = lambda x, **kw: (x + 1, x + 1)
+        layer._compute_q_b = lambda q, positions, q_out: q * 3
+        layer._compute_kv_to_cache = lambda x, positions, batch, backend, qkv_a: (
+            kv.copy_(qkv_a + 5)
         )
         backend = SimpleNamespace(forward_low_ratio_sources=sources)
 
