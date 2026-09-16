@@ -2076,6 +2076,20 @@ class ModelRunner:
             error=error,
         )
 
+    def _report_elastic_runtime_health(self, error: str, effective_size: int) -> None:
+        if self.ps.tp_rank != 0 or get_exec().moe.is_ep_scale_joiner:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+            success=False,
+            terminal=False,
+            effective_ep_size=effective_size,
+            operation_update=False,
+            runtime_health=ElasticEPStateManager.get_runtime_health(),
+            runtime_error=error,
+        )
+
     def _elastic_scale_ready_barrier(self, target_size: int, log_tag: str) -> None:
         if self.ps.tp_rank == 0:
             logger.debug(
@@ -2203,7 +2217,7 @@ class ModelRunner:
                     "Restart the expanded deployment."
                 )
                 ElasticEPStateManager.fail_recovery(error)
-                self._report_elastic_scale_failure(error, effective_size)
+                self._report_elastic_runtime_health(error, effective_size)
                 if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
                     logger.error("[Elastic EP] %s", error)
                 return
