@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -163,6 +164,22 @@ def build_kv_host_pool(
         pool_label=pool_label,
         **kwargs,
     )
+
+
+def _mamba_host_ratio() -> float:
+    # Host Mamba pool / device Mamba pool: the KV host ratio times a Mamba-only
+    # scale, so state capacity can grow without over-provisioning host KV.
+    return get_memory().hicache_ratio * envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.get()
+
+
+def _rebalance_mamba_host_size(
+    kv_host_size: float, mamba_host_size: float
+) -> tuple[float, float]:
+    # --hicache-size is a byte budget split by device pool size. Apply the Mamba
+    # scale inside that budget: the extra state bytes come out of the KV share.
+    extra = mamba_host_size * (envs.SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE.get() - 1.0)
+    extra = min(extra, kv_host_size)
+    return kv_host_size - extra, mamba_host_size + extra
 
 
 def _split_hicache_size(
@@ -862,6 +879,9 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+        kv_host_size, mamba_host_size = _rebalance_mamba_host_size(
+            kv_host_size, mamba_host_size
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -878,7 +898,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
@@ -963,6 +983,9 @@ def build_hybrid_mamba_swa_stack(
         kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
         )
+        kv_host_size, mamba_host_size = _rebalance_mamba_host_size(
+            kv_host_size, mamba_host_size
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
@@ -979,7 +1002,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,

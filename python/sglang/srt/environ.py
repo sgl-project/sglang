@@ -776,6 +776,8 @@ class Envs:
     # Exclusive tiering: also write a node's Mamba state to L3 right after its
     # host backup completes, not only when its KV is host-evicted.
     SGLANG_HICACHE_L3_MAMBA_EAGER_WRITE = EnvBool(False)
+    # Host Mamba-state pool = hicache_ratio * this scale * device Mamba pool.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO_SCALE = EnvFloat(1.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
