@@ -12,10 +12,6 @@ pub struct MmDispatch {
     pub enabled: bool,
     /// → MM worker pool (spawned via `Server.start_mm_workers`).
     pub tx: flume::Sender<MmRequest>,
-    /// Parked results. Purged here when a late result arrives for a request
-    /// that is no longer parked; otherwise it would leak, since only the
-    /// scheduler drain pops entries.
-    pub results: crate::multi_modality::result_store::MmResultStore,
 }
 
 /// Resolved once at boot from the scheduler's `server_args`.

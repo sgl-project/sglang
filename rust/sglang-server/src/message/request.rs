@@ -8,6 +8,7 @@ use bytes::Bytes;
 use itertools::izip;
 use serde::{Deserialize, de::DeserializeOwned};
 
+use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
@@ -467,6 +468,7 @@ impl GenerateBody {
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
                 mm: pack_mm(image_data, video_data, audio_data, processor_extensions),
+                mm_buffers: Vec::new(),
             },
         )
         .collect();
@@ -563,8 +565,10 @@ pub struct MmRequest {
 /// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
-    pub text: Option<String>,
-    pub input_ids: Option<Vec<i32>>,
+    /// The prompt ids with placeholders unexpanded. Always present by the
+    /// time a request reaches `Encoding`: the client's own, or the tokenizer
+    /// pool's (`Tokenizing { then: Encode }` runs first for a text prompt).
+    pub input_ids: TokenIds,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
@@ -589,12 +593,14 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
-/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
-/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+/// One to_scheduler channel entry: the scalar `header` (msgpack; `input_ids`
+/// and `token_ids_logprob` left nil) plus every non-scalar payload as a named
+/// [`Buffer`], so nothing big goes through msgpack and nothing is copied on
+/// the way to the drain. Empty for control requests.
 #[derive(Debug)]
 pub struct SchedulerRequest {
     pub header: Bytes,
-    pub ids: Bytes,
+    pub buffers: Vec<Buffer>,
 }
 
 /// Request variant — selects the request branch, scheduler wire message, and
@@ -663,6 +669,7 @@ pub struct GenerateRequest {
     pub top_logprobs_num: i64,
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
+    /// Rides the ring as the `token_ids_logprob` buffer, nil in the header.
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
     pub return_hidden_states: bool,
@@ -689,6 +696,10 @@ pub struct GenerateRequest {
     /// scheduler header. Boxed so the common text-only request doesn't grow
     /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
+    /// What the MM worker produced (`MmEncoded`): the feature tensors and their
+    /// per-item metadata, already placed inline or in shm. Pushed to the ring
+    /// with the request by [`take_buffers`](Self::take_buffers).
+    pub mm_buffers: Vec<Buffer>,
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
@@ -731,13 +742,12 @@ impl GenerateRequest {
         })
     }
 
-    /// Carve out the MM worker's inputs: `text` is cloned (the scheduler header
-    /// still needs it), `input_ids` is taken (the expanded ids replace it), and
-    /// the mm values move wholesale.
+    /// Carve out the MM worker's inputs: `input_ids` is taken (the expanded
+    /// ids replace it) and the mm values move wholesale. `text` stays — the
+    /// scheduler header still needs it, and the worker does not.
     pub fn take_mm_work(&mut self) -> MmWorkItem {
         let mut work = MmWorkItem {
-            text: self.text.clone(),
-            input_ids: self.input_ids.take(),
+            input_ids: self.input_ids.take().unwrap_or_default(),
             ..Default::default()
         };
         if let Some(m) = self.mm.as_deref_mut() {
@@ -755,16 +765,22 @@ impl GenerateRequest {
         TokenizedGenerateReqInput::from(self).encode()
     }
 
-    /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the to-scheduler channel outside
-    /// msgpack). Empty when not tokenized.
-    pub fn encode_data_buf(&self) -> Bytes {
-        let ids = self.input_ids.as_deref().unwrap_or(&[]);
-        let mut buf = Vec::with_capacity(ids.len() * 8);
-        for &id in ids {
-            buf.extend_from_slice(&(id as i64).to_le_bytes());
+    /// Every non-scalar payload as a named buffer, in the shape the Python
+    /// drain attaches: `input_ids` (already the scheduler's int64),
+    /// `token_ids_logprob` when present, then whatever the MM worker left in
+    /// `mm_buffers`. Pure moves — no id is read here, and the header, the last
+    /// thing built from this request, never carries them.
+    pub fn take_buffers(&mut self) -> Vec<Buffer> {
+        let mut buffers = Vec::with_capacity(2 + self.mm_buffers.len());
+        buffers.push(Buffer::inline(
+            "input_ids",
+            self.input_ids.take().unwrap_or_default(),
+        ));
+        if let Some(ids) = self.token_ids_logprob.take() {
+            buffers.push(Buffer::inline("token_ids_logprob", ids));
         }
-        Bytes::from(buf)
+        buffers.append(&mut self.mm_buffers);
+        buffers
     }
 }
 
@@ -792,7 +808,7 @@ impl HeapBytes for String {
 }
 impl HeapBytes for TokenIds {
     fn heap_bytes(&self) -> usize {
-        self.len() * std::mem::size_of::<i32>()
+        self.len() * std::mem::size_of::<i64>()
     }
 }
 impl<T: HeapBytes> HeapBytes for Option<T> {
@@ -1216,20 +1232,28 @@ mod tests {
         }
     }
 
-    /// `take_mm_work` clones `text` (the scheduler header still needs it) and
-    /// moves everything the worker owns out of the request.
+    /// `take_mm_work` takes `input_ids` (the expanded ids replace them) and
+    /// moves everything the worker owns out of the request. `text` is not part
+    /// of the work item: a text prompt reaches `Encoding` already tokenized.
     #[test]
     fn mm_work_item_takes_owned_fields() {
         let (mut ps, _) =
-            requests(r#"{"text": "hi", "image_data": ["u1", "u2"], "audio_data": "a"}"#).unwrap();
+            requests(r#"{"input_ids": [7, 1, 8], "image_data": ["u1", "u2"], "audio_data": "a"}"#)
+                .unwrap();
         let work = ps[0].take_mm_work();
-        assert_eq!(work.text.as_deref(), Some("hi"));
-        assert!(work.input_ids.is_none());
+        assert_eq!(work.input_ids, vec![7, 1, 8]);
         assert_eq!(work.image_data.len(), 2);
         assert!(work.video_data.is_empty());
         assert_eq!(work.audio_data, vec![MmItem::Source("a".into())]);
-        // Moved out, not cloned; `text` survives for the header.
+        // Moved out, not cloned.
+        assert!(ps[0].input_ids.is_none());
         assert!(ps[0].mm.as_ref().unwrap().image_data.is_empty());
+
+        // A text prompt keeps its text for the scheduler header; the worker
+        // gets whatever ids the tokenizer pool filled in.
+        let (mut ps, _) = requests(r#"{"text": "hi", "image_data": "u"}"#).unwrap();
+        ps[0].input_ids = Some(vec![9]);
+        assert_eq!(ps[0].take_mm_work().input_ids, vec![9]);
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 

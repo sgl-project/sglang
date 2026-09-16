@@ -2,6 +2,7 @@
 //! abort lane ([`AbortSource`]), the producer-side handles ([`Senders`]), and
 //! the shutdown-aware [`recv`].
 
+use crate::message::buffers::Buffer;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::request::Request;
@@ -24,9 +25,14 @@ pub enum TmEvent {
     /// on success, or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
     /// An MM worker finished a request parked in `Encoding`: `input_ids` are the
-    /// final placeholder-expanded prompt ids. The buffers ride the rid-keyed
-    /// result store (`Server.take_mm_result`), not this event.
-    MmEncoded { rid: Rid, input_ids: Vec<i32> },
+    /// final placeholder-expanded prompt ids; `buffers` the feature tensors and
+    /// per-item metadata, already placed (inline or shm), to ride the ring with
+    /// the request. Nobody parked: dropping them releases any shm.
+    MmEncoded {
+        rid: Rid,
+        input_ids: Vec<i64>,
+        buffers: Vec<Buffer>,
+    },
     /// An MM worker rejected a request parked in `Encoding` (bad media URL,
     /// unsupported modality, preprocess error, …).
     MmFailed { rid: Rid, message: String },

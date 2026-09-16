@@ -41,9 +41,6 @@ pub trait Runnable: Send + 'static {
 pub struct Runtime {
     pub to_scheduler_rx: ToSchedulerRx,
     pub from_scheduler_tx: FromSchedulerTx,
-    /// MM results parked between a worker's `MmEncoded` and the scheduler drain
-    /// (`Server.take_mm_result`).
-    pub mm_results: crate::multi_modality::result_store::MmResultStore,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
@@ -71,24 +68,23 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
-            spec,
-            self.mm_wiring.tokenizer.clone(),
-            self.mm_results.clone(),
-        )?);
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
 
+    /// Start the shared worker pool with a processor supplied by an external
+    /// model package. `feature_shm` is that package's `_use_feature_shm`
+    /// answer: place feature tensors in POSIX shm for the TP broadcast.
     pub fn start_mm_workers_with_processor(
         &self,
         processor: Arc<dyn crate::multi_modality::worker::MmProcessor>,
         workers: usize,
+        feature_shm: bool,
     ) {
         let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
             processor,
-            self.mm_wiring.tokenizer.clone(),
-            self.mm_results.clone(),
+            feature_shm,
         ));
         self.spawn_mm_pool(workers, ctx);
     }
@@ -179,14 +175,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
-    // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
-    // worker path (which encodes the placeholder-expanded prompt itself).
+    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
+    // never tokenize: a multimodal text prompt passes through the pool first.
     let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
-
-    // Shared: MM workers park, the Python drain pops.
-    let mm_results: crate::multi_modality::result_store::MmResultStore = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -274,7 +267,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
-            results: mm_results.clone(),
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
@@ -339,11 +331,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     Ok(Runtime {
         to_scheduler_rx,
         from_scheduler_tx,
-        mm_results,
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
-            tokenizer: text_tokenizer,
         },
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
