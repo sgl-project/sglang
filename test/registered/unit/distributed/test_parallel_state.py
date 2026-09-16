@@ -391,7 +391,8 @@ if __name__ == "__main__":
     import sys
 
     try:
-        test_parallel_group_construction_tp8_attn_cp2()
+        test_parallel_group_construction_tp8_attn_cp2(False)
+        test_parallel_group_construction_tp8_attn_cp2(True)
         test_parallel_group_construction_tp8_moe_ep4_cp2()
         test_group_desc_propagated_via_real_new_group("tp")
         test_group_desc_propagated_via_real_new_group("pp")
