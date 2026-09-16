@@ -264,7 +264,7 @@ void cutlass_w4a8_moe_mm_sm90(
     int64_t chunk_size,
     int64_t topk) {
   const c10::cuda::CUDAGuard device_guard(a_tensors.device());
-  // Match the model token, allowing descriptions such as "NVIDIA H200 SXM".
+  // Detect H200 devices, including names such as "NVIDIA H200 SXM".
   const std::string_view device_name(at::cuda::getCurrentDeviceProperties()->name);
   const auto model_pos = device_name.find("H200");
   const bool is_h200 = model_pos != std::string_view::npos && (model_pos == 0 || device_name[model_pos - 1] == ' ') &&
