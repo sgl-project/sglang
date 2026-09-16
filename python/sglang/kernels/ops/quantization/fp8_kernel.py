@@ -1707,9 +1707,8 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
-    # Only tuned configs that carry SWAP_AB / SPLIT_K (today the M=1 entries of the
-    # H200 [32, 32] files) take the Hopper kernel; split-K sums K in SPLIT_K fp32
-    # partials, so a row's low bits differ from the single-accumulator entries.
+    # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
+    # do not match the single-accumulator kernels bit-for-bit.
     hopper_tuned = get_platform().is_sm90 and (
         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
     )
