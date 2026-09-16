@@ -75,6 +75,19 @@ impl TokenizerRegistry {
             Err(e) => tracing::warn!(model = %m.id, error = %format!("{e:#}"),
                 "failed to load chat formatter; chat traffic routes via raw prompt text"),
         }
+        if m.disable_input_ids_forwarding {
+            tracing::info!(model = %m.id,
+                "router-generated input_ids forwarding disabled; workers tokenize messages; \
+                 routing tokenization remains available");
+        } else if me.has_chat_formatter(&m.id) {
+            tracing::warn!(model = %m.id,
+                "router-generated input_ids forwarding enabled: requires matching worker model \
+                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
+                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
+                 (including --tool-call-parser deepseekv32), content-format detection, and \
+                 conversation-template stop strings are not replicated. Use \
+                 --disable-input-ids-forwarding when these assumptions do not hold");
+        }
         Ok(me)
     }
 
@@ -155,6 +168,7 @@ mod tests {
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,

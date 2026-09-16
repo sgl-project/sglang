@@ -189,6 +189,22 @@ SGLang's request normalization, so forwarding is enabled shape by shape as
 parity is verified. Use matching model files on the router and workers; worker
 template overrides and default kwargs are not observable from the request.
 
+Set `--disable-input-ids-forwarding` for this router's model when worker-side
+rendering has not been verified to match. This disables router-generated IDs
+for every routing policy; cache-aware routing still renders and tokenizes
+locally, and the original messages reach the workers for engine processing.
+Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
+
+Forwarding logs its assumptions at startup. In particular, disable it for
+`SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
+worker parser overrides such as `--tool-call-parser deepseekv32` that select a
+native encoder over a shipped template, or conversation templates with stop
+strings (the engine's `input_ids` path skips those template stops). Also disable
+it for array-only VLM templates: dynamo-render can wrap string content into an
+array where the engine leaves the string unchanged. These worker settings are
+not inferred from the router's environment. Disabling forwarding preserves
+engine behavior but does not establish parity for local routing hashes.
+
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
 

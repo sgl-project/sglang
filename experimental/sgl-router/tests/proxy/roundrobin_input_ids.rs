@@ -16,12 +16,13 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
+use sgl_router::policies::{Policy, SelectionContext};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
-use std::sync::Arc;
+use sgl_router::workers::{Worker, WorkerRegistry};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -42,6 +43,7 @@ fn config() -> Config {
         model: ModelConfig {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -131,6 +133,162 @@ async fn round_robin_plain_chat_forwards_input_ids() {
         body.get("messages").is_some(),
         "messages must be retained alongside input_ids; got {body}"
     );
+}
+
+#[tokio::test]
+async fn forwarding_opt_out_preserves_messages_and_caller_ids() {
+    for policy in [PolicyKind::RoundRobin, PolicyKind::CacheAware] {
+        let mock = MockWorker::start(vec![]).await;
+        let mut cfg = config();
+        cfg.model.policy = policy;
+        cfg.model.cache_aware = (policy == PolicyKind::CacheAware).then(Default::default);
+        cfg.model.disable_input_ids_forwarding = true;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        let mut request = json!({"model": MODEL, "messages": [
+            {"role": "user", "content": "hello there friend"}
+        ]});
+        // The model opt-out must not disable rendering for prefix routing.
+        assert!(!ctx
+            .tokenizers
+            .encode_chat(MODEL, &request)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(captured(&mock), request);
+
+        request["input_ids"] = json!([42, 43]);
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            captured(&mock),
+            request,
+            "caller IDs are not router-generated"
+        );
+        assert!(!ctx
+            .metrics
+            .render()
+            .contains("sgl_router_ingress_tokenize_errors_total{"));
+    }
+}
+
+#[tokio::test]
+async fn forwarding_opt_out_keeps_ingress_tokens_for_routing() {
+    #[derive(Debug, Default)]
+    struct TokenObserver(Mutex<Option<Vec<u32>>>);
+    impl Policy for TokenObserver {
+        fn needs_request_tokens(&self) -> bool {
+            true
+        }
+
+        fn select(
+            &self,
+            workers: &[Arc<Worker>],
+            ctx: &SelectionContext<'_>,
+        ) -> Option<Arc<Worker>> {
+            *self.0.lock().unwrap() = ctx.request_tokens().map(<[u32]>::to_vec);
+            workers.first().cloned()
+        }
+    }
+
+    let mock = MockWorker::start(vec![]).await;
+    let mut cfg = config();
+    cfg.model.disable_input_ids_forwarding = true;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let observer = Arc::new(TokenObserver::default());
+    ctx.policies.insert(ModelId(MODEL.into()), observer.clone());
+    let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let expected = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    assert_eq!(send(ctx, request.clone()).await, StatusCode::OK);
+    assert_eq!(*observer.0.lock().unwrap(), Some(expected));
+    assert_eq!(captured(&mock), request);
+}
+
+/// A known parity gap: Dynamo wraps string content for array-only templates,
+/// while SGLang's content processor leaves strings unchanged. Record both
+/// outcomes and require the model opt-out to preserve the engine's input.
+#[tokio::test]
+async fn array_only_template_fixture_preserves_engine_processing_with_opt_out() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../fixtures/array_content_rendering.json")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": fixture["chat_template"]}).to_string(),
+    )
+    .unwrap();
+    for policy in [PolicyKind::RoundRobin, PolicyKind::CacheAware] {
+        let mock = MockWorker::start(vec![]).await;
+        let mut cfg = config();
+        cfg.model.policy = policy;
+        cfg.model.cache_aware = (policy == PolicyKind::CacheAware).then(Default::default);
+        cfg.model.tokenizer_path = tokenizer.to_str().unwrap().into();
+        cfg.model.disable_input_ids_forwarding = true;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut request = case["request"].clone();
+            request["model"] = MODEL.into();
+            let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+            let engine_ids: Vec<u32> =
+                serde_json::from_value(case["engine_token_ids"].clone()).unwrap();
+            if case["shape"] == "string" {
+                assert_ne!(
+                    ids, engine_ids,
+                    "string-to-array conversion changes the prompt"
+                );
+            } else {
+                assert_eq!(
+                    ids, engine_ids,
+                    "structured text matches the engine fixture"
+                );
+            }
+            assert_eq!(
+                send(Arc::clone(&ctx), request.clone()).await,
+                StatusCode::OK
+            );
+            assert_eq!(captured(&mock), request);
+        }
+        assert!(!ctx
+            .metrics
+            .render()
+            .contains("sgl_router_ingress_tokenize_errors_total{"));
+    }
+}
+
+#[tokio::test]
+async fn disabled_forwarding_does_not_count_routing_render_failures_as_offload_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": "{{ raise_exception('cannot render') }}"}).to_string(),
+    )
+    .unwrap();
+    let mock = MockWorker::start(vec![]).await;
+    let mut cfg = config();
+    cfg.model.policy = PolicyKind::CacheAware;
+    cfg.model.cache_aware = Some(Default::default());
+    cfg.model.tokenizer_path = tokenizer.to_str().unwrap().into();
+    cfg.model.disable_input_ids_forwarding = true;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    assert!(ctx.tokenizers.encode_chat(MODEL, &request).is_none());
+    assert_eq!(
+        send(Arc::clone(&ctx), request.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(captured(&mock), request);
+    assert!(!ctx
+        .metrics
+        .render()
+        .contains("sgl_router_ingress_tokenize_errors_total{"));
 }
 
 /// Even under round-robin, a tool request omits `input_ids` (the safe predicate

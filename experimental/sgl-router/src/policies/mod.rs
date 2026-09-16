@@ -510,14 +510,10 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     }
 
     /// Whether this policy's routing decision needs request tokens (i.e.
-    /// it routes by prompt prefix). Ingress tokenization itself is no longer
-    /// gated on this — that is a model property (`has_chat_formatter`) decided at
-    /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
-    /// keeps the cache-aware policy's RAW-prompt routing path alive: a
-    /// cache-aware model with no chat formatter still wants its `/v1/completions`
-    /// /`text` prompt tokenized for tree matching, which `has_chat_formatter`
-    /// alone would not trigger. Default `false` for load-only and sticky
-    /// routes; only the cache-aware policy overrides it.
+    /// it routes by prompt prefix). This keeps routing tokenization active when
+    /// generated input-ID forwarding is disabled or no chat formatter exists.
+    /// Models with forwarding enabled also tokenize independently of this flag.
+    /// Default `false` for load-only and sticky routes.
     fn needs_request_tokens(&self) -> bool {
         false
     }

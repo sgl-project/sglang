@@ -507,7 +507,7 @@ pub async fn chat_completions(
     // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * `has_chat_formatter` -> a chat request on this model yields
+    //   * Forwarding is enabled and `has_chat_formatter` -> a chat request yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
@@ -523,8 +523,10 @@ pub async fn chat_completions(
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
+    let can_forward_input_ids = !ctx.config.model.disable_input_ids_forwarding
+        && ctx.tokenizers.has_chat_formatter(&model_str);
     let want_tokens = should_tokenize_request(
-        ctx.tokenizers.has_chat_formatter(&model_str),
+        can_forward_input_ids,
         policy.needs_request_tokens(),
         ctx.bucket_selector.is_enabled(),
     );
@@ -798,8 +800,9 @@ pub async fn chat_completions(
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
-    // engine-equivalent (chat-formatter path) AND the request contains nothing
-    // the router's formatter didn't replicate (see `input_ids_safe_to_forward`).
+    // enabled for this model, engine-equivalent (chat-formatter path), and
+    // the request has no unreplicated rendering controls (see
+    // `input_ids_safe_to_forward`).
     // Otherwise omit them and the engine tokenizes from `messages` as usual —
     // a transparent, always-correct fallback (`messages` are always retained
     // in the forwarded body). `forward_input_ids` is `Some` only when
@@ -807,7 +810,9 @@ pub async fn chat_completions(
     // predicate always has a parsed body to inspect.
     let forward_input_ids: Option<&[u32]> = match (request_tokens.as_ref(), request_value.as_ref())
     {
-        (Some(t), Some(v)) if t.rendered_from_chat && input_ids_safe_to_forward(v) => {
+        (Some(t), Some(v))
+            if can_forward_input_ids && t.rendered_from_chat && input_ids_safe_to_forward(v) =>
+        {
             Some(t.ids.as_slice())
         }
         _ => None,
@@ -819,7 +824,7 @@ pub async fn chat_completions(
     // `ingress_tokenize_offload_failed`); successful forwards and expected
     // omissions are not problems.
     if ingress_tokenize_offload_failed(
-        ctx.tokenizers.has_chat_formatter(&model_str),
+        can_forward_input_ids,
         request_value.as_ref(),
         request_tokens.as_ref(),
     ) {
@@ -1198,11 +1203,11 @@ fn parse_optional_positive_f64_header(
 }
 
 fn should_tokenize_request(
-    has_chat_formatter: bool,
+    can_forward_input_ids: bool,
     policy_needs_request_tokens: bool,
     bucket_enabled: bool,
 ) -> bool {
-    has_chat_formatter || policy_needs_request_tokens || bucket_enabled
+    can_forward_input_ids || policy_needs_request_tokens || bucket_enabled
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -1415,6 +1420,7 @@ fn build_outgoing_body(
 ///
 /// Matching model files and engine defaults are still required. Worker template
 /// overrides and default kwargs cannot be inferred from the request.
+/// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
 fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
     if request_has_tools(value)
         || request_has_non_text_content(value)
@@ -1447,15 +1453,15 @@ fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
 
 /// Whether to increment `sgl_router_ingress_tokenize_errors_total`.
 ///
-/// Count chats with a configured formatter that pass the forwarding guard
+/// Count chats with forwarding enabled that pass the forwarding guard
 /// but lack chat-rendered tokens. Excluded requests are expected fallbacks,
 /// even when rendering fails.
 fn ingress_tokenize_offload_failed(
-    has_chat_formatter: bool,
+    can_forward_input_ids: bool,
     request_value: Option<&serde_json::Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> bool {
-    if !has_chat_formatter {
+    if !can_forward_input_ids {
         return false;
     }
     let chat_request = request_value.is_some_and(|v| {
