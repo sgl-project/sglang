@@ -39,12 +39,16 @@ class TestVerifyCandidateGraph(CustomTestCase):
             tp_rank=0,
             available_memory_gb=16,
         )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(DsparkFoldedSampling.AUTO):
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+            DsparkFoldedSampling.AUTO.value
+        ):
             self.assertFalse(_resolve_folded_sampling(**args))
             model.markov_head.supports_sharded_greedy = False
             self.assertTrue(_resolve_folded_sampling(**args))
         model.markov_head.supports_sharded_greedy = True
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(DsparkFoldedSampling.FORCE):
+        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
+            DsparkFoldedSampling.FORCE.value
+        ):
             self.assertTrue(_resolve_folded_sampling(**args))
 
     def test_candidate_backend_falls_back_for_unsupported_models(self):
