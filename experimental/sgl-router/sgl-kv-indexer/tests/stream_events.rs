@@ -412,3 +412,171 @@ async fn private_group_rebuilds_an_in_memory_index_from_the_beginning() {
         "private group leaked: {names}"
     );
 }
+
+/// The lease is the only thing serializing applies, so the central invariant is
+/// that a consumer without it applies nothing. Each consumer gets its own
+/// backend, which is the only way to see who applied what.
+#[tokio::test]
+async fn a_consumer_without_the_lease_applies_nothing() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let sink = StreamSink::connect(&server.config(&prefix), DEFAULT_STREAM_MAXLEN)
+        .await
+        .unwrap();
+    let holder_backend = Arc::new(InMemoryKvIndexerBackend::new());
+    let standby_backend = Arc::new(InMemoryKvIndexerBackend::new());
+
+    let holder = start_consumer(
+        &server,
+        &prefix,
+        shared("holder"),
+        Arc::clone(&holder_backend) as Arc<dyn KvIndexerBackend>,
+    )
+    .await;
+    // Let the holder take the lease before the standby starts polling for it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let standby = start_consumer(
+        &server,
+        &prefix,
+        shared("standby"),
+        Arc::clone(&standby_backend) as Arc<dyn KvIndexerBackend>,
+    )
+    .await;
+
+    let reference = InMemoryKvIndexerBackend::new();
+    for request in [report("w0", 1, None, &[70, 71, 72]), revoke("w0", 2, &[72])] {
+        reference
+            .apply_external_kv_batch(request.clone())
+            .await
+            .unwrap();
+        sink.publish(&request).await.unwrap();
+    }
+    wait_for_parity(
+        holder_backend.as_ref(),
+        &reference,
+        &[70, 71, 72],
+        "holder applied",
+    )
+    .await;
+
+    // Several lease periods: a standby that ever applied would show it by now.
+    tokio::time::sleep(LEASE * 3).await;
+    assert!(
+        placements(standby_backend.as_ref(), &[70, 71, 72])
+            .await
+            .is_empty(),
+        "the standby consumer applied entries without holding the lease"
+    );
+    holder.stop().await;
+    standby.stop().await;
+}
+
+/// Applies are idempotent but not commutative, so a takeover must drain what the
+/// dead holder left pending BEFORE reading anything new: a REPORT stuck in the
+/// dead consumer's pending list, applied after the REVOKE that followed it,
+/// leaves the block present forever.
+#[tokio::test]
+async fn a_takeover_applies_pending_entries_before_newer_ones() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let sink = StreamSink::connect(&server.config(&prefix), DEFAULT_STREAM_MAXLEN)
+        .await
+        .unwrap();
+    let valkey = server.backend(&prefix).await;
+    let stream = format!("{prefix}events");
+    let mut raw = server.raw().await;
+    let _: () = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(&stream)
+        .arg("indexers")
+        .arg("$")
+        .arg("MKSTREAM")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    // A consumer that read the REPORT and died before acknowledging it.
+    let stored = report("w0", 1, None, &[80, 81]);
+    sink.publish(&stored).await.unwrap();
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("indexers")
+        .arg("dead")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(&stream)
+        .arg(">")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    // Then the revoke that must land after it.
+    let revoked = revoke("w0", 2, &[80, 81]);
+    sink.publish(&revoked).await.unwrap();
+
+    let reference = InMemoryKvIndexerBackend::new();
+    for request in [stored, revoked] {
+        reference.apply_external_kv_batch(request).await.unwrap();
+    }
+    assert!(
+        placements(&reference, &[80, 81]).await.is_empty(),
+        "the reference order leaves both blocks revoked"
+    );
+
+    let consumer = start_consumer(&server, &prefix, shared("fresh"), valkey.clone()).await;
+    wait_for_parity(&valkey, &reference, &[80, 81], "takeover ordering").await;
+    // Give a late claim of the pending REPORT a chance to resurrect the blocks.
+    tokio::time::sleep(LEASE * 3).await;
+    assert!(
+        placements(&valkey, &[80, 81]).await.is_empty(),
+        "a REPORT claimed after the REVOKE resurrected the blocks"
+    );
+    consumer.stop().await;
+}
+
+/// A flushed or restored Valkey loses the consumer group. Without recreating it
+/// the consumer retries NOGROUP forever and silently stops applying, so the index
+/// freezes while the fleet keeps publishing.
+#[tokio::test]
+async fn a_group_that_disappears_is_recreated_and_consumption_continues() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let sink = StreamSink::connect(&server.config(&prefix), DEFAULT_STREAM_MAXLEN)
+        .await
+        .unwrap();
+    let valkey = server.backend(&prefix).await;
+    let reference = InMemoryKvIndexerBackend::new();
+    let consumer = start_consumer(&server, &prefix, shared("c1"), valkey.clone()).await;
+
+    let first = report("w0", 1, None, &[90, 91]);
+    reference
+        .apply_external_kv_batch(first.clone())
+        .await
+        .unwrap();
+    sink.publish(&first).await.unwrap();
+    wait_for_parity(&valkey, &reference, &[90, 91], "before the group vanishes").await;
+
+    let mut raw = server.raw().await;
+    let _: i64 = redis::cmd("XGROUP")
+        .arg("DESTROY")
+        .arg(format!("{prefix}events"))
+        .arg("indexers")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    let second = report("w1", 1, None, &[92]);
+    reference
+        .apply_external_kv_batch(second.clone())
+        .await
+        .unwrap();
+    sink.publish(&second).await.unwrap();
+    wait_for_parity(
+        &valkey,
+        &reference,
+        &[90, 91, 92],
+        "after the group was recreated",
+    )
+    .await;
+    consumer.stop().await;
+}

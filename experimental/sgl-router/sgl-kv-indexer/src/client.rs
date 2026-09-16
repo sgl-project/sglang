@@ -21,6 +21,9 @@
 //!
 //! [`PrefixIndexConfig::query_deadline`] is the budget for the whole query
 //! including failovers, so adding endpoints cannot make a slow query slower.
+//! Within it, every endpoint still to be tried gets an equal share: a preferred
+//! endpoint that hangs must not be able to spend the whole deadline and leave
+//! nothing for a healthy one, which is the failure a black-holed host produces.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -41,6 +44,9 @@ pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 32;
 const PREFIX_QUERY_ENCODING_HEADROOM: usize = 16;
 const MAX_PREFIX_HASHES_PER_QUERY: usize =
     (MAX_GRPC_DECODING_MESSAGE_SIZE - PREFIX_QUERY_ENCODING_HEADROOM) / 8;
+/// Below this, an attempt cannot finish a connect plus a round trip, so the
+/// remaining budget is better reported as a timeout than spent on a doomed try.
+const MIN_ATTEMPT_BUDGET: Duration = Duration::from_millis(5);
 
 /// One worker's contiguous prefix hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,10 +305,18 @@ impl PrefixIndex for GrpcPrefixIndex {
         let mut last_error = None;
         for offset in 0..self.endpoints.len() {
             let index = (first + offset) % self.endpoints.len();
-            let Some(budget) = self.deadline.checked_sub(started.elapsed()) else {
+            let Some(remaining) = self.deadline.checked_sub(started.elapsed()) else {
                 break;
             };
-            if budget.is_zero() {
+            // Fair share of what is left, so one hung endpoint cannot consume the
+            // deadline; the last endpoint to try inherits the whole remainder.
+            let still_to_try = (self.endpoints.len() - offset) as u32;
+            let budget = if still_to_try > 1 {
+                remaining / still_to_try
+            } else {
+                remaining
+            };
+            if budget < MIN_ATTEMPT_BUDGET {
                 break;
             }
             // Each attempt needs its own copy: the request takes the hashes, and
