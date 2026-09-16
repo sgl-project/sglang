@@ -19,7 +19,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+from sglang.kernels.ops.attention.dsv4 import (
+    topk_transform_paged_v2,
+    topk_transform_ragged_v2,
+)
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -3697,7 +3700,9 @@ class DeepseekV4AttnBackend(
         )
         if topk_metadata is not None:
             topk_seq_lens = (
-                metadata.c4_seq_lens if candidate_blocks is None else score_lens
+                metadata.compressed_seq_lens
+                if candidate_blocks is None
+                else score_lens
             )
             selected = torch.empty_like(page_indices)
             topk_transform_paged_v2(

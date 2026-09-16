@@ -177,8 +177,8 @@ class TestDecodeProjections(CustomTestCase):
 
     def test_candidate_block_indices_matches_torch(self):
         from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-            candidate_block_state,
             candidate_block_indices,
+            candidate_block_state,
         )
 
         torch.manual_seed(29)

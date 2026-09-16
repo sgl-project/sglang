@@ -854,8 +854,12 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             positions = (
                 candidate_blocks[:, :, None] * block_size + torch.arange(block_size)
             ).flatten(1)
-            slots = req_to_token[req_rows[:, None], positions * ratio] // ratio
-            return score(q, weights, slots, candidate_lens, table, page_size)
+            valid = torch.arange(positions.shape[1]) < candidate_lens[:, None]
+            safe_positions = positions.clamp_max(width - 1)
+            slots = req_to_token[req_rows[:, None], safe_positions * ratio] // ratio
+            return score(q, weights, slots, candidate_lens, table, page_size).masked_fill(
+                ~valid, -torch.inf
+            )
 
         def topk_v2(scores, lens, page_table, out, page_size, metadata):
             self.assertEqual(lens.dtype, torch.int32)
@@ -922,7 +926,12 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 safe = selected.clamp_max(scores.shape[1] - 1)
                 blocks = candidate_blocks.gather(1, safe // candidate_block_size)
                 logical = blocks * candidate_block_size + safe % candidate_block_size
-                slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
+                slots = (
+                    req_to_token[
+                        req_rows[:, None], logical.clamp_max(width - 1) * ratio
+                    ]
+                    // ratio
+                )
             page_out.fill_(-1)
             page_out[:, : selected.shape[1]] = slots.masked_fill(~valid, -1)
             if raw_out is not None:
@@ -930,6 +939,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 raw_out[:, : selected.shape[1]] = logical.masked_fill(~valid, -1)
 
         for lengths in length_steps:
+            backend.forward_metadata.sm90_candidates = None
             lens = torch.tensor(lengths)
             pos = (lens * ratio - 1).clamp_min(0)
             mapping.copy_(mapping.roll(1, dims=0))
@@ -1015,7 +1025,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                             torch.arange(positions.shape[1]) < counts[:, None],
                         )
                 self.assertEqual(full_logits.call_args.args[-1], width)
-                self.assertEqual(full_topk.call_count, 5 if use_topk_v2 else 4)
+                self.assertEqual(full_topk.call_count, 5)
                 self.assertEqual(
                     [call.args[4].shape[1] for call in compact_logits.call_args_list],
                     [4, 4, 4, 4, 4],
