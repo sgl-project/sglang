@@ -17,10 +17,8 @@ import re
 import struct
 import tempfile
 import threading
-from collections import defaultdict
 from pathlib import Path
 from typing import (
-    Any,
     Callable,
     Dict,
     Generator,
@@ -170,57 +168,6 @@ def get_lock(
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
-
-
-def _shared_pointers(tensors):
-    ptrs = defaultdict(list)
-    for k, v in tensors.items():
-        ptrs[v.data_ptr()].append(k)
-    failing = []
-    for _, names in ptrs.items():
-        if len(names) > 1:
-            failing.append(names)
-    return failing
-
-
-def convert_bin_to_safetensor_file(
-    pt_filename: str,
-    sf_filename: str,
-) -> None:
-    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
-    if "state_dict" in loaded:
-        loaded = loaded["state_dict"]
-    shared = _shared_pointers(loaded)
-    for shared_weights in shared:
-        for name in shared_weights[1:]:
-            loaded.pop(name)
-
-    # For tensors to be contiguous
-    loaded = {k: v.contiguous() for k, v in loaded.items()}
-
-    dirname = os.path.dirname(sf_filename)
-    os.makedirs(dirname, exist_ok=True)
-
-    from safetensors.torch import save_file
-
-    save_file(loaded, sf_filename, metadata={"format": "pt"})
-
-    # check file size
-    sf_size = os.stat(sf_filename).st_size
-    pt_size = os.stat(pt_filename).st_size
-    if (sf_size - pt_size) / pt_size > 0.01:
-        raise RuntimeError(f"""The file size different is more than 1%:
-         - {sf_filename}: {sf_size}
-         - {pt_filename}: {pt_size}
-         """)
-
-    # check if the tensors are the same
-    reloaded = safetensors.torch.load_file(sf_filename)
-    for k in loaded:
-        pt_tensor = loaded[k]
-        sf_tensor = reloaded[k]
-        if not torch.equal(pt_tensor, sf_tensor):
-            raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
 def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
@@ -1263,62 +1210,15 @@ def fastsafetensors_weights_iterator(
         loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
-            try:
-                keys = list(fb.key_to_rank_lidx.keys())
-                for k in keys:
-                    t = fb.get_tensor(k)
-                    yield k, t
-            finally:
-                pass
+            keys = list(fb.key_to_rank_lidx.keys())
+            for k in keys:
+                t = fb.get_tensor(k)
+                yield k, t
         finally:
             loader.close()
         if drop_cache_after_load:
             for loaded_file in rank_file_map.get(rank, []):
                 _drop_file_cache_after_load(loaded_file)
-
-
-def multi_thread_safetensors_weights_iterator(
-    hf_weights_files: List[str],
-    max_workers: int,
-    disable_mmap: bool = False,
-    drop_cache_after_load: bool = False,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files."""
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-
-    def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return st_file, result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
-
-        if enable_tqdm:
-            futures_iter = tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(hf_weights_files),
-                desc="Multi-thread loading shards",
-                disable=not enable_tqdm,
-                bar_format=BAR_FORMAT,
-            )
-        else:
-            futures_iter = concurrent.futures.as_completed(futures)
-
-        for future in futures_iter:
-            st_file, state_dict = future.result()
-            for name, param in state_dict.items():
-                yield name, param
-            del state_dict
-            if drop_cache_after_load:
-                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -1569,55 +1469,19 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
-def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
-    """convert PySafeSlice object from safetensors to torch.Tensor
-
-    PySafeSlice object supports indexing, which is done before loading the
-    actual tensor and can reduce the amount of memory being read into the
-    memory. However, it does not support more advanced functionalities
-    like `.view()` or `.t()`. Therefore, if we need to modify the loaded
-    tensor with these more complicated operators, we need to convert to
-    tensor first.
-    """
-    if not isinstance(x, torch.Tensor):
-        x = x[:]
-    return x
-
-
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
-
-
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """Load weights that are row-parallelized."""
-    tp_rank = get_parallel().tp_rank
-    shard_dim = 0 if param.dim() != 1 else None
-
-    if shard_dim is not None:
-        shard_size = param.data.shape[shard_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-
-    return default_weight_loader(param, loaded_weight)
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        assert param.size() == loaded_weight.size(), (
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
+        param.data.copy_(loaded_weight)
 
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]

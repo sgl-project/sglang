@@ -3193,6 +3193,30 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def retire_unadmitted_request(self, req: Req) -> None:
+        """Finish a request the disaggregation queues rejected at their door."""
+        # `create_req` marks a streaming session in-flight, and the pre-abort
+        # detach lives in `StreamingSession.find_active_slot`, which only runs
+        # while scheduling; a session left in-flight rejects every later request.
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
+            req.session = None
+        # `beam_coordinator.validate_and_init` counts the group in ahead of the
+        # checks that reject; no-op when the request has no group.
+        self.beam_coordinator.retire_group(req)
+        # PREFILL runs `_prefetch_kvcache` before its door, so even the
+        # one-token stub is registered with the cache by now:
+        # `prefetch_from_storage` arms the paced-retry set for this attempt's
+        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
+        # that, and a retired request reaches neither.
+        self._release_aborted_request(req)
+        # `update_finish_state` returns early once `finished()`, so an already
+        # set `finished_reason` is what the client receives; report the same.
+        reason = req.finished_reason or req.to_finish
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.update_finish_state()
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
