@@ -78,4 +78,6 @@ rm -rf cann-custom-ops
 
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
-${UV_PIP_INSTALL} -v -e "python[dev_npu]"
+${UV_PIP_INSTALL} -v --constraint "${SCRIPT_DIR}/constraints.txt" -e "python[dev_npu]"
+# Fail setup directly if the ModelScope SDK and hub package are incompatible.
+python3 -c 'from modelscope import AutoConfig, AutoTokenizer, GenerationConfig'
