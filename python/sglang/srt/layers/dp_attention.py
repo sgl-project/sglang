@@ -291,6 +291,36 @@ def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
+@contextmanager
+def dp_buffer_size_scope(
+    global_dp_buffer_len: int,
+    local_dp_buffer_len: int,
+    dp_max_padding: bool,
+    global_num_tokens: List[int],
+    global_num_tokens_gpu: torch.Tensor,
+):
+    """Temporarily size DP collectives for a subset of a forward's token rows."""
+    state = _DpGatheredBufferWrapper
+    saved = (
+        state.get_global_dp_buffer_len(),
+        state.get_local_dp_buffer_len(),
+        state.is_dp_max_padding(),
+        state.get_dp_global_num_tokens(),
+        state.get_dp_global_num_tokens_gpu(),
+    )
+    try:
+        set_dp_buffer_len(
+            global_dp_buffer_len,
+            local_dp_buffer_len,
+            dp_max_padding,
+            global_num_tokens,
+            global_num_tokens_gpu,
+        )
+        yield
+    finally:
+        set_dp_buffer_len(*saved)
+
+
 def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 

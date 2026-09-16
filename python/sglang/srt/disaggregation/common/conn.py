@@ -917,10 +917,8 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
-                )
+            # Matching V4.1 KV/state layouts can use different attention TP
+            # sizes. Let the existing rank mapping select the transfer peers.
 
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
