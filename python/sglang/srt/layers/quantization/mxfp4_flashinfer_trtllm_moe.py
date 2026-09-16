@@ -104,14 +104,11 @@ def routed_hidden_size(layer: Module) -> int:
 
 
 class Mxfp8RoutedInputPreQuant(NamedTuple):
-    """MXFP8 linear-layout quant of the routed MoE input, produced ahead of
-    :meth:`Mxfp4FlashinferTrtllmMoEMethod.apply` by
-    :meth:`Mxfp4FlashinferTrtllmMoEMethod.quantize_routed_input` -- e.g. on a
-    side stream while the gate GEMM and the router run on the main stream.
-    ``ready`` is the event recorded on the producing stream after the quant;
-    ``apply`` makes its stream wait on it right before the routed MoE op, whose
-    first kernel (routing) precedes the GEMM that reads ``x_q``/``x_sf``.
-    Carried in ``StandardDispatchOutput.hidden_states_pre_quant``."""
+    """Carry MXFP8 routed inputs and their producing stream's completion event.
+
+    StandardDispatchOutput retains this object; the routed MoE waits on
+    ``ready`` before consuming the linear-layout ``x_q`` and ``x_sf`` tensors.
+    """
 
     x_q: torch.Tensor
     x_sf: torch.Tensor
@@ -571,15 +568,11 @@ def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
 def should_use_fuse_finalize_all_reduce(
     experts, num_tokens: int, hidden_dim: int
 ) -> bool:
-    """Whether ``moe_finalize_all_reduce`` can replace finalize + shared add +
-    TP all-reduce for this layer and batch.
+    """Whether fused finalize, shared-add and TP all-reduce support this batch.
 
-    Capability only, no routing policy (the batch-size cap lives at the call
-    site): this MXFP4 TRT-LLM method (its deferred-finalize
-    ABI, expert weights already carrying the routed scaling factor -- the
-    kernel never rescales), a hidden width the kernel has a geometry for, a
-    CustomAllReduceV2 push plane on the TP group, and a batch that fits one of
-    its push slots.
+    Requires the deferred MXFP4 ABI with pre-scaled expert weights, a supported
+    hidden width, and a CustomAllReduceV2 push slot large enough for the batch.
+    The caller applies its separate batch-size policy.
     """
     if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
         return False

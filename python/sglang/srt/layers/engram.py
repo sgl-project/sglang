@@ -574,15 +574,11 @@ def _drop_page_cache_once(reason: str) -> None:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table.
+    """Back an Engram table with shared or private host memory.
 
-    Layouts:
-      shared   one memfd holding every row, mapped by all ranks of the group;
-               rank 0 creates it, the others open it through /proc/<pid>/fd.
-               No all-reduce. Huge pages need transparent_hugepage/shmem_enabled.
-      private  one anonymous mapping per rank holding only its own rows, so the
-               lookup keeps the sharded all-reduce. Huge pages come from
-               transparent_hugepage/enabled (madvise or always).
+    Shared layout maps one group-wide memfd and needs shmem huge-page support.
+    Private layout maps each rank's shard, uses anonymous huge pages, and
+    reconstructs lookups with all-reduce.
     """
 
     def __init__(self, layout: str, nbytes: int, name: str, group, pin: bool):
@@ -710,14 +706,11 @@ class _HostTable:
 
 
 class EngramEmbedding(nn.Module):
-    """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
+    """Store one layer's FP8 hash table with e8m0 scales and dequantize lookups.
 
-    Default: rows sharded over the TP group in device memory; each rank gathers
-    the rows it owns, zeroes the rest and the all-reduce reassembles the lookup.
-    With SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE the table lives in host memory and
-    the GPU gathers rows over the CPU link -- either one shared copy with no
-    all-reduce, or one private shard per rank (see _HostTable). Loading is
-    sharded in every layout: a rank writes only its own row range.
+    Device tables are TP-sharded. Host tables may share one copy or keep
+    private shards; sharded lookups use all-reduce. Each rank loads only its
+    own row range in every layout.
     """
 
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):

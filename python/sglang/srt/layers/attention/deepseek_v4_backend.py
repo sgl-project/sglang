@@ -221,18 +221,10 @@ def _maybe_precompute_flashmla_sched_meta(
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
 ) -> None:
-    """Compute FlashMLA's split-KV schedule before it has to.
+    """Populate a missing FlashMLA split-KV schedule before sparse decode.
 
-    `sparse_decode_fwd` builds the schedule itself whenever it is handed none,
-    in a `<<<1, 32>>>` kernel whose partition loop runs on thread 0 and stores
-    each 32-byte entry to global memory. At the 152 partitions of a BS=1 step
-    that is 28 us, and a decode graph replays it on the critical path. Filling
-    the buffers here instead means FlashMLA finds them already populated and
-    skips its kernel; `flashmla_sched_meta` produces the same schedule, bit for
-    bit, in about 9 us.
-
-    Only fires where FlashMLA would have computed -- when the scheduler holds no
-    buffers yet -- so this does not add work to the calls that already reuse one.
+    Existing schedule buffers are reused; newly populated buffers match
+    FlashMLA's schedule and avoid its serial scheduling kernel.
     """
     if flashmla_metadata is None:
         return
@@ -3698,14 +3690,10 @@ class DeepseekV4AttnBackend(
             )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Resolve the SWA KV-store write target for the current forward.
+        """Return cached SWA write locations, or translate the current batch's locations.
 
-        Prefer the value cached by the metadata init: in-graph for
-        decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
-        draft-extend. Translate at store time when nothing matching is cached
-        (paths that skip the init, or a batch re-padded after init). Idle
-        always falls back: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot.
+        Idle batches always translate because their metadata may be stale.
+        Missing or differently padded metadata also falls back to translation.
         """
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:

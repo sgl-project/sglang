@@ -67,12 +67,10 @@ DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 
 @dataclass(frozen=True)
 class Dsv41CandidateGraphVariants:
-    """DeepSeek-V4.1 candidate-indexer decode and DSpark verify graphs.
+    """Select V4.1 decode/verify graphs by the batch's longest request.
 
-    Selected by the longest request in the batch: while every request's
-    positions fit a limit, the captured variant skips the low-ratio scoring or
-    the candidate filtering that longer histories need (see
-    capture_mode.skip_low_ratio_indexer and the backend's _every_request_fits).
+    Bounded variants omit low-ratio scoring or candidate filtering only when
+    every request fits the captured limit.
     """
 
     # (label, max_seq_len it serves), ascending; the last label is the fallback.

@@ -1,14 +1,7 @@
-"""Decode-time low-ratio indexer logits for Hopper.
+"""Score low-ratio FP4 index keys on Hopper.
 
-DeepGEMM's fp8_fp4 mqa-logits kernels need SM100/SM120. This Triton kernel covers
-the same decode step on SM90: one query token per request, scored against the
-request's visible compressed positions read straight out of the fp4 indexer
-pool (e2m1 payload + e8m0 per-32 block scales, page layout of
-store_fp4_index_k_cache), summed over heads with relu and the per-head weights.
-
-Numerics follow the torch reference path (bf16 dot, bf16 relu/weight product,
-bf16 head reduction); the caller runs the same masking / candidate / top-k
-logic on the returned fp32 logits as the per-request torch loop.
+Reads paged e2m1 keys with per-block e8m0 scales and returns FP32 logits.
+Dot products, weighted ReLU and head reductions follow the BF16 torch reference.
 """
 
 import torch

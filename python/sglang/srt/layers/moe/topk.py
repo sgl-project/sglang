@@ -1635,17 +1635,10 @@ def _eplb_remap_enabled() -> bool:
 
 
 def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
-    """Whether the CUDA sqrtsoftplus router masks its own padded rows.
+    """Whether the CUDA sqrtsoftplus router can mask padded rows itself.
 
-    ``moe_fused_gate``'s Triton kernel already implements ``num_token_non_padded``
-    (rows >= it get id -1 and weight 0, ``HAS_PADDING``), so on this path the
-    count is handed to the router and :func:`_post_process_topk_ids` skips the
-    separate ``mask_topk_ids_padded_region`` launch. Live rows are bitwise
-    unchanged (the kernel only adds a final ``tl.where``); padded rows get the
-    same -1 ids and a 0 weight instead of a stale one, which every consumer of
-    a -1 id ignores. Restricted to sqrtsoftplus (DeepSeek-V4): on the sigmoid
-    path a padding count would bypass the Kimi-K3 radix fast path, which does
-    not take one, and on HIP the post-process fills padded ids with 0, not -1.
+    It emits id -1 and weight zero beyond the live token count. Sigmoid must
+    retain the Kimi-K3 radix path; HIP uses a different padding sentinel.
     """
     return _is_cuda and not _use_aiter and scoring_func == "sqrtsoftplus"
 
@@ -1656,16 +1649,10 @@ def _fused_gate_emits_packed_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
     routing_overridden: bool,
 ) -> bool:
-    """Whether the sqrtsoftplus router also writes the FlashInfer routed-MoE
-    packed ids ``(id << 16) | bf16_bits(weight)``, replacing the separate
-    ``PackTopkIds`` launch in ``Mxfp4FlashinferTrtllmMoEMethod.apply``.
+    """Whether routing can emit the final packed IDs consumed by FlashInfer MXFP4.
 
-    Same admission as the Qwen3 fused topk+pack precedent: the pack is taken
-    from the router's final (renormalized, scaled, padding-masked) values, so
-    nothing may rewrite ids or weights afterwards -- no EPLB logical->physical
-    remap, no fused shared-expert slots (which also implies waterfill is off),
-    no benchmark routing override. Only the flashinfer_mxfp4 runner backend
-    consumes the packed form.
+    Packing requires final weights and IDs: no EPLB remap, fused shared-expert
+    rescaling, or benchmark override may rewrite them afterward.
     """
     return (
         _fused_gate_masks_padded_rows(scoring_func)
