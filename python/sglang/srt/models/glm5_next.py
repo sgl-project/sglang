@@ -49,7 +49,8 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -349,19 +350,26 @@ class Glm5NextLinearAttention(nn.Module):
         # LoRA wraps the original projections, not these fused module types.
         self.do_fuse_qkvbfg = not (
             get_lora().enable_lora or get_lora().lora_paths
-        ) and are_linear_prefixes_unquantized(
-            quant_config,
-            (
-                f"{prefix}.{name}"
-                for name in (
-                    "qkv_proj",
-                    "b_proj",
-                    "f_a_proj",
-                    "f_b_proj",
-                    "g_a_proj",
-                    "g_b_proj",
+        ) and (
+            quant_config is None
+            or (
+                type(quant_config) is Fp8Config
+                and all(
+                    is_layer_skipped(
+                        f"{prefix}.{name}",
+                        quant_config.ignored_layers,
+                        fused_mapping=quant_config.packed_modules_mapping,
+                    )
+                    for name in (
+                        "qkv_proj",
+                        "b_proj",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                    )
                 )
-            ),
+            )
         )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
