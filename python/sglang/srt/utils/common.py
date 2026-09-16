@@ -782,17 +782,10 @@ def get_xpu_memory_capacity():
 
 
 def get_mps_memory_capacity():
-    """Metal's recommended working-set size, in MiB.
-
-    Apple Silicon has no dedicated VRAM: the GPU shares system memory, and
-    Metal reports a soft cap -- about two thirds of physical RAM -- past which
-    command buffers fail with ``kIOGPUCommandBufferCallbackErrorOutOfMemory``.
-    That cap, not total system memory, is what the memory budget must fit
-    inside, so it is the capacity this device reports.
-    """
+    """Metal's recommended working-set size in MiB, matching MLX KV budgeting."""
     try:
         if torch.backends.mps.is_available():
-            return torch.mps.recommended_max_memory() // (1 << 20)  # unit: MB
+            return torch.mps.recommended_max_memory() // (1 << 20)
         return None
     except AttributeError:
         raise RuntimeError("torch.mps is not available.")

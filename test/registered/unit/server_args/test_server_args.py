@@ -2180,14 +2180,7 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
 
 
 class TestMpsMemoryBudget(CustomTestCase):
-    """Apple Metal caps the GPU working set well below system RAM.
-
-    The cap -- not total memory -- is the budget every allocation shares, so
-    the device has to report it like any other. Without a capacity,
-    ``handle_gpu_memory_settings`` falls back to a blanket 0.95 that reserves
-    nothing for activations, and the first real prefill runs the Metal command
-    buffer out of memory.
-    """
+    """MPS defaults must size activation headroom from Metal's working set."""
 
     WORKING_SET_BYTES = 16 * (1 << 30)
     WORKING_SET_MIB = 16 * 1024
