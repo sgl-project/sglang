@@ -23,8 +23,10 @@ inside the function body to preserve that invariant.
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
+
+from sglang.srt.runtime_context import get_exec
 
 
 class Phase:
@@ -70,7 +72,8 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # For prefill, bs carries aggregate-token capture buckets for every backend;
 # full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
-# only meaningful when backend == full.
+# only meaningful when backend == full. max_context_size is shared by the
+# breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
     Phase.PREFILL: (
@@ -78,6 +81,7 @@ ALLOWED_KEYS_PER_PHASE = {
         "max_bs",
         "bs",
         "tc_compiler",
+        "max_context_size",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
     ),
@@ -93,6 +97,10 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Effective for both full and breakable backends and currently only DSV4:
+    # fixed maximum context length used by context-shaped prefill graph metadata.
+    # Every token bucket shares this size; larger live contexts run eagerly.
+    max_context_size: Optional[int] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger
@@ -117,6 +125,25 @@ def default_prefill_backend() -> str:
     from sglang.srt.utils import is_cuda
 
     return Backend.BREAKABLE if is_cuda() else Backend.TC_PIECEWISE
+
+
+def with_phase(config: "CudaGraphConfig", phase: str, **changes) -> "CudaGraphConfig":
+    """A copy of ``config`` with ``changes`` applied to one phase.
+
+    Resolution declares values, so a handler that decides a graph setting hands
+    the stash a new config instead of editing the one an earlier handler
+    declared.
+    """
+    if phase not in Phase.ALL:
+        raise KeyError(phase)
+    # Not a deep copy: `dataclasses.replace` copies field references, so a
+    # list-valued `bs` is shared. Rebind `bs`, never mutate it in place.
+    return CudaGraphConfig(
+        **{
+            name: replace(getattr(config, name), **(changes if name == phase else {}))
+            for name in Phase.ALL
+        }
+    )
 
 
 @dataclass
@@ -182,7 +209,6 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     published config. Returns False if the config has not been published
     yet (e.g. unit tests, early startup)."""
-    from sglang.srt.runtime_context import get_exec
 
     try:
         cfg = get_exec().graph.cuda_graph_config

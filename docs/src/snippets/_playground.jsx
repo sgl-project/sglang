@@ -9,7 +9,9 @@
 //   attention   — TP/CP/DP-Attention knobs
 //   moe         — backend (+ MegaMoE quantization sub-select) + EP
 //   parsers     — per-item toggle flags
-//   speculative — single-select preset
+//   speculative — single-select preset; an option may carry `note` (a
+//                 prerequisite line rendered under the chips while that option
+//                 is the one in effect)
 //
 // Axis-level `showWhen(base)` (any axis): the card is not rendered when the Deploy
 // panel has not switched that feature on. `base` carries the cell match dims plus
@@ -171,13 +173,15 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → hw|quant → quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → hw → default.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
       `${sel.hw}|${sel.quant}`,
       sel.quant,
+      sel.hw,
+      "default",
     ];
     for (const k of keys) {
       const hit = config.modelNames[k];
@@ -221,6 +225,17 @@ export const Playground = ({ config }) => {
       Array.isArray(vs) && vs.includes(base[k]));
   };
 
+  // The PD router is shared by every cell, so a platform whose prefill/decode
+  // pair wants a different routing policy declares `routerOverrides: [{when,
+  // port?, command}]` instead of rewriting the default out from under the rest.
+  // First match wins; fields the override omits fall back to the default.
+  const resolveRouter = (fc, sel) => {
+    if (!fc || !fc.router) return null;
+    const hit = (fc.routerOverrides || []).find(
+      (r) => r && matchConstraint(sel, r.when));
+    return hit ? { ...fc.router, ...hit } : fc.router;
+  };
+
   // Normalize a chip entry into `{value, label?, hidden, disabled,
   // disableReason, ...rest}`. `value` resolves to `entry.id` (rich form) or
   // `entry.value` (wrapper form), or the entry itself for bare values.
@@ -233,7 +248,9 @@ export const Playground = ({ config }) => {
     }
     const hidden = entry.hide ? matchConstraint(base, entry.hide) : false;
     let disabled = entry.disabled === true || entry.disable === true;
-    let disableReason = entry.disableReason || "";
+    let disableReason = typeof entry.disableReason === "function"
+      ? entry.disableReason(base)
+      : entry.disableReason || "";
     if (!disabled && entry.disable && typeof entry.disable === "object") {
       if (Array.isArray(entry.disable)) {
         for (const item of entry.disable) {
@@ -336,11 +353,13 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // --tp / --ep spelling families: configs write either the canonical
-  // --tp-size / --ep-size or the short --tp / --ep. Parse and strip every
-  // spelling; when re-emitting, keep the spelling the base already uses.
+  // --tp / --ep / --dp spelling families: configs write either the canonical
+  // --tp-size / --ep-size / --dp-size, a short alias, or the long form. Parse
+  // and strip every spelling; when re-emitting, keep the spelling the base
+  // already uses.
   const TP_HEADS = ["--tp-size", "--tp", "--tensor-parallel-size"];
   const EP_HEADS = ["--ep-size", "--ep", "--expert-parallel-size"];
+  const DP_HEADS = ["--dp-size", "--dp", "--data-parallel-size"];
   const parseIntFlagAny = (flags, heads) => {
     for (const head of heads) {
       const n = parseIntFlag(flags, head);
@@ -356,20 +375,30 @@ export const Playground = ({ config }) => {
   // insertion still works in partial cells).
   const ANCHOR_NEAR_MODEL_PATH = ["--model-path"];
   const ANCHOR_NEAR_TP         = ["--tp-size", "--tp", "--model-path"];
-  const ANCHOR_NEAR_DP         = ["--dp", "--tp-size", "--tp", "--model-path"];
-  const ANCHOR_NEAR_DPATTN     = ["--enable-dp-attention", "--dp", "--tp-size", "--tp", "--model-path"];
+  const ANCHOR_NEAR_DP         = ["--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
+  const ANCHOR_NEAR_DPATTN     = ["--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
   const ANCHOR_NEAR_MOE        = ["--moe-a2a-backend", "--moe-runner-backend",
-                                  "--enable-dp-attention", "--dp", "--tp-size", "--tp", "--model-path"];
+                                  "--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp", "--model-path"];
 
   // Helper bundle passed to every axis handler.
   const helpers = {
     matchConstraint, evaluateChip, findEntry, isHidden,
     stripFlagsByFirstToken, stripEnvByPrefix, insertBeforeTail, insertAfter,
     parseIntFlag, hasFlag, findFlagArg,
-    TP_HEADS, EP_HEADS, parseIntFlagAny, flagSpelling,
+    TP_HEADS, EP_HEADS, DP_HEADS, parseIntFlagAny, flagSpelling,
     ANCHOR_NEAR_MODEL_PATH, ANCHOR_NEAR_TP, ANCHOR_NEAR_DP,
     ANCHOR_NEAR_DPATTN, ANCHOR_NEAR_MOE,
   };
+
+  // -------- HiCache flag family --------
+  // Shared because two axes own it: `hicache` emits it, and `umbp` strips the
+  // whole family when it takes the tier over (the two are mutually exclusive).
+  const HICACHE_HEADS = [
+    "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
+    "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
+    "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
+    "--hicache-storage-backend-extra-config",
+  ];
 
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
@@ -431,7 +460,7 @@ export const Playground = ({ config }) => {
       // baked strategy (legacy mode flags mapped to zigzag/interleave).
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
-        const dpVal = h.parseIntFlag(flags, "--dp");
+        const dpVal = h.parseIntFlagAny(flags, h.DP_HEADS);
         const hasDpAttn = h.hasFlag(flags, "--enable-dp-attention");
         let dpAttn;
         if (dpVal !== null) dpAttn = dpVal;
@@ -468,7 +497,7 @@ export const Playground = ({ config }) => {
           const dpIntent = (value.dpAttn !== null && value.dpAttn !== undefined)
             ? value.dpAttn
             : (h.hasFlag(flags, "--enable-dp-attention")
-                ? (h.parseIntFlag(flags, "--dp") ?? 1) : false);
+                ? (h.parseIntFlagAny(flags, h.DP_HEADS) ?? 1) : false);
           if (typeof dpIntent === "number" && dpIntent > 1) return null;
           return h.parseIntFlagAny(flags, h.TP_HEADS);
         };
@@ -523,13 +552,44 @@ export const Playground = ({ config }) => {
             ]);
           }
         }
-        if (value.dpAttn !== null && value.dpAttn !== undefined
+        // `forceOff: [{when, stripEnv, reason}]` on a knob — the selection
+        // dictates the value, so neither the pick nor the base cell gets a say.
+        // Used where a PD role runs a different topology than the aggregated
+        // cell it derives from: the role is TP-only, but the cell is DP.
+        const dpForced = (knobEntry("dpAttn").forceOff || []).find(
+          (r) => r && h.matchConstraint(factsNow(), r.when));
+        if (dpForced) {
+          flags = h.stripFlagsByFirstToken(flags, [
+            ...h.DP_HEADS, "--enable-dp-attention",
+            "--enable-dp-attention-local-control-broadcast",
+          ]);
+          // The cell's DP-only env would otherwise outlive the flags it tunes.
+          const stripEnv = dpForced.stripEnv || [];
+          if (stripEnv.length) {
+            env = env.filter((e) => !stripEnv.includes(e.split("=")[0]));
+          }
+        } else if (value.dpAttn !== null && value.dpAttn !== undefined
             && !blocked("dpAttn", value.dpAttn)) {
-          flags = h.stripFlagsByFirstToken(flags, ["--dp", "--enable-dp-attention"]);
+          // Capture the spelling before stripping — the TP/EP handlers do the
+          // same, and a lookup on the stripped array always hits the fallback.
+          const dpHead = h.flagSpelling(flags, h.DP_HEADS, "--dp-size");
+          // The local-control-broadcast companion only means anything with DP
+          // attention on, so it has to go down with it — stripping just
+          // `--enable-dp-attention` would leave it orphaned in the command.
+          // apply re-seeds from the base cell, so this restores it when the
+          // cell had it and the user is only re-sizing DP rather than disabling.
+          const hadLocalBroadcast =
+            h.hasFlag(flags, "--enable-dp-attention-local-control-broadcast");
+          flags = h.stripFlagsByFirstToken(flags, [
+            ...h.DP_HEADS, "--enable-dp-attention",
+            "--enable-dp-attention-local-control-broadcast",
+          ]);
           if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
             flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
-              `--dp ${value.dpAttn}`,
+              `${dpHead} ${value.dpAttn}`,
               "--enable-dp-attention",
+              ...(hadLocalBroadcast
+                ? ["--enable-dp-attention-local-control-broadcast"] : []),
             ]);
           }
         }
@@ -591,14 +651,18 @@ export const Playground = ({ config }) => {
               {knobs.map((knob) => {
                 const kc = h.evaluateChip(knob, base);
                 if (kc.hidden) return null;
+                // Mirror apply's forceOff: show the value the command actually
+                // gets, grayed, instead of a live-looking pick apply discards.
+                const forced = (knob.forceOff || []).find(
+                  (r) => r && h.matchConstraint(base, r.when));
                 return (
                   <span key={knob.id} style={s.field}>
                     <span style={s.fieldLabel}>{knob.label || knob.id.toUpperCase()}</span>
-                    {renderSelect(knobDisplay(knob), entriesFor(knob),
+                    {renderSelect(forced ? false : knobDisplay(knob), entriesFor(knob),
                       (nv) => setKnob(knob.id, nv), base, labelFor(knob),
                       { hideValues: hideNullFor(knob),
-                        disabled: kc.disabled,
-                        disabledReason: kc.disableReason })}
+                        disabled: kc.disabled || !!forced,
+                        disabledReason: forced ? forced.reason : kc.disableReason })}
                   </span>
                 );
               })}
@@ -707,6 +771,10 @@ export const Playground = ({ config }) => {
           && (!mmOpt.requiresHw || mmOpt.requiresHw.includes(base.hw))
           && (!mmOpt.excludesStrategy || !mmOpt.excludesStrategy.includes(base.strategy));
         const backendIsMega = slotDisplay("backend") === "megamoe";
+        // `ep.showWhen` (function of base) drops the whole EP select on bases
+        // where EP is not a supported lever (e.g. the single-shape A3 Series recipe).
+        const epShown = !!fc.ep
+          && !(typeof fc.ep.showWhen === "function" && !fc.ep.showWhen(base));
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -728,7 +796,7 @@ export const Playground = ({ config }) => {
                     (v) => setSlot("mmQuant", v), base)}
                 </span>
               )}
-              {fc.ep && (
+              {epShown && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
                   {renderSelect(slotDisplay("ep"), fc.ep.values || [null],
@@ -829,6 +897,11 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
+              // Adaptive draft depth is part of an EAGLE preset, not a
+              // separate knob: a base that carries it must strip it when
+              // another algorithm is picked, or the flag survives and the
+              // server warns it away (only EAGLE/EAGLE3 honor it).
+              || head === "--speculative-adaptive"
               || head === "--speculative-dspark-block-size"
               || head === "--enable-linear-replayssm-spec"
               || head === "--linear-replayssm-cache-len"
@@ -857,6 +930,7 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-adaptive",
           "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
           "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
@@ -878,6 +952,12 @@ export const Playground = ({ config }) => {
           .map((opt) => h.evaluateChip(opt, base))
           .filter((c) => !c.hidden && !(hideCurrent && c.value === "current"));
         if (visible.length === 0) return null;
+        // An option may carry a `note`: a prerequisite the reader must act on
+        // before the composed command runs at all (an algorithm whose support
+        // is not in the page's pinned image yet, a draft checkpoint to fetch).
+        // Shown only for the option in effect, so the card stays a chip row
+        // until the pick actually needs something.
+        const note = (visible.find((c) => c.value === display) || {}).note;
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -890,6 +970,7 @@ export const Playground = ({ config }) => {
                 </span>
               ))}
             </div>
+            {note && <div style={s.axisNote}>{note}</div>}
           </div>
         );
       },
@@ -957,10 +1038,25 @@ export const Playground = ({ config }) => {
           // render, so a base flag is never left over from an earlier selection
           // and must not be stripped when the role is Off.
           const modeMeta = (fc.modes || []).find((m) => m.id === mode);
-          if (modeMeta && modeMeta.flags && modeMeta.flags.length) {
+          // A role may scope its flags/env to a subset of hardware via `when`
+          // (same shape as a backend's `envWhen`), so a ROCm-only prefill recipe
+          // doesn't leak onto CUDA. Absent `when`, the role applies everywhere.
+          //
+          // `roleOverrides: [{when, mode, flags, env}]` then re-specifies a role
+          // for a narrower selection — a second operating point (low-latency vs
+          // high-throughput sizing) is a different flag set for the SAME role,
+          // so it belongs here rather than as a duplicate entry in the Mode
+          // select. First match wins and replaces the role's own flags/env.
+          const roleOverride = (fc.roleOverrides || []).find((r) =>
+            r && r.mode === mode && r.when && h.matchConstraint(sel, r.when));
+          const roleSpec = roleOverride || modeMeta;
+          const modeGate = roleOverride ? null : (modeMeta && modeMeta.when);
+          const modeOk = !modeGate || Object.keys(modeGate).every(
+            (k) => (modeGate[k] || []).includes(sel[k]));
+          if (modeOk && roleSpec && roleSpec.flags && roleSpec.flags.length) {
             flags = h.stripFlagsByFirstToken(
-              flags, modeMeta.flags.map((f) => f.split(/[\s=]/)[0]));
-            adds.push(...modeMeta.flags);
+              flags, roleSpec.flags.map((f) => f.split(/[\s=]/)[0]));
+            adds.push(...roleSpec.flags);
           }
           // Single-host needs no --dist-init-addr: prefill/decode derive their
           // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
@@ -987,8 +1083,8 @@ export const Playground = ({ config }) => {
             if (ok) env = [...env, ...meta.env.filter((e) => !env.includes(e))];
           }
           // Same for env declared on the selected role.
-          if (modeMeta && modeMeta.env && modeMeta.env.length) {
-            env = [...env, ...modeMeta.env.filter((e) => !env.includes(e))];
+          if (modeOk && roleSpec && roleSpec.env && roleSpec.env.length) {
+            env = [...env, ...roleSpec.env.filter((e) => !env.includes(e))];
           }
         }
         return { flags, env };
@@ -1006,12 +1102,19 @@ export const Playground = ({ config }) => {
         return null;
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderSelect }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderSelect }) => {
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         const showModes    = (fc.modes            || []).length > 0;
         const showBackends = (fc.transferBackends || []).length > 0;
         const showIb       = (fc.ibDevices        || []).length > 0;
         if (!showModes && !showBackends && !showIb) return null;
+        // `notes: [{when, mode, text}]` — a prerequisite the role needs from
+        // another card, surfaced only while the selection actually trips it.
+        // `when` matches against constraintBase, so it can key off cross-axis
+        // facts like dpAttnOn, not just the five cell dimensions.
+        const note = (fc.notes || []).find(
+          (n) => n && (!n.mode || [].concat(n.mode).includes(value.mode))
+                 && h.matchConstraint(base, n.when));
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -1038,6 +1141,7 @@ export const Playground = ({ config }) => {
                 </span>
               )}
             </div>
+            {note && <div style={s.axisNote}>{note.text}</div>}
           </div>
         );
       },
@@ -1140,10 +1244,7 @@ export const Playground = ({ config }) => {
 
         const backendOptions = fc.backends || [];
         const ownedHeads = [
-          "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
-          "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
-          "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
-          "--hicache-storage-backend-extra-config",
+          ...HICACHE_HEADS,
           ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
           ...backendOptions.flatMap((o) => (o.flags || []).map((f) => f.split(/\s/)[0])),
         ];
@@ -1245,6 +1346,91 @@ export const Playground = ({ config }) => {
                   <span style={s.fieldLabel}>Write</span>
                   {renderSelect(writePolicy, fc.writePolicies,
                     (v) => setSlot("writePolicy", v), base)}
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: UMBP (unified cache external linker) -------------------------
+    // A SIBLING of HiCache, not a tier inside it: the unified radix tree loads
+    // and offloads straight against an external store with no host cache tier,
+    // and sglang refuses the pair outright (arg_groups/hicache_hook.py raises on
+    // --enable-hierarchical-cache or --hicache-storage-backend alongside it).
+    // So enabling this strips the whole HiCache family instead of layering on
+    // it, and it is declared after hicache so that strip runs last.
+    umbp: {
+      initState: () => ({ enable: null, backend: null }),
+
+      deriveFromBase: (cell, fc, h) => {
+        const flags = (cell && cell.flags) || [];
+        return {
+          enable: h.hasFlag(flags, "--enable-unified-cache-external-linker"),
+          backend: h.findFlagArg(flags, "--unified-cache-external-linker-backend"),
+        };
+      },
+
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const ownedHeads = [
+          "--enable-unified-cache-external-linker",
+          "--unified-cache-external-linker-backend",
+          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
+        ];
+        flags = h.stripFlagsByFirstToken(flags, ownedHeads);
+        if (fc.requiredEnv && fc.requiredEnv.length) {
+          env = h.stripEnvByPrefix(env, fc.requiredEnv.map((e) => e.split("=")[0]));
+        }
+        const enabled = value.enable !== null
+          ? value.enable : !!(derived && derived.enable);
+        if (!enabled) return { flags, env };
+        if (fc.onlyHw && sel && !fc.onlyHw.includes(sel.hw)) return { flags, env };
+        // The linker keys by DP rank; under pure TP each rank opens its own
+        // keyspace and the store holds TP copies of the same tokens, so the
+        // recipe is only meaningful with DP attention on. Read it off the live
+        // flags rather than the Deploy dims — the attention axis runs first.
+        if (fc.requiresDpAttention
+          && !flags.some((f) => f.split(/[\s=]/)[0] === "--enable-dp-attention")) {
+          return { flags, env };
+        }
+        flags = h.stripFlagsByFirstToken(flags, HICACHE_HEADS);
+        const backend = value.backend
+          || (derived && derived.backend) || fc.defaultBackend || "mori";
+        flags = h.insertBeforeTail(flags, [
+          "--enable-unified-cache-external-linker",
+          `--unified-cache-external-linker-backend ${backend}`,
+          ...(fc.requiredFlags || []),
+        ]);
+        env = [...env, ...(fc.requiredEnv || []).filter((e) => !env.includes(e))];
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
+        if (fc.onlyHw && !fc.onlyHw.includes(base.hw)) return null;
+        const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const enabled = value.enable !== null
+          ? value.enable : !!(derived && derived.enable);
+        const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn;
+        const backend = value.backend !== null
+          ? value.backend : ((derived && derived.backend) || fc.defaultBackend || "mori");
+        return (
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>UMBP</span>
+              <span style={s.field}>
+                {renderChip("Enable", enabled, true,
+                  () => setSlot("enable", !enabled),
+                  { disabled: needsDp,
+                    disabledReason: needsDp
+                      ? "Needs DP Attention — the linker keyspace is per DP rank, so under pure TP the store holds one copy per TP rank."
+                      : "" })}
+              </span>
+              {(fc.backends || []).length > 0 && (
+                <span style={s.field}>
+                  <span style={s.fieldLabel}>Store</span>
+                  {renderSelect(backend, fc.backends,
+                    (v) => setSlot("backend", v), base)}
                 </span>
               )}
             </div>
@@ -1435,6 +1621,15 @@ export const Playground = ({ config }) => {
     let flags = [...baseFlags];
     let env = [...(baseEnv || [])];
     let pdMode = null;
+    // The selected PD role, resolved up front rather than from the loop's
+    // getRenderHints: axes that run BEFORE pdDisagg still need it, since a role
+    // can constrain what another axis is allowed to emit (a TP-only role has to
+    // force DP-Attention off in the attention axis, which composes earlier).
+    const pdFc = pgFeatures.pdDisagg;
+    const pdDelta = allDeltas.pdDisagg;
+    const pdRoleSel = (pdFc && (pdFc.modes || []).length && pdDelta)
+      ? pdDelta.mode
+      : ((sel && sel.pdMode) || "off");
     for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
       const fc = pgFeatures[axisId];
       if (!fc) continue;
@@ -1443,7 +1638,7 @@ export const Playground = ({ config }) => {
       const derived = derivedMap ? derivedMap[axisId] : null;
       const specAlgorithm = (findFlagArg(
         flags, "--speculative-algorithm") || "").toUpperCase() || null;
-      const liveSel = { ...sel, specAlgorithm };
+      const liveSel = { ...sel, specAlgorithm, pdMode: pdRoleSel };
       const out = handler.apply({ flags, env, value, fc, sel: liveSel, h: helpers, derived });
       flags = out.flags;
       env = out.env;
@@ -1475,7 +1670,7 @@ export const Playground = ({ config }) => {
     if (multinode && !f.some((x) => x.startsWith("--nnodes"))) {
       // Insert the multi-node trio after the last parallelism flag (matches
       // _deployment.jsx so untouched-base output is byte-identical).
-      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp-size", "--tp"];
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp-size", "--dp", "--tp-size", "--tp"];
       let at = -1;
       for (const anchor of PARALLELISM_ANCHORS) {
         at = f.findIndex((x) => x.split(/[\s=]/)[0] === anchor);
@@ -1492,13 +1687,17 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
-      // `hw`; `:dev` if unmapped (matches _deployment.jsx). The strategy key covers
-      // a tier that needs its own build (e.g. a spec-decoding preview image), so the
-      // playground base must resolve it too or it hands back an image that cannot
-      // run the command.
+      // Image keyed by `hw|variant|quant` (most specific), then `variant|quant`,
+      // then `hw|quant|strategy`, `hw|quant`, `hw`; `:dev` if unmapped (matches
+      // _deployment.jsx). The variant keys cover a checkpoint that needs its own
+      // build (e.g. a new-variant preview image) and the strategy key a tier that
+      // needs one (e.g. a spec-decoding preview image), so the playground base
+      // must resolve them too or it hands back an image that cannot run the
+      // command.
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+      const image = di[`${sel.hw}|${sel.variant}|${sel.quant}`]
+        || di[`${sel.variant}|${sel.quant}`]
+        || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
         ? config.dockerRunCommand(sel)
@@ -1509,17 +1708,41 @@ export const Playground = ({ config }) => {
         && config.dockerHostNetworkWhen(sel, { flags: f, env: cellEnv }));
       // Mirrors `multiNodeDockerFlags` on the _deployment.jsx HARDWARE_CATALOG
       // (Mintlify strips module state, so the engines cannot share it).
+      const AMD_RDMA_DOCKER_FLAGS = [
+        "--device /dev/infiniband", "--cap-add IPC_LOCK",
+        "--ulimit memlock=-1", "--ulimit stack=67108864",
+        "--ulimit nofile=1048576:1048576",
+      ];
       const HW_MULTINODE_DOCKER_FLAGS = {
         "dgx-spark": [
           "--ulimit memlock=-1:-1", "--cap-add IPC_LOCK", "--device /dev/infiniband",
         ],
+        mi300x: AMD_RDMA_DOCKER_FLAGS,
+        mi325x: AMD_RDMA_DOCKER_FLAGS,
+        mi350x: AMD_RDMA_DOCKER_FLAGS,
+        mi355x: AMD_RDMA_DOCKER_FLAGS,
       };
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
+      // Mirrors the vendor branch in _deployment.jsx: ROCm reaches its GPUs
+      // through /dev/kfd + /dev/dri and the video group, not --gpus all.
+      const isAmdHw = /^mi\d/.test(sel.hw || "");
       const dockerLines = [
-        "docker run --gpus all",
-        "  --shm-size 32g",
+        ...(isAmdHw
+          ? [
+              "docker run",
+              "  --device=/dev/kfd --device=/dev/dri",
+              "  --group-add video",
+              "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
+              "  --shm-size 32g",
+            ]
+          : [
+              "docker run --gpus all",
+              "  --shm-size 32g",
+            ]),
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
+        // A PD pair is cross-host even when each role is a single-node cell, so
+        // the RDMA fabric flags are needed for `pdMode` too, not just multinode.
+        ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
@@ -1550,9 +1773,8 @@ export const Playground = ({ config }) => {
     }
     if (pdMode === "prefill" || pdMode === "decode") {
       const sibling = pdMode === "prefill" ? "decode" : "prefill";
-      const routerCfg = config.playgroundFeatures
-        && config.playgroundFeatures.pdDisagg
-        && config.playgroundFeatures.pdDisagg.router;
+      const routerCfg = resolveRouter(config.playgroundFeatures
+        && config.playgroundFeatures.pdDisagg, sel);
       const routerPort = (routerCfg && routerCfg.port) || 8000;
       const routerLine = routerCfg
         ? `# then front BOTH with the Router shown below.\n`
@@ -1759,6 +1981,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout for a prerequisite an axis option carries — rendered
+    // inside the axis card, so it reads as a condition on the pick rather
+    // than on the composed command.
+    axisNote: {
+      margin: "6px 0 0", padding: "6px 10px", borderRadius: "6px",
+      fontSize: "11px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     // Amber callout under the playground command when the effective (post-
     // override) command turns speculative decoding on without setting
@@ -2169,10 +2401,12 @@ export const Playground = ({ config }) => {
   let pgFlagsLatest = [];
   let pgEnvLatest = [];
   // Render-only ratio injection (before the host/port tail); skipped if the
-  // flags somehow already carry the family.
+  // flags already carry the family, or the base cell sizes the pool explicitly
+  // with --max-mamba-cache-size (the ratio would contradict its slot count).
   const withRatio = (fl, value) => {
     if (!value) return fl;
-    if (fl.some((f) => f.startsWith("--mamba-full-memory-ratio"))) return fl;
+    if (fl.some((f) =>
+      f.startsWith("--mamba-full-memory-ratio") || f.startsWith("--max-mamba-cache-size"))) return fl;
     const out = [...fl];
     const line = `--mamba-full-memory-ratio ${value}`;
     const i = out.findIndex((f) => f.startsWith("--host"));
@@ -2221,9 +2455,18 @@ export const Playground = ({ config }) => {
     ? matchedCell : null;
   const pgSpecAlgoFlag = pgFlagsLatest.find(
     (f) => f.split(/[\s=]/)[0] === "--speculative-algorithm");
+  // Off PD, the hint is a "you forgot to set it" warning and disappears once
+  // the ceiling is explicit. A PD role always ships one, so that form would
+  // never fire there — but the role is exactly where the sizing rule bites,
+  // since the ceiling has to be set on both roles and the decode graphs sized
+  // to what it leaves per rank. Under a role the hint switches to that form and
+  // shows whether or not the flag is present.
+  const pgPdRole = pdMode === "prefill" || pdMode === "decode";
   const pgSpecHint =
     !!pgSpecAlgoFlag &&
-    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+    (pgPdRole
+      || !pgFlagsLatest.some(
+        (f) => f.split(/[\s=]/)[0] === "--max-running-requests"));
   const specAlgoLabels = {
     EAGLE: "MTP", EAGLE3: "MTP", FROZEN_KV_MTP: "MTP",
     DSPARK: "DSpark", DFLASH: "DFlash", NGRAM: "N-gram",
@@ -2261,9 +2504,8 @@ export const Playground = ({ config }) => {
   // PD-Disagg router, if configured. When a PD role is active, cURL retargets
   // to the router port and a companion router block renders below the command.
   const pdRouter = (pdMode !== "off"
-    && config.playgroundFeatures
-    && config.playgroundFeatures.pdDisagg
-    && config.playgroundFeatures.pdDisagg.router) || null;
+    && resolveRouter(config.playgroundFeatures
+      && config.playgroundFeatures.pdDisagg, base)) || null;
   const curlEnv = (pdRouter && pdRouter.port != null)
     ? { ...env, CURL_PORT: String(pdRouter.port) }
     : env;
@@ -2508,7 +2750,11 @@ export const Playground = ({ config }) => {
           </pre>
           {pgSpecHint && (
             <div style={s.mtpWarn}>
-              ⚠️ Speculative decoding ({pgSpecAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              {pgPdRole ? (
+                <>⚠️ Speculative decoding ({pgSpecAlgoName}) is on — for a target concurrency of N, set <code>--max-running-requests &lt;N*2&gt;</code> on <strong>both</strong> the prefill and decode roles. That ceiling is server-wide and floor-divided by <code>attn_dp_size</code>, so size the decode graphs to the per-rank batch it leaves: <code>--cuda-graph-bs-decode</code> up to <code>N*2 / dp_size</code>.</>
+              ) : (
+                <>⚠️ Speculative decoding ({pgSpecAlgoName}) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.</>
+              )}
             </div>
           )}
           {pgCpDpHint && (

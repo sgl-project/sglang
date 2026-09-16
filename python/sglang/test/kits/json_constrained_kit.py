@@ -6,7 +6,6 @@ import requests
 
 
 class JSONConstrainedMixin:
-
     json_schema = json.dumps(
         {
             "type": "object",

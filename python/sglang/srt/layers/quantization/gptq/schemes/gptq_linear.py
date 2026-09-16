@@ -19,7 +19,7 @@ from .gptq_scheme import GPTQLinearSchemeBase
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
 
-__all__ = ["GPTQLinearScheme", "GPTQAscendLinearScheme"]
+__all__ = ["GPTQLinearScheme", "GPTQAscendLinearScheme", "GPTQXPULinearScheme"]
 
 
 class GPTQLinearScheme(GPTQLinearSchemeBase):
@@ -29,11 +29,10 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
         self.kernel = self._init_kernel(quant_config)
 
     def _init_kernel(self, quant_config: GPTQConfig):
-        from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
-            GPTQLinearKernel,
+        raise RuntimeError(
+            "The non-Marlin GPTQ CUDA kernel has been removed. Use "
+            "quantization='gptq_marlin' (or a Marlin-compatible checkpoint) instead."
         )
-
-        return GPTQLinearKernel(quant_config)
 
     def create_weights(
         self,
@@ -169,3 +168,12 @@ class GPTQAscendLinearScheme(GPTQLinearScheme):
         super().create_weights(layer=layer, **kwargs)
         set_weight_attrs(layer.qzeros, {"pack_factor": self.quant_config.pack_factor})
         set_weight_attrs(layer.qweight, {"pack_factor": self.quant_config.pack_factor})
+
+
+class GPTQXPULinearScheme(GPTQLinearScheme):
+    def _init_kernel(self, quant_config: GPTQConfig):
+        from sglang.srt.hardware_backend.xpu.quantization.gptq_kernels import (
+            GPTQXPULinearKernel,
+        )
+
+        return GPTQXPULinearKernel(quant_config)

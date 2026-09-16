@@ -272,16 +272,6 @@ def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     tl.store(gate_row_ptr + cols, gate, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=2),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 512}, num_warps=4),
-        triton.Config({"BLOCK_N": 1024}, num_warps=8),
-    ],
-    key=["inner_dim"],
-)
 @triton.jit
 def _fused_scale_shift_4d_kernel(
     output_ptr,
@@ -416,13 +406,16 @@ def fuse_scale_shift_kernel(
         x_2d = x.view(rows, C)
         output_2d = output.view(rows, C)
 
-        def grid(meta):
-            return (rows, triton.cdiv(C, meta["BLOCK_N"]))
-
+        # Autotuning this bandwidth-bound kernel is much more expensive than
+        # the launch itself on causal video models.  A capped power-of-two
+        # tile is fastest or within noise across the production hidden sizes.
+        block_n = max(64, min(512, triton.next_power_of_2(C)))
+        num_warps = 2 if block_n == 64 else 4
+        grid = (rows, triton.cdiv(C, block_n))
         num_frames = scale.shape[1]
-        assert (
-            L % num_frames == 0
-        ), "seq_len must be divisible by num_frames for 4D scale/shift"
+        assert L % num_frames == 0, (
+            "seq_len must be divisible by num_frames for 4D scale/shift"
+        )
         frame_seqlen = L // num_frames
 
         # Compact scale [B, F, 1, C] -> [B*F, C] (per-frame)
@@ -454,6 +447,8 @@ def fuse_scale_shift_kernel(
             L,
             num_frames,
             frame_seqlen,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
         )
     else:
         # 2D: [B, C] or [1, C]  -> treat as [B, 1, C] and broadcast over L
@@ -529,6 +524,66 @@ def fuse_scale_shift_kernel(
             num_stages=2,
         )
     return output
+
+
+def expand_scale_shift_cpu_param(
+    tensor: torch.Tensor,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    B, L, C = x.shape
+
+    if tensor.numel() == 1:
+        return tensor.reshape(1, 1, 1).expand(B, L, C)
+
+    if tensor.dim() == 1:
+        if tensor.shape[0] != C:
+            raise ValueError(f"1D modulation tensor must have shape [{C}]")
+        tensor = tensor.reshape(1, 1, C)
+
+    elif tensor.dim() == 2:
+        tensor = tensor[:, None, :]
+
+    elif tensor.dim() == 3:
+        pass
+
+    elif tensor.dim() == 4:
+        # [B, F, 1, C] -> [B, L, C]
+        if tensor.shape[2] != 1:
+            raise ValueError("4D modulation tensor must have shape [B, F, 1, C]")
+        num_frames = tensor.shape[1]
+        if L % num_frames != 0:
+            raise ValueError("sequence length must be divisible by num_frames")
+        frame_seqlen = L // num_frames
+        tensor = tensor.expand(
+            tensor.shape[0], num_frames, frame_seqlen, tensor.shape[-1]
+        ).reshape(tensor.shape[0], L, tensor.shape[-1])
+
+    else:
+        raise ValueError("modulation tensor must be scalar or 1D/2D/3D/4D")
+    return tensor.expand(B, L, C)
+
+
+def _fuse_scale_shift_kernel_cpu(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    scale_constant: float = 1.0,
+    block_l: int = 128,
+    block_c: int = 128,
+) -> torch.Tensor:
+    import sgl_kernel  # noqa: F401
+
+    del block_l, block_c
+
+    scale = expand_scale_shift_cpu_param(scale, x)
+    shift = expand_scale_shift_cpu_param(shift, x)
+
+    return torch.ops.sgl_kernel.fused_scale_shift_cpu(
+        x,
+        scale,
+        shift,
+        scale_constant,
+    )
 
 
 def fuse_layernorm_scale_shift_gate_select01_kernel(
@@ -738,5 +793,5 @@ fuse_scale_shift_kernel = select_impl(
     npu=lazy_fallback("npu", "fuse_scale_shift_native"),
     mps=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     musa=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
-    cpu=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
+    cpu=_fuse_scale_shift_kernel_cpu,
 )

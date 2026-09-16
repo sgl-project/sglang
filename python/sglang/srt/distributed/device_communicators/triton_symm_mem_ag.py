@@ -16,6 +16,12 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
+
 logger = logging.getLogger(__name__)
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
@@ -368,9 +374,9 @@ def all_gather_inner(
         f"hidden_states.data_ptr()={hex(hidden_states.data_ptr())} must be "
         f"16-byte aligned for 128-bit multimem.st"
     )
-    assert (
-        tp_hidden_dim % world_size == 0
-    ), f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    assert tp_hidden_dim % world_size == 0, (
+        f"tp_hidden_dim={tp_hidden_dim} must be divisible by world_size={world_size}"
+    )
     local_hidden = tp_hidden_dim // world_size
     assert local_hidden % _NUMEL_PER_THREAD == 0, (
         f"per-rank hidden shard ({local_hidden}) must be a multiple of "
@@ -381,12 +387,12 @@ def all_gather_inner(
         f"state.hidden_dim={state.hidden_dim}"
     )
     total_tokens, in_hidden = hidden_states.shape
-    assert (
-        in_hidden == local_hidden
-    ), f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
-    assert (
-        total_tokens <= state.max_token_num
-    ), f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    assert in_hidden == local_hidden, (
+        f"input hidden ({in_hidden}) != this rank's shard ({local_hidden})"
+    )
+    assert total_tokens <= state.max_token_num, (
+        f"total_tokens={total_tokens} exceeds max_token_num={state.max_token_num}"
+    )
 
     hidden_offset = local_hidden * state.rank_in_group
     symm_mem_hdl = state.symm_mem_hdl
@@ -423,19 +429,18 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
     chunk. Returns ``floor`` if server args are unavailable."""
     try:
-        from sglang.srt.runtime_context import get_server_args
 
-        sa = get_server_args()
+        def g(value) -> int:
+            return value if isinstance(value, int) and value > 0 else 0
 
-        def g(name: str) -> int:
-            v = getattr(sa, name, 0)
-            return v if isinstance(v, int) and v > 0 else 0
-
-        tokens = g("max_running_requests") * max(
-            g("speculative_num_draft_tokens"), g("speculative_eagle_topk"), 1
+        schedule, spec = get_schedule(), get_spec()
+        tokens = g(schedule.max_running_requests) * max(
+            g(spec.speculative_num_draft_tokens), g(spec.speculative_eagle_topk), 1
         )
         if include_prefill:
-            tokens = max(tokens, g("chunked_prefill_size"), g("max_prefill_tokens"))
+            tokens = max(
+                tokens, g(schedule.chunked_prefill_size), g(schedule.max_prefill_tokens)
+            )
         return max(tokens, floor)
     except Exception:
         return floor
@@ -466,7 +471,6 @@ class MultimemAllGatherer:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
-            from sglang.srt.runtime_context import get_parallel
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span

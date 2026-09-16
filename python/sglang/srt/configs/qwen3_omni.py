@@ -235,7 +235,6 @@ class Qwen3OmniMoeThinkerConfig(PretrainedConfig):
 
 
 class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
-
     model_type = "qwen3_omni_moe_talker_code_predictor"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -325,7 +324,6 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(PretrainedConfig):
 
 
 class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
-
     model_type = "qwen3_omni_moe_talker_text"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -415,7 +413,6 @@ class Qwen3OmniMoeTalkerTextConfig(PretrainedConfig):
 
 
 class Qwen3OmniMoeTalkerConfig(PretrainedConfig):
-
     sub_configs = {
         "code_predictor_config": Qwen3OmniMoeTalkerCodePredictorConfig,
         "text_config": Qwen3OmniMoeTalkerTextConfig,
@@ -486,7 +483,6 @@ class Qwen3OmniMoeTalkerConfig(PretrainedConfig):
 
 
 class Qwen3OmniMoeCode2WavConfig(PretrainedConfig):
-
     def __init__(
         self,
         codebook_size=2048,
@@ -538,7 +534,6 @@ class Qwen3OmniMoeCode2WavConfig(PretrainedConfig):
 
 
 class Qwen3OmniMoeConfig(PretrainedConfig):
-
     model_type = "qwen3_omni_moe"
     sub_configs = {
         "thinker_config": Qwen3OmniMoeThinkerConfig,
