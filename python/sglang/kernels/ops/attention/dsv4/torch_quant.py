@@ -66,8 +66,7 @@ def fake_quant_compressed_kv(x: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------
 # Pure-torch reference of the paged V4.1 fp8 KV cache format read by the sparse
-# decode kernel (528 B/token "V41"), byte for byte what the store / dequant
-# kernels are checked against.
+# decode kernel (528 B/token, "V41").
 # ---------------------------------------------------------------------------
 
 

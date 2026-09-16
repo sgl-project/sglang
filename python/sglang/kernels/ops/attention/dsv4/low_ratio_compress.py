@@ -3,11 +3,9 @@ cache write in one launch.
 
 Ratio 1 takes the bf16 ``wkv`` projection as is: RoPE uses the token's own
 position and the compressed slot equals the FULL slot. Ratio 2 pair-pools the
-token against the pending partner in the state ring first; its closed-form
-softmax and FMA contraction can differ from torch by fp32 ulps, so pooling is
-compared with a tolerance while stores from a given latent are bitwise.
-``out_loc == 0`` marks a padded graph row on both paths, and both return the
-pre-RoPE latent for the index-key projection.
+token against the pending partner in the state ring first. ``out_loc == 0``
+marks a padded graph row on both paths, and both return the pre-RoPE latent for
+the index-key projection.
 """
 
 from __future__ import annotations
@@ -64,23 +62,16 @@ def c1_decode_norm_rope_store(
 ) -> torch.Tensor:
     """RMSNorm ``kv_input`` and write the main KV slot, in a single launch.
 
-    ``out`` contains the pre-RoPE latent for the index-K branch's ``wk`` projection;
-    the main KV cache receives the rotated and quantized value.
-
-    :param kv_input: ``[num_tokens, head_dim]`` bf16 -- ``compressor.project(x)``
-                     at ratio 1, i.e. the raw ``wkv`` output.
-    :param norm_weight: ``[head_dim]`` bf16. ``DeepseekV41Compressor.norm`` holds
-                        its weight in the model dtype and the multiply is done in
-                        fp32 by promoting it, exactly as the module does.
-    :param positions: ``[num_tokens]`` int32 or int64, the token's position.
-                      Indexed into ``freqs_cis`` as-is: at ratio 1 the latent
-                      stands for the token itself, so there is no ``- 1`` and no
-                      gather launch.
+    :param kv_input: ``[num_tokens, head_dim]`` bf16, the raw ``wkv`` projection
+                     output.
+    :param norm_weight: ``[head_dim]`` bf16, promoted to fp32 for the multiply.
+    :param positions: ``[num_tokens]`` int32 or int64, indexed into ``freqs_cis``
+                      as-is: at ratio 1 the latent stands for the token itself,
+                      so there is no ``- 1``.
     :param out_loc: ``[num_tokens]`` int32 or int64 ``c1_out_loc``, which at ratio 1
                     equals ``raw_out_loc`` (the scheduler's int64 ``out_cache_loc``).
-                    ``0`` marks a padded graph row: it computes
-                    and publishes its latent, which the caller discards, but
-                    writes nothing to the cache.
+                    ``0`` marks a padded graph row: its latent is still computed
+                    and published, but nothing is written to the cache.
     :param eps: RMSNorm epsilon.
     :param freqs_cis: ``[max_pos, rope_dim]`` fp32, real/imag interleaved --
                       ``torch.view_as_real(freqs).flatten(-2)``.
@@ -156,13 +147,12 @@ def c2_decode_norm_rope_store(
 ) -> torch.Tensor:
     """Pair-pool ``kv_input`` against ``kv_state``, RMSNorm, and write the main KV slot.
 
-    ``out`` contains the pre-RoPE latent for the index-K branch's ``wk`` projection.
     The cache store uses ``raw_out_loc // 2`` as its slot.
 
     :param freqs_cis: ``[max_pos, rope_dim]`` fp32, real/imag interleaved --
                       ``torch.view_as_real(freqs).flatten(-2)``. Indexed
                       in-kernel at ``positions - 1``, the position the latent
-                      stands for, so there is no gather launch.
+                      stands for.
     :param k_cache: the compressed KV pool buffer for this layer.
     :param page_size: slots per page of that pool (``page_size // ratio``).
     :param layout: the pool's :class:`KVLayout`. The fp8 layouts (``V4``,
