@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -17,15 +18,15 @@ register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
-        "accuracy": 0.85,
-        "latency": 180,
-        "output_throughput": 20,
+    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8": {
+        "accuracy": 0.34,
+        "latency": 1000,
+        "output_throughput": 6,
     },
 }
 
 
-class TestAscendTp2Bf16(CustomTestCase):
+class TestAscendMlaW8A8Int8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -40,9 +41,14 @@ class TestAscendTp2Bf16(CustomTestCase):
             "ascend",
             "--tp-size",
             2,
+            "--disable-radix-cache",
+            "--enable-hierarchical-cache",
+            "--hicache-ratio",
+            1.2,
         ]
 
     def test_a_gsm8k(self):
+        os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
                 process = popen_launch_server(
