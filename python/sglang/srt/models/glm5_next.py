@@ -118,6 +118,115 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 
+# transformers renames GLM-5.3-Flash tensors while loading the released
+# checkpoint (`conversion_mapping.py`, entry "glm5_next") and never reverses
+# that on save, so anything written by `save_pretrained` -- a fine-tune, a
+# merged adapter, a bf16 re-export -- carries transformers module names rather
+# than the released ones the loader below is written against. Those names miss
+# `params_dict` and the tensors are dropped without an error, which starts the
+# server on a partly-initialised model. Mapping them back here keeps one
+# loading path for both layouts.
+_HF_NATIVE_RENAMES = (
+    (".self_attn.forget_gate.", ".self_attn."),
+    (".attn_hc.fn", ".hc_attn_fn"),
+    (".attn_hc.base", ".hc_attn_base"),
+    (".attn_hc.scale", ".hc_attn_scale"),
+    (".ffn_hc.fn", ".hc_ffn_fn"),
+    (".ffn_hc.base", ".hc_ffn_base"),
+    (".ffn_hc.scale", ".hc_ffn_scale"),
+)
+
+_HF_PACKED_GATE_UP = ".mlp.experts.gate_up_proj"
+_HF_PACKED_DOWN = ".mlp.experts.down_proj"
+_HF_PACKED_CONV1D = ".self_attn.conv1d.weight"
+
+
+def _split_hf_packed_gate_up(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`experts.gate_up_proj` [E, 2I, H] -> per-expert `gate_proj` / `up_proj`.
+
+    transformers stacks the experts on dim 0 and concatenates gate and up on
+    dim 1, in that order, so the halves come back apart the same way.
+    """
+    if weight.dim() != 3:
+        raise ValueError(f"{name}: expected a 3-D packed tensor, got {weight.shape}")
+    n_experts, gate_and_up, _ = weight.shape
+    if gate_and_up % 2:
+        raise ValueError(f"{name}: dim 1 is {gate_and_up}, which is not two halves")
+    inter = gate_and_up // 2
+    prefix = name[: -len("gate_up_proj")]
+    for expert in range(n_experts):
+        yield f"{prefix}{expert}.gate_proj.weight", weight[expert, :inter]
+        yield f"{prefix}{expert}.up_proj.weight", weight[expert, inter:]
+
+
+def _split_hf_packed_down(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`experts.down_proj` [E, H, I] -> per-expert `down_proj`."""
+    if weight.dim() != 3:
+        raise ValueError(f"{name}: expected a 3-D packed tensor, got {weight.shape}")
+    prefix = name[: -len("down_proj")]
+    for expert in range(weight.shape[0]):
+        yield f"{prefix}{expert}.down_proj.weight", weight[expert]
+
+
+def _split_hf_packed_conv1d(
+    name: str, weight: torch.Tensor
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """`self_attn.conv1d.weight` [3P, 1, K] -> `q_conv1d` / `k_conv1d` / `v_conv1d`.
+
+    The singleton dimension is kept: `qkv_conv1d.weight` is unsqueezed after
+    construction, so its shards are [P, 1, K] too.
+    """
+    if weight.shape[0] % 3:
+        raise ValueError(
+            f"{name}: dim 0 is {weight.shape[0]}, which is not three parts"
+        )
+    prefix = name[: -len("conv1d.weight")]
+    for shard, chunk in zip("qkv", weight.chunk(3, dim=0)):
+        yield f"{prefix}{shard}_conv1d.weight", chunk
+
+
+def convert_hf_native_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Yield weights under released names, whichever layout they arrived in.
+
+    A released checkpoint passes through untouched: every rule keys off a name
+    only transformers produces, and the packed tensors it unpacks do not exist
+    there under any name.
+    """
+    announced = False
+    for name, loaded_weight in weights:
+        for source, target in _HF_NATIVE_RENAMES:
+            if source in name:
+                name = name.replace(source, target)
+                converted = True
+                break
+        else:
+            converted = name.endswith(
+                (_HF_PACKED_GATE_UP, _HF_PACKED_DOWN, _HF_PACKED_CONV1D)
+            )
+        if converted and not announced:
+            announced = True
+            log_info_on_rank0(
+                logger,
+                "glm5_next: checkpoint uses transformers module names; "
+                "mapping them back to the released layout",
+            )
+
+        if name.endswith(_HF_PACKED_GATE_UP):
+            yield from _split_hf_packed_gate_up(name, loaded_weight)
+        elif name.endswith(_HF_PACKED_DOWN):
+            yield from _split_hf_packed_down(name, loaded_weight)
+        elif name.endswith(_HF_PACKED_CONV1D):
+            yield from _split_hf_packed_conv1d(name, loaded_weight)
+        else:
+            yield name, loaded_weight
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -1423,7 +1532,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         params_dict = dict(self.named_parameters())
         weight_names = []
-        for name, loaded_weight in weights:
+        for name, loaded_weight in convert_hf_native_weights(weights):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
