@@ -1482,7 +1482,7 @@ class CommonKVSender(BaseKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
-        self._transfer_num_state_indices = 0
+        self._transfer_state_bytes = 0
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1545,9 +1545,7 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
+        total_bytes += self._transfer_state_bytes
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -1560,9 +1558,13 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            for component, component_indices in enumerate(state_indices):
                 if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+                    # Each component has its own slot size (e.g. Mamba vs
+                    # DFlash ring). Mixing counts and sizes creates cross-products.
+                    self._transfer_state_bytes += len(component_indices) * sum(
+                        self.kv_mgr.kv_args.state_item_lens[component]
+                    )
 
     def _prepare_send_indices(
         self,
