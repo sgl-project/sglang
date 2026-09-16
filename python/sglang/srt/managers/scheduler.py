@@ -1962,6 +1962,13 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
+            # Mamba prefix insertion can replace req_to_token entries with
+            # canonical cached slots and free the duplicate slots. Publish that
+            # mapping before preparing a dependent decode/verify batch.
+            processed_prefill_cache = self._has_pending_mamba_cache_update()
+            if processed_prefill_cache:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1969,14 +1976,16 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+            disable_overlap_for_batch = (
+                not processed_prefill_cache
+                and self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch)
             )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                pop_and_process()
+            if disable_overlap_for_batch or processed_prefill_cache:
+                if not processed_prefill_cache:
+                    pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1998,7 +2007,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not processed_prefill_cache:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2014,6 +2023,31 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _has_pending_mamba_cache_update(self) -> bool:
+        if not self.result_queue:
+            return False
+        pending_batch = self.result_queue[0][0]
+        if not pending_batch.forward_mode.is_extend():
+            return False
+        # DP/MLP-sync ranks need a collective decision; retain their overlap path.
+        if (
+            self.require_mlp_sync
+            or getattr(self.tree_cache, "disable", True)
+            or not getattr(self.tree_cache, "enable_mamba_extra_buffer", False)
+        ):
+            return False
+        return any(
+            req.kv.mamba_last_track_seqlen is not None
+            and not req.finished()
+            and not req.is_retracted
+            and not req.skip_radix_cache_insert
+            and (
+                not pending_batch.decoding_reqs
+                or req not in pending_batch.decoding_reqs
+            )
+            for req in pending_batch.reqs
+        )
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
