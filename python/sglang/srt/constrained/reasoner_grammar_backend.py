@@ -15,6 +15,7 @@
 
 import json
 import logging
+import time
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -350,10 +351,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        start = time.perf_counter()
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
+            ret = self.grammar_backend.wrap_full_assistant_grammar(ret, key[1])
+            if ret.grammar_stats is not None:
+                ret.grammar_stats.compilation_time = time.perf_counter() - start
             return ret
         if not self.enable_strict_thinking and key[0] == "structural_tag":
             from sglang.srt.function_call.inkling_detector import InklingDetector
