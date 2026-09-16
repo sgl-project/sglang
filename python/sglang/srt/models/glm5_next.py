@@ -1426,8 +1426,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def maybe_map_fp8_block_scale_name(name: str) -> str:
-            if name.endswith(".weight_scale"):
-                candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+            if name.endswith("weight_scale"):
+                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
                 if candidate in params_dict:
                     return candidate
             return name
