@@ -306,6 +306,9 @@ def _cp_allgather_and_save_kv_npu(
 class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
+        self.dflash_init_mask_once = get_bool_env_var(
+            "SGLANG_NPU_DFLASH_INIT_MASK_ONCE", "True"
+        )
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
