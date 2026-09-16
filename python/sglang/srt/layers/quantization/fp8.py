@@ -1674,14 +1674,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_scale=layer.w2_weight_scale_inv,
                     input_scale=None,
                 )
-                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale_inv = Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale_inv = Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
+                copy_or_rebind_param(layer, "w13_weight", w13_weight)
+                copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_weight_scale)
+                copy_or_rebind_param(layer, "w2_weight", w2_weight)
+                copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_weight_scale)
                 layer.w13_input_scale = None
                 layer.w2_input_scale = None
             runner_is_aiter = (
