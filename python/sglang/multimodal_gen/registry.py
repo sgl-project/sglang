@@ -1330,9 +1330,11 @@ def _register_configs():
     register_configs(
         sampling_param_cls=CosmosDreamsTransferSamplingParams,
         pipeline_config_cls=CosmosDreamsTransferConfig,
-        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Transfer"],
-        # Matches the ``CosmosDreamsTransferPipeline`` ``_class_name`` of the checkpoint.
-        model_detectors=[lambda hf_id: "cosmosdreamstransferpipeline" in hf_id.lower()],
+        hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Depth"],
+        # Matches the release ``Cosmos3NanoSimTransferPipeline`` ``_class_name``.
+        model_detectors=[
+            lambda hf_id: "cosmos3nanosimtransferpipeline" in hf_id.lower()
+        ],
     )
 
     # Cosmos3 Multiview-AV: 11-camera WSM transfer with block-sparse cross-camera

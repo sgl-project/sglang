@@ -307,7 +307,7 @@ class TestCosmosDreamsManifest(unittest.TestCase):
             load_cosmos_dreams_manifest({"hidden_size": 4096})
 
     def test_load_reads_the_exporter_envelope_only(self):
-        # One envelope serves Sim-Bimanual and Sim-Transfer exports; the legacy
+        # One envelope serves Sim-Bimanual and Sim-Depth exports; the legacy
         # ``cosmos_dreams`` block and unnamed blocks are rejected with a re-export hint.
         manifest = load_cosmos_dreams_manifest(
             {"hidden_size": 4096, "cosmos3_nano_sim_bimanual": _artifact()}

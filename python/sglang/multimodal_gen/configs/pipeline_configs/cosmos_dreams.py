@@ -72,8 +72,8 @@ class CosmosDreamsConfig(Cosmos3Config):
             raise ValueError(
                 f"Checkpoint {manifest.checkpoint_id} is conditioned on "
                 f"{manifest.conditioning_mode!r} but {type(self).__name__} drives "
-                f"{self.conditioning_mode!r}; use CosmosDreamsPipeline for action "
-                "checkpoints and CosmosDreamsTransferPipeline for control-video checkpoints."
+                f"{self.conditioning_mode!r}; use Cosmos3NanoSimBimanualPipeline for action "
+                "checkpoints and Cosmos3NanoSimTransferPipeline for control-video checkpoints."
             )
         if self.distilled_sigmas is None:
             raise ValueError(

@@ -549,7 +549,7 @@ def parse_cosmos_dreams_manifest(artifact: dict[str, Any]) -> CosmosDreamsManife
 
 
 # The imaginaire4 exporter writes one envelope for both Sim-Bimanual and
-# Sim-Transfer; the pipeline variant is selected by model_index.json's _class_name.
+# Sim-Depth; the pipeline variant is selected by model_index.json's _class_name.
 COSMOS_DREAMS_ARTIFACT_KEY = "cosmos3_nano_sim_bimanual"
 _LEGACY_ARTIFACT_KEY = "cosmos_dreams"
 

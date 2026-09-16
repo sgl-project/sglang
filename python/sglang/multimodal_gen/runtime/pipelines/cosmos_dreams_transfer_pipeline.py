@@ -28,10 +28,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class CosmosDreamsTransferPipeline(ComposedPipelineBase):
+class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
     """Control video + prompt to video, one chunk at a time."""
 
-    pipeline_name = "CosmosDreamsTransferPipeline"
+    pipeline_name = "Cosmos3NanoSimTransferPipeline"
     is_video_pipeline = True
 
     _required_config_modules = [
@@ -45,14 +45,14 @@ class CosmosDreamsTransferPipeline(ComposedPipelineBase):
         pipeline_config = server_args.pipeline_config
         if not isinstance(pipeline_config, CosmosDreamsTransferConfig):
             raise TypeError(
-                "CosmosDreamsTransferPipeline requires CosmosDreamsTransferConfig, got "
-                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Transfer "
-                "or make the checkpoint's model_index.json name CosmosDreamsTransferPipeline."
+                "Cosmos3NanoSimTransferPipeline requires CosmosDreamsTransferConfig, got "
+                f"{type(pipeline_config).__name__}; pass --model-id nvidia/Cosmos3-Nano-Sim-Depth "
+                "or make the checkpoint's model_index.json name Cosmos3NanoSimTransferPipeline."
             )
         transformer = self.get_module("transformer")
         if not isinstance(transformer, CosmosDreamsTransformer):
             raise TypeError(
-                "CosmosDreamsTransferPipeline loaded the wrong transformer type: "
+                "Cosmos3NanoSimTransferPipeline loaded the wrong transformer type: "
                 f"{type(transformer).__name__}."
             )
         manifest = transformer.manifest
@@ -90,4 +90,4 @@ class CosmosDreamsTransferPipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = [CosmosDreamsTransferPipeline]
+EntryClass = [Cosmos3NanoSimTransferPipeline]
