@@ -4,12 +4,26 @@
 //! SGLang KV event bridge.
 //!
 //! Subscribes to a worker's ZMQ KV-event stream, decodes each batch, and
-//! forwards it to the indexer over gRPC.
+//! forwards it to one indexer over gRPC ([`Sink::Grpc`]) or to the Valkey event
+//! stream that any number of indexers consume ([`Sink::Stream`]).
 //!
-//! It keeps a reconnect supervisor but does not recover data: no sequence
-//! tracking, no replay of missed batches, no incarnation token, no liveness
-//! heartbeat. A sequence gap is logged and ignored, and events produced while
-//! the bridge is disconnected are lost.
+//! What it recovers, and what it still does not:
+//!
+//! * Missed batches, when `SGLANG_KV_REPLAY_ENDPOINT` names the worker's replay
+//!   socket: on connect and on a sequence gap it asks for everything after the
+//!   last sequence it forwarded, and that sequence is checkpointed in Valkey so
+//!   a restart replays the gap rather than the whole buffer. What the worker's
+//!   bounded buffer has already dropped is unrecoverable; the bridge detects
+//!   that case and clears the worker so the index rebuilds instead of carrying
+//!   a hole.
+//! * A publisher that restarted, told apart from an already-forwarded batch by
+//!   the batch timestamp, and answered with `AllBlocksCleared` because that
+//!   worker's cache is empty.
+//! * Worker liveness, when a Valkey configuration is present: a TTL key
+//!   refreshed only while the worker's own port answers.
+//!
+//! Still absent: an incarnation token (a restart is inferred, not announced) and
+//! any acknowledgement of what the indexer actually applied.
 
 use std::io::Cursor;
 use std::time::Duration;
@@ -551,10 +565,22 @@ async fn run_session(
     checkpoint: Option<&Checkpoint>,
 ) -> Result<(), BridgeError> {
     // Whatever the worker still buffers since we last saw it, before live events.
-    replay(config, &mut forwarder, last_seq, None).await?;
+    // A replay that cannot be served costs recovery, not the session: the live
+    // stream is still worth consuming.
+    if let Err(error) = replay(config, &mut forwarder, last_seq, None).await {
+        if error.is_permanent() {
+            return Err(error);
+        }
+        warn!(%error, "replay on connect failed; continuing with live events only");
+    }
     if let Some(checkpoint) = checkpoint {
         checkpoint.store(*last_seq).await;
     }
+    // Newest batch timestamp forwarded. A sequence at or below `last_seq` is
+    // either a restarted publisher, whose batches are newer than anything seen,
+    // or a batch already forwarded because the replay and the live stream
+    // overlap. Only the first may clear the worker.
+    let mut newest_ts = f64::MIN;
 
     loop {
         let message = tokio::select! {
@@ -576,10 +602,19 @@ async fn run_session(
             continue;
         }
 
+        let ts = decode_batch_timestamp(&payload);
         if let Some(previous) = *last_seq {
-            if seq < previous {
-                // A publisher restarted from zero: the worker's cache is empty and
-                // every placement the index holds for it is stale.
+            if seq <= previous {
+                if !ts.is_some_and(|ts| ts > newest_ts) {
+                    debug!(
+                        previous,
+                        actual = seq,
+                        "skipping a batch this session already forwarded"
+                    );
+                    continue;
+                }
+                // A publisher counting from zero again: the worker's cache is
+                // empty and every placement the index holds for it is stale.
                 warn!(
                     previous,
                     actual = seq,
@@ -587,14 +622,25 @@ async fn run_session(
                 );
                 forwarder.forward(clear_all_request(config, seq)).await?;
                 *last_seq = None;
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.store(None).await;
+                }
             } else if seq > previous.wrapping_add(1) {
                 warn!(previous, actual = seq, "SGLang KV event sequence gap");
-                replay(config, &mut forwarder, last_seq, Some(seq)).await?;
+                if let Err(error) = replay(config, &mut forwarder, last_seq, Some(seq)).await {
+                    if error.is_permanent() {
+                        return Err(error);
+                    }
+                    warn!(%error, "gap replay failed; the missed batches are lost");
+                }
             }
         }
 
         forward_raw_batch(config, &mut forwarder, seq, &payload).await?;
         *last_seq = Some(seq);
+        if let Some(ts) = ts {
+            newest_ts = newest_ts.max(ts);
+        }
         if let Some(checkpoint) = checkpoint {
             checkpoint.store(Some(seq)).await;
         }
@@ -650,7 +696,15 @@ async fn replay(
     };
     let start = last_seq.map_or(0, |seq| seq.wrapping_add(1));
     let mut dealer = DealerSocket::new();
-    dealer.connect(endpoint).await?;
+    // A replay socket nothing is listening on must not stall the session.
+    match tokio::time::timeout(REPLAY_TIMEOUT, dealer.connect(endpoint)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(BridgeError::Decode(format!(
+                "replay endpoint {endpoint} did not accept a connection within {REPLAY_TIMEOUT:?}"
+            )))
+        }
+    }
     // The publisher's ROUTER expects [identity][empty][start_seq]; the DEALER
     // supplies the identity, we send the rest.
     let mut request = ZmqMessage::from(Bytes::new());
@@ -658,6 +712,10 @@ async fn replay(
     dealer.send(request).await?;
 
     let mut replayed = 0usize;
+    // A first replied batch above the sequence asked for means the publisher's
+    // bounded deque already dropped the rest: no later event will carry it.
+    let mut dropped_before: Option<u64> = None;
+    let mut first_reply = true;
     loop {
         let message = match tokio::time::timeout(REPLAY_TIMEOUT, dealer.recv()).await {
             Ok(message) => message?,
@@ -681,6 +739,12 @@ async fn replay(
         if seq == END_SEQ {
             break;
         }
+        if first_reply {
+            first_reply = false;
+            if seq > start {
+                dropped_before = Some(seq);
+            }
+        }
         if last_seq.is_some_and(|previous| seq <= previous) || until.is_some_and(|u| seq >= u) {
             continue;
         }
@@ -689,6 +753,18 @@ async fn replay(
         replayed += 1;
     }
     info!(start, replayed, "replayed buffered KV event batches");
+    if let Some(first) = dropped_before {
+        // A hole would leave the index claiming blocks the worker may no longer
+        // hold, with nothing to correct it. Clearing costs this worker's affinity
+        // until it reports again, which is recoverable; a hole is not.
+        warn!(
+            start,
+            first,
+            "the worker's replay buffer no longer holds the missed batches; clearing its placements"
+        );
+        forwarder.forward(clear_all_request(config, start)).await?;
+        *last_seq = None;
+    }
     Ok(())
 }
 
@@ -903,6 +979,21 @@ fn encode_block_sizes(block_sizes: &[Option<u32>]) -> Vec<u32> {
 
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     decode_event_batch_impl(payload, true)
+}
+
+/// The timestamp SGLang stamps on a batch at publish time (`KVEventBatch[0]`).
+/// It is how a restarted publisher is told from a batch already forwarded: a
+/// replayed batch carries its original timestamp, a new incarnation's first
+/// batch carries a fresh one.
+fn decode_batch_timestamp(payload: &[u8]) -> Option<f64> {
+    let mut cursor = Cursor::new(payload);
+    let value = read_value(&mut cursor).ok()?;
+    match expect_array(&value, "KVEventBatch").ok()?.first()? {
+        Value::F64(ts) => Some(*ts),
+        Value::F32(ts) => Some(*ts as f64),
+        Value::Integer(ts) => ts.as_f64(),
+        _ => None,
+    }
 }
 
 fn decode_event_batch_impl(

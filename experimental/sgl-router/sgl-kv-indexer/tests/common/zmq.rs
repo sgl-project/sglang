@@ -157,14 +157,20 @@ pub fn removed(hashes: &[i64]) -> Value {
     ])
 }
 
-/// `[ts, events, attn_dp_rank]`, msgpack-encoded.
-pub fn batch(events: Vec<Value>) -> Vec<u8> {
+/// `[ts, events, attn_dp_rank]`, msgpack-encoded, with the publish timestamp
+/// SGLang stamps. The timestamp is load-bearing: it is how the bridge tells a
+/// restarted publisher from a batch it has already forwarded.
+pub fn batch_at(ts: f64, events: Vec<Value>) -> Vec<u8> {
     let value = Value::Array(vec![
-        Value::from(1.0_f64),
+        Value::from(ts),
         Value::Array(events),
         Value::from(0_i64),
     ]);
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, &value).unwrap();
     buf
+}
+
+pub fn batch(events: Vec<Value>) -> Vec<u8> {
+    batch_at(1.0, events)
 }

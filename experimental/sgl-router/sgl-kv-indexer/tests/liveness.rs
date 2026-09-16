@@ -94,6 +94,17 @@ async fn expired_heartbeat_clears_the_worker_through_notifications() {
     let backend = server.backend(&prefix).await;
     seed(&backend, "w0", &[1, 2, 3]).await;
     seed(&backend, "w1", &[1, 2]).await;
+    seed(&backend, "w2", &[5]).await;
+
+    // w2 keeps heartbeating throughout: the watcher clears a worker only while
+    // some other heartbeating worker is still alive.
+    let steady = Heartbeat::connect(&server.config(&prefix), "w2", "", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let (steady_tx, steady_rx) = tokio::sync::oneshot::channel::<()>();
+    let steady_task = tokio::spawn(steady.run(async move {
+        let _ = steady_rx.await;
+    }));
 
     // Heartbeat for w0 only, then stop it and let the key expire.
     let ttl = Duration::from_millis(400);
@@ -128,6 +139,8 @@ async fn expired_heartbeat_clears_the_worker_through_notifications() {
     assert_eq!(held_hashes(&backend, "w1", &[1, 2]).await, vec![1, 2]);
     let _ = watch_tx.send(());
     let _ = watching.await;
+    let _ = steady_tx.send(());
+    let _ = steady_task.await;
 }
 
 #[tokio::test]
@@ -137,14 +150,26 @@ async fn sweep_clears_marked_workers_without_a_live_key() {
     let backend = server.backend(&prefix).await;
     seed(&backend, "w0", &[1, 2, 3]).await;
     seed(&backend, "w1", &[1, 2]).await;
+    seed(&backend, "w2", &[5]).await;
     let mut raw = server.raw().await;
-    // w0 heartbeated once and its key is gone; w1 never did.
+    // w0 heartbeated once and its key is gone; w1 never did; w2 is alive, which
+    // is what tells the watcher this is one dead worker and not a Valkey event.
     let _: () = redis::cmd("SET")
         .arg(marker_key(&prefix, "w0"))
         .arg(1)
         .query_async(&mut raw)
         .await
         .unwrap();
+    for key in [marker_key(&prefix, "w2"), alive_key(&prefix, "w2")] {
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg(1)
+            .arg("PX")
+            .arg(60_000)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+    }
 
     let watcher = LivenessWatcher::new(
         backend.clone(),
@@ -204,4 +229,99 @@ async fn heartbeat_does_not_vouch_for_an_unreachable_worker() {
         .await
         .unwrap();
     assert_eq!((alive, marked), (0, 0));
+}
+
+/// A Valkey failover or a restore that brings back the markers but not the
+/// volatile heartbeats makes every worker look dead at once. Clearing then turns
+/// one infrastructure event into a fleet-wide loss of cache affinity, so the
+/// watcher must refuse and say so.
+#[tokio::test]
+async fn a_fleet_that_looks_entirely_dead_is_not_cleared() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let backend = server.backend(&prefix).await;
+    seed(&backend, "w0", &[1, 2, 3]).await;
+    seed(&backend, "w1", &[4, 5]).await;
+    let mut raw = server.raw().await;
+    // Both heartbeated before; neither has a live key now.
+    for worker in ["w0", "w1"] {
+        let _: () = redis::cmd("SET")
+            .arg(marker_key(&prefix, worker))
+            .arg(1)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+    }
+
+    let watcher = LivenessWatcher::new(
+        backend.clone(),
+        server.config(&prefix),
+        Duration::from_secs(600),
+    );
+    assert_eq!(watcher.sweep().await.unwrap(), 0);
+    assert_eq!(held_hashes(&backend, "w0", &[1, 2, 3]).await, vec![1, 2, 3]);
+    assert_eq!(held_hashes(&backend, "w1", &[4, 5]).await, vec![4, 5]);
+
+    // One worker coming back is the evidence that the others really are gone.
+    let _: () = redis::cmd("SET")
+        .arg(alive_key(&prefix, "w1"))
+        .arg(1)
+        .arg("PX")
+        .arg(60_000)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(watcher.sweep().await.unwrap(), 1);
+    assert!(held_hashes(&backend, "w0", &[1, 2, 3]).await.is_empty());
+    assert_eq!(held_hashes(&backend, "w1", &[4, 5]).await, vec![4, 5]);
+}
+
+/// A cleared worker must be replayed from the start of its buffer, so the clear
+/// also drops the bridge's sequence checkpoint; leaving it means the bridge
+/// resumes past events the index no longer has and the worker stays empty until
+/// its cache churns.
+#[tokio::test]
+async fn clearing_a_worker_drops_its_bridge_checkpoint() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let backend = server.backend(&prefix).await;
+    seed(&backend, "w0", &[1, 2, 3]).await;
+    seed(&backend, "w1", &[9]).await;
+    let mut raw = server.raw().await;
+    let checkpoint = format!("{prefix}seq:w0");
+    let _: () = redis::cmd("SET")
+        .arg(&checkpoint)
+        .arg(4242)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg(marker_key(&prefix, "w0"))
+        .arg(1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    for key in [marker_key(&prefix, "w1"), alive_key(&prefix, "w1")] {
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg(1)
+            .arg("PX")
+            .arg(60_000)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+    }
+
+    let watcher = LivenessWatcher::new(
+        backend.clone(),
+        server.config(&prefix),
+        Duration::from_secs(600),
+    );
+    assert_eq!(watcher.sweep().await.unwrap(), 1);
+    let left: i64 = redis::cmd("EXISTS")
+        .arg(&checkpoint)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the cleared worker's checkpoint must be gone");
 }

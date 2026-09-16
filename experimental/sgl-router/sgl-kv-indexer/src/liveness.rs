@@ -19,9 +19,21 @@
 //! and cluster nodes whose notifications did not reach the subscribed node.
 //!
 //! Clearing goes through the normal apply path (`CLEAR_ALL_AT_TIER` at every
-//! tier), so hit counts, pruning and parity semantics hold. The placements of a
-//! returning worker are rebuilt from its own events; the phantom prefixes a
-//! restart used to leave behind are gone.
+//! tier), so hit counts, pruning and parity semantics hold. A worker that
+//! restarted re-reports as it fills its cache, which is what makes the clear
+//! right: the phantom prefixes a restart used to leave behind are gone. A worker
+//! that was cleared while still serving does NOT get those placements back
+//! immediately - it only re-reports blocks it stores from then on - so a clear
+//! is deliberately conservative:
+//!
+//! * A worker is cleared only when at least one other heartbeating worker is
+//!   still alive. Every worker looking dead at once is a Valkey event (a
+//!   failover, a flush, a restore that brought back the markers but not the
+//!   volatile heartbeats), not a fleet that died, and clearing the whole index
+//!   in response would turn one incident into an outage.
+//! * Clearing also deletes the bridge's sequence checkpoint, so the next bridge
+//!   session replays that worker's buffer from the start instead of resuming
+//!   past it, and whatever the worker still holds is reported again.
 
 use std::future::Future;
 use std::net::ToSocketAddrs;
@@ -152,7 +164,30 @@ async fn probe_tcp(target: &str) -> bool {
     )
 }
 
+/// Which heartbeating workers are alive and which have expired.
+#[derive(Debug, Default)]
+struct Census {
+    alive: Vec<String>,
+    expired: Vec<String>,
+}
+
+impl Census {
+    fn dead(&self) -> &[String] {
+        &self.expired
+    }
+
+    /// Whether any OTHER heartbeating worker is alive. A single-worker fleet has
+    /// no second opinion available, so its own expiry is taken at face value.
+    fn other_worker_alive(&self, worker: &str) -> bool {
+        if self.alive.is_empty() {
+            return self.alive.len() + self.expired.len() <= 1;
+        }
+        self.alive.iter().any(|alive| alive != worker)
+    }
+}
+
 /// Indexer side: clears workers whose heartbeat expired.
+#[derive(Clone)]
 pub struct LivenessWatcher {
     backend: ValkeyKvIndexerBackend,
     valkey: ValkeyConfig,
@@ -175,11 +210,7 @@ impl LivenessWatcher {
     /// Runs the notification subscriber and the sweep until `shutdown` resolves.
     pub async fn run(self, shutdown: impl Future<Output = ()>) {
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let notifications = tokio::spawn(Self::watch_expiries(
-            self.backend.clone(),
-            self.valkey.clone(),
-            stop_rx,
-        ));
+        let notifications = tokio::spawn(Self::watch_expiries(self.clone(), stop_rx));
         tokio::pin!(shutdown);
         loop {
             match self.sweep().await {
@@ -198,9 +229,21 @@ impl LivenessWatcher {
 
     /// Marked workers with no `alive` key. Returns how many were cleared.
     pub async fn sweep(&self) -> Result<usize, Status> {
+        let census = self.census().await?;
+        let mut cleared = 0;
+        for worker in census.dead() {
+            if self.clear_dead_worker(worker, &census).await? {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
+    /// Who heartbeats and who is currently alive, in one round trip.
+    async fn census(&self) -> Result<Census, Status> {
         let workers = self.backend.worker_ids().await?;
         if workers.is_empty() {
-            return Ok(0);
+            return Ok(Census::default());
         }
         let prefix = self.backend.key_prefix();
         let mut pipe = redis::pipe();
@@ -209,29 +252,60 @@ impl LivenessWatcher {
             pipe.cmd("EXISTS").arg(alive_key(prefix, worker));
         }
         let flags: Vec<i64> = self.backend.conn().run(&pipe).await?;
-        let mut cleared = 0;
+        let mut census = Census::default();
         for (worker, pair) in workers.iter().zip(flags.chunks(2)) {
-            let (marked, alive) = (pair.first() == Some(&1), pair.get(1) == Some(&1));
-            if marked && !alive && self.backend.clear_worker(worker).await? {
-                info!(worker, "heartbeat expired; placements cleared");
-                cleared += 1;
+            if pair.first() != Some(&1) {
+                continue; // never heartbeated: not subject to liveness
+            }
+            if pair.get(1) == Some(&1) {
+                census.alive.push(worker.clone());
+            } else {
+                census.expired.push(worker.clone());
             }
         }
-        Ok(cleared)
+        Ok(census)
     }
 
-    async fn watch_expiries(
-        backend: ValkeyKvIndexerBackend,
-        valkey: ValkeyConfig,
-        mut stop: tokio::sync::watch::Receiver<bool>,
-    ) {
+    /// Clears one worker whose heartbeat expired, unless the whole fleet looks
+    /// dead, which is an infrastructure event rather than N worker deaths.
+    async fn clear_dead_worker(&self, worker: &str, census: &Census) -> Result<bool, Status> {
+        if !census.other_worker_alive(worker) {
+            warn!(
+                worker,
+                expired = census.expired.len(),
+                "every heartbeating worker looks dead at once; refusing to clear the index"
+            );
+            return Ok(false);
+        }
+        // The bridge must replay this worker from the start of its buffer, not
+        // from a checkpoint that is now ahead of what the index holds.
+        self.forget_checkpoint(worker).await;
+        if !self.backend.clear_worker(worker).await? {
+            return Ok(false);
+        }
+        info!(worker, "heartbeat expired; placements cleared");
+        Ok(true)
+    }
+
+    /// Best effort: a surviving checkpoint costs a longer replay, not data.
+    async fn forget_checkpoint(&self, worker: &str) {
+        let mut pipe = redis::pipe();
+        pipe.cmd("DEL")
+            .arg(format!("{}seq:{worker}", self.backend.key_prefix()))
+            .ignore();
+        if let Err(status) = self.backend.conn().exec(&pipe).await {
+            warn!(worker, %status, "could not clear the bridge sequence checkpoint");
+        }
+    }
+
+    async fn watch_expiries(watcher: Self, mut stop: tokio::sync::watch::Receiver<bool>) {
         let mut delay = RESUBSCRIBE_MIN;
         loop {
             if *stop.borrow() {
                 return;
             }
             let outcome = tokio::select! {
-                outcome = Self::subscribe_and_clear(&backend, &valkey) => outcome,
+                outcome = watcher.subscribe_and_clear() => outcome,
                 _ = stop.changed() => return,
             };
             match outcome {
@@ -250,16 +324,13 @@ impl LivenessWatcher {
 
     /// Subscribes to expiry notifications and clears workers as they arrive.
     /// Returns when the connection drops.
-    async fn subscribe_and_clear(
-        backend: &ValkeyKvIndexerBackend,
-        valkey: &ValkeyConfig,
-    ) -> Result<(), Status> {
-        ensure_expiry_notifications(&mut backend.conn()).await;
+    async fn subscribe_and_clear(&self) -> Result<(), Status> {
+        ensure_expiry_notifications(&mut self.backend.conn()).await;
         let (tx, mut rx) = mpsc::unbounded_channel::<PushInfo>();
         // The connection must outlive the subscription; dropping it ends it.
-        let _connection = subscribe_expired(valkey, tx).await?;
+        let _connection = subscribe_expired(&self.valkey, tx).await?;
         info!("subscribed to key expiry notifications");
-        let prefix = backend.key_prefix().to_string();
+        let prefix = self.backend.key_prefix().to_string();
         while let Some(push) = rx.recv().await {
             match push.kind {
                 PushKind::PMessage => {
@@ -272,10 +343,17 @@ impl LivenessWatcher {
                     else {
                         continue;
                     };
-                    match backend.clear_worker(&worker).await {
-                        Ok(true) => info!(worker, "heartbeat expired; placements cleared"),
-                        Ok(false) => debug!(worker, "expired heartbeat for unknown worker"),
-                        Err(status) => warn!(worker, %status, "failed to clear expired worker"),
+                    // Re-read the census: an expiry notification says one key
+                    // went away, not that this worker is the only one gone.
+                    match self.census().await {
+                        Ok(census) => match self.clear_dead_worker(&worker, &census).await {
+                            Ok(true) => {}
+                            Ok(false) => debug!(worker, "expired heartbeat not acted on"),
+                            Err(status) => {
+                                warn!(worker, %status, "failed to clear expired worker")
+                            }
+                        },
+                        Err(status) => warn!(worker, %status, "could not take a liveness census"),
                     }
                 }
                 PushKind::Disconnection => {
