@@ -1424,8 +1424,7 @@ class DeepseekOCRForCausalLM(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         text_config = hf_config.text_config
-        # Class-level hook: the loader calls it on the class before the model is
-        # built (`getattr(model_class, ...)`), so there is no `self.is_ocr2` yet.
+        # Class-level hook: called before the model is built, so no `self.is_ocr2` yet.
         if is_ocr2_config(hf_config) or not (
             text_config.topk_method == "noaux_tc" or text_config.use_mla
         ):

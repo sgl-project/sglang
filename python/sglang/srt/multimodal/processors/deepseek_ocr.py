@@ -10,15 +10,10 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 
 def apply_ocr_geometry(_processor, hf_config) -> None:
-    """Point an OCR processor at its checkpoint's local-crop geometry.
+    """Patch a checkpoint's local-crop geometry onto an already-built HF processor.
 
-    The checkpoint config does not carry the crop size (see `local_crop_size`),
-    and the HF processor is already built by the time SGLang sees it, so the
-    geometry is patched onto the instance here. Kept as a function so that both
-    the policy and this patching can be asserted without a server.
-
-    Note this overwrites `image_size` unconditionally: the geometry is derived
-    from the model identity, so a value declared in `processor_config.json` would
+    `image_size` is overwritten unconditionally: neither checkpoint carries the
+    crop size (see `local_crop_size`), so a value in `processor_config.json` would
     not survive.
     """
     _processor.ocr2_mode = is_ocr2_config(hf_config)
@@ -29,11 +24,8 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        # The local-crop geometry is not in the checkpoints: DeepSeek-OCR and
-        # DeepSeek-OCR-2 ship identical processor configs with no `image_size` and
-        # candidate_resolutions=[[1024, 1024]] (the *global* base). Taking the crop
-        # size from there would serve OCR-2 with OCR-1's 640px crops, whose 100
-        # visual tokens match neither tuned query table. Pick it per model.
+        # The shared processor config's candidate_resolutions is the *global* base, so
+        # the crop size has to come from the model identity instead.
         apply_ocr_geometry(_processor, hf_config)
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
         self.mm_tokens = MultimodalSpecialTokens(
