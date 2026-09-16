@@ -124,6 +124,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: sgl_router::config::ModelConfig {
@@ -138,6 +139,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],
