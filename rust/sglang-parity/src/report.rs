@@ -242,7 +242,7 @@ impl<'a> ReportView<'a> {
                     .unwrap();
                 }
             }
-            out.push_str("\nCounts are difference occurrences, not independent bugs.\nComparison values include declared replacements; use --case for original values and rules.\n");
+            out.push_str("\nCounts are difference occurrences, not independent bugs.\nComparison values include declared replacements; use --case for reconstructed values, source events and rules.\n");
         }
         let diagnostics = self.diagnostics(case);
         if !diagnostics.is_empty() {
