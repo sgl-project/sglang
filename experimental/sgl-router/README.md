@@ -203,10 +203,10 @@ strings (the engine's `input_ids` path skips those template stops). These worker
 settings are not inferred from the router's environment. Disabling forwarding preserves
 engine behavior but does not establish parity for local routing hashes.
 
-Forwarding is automatically withheld for templates that fail a direct string-content
-probe, including array-only VLM templates. The probe is conservative: templates
-requiring additional rendering helpers may also be withheld. Routing can still use
-Dynamo's rendering; detailed content-format parity coverage follows in #39133.
+Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
+string content into arrays differently from the worker. Dynamo 5.1.2 does not expose
+its conversion flag, so the router cannot automatically block these templates.
+Detailed content-format parity coverage follows in #39133.
 
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.

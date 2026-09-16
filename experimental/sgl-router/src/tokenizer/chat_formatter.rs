@@ -36,7 +36,6 @@ pub struct ChatFormatter {
     formatter: Arc<dyn OAIPromptFormatter>,
     /// Template context defaults; request `chat_template_kwargs` override them.
     defaults: ChatTemplateKwargs,
-    supports_string_content: bool,
 }
 
 impl ChatFormatter {
@@ -115,22 +114,6 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // Fail closed when the raw template cannot render string content. Dynamo's
-        // private array detector uses this same message and marker; routing may
-        // still use its content conversion, but forwarding must not depend on it.
-        let source = cfg["chat_template"].as_str().or_else(|| {
-            cfg["chat_template"]
-                .as_array()?
-                .iter()
-                .rev()
-                .find_map(|t| t["default"].as_str())
-        });
-        let supports_string_content = source.is_some_and(|source| {
-            minijinja::Environment::new().render_str(source, minijinja::context! {
-                messages => serde_json::json!([{"role": "user", "content": "template_test"}]),
-                add_generation_prompt => false,
-            }).is_ok_and(|text| text.contains("template_test"))
-        });
         let template: ChatTemplate =
             serde_json::from_value(cfg).context("parse tokenizer_config.json")?;
         if template.chat_template.is_none() {
@@ -142,7 +125,6 @@ impl ChatFormatter {
         Ok(Some(Self {
             formatter,
             defaults,
-            supports_string_content,
         }))
     }
 
@@ -174,12 +156,7 @@ impl ChatFormatter {
         Some(Self {
             formatter,
             defaults,
-            supports_string_content: true,
         })
-    }
-
-    pub fn supports_string_content(&self) -> bool {
-        self.supports_string_content
     }
 
     fn template_kwargs(&self, request: &JsonValue) -> Result<ChatTemplateKwargs> {

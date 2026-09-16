@@ -507,7 +507,7 @@ pub async fn chat_completions(
     // MODEL (does it have a chat formatter so the router can produce
     // engine-equivalent tokens?), not of how we pick the worker. Two gates:
     //
-    //   * Forwarding is enabled and `can_forward_chat` -> a chat request yields
+    //   * Forwarding is enabled and `has_chat_formatter` -> a chat request yields
     //     engine-equivalent ids we can forward as `input_ids` so the engine
     //     skips re-tokenizing. This enables the offload for EVERY policy —
     //     sticky and round-robin included — not just cache-aware.
@@ -524,7 +524,7 @@ pub async fn chat_completions(
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
     let can_forward_input_ids = !ctx.config.model.disable_input_ids_forwarding
-        && ctx.tokenizers.can_forward_chat(&model_str);
+        && ctx.tokenizers.has_chat_formatter(&model_str);
     let want_tokens = should_tokenize_request(
         can_forward_input_ids,
         policy.needs_request_tokens(),
