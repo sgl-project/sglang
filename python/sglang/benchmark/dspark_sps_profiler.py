@@ -985,9 +985,7 @@ def postprocess_round(
         budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
 
         batch_tokens = batch_size_per_rank + budget
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        logger.info( "[SPS-GRAPH] per_rank_bs=%s frac=%s logical_M=%s graph_tier=%s", batch_size_per_rank, frac,batch_tokens, graph_tier,)
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 
         if graph_tier < batch_tokens:
             raise RuntimeError(

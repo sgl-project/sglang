@@ -494,31 +494,11 @@ class DSparkVerifyPlanner:
             tier_num_tokens=tier_num_tokens,
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        # logger.info(
-        #     "[DSPARK-TIER] "
-        #     "bs=%s global_num_reqs=%s budget=%s "
-        #     "dp_tier_num_tokens=%s tier_num_tokens=%s "
-        #     "graph_floor=%s capture_grid=%s",
-        #     bs,
-        #     global_num_reqs,
-        #     budget,
-        #     dp_tier_num_tokens,
-        #     tier_num_tokens,
-        #     graph_num_tokens_floor,
-        #     capture_num_tokens,
-        # )
-        #>>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
 
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        #     logger.info(
-        #         "[DSPARK-TIER] graph_num_tokens=%s",
-        #         graph_num_tokens,
-        #     )
-        # >>>>>>>>>>>>>>>>>>>>>>>>>>>> l09093641 临时测试打印<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
