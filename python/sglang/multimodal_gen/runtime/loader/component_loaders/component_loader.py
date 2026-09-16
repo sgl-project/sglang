@@ -376,22 +376,32 @@ class ComponentLoader(ABC):
                 server_args.resolve_component_attention_backend(component_name)
             )
             component_attn_name = matched_backend_key or component_name
-            component_backend_by_role = server_args.resolve_component_backend_by_role(
-                component_name
-            )
             if component_attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
                     component_attn_backend.name.lower(),
                     matched_backend_key,
                 )
+        if (
+            component_backend_by_role is None
+            and get_component_attn_backend_context() is None
+        ):
+            # A caller that resolved only the component-wide backend must not
+            # silently drop the role-qualified overrides that go with it.
+            component_backend_by_role = server_args.resolve_component_backend_by_role(
+                component_name, component_attn_name
+            )
         requested_backend = (
             server_args.requested_component_attention_backend(component_attn_name)
             if component_attn_name is not None
             else None
         )
-        require_backend_selection = requested_backend is not None
-        if require_backend_selection and (
+        # A role override is as explicit as a component-wide one, so it carries
+        # the same requirement that the component actually apply it.
+        require_backend_selection = requested_backend is not None or bool(
+            component_backend_by_role
+        )
+        if requested_backend is not None and (
             component_attn_backend is None
             or component_attn_backend.name.lower() != requested_backend
         ):
