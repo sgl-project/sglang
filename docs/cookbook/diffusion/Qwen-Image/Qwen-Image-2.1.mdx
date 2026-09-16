@@ -8,7 +8,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Deployment } from '/src/snippets/_deployment.jsx';
 import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "image editing", "block-causal attention", "64-channel latents"]} />
+<DiffusionModelTags tags={["RGBA image", "text-to-image", "image editing", "multi-image references", "block-causal attention"]} />
 
 ## 1. Quick start
 
@@ -19,6 +19,31 @@ place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux
 the full checkpoint has been exercised on H200 with generation and editing requests.
 
 <Deployment config={config} />
+
+Use **Setup** to select text-to-image, single-image editing, or multi-image
+editing. **Server** controls placement, attention, encoder scheduling, VAE
+tiling, and graph execution. **Request** controls the background, resolution,
+steps, and output count. Set reference PNG paths under **Variables**; edits
+upload files from the machine running cURL, so they need not exist on the server.
+
+The recommended server is one H200 with resident weights. Custom two-GPU
+topologies and unverified feature combinations remain selectable and are labeled
+**Unverified**. Invalid topology combinations disable Copy. This integration
+currently uses the Python/source command; no published Docker image is verified.
+
+Both request modes return base64 PNGs. To save all returned images, append
+`> response.json` to the request command, then run:
+
+```bash Command
+python - <<'PY'
+import base64
+import json
+from pathlib import Path
+
+for i, item in enumerate(json.loads(Path("response.json").read_text())["data"]):
+    Path(f"output-{i}.png").write_bytes(base64.b64decode(item["b64_json"]))
+PY
+```
 
 ## 2. Model capabilities
 
@@ -57,6 +82,22 @@ Reference comparisons should use Transformers 4.57.3; the same
 Use `--model-id Qwen-Image-2.1` when the checkpoint directory has a different
 name. The model ID is a routing identifier; it does not grant access to model
 weights. Keep checkpoint access credentials in your environment.
+
+### Transparent PNG output
+
+Choose **Transparent / alpha** under Request to generate an isolated subject
+or preserve a transparent reference during editing. The picker adds the
+transparency instruction to the prompt and sets `output_format: "png"`.
+`background: "transparent"` alone only selects an output format; it does not
+remove the background or change model conditioning. JPEG cannot retain alpha.
+
+The model predicts continuous alpha values, including partly transparent edges.
+No thresholding or background-removal postprocessing is applied. Transparent
+generation and transparent-input editing were compared against the reference
+at 1024 × 1024 and 40 steps; that check does not guarantee perfect cutouts for
+every prompt. The generated cURL commands for transparent generation and
+single-image editing also passed on the recommended one-H200 server at that
+resolution and step count, with one output per request.
 
 ## 4. Offline requests
 
