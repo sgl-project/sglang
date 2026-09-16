@@ -36,6 +36,13 @@ class FreeDeviceKV(msgspec.Struct, frozen=True):
     indices: list[torch.Tensor]
 
 
+class FreeDeviceKVFullOnly(msgspec.Struct, frozen=True):
+    """Free the full side only, for a tombstoned node whose SWA peers are gone;
+    FreeDeviceKV would release the SWA side twice."""
+
+    indices: list[torch.Tensor]
+
+
 class ComponentAction(msgspec.Struct, frozen=True):
     """Base for component-routed actions; the cache dispatches each one to
     ``component_type``'s class-level ``apply_component_action``; every subclass
@@ -100,4 +107,6 @@ class SWARebuild(ComponentAction, frozen=True):
 
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
-CacheAction = ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV
+CacheAction = (
+    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
+)

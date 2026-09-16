@@ -74,7 +74,9 @@ class _FakeMHATokenToKVPool(_FakeKVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
         self._create_buffers()
 

@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -163,6 +164,17 @@ def _get_or_create_alt_stream(device_module):
     return _alt_stream
 
 
+def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
+    return (
+        # LoRA swaps a wrapper module over this attribute after init,
+        # and a subclass may override forward; exact type excludes both.
+        type(projection) is ReplicatedLinear
+        # Without a bias, ReplicatedLinear.forward is a bare quant_method.apply.
+        and projection.bias is None
+        and isinstance(projection.quant_method, UnquantizedLinearMethod)
+    )
+
+
 class NemotronHMoE(nn.Module):
     def __init__(
         self,
@@ -235,6 +247,7 @@ class NemotronHMoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
                     else {}
                 ),
                 prefix=f"{prefix}.shared_experts",
@@ -331,6 +344,22 @@ class NemotronHMoE(nn.Module):
 
         return final_hidden_states, shared_output
 
+    def _apply_latent_projection(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        projection = self.fc2_latent_proj
+        if shared_output is not None and _latent_proj_fuses_shared_add(projection):
+            return projection.quant_method.apply_with_addend(
+                projection, final_hidden_states, addend=shared_output
+            )
+
+        final_hidden_states, _ = projection(final_hidden_states)
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,9 +370,10 @@ class NemotronHMoE(nn.Module):
         final_hidden_states, shared_output = self._forward_core(hidden_states)
 
         if self.use_latent_moe:
-            final_hidden_states, _ = self.fc2_latent_proj(final_hidden_states)
-
-        if shared_output is not None:
+            final_hidden_states = self._apply_latent_projection(
+                final_hidden_states, shared_output
+            )
+        elif shared_output is not None:
             final_hidden_states += shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
@@ -833,6 +863,7 @@ class NemotronHModel(nn.Module):
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture: set[int] = set()
 
     def forward(
         self,
@@ -853,7 +884,17 @@ class NemotronHModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                if residual is not None and getattr(
+                    hidden_states, "_sglang_needs_allreduce_fusion", False
+                ):
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states._sglang_needs_allreduce_fusion = False
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             layer = self.layers[i]
             if not isinstance(layer, Layers):
                 raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -867,7 +908,18 @@ class NemotronHModel(nn.Module):
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        if self.end_layer in self.layers_to_capture:
+            if residual is not None and getattr(
+                hidden_states, "_sglang_needs_allreduce_fusion", False
+            ):
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -962,6 +1014,7 @@ class NemotronHForCausalLM(nn.Module):
                 self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def _init_model(
         self,
@@ -1082,9 +1135,16 @@ class NemotronHForCausalLM(nn.Module):
         hidden_states = self.model.forward(
             input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
@@ -1105,6 +1165,17 @@ class NemotronHForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False

@@ -73,7 +73,6 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                     "--expert-distribution-recorder-buffer-size",
                     "50",
                     # TODO pr-chain: enable later
-                    # "--enable-expert-distribution-metrics",
                     # TODO auto determine these flags
                     "--expert-distribution-recorder-mode",
                     "stat",

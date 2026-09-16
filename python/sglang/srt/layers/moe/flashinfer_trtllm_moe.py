@@ -120,6 +120,7 @@ def trtllm_fp8_block_scale_moe_out_wrapper(
 
 def _fake_fp8_block_scale_routed_moe_out(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -156,6 +157,7 @@ def _fake_fp8_block_scale_routed_moe_out(
 )
 def trtllm_fp8_block_scale_routed_moe_out_wrapper(
     topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -192,7 +194,7 @@ def trtllm_fp8_block_scale_routed_moe_out_wrapper(
         ) from e
 
     kwargs = {
-        "topk_ids": topk_ids,
+        "topk_ids": topk_ids if topk_weights is None else (topk_ids, topk_weights),
         "routing_bias": routing_bias,
         "hidden_states": hidden_states,
         "hidden_states_scale": hidden_states_scale,
