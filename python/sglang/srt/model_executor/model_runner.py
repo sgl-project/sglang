@@ -42,7 +42,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     get_healthy_expert_location_src_rank,
-    get_scale_cohort_target,
+    get_scale_cohort,
     join_process_groups,
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
@@ -503,10 +503,21 @@ class ModelRunner:
         join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
-            register_scale_cohort(
+            cohort = register_scale_cohort(
                 get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
+                get_exec().moe.elastic_ep_scale_timeout,
+                get_parallel().elastic_ep_member_id,
             )
+            logger.info(
+                "[Elastic EP][joiner] Assigned runtime=%s operation=%s "
+                "rank_offset=%d target_ep_size=%d",
+                cohort.runtime_instance_id,
+                cohort.operation_id,
+                cohort.rank_offset,
+                cohort.target_ep_size,
+            )
+        dist.barrier(group=self.tp_group.cpu_group)
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
@@ -2060,6 +2071,8 @@ class ModelRunner:
         self._pending_elastic_scale_update = ElasticScaleUpdateReq(
             success=False,
             effective_ep_size=effective_size,
+            operation_id=ElasticEPStateManager.get_operation_id(),
+            scale_phase="failed",
             error=error,
         )
 
@@ -2140,9 +2153,20 @@ class ModelRunner:
         if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
+            cohort = get_scale_cohort(effective_size)
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
+                operation_id=ElasticEPStateManager.get_operation_id(),
+                scale_phase="serving_expanded",
+                joining_rank_offset=effective_size,
+                joining_rank_count=target_size - effective_size,
+                ready_rank_count=target_size - effective_size,
+                joining_member_ids=(
+                    [cohort.member_id]
+                    if cohort is not None and cohort.member_id is not None
+                    else []
+                ),
                 slot_offset=effective_size,
                 slot_count=target_size - effective_size,
             )
@@ -2201,13 +2225,20 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort_target = get_scale_cohort_target(effective_size)
-            if cohort_target is None:
+            cohort = get_scale_cohort(effective_size)
+            if cohort is None:
                 return
-            if cohort_target != pending_size:
+            if (
+                cohort.target_ep_size != pending_size
+                or cohort.operation_id != state.operation_id
+                or cohort.runtime_instance_id != state.runtime_instance_id
+            ):
                 error = (
-                    f"Requested target EP size {pending_size} does not match "
-                    f"joining cohort target {cohort_target}"
+                    "Joining cohort does not match the pending scale operation: "
+                    f"cohort=(runtime={cohort.runtime_instance_id}, "
+                    f"operation={cohort.operation_id}, target={cohort.target_ep_size}), "
+                    f"pending=(runtime={state.runtime_instance_id}, "
+                    f"operation={state.operation_id}, target={pending_size})."
                 )
                 ElasticEPStateManager.fail_scale(error)
                 self._reset_eplb_after_elastic_scale_failure()
@@ -2215,6 +2246,22 @@ class ModelRunner:
                 if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
                     logger.error("[Elastic EP] %s", error)
                 return
+            if self.ps.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
+                from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+                self._pending_elastic_scale_update = ElasticScaleUpdateReq(
+                    success=True,
+                    terminal=False,
+                    effective_ep_size=effective_size,
+                    operation_id=state.operation_id,
+                    scale_phase="cohort_ready",
+                    joining_rank_offset=cohort.rank_offset,
+                    joining_rank_count=pending_size - effective_size,
+                    ready_rank_count=cohort.ready_rank_count,
+                    joining_member_ids=(
+                        [cohort.member_id] if cohort.member_id is not None else []
+                    ),
+                )
             if not ElasticEPStateManager.begin_scale():
                 return
 

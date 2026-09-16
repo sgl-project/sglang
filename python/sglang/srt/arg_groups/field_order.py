@@ -334,6 +334,8 @@ POSITIONAL_FIELD_ORDER = (
     "enable_waterfill",
     "ep_join_mode",
     "ep_join_rank_offset",
+    "elastic_ep_replica_index",
+    "elastic_ep_member_id",
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",

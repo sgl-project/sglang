@@ -2079,6 +2079,13 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
 
     success: bool
     effective_ep_size: int
+    operation_id: Optional[str] = None
+    scale_phase: str = "idle"
+    terminal: bool = True
+    joining_rank_offset: int = 0
+    joining_rank_count: int = 0
+    ready_rank_count: int = 0
+    joining_member_ids: List[str] = msgspec.field(default_factory=list)
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
@@ -2088,11 +2095,20 @@ class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    operation_id: Optional[str] = None
+    expected_instance_id: Optional[str] = None
+    expected_joining_member_ids: Optional[List[str]] = None
+    # Filled by TokenizerManager before scheduler fan-out. It is not accepted
+    # from the public API as the runtime is authoritative for its own identity.
+    runtime_instance_id: Optional[str] = None
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    conflict: bool = False
+    operation_id: Optional[str] = None
+    instance_id: Optional[str] = None
     old_ep_size: int = 0
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None

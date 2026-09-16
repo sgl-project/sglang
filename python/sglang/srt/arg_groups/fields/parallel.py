@@ -264,6 +264,30 @@ class Parallel(msgspec.Struct):
             cli_name="--elastic-ep-join-rank-offset",
         ),
     ] = 0
+    elastic_ep_replica_index: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Stable zero-based replica index used by elastic EP automatic "
+                "bootstrap. Replica 0 starts the primary runtime; later replicas "
+                "derive their joining rank offset from this index and the local TP "
+                "width. This allows every replica to use the same pod template."
+            ),
+            cli_name="--elastic-ep-replica-index",
+        ),
+    ] = None
+    elastic_ep_member_id: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Opaque identity of this elastic EP capacity member, such as a "
+                "Kubernetes Pod UID. Automatic bootstrap reports it with the "
+                "joining cohort so an orchestrator can correlate ranks with "
+                "physical capacity."
+            ),
+            cli_name="--elastic-ep-member-id",
+        ),
+    ] = None
     elastic_ep_initial_size: A[
         Optional[int],
         "EP size used to define the immutable per-rank expert storage layout. "
