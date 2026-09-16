@@ -70,8 +70,8 @@ def sharded_greedy_step(bias, base_local, *, group, vocab_start, gather=None):
     the full local logits.
 
     ``bias`` is the original GEMM's already-rounded result. Communication carries
-    eight (value, global-index-bits) pairs per row; indices are transported as
-    bits and are never converted numerically to float.
+    one (value, global-index-bits) pair per 4096-wide block of the shard per row;
+    indices are transported as bits and are never converted numerically to float.
     """
     assert bias.ndim == base_local.ndim == 2
     assert bias.shape[0] == base_local.shape[0]
