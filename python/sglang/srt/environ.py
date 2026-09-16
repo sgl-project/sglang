@@ -940,7 +940,7 @@ class Envs:
     SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM = EnvBool(True)
     # gfx950 large prefill: compensated BF16 mHC projection after post-mix/collapse.
     SGLANG_OPT_HIP_MHC_BF16X3_PREFILL = EnvBool(True)
-    # gfx950 TP4 tiny-row attention all-reduce/post fusion.
+    # gfx950 TP4 tiny-row attention and MoE all-reduce/post fusion.
     SGLANG_OPT_HIP_ALL_REDUCE_MHC = EnvBool(True)
     # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
     SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)

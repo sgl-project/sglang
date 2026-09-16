@@ -1,4 +1,4 @@
-"""TP4 attention reduction/post handoff and mutable graph replay on gfx950."""
+"""TP4 attention and MoE reduction/post handoff and mutable graph replay on gfx950."""
 
 import gc
 import os
@@ -47,7 +47,10 @@ def group():
         use_npu_communicator=False,
         group_name="mhc_hip_test",
     )
-    yield g
+    from sglang.srt.runtime_context import get_context
+
+    with get_context().override_server_args(moe_runner_backend="aiter"):
+        yield g
     if g.qr_comm is not None:
         g.qr_comm.close()
         g.qr_comm = None
@@ -95,6 +98,7 @@ def _layer(group):
         config=SimpleNamespace(model_type="deepseek_v41"),
         dsa_enable_prefill_cp=False,
         self_attn=_Attention(group),
+        mlp=SimpleNamespace(tp_size=1),
         hc_mult=4,
         hc_sinkhorn_iters=20,
         rms_norm_eps=1e-6,
@@ -239,6 +243,173 @@ def test_fallback_keeps_the_original_reduction(group, reason):
             actual = MQALayer._project_wo_b(layer.self_attn, x)
         assert layer.self_attn.wo_b.skip_reduction == [False]
         torch.testing.assert_close(actual, torch.full_like(actual, 10), atol=0, rtol=0)
+
+
+def _moe(group, dual, shared_tp1):
+    from sglang.srt.layers.moe.topk import TopKOutputFormat
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    class Experts:
+        quant_method = None
+        moe_runner_config = SimpleNamespace(inplace=False)
+
+        def __call__(self, x, *args, **kwargs):
+            return x * (group.rank_in_group + 1)
+
+    class Moe(DeepseekV2MoE):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.tp_size = 4
+            self._shared_expert_tp1 = shared_tp1
+            self.layer_id = 0
+            self.is_nextn = False
+            self.is_hash = False
+            self._fuse_shared_experts_inside_sbo = False
+            self._fuse_finalize_all_reduce = False
+            self.num_fused_shared_experts = 0
+            self.routed_scaling_factor = 1.0
+            self.experts = Experts()
+            self.alt_stream = torch.cuda.Stream()
+            self.topk = lambda *a, **kw: SimpleNamespace(
+                format=TopKOutputFormat.STANDARD
+            )
+
+        def _maybe_quant_moe_input_once(self, x):
+            return None
+
+        def _should_quant_routed_input_mxfp8(self, x):
+            return False
+
+        def _forward_gate(self, x, *args, **kwargs):
+            return x, None
+
+        def _forward_shared_experts(self, x, *args, **kwargs):
+            return x * 0.5
+
+        def forward(self, x, *args, **kwargs):
+            return (self.forward_normal_dual_stream if dual else self.forward_normal)(x)
+
+    return Moe()
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("shared_tp1", [False, True])
+def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import MoeA2ABackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+        forward_hc_pre_from_prev_fused_boundary,
+    )
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.runtime_context import get_forward, get_parallel
+
+    layer = _layer(group)
+    layer.mlp = _moe(group, dual, shared_tp1)
+    layer._run_moe_ffn_dp_sync = lambda *a, **kw: (
+        DeepseekV4DecoderLayer._run_moe_ffn_dp_sync(layer, *a, **kw)
+    )
+    layer.hc_post = lambda *a: DeepseekV4DecoderLayer.hc_post(layer, *a)
+    residual = torch.randn(rows, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    pre = torch.sigmoid(torch.randn(rows, 4, device="cuda"))
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE, num_token_non_padded=None)
+    outcomes = []
+
+    def run():
+        hidden, next_pre, pending = forward_hc_pre_from_prev_fused_boundary(
+            layer, None, residual, None, batch, None, pre, None, defer
+        )
+        outcomes.append(pending is not None)
+        if pending is not None:
+            hidden = layer.hc_post(*pending)
+        return hidden, next_pre
+
+    with (
+        get_parallel().override(tp_size=4, attn_tp_size=4, attn_dp_size=1),
+        get_forward().scoped(
+            sp_active=False, fuse_mlp_allreduce=False, flashinfer_trtllm_bypass=False
+        ),
+        patch(
+            "sglang.srt.distributed.parallel_state.get_attn_tp_group",
+            return_value=group,
+        ),
+        patch("sglang.srt.distributed.parallel_state.get_tp_group", return_value=group),
+        patch(
+            "sglang.srt.models.deepseek_v2.tensor_model_parallel_all_reduce",
+            side_effect=group.all_reduce,
+        ) as original_reduce,
+        patch(
+            "sglang.srt.layers.moe.get_moe_a2a_backend", return_value=MoeA2ABackend.NONE
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.get_moe_a2a_backend",
+            return_value=MoeA2ABackend.NONE,
+        ),
+        patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                deterministic=SimpleNamespace(enable_deterministic_inference=False)
+            ),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v2.get_exec",
+            return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+        ),
+    ):
+        graphs = []
+        for enabled in (False, True):
+            with envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled):
+                graph = torch.cuda.CUDAGraph()
+                with group.graph_capture() as capture:
+                    run()
+                    original_reduce.reset_mock()
+                    with torch.cuda.graph(graph, stream=capture.stream):
+                        output = run()
+                assert original_reduce.call_count == int(not enabled or shared_tp1)
+                assert outcomes[-1] == (defer and (not enabled or shared_tp1))
+                graphs.append((graph, output))
+        for _ in range(3):
+            residual.normal_()
+            pre.uniform_()
+            for graph, _ in graphs:
+                graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                graphs[0][1][0], graphs[1][1][0], atol=0.01, rtol=0.01
+            )
+            torch.testing.assert_close(
+                graphs[0][1][1], graphs[1][1][1], atol=1e-5, rtol=1e-5
+            )
+
+
+@pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("flag", ["mlp_reduce_scatter", "fuse_mlp_allreduce"])
+def test_moe_skipped_reduction_does_not_apply_post(group, dual, flag):
+    from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion, use_mhc_post_fusion
+    from sglang.srt.runtime_context import get_forward
+
+    moe = _moe(group, dual, False)
+    x = torch.ones(1, 5120, device="cuda", dtype=torch.bfloat16)
+    state = MhcPostFusion(None, None, None, None)
+    with (
+        get_forward().scoped(**{flag: True}, flashinfer_trtllm_bypass=False),
+        use_mhc_post_fusion(state),
+        patch(
+            "sglang.srt.models.deepseek_v2.tensor_model_parallel_all_reduce"
+        ) as reduction,
+        patch(
+            "sglang.srt.models.deepseek_v2.get_exec",
+            return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
+        ),
+    ):
+        actual = moe(x)
+        assert state.output is None
+        reduction.assert_not_called()
+        torch.testing.assert_close(
+            actual, x * (group.rank_in_group + 1.5), atol=0, rtol=0
+        )
 
 
 if __name__ == "__main__":
