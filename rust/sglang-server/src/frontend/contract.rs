@@ -248,7 +248,7 @@ pub(crate) struct MemoryUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) weight: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) kvcache: Option<f64>,
+    pub(crate) kvcache: Option<MemoryMeasurement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) startup_available: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,4 +256,14 @@ pub(crate) struct MemoryUsage {
     pub(crate) token_capacity_swa: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) graph: Option<BTreeMap<String, f64>>,
+}
+
+/// The scheduler's KV-cache measurement can be a native float or a NumPy
+/// scalar stringified by the MessagePack bridge. Preserve that representation
+/// so extracting the typed frontend contract does not change public responses.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum MemoryMeasurement {
+    Number(f64),
+    String(String),
 }

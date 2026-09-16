@@ -195,6 +195,16 @@ mod tests {
 
     #[tokio::test]
     async fn server_info_route_serializes_only_the_typed_public_subset() {
+        // Native floats stay JSON numbers; NumPy scalars encoded by Python's
+        // msgspec enc_hook=str must remain JSON strings, as before the refactor.
+        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616)).await;
+        assert_server_info_response(rmpv::Value::from("23.616"), serde_json::json!("23.616")).await;
+    }
+
+    async fn assert_server_info_response(
+        kvcache: rmpv::Value,
+        expected_kvcache: serde_json::Value,
+    ) {
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
@@ -238,6 +248,7 @@ mod tests {
             (
                 rmpv::Value::from("memory_usage"),
                 rmpv::Value::Map(vec![
+                    (rmpv::Value::from("kvcache"), kvcache),
                     (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
                     (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
                     (
@@ -272,6 +283,10 @@ mod tests {
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
         assert_eq!(body["internal_states"][0]["last_gen_throughput"], 1.5);
+        assert_eq!(
+            body["internal_states"][0]["memory_usage"]["kvcache"],
+            expected_kvcache
+        );
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["token_capacity"],
             8192
