@@ -17,13 +17,14 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
-    ComponentType,
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
 )
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 
 
 class _FakeTreeCore:
