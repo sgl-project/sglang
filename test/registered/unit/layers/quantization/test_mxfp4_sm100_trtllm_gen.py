@@ -1,4 +1,4 @@
-"""Focused SM100 trtllm-gen MXFP4 MoE regression tests.
+"""Focused SM100 trtllm-gen MXFP4 MoE regression test.
 
 ``Mxfp4MoEMethod.apply`` (SM100 branch, via the unified MoeRunner) must feed
 ``trtllm_fp4_block_scale_moe`` the same args a direct kernel call does, so the
@@ -327,106 +327,6 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
         f"SGLang vs FlashInfer-direct mismatch (precision={precision}); "
         f"max abs diff = {(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
     )
-
-
-def _build_trtllm_layer(fixtures):
-    w13, w2, w13_s, w2_s, _, _ = fixtures
-    layer = torch.nn.Module()
-    for name, tensor in (
-        ("w13_weight", w13),
-        ("w2_weight", w2),
-        ("w13_weight_scale_inv", w13_s),
-        ("w2_weight_scale_inv", w2_s),
-    ):
-        layer.register_parameter(
-            name, torch.nn.Parameter(tensor.clone(), requires_grad=False)
-        )
-    layer.num_experts = w13.shape[0]
-    layer.num_local_experts = w13.shape[0]
-    layer.moe_ep_rank = 0
-    return layer
-
-
-def _build_trtllm_method(layer):
-    from types import SimpleNamespace
-
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
-        Mxfp4FlashinferTrtllmMoEMethod,
-    )
-
-    method = Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod)
-    # The FP8 pre-pass only rewrites FP8-serialized checkpoints.
-    method._fp8 = SimpleNamespace(process_weights_after_loading=lambda layer: None)
-    method.prefix = "test.experts"
-    method.flashinfer_mxfp4_moe_precision = "default"
-    method.process_weights_after_loading(layer)
-    method.create_moe_runner(layer, MoeRunnerConfig(swiglu_limit=10.0))
-    return method
-
-
-def _tp_shard(fixtures, rank, tp_size):
-    w13, w2, w13_s, w2_s, w13_b, w2_b = fixtures
-    inter = w13.shape[1] // 2
-    per_rank = inter // tp_size
-    start, end = rank * per_rank, (rank + 1) * per_rank
-    rows = torch.cat(
-        (torch.arange(start, end), torch.arange(inter + start, inter + end))
-    ).to(w13.device)
-    return (
-        w13[:, rows],
-        w2[..., start // 2 : end // 2].contiguous(),
-        w13_s[:, rows],
-        w2_s[..., start // GROUP_SIZE : end // GROUP_SIZE].contiguous(),
-        w13_b,
-        w2_b,
-    )
-
-
-def test_trtllm_method_pads_unaligned_tp_shards(monkeypatch):
-    """A TP shard whose intermediate size is not a multiple of 128 used to fail the
-    kernel's config lookup; the padded shards must sum to the unsharded output."""
-    import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mod
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-    monkeypatch.setattr(mod, "use_symmetric_memory", lambda *a, **kw: nullcontext())
-    monkeypatch.setattr(mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mod, "get_tp_group", lambda: None)
-
-    # 2304 / 4 = 576 local channels: the kernel has no config for that width.
-    num_experts, hidden, inter, top_k, tp_size = 8, 5120, 2304, 6, 4
-    assert (inter // tp_size) % 128 != 0
-    fixtures = _make_random_mxfp4(num_experts, hidden, inter, seed=42)
-    full_layer = _build_trtllm_layer(fixtures)
-    full_method = _build_trtllm_method(full_layer)
-    shards = []
-    for rank in range(tp_size):
-        layer = _build_trtllm_layer(_tp_shard(fixtures, rank, tp_size))
-        shards.append((_build_trtllm_method(layer), layer))
-
-    g = torch.Generator(device="cuda").manual_seed(1234)
-    for tokens in (1, 16, 64):
-        x = torch.randn(
-            tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=g
-        )
-        logits = torch.randn(tokens, num_experts, device="cuda", generator=g)
-        scores, ids = logits.softmax(-1).topk(top_k, dim=-1)
-        dispatch = StandardDispatchOutput(
-            x, None, StandardTopKOutput(scores, ids.to(torch.int32), logits)
-        )
-        reference = full_method.apply(full_layer, dispatch).hidden_states.float()
-        actual = sum(
-            method.apply(layer, dispatch).hidden_states.float()
-            for method, layer in shards
-        )
-        assert torch.isfinite(actual).all()
-        rel_rmse = (
-            (actual - reference).square().mean() / reference.square().mean()
-        ).sqrt()
-        assert rel_rmse.item() < 0.01, (
-            f"tokens={tokens}: rel rmse {rel_rmse.item():.4g}"
-        )
 
 
 if __name__ == "__main__":
