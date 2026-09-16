@@ -1925,12 +1925,19 @@ class Req(ReqDllmMixin):
         # with the newly generated output token IDs during re-prefill of retracted request.
         # output_ids will have no use, but will lead to wrong size cache indexes.
         # Therefore, we discard the generated output_ids and restart prefill and generation
-        # to ensure shape consistency in KV cache.
+        # to ensure shape consistency in KV cache. Stream cursors that index
+        # output_ids (and incremental detok state) must restart with it.
         if self.input_embeds is not None:
             self.output_ids = array("q")
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+            self.send_token_offset = 0
+            self.send_decode_id_offset = 0
+            self.send_output_token_logprobs_offset = 0
+            self.send_output_sampling_mask_offset = 0
+            self.surr_offset = None
+            self.read_offset = None
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.get_kvcache().cpu_copy_carries_mamba:
