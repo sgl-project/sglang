@@ -1,8 +1,7 @@
 /**
  * \brief DeepSeek-V4.1's bf16 top-k kernel for short rows (<= 16384 scores)
  * Adapted from https://github.com/deepseek-ai/DeepSelect
- * We only tuned for 16384 in + k=512
- * Rewrite in SIMT for better architecture portability (AMD team should thank me)
+ * Plain SIMT (no tensor cores or clusters), tuned for 16384-wide rows with k = 512.
  */
 #pragma once
 
@@ -25,12 +24,10 @@ namespace sglang {
  * \brief bf16 top-k of one row that fits in registers (rows of at most 16384 scores: the
  *        DeepSeek-V4.1 sparse indexer's consumer rows), fused with a page-table transform.
  *
- * One CTA of 512 threads per row. The row is split into contiguous per-thread slices of up to
- * 32 scores held in registers for the whole kernel. Two radix passes (the raw high byte, then
- * the raw low byte among the elements sharing the pivot's high byte) locate the k-th largest
- * value exactly, a census then tells every thread how many of its elements are above / equal
- * to it and where they go, and the selected indices are staged in shared memory before one
- * coalesced, page-transformed copy to the output. This is DeepSelect's init-window select.
+ * One CTA of 512 threads per row, up to 32 scores per thread held in registers. Two radix
+ * passes over the raw bf16 bytes locate the k-th largest value exactly, a census places every
+ * element relative to it, and the selected indices are staged in shared memory before one
+ * coalesced, page-transformed store. This is DeepSelect's init-window select.
  *
  * \note The value order used everywhere is the "distorted" order of the raw bf16 bits
  *       (`x ^ (x < 0 ? 0xFFFF : 0x8000)`, negatives below positives, -0 below +0). The
@@ -116,15 +113,10 @@ struct TopKBF16Pivot {
   uint32_t remain;  // how many elements of `bin` still have to be taken
 };
 
-/**
- * \brief Locate the bin holding the k-th largest element in a 256-bin histogram indexed by a
- *        raw byte. Called by one whole warp; exactly one lane finds it and writes the answer
- *        to `smem.pivot_*` (the block reads it behind the caller's barrier, so there is no
- *        point in broadcasting it inside the warp first).
- * \param msb_mode  The raw byte is the high byte: lanes < 16 cover raw 0xFF..0x80 (negatives,
- *                  reversed), lanes >= 16 cover raw 0x00..0x7F.
- * \param negative  LSB mode only: the pivot bucket is negative, so the whole byte is reversed.
- */
+/// Locate the bin holding the k-th largest element in a 256-bin histogram indexed by a raw
+/// byte; one warp, exactly one lane writes `smem.pivot_*`. `msb_mode`: lanes < 16 cover raw
+/// 0xFF..0x80 (negatives, reversed), lanes >= 16 raw 0x00..0x7F. `negative` (LSB mode only):
+/// the pivot bucket is negative, so the whole byte is reversed.
 SGL_DEVICE void topk_bf16_find_pivot_warp(
     const uint32_t* hist, uint32_t k, bool msb_mode, bool negative, uint32_t lane_id, TopKBF16Config::Smem& smem) {
   using C = TopKBF16Config;
@@ -172,8 +164,7 @@ SGL_DEVICE void topk_bf16_find_pivot_warp(
   }
 }
 
-/// \brief One byte of hit bits for the 8 elements of a vector, element `e` at bit `e`.
-/// \param m Per-pair 16-bit masks (0xFFFF / 0) as produced by `__hgt2_mask` and friends.
+/// One hit bit per element of an 8-wide vector, from the per-pair 16-bit masks of `__hgt2_mask` and friends.
 SGL_DEVICE uint32_t topk_bf16_pack_hits(const uint32_t (&m)[4]) {
   // one flag byte per element (0xFF / 0x00), then signed dot products turn them into bits
   const auto lo = __byte_perm(m[0], m[1], 0x7531);
@@ -374,12 +365,11 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
 
-  // Slots past the census total were never staged. That only happens with NaN scores (the
-  // histogram counts them, no ordered compare ever selects them); write -1 there rather than
-  // whatever shared memory held before.
+  // Slots past the census total were never staged (only NaN scores cause that: counted by the
+  // histogram, never selected); write -1 there.
   const uint32_t totals = smem.count_gt_eq;
   const uint32_t num_staged = (totals >> 16) + min(totals & 0xFFFFu, eq_total);
-  // TODO: pragma unroll this one, if real topk > 512
+  // TODO(perf): unroll once k regularly exceeds 512.
   for (uint32_t t = tx; t < topk; t += C::kBlockSize) {
     out[t] = t < num_staged ? transform(smem.stage[t]) : -1;
   }
