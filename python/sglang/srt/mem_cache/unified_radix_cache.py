@@ -2418,7 +2418,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _handle_storage_prefetch_anchor_loss(self, request: CacheRequestHandle) -> None:
         operation = self.ongoing_prefetch[request].operation
         storage_hit_end = operation.storage_start + operation.storage_hit_count
-        self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="shrunk")
+        self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="anchor_lost")
         self.revoke_pending_prefetch(request)
         self.storage_prefetch_retries.refetch(request.rid, storage_hit_end)
 
