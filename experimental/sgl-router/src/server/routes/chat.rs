@@ -289,6 +289,18 @@ pub async fn chat_completions(
         .as_ref()
         .map(|config| config.session_affinity_mode)
         .unwrap_or(SessionAffinityMode::Bucket);
+    // The queue gate (`--worker-queue-limit`) applies to the cache-aware
+    // candidate resolution and, beneath it, to primary/backup admission and
+    // the min-load range fallback. It does NOT reach the
+    // `CapacityFallbackPowerOfTwo` last resort: by the time that fires no
+    // worker in the domain is capacity-admitted, so there is no unqueued
+    // destination left to prefer.
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.worker_queue_limit);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -307,6 +319,7 @@ pub async fn chat_completions(
         ttft_slo_ms,
         tps_slo,
         session_affinity_mode,
+        worker_queue_limit,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
