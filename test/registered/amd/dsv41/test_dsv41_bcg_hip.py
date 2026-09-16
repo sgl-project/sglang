@@ -211,6 +211,12 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
     BUCKET = 96
 
     def test_capture_replay_matches_eager(self):
+        self._capture_replay_matches_eager(max_context_size=None)
+
+    def test_fixed_context_capture_replay_matches_eager(self):
+        self._capture_replay_matches_eager(max_context_size=512)
+
+    def _capture_replay_matches_eager(self, max_context_size):
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
@@ -229,7 +235,7 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             num_heads=64,
             page_size=DSV4_PAGE_SIZE,
-            prefix_lens=(0, 0),
+            prefix_lens=(256, 256) if max_context_size is not None else (0, 0),
             extend_lens=(40, 24),
         )
         fixture = build_dsv4_attention_fixture(
@@ -270,8 +276,10 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             out_cache_loc=torch.zeros(self.BUCKET, dtype=torch.int64, device=device),
             device=device,
         )
+        capture_batch.max_seq_len_override = max_context_size
         # static view of the live batch: out_cache_loc padded to the bucket with the dummy slot
         static = copy.copy(live)
+        static.max_seq_len_override = max_context_size
         static.out_cache_loc = torch.nn.functional.pad(
             live.out_cache_loc, (0, self.BUCKET - num_tokens), value=0
         )
@@ -280,6 +288,12 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             backend.init_forward_metadata(live)
             eager = backend.forward_metadata
             eager_out = attention(live)
+            if max_context_size is not None:
+                eager = backend._prefill_metadata_for_batch(
+                    live, max_seq_len_override=max_context_size
+                )
+                backend.forward_metadata = eager
+                backend.init_forward_metadata_in_graph(live)
 
             captured = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
                 capture_batch
@@ -287,10 +301,10 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             self.assertIs(backend.forward_metadata, captured)
             pinned = captured.core_attn_metadata.swa_out_cache_loc
             self.assertEqual(tuple(pinned.shape), (self.BUCKET,))
-            # the capture batch is one request of BUCKET tokens, so its page table is bucket-wide
             self.assertEqual(
                 captured.core_attn_metadata.page_table.shape[1],
-                (self.BUCKET + DSV4_PAGE_SIZE - 1) // DSV4_PAGE_SIZE,
+                ((max_context_size or self.BUCKET) + DSV4_PAGE_SIZE - 1)
+                // DSV4_PAGE_SIZE,
             )
 
             # A segment's store reads the target by address.
@@ -359,6 +373,7 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                 device=device,
             )
             static2 = copy.copy(live2)
+            static2.max_seq_len_override = max_context_size
             static2.out_cache_loc = torch.nn.functional.pad(
                 live2.out_cache_loc, (0, self.BUCKET - num_tokens), value=0
             )
@@ -383,6 +398,15 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                     eager2.core_attn_metadata.seq_lens_casual,
                 )
             )
+            if max_context_size is not None:
+                overflow = copy.copy(live2)
+                overflow.seq_lens_cpu = torch.tensor([max_context_size + 1, 40])
+                with self.assertRaisesRegex(
+                    ValueError, "smaller than the live context"
+                ):
+                    backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                        captured, overflow, static_forward_batch=static2
+                    )
 
 
 if __name__ == "__main__":
