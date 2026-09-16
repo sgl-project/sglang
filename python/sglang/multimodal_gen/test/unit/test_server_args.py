@@ -70,6 +70,7 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
@@ -85,7 +86,6 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
-from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -351,9 +351,31 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             }
         )
 
+        # Role-qualified entries must not leak into the flat component map, or
+        # every consumer that looks a component up by name would see them.
+        self.assertEqual(args.component_attention_backends, {})
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"self": "sage_attn", "cross": "fa"}},
+        )
+
+    def test_role_and_component_wide_keys_are_split(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": (
+                    "text_encoder=torch_sdpa,transformer=fa,transformer.cross=fa3"
+                ),
+            }
+        )
+
         self.assertEqual(
             args.component_attention_backends,
-            {"transformer.self": "sage_attn", "transformer.cross": "fa"},
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+        self.assertEqual(
+            args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
         )
 
     def test_role_qualified_component_normalizes_hyphenated_component(self):
@@ -364,9 +386,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             }
         )
 
+        self.assertEqual(args.component_attention_backends, {})
         self.assertEqual(
-            args.component_attention_backends,
-            {"text_encoder.cross": "torch_sdpa"},
+            args.component_attention_backend_roles,
+            {"text_encoder": {"cross": "torch_sdpa"}},
         )
 
     def test_invalid_component_attention_role_raises(self):
@@ -419,8 +442,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
+        self.assertEqual(server_args.component_attention_backends, {})
         self.assertEqual(
-            server_args.component_attention_backends, {"transformer.cross": "fa"}
+            server_args.component_attention_backend_roles,
+            {"transformer": {"cross": "fa"}},
         )
 
     def test_resolve_component_backend_by_role_returns_overrides(self):

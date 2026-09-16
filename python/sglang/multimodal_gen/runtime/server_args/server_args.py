@@ -29,6 +29,10 @@ from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuant
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.layers.attention.roles import (
+    AttentionRole,
+    split_component_role_key,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -59,11 +63,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     layerwise_component_matches_any_selection,
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
-)
-from sglang.multimodal_gen.runtime.layers.attention.roles import (
-    AttentionRole,
-    make_component_role_key,
-    split_component_role_key,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -290,6 +289,15 @@ class ServerArgs(DisaggServerArgsMixin):
     )
     _requested_component_attention_backends: dict[str, str] | None = field(
         default=None, repr=False, compare=False
+    )
+    # Role-qualified overrides (``<component>.<role>``) live in their own map so
+    # ``component_attention_backends`` stays a plain component -> backend dict for
+    # every consumer that looks a component up by name.
+    component_attention_backend_roles: dict[str, dict[str, str]] = field(
+        default_factory=dict
+    )
+    _requested_component_attention_backend_roles: dict[str, dict[str, str]] | None = (
+        field(default=None, repr=False, compare=False)
     )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
@@ -1065,20 +1073,29 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
-        self.component_attention_backends = (
-            self._normalize_component_attention_backends(
-                self.component_attention_backends
+        self.component_attention_backends, self.component_attention_backend_roles = (
+            self._split_component_attention_backends(
+                self.component_attention_backends,
+                self.component_attention_backend_roles,
             )
         )
+        # Snapshot what the user asked for before the pipeline-specific
+        # adjustments below add any automatic entries of our own.
         if self._requested_component_attention_backends is None:
             self._requested_component_attention_backends = dict(
                 self.component_attention_backends
             )
+            self._requested_component_attention_backend_roles = {
+                component: dict(entries)
+                for component, entries in self.component_attention_backend_roles.items()
+            }
         else:
-            self._requested_component_attention_backends = (
-                self._normalize_component_attention_backends(
-                    self._requested_component_attention_backends
-                )
+            (
+                self._requested_component_attention_backends,
+                self._requested_component_attention_backend_roles,
+            ) = self._split_component_attention_backends(
+                self._requested_component_attention_backends,
+                self._requested_component_attention_backend_roles,
             )
 
         # attention_backend_config
@@ -1105,6 +1122,20 @@ class ServerArgs(DisaggServerArgsMixin):
                         text_backend,
                     )
                 self.component_attention_backends["text_encoder"] = "torch_sdpa"
+            # A role-qualified override would otherwise outrank the backend we
+            # just forced, so drop it for the same reason.
+            text_encoder_roles = self.component_attention_backend_roles.pop(
+                "text_encoder", None
+            )
+            if text_encoder_roles:
+                logger.warning(
+                    "Ignoring per-role attention backend overrides (%s) for component "
+                    "text_encoder to preserve LTX2 official attention semantics",
+                    ", ".join(
+                        f"{role}={backend}"
+                        for role, backend in sorted(text_encoder_roles.items())
+                    ),
+                )
         from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
             MiniMaxH3PipelineConfig,
         )
@@ -1114,6 +1145,7 @@ class ServerArgs(DisaggServerArgsMixin):
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
             and self.attention_backend == "laser_attn"
             and "text_encoder" not in self.component_attention_backends
+            and "text_encoder" not in self.component_attention_backend_roles
         ):
             # Laser Attention is used only by the MiniMax-H3 transformer.
             # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
@@ -1276,35 +1308,41 @@ class ServerArgs(DisaggServerArgsMixin):
             result[component.strip()] = backend.strip()
         return result
 
-    @staticmethod
-    def _normalize_component_attention_backend_key(component: str) -> str:
-        """Normalize a ``component`` or role-qualified ``component.role`` key.
-
-        The optional trailing ``.<role>`` selects the backend for one attention
-        role (self vs cross); the role token is validated against
-        ``AttentionRole`` while the component half is normalized like any other
-        component name.
-        """
-        component_part, role = split_component_role_key(component.strip())
-        component_name = component_part.strip().replace("-", "_")
-        if not component_name:
-            raise ValueError("Component attention backend key must not be empty")
-        if role is None:
-            return component_name
-        return make_component_role_key(component_name, role)
-
     @classmethod
-    def _normalize_component_attention_backends(
-        cls, value: dict[str, str] | str | None
-    ) -> dict[str, str]:
+    def _split_component_attention_backends(
+        cls,
+        value: dict[str, str] | str | None,
+        roles: dict[str, dict[str, str]] | None = None,
+    ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+        """Normalize raw entries into component-wide and role-qualified maps.
+
+        A key may be a bare ``component`` or a role-qualified ``component.role``.
+        The optional trailing ``.<role>`` selects the backend for one attention
+        role (self vs cross) and is validated against ``AttentionRole``; those
+        entries are routed into the returned role map instead of the flat one so
+        a component lookup by name never sees them. ``roles`` seeds the role map
+        for callers that already hold a normalized one.
+        """
         raw = cls._parse_component_attention_backend_map(value)
         normalized: dict[str, str] = {}
+        normalized_roles: dict[str, dict[str, str]] = {
+            component: dict(entries) for component, entries in (roles or {}).items()
+        }
         for component, backend in raw.items():
             if not isinstance(component, str):
                 raise ValueError("Component attention backend key must be a string")
-            key = cls._normalize_component_attention_backend_key(component)
-            normalized[key] = cls._normalize_attention_backend_name(backend)
-        return normalized
+            component_part, role = split_component_role_key(component.strip())
+            component_name = component_part.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
+            backend_name = cls._normalize_attention_backend_name(backend)
+            if role is None:
+                normalized[component_name] = backend_name
+            else:
+                normalized_roles.setdefault(component_name, {})[role.value] = (
+                    backend_name
+                )
+        return normalized, normalized_roles
 
     @staticmethod
     def _component_fallback_keys(component_name: str) -> list[str]:
@@ -1333,7 +1371,9 @@ class ServerArgs(DisaggServerArgsMixin):
         return self._requested_component_attention_backends.get(component_name)
 
     def has_requested_component_attention_backends(self) -> bool:
-        return bool(self._requested_component_attention_backends)
+        return bool(self._requested_component_attention_backends) or bool(
+            self._requested_component_attention_backend_roles
+        )
 
     def is_component_attention_backend_automatic(
         self, component_name: str | None
@@ -1359,9 +1399,9 @@ class ServerArgs(DisaggServerArgsMixin):
                     continue
                 matched = False
                 for base_key in self._component_fallback_keys(component_name):
-                    backend = self.component_attention_backends.get(
-                        make_component_role_key(base_key, role)
-                    )
+                    backend = self.component_attention_backend_roles.get(
+                        base_key, {}
+                    ).get(role.value)
                     if backend is not None:
                         backend_by_role[role] = AttentionBackendEnum[backend.upper()]
                         matched = True
