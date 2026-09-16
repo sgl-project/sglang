@@ -11,7 +11,7 @@ use crate::policies::selection::{
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
-use crate::server::chat_forward::{forward, SelectedWorkers};
+use crate::server::chat_forward::{forward_chat_request, SelectedWorkers};
 use crate::server::chat_preparation::{parse_routing_fields, PreparedChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
@@ -72,7 +72,7 @@ pub async fn chat_completions(
     .await?;
 
     // PD sends to both workers and returns the decode response.
-    forward(&ctx, request, workers, headers, start).await
+    forward_chat_request(&ctx, request, workers, headers, start).await
 }
 
 fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
@@ -104,7 +104,7 @@ async fn select_workers(
     Ok(SelectedWorkers {
         prefill,
         decode,
-        timestamped: policy.needs_dispatch_timestamps(),
+        track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
     })
 }
 
