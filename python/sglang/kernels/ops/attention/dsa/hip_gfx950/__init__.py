@@ -9,4 +9,5 @@ from sglang.kernels.ops.attention.dsa.hip_gfx950.fused_decode import (  # noqa: 
     consume_fresh_allocation,
     model_shape_supported,
     prealloc_workspace,
+    supported_hardware,
 )

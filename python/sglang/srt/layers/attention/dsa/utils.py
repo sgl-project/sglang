@@ -69,38 +69,32 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     """Whether this runtime can serve the gfx950 fused indexer: gfx950, aiter
     preshuffle, and an fp8 e4m3fn index cache.
 
-    A machine that is simply not the target degrades quietly. Anything else --
-    right hardware, wrong configuration, or kernels that will not build -- is
-    fatal when the path was asked for by name rather than a silent perf cliff,
-    which is the lesson of #39516."""
+    Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
+    first. Every decline here is therefore a configuration or toolchain error,
+    and is fatal when the path was asked for by name rather than a silent perf
+    cliff -- the lesson of #39516."""
     from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
     from sglang.srt.runtime_context import get_exec
-    from sglang.srt.utils import is_gfx95_supported
 
     requested = get_exec().kernel.enable_dsa_fused_indexer
     if requested is False:
         return False  # asked for the standard path; not worth a line per server
 
-    # Each decline logs its reason. Without this the path is invisible: a run
+    # Every decline logs its reason. Without this the path is invisible: a run
     # with the switch on and one with it off produce identical logs, and telling
     # the two apart cost a day of bisecting benchmark results.
-    def _no(reason: str) -> bool:
-        logger.info("gfx950 fused DSA indexer disabled: %s", reason)
-        return False
-
     def _refuse(reason: str) -> bool:
         if requested is True:
             raise RuntimeError(
                 f"the fused DSA indexer was requested but {reason}. Unset "
                 "enable_dsa_fused_indexer to let the runtime decide."
             )
-        return _no(reason)
+        logger.info("gfx950 fused DSA indexer disabled: %s", reason)
+        return False
 
-    # Wrong hardware is not a configuration error: degrade, never refuse. CUDA
-    # never reaches here at all (dsa_indexer short-circuits on
-    # use_dsa_indexer_fusion), so refusing would single out gfx942.
-    if not (is_hip() and is_gfx95_supported()):
-        return _no("not a gfx95 HIP device")
+    # No hardware term here: fused_decode.supported_hardware() is the hardware
+    # half of the gate and runs first, so anything reaching this point is
+    # already on gfx950. What is left is what a deployment can get wrong.
     if not get_bool_env_var("SGLANG_USE_AITER"):
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():

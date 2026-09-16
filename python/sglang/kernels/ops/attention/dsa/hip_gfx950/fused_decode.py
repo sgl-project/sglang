@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from sglang.kernels.jit.utils.common import is_hip_runtime
 from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,15 @@ DUAL_GEMV_MAX_M = 8
 MAX_ROWS = 48  # bs 8 x num_draft_tokens 6
 
 
+def supported_hardware() -> bool:
+    """Whether this device is one the kernels target, before asking whether the
+    shape fits or whether they build. They are raw gfx950: MFMA, wave64 DPP and
+    an e4m3fn fp8 cache throughout."""
+    if not is_hip_runtime() or not torch.cuda.is_available():
+        return False
+    return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+
+
 def model_shape_supported(
     *,
     head_dim: int,
@@ -53,7 +63,8 @@ def model_shape_supported(
     from sglang.srt.layers.layernorm import LayerNorm
 
     return (
-        head_dim == HEAD_DIM
+        supported_hardware()
+        and head_dim == HEAD_DIM
         and rope_head_dim == ROPE_DIM
         and n_heads == N_HEADS
         and index_topk == INDEX_TOPK
