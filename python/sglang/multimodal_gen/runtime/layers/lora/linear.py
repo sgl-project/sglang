@@ -124,7 +124,6 @@ class BaseLayerWithLoRA(nn.Module):
             return isinstance(self.base_layer.quant_method, UnquantizedLinearMethod)
         return True
 
-    @torch.compile()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.disable_lora or (self.merged and not self.has_lora_output_offset):
             return self.base_layer(input)
