@@ -26,8 +26,10 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_COPY_BUFFERS_ALIGNED_16_KEY,
     STAGING_WATERMARK_WAIT_S,
     StagingManagerMixin,
+    build_staging_kv_buffer_info,
     handle_staging_rsp,
     handle_watermark_msg,
 )
@@ -590,16 +592,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(ptr=0x{ptr:x}, size={size})"
             )
 
-    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+    def set_kv_buffer_tensors(
+        self,
+        k_buffers: list,
+        v_buffers: list,
+        page_size: int,
+        slot_layer_ids: Optional[List[int]] = None,
+    ):
         # NOTE: matches mooncake behavior -- staging buffers are now
         # created in __init__ (per-worker), independent of the kv
         # tensors. This setter only stashes the tensor metadata used by
         # send_kvcache_staged().
-        self.kv_buffer_tensors = {
-            "k_buffers": k_buffers,
-            "v_buffers": v_buffers,
-            "page_size": page_size,
-        }
+        self.kv_buffer_tensors = build_staging_kv_buffer_info(
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            page_size=page_size,
+            slot_layer_ids=slot_layer_ids,
+        )
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
@@ -2066,6 +2075,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_heads_to_send,
             page_size,
             self.kv_args.gpu_id,
+            buffers_aligned_16=self.kv_buffer_tensors.get(
+                STAGING_COPY_BUFFERS_ALIGNED_16_KEY
+            ),
         )
 
         dst_write_ptr = dst_staging_ptr + rank_offset

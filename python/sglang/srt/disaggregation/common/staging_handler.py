@@ -23,6 +23,8 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
+STAGING_COPY_BUFFERS_ALIGNED_16_KEY = "staging_copy_buffers_aligned_16"
+
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
@@ -60,6 +62,39 @@ class PrefillStagingContext:
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
     prefetch_sockets: dict = dataclasses.field(default_factory=dict)
+
+
+def build_staging_kv_buffer_info(
+    k_buffers: list,
+    v_buffers: list,
+    page_size: int,
+    slot_layer_ids: Optional[List[int]] = None,
+) -> dict:
+    """Snapshot KV-buffer metadata and cache its stable alignment proof."""
+    from sglang.srt.disaggregation.common.staging_buffer import (
+        kv_buffers_preserve_16_byte_alignment,
+    )
+
+    k_buffers = list(k_buffers)
+    v_buffers = list(v_buffers)
+    buffers = k_buffers + v_buffers
+    buffers_aligned_16 = False
+    if buffers:
+        head_dim = buffers[0].shape[-1]
+        stride_pool_token = buffers[0].shape[1] * head_dim
+        buffers_aligned_16 = kv_buffers_preserve_16_byte_alignment(
+            buffers,
+            stride_pool_token=stride_pool_token,
+            head_dim=head_dim,
+        )
+
+    return {
+        "k_buffers": k_buffers,
+        "v_buffers": v_buffers,
+        "page_size": page_size,
+        "slot_layer_ids": list(slot_layer_ids or []),
+        STAGING_COPY_BUFFERS_ALIGNED_16_KEY: buffers_aligned_16,
+    }
 
 
 class DecodeStagingHandler:
@@ -447,6 +482,9 @@ class DecodeStagingHandler:
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
+                buffers_aligned_16=self.kv_buffer_info.get(
+                    STAGING_COPY_BUFFERS_ALIGNED_16_KEY
+                ),
             )
 
         return True
