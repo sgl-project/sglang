@@ -17,6 +17,8 @@ type ReplayBuffer = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 pub struct FakePublisher {
     pub pub_endpoint: String,
     pub replay_endpoint: String,
+    /// Start sequences the bridge asked to replay from, in order.
+    pub replay_requests: Arc<Mutex<Vec<u64>>>,
     topic: Vec<u8>,
     publisher: PubSocket,
     buffer: ReplayBuffer,
@@ -35,6 +37,8 @@ impl FakePublisher {
         let replay_endpoint = router.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
         let buffer: ReplayBuffer = Arc::new(Mutex::new(Vec::new()));
         let served = Arc::clone(&buffer);
+        let replay_requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::clone(&replay_requests);
         let replay_task = tokio::spawn(async move {
             loop {
                 let Ok(request) = router.recv().await else {
@@ -47,6 +51,7 @@ impl FakePublisher {
                 }
                 let identity = frames[0].clone();
                 let start = u64::from_be_bytes(frames[2].as_ref().try_into().unwrap());
+                requests.lock().unwrap().push(start);
                 let entries: Vec<(u64, Vec<u8>)> = served
                     .lock()
                     .unwrap()
@@ -81,6 +86,7 @@ impl FakePublisher {
         Self {
             pub_endpoint,
             replay_endpoint,
+            replay_requests,
             topic: topic.as_bytes().to_vec(),
             publisher,
             buffer,
