@@ -145,6 +145,7 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
 from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
+    compute_config_digest,
     compute_local_gpu_id,
     get_ready_path,
 )
@@ -700,6 +701,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 "--dist-init-addr so all nodes rendezvous at the same endpoint."
             )
 
+        cfg = resolving_view(server_args)
         tp_size = get_parallel().tp_size
 
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
@@ -744,7 +746,10 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=get_device().base_gpu_id,
                     gpu_id_step=get_device().gpu_id_step,
                 )
-                cleanup_stale_daemon_files(current_platform.get_device_uuid(gpu_id))
+                cleanup_stale_daemon_files(
+                    current_platform.get_device_uuid(gpu_id),
+                    compute_config_digest(cfg, tp_rank=tp_rank, pp_rank=pp_rank),
+                )
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -785,7 +790,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         gpu_id_step=get_device().gpu_id_step,
                     )
                     ready_path = get_ready_path(
-                        current_platform.get_device_uuid(gpu_id)
+                        current_platform.get_device_uuid(gpu_id),
+                        compute_config_digest(cfg, tp_rank=tp_rank, pp_rank=pp_rank),
                     )
                     while not os.path.exists(ready_path):
                         time.sleep(check_interval)
