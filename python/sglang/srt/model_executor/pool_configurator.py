@@ -663,6 +663,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
+                # Same DCP replication the default configurator prices: the
+                # target pool is sharded while the draft pool spans the
+                # allocator's widened virtual location space. Scale the derived
+                # per-geometry counts rather than draft_layers, which indexes
+                # real draft layer ids above.
+                dcp_size = get_parallel().attn_dcp_size
+                self._draft_full_layers_num *= dcp_size
+                self._draft_swa_layers_num *= dcp_size
+                self._draft_swa_full_layers_num *= dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
