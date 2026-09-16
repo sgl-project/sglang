@@ -1,9 +1,9 @@
 # flash_mla
-# DeepSeek v4.1 kernels merged into the SGLang fork (sgl-project/FlashMLA@3e18517).
+# DeepSeek v4.1 kernels plus the SM90 mixed packed-Main reader.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3e18517fb055a6c9608eef5a1f1347fb1a047bbd.tar.gz
-    URL_HASH SHA256=ab2af4657683a1bbaa707a2781a5e2c2792eba574ff36905f1832598e67fea79
+    URL      https://${GITHUB_ARTIFACTORY}/yuyu5333/FlashMLA/archive/a48879650910f3d5ec692692a24a88ee49093c2b.tar.gz
+    URL_HASH SHA256=de8313532579e5a45658a668cc95aaa4d46f56c2c6861ae3c005495c379df27d
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -109,6 +109,8 @@ set(FlashMLA_SOURCES
     # sm90 sparse decode.
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_dsv41_main_fp4_persistent_h64.cu
+    ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v4_dsv41_main_fp4_persistent_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu

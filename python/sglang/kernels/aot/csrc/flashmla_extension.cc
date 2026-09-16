@@ -46,6 +46,25 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::
     float sm_scale,
     const std::optional<std::string>& kv_format);
 
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_mixed_decode_interface_v1(
+    const at::Tensor& q,
+    const at::Tensor& swa_cache,
+    const at::Tensor& swa_indices,
+    const std::optional<at::Tensor>& swa_topk_length,
+    const at::Tensor& main_cache_bytes,
+    const at::Tensor& main_indices,
+    const std::optional<at::Tensor>& main_topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor>& tile_scheduler_metadata,
+    std::optional<at::Tensor>& num_splits,
+    int d_v,
+    float sm_scale,
+    const std::string& swa_layout,
+    const std::string& main_layout,
+    int main_page_slots,
+    int main_page_bytes);
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
     const at::Tensor& kv,
@@ -97,6 +116,47 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_fwd_mixed_v1(
+    const at::Tensor& q,
+    const at::Tensor& swa_cache,
+    const at::Tensor& swa_indices,
+    const std::optional<at::Tensor>& swa_topk_length,
+    const at::Tensor& main_cache_bytes,
+    const at::Tensor& main_indices,
+    const std::optional<at::Tensor>& main_topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    int64_t d_v,
+    double sm_scale,
+    const std::string& swa_layout,
+    const std::string& main_layout,
+    int64_t main_page_slots,
+    int64_t main_page_bytes) {
+  return sparse_attn_mixed_decode_interface_v1(
+      q,
+      swa_cache,
+      swa_indices,
+      swa_topk_length,
+      main_cache_bytes,
+      main_indices,
+      main_topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      swa_layout,
+      main_layout,
+      static_cast<int>(main_page_slots),
+      static_cast<int>(main_page_bytes));
+}
+
+static int64_t sgl_flashmla_mixed_kv_api_version() {
+  return 1;
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -130,6 +190,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def(
+      "sparse_decode_fwd_mixed_v1(Tensor q, Tensor swa_cache, Tensor swa_indices, Tensor? swa_topk_length, "
+      "Tensor main_cache_bytes, Tensor main_indices, Tensor? main_topk_length, Tensor? attn_sink, "
+      "Tensor? tile_scheduler_metadata, Tensor? num_splits, int d_v, float sm_scale, str swa_layout, "
+      "str main_layout, int main_page_slots, int main_page_bytes) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_fwd_mixed_v1", torch::kCUDA, &sgl_sparse_decode_fwd_mixed_v1);
+
+  m.def("flashmla_mixed_kv_api_version() -> int", &sgl_flashmla_mixed_kv_api_version);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

@@ -267,7 +267,7 @@ class ExecKernel(msgspec.Struct):
             help="DeepSeek-V4.1 ratio-1/ratio-2 Main-KV storage layout. "
             "'auto' keeps the current FlashMLA layout, 'flashmla_fp8' explicitly "
             "selects it, and 'packed_fp4' selects the versioned 384-byte layout "
-            "once a compatible consumer is available.",
+            "for the explicit SM90 direct consumer.",
             choices=["auto", "flashmla_fp8", "packed_fp4"],
         ),
     ] = "auto"
@@ -275,8 +275,8 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="Consumer for the versioned DeepSeek-V4.1 packed Main-KV "
-            "layout. PR1 reserves 'staged' and 'direct'; neither is available "
-            "until its corresponding follow-up implementation lands.",
+            "layout. 'direct' uses the SM90 mixed-cache FlashMLA kernel; 'staged' "
+            "is reserved for the compatibility implementation.",
             choices=["auto", "staged", "direct"],
         ),
     ] = "auto"

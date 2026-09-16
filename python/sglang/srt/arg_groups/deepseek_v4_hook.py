@@ -263,15 +263,30 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
         return
 
-    if cfg.dsv41_main_kv_consumer != "auto":
+    if cfg.dsv41_main_kv_consumer == "staged":
         raise ValueError(
-            "DeepSeek-V4.1 packed Main-KV consumers are not available in PR1; "
-            "leave --dsv41-main-kv-consumer=auto"
+            "DeepSeek-V4.1 packed Main-KV staged consumption is not available; "
+            "use --dsv41-main-kv-consumer=direct on SM90"
         )
     if cfg.dsv41_main_kv_layout == "packed_fp4":
+        if cfg.dsv41_main_kv_consumer != "direct":
+            raise ValueError(
+                "--dsv41-main-kv-layout=packed_fp4 currently requires "
+                "--dsv41-main-kv-consumer=direct; auto remains on the legacy layout"
+            )
+        if not get_platform().is_sm90:
+            raise ValueError(
+                "DeepSeek-V4.1 packed Main-KV direct consumption requires SM90"
+            )
+        if cfg.dsv4_attn_backend not in ("auto", "flashmla"):
+            raise ValueError(
+                "DeepSeek-V4.1 packed Main-KV direct consumption requires the "
+                "FlashMLA attention backend"
+            )
+    elif cfg.dsv41_main_kv_consumer == "direct":
         raise ValueError(
-            "DeepSeek-V4.1 packed_fp4 Main KV has no attention consumer in PR1; "
-            "use --dsv41-main-kv-layout=auto until the staged or direct consumer lands"
+            "--dsv41-main-kv-consumer=direct requires "
+            "--dsv41-main-kv-layout=packed_fp4"
         )
     if cfg.dsv41_main_kv_layout == "flashmla_fp8" and (
         envs.SGLANG_DSV4_KV_LAYOUT.get().lower() == "v41"

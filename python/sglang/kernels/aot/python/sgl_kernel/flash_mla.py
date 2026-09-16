@@ -31,6 +31,9 @@ class FlashMLASchedMeta:
         topk: Optional[int]
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
+        api_variant: str = "legacy"
+        kv_format: Optional[str] = None
+        extra_kv_format: Optional[str] = None
 
     have_initialized: bool = False
     config: Optional[Config] = None
@@ -242,6 +245,10 @@ def _flash_mla_with_kvcache_sched_meta(
             topk=topk,
             extra_page_block_size=extra_page_block_size,
             extra_topk=extra_topk,
+            api_variant="legacy",
+            extra_kv_format=(
+                str(extra_k_cache.shape[-1]) if extra_k_cache is not None else None
+            ),
         )
     else:
         helper_msg = (
@@ -261,6 +268,10 @@ def _flash_mla_with_kvcache_sched_meta(
             helper_msg
         )
         assert sched_meta.config.extra_topk == extra_topk, helper_msg
+        assert sched_meta.config.api_variant == "legacy", helper_msg
+        assert sched_meta.config.extra_kv_format == (
+            str(extra_k_cache.shape[-1]) if extra_k_cache is not None else None
+        ), helper_msg
 
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
@@ -304,6 +315,102 @@ def _flash_mla_with_kvcache_sched_meta(
 
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
+    return out, lse
+
+
+def get_mla_capabilities() -> dict:
+    """Return machine-readable capabilities of the loaded FlashMLA AOT extension."""
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    major, minor = torch.cuda.get_device_capability()
+    api_version = torch.ops.sgl_kernel.flashmla_mixed_kv_api_version.default()
+    supported = (major, minor) == (9, 0)
+    return {
+        "mixed_kvcache_api_version": api_version,
+        "architecture": f"sm{major}{minor}",
+        "mixed_kvcache_supported": supported,
+        "supported_mixed_layout_pairs": (
+            [["V4", "DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1"]]
+            if supported
+            else []
+        ),
+        "supported_num_heads": [64, 128],
+        "supported_main_page_slots": [128, 256],
+    }
+
+
+def flash_mla_with_mixed_kvcache(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    main_cache_bytes: torch.Tensor,
+    main_indices: torch.Tensor,
+    swa_layout: str,
+    main_layout: str,
+    main_page_slots: int,
+    main_page_bytes: int,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    swa_topk_length: Optional[torch.Tensor] = None,
+    main_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the versioned SM90 V4-SWA plus packed-Main sparse decode path."""
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    assert isinstance(tile_scheduler_metadata, FlashMLASchedMeta)
+    assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    config = FlashMLASchedMeta.Config(
+        b=q.shape[0],
+        s_q=q.shape[1],
+        h_q=q.shape[2],
+        page_block_size=swa_cache.shape[1],
+        h_k=swa_cache.shape[2],
+        causal=False,
+        is_fp8_kvcache=True,
+        topk=swa_indices.shape[-1],
+        extra_page_block_size=main_page_slots,
+        extra_topk=main_indices.shape[-1],
+        api_variant="mixed_v1",
+        kv_format=swa_layout,
+        extra_kv_format=main_layout,
+    )
+    if not tile_scheduler_metadata.have_initialized:
+        tile_scheduler_metadata.have_initialized = True
+        tile_scheduler_metadata.config = config
+    else:
+        assert tile_scheduler_metadata.config == config, (
+            "Input arguments are inconsistent with FlashMLASchedMeta. Use "
+            "distinct scheduler metadata for legacy/staged and mixed-v1 calls."
+        )
+
+    out, lse, new_metadata, new_num_splits = (
+        torch.ops.sgl_kernel.sparse_decode_fwd_mixed_v1.default(
+            q,
+            swa_cache,
+            swa_indices,
+            swa_topk_length,
+            main_cache_bytes,
+            main_indices,
+            main_topk_length,
+            attn_sink,
+            tile_scheduler_metadata.tile_scheduler_metadata,
+            tile_scheduler_metadata.num_splits,
+            head_dim_v,
+            softmax_scale,
+            swa_layout,
+            main_layout,
+            main_page_slots,
+            main_page_bytes,
+        )
+    )
+    tile_scheduler_metadata.tile_scheduler_metadata = new_metadata
+    tile_scheduler_metadata.num_splits = new_num_splits
     return out, lse
 
 
