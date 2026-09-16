@@ -41,6 +41,7 @@ def _make_kv_mgr(is_mla_backend):
     mgr.is_mla_backend = is_mla_backend
     mgr.kv_item_lens_sum = KV_ITEM_LENS_SUM
     mgr.state_item_lens_sum = STATE_ITEM_LENS_SUM
+    mgr.kv_args = SimpleNamespace(state_item_lens=[[STATE_ITEM_LENS_SUM]])
     mgr._kv_replica_factor = None if is_mla_backend else 1
     return mgr
 
@@ -64,7 +65,7 @@ def _make_sender(kv_mgr):
     sender = _ConcreteKVSender.__new__(_ConcreteKVSender)
     sender._transfer_metric = KVTransferMetric()
     sender._transfer_num_kv_indices = 0
-    sender._transfer_num_state_indices = 0
+    sender._transfer_state_bytes = 0
     sender.kv_mgr = kv_mgr
     return sender
 
@@ -82,6 +83,18 @@ class TestKVTransferReplicaMetric(CustomTestCase):
             np.arange(8, dtype=np.int32), [np.arange(5, dtype=np.int32)]
         )
         expected = (8 * KV_ITEM_LENS_SUM + 5 * STATE_ITEM_LENS_SUM) * 4
+        self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, expected)
+
+    def test_components_use_their_own_slot_sizes(self):
+        mgr = _make_kv_mgr(is_mla_backend=True)
+        mgr.kv_args.state_item_lens = [[3, 4], [10, 20]]
+        sender = _make_sender(mgr)
+        mgr.resolve_kv_replica_factor(_room(4))
+        sender._record_transfer_indices(
+            np.arange(8, dtype=np.int32),
+            [np.arange(5, dtype=np.int32), np.arange(2, dtype=np.int32)],
+        )
+        expected = (8 * KV_ITEM_LENS_SUM + 5 * 7 + 2 * 30) * 4
         self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, expected)
 
     def test_non_mla_factor_is_one_regardless_of_destinations(self):
