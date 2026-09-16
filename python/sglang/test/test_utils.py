@@ -2007,6 +2007,7 @@ _GPU_IDLE_POLL_INTERVAL_SECS = 2.0
 _GPU_IDLE_USED_MEMORY_THRESHOLD = 2 << 30  # 2 GiB
 _GPU_RELEASE_TIMEOUT_SECS = 60.0
 _GPU_RELEASE_POLL_INTERVAL_SECS = 0.5
+_GPU_RELEASE_REPORT_THRESHOLD_SECS = 1.0
 
 
 def _format_gib(num_bytes: Optional[int]) -> str:
@@ -2164,10 +2165,19 @@ def wait_for_gpu_release(
     try:
         gpu_indices = _visible_gpu_indices(pynvml)
         pending = set(pids)
-        deadline = time.monotonic() + timeout
+        start = time.monotonic()
+        deadline = start + timeout
         while True:
             holders = _gpu_memory_holders(pynvml, gpu_indices, pending)
             if not holders:
+                # Without this, a wait is indistinguishable from no wait.
+                waited = time.monotonic() - start
+                if waited >= _GPU_RELEASE_REPORT_THRESHOLD_SECS:
+                    print(
+                        f"[CI GPU Release] Waited {waited:.1f}s for"
+                        f" {len(pending)} pid(s) to release.",
+                        flush=True,
+                    )
                 return
             if time.monotonic() >= deadline:
                 print(

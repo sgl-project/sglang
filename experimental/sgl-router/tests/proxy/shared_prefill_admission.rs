@@ -124,6 +124,7 @@ impl Policy for CacheCandidatesPolicy {
                 worker: Arc::clone(&self.worker),
                 matched_prefix_tokens: 1,
                 uncached_tokens: 1,
+                matched_prefix_blocks: 1,
                 candidate_range_id: "global".into(),
                 max_pending_prefill_tokens: None,
             }],
@@ -156,6 +157,7 @@ fn config(policy: PolicyKind) -> Config {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

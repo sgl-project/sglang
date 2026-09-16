@@ -43,6 +43,32 @@ at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps,
 at::Tensor
 layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps);
 
+// fused_scale_shift
+at::Tensor
+fused_scale_shift_cpu(const at::Tensor& input, const at::Tensor& scale, const at::Tensor& shift, double scale_constant);
+
+// fused_norm_scale_shift
+at::Tensor fused_norm_scale_shift_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
+// fused_scale_residual_norm_scale_shift
+std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
+    const at::Tensor& residual,
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& gate,
+    const std::optional<at::Tensor>& weight,
+    const std::optional<at::Tensor>& bias,
+    const at::Tensor& scale,
+    const at::Tensor& shift,
+    const std::string& norm_type,
+    double eps);
+
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
 
@@ -317,6 +343,14 @@ at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat2,
     at::Tensor& scales2,
     std::vector<int64_t> block_size,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType out_dtype,
+    bool is_vnni);
+
+at::Tensor fp8_per_tensor_scaled_mm_cpu(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    at::Tensor& scales2,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
@@ -651,6 +685,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "head_dim, int num_head) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
+  m.def("fused_scale_shift_cpu(Tensor input, Tensor scale, Tensor shift, float scale_constant) -> Tensor");
+  m.impl("fused_scale_shift_cpu", torch::kCPU, &fused_scale_shift_cpu);
+  m.def(
+      "fused_norm_scale_shift_cpu("
+      "Tensor input, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> Tensor");
+
+  m.impl("fused_norm_scale_shift_cpu", torch::kCPU, &fused_norm_scale_shift_cpu);
+  m.def(
+      "fused_scale_residual_norm_scale_shift_cpu("
+      "Tensor residual, "
+      "Tensor input, "
+      "Tensor? gate, "
+      "Tensor? weight, "
+      "Tensor? bias, "
+      "Tensor scale, "
+      "Tensor shift, "
+      "str norm_type, "
+      "float eps"
+      ") -> (Tensor, Tensor)");
+
+  m.impl("fused_scale_residual_norm_scale_shift_cpu", torch::kCPU, &fused_scale_residual_norm_scale_shift_cpu);
 
   // speculative decoding
   m.def(
@@ -786,6 +848,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, int[] block_size, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+  m.def(
+      "fp8_per_tensor_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType "
+      "out_dtype, bool is_vnni) -> Tensor");
+  m.impl("fp8_per_tensor_scaled_mm_cpu", torch::kCPU, &fp8_per_tensor_scaled_mm_cpu);
 
   // mxfp4 gemm
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
