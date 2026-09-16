@@ -1797,6 +1797,7 @@ async def benchmark(
             # Arguments
             "tag": getattr(args, "tag", None),
             "backend": args.backend,
+            "flushed_cache": should_flush_cache,
             "dataset_name": args.dataset_name,
             "request_rate": "trace" if use_trace_timestamps else request_rate,
             "max_concurrency": max_concurrency,
