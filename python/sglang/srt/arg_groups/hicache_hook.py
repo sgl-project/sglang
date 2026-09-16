@@ -48,6 +48,7 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    validate_hicache_mamba_size(server_args)
 
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
@@ -222,3 +223,23 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "context and never consuming its staged holds. Prefill "
             "instances share the standard scheduler path and are supported."
         )
+
+
+def validate_hicache_mamba_size(server_args: Any):
+    """--hicache-mamba-size-gb: a GB figure below --hicache-size, or 'auto'.
+
+    The knob carves the Mamba checkpoint share out of the fixed
+    --hicache-size budget, so it is rejected without one (ratio-sized host
+    pools have nothing to split) and an explicit figure must leave the KV
+    host pool a positive share. The rule itself is torch-free and unit-tested
+    in hicache_mamba_sizing; this only reads the resolved arguments.
+    """
+    cfg = resolving_view(server_args)
+    raw = cfg.hicache_mamba_size_gb
+    if raw is None:
+        return
+    from sglang.srt.mem_cache.hybrid_cache.hicache_mamba_sizing import (
+        validate_mamba_host_size_knob,
+    )
+
+    validate_mamba_host_size_knob(raw, cfg.hicache_size)
