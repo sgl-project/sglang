@@ -611,6 +611,7 @@ class ModelRunner:
             max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
             context_window=features.watermark_context_window,
             max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+            vocab_size=self.model_config.vocab_size,
             key=features.watermark_key,
             key_b=features.watermark_key_b,
             mixing_probability=features.watermark_mixing_probability,

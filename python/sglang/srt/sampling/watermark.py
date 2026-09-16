@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
+_MAX_WATERMARKED_CONTEXTS_PER_REQUEST = 4096
 
 
 def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
@@ -378,6 +379,10 @@ def force_watermark_tokens(
     keys: torch.Tensor,
     keys_b: Optional[torch.Tensor] = None,
     mixing_thresholds: Optional[torch.Tensor] = None,
+    max_top_k: Optional[int] = None,
+    partial_scores: Optional[torch.Tensor] = None,
+    partial_token_ids: Optional[torch.Tensor] = None,
+    output_token_ids: Optional[torch.Tensor] = None,
 ) -> None:
     if logits.is_cuda:
         try:
@@ -398,6 +403,10 @@ def force_watermark_tokens(
                 keys,
                 keys_b,
                 mixing_thresholds,
+                max_top_k=max_top_k,
+                partial_scores=partial_scores,
+                partial_token_ids=partial_token_ids,
+                output_token_ids=output_token_ids,
             )
             return
 
@@ -456,6 +465,7 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        vocab_size: int = 0,
         key_b: Optional[str] = None,
         mixing_probability: float = 0.5,
         default_enabled: bool = False,
@@ -474,6 +484,9 @@ class WatermarkState:
         self.default_enabled = default_enabled
         self.enforce_all = enforce_all
         self.context_window = context_window
+        history_capacity = min(
+            max_contexts_per_req, _MAX_WATERMARKED_CONTEXTS_PER_REQUEST
+        )
         self.token_ids = torch.zeros(
             (max_num_reqs, context_window), dtype=torch.int32, device=device
         )
@@ -482,13 +495,13 @@ class WatermarkState:
             max_num_reqs, dtype=torch.int64, device=device
         )
         self.watermarked_context_hashes = torch.empty(
-            (max_num_reqs, max_contexts_per_req), dtype=torch.int32, device=device
+            (max_num_reqs, history_capacity), dtype=torch.int32, device=device
         )
         self.num_watermarked_contexts = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
         self.context_history_positions = torch.arange(
-            max_contexts_per_req, dtype=torch.int32, device=device
+            history_capacity, dtype=torch.int32, device=device
         )
         self.context_hash_buffer = torch.empty(
             max_num_reqs, dtype=torch.int64, device=device
@@ -508,6 +521,24 @@ class WatermarkState:
             dtype=torch.int64,
             device=device,
         )
+        default_key = self.default_key if self.default_key is not None else 0
+        self.default_key_buffer = torch.full(
+            (max_num_reqs,), default_key, dtype=torch.int64, device=device
+        )
+        self.default_context_window_buffer = torch.full(
+            (max_num_reqs,), context_window, dtype=torch.int32, device=device
+        )
+        self.default_enabled_buffer = torch.full(
+            (max_num_reqs,),
+            self.default_key is not None and (default_enabled or enforce_all),
+            dtype=torch.bool,
+            device=device,
+        )
+        self.partial_scores_buffer = torch.empty(0, dtype=torch.float32, device=device)
+        self.partial_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
+        self.output_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
+        if vocab_size > 0 and self.token_ids.is_cuda:
+            self._ensure_selection_buffers(max_num_reqs, vocab_size)
 
     @classmethod
     def create(
@@ -519,6 +550,7 @@ class WatermarkState:
         max_contexts_per_req: int,
         key: Optional[str],
         device: str,
+        vocab_size: int = 0,
         key_b: Optional[str] = None,
         mixing_probability: float = 0.5,
         default_enabled: bool = False,
@@ -530,6 +562,7 @@ class WatermarkState:
             max_num_reqs=max_num_reqs,
             context_window=context_window,
             max_contexts_per_req=max_contexts_per_req,
+            vocab_size=vocab_size,
             key=key,
             key_b=key_b,
             mixing_probability=mixing_probability,
@@ -598,6 +631,8 @@ class WatermarkState:
                     continue
                 seen.add(context_hash)
                 history.append(_as_signed_int32(context_hash))
+                if len(history) == self.watermarked_context_hashes.shape[1]:
+                    break
             histories.append(history)
 
         return histories if has_retracted_request else None
@@ -700,23 +735,36 @@ class WatermarkState:
         if keys is not None and context_windows is not None and enabled is not None:
             return keys, context_windows, enabled
 
-        key = self.default_key if self.default_key is not None else 0
-        device = sampling_info.top_ks.device
         return (
-            torch.full((batch_size,), key, dtype=torch.int64, device=device),
-            torch.full(
-                (batch_size,),
-                self.context_window,
-                dtype=torch.int32,
-                device=device,
-            ),
-            torch.full(
-                (batch_size,),
-                self.default_key is not None
-                and (self.default_enabled or self.enforce_all),
-                dtype=torch.bool,
-                device=device,
-            ),
+            self.default_key_buffer[:batch_size],
+            self.default_context_window_buffer[:batch_size],
+            self.default_enabled_buffer[:batch_size],
+        )
+
+    def _ensure_selection_buffers(
+        self, batch_size: int, vocab_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.sampling.textseal_selector import (
+            watermark_selector_num_splits,
+        )
+
+        num_splits = watermark_selector_num_splits(vocab_size)
+        partial_size = batch_size * num_splits
+        if self.partial_scores_buffer.numel() < partial_size:
+            self.partial_scores_buffer = torch.empty(
+                partial_size, dtype=torch.float32, device=self.token_ids.device
+            )
+            self.partial_token_ids_buffer = torch.empty(
+                partial_size, dtype=torch.int32, device=self.token_ids.device
+            )
+        if self.output_token_ids_buffer.numel() < batch_size:
+            self.output_token_ids_buffer = torch.empty(
+                batch_size, dtype=torch.int32, device=self.token_ids.device
+            )
+        return (
+            self.partial_scores_buffer[:partial_size],
+            self.partial_token_ids_buffer[:partial_size],
+            self.output_token_ids_buffer[:batch_size],
         )
 
     def context_windows(self, sampling_info: SamplingBatchInfo) -> torch.Tensor:
@@ -884,6 +932,9 @@ class WatermarkState:
             & prior_rows.view(1, draft_token_num, draft_token_num)
         ).any(dim=2)
         selected &= repeated_in_tree.flatten().logical_not()
+        partial_scores, partial_token_ids, output_token_ids = (
+            self._ensure_selection_buffers(logits.shape[0], logits.shape[1])
+        )
         force_watermark_tokens(
             logits=logits,
             context_hashes=context_hashes,
@@ -897,6 +948,10 @@ class WatermarkState:
             keys=keys,
             keys_b=keys_b,
             mixing_thresholds=mixing_thresholds,
+            max_top_k=getattr(sampling_info, "max_top_k", None),
+            partial_scores=partial_scores,
+            partial_token_ids=partial_token_ids,
+            output_token_ids=output_token_ids,
         )
         return context_hashes, selected
 
@@ -936,9 +991,17 @@ class WatermarkState:
         keys, context_windows, watermark_enabled = self._watermark_batch_config(
             sampling_info
         )
+        max_top_k = getattr(sampling_info, "max_top_k", None)
+        if max_top_k == 1:
+            return
+        partial_scores, partial_token_ids, output_token_ids = (
+            self._ensure_selection_buffers(logits.shape[0], logits.shape[1])
+        )
         if logits.is_cuda:
             try:
                 from sglang.kernels.ops.sampling.textseal_selector import (
+                    can_use_finite_topk_watermark,
+                    force_watermark_tokens_with_state_triton,
                     prepare_watermark_contexts_triton,
                 )
             except ImportError:
@@ -947,6 +1010,41 @@ class WatermarkState:
                 batch_size = req_pool_indices.shape[0]
                 context_hashes = self.context_hash_buffer[:batch_size]
                 eligible = self.eligible_buffer[:batch_size]
+                pool_indices = req_pool_indices.to(torch.int64)
+                keys_b = (
+                    self.key_b_buffer[pool_indices]
+                    if self.default_key_b is not None
+                    else None
+                )
+                mixing_thresholds = (
+                    self.mixing_threshold_buffer[pool_indices]
+                    if self.default_key_b is not None
+                    else None
+                )
+                if can_use_finite_topk_watermark(max_top_k, logits.shape[1]):
+                    force_watermark_tokens_with_state_triton(
+                        logits,
+                        self.token_ids,
+                        self.lengths,
+                        self.write_positions,
+                        self.watermarked_context_hashes,
+                        self.num_watermarked_contexts,
+                        req_pool_indices,
+                        context_windows,
+                        watermark_enabled,
+                        sampling_info.temperatures,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        keys,
+                        keys_b,
+                        mixing_thresholds,
+                        context_hashes,
+                        eligible,
+                        output_token_ids,
+                        max_top_k,
+                    )
+                    return
                 prepare_watermark_contexts_triton(
                     self.token_ids,
                     self.lengths,
@@ -969,16 +1067,12 @@ class WatermarkState:
                     top_ps=sampling_info.top_ps,
                     min_ps=sampling_info.min_ps,
                     keys=keys,
-                    keys_b=(
-                        self.key_b_buffer[req_pool_indices.to(torch.int64)]
-                        if self.default_key_b is not None
-                        else None
-                    ),
-                    mixing_thresholds=(
-                        self.mixing_threshold_buffer[req_pool_indices.to(torch.int64)]
-                        if self.default_key_b is not None
-                        else None
-                    ),
+                    keys_b=keys_b,
+                    mixing_thresholds=mixing_thresholds,
+                    max_top_k=max_top_k,
+                    partial_scores=partial_scores,
+                    partial_token_ids=partial_token_ids,
+                    output_token_ids=output_token_ids,
                 )
                 return
 
@@ -1011,6 +1105,10 @@ class WatermarkState:
                 if self.default_key_b is not None
                 else None
             ),
+            max_top_k=max_top_k,
+            partial_scores=partial_scores,
+            partial_token_ids=partial_token_ids,
+            output_token_ids=output_token_ids,
         )
         self._record_contexts(req_pool_indices, context_hashes, selected)
 

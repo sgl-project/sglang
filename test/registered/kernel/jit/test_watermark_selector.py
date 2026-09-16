@@ -174,6 +174,97 @@ def test_fused_force_matches_torch_truncation(dtype, vocab_size, dual_key):
     assert torch.equal(actual_logits, expected_logits)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_finite_top_k_fast_path_matches_sort_with_ties(dtype):
+    vocab_size = 8193
+    token_ids = torch.arange(vocab_size, device="cuda", dtype=torch.float32)
+    logits = torch.stack(
+        (
+            torch.zeros_like(token_ids),
+            token_ids.remainder(5),
+            torch.round(torch.sin(token_ids) * 8),
+            torch.where(token_ids < 5, torch.ones_like(token_ids), -torch.inf),
+        )
+    ).to(dtype)
+    temperatures = torch.tensor([[0.7], [1.0], [1.3], [0.9]], device="cuda")
+    top_ks = torch.tensor([2, 7, 20, 64], dtype=torch.int32, device="cuda")
+    top_ps = torch.tensor([1.0, 0.95, 0.5, 1.0], device="cuda")
+    min_ps = torch.tensor([0.0, 0.0, 0.05, 0.2], device="cuda")
+    context_hashes = torch.tensor(
+        [0, 1, 2**32 - 1, 1145416960], dtype=torch.int64, device="cuda"
+    )
+    keys = torch.tensor(
+        [0, 1, -1, 0x0123456789ABCDEF], dtype=torch.int64, device="cuda"
+    )
+    eligible = torch.ones(4, dtype=torch.bool, device="cuda")
+
+    sort_logits = logits.clone()
+    sort_selected = force_watermark_tokens_triton(
+        sort_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+    )
+    fast_logits = logits.clone()
+    fast_selected = force_watermark_tokens_triton(
+        fast_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+        max_top_k=64,
+    )
+
+    assert torch.equal(fast_selected, sort_selected)
+    assert torch.equal(fast_logits, sort_logits)
+
+    keys_b = torch.tensor(
+        [1, -1, 0x1111222233334444, -(2**63)], dtype=torch.int64, device="cuda"
+    )
+    mixing_thresholds = torch.tensor(
+        [1, 1 << 30, 1 << 31, (1 << 32) - 1],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    dual_sort_logits = logits.clone()
+    dual_sort_selected = force_watermark_tokens_triton(
+        dual_sort_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+        keys_b,
+        mixing_thresholds,
+    )
+    dual_fast_logits = logits.clone()
+    dual_fast_selected = force_watermark_tokens_triton(
+        dual_fast_logits,
+        context_hashes,
+        eligible,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+        keys_b,
+        mixing_thresholds,
+        max_top_k=64,
+    )
+
+    assert torch.equal(dual_fast_selected, dual_sort_selected)
+    assert torch.equal(dual_fast_logits, dual_sort_logits)
+
+
 def test_fused_context_state_matches_torch():
     max_contexts = 2048
     reference = WatermarkState(

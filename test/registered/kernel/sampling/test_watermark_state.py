@@ -31,6 +31,7 @@ def test_repeated_context_and_greedy_bypass():
         top_ks=torch.tensor([64, 1], device=device, dtype=torch.int32),
         top_ps=torch.ones(2, device=device),
         min_ps=torch.zeros(2, device=device),
+        max_top_k=64,
     )
 
     first_logits = torch.zeros((2, 64), device=device)
@@ -104,6 +105,7 @@ def test_retracted_request_restores_context_history():
         top_ks=torch.tensor([64], device=device, dtype=torch.int32),
         top_ps=torch.ones(1, device=device),
         min_ps=torch.zeros(1, device=device),
+        max_top_k=64,
     )
     logits = torch.zeros((1, 64), device=device)
     state.force(logits, req_pool_indices, sampling_info)

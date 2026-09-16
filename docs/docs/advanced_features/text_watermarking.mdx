@@ -256,6 +256,8 @@ node before selection.
   the signal.
 - The detector needs the matching key, tokenizer, context window, and prompt
   token IDs for the strongest result.
+- Each request tracks at most 4,096 unique watermarked contexts. After that
+  bound, generation continues with ordinary sampling for the remaining tokens.
 - Speculative decoding can lose accepted draft tokens when a draft proposal does
   not match the watermarked target token. The impact depends on tree width and
   workload.
