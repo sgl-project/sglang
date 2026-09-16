@@ -57,7 +57,26 @@
     },
     "cached_cumulative": {
       "server": {
-        "radix_cache": true
+        "radix_cache": true,
+        "args": [
+          "--revision",
+          "73e3e38d981303bc594367cd910ea6eb48349da8",
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--enable-cache-report"
+        ]
       }
     },
     "cached_incremental": {
@@ -79,7 +98,8 @@
           "torch_native",
           "--decode-attention-backend",
           "torch_native",
-          "--incremental-streaming-output"
+          "--incremental-streaming-output",
+          "--enable-cache-report"
         ],
         "radix_cache": true
       }
@@ -288,6 +308,55 @@
           "cuda"
         ],
         "min_cuda_devices": 1
+      }
+    },
+    "tools_cumulative": {
+      "server": {
+        "args": [
+          "--revision",
+          "73e3e38d981303bc594367cd910ea6eb48349da8",
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--tool-call-parser",
+          "qwen25"
+        ]
+      }
+    },
+    "tools_incremental": {
+      "server": {
+        "args": [
+          "--revision",
+          "73e3e38d981303bc594367cd910ea6eb48349da8",
+          "--device",
+          "mps",
+          "--disable-cuda-graph",
+          "--mlx-enable-sampling",
+          "--max-total-tokens",
+          "4096",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--prefill-attention-backend",
+          "torch_native",
+          "--decode-attention-backend",
+          "torch_native",
+          "--incremental-streaming-output",
+          "--tool-call-parser",
+          "qwen25"
+        ]
       }
     }
   }

@@ -7,6 +7,7 @@ struct Choice {
     value: serde_json::Map<String, Value>,
     finished: bool,
     origins: BTreeMap<String, Vec<usize>>,
+    tools: BTreeMap<usize, serde_json::Map<String, Value>>,
 }
 
 pub(super) fn reconstruct(
@@ -175,6 +176,11 @@ pub(super) fn reconstruct(
                                     .ok_or_else(|| invalid(&path, "delta rule not covered"))?
                                 {
                                     Rule::Text => append_text(target, field, value, &path)?,
+                                    Rule::ToolCalls => {
+                                        merge_tools(&mut state.tools, value, &path)?;
+                                        // Preserve explicit null/empty arrays even when no calls arrive.
+                                        target.entry(field).or_insert_with(|| value.clone());
+                                    }
                                     Rule::Constant => {
                                         if field == "role"
                                             && value.is_null()
@@ -182,9 +188,7 @@ pub(super) fn reconstruct(
                                         {
                                             continue;
                                         }
-                                        if matches!(field.as_str(), "tool_calls" | "function_call")
-                                            && !value.is_null()
-                                        {
+                                        if field == "function_call" && !value.is_null() {
                                             return Err(invalid(
                                                 &path,
                                                 "tool generation is outside this suite",
@@ -208,7 +212,9 @@ pub(super) fn reconstruct(
                                 state.origins.entry(path).or_default().push(event_index);
                             }
                         }
-                        Rule::Usage | Rule::ChatConstant => unreachable!("validated choice rule"),
+                        Rule::Usage | Rule::ChatConstant | Rule::ToolCalls => {
+                            unreachable!("validated choice rule")
+                        }
                     }
                     state.origins.entry(path).or_default().push(event_index);
                 }
@@ -218,7 +224,14 @@ pub(super) fn reconstruct(
                 } else {
                     &entry["text"]
                 };
-                let has_content = content.as_str().is_some_and(|s| !s.is_empty());
+                let has_content = content.as_str().is_some_and(|s| !s.is_empty())
+                    || (chat
+                        && (["reasoning_content", "refusal"]
+                            .iter()
+                            .any(|k| entry["delta"][*k].as_str().is_some_and(|s| !s.is_empty()))
+                            || entry["delta"]["tool_calls"]
+                                .as_array()
+                                .is_some_and(|a| !a.is_empty())));
                 if continuous && has_content && !value.get("usage").is_some_and(Value::is_object) {
                     return Err(invalid("/usage", "requested continuous usage missing"));
                 }
@@ -238,15 +251,20 @@ pub(super) fn reconstruct(
         return Err(invalid("/usage", "requested final usage missing"));
     }
     let mut values = Vec::new();
-    for (index, state) in choices {
-        let value = Value::Object(state.value);
-        if chat {
-            if value["delta"]["role"] != "assistant" || !value["delta"]["content"].is_string() {
+    for (index, mut state) in choices {
+        if !state.tools.is_empty() {
+            if state.tools.keys().copied().ne(0..state.tools.len()) {
                 return Err(invalid(
-                    &format!("/choices/{index}/delta"),
-                    "missing assistant text",
+                    &format!("/choices/{index}/delta/tool_calls"),
+                    "non-contiguous tool indices",
                 ));
             }
+            state.value.get_mut("delta").unwrap()["tool_calls"] =
+                Value::Array(state.tools.into_values().map(Value::Object).collect());
+        }
+        let value = Value::Object(state.value);
+        if chat {
+            assistant_message(&value["delta"], &format!("/choices/{index}/delta"))?;
         } else if !value["text"].is_string() {
             return Err(invalid(
                 &format!("/choices/{index}/text"),
@@ -332,4 +350,63 @@ fn merge_logprobs(target: &mut serde_json::Map<String, Value>, key: &str, value:
             .unwrap()
             .extend(values.as_array().unwrap().iter().cloned());
     }
+}
+
+/// The wire index routes argument fragments; it is retained in the full result.
+fn merge_tools(
+    target: &mut BTreeMap<usize, serde_json::Map<String, Value>>,
+    value: &Value,
+    path: &str,
+) -> Result<(), Violation> {
+    if value.is_null() {
+        return Ok(());
+    }
+    for call in value
+        .as_array()
+        .ok_or_else(|| invalid(path, "expected tool call array"))?
+    {
+        let index = call["index"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| invalid(path, "missing tool index"))?;
+        let call = call
+            .as_object()
+            .ok_or_else(|| invalid(path, "expected tool call object"))?;
+        let state = target.entry(index).or_default();
+        for (key, value) in call {
+            let path = format!("{path}/{index}/{key}");
+            match key.as_str() {
+                "index" => constant(state, key, value, &path)?,
+                "id" | "type" => {
+                    if !value.is_null() {
+                        if value.as_str().is_none_or(str::is_empty) {
+                            return Err(invalid(&path, "expected nonempty tool identity"));
+                        }
+                        constant(state, key, value, &path)?;
+                    }
+                }
+                "function" => {
+                    let function = value
+                        .as_object()
+                        .ok_or_else(|| invalid(&path, "expected function object"))?;
+                    let output = state
+                        .entry(key)
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .unwrap();
+                    for (field, value) in function {
+                        if !matches!(field.as_str(), "name" | "arguments") {
+                            return Err(invalid(
+                                &format!("{path}/{field}"),
+                                "tool function rule not covered",
+                            ));
+                        }
+                        append_text(output, field, value, &format!("{path}/{field}"))?;
+                    }
+                }
+                _ => return Err(invalid(&path, "tool call rule not covered")),
+            }
+        }
+    }
+    Ok(())
 }

@@ -1,18 +1,23 @@
 use super::*;
 use sglang_parity::sse::SseEvent;
 
+fn config() -> RunConfig {
+    let mut config: RunConfig =
+        serde_json::from_str(include_str!("../../configs/cuda.json")).unwrap();
+    config.server.model = "test".into();
+    config
+}
+
 fn plan() -> ExecutionPlan<OpenAiPolicy> {
-    let config = serde_json::from_value(json!({
-        "server":{"model":"test","seed":42},
-        "profiles":{"incremental":{"server":{"args":["--incremental-streaming-output"]}}}
-    }))
-    .unwrap();
-    load_plan(DEFAULT_SPEC, &config).unwrap()
+    load_plan(DEFAULT_SPEC, &config()).unwrap()
 }
 
 fn case(name: &str) -> (HttpCase, OpenAiPolicy) {
-    let mut plan = plan();
-    let profile = plan.profiles.remove(0);
+    let profile = plan()
+        .profiles
+        .into_iter()
+        .find(|p| p.suite.cases.iter().any(|c| c.name == name))
+        .unwrap();
     (
         profile
             .suite
@@ -106,7 +111,7 @@ fn unary(chat: bool) -> Value {
 #[test]
 fn plans_bind_only_selected_profiles_and_validate_equivalence_pairs() {
     let plan = plan();
-    assert_eq!(plan.profiles.len(), 2);
+    assert_eq!(plan.profiles.len(), 10);
     for profile in plan.profiles {
         assert!(
             profile
@@ -117,9 +122,7 @@ fn plans_bind_only_selected_profiles_and_validate_equivalence_pairs() {
         );
         assert!(profile.suite.response_policy.is_some());
     }
-    let config: RunConfig = serde_json::from_value(json!({"server":{"model":"test"},
-        "profiles":{"incremental":{}}}))
-    .unwrap();
+    let config = config();
     for mutation in ["profile", "body", "endpoint", "rules"] {
         let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
         match mutation {
@@ -406,7 +409,7 @@ fn both_platform_configs_and_model_aliases_resolve_without_side_effects() {
             .args
             .extend(["--served-model-name".into(), "alias".into()]);
         let plan = load_plan(DEFAULT_SPEC, &config).unwrap();
-        assert_eq!(plan.profiles.len(), 2);
+        assert_eq!(plan.profiles.len(), 10);
         assert!(
             plan.profiles[0]
                 .suite
@@ -414,9 +417,14 @@ fn both_platform_configs_and_model_aliases_resolve_without_side_effects() {
                 .iter()
                 .all(|c| c.body["model"] == "alias")
         );
-        assert_eq!(plan.profiles[1].suite.output_mode, "incremental");
-        assert_eq!(plan.profiles[0].suite.cases.len(), 32);
-        assert_eq!(plan.profiles[1].suite.cases.len(), 30);
+        let incremental = plan
+            .profiles
+            .iter()
+            .find(|p| p.profile.id == "incremental")
+            .unwrap();
+        assert_eq!(incremental.suite.output_mode, "incremental");
+        assert_eq!(plan.profiles[0].suite.cases.len(), 44);
+        assert_eq!(incremental.suite.cases.len(), 42);
     }
 }
 
@@ -540,4 +548,304 @@ fn chat_control_events_need_no_continuous_usage_and_native_errors_are_preserved(
         )
         .unwrap();
     assert_eq!(response.value, value);
+}
+
+#[test]
+fn scenario_assertions_distinguish_inactive_and_populated_values() {
+    let (c, _) = case("chat_greedy_json");
+    let rows = [
+        (
+            json!({"check":"reasoning","enabled":true}),
+            "/choices/0/message/reasoning_content",
+            json!("Think."),
+            json!(null),
+        ),
+        (
+            json!({"check":"reasoning","enabled":false}),
+            "/choices/0/message/reasoning_content",
+            json!(null),
+            json!("Think."),
+        ),
+        (
+            json!({"check":"reasoning_tokens","positive":true}),
+            "/usage/reasoning_tokens",
+            json!(1),
+            json!(0),
+        ),
+        (
+            json!({"check":"reasoning_tokens","positive":false}),
+            "/usage/reasoning_tokens",
+            json!(0),
+            json!(1),
+        ),
+        (
+            json!({"check":"cached_tokens","positive":true}),
+            "/usage/prompt_tokens_details",
+            json!({"cached_tokens":1}),
+            json!(null),
+        ),
+        (
+            json!({"check":"cached_tokens","positive":false}),
+            "/usage/prompt_tokens_details",
+            json!(null),
+            json!({"cached_tokens":1}),
+        ),
+        (
+            json!({"check":"content","empty":true}),
+            "/choices/0/message/content",
+            json!(""),
+            json!("hello"),
+        ),
+        (
+            json!({"check":"content","empty":false}),
+            "/choices/0/message/content",
+            json!("hello"),
+            json!(""),
+        ),
+        (
+            json!({"check":"no_refusal"}),
+            "/choices/0/message/refusal",
+            json!(null),
+            json!("Refused"),
+        ),
+        (
+            json!({"check":"tool_calls","enabled":false}),
+            "/choices/0/message/tool_calls",
+            json!([]),
+            json!([{}]),
+        ),
+        (
+            json!({"check":"logprobs","enabled":false}),
+            "/choices/0/logprobs",
+            json!(null),
+            json!({}),
+        ),
+        (
+            json!({"check":"weight_version","value":"parity-v1"}),
+            "/metadata",
+            json!({"weight_version":"parity-v1","weight_versions":[{"version":"parity-v1","start":0,"end":2}]}),
+            json!({"weight_version":"default"}),
+        ),
+    ];
+    for (spec, path, valid, invalid) in rows {
+        let expectation: Expectation = serde_json::from_value(spec.clone()).unwrap();
+        let mut response = unary(true);
+        // Populate parent objects once; the table varies just the target field.
+        response["usage"]["reasoning_tokens"] = Value::Null;
+        response["usage"]["prompt_tokens_details"] = Value::Null;
+        response["metadata"] = Value::Null;
+        for key in ["reasoning_content", "refusal", "tool_calls"] {
+            response["choices"][0]["message"][key] = Value::Null;
+        }
+        for (value, passes) in [(valid, true), (invalid, false)] {
+            *response.pointer_mut(path).unwrap() = value;
+            let result = expectation.evaluate(&response, &c);
+            assert_eq!(result.violations.is_empty(), passes, "{spec}: {response}");
+        }
+    }
+    // A missing positive field never counts as exercising the populated state.
+    for check in ["reasoning_tokens", "cached_tokens"] {
+        let expectation: Expectation =
+            serde_json::from_value(json!({"check":check,"positive":true})).unwrap();
+        assert!(!expectation.evaluate(&unary(true), &c).violations.is_empty());
+    }
+}
+
+#[test]
+fn logprob_alternative_scenarios_require_sampled_data_and_preserve_empty_shapes() {
+    for chat in [false, true] {
+        let prefix = if chat { "chat" } else { "completion" };
+        let (c, p) = case(&format!("{prefix}_logprobs_no_alternatives_json"));
+        for alternatives in [0, 2] {
+            let expectation: Expectation = serde_json::from_value(
+                json!({"check":"logprobs","enabled":true,"alternatives":alternatives}),
+            )
+            .unwrap();
+            for populated in [false, true] {
+                let mut response = unary(chat);
+                response["choices"][0]["logprobs"] = if chat {
+                    json!({"content":[{"token":"hi","token_id":0,"logprob":-1.0,
+                        "top_logprobs":if populated { json!([{"token":"hi","logprob":-1.0}]) } else {json!([])}}]})
+                } else {
+                    json!({"tokens":["hi"],"token_logprobs":[-1.0],"text_offset":[-1],
+                        "top_logprobs":if populated {json!([{"hi":-1.0}])} else {json!([])}})
+                };
+                let prepared = p
+                    .prepare(
+                        &c,
+                        &HttpObservation {
+                            json: Some(response.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(prepared.value, response);
+                assert_eq!(
+                    expectation.evaluate(&response, &c).violations.is_empty(),
+                    populated == (alternatives > 0)
+                );
+                if chat {
+                    let ids = Expectation::TokenIds;
+                    assert!(ids.evaluate(&response, &c).violations.is_empty());
+                    response["choices"][0]["logprobs"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("token_id");
+                    assert!(!ids.evaluate(&response, &c).violations.is_empty());
+                }
+                response["choices"][0]["logprobs"] = json!({});
+                assert!(!expectation.evaluate(&response, &c).violations.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_fragments_reconstruct_without_hiding_arguments_or_identity_errors() {
+    let (json_case, policy) = case("chat_tools_required_json");
+    let (stream_case, _) = case("chat_tools_required_stream");
+    let call = json!({"id":"call-json", "type":"function", "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}});
+    let mut response = unary(true);
+    response["choices"][0]["message"] =
+        json!({"role":"assistant","content":null,"tool_calls":[call]});
+    response["choices"][0]["finish_reason"] = json!("tool_calls");
+    response["choices"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("logprobs");
+    let json = policy
+        .prepare(
+            &json_case,
+            &HttpObservation {
+                json: Some(response),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(json.assertions.iter().all(|a| a.violations.is_empty()));
+    let chunks = vec![
+        chunk(
+            true,
+            json!({"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-stream","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}),
+        ),
+        chunk(
+            true,
+            json!({"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":"tool_calls"}),
+        ),
+        usage_event(true),
+    ];
+    let stream = policy
+        .prepare(&stream_case, &capture(chunks.clone()))
+        .unwrap();
+    assert!(stream.assertions.iter().all(|a| a.violations.is_empty()));
+    assert_eq!(
+        json.equivalence.unwrap().value,
+        stream.equivalence.unwrap().value
+    );
+    assert_eq!(stream.origins["/choices/0/delta/tool_calls"], vec![0, 1]);
+    assert_eq!(
+        stream.value["choices"][0]["delta"]["tool_calls"][0]["id"],
+        "call-stream"
+    );
+    for mutation in ["id", "index", "unknown", "arguments", "empty", "wrong_args"] {
+        let mut values = chunks.clone();
+        let call = &mut values[1]["choices"][0]["delta"]["tool_calls"][0];
+        match mutation {
+            "id" => call["id"] = json!("changed"),
+            "index" => {
+                call.as_object_mut().unwrap().remove("index");
+            }
+            "unknown" => call["new_field"] = json!(1),
+            "arguments" => call["function"]["arguments"] = json!(3),
+            "empty" => values[0]["choices"][0]["delta"]["tool_calls"][0]["id"] = json!(""),
+            _ => call["function"]["arguments"] = json!("\"London\"}"),
+        }
+        let result = policy.prepare(&stream_case, &capture(values));
+        if mutation == "wrong_args" {
+            // Valid protocol, but the desired scenario did not occur. Keep the
+            // full response and semantic view available for parity comparison.
+            let result = result.unwrap();
+            assert!(!result.assertions[0].violations.is_empty());
+            assert!(result.equivalence.is_some());
+        } else {
+            assert!(result.is_err(), "{mutation}");
+        }
+    }
+}
+
+#[test]
+fn reasoning_only_streams_retain_payload_and_participate_in_equivalence() {
+    let (c, p) = case("chat_reasoning_stream");
+    let values = vec![
+        chunk(
+            true,
+            json!({"index":0,"delta":{"role":"assistant","reasoning_content":"Let "},"finish_reason":null}),
+        ),
+        chunk(
+            true,
+            json!({"index":0,"delta":{"reasoning_content":"me think."},"finish_reason":"length"}),
+        ),
+        usage_event(true),
+    ];
+    let result = p.prepare(&c, &capture(values)).unwrap();
+    assert_eq!(
+        result.value["choices"][0]["delta"]["reasoning_content"],
+        "Let me think."
+    );
+    assert!(result.value["choices"][0]["delta"].get("content").is_none());
+    assert_eq!(
+        result.equivalence.unwrap().value["choices"][0]["reasoning_content"],
+        "Let me think."
+    );
+    assert!(result.assertions[0].violations.is_empty());
+    assert!(!result.assertions[1].violations.is_empty()); // Missing token accounting.
+}
+
+#[test]
+fn coverage_cases_resolve_assertions_and_warmups_for_every_stream_mode() {
+    let plan = plan();
+    for (scenario, profile_prefix) in [
+        ("cached", "cached"),
+        ("versioned", "versioned"),
+        ("reasoning", "reasoning"),
+        ("tools_required", "tools"),
+    ] {
+        for mode in ["cumulative", "incremental"] {
+            let profile = plan
+                .profiles
+                .iter()
+                .find(|p| p.profile.id == format!("{profile_prefix}_{mode}"))
+                .unwrap();
+            for capture in [CaptureMode::Json, CaptureMode::Sse] {
+                let c = profile
+                    .suite
+                    .cases
+                    .iter()
+                    .find(|c| {
+                        c.name.starts_with(&format!("chat_{scenario}_")) && c.capture == capture
+                    })
+                    .unwrap();
+                if scenario == "cached" {
+                    assert_eq!(c.before_each.len(), 1);
+                    assert_eq!(c.before_each[0].body["model"], "test");
+                    assert!(profile.profile.server.radix_cache);
+                    assert!(
+                        profile
+                            .profile
+                            .server
+                            .args
+                            .contains(&"--enable-cache-report".into())
+                    );
+                }
+                if scenario != "versioned" || capture == CaptureMode::Json {
+                    assert!(!c.assertions.is_empty());
+                    assert!(
+                        profile.suite.response_policy.as_ref().unwrap()["expectations"]
+                            .get(&c.name)
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
 }

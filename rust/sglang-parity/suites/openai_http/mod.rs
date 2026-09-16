@@ -11,6 +11,9 @@ use sglang_parity::{
     Violation,
 };
 
+mod expectations;
+use expectations::Expectation;
+
 mod streaming;
 #[cfg(test)]
 mod tests;
@@ -36,6 +39,10 @@ struct Case {
     body: Value,
     expect_status: u16,
     #[serde(default)]
+    before_each: Vec<Value>,
+    #[serde(default)]
+    expectations: Vec<Expectation>,
+    #[serde(default)]
     equivalence_group: Option<String>,
 }
 
@@ -59,18 +66,29 @@ enum Rule {
     Index,
     Delta,
     Usage,
+    ToolCalls,
 }
 
 pub struct OpenAiPolicy {
     rules: StreamingRules,
+    expectations: BTreeMap<String, Vec<Expectation>>,
 }
 
-const SEMANTICS: [&str; 5] = ["model", "content", "finish_reason", "logprobs", "usage"];
+const SEMANTICS: [&str; 8] = [
+    "model",
+    "content",
+    "reasoning_content",
+    "tool_calls",
+    "refusal",
+    "finish_reason",
+    "logprobs",
+    "usage",
+];
 
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiPolicy>, String> {
     let spec: Specification = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if spec.name != "openai_http" || spec.equivalence != SEMANTICS {
-        return Err("openai_http requires its declared model/content/finish_reason/logprobs/usage projection".into());
+        return Err("openai_http requires its declared equivalence projection".into());
     }
     // The finite rule vocabulary documents the supported contract, not a DSL.
     let defaults: Specification = serde_json::from_str(DEFAULT_SPEC).map_err(|e| e.to_string())?;
@@ -117,6 +135,24 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
             choice_count(&case.body, is_chat(&case.path)).map_err(|e| e.message)?;
             if !case.body.get("stream").is_some_and(Value::is_boolean) {
                 return Err(format!("{}: stream must be explicit", case.name));
+            }
+        }
+        Expectation::validate_all(&case.expectations)?;
+        if case.expect_status != 200
+            && (!case.expectations.is_empty() || !case.before_each.is_empty())
+        {
+            return Err(format!(
+                "{}: error cases cannot have generation expectations or warmups",
+                case.name
+            ));
+        }
+        for body in &case.before_each {
+            choice_count(body, is_chat(&case.path)).map_err(|e| e.message)?;
+            if !body.is_object() || body["stream"] != false {
+                return Err(format!(
+                    "{}: warmups must be non-streaming requests",
+                    case.name
+                ));
             }
         }
         if let Some(group) = &case.equivalence_group {
@@ -198,8 +234,26 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
                     comparison_scope: ComparisonScope::Root,
                 },
                 equivalence_group: case.equivalence_group.clone(),
-                assertions: Vec::new(),
-                before_each: Vec::new(),
+                assertions: case.expectations.iter().map(|e| e.name().into()).collect(),
+                before_each: case
+                    .before_each
+                    .iter()
+                    .map(|body| {
+                        let mut body = body.clone();
+                        body.as_object_mut()
+                            .unwrap()
+                            .entry("model")
+                            .or_insert(json!(model));
+                        HttpRequest {
+                            method: "POST".into(),
+                            path: case.path.clone(),
+                            body,
+                            expect_status: 200,
+                            capture: CaptureMode::Json,
+                            comparison_scope: ComparisonScope::Root,
+                        }
+                    })
+                    .collect(),
                 isolation: Isolation::Shared,
                 requires: Default::default(),
             });
@@ -207,6 +261,12 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
         if cases.is_empty() {
             continue;
         }
+        let expectations: BTreeMap<_, _> = spec
+            .cases
+            .iter()
+            .filter(|c| c.profiles.contains(&profile.id) && !c.expectations.is_empty())
+            .map(|c| (c.name.clone(), c.expectations.clone()))
+            .collect();
         let incremental = profile.server.incremental_output();
         let suite = HttpSuite {
             name: spec.name.clone(),
@@ -221,6 +281,7 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
                 "streaming": spec.streaming,
                 "wire_content": "OpenAI SSE delta, independent of backend output mode",
                 "equivalence": spec.equivalence,
+                "expectations": expectations,
             })),
             comparison: spec.comparison.clone(),
             cases,
@@ -230,6 +291,7 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
             suite,
             policy: OpenAiPolicy {
                 rules: spec.streaming.clone(),
+                expectations,
             },
         });
     }
@@ -379,6 +441,11 @@ fn logprobs(value: &Value, chat: bool) -> Result<(), Violation> {
             let array = entries
                 .as_array()
                 .ok_or_else(|| invalid("/logprobs", "expected array"))?;
+            // With logprobs=0, alternatives can be an empty array even
+            // though sampled-token probabilities are populated.
+            if key == "top_logprobs" && array.is_empty() {
+                continue;
+            }
             if length
                 .replace(array.len())
                 .is_some_and(|n| n != array.len())
@@ -471,14 +538,7 @@ impl OpenAiPolicy {
                     ));
                 }
                 if is_chat(&case.path) {
-                    if choice["message"]["role"] != "assistant"
-                        || !choice["message"]["content"].is_string()
-                    {
-                        return Err(invalid(
-                            "/choices/message",
-                            "expected assistant text message",
-                        ));
-                    }
+                    assistant_message(&choice["message"], "/choices/message")?;
                 } else if !choice["text"].is_string() {
                     return Err(invalid("/choices/text", "expected text"));
                 }
@@ -495,11 +555,64 @@ impl OpenAiPolicy {
             }
             value.into()
         };
+        if let Some(expectations) = self.expectations.get(&case.name) {
+            prepared.assertions = expectations
+                .iter()
+                .map(|e| e.evaluate(&prepared.value, case))
+                .collect();
+        }
         if case.equivalence_group.is_some() {
             prepared.equivalence = Some(project(&prepared, is_chat(&case.path))?);
         }
         Ok(prepared)
     }
+}
+
+fn assistant_message(message: &Value, path: &str) -> Result<(), Violation> {
+    if message["role"] != "assistant" {
+        return Err(invalid(path, "expected assistant role"));
+    }
+    for key in ["content", "reasoning_content", "refusal"] {
+        if message
+            .get(key)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return Err(invalid(&format!("{path}/{key}"), "expected string or null"));
+        }
+    }
+    if let Some(calls) = message.get("tool_calls").filter(|v| !v.is_null()) {
+        let calls = calls
+            .as_array()
+            .ok_or_else(|| invalid(path, "expected tool call array"))?;
+        let mut ids = BTreeSet::new();
+        for (index, call) in calls.iter().enumerate() {
+            if call["id"].as_str().is_none_or(str::is_empty)
+                || !ids.insert(call["id"].as_str().unwrap())
+                || call["type"] != "function"
+                || call["function"]["name"].as_str().is_none_or(str::is_empty)
+                || !call["function"]["arguments"].is_string()
+            {
+                return Err(invalid(
+                    &format!("{path}/tool_calls/{index}"),
+                    "invalid function tool call",
+                ));
+            }
+        }
+    }
+    if !message["content"].is_string()
+        && !["reasoning_content", "refusal"]
+            .iter()
+            .any(|key| message[*key].as_str().is_some_and(|s| !s.is_empty()))
+        && message["tool_calls"]
+            .as_array()
+            .is_none_or(|calls| calls.is_empty())
+    {
+        return Err(invalid(
+            path,
+            "missing assistant content, reasoning, refusal or tool calls",
+        ));
+    }
+    Ok(())
 }
 
 fn requested_logprobs(case: &HttpCase) -> bool {
@@ -537,9 +650,44 @@ fn project(response: &PreparedResponse, chat: bool) -> Result<EquivalenceValue, 
         } else {
             &choice[content_key]
         };
+        let content = if chat {
+            json!(content.as_str().unwrap_or_default())
+        } else {
+            content.clone()
+        };
         let mut result = json!({"index": choice["index"], "content": content, "finish_reason": choice["finish_reason"]});
         if let Some(logprobs) = choice.get("logprobs") {
             result["logprobs"] = logprobs.clone();
+        }
+        if chat {
+            for key in ["reasoning_content", "refusal", "tool_calls"] {
+                // These optional payloads describe generated output. No text
+                // or no calls has one semantic representation; full parity
+                // continues to compare the untouched null/empty/absent fields.
+                let mut value = if key == "tool_calls" {
+                    choice[content_key][key]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into()
+                } else {
+                    json!(choice[content_key][key].as_str().unwrap_or_default())
+                };
+                if let Some(calls) = value.as_array_mut() {
+                    for call in calls {
+                        let object = call.as_object_mut().unwrap();
+                        object.remove("id");
+                        object.remove("index");
+                    }
+                }
+                result[key] = value;
+                if let Some(events) = response
+                    .origins
+                    .get(&format!("/choices/{source}/{content_key}/{key}"))
+                {
+                    origins.insert(format!("/choices/{position}/{key}"), events.clone());
+                }
+            }
         }
         for (destination, source_key) in [
             ("content", content_key),

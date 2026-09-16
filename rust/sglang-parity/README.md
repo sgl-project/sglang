@@ -645,9 +645,52 @@ overrides the specification of the explicitly selected suite.
 `suites/openai_http/suite.json` defines both `POST /v1/completions` and
 `POST /v1/chat/completions`: JSON/SSE, greedy and seeded sampling, multiple
 choices, batch prompts, echo, multi-turn chat, logprobs, usage options, and
-invalid token limits. Only the bound `default` and `incremental` profiles run.
-Chat text cases disable thinking. Tools, reasoning-specific behavior, multimodal
-inputs, Responses and embeddings are not covered yet.
+invalid token limits. It also binds the cached, versioned, reasoning and tool
+profiles in both backend streaming modes. Ordinary chat cases disable thinking;
+the reasoning cases explicitly enable it. Multimodal inputs, Responses and
+embeddings remain outside this suite.
+
+#### Empty and populated response scenarios
+
+The same specification includes `expectations` for real-service scenario checks.
+These run on the original, reconstructed response before comparison exceptions.
+A missing positive field or an untriggered stop/cache/tool condition fails the
+scenario assertion; it never counts as verified coverage. Protocol-valid responses
+remain available for parity even when a scenario assertion fails.
+
+| Field / behavior | Inactive or empty scenario | Populated scenario |
+|---|---|---|
+| `choices[].logprobs` | Greedy generation without logprobs | Logprobs enabled, with sampled-token probabilities |
+| `top_logprobs` | `logprobs=0` / `top_logprobs=0`; no alternatives | Up to two alternatives per generated token |
+| Generated text | Explicit stop at the first output text | Greedy generation requires nonempty text |
+| `matched_stop` | One token with EOS ignored requires length finish and null | Explicit stop strings require a matching stop and stop finish |
+| `message/delta.reasoning_content` | Thinking disabled | Qwen3 reasoning parser; nonempty reasoning required |
+| `usage.reasoning_tokens` | Zero when thinking is disabled | Positive count, bounded by generated tokens |
+| `usage.prompt_tokens_details` | Cache reporting disabled | Radix cache plus `--enable-cache-report`; warm the exact request prefix before each measured attempt, require positive cached tokens |
+| `message/delta.tool_calls` | No tools and `tool_choice=none` | Qwen25 parser, one named function; require the name, parsed arguments and tool-call finish reason |
+| `metadata` | Default weight version (already populated) | Explicit `parity-v1`; verify version and nonempty spans in JSON responses |
+| Chat logprob `token_id` | Not applicable when logprobs are disabled | Require a nonnegative integer for every sampled token; zero is a valid ID |
+| `refusal`, `logprobs.refusal` | Verify no structured refusal in ordinary chat | **Unavailable:** neither current service emits structured refusal payloads; a natural-language refusal is ordinary content |
+
+An inactive feature may legitimately have no payload (missing, null, or an empty
+collection). Scenario checks establish that no payload was generated; the full
+parity comparison still distinguishes every wire representation. Empty objects
+are not fabricated for metadata or usage: these objects have required members
+when present. Weight metadata is currently emitted on JSON responses, not SSE.
+The paired versioned SSE requests still participate in full parity and equivalence.
+
+Tool arguments are reconstructed by tool-call index. No external tool is executed.
+The named call uses an enum-constrained argument to make the scenario reproducible;
+if generation does not satisfy it, the report records a scenario failure.
+Only the single call's ID is a declared value exception; names and arguments
+remain exact. Adding multi-call cases requires declaring the corresponding ID
+exceptions as well.
+
+This is a coverage **specification**, not a claim that all server behavior passes.
+Check response validation and scenario assertions in each real run. A skipped,
+invalid or untriggered case is unverified coverage; unit fixtures cannot establish
+E2E acceptance. The nonempty refusal state remains explicitly unsupported until
+a service implements it.
 
 OpenAI SSE always contains **deltas**, even when the backend profile uses
 cumulative native output. The suite validates every event and reconstructs each
@@ -667,13 +710,15 @@ There are two deliberately separate comparisons:
   SSE result in `final.json`. Only declared ID/time values are replaced;
   missing fields, nulls and empty values remain distinct.
 - **JSON/SSE equivalence** uses `equivalence.json`: model, indexed content,
-  finish reasons, token logprobs and final usage. IDs and wire wrappers such as
+  reasoning/refusal text, function tool calls, finish reasons, token logprobs and
+  final usage. Absent/null optional text and call collections mean no generated
+  payload in this view; their exact shapes remain in full parity. IDs and wire wrappers such as
   message/delta are excluded only from this semantic view. The paired streaming
   request requires final usage. Other fields remain visible to full parity.
 
 Allowing Completion IDs to vary does not relax JSON/SSE result equivalence:
-every declared pair still compares each indexed choice's content, finish reason
-and logprobs, along with the model and complete final usage. Independent JSON
+every declared pair still compares each indexed choice's content, reasoning, tool
+calls, refusal, finish reason and logprobs, along with the model and complete final usage. Independent JSON
 and SSE requests need not produce the same literal ID.
 
 The OpenAI suite specification explicitly compares log probabilities at `float32`

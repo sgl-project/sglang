@@ -47,7 +47,21 @@
     },
     "cached_cumulative": {
       "server": {
-        "radix_cache": true
+        "radix_cache": true,
+        "args": [
+          "--revision",
+          "c1899de289a04d12100db370d81485cdf75e47ca",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--max-total-tokens",
+          "4096",
+          "--attention-backend",
+          "triton",
+          "--enable-cache-report"
+        ]
       }
     },
     "cached_incremental": {
@@ -64,7 +78,8 @@
           "--max-total-tokens",
           "4096",
           "--attention-backend",
-          "triton"
+          "triton",
+          "--enable-cache-report"
         ],
         "radix_cache": true
       }
@@ -238,6 +253,45 @@
           "cuda"
         ],
         "min_cuda_devices": 1
+      }
+    },
+    "tools_cumulative": {
+      "server": {
+        "args": [
+          "--revision",
+          "c1899de289a04d12100db370d81485cdf75e47ca",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--max-total-tokens",
+          "4096",
+          "--attention-backend",
+          "triton",
+          "--tool-call-parser",
+          "qwen25"
+        ]
+      }
+    },
+    "tools_incremental": {
+      "server": {
+        "args": [
+          "--revision",
+          "c1899de289a04d12100db370d81485cdf75e47ca",
+          "--max-running-requests",
+          "4",
+          "--context-length",
+          "2048",
+          "--disable-cuda-graph",
+          "--incremental-streaming-output",
+          "--max-total-tokens",
+          "4096",
+          "--attention-backend",
+          "triton",
+          "--tool-call-parser",
+          "qwen25"
+        ]
       }
     }
   }
