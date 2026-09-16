@@ -219,6 +219,7 @@ class PrefillBootstrapQueue:
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
                 state_item_lens=kv_args.state_item_lens,
+                page_size=kv_args.page_size,
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -1305,7 +1306,9 @@ class SchedulerDisaggregationPrefillMixin:
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
-            self.disagg_metadata_buffers.set_kv_checksum(req, value)
+            self.disagg_metadata_buffers.set_kv_checksum(
+                req, value, computer.signature if value else 0
+            )
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(

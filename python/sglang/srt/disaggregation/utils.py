@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -26,6 +27,8 @@ from sglang.srt.runtime_context import (
     get_disagg,
 )
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -430,11 +433,17 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
-    def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+    def set_kv_checksum(self, req: Req, value: int, signature: int = 0) -> None:
+        # Slot 0 the digest, slot 1 the layout signature it was taken under.
+        # The row is already 8 wide (64 B RDMA minimum), so this costs nothing.
+        row = self.kv_checksum[req.metadata_buffer_index]
+        row[0] = value
+        row[1] = signature
 
-    def get_kv_checksum(self, idx: int) -> int:
-        return int(self.kv_checksum[idx, 0].item())
+    def get_kv_checksum(self, idx: int) -> Tuple[int, int]:
+        """Return ``(digest, layout_signature)``; ``(0, 0)`` means "no digest"."""
+        row = self.kv_checksum[idx, :2].tolist()
+        return int(row[0]), int(row[1])
 
     def get_buf_infos(self):
         bufs = [
@@ -1763,3 +1772,32 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+def aux_buffer_pair_count(
+    num_local: int, num_remote: int, logged: set, backend: str
+) -> int:
+    """Buffers both sides registered, warning once if the lists differ.
+
+    The aux list is matched positionally, so a peer that registered a
+    different number of buffers -- the usual cause is an optional metadata
+    buffer enabled on one engine only, e.g. the PD KV checksum -- used to walk
+    off the end of the shorter list. Transfer what both sides agree on; the
+    feature whose buffer went missing reads "not written" and skips.
+    """
+    if num_local != num_remote:
+        key = (backend, num_local, num_remote)
+        if key not in logged:
+            logged.add(key)
+            logger.warning(
+                "%s: peer registered %d aux buffers but this engine has %d. "
+                "Transferring the %d both sides share. This usually means an "
+                "optional metadata buffer (e.g. "
+                "--disaggregation-enable-kv-checksum) is enabled on only one "
+                "of the prefill/decode engines.",
+                backend,
+                num_remote,
+                num_local,
+                min(num_local, num_remote),
+            )
+    return min(num_local, num_remote)

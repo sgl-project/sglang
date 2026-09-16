@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -31,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -39,6 +41,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
+    corrupt_one_kv_row_for_test,
     is_health_check_req,
     page_indices_for_request,
     state_indices_for_request,
@@ -348,6 +351,24 @@ class DecodeRequest:
         return self.req.priority
 
 
+def _kv_checksum_supported() -> bool:
+    """The digest covers [0, end); the prefill sends [decode_prefix_len, end).
+
+    A decode-side prefix hit fills the difference from this engine's own
+    cache -- bytes from a different prefill run -- so every hit would look like
+    corruption. No digest is the safe direction.
+    """
+    if get_disagg().disaggregation_decode_enable_radix_cache:
+        logger.warning(
+            "KV checksum disabled: --disaggregation-decode-enable-radix-cache "
+            "makes the prefill send only the suffix of a prompt, while the "
+            "digest covers the whole of it, so every prefix hit would look "
+            "like corruption."
+        )
+        return False
+    return True
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -437,7 +458,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-        if get_disagg().disaggregation_enable_kv_checksum:
+        if get_disagg().disaggregation_enable_kv_checksum and _kv_checksum_supported():
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
                 device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
@@ -445,6 +466,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
                 state_item_lens=kv_args.state_item_lens,
+                page_size=kv_args.page_size,
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -2133,6 +2155,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        # A prefill whose layout signature differs cannot be compared against;
+        # say so once rather than once per request.
+        self._logged_checksum_signatures: set = set()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
         self.enable_deferred_kv_release = (
@@ -2155,13 +2180,39 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    def _kv_checksum_comparable(self, signature: int) -> bool:
+        """Whether the prefill's digest describes the layout we would digest.
+
+        A prefill with a different TP width, one whose pool covers a layer
+        subset (PP or layer sharding), or one with the feature off cannot be
+        compared against -- its digest covers different bytes. Say so once and
+        skip, rather than aborting every request.
+        """
+        if signature == 0:
+            return False
+        mine = self.scheduler.kv_checksum_computer.signature
+        if signature == mine:
+            return True
+        if signature not in self._logged_checksum_signatures:
+            self._logged_checksum_signatures.add(signature)
+            logger.warning(
+                "KV checksum skipped: prefill layout signature %#x does not "
+                "match this decode's %#x (different TP width, a layer-sharded "
+                "or PP prefill, or a different build). No request is aborted "
+                "for this.",
+                signature,
+                mine,
+            )
+        return False
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
         idx = decode_req.metadata_buffer_index
         if self.scheduler.kv_checksum_computer is not None:
-            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
-                idx
+            digest, signature = self.metadata_buffers.get_kv_checksum(idx)
+            decode_req.req.expected_kv_checksum = (
+                digest if self._kv_checksum_comparable(signature) else 0
             )
         (
             output_id,
@@ -2716,26 +2767,53 @@ class SchedulerDisaggregationDecodeMixin:
         if computer is None:
             return self._get_new_prebuilt_batch(running_batch)
 
-        verified: List[Req] = []
-        for req in self.waiting_queue:
+        queue = self.waiting_queue
+        mismatched = [0] * len(queue)
+        messages: Dict[int, str] = {}
+        corrupt_prob = envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.get()
+
+        for i, req in enumerate(queue):
             if is_health_check_req(req):
-                verified.append(req)
                 continue
             expected = req.expected_kv_checksum
             if expected == 0:
-                verified.append(req)
                 continue
             seq_len = len(req.origin_input_ids)
             page_indices_gpu = page_indices_for_request(self, req, seq_len)
             state_indices = state_indices_for_request(self, req, seq_len)
+            if corrupt_prob > 0 and random.random() < corrupt_prob:
+                if corrupt_one_kv_row_for_test(self, page_indices_gpu):
+                    logger.warning(
+                        "SGLANG_TEST_DISAGG_KV_CORRUPT_PROB: clobbered a KV row "
+                        "of request %s to exercise the checksum",
+                        req.rid,
+                    )
             actual = computer.compute(page_indices_gpu, state_indices)
             if actual == expected:
-                verified.append(req)
                 continue
-            msg = (
+            mismatched[i] = 1
+            messages[i] = (
                 f"KV checksum mismatch req={req.rid} "
                 f"bootstrap_room={req.bootstrap_room} "
                 f"expected={expected:#x} got={actual:#x}"
+            )
+
+        # Corruption is per-rank, so a rank-local drop would leave peers with a
+        # different waiting queue and hang the next collective. Agree first --
+        # the same reason `poll_and_all_reduce` reduces the polls it commits on.
+        mismatched = self._all_reduce_kv_checksum_mismatches(mismatched)
+        if not any(mismatched):
+            return self._get_new_prebuilt_batch(running_batch)
+
+        verified: List[Req] = []
+        for i, req in enumerate(queue):
+            if not mismatched[i]:
+                verified.append(req)
+                continue
+            msg = messages.get(
+                i,
+                f"KV checksum mismatch on a peer rank: req={req.rid} "
+                f"bootstrap_room={req.bootstrap_room}",
             )
             logger.error(msg)
             self._handle_kv_checksum_mismatch(req, msg)
@@ -2743,12 +2821,24 @@ class SchedulerDisaggregationDecodeMixin:
 
         return self._get_new_prebuilt_batch(running_batch)
 
+    def _all_reduce_kv_checksum_mismatches(self, mismatched: List[int]) -> List[int]:
+        """MAX-reduce the drop set so every rank drops the same requests."""
+        group = getattr(self, "attn_tp_cpu_group", None)
+        if group is None or not mismatched or dist.get_world_size(group) == 1:
+            return mismatched
+        flags = torch.tensor(mismatched, dtype=torch.uint8, device="cpu")
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+        return flags.tolist()
+
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
         # so the cause is hardware or transport rather than the request. Serving
         # keeps going and drops just this request; CI fails instead, because a
         # single aborted request is easy to miss in a passing run.
-        if is_in_ci():
+        # ...unless the injector caused it: CI runners export SGLANG_IS_IN_CI
+        # to the engines, so raising would kill the scheduler the injection
+        # test asserts stays up.
+        if is_in_ci() and envs.SGLANG_TEST_DISAGG_KV_CORRUPT_PROB.get() == 0.0:
             raise RuntimeError(msg)
         prepare_abort(
             req,

@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    aux_buffer_pair_count,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -207,6 +208,9 @@ class KVArgsRegisterInfo:
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    # Peers that registered a different number of aux buffers are
+    # reported once, not once per transfer.
+    _logged_aux_count_mismatch: set = set()
     AUX_DATA_HEADER = b"AUX_DATA"
 
     def __init__(
@@ -1260,7 +1264,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+        num_bufs = aux_buffer_pair_count(
+            len(prefill_aux_ptrs),
+            len(dst_aux_ptrs),
+            self._logged_aux_count_mismatch,
+            "mooncake send_aux",
+        )
+        for i in range(num_bufs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
@@ -1277,7 +1287,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        for i in range(len(prefill_aux_ptrs)):
+        num_bufs = aux_buffer_pair_count(
+            len(prefill_aux_ptrs),
+            len(dst_aux_ptrs),
+            self._logged_aux_count_mismatch,
+            "mooncake send_aux_tcp",
+        )
+        for i in range(num_bufs):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
