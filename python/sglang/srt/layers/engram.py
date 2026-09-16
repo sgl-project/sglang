@@ -281,6 +281,17 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if mode.is_idle():
+            # DP-attention MLP-sync dummy batch (padded idle). Its output is
+            # discarded and it must NOT mutate engram history. Under CUDA graph
+            # this is folded into the decode graph (ForwardMode.is_cuda_graph()
+            # includes IDLE); only the eager path (disable_cuda_graph) reaches
+            # here with a padded idle batch, so return throwaway zero hashes.
+            return torch.zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device

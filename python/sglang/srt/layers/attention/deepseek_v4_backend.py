@@ -2840,6 +2840,27 @@ class DeepseekV4AttnBackend(
             )
             return
         meta = self.forward_metadata
+        # The per-DP batch width is padded up to attn_tp_size before the forward
+        # (prepare_mlp_sync_batch), so an eager `positions` can carry trailing
+        # pad rows while `extend_seq_lens` only covers the live tokens. The
+        # compressor/indexer rebuild per-token request ids from those lengths
+        # (`repeat_interleave(..., output_size=positions.shape[0])`), which needs
+        # the two to agree, so run them over the live prefix and let the
+        # existing pad masks drop the remaining rows.
+        in_prefill_graph = self._low_ratio_in_prefill_graph()
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not in_prefill_graph
+            and getattr(meta, "late_layer_tail", None) is None
+            and forward_batch.extend_seq_lens_cpu is not None
+            and x.shape[0] == positions.shape[0]
+        ):
+            live_tokens = sum(int(n) for n in forward_batch.extend_seq_lens_cpu)
+            if 0 <= live_tokens < positions.shape[0]:
+                x = x[:live_tokens]
+                if q_lora is not None:
+                    q_lora = q_lora[:live_tokens]
+                positions = positions[:live_tokens]
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
         if (
@@ -2854,10 +2875,7 @@ class DeepseekV4AttnBackend(
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             # Every consumer takes int32 or int64 positions; keep the caller's.
             pos = positions
-        if (
-            forward_batch.forward_mode.is_extend()
-            and self._low_ratio_in_prefill_graph()
-        ):
+        if forward_batch.forward_mode.is_extend() and in_prefill_graph:
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
             _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
             if run_compressor and layer.compressor is not None:
