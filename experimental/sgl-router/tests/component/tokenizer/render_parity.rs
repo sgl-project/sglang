@@ -11,7 +11,7 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::ModelId;
 use sgl_router::policies::request_tokens_for;
-use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter, TokenizerRegistry};
 use std::path::PathBuf;
 
 #[derive(Deserialize)]
@@ -25,6 +25,31 @@ struct Case {
     shape: String,
     request: serde_json::Value,
     expected_token_ids: Vec<u32>,
+}
+
+/// String-to-array conversion is a known parity gap, so these templates must
+/// remain excluded from forwarding. This fixture needs no cached model files.
+#[test]
+fn array_only_template_content_parity() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../fixtures/array_content_rendering.json")).unwrap();
+    let formatter = ChatFormatter::from_tokenizer_config(
+        serde_json::json!({"chat_template": fixture["chat_template"]}),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let tokenizer = adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        let request =
+            serde_json::json!({"messages": [{"role": "user", "content": case["content"]}]});
+        let ids = formatter.encode(&tokenizer, &request).unwrap();
+        assert_eq!(
+            serde_json::json!(ids) == case["engine_token_ids"],
+            case["content"].is_array(),
+            "{case}"
+        );
+    }
 }
 
 fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
@@ -48,11 +73,13 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: model_id.into(),
             tokenizer_path: tokenizer_path.to_str().unwrap().into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -62,6 +89,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             sticky: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

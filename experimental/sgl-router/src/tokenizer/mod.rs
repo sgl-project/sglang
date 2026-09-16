@@ -75,6 +75,23 @@ impl TokenizerRegistry {
             Err(e) => tracing::warn!(model = %m.id, error = %format!("{e:#}"),
                 "failed to load chat formatter; chat traffic routes via raw prompt text"),
         }
+        if m.disable_input_ids_forwarding {
+            tracing::info!(model = %m.id,
+                "router-generated input_ids forwarding disabled; workers tokenize messages; \
+                 routing tokenization remains available");
+        } else if me.has_chat_formatter(&m.id) && !me.can_forward_chat(&m.id) {
+            tracing::info!(model = %m.id,
+                "input_ids forwarding withheld: template did not pass the string-content probe; \
+                 chat rendering remains available for routing");
+        } else if me.can_forward_chat(&m.id) {
+            tracing::warn!(model = %m.id,
+                "router-generated input_ids forwarding enabled: requires matching worker model \
+                 files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
+                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
+                 (including --tool-call-parser deepseekv32), content-format detection, and \
+                 conversation-template stop strings are not replicated. Use \
+                 --disable-input-ids-forwarding when these assumptions do not hold");
+        }
         Ok(me)
     }
 
@@ -86,6 +103,13 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
         self.formatters.contains_key(model_id)
+    }
+
+    /// Request and deployment guards still apply after this template-level check.
+    pub fn can_forward_chat(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|entry| entry.formatter.supports_string_content())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
@@ -149,11 +173,13 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,
@@ -163,6 +189,7 @@ mod tests {
                 affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
