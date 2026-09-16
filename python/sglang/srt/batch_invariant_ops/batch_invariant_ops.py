@@ -939,6 +939,115 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    input_ptr,
+    residual_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_out_ptr,
+    input_row_stride: tl.constexpr,
+    residual_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    residual_out_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Add the residual, RMS-normalize the sum, and emit both results.
+
+    One program per row, as in `_rms_norm_kernel`: the reduction never spans rows and
+    its order is fixed by BLOCK_SIZE alone, so a row's output cannot depend on how
+    many rows share the batch.
+
+    The sum is rounded to the input dtype before it is squared. That is not an
+    accident of the port -- the unfused path adds in the original dtype and re-reads
+    the stored result, so keeping the rounding here is what makes the two agree.
+
+    Both passes recompute the sum from `input` and `residual` rather than reading back
+    what the first pass stored, which keeps the kernel free of any assumption about
+    ordering between a store and a later load of the same address.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    in_row = input_ptr + row_idx * input_row_stride
+    res_row = residual_ptr + row_idx * residual_row_stride
+    out_row = output_ptr + row_idx * output_row_stride
+    res_out_row = residual_out_ptr + row_idx * residual_out_row_stride
+
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        x = tl.load(in_row + col_idx, mask=mask, other=0.0)
+        r = tl.load(res_row + col_idx, mask=mask, other=0.0)
+        total = (x + r).to(x.dtype)
+        total_f32 = total.to(tl.float32)
+        sum_sq += tl.sum(tl.where(mask, total_f32 * total_f32, 0.0))
+
+    inv_rms = 1.0 / tl.sqrt(sum_sq / n_cols + eps)
+
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        x = tl.load(in_row + col_idx, mask=mask, other=0.0)
+        r = tl.load(res_row + col_idx, mask=mask, other=0.0)
+        total = (x + r).to(x.dtype)
+        tl.store(res_out_row + col_idx, total, mask=mask)
+
+        weight = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+        out_f32 = total.to(tl.float32) * inv_rms * weight.to(tl.float32)
+        tl.store(out_row + col_idx, out_f32.to(total.dtype), mask=mask)
+
+
+def fused_add_rms_norm_batch_invariant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batch-invariant `x, residual = rms_norm(x + residual), x + residual`.
+
+    Without this, deterministic mode sends every residual RMSNorm to the unfused
+    PyTorch path, which spends ten pointwise kernels per call where one would do --
+    on Qwen3-0.6B at batch 1 that path costs more than every GEMM in the step.
+
+    A new residual tensor is returned rather than updating the argument in place,
+    matching what the fused vendor path does.
+    """
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+    assert residual.shape == input.shape, (
+        f"Residual shape ({residual.shape}) must match input shape ({input.shape})"
+    )
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    residual_2d = residual.reshape(-1, residual.shape[-1]).contiguous()
+    weight = weight.contiguous()
+
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d)
+    residual_out = torch.empty_like(residual_2d)
+    _fused_add_rms_norm_kernel[(n_rows,)](
+        input_2d,
+        residual_2d,
+        weight,
+        output,
+        residual_out,
+        input_2d.stride(0),
+        residual_2d.stride(0),
+        output.stride(0),
+        residual_out.stride(0),
+        n_cols,
+        eps,
+        BLOCK_SIZE=1024,
+    )
+    return output.reshape(original_shape), residual_out.reshape(original_shape)
+
+
 _ONES_CACHE: dict[Tuple, torch.Tensor] = {}
 
 

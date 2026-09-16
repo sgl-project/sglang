@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
+    fused_add_rms_norm_batch_invariant,
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
@@ -671,6 +672,23 @@ class RMSNorm(BaseFusedOp):
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
+            # Same fusion as the HIP path: a residual RMSNorm otherwise falls all the
+            # way back to the unfused native implementation. The guards that change the
+            # arithmetic rather than just fusing it keep their fallback.
+            if residual is not None and not (
+                self.cast_x_before_out_mul
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+                or self.variance_size_override is not None
+                or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
+            ):
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return fused_add_rms_norm_batch_invariant(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
@@ -767,12 +785,25 @@ class RMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
+            # These three change the arithmetic rather than just fusing it, so they
+            # stay on the unfused path: cast_x_before_out_mul rounds x before the
+            # weight multiply, the fsdp target carries the RL alignment contract, and
+            # variance_size_override normalizes over a prefix of the row.
             if (
-                residual is not None
-                or self.cast_x_before_out_mul
+                self.cast_x_before_out_mul
                 or get_exec().deterministic.rl_on_policy_target == "fsdp"
+                or self.variance_size_override is not None
             ):
                 return self.forward_native(x, residual, post_residual_addition)
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return fused_add_rms_norm_batch_invariant(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                )
             return rms_norm_batch_invariant(
                 x,
                 self.weight.data,
