@@ -336,10 +336,7 @@ constexpr uint32_t kMaxCluster16BatchSize = SGL_TOPK_V2_MAX_C16_OCC1;
 constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
-/**
- * \brief Persistent cluster kernel for the long items. It will handle long inputs.
- * The short items are handled by the separate topk_kernel.
- */
+/// Persistent cluster kernel for the items the plan routed to the pool; topk_main_kernel handles the rest.
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
