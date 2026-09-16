@@ -22,11 +22,9 @@ uint32_t get_max_active_clusters(uint32_t cluster_size, uint32_t num_waves) {
   CHECK_CUDA(cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
   CHECK_CUDA(cudaDeviceGetAttribute(&smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
-  // Threads alone cannot pin the probe to `num_waves` blocks per SM: a block
-  // caps at 1024, so num_waves == 1 still leaves room for a second block. Spend
-  // the shared budget instead -- what one block gets at this occupancy, less the
-  // per-block driver reserve, floored to the 1 KiB allocation granularity so the
-  // driver cannot round it back up and squeeze out a block.
+  // A block caps at 1024 threads, so threads alone cannot pin `num_waves` blocks
+  // per SM; spend the shared budget instead, less the per-block driver reserve,
+  // floored to the 1 KiB granularity so the driver cannot round it back up.
   const auto reserved = static_cast<uint32_t>(smem_per_sm - smem_per_block);
   const auto budget = static_cast<uint32_t>(smem_per_sm) / num_waves;
   const auto smem = (std::min(budget - std::min(budget, reserved), static_cast<uint32_t>(smem_per_block))) & ~1023u;

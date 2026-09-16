@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import _jit_topk_v2_module
+from sglang.kernels.ops.attention.dsv4.topk import topk_v2_plan_is_written
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
@@ -102,11 +102,7 @@ def assert_metadata_equal(test, actual, expected):
     for name, value in actual_buffers.items():
         reference = expected_buffers[name]
         if name == "topk_v2_plan":
-            # Small-batch and non-cluster paths leave the entire plan unwritten.
-            # Probe the planner instead of duplicating its device-specific limits.
-            probe = torch.full_like(reference, -1)
-            _jit_topk_v2_module().topk_plan(expected.dsa_seqlens_expanded, probe, -1)
-            if probe[0, 1].item() == -1:
+            if not topk_v2_plan_is_written(expected.dsa_seqlens_expanded):
                 continue
             # Unused plan rows are intentionally uninitialized. Active rows are
             # compacted by atomicAdd, so compare them in request order.
