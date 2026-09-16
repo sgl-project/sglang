@@ -13,13 +13,15 @@ boundaries are exercised:
   trivial       seq <= k
   Register2     k < seq <= 8192        max_seq <= 8192          (level 0)
   Register4     8192 < seq <= 16384    max_seq <= 16384         (level 1)
-  Streaming     16384 < seq <= floor   max_seq > 16384, non-cluster (level 2)
-  Cluster       seq > floor(=65536)    max_seq > floor and batch <= 128
+  Streaming     seq > 16384            max_seq > 16384, below the cluster floor (level 2)
+  Cluster       seq above the floor    the arch has clusters and batch <= 512
 
-and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
-the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
-(8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
-included explicitly, across k in {512,1024,2048} and identity/perm page tables.
+and two cluster dispatch shapes: the fused small-batch kernel (batch up to the
+probed persistent-pool size) and the persistent pool + main kernel above it. The
+cluster floor and pool size are per-arch (see topk_v2.cuh), so the (batch, seq)
+grid below brackets the fixed boundaries (8192/8193, 16384/16385) exactly and
+spans the arch-dependent ones, across k in {512,1024,2048} and identity/perm
+page tables.
 """
 
 from __future__ import annotations
@@ -43,7 +45,6 @@ PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
-FLOOR = 65536  # kClusterFloor
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -60,22 +61,22 @@ FIXED_CONFIGS = [
     (64, 16384),  # reg4 upper boundary
     (256, 16384),  # batch > 128
     # --- Streaming (level 2: max_seq > 16384, non-cluster) ---
-    (8, 16385),  # just over reg4 (small batch, seq < floor => non-cluster)
+    (8, 16385),  # just over reg4
     (4, 32768),
-    (16, 65535),  # just under floor
-    (4, 65536),  # at floor (seq == floor => non-cluster)
+    (16, 65535),
+    (4, 65536),
     (100, 65536),
-    # --- Cluster, fused small-batch kernel (batch <= 30, max_seq > floor) ---
-    (1, 65537),  # single row just over floor
+    # --- long rows, small batch: fused cluster kernel where the arch has clusters ---
+    (1, 65537),
     (2, 131072),
     (8, 98304),
-    (30, 131072),  # batch == pool boundary
-    # --- Cluster, persistent pool + main kernel (30 < batch <= 128) ---
-    (31, 131072),  # just over small-batch
-    (40, 262144),  # N > pool of 30 => round-robin
+    (30, 131072),
+    # --- long rows, mid batch: persistent cluster pool + main kernel ---
+    (31, 131072),
+    (40, 262144),  # more items than the pool => round-robin
     (64, 196608),
-    (128, 131072),  # cluster batch upper boundary
-    # --- batch > 128 => non-cluster streaming even at long ctx ---
+    (128, 131072),
+    # --- long rows, large batch ---
     (129, 131072),
     (200, 262144),
 ]
@@ -238,7 +239,7 @@ def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> Non
     device = "cuda"
     seq = 262144
     scores = torch.randn(batch, seq, dtype=torch.float32, device=device)
-    # span every path; guarantee at least one > floor row so cluster dispatch fires
+    # span every path, including rows long enough for the cluster dispatch
     buckets = [max(1, k // 2), k, 4096, 12000, 40000, 65536, 98304, 262144]
     g = torch.Generator(device="cpu").manual_seed(batch + k)
     lengths = torch.tensor(
