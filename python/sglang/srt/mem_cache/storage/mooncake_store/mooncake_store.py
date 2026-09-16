@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    format_kv_cache_dtype,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -28,6 +29,8 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
+# setup(..., tenant_id=...) first shipped in mooncake-transfer-engine 0.3.12.
+MOONCAKE_MIN_VERSION_FOR_TENANT_ID = "0.3.12"
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,33 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         return tensor.view(dims)
 
 
+def _normalize_tenant_id(value) -> str:
+    if value is None:
+        return DEFAULT_TENANT_ID
+    tenant_id = str(value).strip()
+    return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
+def _compose_tenant_id(tenant_id: str, kv_cache_dtype: Optional[str]) -> str:
+    tenant_id = _normalize_tenant_id(tenant_id)
+    dtype = format_kv_cache_dtype(kv_cache_dtype)
+    if dtype is None:
+        return tenant_id
+    prefix = "" if tenant_id == DEFAULT_TENANT_ID else f"{tenant_id}_"
+    return f"{prefix}dtype_{dtype}"
+
+
+def _tenant_id_unsupported_message() -> str:
+    return (
+        "The installed Mooncake version does not support tenant_id in "
+        "MooncakeDistributedStore.setup(). SGLang uses tenant_id to isolate "
+        "KV-cache dtypes and requires "
+        f"mooncake-transfer-engine>={MOONCAKE_MIN_VERSION_FOR_TENANT_ID}. "
+        "Upgrade with: pip install -U "
+        f"'mooncake-transfer-engine>={MOONCAKE_MIN_VERSION_FOR_TENANT_ID}'"
+    )
+
+
 def _parse_global_segment_size(value) -> int:
     if isinstance(value, int):
         return value
@@ -79,15 +109,8 @@ def _parse_global_segment_size(value) -> int:
                     "Invalid global_segment_size: missing number before 'gb'"
                 )
             return int(num) * 1024 * 1024 * 1024
-        return int(s)
+            return int(s)
     return int(value)
-
-
-def _normalize_tenant_id(value) -> str:
-    if value is None:
-        return DEFAULT_TENANT_ID
-    tenant_id = str(value).strip()
-    return tenant_id if tenant_id else DEFAULT_TENANT_ID
 
 
 @dataclass
@@ -291,6 +314,34 @@ class MooncakeBaseStore:
                 supports_group_ids = False
         return ReplicateConfig, supports_group_ids
 
+    def _tenant_setup_kwargs(self) -> dict:
+        if self.config is not None and self.config.tenant_id != DEFAULT_TENANT_ID:
+            return {"tenant_id": self.config.tenant_id}
+        return {}
+
+    def _call_store_setup(self, *args, **kwargs):
+        setup_kwargs = dict(kwargs)
+        setup_kwargs.update(self._tenant_setup_kwargs())
+        while True:
+            try:
+                return self.store.setup(*args, **setup_kwargs)
+            except TypeError as e:
+                unsupported_kwargs = [
+                    key for key in list(setup_kwargs) if key in str(e)
+                ]
+                if not unsupported_kwargs:
+                    raise
+                if "tenant_id" in unsupported_kwargs:
+                    raise RuntimeError(_tenant_id_unsupported_message()) from e
+                logger.warning(
+                    "The installed Mooncake version does not support the "
+                    f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
+                    f"Retrying without {', '.join(unsupported_kwargs)}. "
+                    "Please upgrade Mooncake to enable SSD offload support."
+                )
+                for key in unsupported_kwargs:
+                    setup_kwargs.pop(key, None)
+
     def _load_config(self, storage_config: Any = None):
         extra_config = (
             getattr(storage_config, "extra_config", None) if storage_config else None
@@ -419,8 +470,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config.global_segment_size // rank_scale_factor
             )
 
-            # Use the backend tag and model name as a prefix to isolate tenants
-            # and models sharing one store.
+            self.config.tenant_id = _compose_tenant_id(
+                self.config.tenant_id,
+                (
+                    getattr(storage_config, "kv_cache_dtype", None)
+                    if storage_config is not None
+                    else None
+                ),
+            )
+
+            # Use the backend tag and model name as a prefix to isolate
+            # deployments and models sharing one store. Dtype isolation uses
+            # tenant_id instead of this prefix.
             self.config_prefix = None
             config_prefix_parts = []
             if extra_config and extra_config.get("extra_backend_tag") is not None:
@@ -431,6 +492,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
+            if self.config.tenant_id != DEFAULT_TENANT_ID:
+                logger.info(
+                    "Using Mooncake tenant_id=%s "
+                    "(requires mooncake-transfer-engine>=%s)",
+                    self.config.tenant_id,
+                    MOONCAKE_MIN_VERSION_FOR_TENANT_ID,
+                )
 
             # Check server status
             if self.config.check_server:
@@ -462,6 +530,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
+                if self.config.tenant_id != DEFAULT_TENANT_ID:
+                    logger.warning(
+                        "Mooncake dummy/standalone setup does not pass tenant_id. "
+                        "Start mooncake_client with --tenant_id=%s.",
+                        self.config.tenant_id,
+                    )
                 ret_code = self.store.setup_dummy(
                     required_bytes,
                     DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
@@ -505,44 +579,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
                     setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
-                if self.config.tenant_id != DEFAULT_TENANT_ID:
-                    setup_kwargs["tenant_id"] = self.config.tenant_id
 
-                while True:
-                    try:
-                        ret_code = self.store.setup(
-                            client_hostname,
-                            self.config.metadata_server,
-                            per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                            self.config.protocol,
-                            device_name,
-                            self.config.master_server_address,
-                            transfer_engine,
-                            **setup_kwargs,
-                        )
-                        break
-                    except TypeError as e:
-                        unsupported_kwargs = [
-                            key for key in list(setup_kwargs) if key in str(e)
-                        ]
-                        if not unsupported_kwargs:
-                            raise
-                        if "tenant_id" in unsupported_kwargs:
-                            raise RuntimeError(
-                                "The installed Mooncake version does not support "
-                                "tenant_id in MooncakeDistributedStore.setup(). "
-                                "Please upgrade Mooncake to use non-default "
-                                "Mooncake tenants with SGLang."
-                            ) from e
-                        logger.warning(
-                            "The installed Mooncake version does not support the "
-                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
-                            f"Retrying without {', '.join(unsupported_kwargs)}. "
-                            "Please upgrade Mooncake to enable SSD offload support."
-                        )
-                        for key in unsupported_kwargs:
-                            setup_kwargs.pop(key, None)
+                ret_code = self._call_store_setup(
+                    client_hostname,
+                    self.config.metadata_server,
+                    per_rank_global_segment_size,
+                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                    transfer_engine,
+                    **setup_kwargs,
+                )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
