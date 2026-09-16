@@ -98,14 +98,11 @@ def _make_deferred_finalize_output(
 ) -> FlashInferTrtllmDeferredFinalizeOutput:
     """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-    # Some FlashInfer versions size this buffer from routing_logits dtype while
-    # writing BF16 weights into it. Reinterpret only the live BF16 prefix.
-    if expert_weights.dtype == torch.float32:
-        n, k = expert_weights.shape
-        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-    if expert_weights.dtype != torch.bfloat16:
+    # FlashInfer >= 0.6.18 types this buffer by content (flashinfer #3595):
+    # bf16 for packed routing, the caller's dtype for unpacked routing.
+    if expert_weights.dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(
-            "FlashInfer deferred finalize must return BF16 expert weights, got "
+            "FlashInfer deferred finalize must return BF16 or FP32 expert weights, got "
             f"{expert_weights.dtype}"
         )
     if gemm2_out.dtype != torch.bfloat16:
@@ -133,6 +130,8 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -721,13 +720,16 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
-    dispatch_output: StandardDispatchOutput,
+    dispatch_output: StandardDispatchOutput | FlashinferDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     use_routed_topk: bool = False,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import Fp8QuantizationType
 
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -740,6 +742,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     assert not runner_config.no_combine, "no_combine is not supported for flashinfer."
 
     hidden_states = dispatch_output.hidden_states
+    output_dtype = (
+        dispatch_output.output_dtype
+        if isinstance(dispatch_output, FlashinferDispatchOutput)
+        else hidden_states.dtype
+    )
     topk_output = dispatch_output.topk_output
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
@@ -775,14 +782,26 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         if quant_info.use_mxfp8:
             assert quant_info.weight_block_k == 32
-            from sglang.srt.layers.quantization.fp8_utils import (
-                flashinfer_mxfp8_quantize,
-            )
+            if dispatch_output.hidden_states_scale is not None:
+                a_q = hidden_states
+                a_sf_t = dispatch_output.hidden_states_scale
+                a_sf_t = a_sf_t.reshape(hidden_states.shape[0], -1).contiguous()
+            else:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    flashinfer_mxfp8_quantize,
+                )
 
-            a_q, a_sf = flashinfer_mxfp8_quantize(hidden_states, False)
-            # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
-            # [num_tokens, hidden_size // 32] (no transpose).
-            a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
+                a_q, a_sf = flashinfer_mxfp8_quantize(hidden_states, False)
+                # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
+                # [num_tokens, hidden_size // 32] (no transpose).
+                a_sf_t = (
+                    a_sf.view(torch.uint8)
+                    .reshape(hidden_states.shape[0], -1)
+                    .contiguous()
+                )
+            assert a_q.dtype == torch.float8_e4m3fn
+            assert a_sf_t.dtype == torch.uint8
+            assert a_sf_t.shape[1] == hidden_states.shape[1] // 32
         else:
             a_q, a_sf = per_token_group_quant_fp8(
                 hidden_states, quant_info.weight_block_k, column_major_scales=True
@@ -799,7 +818,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 symm_output = torch.empty(
                     hidden_states.shape[0],
                     hidden_states.shape[1],
-                    dtype=hidden_states.dtype,
+                    dtype=output_dtype,
                     device=hidden_states.device,
                 )
 
@@ -1688,16 +1707,27 @@ def fused_experts_flashinfer_to_flashinfer_trtllm(
             use_routed_topk=True,
         )
     elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
-        if dispatch_output.hidden_states.dtype != torch.bfloat16:
-            raise TypeError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
-                f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
-            )
-        if dispatch_output.hidden_states_scale is not None:
-            raise ValueError(
-                "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
-                "the BF16 dispatch payload must not carry activation scales."
-            )
+        mxfp8_dispatch = (
+            quant_info.use_mxfp8
+            and dispatch_output.hidden_states.dtype == torch.float8_e4m3fn
+        )
+        if mxfp8_dispatch:
+            if dispatch_output.hidden_states_scale is None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen MXFP8 MoE requires activation "
+                    "scales alongside the FP8 dispatch payload."
+                )
+        else:
+            if dispatch_output.hidden_states.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE requires a BF16 "
+                    f"dispatch payload, got {dispatch_output.hidden_states.dtype}."
+                )
+            if dispatch_output.hidden_states_scale is not None:
+                raise ValueError(
+                    "FlashInfer A2A + TRT-LLM Gen FP8 MoE quantizes locally; "
+                    "the BF16 dispatch payload must not carry activation scales."
+                )
         result = fused_experts_none_to_flashinfer_trtllm_fp8(
             dispatch_output,
             quant_info,

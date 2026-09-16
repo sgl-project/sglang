@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use sglang_radix_tree::{
-    BackupKV, CacheAction, CacheInitParams, FULL, InsertParams, InsertResult, KeyNamespaceRef,
-    MAMBA, MatchPrefixParams, PageValue, RadixValue, TreeCoreRuntimeError, UnifiedTreeCore,
+    BackupKV, CacheAction, CacheInitParams, ComponentSet, DecLockRefParams, FULL, IncLockRefResult,
+    InsertParams, InsertResult, KeyNamespaceRef, MAMBA, MatchPrefixParams, PageValue, RadixValue,
+    TreeCoreRuntimeError, UnifiedTreeCore,
 };
 
 type TestCore = UnifiedTreeCore<Vec<i64>, PageValue<u32>>;
@@ -21,6 +22,8 @@ fn insert(core: &mut TestCore, key: &[i64], values: &[u32]) -> InsertResult<Page
     core.insert(&InsertParams {
         key: &key.to_vec(),
         namespace: KeyNamespaceRef::default(),
+        session_id: None,
+        swa_branching_seqlen: None,
         value: PageValue::from_vec(values.to_vec()),
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
@@ -29,6 +32,16 @@ fn insert(core: &mut TestCore, key: &[i64], values: &[u32]) -> InsertResult<Page
         priority: 0,
         track_adopted_ranges: false,
     })
+}
+
+/// Replay an acquire's receipt on release, as the cache controller does.
+fn release_params(receipt: &IncLockRefResult) -> DecLockRefParams {
+    DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    }
 }
 
 #[test]
@@ -54,7 +67,8 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         namespace: KeyNamespaceRef::default(),
     });
     assert_eq!(prefix.device_indices.as_slice(), &[1, 2]);
-    tree.inc_lock_ref(prefix.last_device_node_id)
+    let prefix_lock = tree
+        .inc_lock_ref(prefix.last_device_node_id, ComponentSet::EMPTY)
         .expect("live node");
     assert_eq!(tree.protected_size(), 2);
 
@@ -64,6 +78,8 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         &InsertParams {
             key: &partial_key,
             namespace: KeyNamespaceRef::default(),
+            session_id: None,
+            swa_branching_seqlen: None,
             value: PageValue::from_vec(vec![5, 6]),
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
@@ -86,11 +102,17 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
     assert_eq!(canonical_suffix.as_slice(), &[5, 6]);
 
     let inserted_node = result.last_device_node_id.expect("inserted node");
-    tree.inc_lock_ref(inserted_node).expect("live node");
-    tree.dec_lock_ref(prefix.last_device_node_id, None, false)
+    let inserted_lock = tree
+        .inc_lock_ref(inserted_node, ComponentSet::EMPTY)
         .expect("live node");
+    tree.dec_lock_ref(
+        prefix.last_device_node_id,
+        &release_params(&prefix_lock),
+        false,
+    )
+    .expect("live node");
     assert_eq!(tree.protected_size(), 4);
-    tree.dec_lock_ref(inserted_node, None, false)
+    tree.dec_lock_ref(inserted_node, &release_params(&inserted_lock), false)
         .expect("live node");
     assert_eq!(tree.protected_size(), 0);
     // The original [30, 40] branch plus the new branch remain cacheable.
@@ -142,6 +164,8 @@ fn continuation_insert_rejects_a_host_only_anchor() {
             &InsertParams {
                 key: &key,
                 namespace: KeyNamespaceRef::default(),
+                session_id: None,
+                swa_branching_seqlen: None,
                 value: PageValue::from_vec(vec![5, 6]),
                 prev_prefix_len: 2,
                 swa_evicted_seqlen: 0,
@@ -174,6 +198,8 @@ fn full_kv_prefix_len_is_the_full_hit_not_the_admitted_prefix_on_mamba_trees() {
     tree.insert(&InsertParams {
         key: &key,
         namespace: KeyNamespaceRef::default(),
+        session_id: None,
+        swa_branching_seqlen: None,
         value: PageValue::from_vec(vec![1, 2, 3, 4]),
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
@@ -209,6 +235,8 @@ fn continuation(
         &InsertParams {
             key: &key.to_vec(),
             namespace: KeyNamespaceRef::default(),
+            session_id: None,
+            swa_branching_seqlen: None,
             value: PageValue::from_vec(values.to_vec()),
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
@@ -277,6 +305,8 @@ fn empty_insert_leaves_the_donated_mamba_slot_with_the_caller() {
     let result = tree.insert(&InsertParams {
         key: &key,
         namespace: KeyNamespaceRef::default(),
+        session_id: None,
+        swa_branching_seqlen: None,
         value: PageValue::from_vec(vec![1]),
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
@@ -332,6 +362,8 @@ fn inserted_values_do_not_retain_the_caller_buffer() {
         &InsertParams {
             key: &extended_key,
             namespace: KeyNamespaceRef::default(),
+            session_id: None,
+            swa_branching_seqlen: None,
             value: extended_value,
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,

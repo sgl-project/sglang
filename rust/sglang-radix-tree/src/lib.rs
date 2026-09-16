@@ -28,7 +28,7 @@ mod unified_lru_list;
 mod unified_tree_core;
 mod value;
 
-pub use components::{ComponentType, FULL, MAMBA, SWA};
+pub use components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 pub use node::{
     ChildKeyType, KeyNamespace, KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError,
 };
