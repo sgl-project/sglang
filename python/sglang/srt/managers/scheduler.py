@@ -4448,6 +4448,13 @@ class Scheduler(
                                 is_verify=True,
                             )
                         batch_result.can_run_cuda_graph = can_run_cuda_graph
+                        # The isolation above restores batch.out_cache_loc, but
+                        # this stage still has to compact its own accepted-path
+                        # KV once the last stage relays which nodes it kept, so
+                        # the verify slots have to outlive the forward.
+                        batch_result.spec_verify_out_cache_loc = (
+                            verify_forward_batch.out_cache_loc
+                        )
                     else:
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors

@@ -61,6 +61,7 @@ class PPBatchMetadata:
     # result arrives, so relayed tensors must be applied against the
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
+    verify_out_cache_loc: Optional[torch.Tensor] = None
 
 
 class SchedulerPPMixin:
@@ -811,6 +812,13 @@ class SchedulerPPMixin:
             tensor_dict["spec_accept_lens"] = result.accept_lens
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
+            if (
+                result.accept_index is not None
+                and get_spec().speculative_eagle_topk > 1
+            ):
+                # Only a tree needs it: a chain's accepted path is already the
+                # front of each block, so compacting it is an identity.
+                tensor_dict["spec_accept_index"] = result.accept_index
             if result.next_verify_chain is not None:
                 # Tail-drafted tree for the next verify round (root = bonus),
                 # with the topology its tokens were arranged by.
@@ -989,6 +997,14 @@ class SchedulerPPMixin:
             new_seq_lens = pp_outputs["spec_new_seq_lens"]
             fwd_rids = [req.rid for req in fwd_batch.reqs]
             live_rids = [req.rid for req in batch.reqs]
+            self._pp_spec_compact_accept_kv(
+                batch,
+                fwd_batch,
+                fwd_rids,
+                live_rids,
+                mb_metadata.verify_out_cache_loc,
+                pp_outputs,
+            )
             if live_rids == fwd_rids:
                 batch.seq_lens = new_seq_lens
                 if batch.seq_lens_cpu is not None:
@@ -1105,6 +1121,57 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+
+    def _pp_spec_compact_accept_kv(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        fwd_batch: ScheduleBatch,
+        fwd_rids: List[str],
+        live_rids: List[str],
+        verify_out_cache_loc: Optional[torch.Tensor],
+        pp_outputs,
+    ) -> None:
+        """Move this stage's accepted-path KV to the front of each request block.
+
+        The verify forward writes one KV slot per tree node, in node order. The
+        committed prefix that every later read assumes is the accepted path laid
+        out contiguously, so the two have to be reconciled once per round -- and
+        each stage has to do it for its own layers, since KV is not relayed.
+        The last stage does it inside verify (_finalize_accept_tree_path); this
+        is the same step for the stages that only ran the target forward.
+
+        Must run before seq_lens advances: the move writes into the block that
+        starts at the pre-advance length.
+        """
+        accept_index = pp_outputs.tensors.get("spec_accept_index")
+        if accept_index is None or fwd_batch.forward_mode.is_idle():
+            return
+        if verify_out_cache_loc is None:
+            return
+        from sglang.srt.speculative.spec_utils import (
+            move_accept_tokens_to_target_kvcache,
+        )
+
+        # The destination base is the length each request had when the forward
+        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
+        # that snapshot is already in the forward's row order -- the live batch
+        # may have been filtered or merged since, and reindexing it would skip
+        # exactly the rounds whose composition changed.
+        device = verify_out_cache_loc.device
+        if fwd_batch.seq_lens_cpu is not None:
+            seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
+        elif live_rids == fwd_rids:
+            seq_lens = batch.seq_lens
+        else:
+            return
+        fwd_batch.seq_lens = seq_lens
+        fwd_batch.out_cache_loc = verify_out_cache_loc
+        move_accept_tokens_to_target_kvcache(
+            fwd_batch,
+            accept_index.to(device),
+            pp_outputs["spec_accept_lens"].to(device) - 1,
+            self.token_to_kv_pool_allocator,
+        )
 
     def _pp_spec_adopt_relayed_tree(
         self: Scheduler,
@@ -1563,6 +1630,7 @@ class SchedulerPPMixin:
                         if not cur_batch.spec_algorithm.is_none()
                         else None
                     ),
+                    verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
