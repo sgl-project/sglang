@@ -1459,9 +1459,6 @@ impl HashTree {
     /// MUST run on the single writer (the KV-event pump), like every other
     /// mutator. That is also what makes the chunked locking below safe: no
     /// other writer can prune a parent recorded by an earlier chunk.
-    // The in-module tests are the only caller until the bootstrap consumer
-    // lands; `pub(super)` is the provenance boundary, not an oversight.
-    #[allow(dead_code)]
     pub(super) fn restore_snapshot(
         &self,
         worker_table: &[KvWorkerId],
