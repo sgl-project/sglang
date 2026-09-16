@@ -54,6 +54,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.dtype = dtype
         self.device = device
         self._kvcache = kvcache
+        # Optional independent draft storage sharing this allocator's token ids.
+        # PD CPU retraction must preserve it before those ids can be reused.
+        self.cpu_retraction_draft_pool: KVCache | None = None
         self.need_sort = need_sort
 
         self.free_pages = None
