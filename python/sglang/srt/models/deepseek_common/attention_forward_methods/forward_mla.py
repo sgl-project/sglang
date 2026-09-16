@@ -106,7 +106,7 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     #
     # "ascend": CANN defines softmax_sum as sum(exp(qk - max)) and the LSE is
     # reconstructed as softmax_max + log(softmax_sum), which is natural log.
-    return attention_backend in {"flashmla", "cutedsl_mla", "ascend"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter", "ascend"}
 
 
 if _is_cuda:

@@ -25,6 +25,16 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 logger = logging.getLogger(__name__)
 
 
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -435,8 +445,21 @@ def validate_experimental_sgl_marlin(server_args: Any):
 
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.prefill_decode_interval < 0:
+    if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def default_unset_prefill_decode_interval(server_args: Any):
+    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_decode_interval is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_default",
+            prefill_decode_interval=0,
+        )
 
 
 def validate_sampling_mask_max_tokens(server_args: Any):

@@ -164,9 +164,9 @@ impl BucketSelector {
         }) else {
             return Some(candidate);
         };
-        if !spec
+        if spec
             .max_context_tokens
-            .is_none_or(|max_context| request.input_tokens <= max_context)
+            .is_some_and(|max_context| request.input_tokens > max_context)
             || (config.ttft_slo_policy == SloBucketPolicy::SloFirst
                 && !ttft_eligible(spec, request.ttft_slo_ms))
         {
