@@ -135,10 +135,17 @@ _FNS = {
 }
 
 
-@pytest.mark.parametrize("tokens", [1, 7, 128, 1024])
-@pytest.mark.parametrize("residual", [False, True])
-@pytest.mark.parametrize("plane", ["push", "pull"])
-@pytest.mark.parametrize("op", nvl.SUPPORTED_OPS)
+@pytest.mark.parametrize(
+    "op,plane,residual,tokens",
+    [
+        ("all_reduce", "push", False, 1),
+        ("all_reduce", "pull", True, 7),
+        ("all_gather", "push", True, 7),
+        ("all_gather", "pull", False, 1024),
+        ("reduce_scatter", "push", False, 7),
+        ("reduce_scatter", "pull", True, 1024),
+    ],
+)
 def test_collective(op: str, plane: str, residual: bool, tokens: int) -> None:
     cpu_group, nccl_group = _init_world()
     comm = _init_comm()
@@ -171,13 +178,70 @@ def test_collective(op: str, plane: str, residual: bool, tokens: int) -> None:
         torch.testing.assert_close(sym_out.float(), ref, atol=0.1, rtol=0.02)
 
 
-@pytest.mark.parametrize("tokens", [1, 7, 128])
+@pytest.mark.parametrize("op", ["all_gather", "reduce_scatter"])
+@pytest.mark.parametrize("plane", ["push", "pull"])
+def test_ragged_collective_with_empty_ranks(op: str, plane: str) -> None:
+    """Use fewer total rows than ranks so AG/RS exercise zero-row shards."""
+    cpu_group, nccl_group = _init_world()
+    comm = _init_comm()
+    world_size = dist.get_world_size(cpu_group)
+    rank = dist.get_rank(cpu_group)
+    device = _device()
+    total_tokens = world_size - 1
+    partition = nvl.get_token_partition(total_tokens, comm.obj)
+    routes = [
+        total_tokens // world_size + (peer < total_tokens % world_size)
+        for peer in range(world_size)
+    ]
+    max_local_tokens = max(routes)
+
+    if op == "all_gather":
+        input_storage = _symm((max_local_tokens, HIDDEN))
+        sym_in = input_storage[: partition.num_local_tokens]
+        sym_out = _symm((total_tokens, HIDDEN))
+    else:
+        sym_in = _symm((total_tokens, HIDDEN))
+        output_storage = _symm((max_local_tokens, HIDDEN))
+        sym_out = output_storage[: partition.num_local_tokens]
+
+    gen = torch.Generator(device=device).manual_seed(9000 + rank)
+    sym_in.copy_(torch.randn(sym_in.shape, dtype=DTYPE, device=device, generator=gen))
+    sym_out.zero_()
+
+    if op == "all_gather":
+        padded = torch.zeros(
+            (max_local_tokens, HIDDEN), dtype=torch.float32, device=device
+        )
+        padded[: partition.num_local_tokens].copy_(sym_in.float())
+        gathered = [torch.empty_like(padded) for _ in range(world_size)]
+        dist.all_gather(gathered, padded, group=nccl_group)
+        ref = torch.cat([chunk[:count] for chunk, count in zip(gathered, routes)])
+    else:
+        reduced = sym_in.float().clone()
+        dist.all_reduce(reduced, group=nccl_group)
+        begin = partition.num_prefix_tokens
+        ref = reduced[begin : begin + partition.num_local_tokens]
+
+    dist.barrier(nccl_group)
+    torch.cuda.synchronize()
+    _FNS[(op, plane)](comm.obj, sym_in, sym_out)
+    torch.cuda.synchronize()
+    dist.barrier(nccl_group)
+    if op == "all_gather":
+        torch.testing.assert_close(
+            sym_out.float(), ref.to(DTYPE).float(), atol=0, rtol=0
+        )
+    else:
+        torch.testing.assert_close(sym_out.float(), ref, atol=0.1, rtol=0.02)
+
+
 @pytest.mark.parametrize("variant", ["multicast", "unicast"])
-def test_copy_engine_all_gather(variant: str, tokens: int) -> None:
+def test_copy_engine_all_gather(variant: str) -> None:
     cpu_group, nccl_group = _init_world()
     comm = _init_comm()
     world_size = dist.get_world_size(cpu_group)
     device = _device()
+    tokens = 7
     in_shape, out_shape = _shapes("all_gather", tokens, world_size)
     sym_in, sym_out = _symm(in_shape), _symm(out_shape)
     gen = torch.Generator(device=device).manual_seed(

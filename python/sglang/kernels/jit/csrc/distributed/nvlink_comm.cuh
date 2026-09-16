@@ -397,10 +397,10 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
 template <bool kUsePDL>
 __global__ void nvlink_barrier_kernel(Semaphore* sem_local, Semaphore* sem_mc, uint32_t world_size) {
   using device::distributed::McBarrier;
-  device::PDLWaitPrimary<true>();
+  device::PDLWaitPrimary<kUsePDL>();
   const auto barrier = McBarrier{sem_local, sem_mc, world_size, 1};
   barrier.arrive_relaxed(0);
-  device::PDLTriggerSecondary<true>();
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
 /// Block size for the push kernel: the smallest that still spreads the work
