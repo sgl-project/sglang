@@ -154,7 +154,10 @@ def _print_report(manifest, checks):
             f"root_pid={manifest.root_pid} pids={len(manifest.pids)} "
             f"cuda={len(manifest.cuda_pids)}",
         ),
-        ("canary", f"token {manifest.canary.token_id}"),
+        (
+            "canary",
+            f"token {manifest.canary.token_id} logprob {manifest.canary.logprob:.4f}",
+        ),
         ("files", f"{len(manifest.files)} carried, {len(manifest.dev_shm)} /dev/shm"),
         ("bytes", manifest.artifact_bytes),
         ("identity", checks["identity"]),
