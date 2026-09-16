@@ -55,8 +55,7 @@ def _jit_fused_store_module(
 
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     # The schedule only depends on the sequence lengths (256-token splits), not
-    # on the page size; DeepGEMM takes 32 / 64 / 128 on SM100 and we page at 64
-    # or 128 slots.
+    # on the page size.
     assert page_size in (64, 128), page_size
     seq_lens = seq_lens.view(-1).to(torch.int32)
     bs = int(seq_lens.shape[0])
@@ -92,9 +91,8 @@ def fused_store_cache(
         V4.1 formats, fp8 with per-32 ue8m0 scales and e2m1 with per-16 e4m3
         scales over all 512 dims.
     :param freqs_cis: V4.1 layouts only. ``[num_tokens, 32]`` complex or
-        ``[num_tokens, 64]`` fp32 (real / imag interleaved): rotate the 64-dim
-        RoPE tail in-kernel first, so that the caller passes the un-rotated,
-        un-quantized latent and the fp4 / fp8 rounding happens exactly once.
+        ``[num_tokens, 64]`` fp32 (real / imag interleaved); rotates the 64-dim
+        RoPE tail in-kernel, so ``input`` must then be the un-rotated latent.
     """
     layout = KVLayout.parse(layout)
     if is_hip_runtime():
