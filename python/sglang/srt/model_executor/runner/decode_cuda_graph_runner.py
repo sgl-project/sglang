@@ -969,9 +969,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            # The slot is only maintained under expert parallelism; hand out
-            # None otherwise, like the eager batch, so routing does not mask
-            # every row against a never-filled zero count.
+            # Only EP maintains this count; a stale zero would mask every route outside EP.
             num_token_non_padded=(
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),

@@ -298,10 +298,7 @@ def _router_triton_kernel(
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
     if HAS_PACKED:
-        # FlashInfer routed-MoE packed entry, the exact expression of
-        # _pack_topk_ids_triton_kernel applied in-register to the values stored
-        # above (same fp32 -> bf16 rounding, same -1 sentinel on padded rows),
-        # so it is bitwise identical to the separate pack launch it replaces.
+        # Pack the same rounded weights and padded-row sentinels as the standalone router epilogue.
         w_bits = selected_vals.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
         packed = (selected_idx << 16) | (w_bits & 0xFFFF)
         out_p_ptr = (
@@ -443,9 +440,7 @@ def moe_fused_gate(
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
-    # Never alias an output as the fallback for an unused pointer arg: when
-    # Dynamo cannot analyze the kernel (PDL inline asm) it treats every pointer
-    # as mutated and writes both aliases back, clobbering `indices`.
+    # Dynamo may mark all pointers mutated; an aliased fallback would clobber indices on writeback.
     _unused_i32 = torch.empty(1, dtype=torch.int32, device=scores.device)
     _router_triton_kernel[grid](
         scores,

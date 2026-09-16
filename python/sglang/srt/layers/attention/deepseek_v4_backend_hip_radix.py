@@ -1512,11 +1512,7 @@ class DeepseekV4HipRadixBackend(
         if window is not None and isinstance(metadata, DSV4Metadata):
             window.activate(metadata.core_attn_metadata.request_window_layout)
 
-        # Compute the SWA KV-store write target once per forward and cache it on
-        # the metadata for every layer's store. This is recorded inside the cuda
-        # graph, so replay re-reads the live out_cache_loc buffer (spec-v2 and DP
-        # padding rebind out_cache_loc after out-graph metadata prep). flash_mla
-        # kernels require int32 indices.
+        # Capture the int32 SWA translation so replay reads live, possibly rebound out_cache_loc.
         if (
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None

@@ -612,9 +612,7 @@ class _HostTable:
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "private":
-            # Fault the shard in now, on a host whose page cache has just been
-            # emptied: cached checkpoint pages left by a previous server, or by
-            # the loader itself, make the 512 MiB huge-page faults fall back.
+            # Cached checkpoint pages can prevent huge-page faults; pre-fault after dropping them.
             _drop_page_cache_once("before pre-faulting the private shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
         if layout == "shared":
@@ -833,10 +831,7 @@ class EngramEmbedding(nn.Module):
 
     def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
         if is_hip() and values.is_cuda:
-            # Exactly one shard owns each row; every other shard contributes
-            # zero bits. Integer addition reconstructs BF16 values exactly,
-            # including subnormals that floating custom all-reduce flushes.
-            # Pack two BF16 values per int32 without copying or widening.
+            # Integer addition preserves all BF16 bits because exactly one shard owns each row.
             inplace_all_reduce(
                 values.view(torch.int32), group_name=get_tp_group().unique_name
             )

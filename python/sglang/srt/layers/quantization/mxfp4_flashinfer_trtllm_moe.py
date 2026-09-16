@@ -424,11 +424,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         num_tokens = x_quant.shape[0]
-        # Deferred finalize (flashinfer_trtllm_deferred_finalize_context): hand
-        # back FlashInfer's permuted GEMM2 output + routing triple instead of
-        # the finalized [T, hidden] tensor, for a caller that fuses the
-        # finalize into its shared add / all-reduce
-        # (kernels.ops.communication.all_reduce_fusion).
+        # Return the GEMM2 output and routing tuple for fused shared-add/all-reduce finalization.
         defer_finalize = is_deferred_finalize_enabled()
         symm_output = None
         if not defer_finalize:

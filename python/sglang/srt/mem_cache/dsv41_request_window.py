@@ -21,9 +21,7 @@ class WindowLayout(msgspec.Struct, frozen=True):
     size: int
 
     def copy_(self, other: "WindowLayout") -> None:
-        # Graph replay refreshes a captured layout in place: the captured copy
-        # kernels read these tensors by address, so their contents move, not
-        # the object.
+        # Captured copy kernels retain tensor addresses; refresh their contents in place.
         assert self.size == other.size, (self.size, other.size)
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
@@ -229,9 +227,7 @@ class RequestWindow:
         )
 
     def buffer(self, layer):
-        # The runner's capture scope includes eager warmups, before CUDA capture
-        # starts. Include the phase in the key so leaving that scope revalidates
-        # ownership even when the layout and layer have not changed.
+        # Eager capture warmups also enter this scope; include phase to revalidate ownership afterward.
         in_capture = get_is_capture_mode() or _capturing()
         prepared_key = (layer, in_capture)
         if self.prepared != prepared_key:

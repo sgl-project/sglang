@@ -1104,9 +1104,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits_partials=router_logits_partials,
                     **topk_kwargs,
                 )
-        # Recorded after the router so the routed MoE's first kernel, which
-        # joins this side stream, keeps the main chain on the main stream at
-        # CUDA-graph replay (the fork point above is unchanged).
+        # Record after routing so the graph join keeps the routed MoE on the main stream.
         routed_pre_quant_input = pre_quant_input
         if should_quant_routed_input_mxfp8:
             with torch.cuda.stream(self.routed_quant_stream):
@@ -1893,9 +1891,7 @@ class DeepseekV2MoE(nn.Module):
             return False, "experts quant method not Mxfp4FlashinferTrtllmMoEMethod"
         if quant_method.flashinfer_mxfp4_moe_precision != "default":
             return False, "flashinfer_mxfp4_moe_precision not default (no MXFP8 quant)"
-        # The pre-quant must describe exactly the tensor apply() receives: the
-        # standard dispatcher passes hidden_states through unchanged (the mxfp4
-        # backend keeps global expert ids), the fp4 all-gather does not.
+        # Pre-quantization is valid only when dispatch preserves hidden_states and global expert IDs.
         if not isinstance(experts.dispatcher, StandardDispatcher):
             return False, "dispatcher not StandardDispatcher"
         if should_use_flashinfer_cutlass_moe_fp4_allgather():

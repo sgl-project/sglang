@@ -272,9 +272,7 @@ class TopKConfig:
 class TopKOutputChecker:
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        # StandardTopKOutputPacked is the standard (weights, ids, logits) triple
-        # plus the FlashInfer routed-MoE packed ids the router emitted alongside
-        # them; every standard-format consumer reads it by field name.
+        # Packed standard output retains named fields for consumers of the standard triple.
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
@@ -331,13 +329,7 @@ class StandardTopKOutputDeferredPad(StandardTopKOutput):
         return self
 
 
-# Standard top-k output carrying, in addition, the FlashInfer routed-MoE packed
-# topk ``(id << 16) | bf16_bits(weight)`` that the gating kernel produced in the
-# same launch (the sqrtsoftplus Triton router under the flashinfer_mxfp4 runner
-# backend, and the experimental Qwen3 fused topk+pack). Kept a SEPARATE type
-# rather than a 4th StandardTopKOutput field so the `a, b, _ = topk_output`
-# 3-tuple unpack in runners that never see it stays valid; consumers read
-# .packed_topk_ids via _get_packed_topk_ids_for_flashinfer_routed (getattr).
+# Keep packed routing separate so standard consumers can still unpack the original three fields.
 class StandardTopKOutputPacked(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -1476,9 +1468,7 @@ def biased_topk_jit_kernel_impl(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            # The router masks rows >= num_token_non_padded itself (id -1,
-            # weight 0), saving the post-process mask launch; see
-            # _fused_gate_masks_padded_rows for why this is sqrtsoftplus-only.
+            # The sqrtsoftplus router masks padded rows itself, avoiding a separate mask launch.
             num_token_non_padded=(
                 num_token_non_padded
                 if _fused_gate_masks_padded_rows(scoring_func)

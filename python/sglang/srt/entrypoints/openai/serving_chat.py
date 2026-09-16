@@ -1477,9 +1477,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
-            # An empty system message hosts the request tools. dsv4/dsv32 render
-            # it to nothing, so they always insert one; dsv41 renders a system
-            # token for it, so it only gets one when tools need the host.
+            # Unlike dsv4/dsv32, dsv41 emits an empty system token; add one only to host tools.
             if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:

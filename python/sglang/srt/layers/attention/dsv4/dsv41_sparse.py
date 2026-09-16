@@ -155,9 +155,7 @@ class DeepseekV41Compressor(nn.Module):
             fused = self.project_fused(x)
             head_dim = fused.shape[-1] // 2
             return fused[..., :head_dim], fused[..., head_dim:]
-        # Two GEMMs rather than one fused [2D, K] projection: the decode epilogue
-        # kernel (pair_pool_decode) reads kv and score as contiguous [n, D] fp32
-        # rows, which column slices of a fused output are not.
+        # Pair pooling requires contiguous KV/score rows, which slices of a fused projection cannot provide.
         kv = linear_bf16_fp32(x, self.wkv.weight)
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score

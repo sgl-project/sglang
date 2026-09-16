@@ -198,10 +198,7 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
-# The head64 sm100 decode scheduling constants, and the partition count
-# `num_sm_parts` that goes with them. Not exported, so the fast schedule only
-# runs for the shape they are known for and FlashMLA's own shape check is what
-# catches it if they ever stop matching.
+# These private FlashMLA schedule constants apply only to the head64 SM100 shape.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
 
@@ -482,9 +479,7 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
-    # The (1, 2) subset of present_ratios (DeepSeek V4.1): one latent per ratio
-    # tokens at slot raw_out_loc // ratio of the c1 / c2 pool, attended through
-    # the FlashMLA extra cache like c4.
+    # Ratios 1/2 store each latent at raw_out_loc // ratio in the extra attention cache.
     low_ratios: Tuple[int, ...] = ()
     c1_out_loc: Optional[torch.Tensor] = None
     c1_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -1012,10 +1007,7 @@ class DSV4Metadata:
     # Later layers overwrite real heads and preserve the zero padding.
     q_pad_buffer: Optional[torch.Tensor] = None
 
-    # Two-level low-ratio indexer (dsv4/candidate_indexer.py): what the
-    # candidate-source layer published for the index-source layers after it, in
-    # the chosen implementation's own type. Written once per forward by that
-    # layer, read by those layers, never copied from the host.
+    # Candidate-source layers publish this once per forward for later index-source layers.
     candidate_metadata: Optional[CandidateMetadata] = None
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
@@ -1190,11 +1182,7 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        # The distinct ratios this stage has, sorted -- (4, 128) for V4, (1, 2)
-        # for V4.1 -- not the per-layer hf_config.compress_ratios list. Nothing
-        # is built for a ratio outside this set.
-        # Empty C4/C128 pools are kept for compatibility even when the model
-        # only uses V4.1 ratios 1/2. They have no metadata consumers.
+        # Build metadata only for present ratios; empty compatibility pools have no consumers.
         model_ratios = set(self.token_to_kv_pool.compression_ratios)
         self.present_ratios: Tuple[int, ...] = tuple(
             ratio
@@ -1780,9 +1768,7 @@ class DeepseekV4AttnBackend(
                     for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
                 ]
             )
-        # The last index-source layer before the switch published its top-k into
-        # the full metadata's buffers; the consumer layers after the switch read
-        # the tail metadata's, so carry the tail rows over (padding stays -1).
+        # Consumer layers switch metadata at the replay boundary; carry over the published tail top-k.
         full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
         for ratio in tail_core.low_ratios:
@@ -2134,9 +2120,7 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
-        # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
-        # materialization is recorded inside the cuda graph; a no-op (Full
-        # already) when PREP_IN_CUDA_GRAPH=0.
+        # Materialize raw metadata inside capture; full metadata needs no conversion.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
@@ -2162,11 +2146,7 @@ class DeepseekV4AttnBackend(
                         raw_indices=core.sparse_raw_indices(ratio),
                     )
 
-        # Compute the SWA KV-store write target once per forward and cache it on
-        # the metadata for every layer's store. This is recorded inside the cuda
-        # graph, so replay re-reads the live out_cache_loc buffer (spec-v2 and DP
-        # padding rebind out_cache_loc after out-graph metadata prep). flash_mla
-        # kernels require int32 indices.
+        # Capture the int32 SWA translation so replay reads live, possibly rebound out_cache_loc.
         if (
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None

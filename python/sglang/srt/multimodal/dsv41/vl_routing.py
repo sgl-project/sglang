@@ -13,9 +13,7 @@ from sglang.srt.utils import is_cuda
 
 
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
-    # Standard EP replicates the fused shared expert on every rank and
-    # all-reduces the outputs, so the shared columns carry a 1/ep_size factor
-    # (applied by _post_process_topk_ids on the paths that go through it).
+    # Standard EP replicates shared experts, so their weights need a 1/ep_size factor.
     if num_fused_shared_experts and scaling_factor is not None:
         weights[:, -num_fused_shared_experts:] *= scaling_factor
     return weights

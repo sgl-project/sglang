@@ -57,9 +57,7 @@ def get_compress_state_ring_size(
         if not is_speculative:
             return 2
         return 1 << (num_draft_tokens + 1).bit_length()
-    # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # Online c128 uses one accumulated state row and does not support speculative decode.
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             raise AssertionError("online c128 does not support MTP")
@@ -924,9 +922,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start_layer,
             end_layer,
         )
-        # Layout of the SWA (main) cache; the compressed caches follow
-        # resolve_compressed_kv_layout, so every (main, extra) pair the decode
-        # kernel accepts is formed here and nowhere else.
+        # Resolve the main/extra layout pair here so every pool matches the attention kernel.
         self.kv_layout = KVLayout.parse(kv_layout)
         assert self.kv_layout in (
             KVLayout.V4,
@@ -1451,9 +1447,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if config.indexer_size is not None
         }
         for ratio, sources in low_ratio_sources.items():
-            # Slots remain loc // ratio, with DSV41_INDEX_PAGE_SIZE packed-buffer pages.
-            # Reserved FULL page 0 extends real slots past full_size; one index padding
-            # page is too small to cover that gap.
+            # Reserved FULL page 0 requires more padding than one packed-index page can hold.
             self.index_pools[ratio] = self._make_indexer_pool(
                 (self.full_size + page_size) // ratio,
                 DSV41_INDEX_PAGE_SIZE,

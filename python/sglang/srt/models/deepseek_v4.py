@@ -543,9 +543,7 @@ def _apply_wo_a_bf16_matmul(
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
         )
-        # BLAS accepts the strided destination, preserving the einsum
-        # reduction while producing the contiguous layout consumed by wo_b.
-        # Draft warmup/capture can enter with grad tracking enabled.
+        # BLAS writes the wo_b layout directly; draft capture may still have grad tracking enabled.
         with torch.no_grad():
             torch.bmm(
                 o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
@@ -1818,10 +1816,7 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        # kv_score depends only on x, so its CP all-gather can start before the
-        # projections and be collected inside forward_core_compressor below --
-        # the projections are what hides it. No-op unless the CP+TBO path armed
-        # _cp_prefetch_comm_stream.
+        # CP projections hide the KV-score all-gather; forward_core_compressor joins it.
         if (
             _is_hip
             and self.compressor is not None
@@ -2297,9 +2292,7 @@ class MQALayer(MqaAttentionBase):
                             except (AttributeError, TypeError):
                                 pass
                 elif _is_gfx942_supported:
-                    # Uninitialized padded TP heads inject NaN into attention on gfx942
-                    # (fnuz), so zero-init there; other archs tolerate new_empty and skip
-                    # the per-forward memset.
+                    # gfx942 attention reads padded heads, so zero them to prevent NaNs.
                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
                 else:
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
@@ -3308,9 +3301,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and norm.variance_size_override is None
                 and not is_batch_invariant_mode_enabled()
             ):
-                # The fused scale writer supports the small decode/verify
-                # tile only. Large prefill keeps its one-CTA-per-row norm and
-                # lets the projection quantize the full activation layout.
+                # Fused scale writes support decode/verify tiles; prefill quantizes after its row norm.
                 if quantize and x.shape[0] <= 8:
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
@@ -4138,9 +4129,7 @@ class DeepseekV4Model(nn.Module):
             if use_stream_pool
             else None
         )
-        # One stream for every layer's routed-MoE input pre-quant, separate from
-        # the attention/indexer streams and the shared expert's; each layer joins
-        # it (event wait) before its routed MoE op.
+        # Each routed MoE joins its input quantization stream before consuming the result.
         self.moe_routed_quant_stream = (
             device_module.Stream()
             if _is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
