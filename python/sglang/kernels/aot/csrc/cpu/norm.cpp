@@ -149,42 +149,6 @@ struct NormTraits<NormMode::RMSNormGated> : NormTraitsBase {
 };
 
 #if defined(CPU_CAPABILITY_AVX512)
-template <typename scalar_t>
-inline std::tuple<__m512, __m512> load_32_as_float(const scalar_t* __restrict__ input) {
-  if constexpr (std::is_same_v<scalar_t, float>) {
-    return std::make_tuple(_mm512_loadu_ps(input), _mm512_loadu_ps(input + 16));
-  } else {
-    const __m512i input_16 = _mm512_loadu_si512(input);
-    if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
-      return std::make_tuple(
-          CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 0)),
-          CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 1)));
-    } else {
-      static_assert(std::is_same_v<scalar_t, at::Half>);
-      return std::make_tuple(
-          CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 0)),
-          CVT_FP16_TO_FP32(_mm512_extracti32x8_epi32(input_16, 1)));
-    }
-  }
-}
-
-template <typename scalar_t>
-inline void store_32_from_float(scalar_t* __restrict__ output, __m512 value0, __m512 value1) {
-  if constexpr (std::is_same_v<scalar_t, float>) {
-    _mm512_storeu_ps(output, value0);
-    _mm512_storeu_ps(output + 16, value1);
-  } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
-    _mm512_storeu_si512(output, (__m512i)(_mm512_cvtne2ps_pbh(value1, value0)));
-  } else {
-    static_assert(std::is_same_v<scalar_t, at::Half>);
-    _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(output), _mm512_cvtps_ph(value0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-    _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(output + 16),
-        _mm512_cvtps_ph(value1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-  }
-}
-
 template <NormMode M, typename input_t, typename weight_t, typename bias_t, int D>
 struct NormReduce {
   static inline void apply(
@@ -204,7 +168,7 @@ struct NormReduce {
     __m512 vsum = _mm512_set1_ps(0.f);
     __m512 vsum2 = _mm512_set1_ps(0.f);
     Unroll<COLS>{}([&](auto col) {
-      std::tie(va0[col], va1[col]) = load_32_as_float(input + col * 32);
+      std::tie(va0[col], va1[col]) = load_float_vec2(input + col * 32);
       if constexpr (NormTraits<M>::has_mean) {
         vsum = _mm512_add_ps(vsum, va0[col]);
         vsum = _mm512_add_ps(vsum, va1[col]);
@@ -236,7 +200,8 @@ struct NormReduce {
       if constexpr (NormTraits<M>::has_weight) {
         // TODO: need to block B to hide weight reload
         const weight_t* weight = static_cast<const weight_t*>(params.weight);
-        auto [weight0, weight1] = load_32_as_float(weight + col * 32);
+        __m512 weight0, weight1;
+        std::tie(weight0, weight1) = load_float_vec2(weight + col * 32);
         if constexpr (NormTraits<M>::has_shift) {
           weight0 = NormTraits<M>::apply_shift(weight0, vshift);
           weight1 = NormTraits<M>::apply_shift(weight1, vshift);
@@ -247,17 +212,24 @@ struct NormReduce {
       if constexpr (NormTraits<M>::has_bias) {
         if (use_bias) {
           const bias_t* bias = static_cast<const bias_t*>(params.bias);
-          auto [bias0, bias1] = load_32_as_float(bias + col * 32);
+          __m512 bias0, bias1;
+          std::tie(bias0, bias1) = load_float_vec2(bias + col * 32);
           value0 = NormTraits<M>::apply_bias(value0, bias0);
           value1 = NormTraits<M>::apply_bias(value1, bias1);
         }
       }
       if constexpr (NormTraits<M>::has_gate) {
-        auto [gate0, gate1] = load_32_as_float(gate + col * 32);
+        __m512 gate0, gate1;
+        std::tie(gate0, gate1) = load_float_vec2(gate + col * 32);
         value0 = NormTraits<M>::apply_gate(value0, gate0);
         value1 = NormTraits<M>::apply_gate(value1, gate1);
       }
-      store_32_from_float(out + col * 32, value0, value1);
+      if constexpr (std::is_same_v<input_t, float>) {
+        at::vec::Vectorized<float>(value0).store(out + col * 32);
+        at::vec::Vectorized<float>(value1).store(out + col * 32 + 16);
+      } else {
+        convert_from_float_ext<input_t>(value0, value1).store(out + col * 32);
+      }
     });
   }
 };
