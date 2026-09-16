@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import broadcast_pyobj
-
 from .parallel_state import (
     get_attn_cp_group,
     get_attn_tp_group,
@@ -20,6 +20,18 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    small_ar_max_bytes = envs.SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES.get()
+    if (
+        small_ar_max_bytes > 0
+        and input_.dim() == 2
+        and input_.dtype == torch.bfloat16
+        and input_.numel() * input_.element_size() <= small_ar_max_bytes
+    ):
+        from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce
+
+        output = flashinfer_allreduce(input_tensor=input_)
+        if output is not None:
+            return output
     return get_tp_group().all_reduce(input_)
 
 

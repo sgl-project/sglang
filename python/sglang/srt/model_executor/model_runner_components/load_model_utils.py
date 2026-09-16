@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
+    os.getenv("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S", "480")
+)
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
