@@ -15,8 +15,8 @@
 namespace sglang {
 
 /// Level-one keys of the two-level indexer: the max of each kBlockTokens-score
-/// block, the row's newest block forced to +inf. Contract: AmaxCopyKernel.
-struct AmaxConfig {
+/// block, the row's newest block forced to +inf. Contract: BlockAmaxKernel.
+struct BlockAmaxConfig {
   using DType = float;
   static constexpr uint32_t kBlockTokens = 8;  // scores per key
   static constexpr uint32_t kBlockSize = 512;
@@ -30,9 +30,9 @@ struct AmaxConfig {
   using vec_t = device::AlignedVector<DType, kVecSize>;
 };
 
-struct AmaxParams {
-  const AmaxConfig::DType* __restrict__ scores;
-  AmaxConfig::DType* __restrict__ amax_scores;
+struct BlockAmaxParams {
+  const BlockAmaxConfig::DType* __restrict__ scores;
+  BlockAmaxConfig::DType* __restrict__ amax_scores;
   const int32_t* __restrict__ seq_len;
   int64_t stride_scores;       // in elements
   int64_t stride_amax_scores;  // in elements
@@ -42,10 +42,10 @@ struct AmaxParams {
 /// grid = (rows, ceil(max_keys / kKeysPerCTA)); a CTA owns kKeysPerCTA consecutive
 /// keys of one row, a thread kNumItems keys kBlockSize apart (coalesced loads).
 template <bool kUsePDL>
-__global__ __launch_bounds__(AmaxConfig::kBlockSize, AmaxConfig::kOccupancy)  //
-    void amax8_varlen_kernel(const __grid_constant__ AmaxParams params) {
+__global__ __launch_bounds__(BlockAmaxConfig::kBlockSize, BlockAmaxConfig::kOccupancy)  //
+    void amax8_varlen_kernel(const __grid_constant__ BlockAmaxParams params) {
   using namespace device;
-  using C = AmaxConfig;
+  using C = BlockAmaxConfig;
   using T = typename C::DType;
   using vec_t = typename C::vec_t;
   const auto bx = blockIdx.x;
@@ -100,14 +100,14 @@ __global__ __launch_bounds__(AmaxConfig::kBlockSize, AmaxConfig::kOccupancy)  //
 /// The grid covers `amax_scores`' width, so the caller sizes it for the longest
 /// row: `seq_len[b] <= 8 * amax_scores.shape[1]` for every row (not checked).
 template <bool kPDL>
-struct AmaxCopyKernel {
+struct BlockAmaxKernel {
   static void amax8_varlen(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView amax_scores,
       const uint32_t topk) {
     using namespace host;
-    using C = AmaxConfig;
+    using C = BlockAmaxConfig;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"stride_scores"};
@@ -135,7 +135,7 @@ struct AmaxCopyKernel {
         "scores must be 32 B aligned");
     RuntimeCheck(K.unwrap() > 0, "amax_scores must hold at least one key per row");
     const auto max_keys = K.unwrap();  // ceil(longest row / 8), sized by the caller
-    const auto params = AmaxParams{
+    const auto params = BlockAmaxParams{
         .scores = static_cast<const typename C::DType*>(scores.data_ptr()),
         .amax_scores = static_cast<typename C::DType*>(amax_scores.data_ptr()),
         .seq_len = static_cast<const int32_t*>(seq_lens.data_ptr()),
