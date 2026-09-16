@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-class TestCompressWritePlanDraftPad(CustomTestCase):
+class TestCompressWritePlanBounds(CustomTestCase):
     def test_64k_prefill_preserves_last_token(self):
         """65536 tokens fit uint16 indices; the last token must not wrap or vanish."""
         for cr in (4, 128):

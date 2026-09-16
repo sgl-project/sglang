@@ -22,7 +22,7 @@ namespace sglang {
 ///
 /// `kv_input` and `kv_state` rows are `2 * kHeadDim` floats, kv then score.
 /// `kv_output` is the pre-RoPE latent, for the index-K branch's `wk`.
-struct C2Params {
+struct Compress2DecodeParams {
   const float* __restrict__ kv_input;  // [num_tokens, 2 * kHeadDim] fp32
   /// `CompressStatePool`'s flat `KVAndScore` buffer, `[size, 2 * kHeadDim]`
   /// fp32 with kv in the low half and score in the high half. A request's
@@ -73,7 +73,7 @@ template <
     typename LocT,
     deepseek_v4::KVLayout kLayout,
     bool kUsePDL>
-__global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const C2Params params) {
+__global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const Compress2DecodeParams params) {
   using namespace device;
   using deepseek_v4::KVLayout;
   using deepseek_v4::fp8::cast_to_ue8m0;
@@ -275,7 +275,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
 }
 
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
-struct FlashC2DecodeKernel {
+struct FlashCompress2Kernel {
   static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
@@ -374,7 +374,7 @@ struct FlashC2DecodeKernel {
     CHECK_HOST(!is_verify || num_tokens % draft_len == 0);
     CHECK_HOST(!is_verify || ring_size > draft_len)
         << "the pair-state ring (" << ring_size << ") must be wider than the draft length (" << draft_len << ")";
-    const auto params = C2Params{
+    const auto params = Compress2DecodeParams{
         .kv_input = static_cast<const float*>(kv_input.data_ptr()),
         .kv_state = static_cast<float*>(kv_state.data_ptr()),
         .kv_output = static_cast<bf16_t*>(kv_output.data_ptr()),

@@ -71,15 +71,15 @@ def fake_quant_compressed_kv(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def cast_scale_inv_to_ue8m0(scale_inv: torch.Tensor) -> torch.Tensor:
-    """``2 ** ceil(log2(max(scale_inv, 1e-4)))`` as fp32, computed on the IEEE
-    bits so that it is exact at (and just above) powers of two."""
-    scale_inv = scale_inv.float()
-    scale = ceil_pow2(torch.clamp_min(scale_inv, 1e-4))
+def ceil_pow2_scale(x: torch.Tensor) -> torch.Tensor:
+    """``2 ** ceil(log2(max(x, 1e-4)))`` as fp32, computed on the IEEE bits so
+    that it is exact at (and just above) powers of two."""
+    x = x.float()
+    scale = ceil_pow2(torch.clamp_min(x, 1e-4))
     # ceil_pow2 works on the bits of a finite value; a NaN or inf amax passes
     # through (both become the ue8m0 NaN byte, but only the NaN one turns the
     # whole tile's payload into NaN).
-    return torch.where(torch.isfinite(scale_inv), scale, scale_inv)
+    return torch.where(torch.isfinite(x), scale, x)
 
 
 def quantize_k_cache_v41(
@@ -91,7 +91,7 @@ def quantize_k_cache_v41(
     num_pages, page_size, d = k.shape
     assert d == 512
     x = k.float().view(num_pages, page_size, 16, 32)
-    scale = cast_scale_inv_to_ue8m0(x.abs().amax(dim=-1) / 448.0)
+    scale = ceil_pow2_scale(x.abs().amax(dim=-1) / 448.0)
     data = (x / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
     scale_u8 = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
     raw = page_size * 528
