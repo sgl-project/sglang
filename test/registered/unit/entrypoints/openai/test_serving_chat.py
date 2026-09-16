@@ -292,6 +292,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.tm.tokenizer.reset_mock()
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(
