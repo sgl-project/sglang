@@ -684,6 +684,7 @@ async fn execute_profile<P: ResponsePolicy>(
                             active = Some((process, log));
                         }
                         Err(error) => {
+                            tracing::error!(profile = %id, implementation = side, %error, "Server startup failed");
                             state
                                 .report
                                 .as_mut()

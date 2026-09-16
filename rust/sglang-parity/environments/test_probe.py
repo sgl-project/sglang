@@ -72,6 +72,28 @@ class ProbeTests(unittest.TestCase):
                 probe.verify_python(Path(sys.executable), "3.12.8")
             probe.verify_python(Path(sys.executable), "3.12.9")
 
+    def test_ninja_must_be_executable_on_the_server_path(self):
+        with (
+            patch.object(probe.shutil, "which", return_value=None) as which,
+            patch.object(probe.subprocess, "run") as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ninja on the server PATH"):
+                probe.verify_ninja()
+            run.assert_not_called()
+            which.return_value = "/venv/bin/ninja"
+            run.return_value.stdout = "1.13.2\n"
+            self.assertEqual(
+                probe.verify_ninja(),
+                {"path": "/venv/bin/ninja", "version": "1.13.2"},
+            )
+            run.assert_called_once_with(
+                ["/venv/bin/ninja", "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
     def test_lock_versions_are_required_and_extra_packages_are_reported(self):
         def distribution(name, version):
             return SimpleNamespace(metadata={"Name": name}, version=version)

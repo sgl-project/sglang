@@ -550,6 +550,26 @@ pub(crate) async fn prepare_environment(
     )
     .await?;
     let mut environment = plan.build_environment.clone();
+    // Selecting a venv's interpreter does not expose its tools (e.g. ninja).
+    let mut paths = vec![
+        plan.python
+            .parent()
+            .ok_or("Python has no bin directory")?
+            .to_owned(),
+    ];
+    let inherited_path = environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    paths.extend(std::env::split_paths(&inherited_path));
+    environment.insert(
+        "PATH".into(),
+        std::env::join_paths(paths)
+            .map_err(|e| format!("invalid Python environment PATH: {e}"))?
+            .into_string()
+            .map_err(|_| "Python environment PATH is not UTF-8")?,
+    );
     environment.insert(
         "PYTHONPATH".into(),
         plan.source_snapshot

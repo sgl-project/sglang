@@ -242,6 +242,9 @@ wheels. The CUDA profile adds NVIDIA's official package index with uv's
 `first-index` policy, which obtains the genuine `cuda-tile` wheels instead of
 building its PyPI downloader stub. Lock generation and installation use the same
 index settings, and every installed distribution must match a recorded hash.
+The selected Python environment's executable directory is prepended to the
+server `PATH`, so its locked tools are available to subprocesses. CUDA setup
+checks that `ninja` runs before compiling the Rust extension or starting services.
 
 Optional `environment` settings in `run.json`:
 

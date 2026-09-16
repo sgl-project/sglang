@@ -140,6 +140,7 @@ if phase == 'venv':
     executable.chmod(0o755)
 elif phase == 'probe':
     source = pathlib.Path(args[args.index('--source') + 1])
+    assert os.environ['PATH'].split(os.pathsep)[0] == str(pathlib.Path(sys.argv[0]).parent)
     assert os.environ['PYTHONPATH'] == str(source / 'python')
     assert os.environ['SGLANG_RUST_BUILD_MODE'] == 'auto'
     output = pathlib.Path(args[args.index('--output') + 1])
@@ -201,6 +202,13 @@ async fn cached_environments_are_reverified_and_incomplete_installations_are_reb
     assert_eq!(
         first.server(&fixture.config.server).python.as_ref(),
         Some(&plan.python)
+    );
+    let server = first.server(&fixture.config.server);
+    let mut paths = std::env::split_paths(&server.env["PATH"]);
+    assert_eq!(paths.next().as_deref(), plan.python.parent());
+    assert_eq!(
+        paths.collect::<Vec<_>>(),
+        std::env::split_paths(&fixture.config.server.env["PATH"]).collect::<Vec<_>>()
     );
     assert_eq!(fixture.phases(), ["venv", "sync", "install", "probe"]);
     drop(first);

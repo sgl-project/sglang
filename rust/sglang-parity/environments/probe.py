@@ -10,6 +10,8 @@ import importlib.metadata
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import sysconfig
 from pathlib import Path
@@ -141,6 +143,20 @@ def verify_backend(backend: str) -> dict:
     }
 
 
+def verify_ninja() -> dict[str, str]:
+    executable = shutil.which("ninja")
+    if executable is None:
+        raise RuntimeError("CUDA kernel compilation requires ninja on the server PATH")
+    version = subprocess.run(
+        [executable, "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout.strip()
+    return {"path": executable, "version": version}
+
+
 def verify_rust(source: Path, loader: object) -> tuple[dict, dict]:
     workspace = source / "rust"
     crate = loader._discover_crate(workspace, RUST_MODULE)
@@ -211,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         verify_python(args.python.expanduser(), args.python_version)
         result["packages"] = verify_packages(lock)
         if not args.dependencies_only:
+            if args.backend == "cuda":
+                result["ninja"] = verify_ninja()
             result["backend"] = verify_backend(args.backend)
             sglang = importlib.import_module("sglang")
             result["source_origins"] = {"sglang": source_origin(sglang, source)}
