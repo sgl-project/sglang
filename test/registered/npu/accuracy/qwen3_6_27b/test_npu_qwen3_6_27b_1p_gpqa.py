@@ -18,14 +18,6 @@ register_npu_ci(
     nightly=True,
 )
 
-register_npu_ci(
-    # Duplicate registration for the dedicated qwen3.6-27b suite, so the
-    # nightly-acc-2-npu-a3-qwen3-6-27b job can run this file standalone.
-    est_time=6500,
-    suite="nightly-acc-2-npu-a3-qwen3-6-27b",
-    nightly=True,
-)
-
 QWEN3_6_27B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "SGLANG_SET_CPU_AFFINITY": "1",
