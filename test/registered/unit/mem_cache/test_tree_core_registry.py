@@ -351,21 +351,6 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                     select_tree_core_backend(_cache_init_params()), "python"
                 )
 
-    def test_swa_buffer_mode_uses_python_for_default_and_explicit_rust(self):
-        params = _cache_init_params(hicache_host_memory_mode="buffer_only")
-        params.tree_components = (ComponentType.FULL, ComponentType.SWA)
-        self.assertEqual(select_tree_core_backend(params), "python")
-        self.assertEqual(resolve_tree_core_backend("rust", params), "python")
-
-    def test_full_buffer_and_swa_cache_mode_still_use_rust(self):
-        params = _cache_init_params(hicache_host_memory_mode="buffer_only")
-        self.assertEqual(select_tree_core_backend(params), "rust")
-        params.tree_components = (ComponentType.FULL, ComponentType.SWA)
-        for mode in (None, "cache"):
-            with self.subTest(mode=mode):
-                params.hicache_host_memory_mode = mode
-                self.assertEqual(select_tree_core_backend(params), "rust")
-
     def test_unsupported_device_uses_python(self):
         params = _cache_init_params()
         params.token_to_kv_pool_allocator = SimpleNamespace(device="xpu:0")

@@ -1039,6 +1039,49 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().match_full_device_prefix(key, namespace))
     }
 
+    fn swa_tombstone_ranges(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+        start: usize,
+        end: usize,
+    ) -> PyResult<Vec<(usize, usize)>> {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        py.allow_threads(|| {
+            self.core()
+                .swa_tombstone_ranges(key.as_ref(), namespace, start, end)
+        })
+        .map_err(PyAssertionError::new_err)
+    }
+
+    fn attach_swa_window(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+        window_start: usize,
+        window_end: usize,
+        swa_values: PyTensor,
+    ) -> PyResult<Py<PyList>> {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        let swa_values = swa_values.0;
+        let actions = py
+            .allow_threads(move || {
+                self.core().attach_swa_window(
+                    key.as_ref(),
+                    namespace,
+                    window_start,
+                    window_end,
+                    &swa_values,
+                )
+            })
+            .map_err(PyAssertionError::new_err)?;
+        cache_actions_to_py(py, actions)
+    }
+
     /// The empty match result anchored at the root.
     fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
         let result = py.allow_threads(|| self.core().empty_match_result());
@@ -2500,6 +2543,27 @@ macro_rules! tree_core_binding {
                 params: &MatchParamsBinding,
             ) -> (usize, NodeId, usize) {
                 self.inner.match_full_device_prefix(py, params)
+            }
+
+            fn swa_tombstone_ranges(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                start: usize,
+                end: usize,
+            ) -> PyResult<Vec<(usize, usize)>> {
+                self.inner.swa_tombstone_ranges(py, params, start, end)
+            }
+
+            fn attach_swa_window(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                window_start: usize,
+                window_end: usize,
+                swa_values: PyTensor,
+            ) -> PyResult<Py<PyList>> {
+                self.inner.attach_swa_window(py, params, window_start, window_end, swa_values)
             }
 
             /// The empty match result anchored at the root.

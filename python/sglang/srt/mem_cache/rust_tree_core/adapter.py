@@ -421,9 +421,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def swa_tombstone_ranges(
         self, key: RadixKey, start: int, end: int
     ) -> list[tuple[int, int]]:
-        raise NotImplementedError(
-            "swa_tombstone_ranges: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+        return self._binding.swa_tombstone_ranges(
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
+            ),
+            start,
+            end,
         )
 
     def attach_swa_window(
@@ -432,10 +437,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-    ) -> list:
-        raise NotImplementedError(
-            "attach_swa_window: buffer-mode SWA window repair is not yet "
-            "ported to the Rust tree core"
+    ) -> list[CacheAction | ComponentAction]:
+        return _cache_actions_from_tagged(
+            self._binding.attach_swa_window(
+                self._bindings.MatchParamsBinding(
+                    key=_radix_key_buffer(key),
+                    extra_key=key.extra_key,
+                    cache_salt=key.cache_salt,
+                ),
+                window_start,
+                window_end,
+                swa_values,
+            )
         )
 
     def inc_lock_ref(

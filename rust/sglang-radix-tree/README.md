@@ -7,10 +7,8 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 Rust is temporarily the default to exercise broader CI coverage on supported
 Linux installations with PyTorch 2.11 through 2.13 and CPU or CUDA devices.
 The centralized tree-core registry resolves session-aware caching, C128 or custom
-components, SWA with buffer-only HiCache host memory, unsupported platforms, and
-installations without the extension or its sources to Python. This policy also
-applies when Rust is explicitly selected. The buffer-mode SWA window-repair APIs
-introduced in #39283 still need a Rust port.
+components, unsupported platforms, and installations without the extension or
+its sources to Python. This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
 
 Select a backend explicitly with:
@@ -52,3 +50,8 @@ cache suite. Production wheels do not enable it.
 Unit tests live in `src/tests/`, mirroring the source layout one file per module (wired via `#[cfg(test)] #[path = ...]`), so implementation files stay free of inline test blocks.
 
 Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Full, SWA, Mamba]`.
+
+SWA buffer-mode load-back can repair tombstoned windows in Rust. The core finds
+missing SWA spans and attaches loaded slots across node boundaries, preserving
+Full-KV ownership, lock accounting, and pending write-through split actions.
+The shared Python pipeline handles transfers and redundant-slot cleanup.

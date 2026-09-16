@@ -1668,6 +1668,110 @@ def test_swa_load_back_missing_value_raises_assertion_error():
         core.build_load_back_spec(node)
 
 
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_bigram):
+    core = _swa_tree_core(page_size=page_size, is_eagle=is_bigram)
+    key = RadixKey(
+        array("q", range(8 + is_bigram)),
+        extra_key="adapter-a",
+        cache_salt="tenant-a",
+        is_bigram=is_bigram,
+    )
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 8)]
+    values = torch.arange(50, 54, dtype=torch.int64)
+    assert core.attach_swa_window(key, 2, 6, values) == []
+    values.fill_(-1)
+
+    # Slicing and namespace conversion must retain logical bigram positions.
+    full_values = []
+    for end in (2, 6, 8):
+        _, node, _ = core.match_full_device_prefix(key[:end])
+        full_values.extend(
+            core.get_component_device_value(node, ComponentType.FULL).tolist()
+        )
+        swa = core.get_component_device_value(node, ComponentType.SWA)
+        if end == 6:
+            assert swa.tolist() == [50, 51, 52, 53]
+        else:
+            assert swa is None
+    assert full_values == list(range(10, 18))
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
+    assert core.swa_tombstone_ranges(key, 1, 7) == [(1, 2), (6, 7)]
+    for extra_key, cache_salt in (("adapter-b", "tenant-a"), ("adapter-a", "tenant-b")):
+        other_key = RadixKey(
+            key.token_ids,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            is_bigram=is_bigram,
+        )
+        assert core.swa_tombstone_ranges(other_key, 0, 8) == []
+    assert core.full_evictable_size() == 8
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
+def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
+    core = _swa_tree_core()
+    core.set_hicache_enabled()
+    key = _key(list(range(8)))
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    _, leaf, _ = core.match_full_device_prefix(key)
+    receipt = core.inc_lock_ref(leaf)
+    core.mark_write_through_pending([leaf], ack_id=leaf)
+    actions = core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    assert len(actions) == 2
+    for action in actions:
+        assert isinstance(action, ReplaceWriteThroughOnNodeSplit)
+        assert action.ack_id == leaf
+        assert action.old_node_id == leaf
+        assert action.new_child_node_id == leaf
+    assert actions[0].new_node_id != actions[1].new_node_id
+    assert core.swa_protected_size() == 4
+    assert core.swa_evictable_size() == 0
+    core.finish_write_through([action.new_node_id for action in actions] + [leaf], leaf)
+    core.dec_lock_ref(leaf, receipt.to_dec_params())
+    assert core.swa_protected_size() == 0
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
+def test_swa_window_repair_rejects_invalid_publication_without_partial_changes():
+    core = _swa_tree_core()
+    key = _key(list(range(8)))
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.arange(10, 18, dtype=torch.int64),
+            swa_evicted_seqlen=8,
+        ),
+    )
+    core.attach_swa_window(key, 2, 6, torch.arange(50, 54))
+    with pytest.raises(AssertionError, match="over live SWA"):
+        core.attach_swa_window(key, 0, 6, torch.arange(60, 66))
+    with pytest.raises(AssertionError, match="int64"):
+        core.attach_swa_window(key, 0, 2, torch.zeros(2, dtype=torch.int32))
+    assert core.swa_tombstone_ranges(key, 0, 8) == [(0, 2), (6, 8)]
+    assert core.swa_evictable_size() == 4
+    core.sanity_check([], [])
+
+
 def test_swa_straddling_insert_crosses_the_boundary_actions():
     core = _swa_tree_core(window=8)
     _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
