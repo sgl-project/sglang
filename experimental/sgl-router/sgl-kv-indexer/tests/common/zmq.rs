@@ -157,9 +157,8 @@ pub fn removed(hashes: &[i64]) -> Value {
     ])
 }
 
-/// `[ts, events, attn_dp_rank]`, msgpack-encoded, with the publish timestamp
-/// SGLang stamps. The timestamp is load-bearing: it is how the bridge tells a
-/// restarted publisher from a batch it has already forwarded.
+/// `[ts, events, attn_dp_rank]`, msgpack-encoded. `ts` is load-bearing: the
+/// bridge tells a restarted publisher from a replay by it.
 pub fn batch_at(ts: f64, events: Vec<Value>) -> Vec<u8> {
     let value = Value::Array(vec![
         Value::from(ts),

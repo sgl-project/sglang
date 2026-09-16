@@ -4,8 +4,9 @@
 //! Worker liveness over Valkey keys.
 //!
 //! The bridge beside each worker writes `<prefix>alive:<worker>` with a TTL and
-//! refreshes it at a third of that TTL, but only while the worker's serving port
-//! accepts a TCP connection: the key expiring means the worker is gone (or the
+//! refreshes it at a third of that TTL, gated on a TCP connect to the worker's
+//! serving port when one is configured (without an address the beat only says the
+//! bridge is alive): the key expiring means the worker is gone (or the
 //! bridge is, which is the deployer's trade-off; size the TTL above a bridge
 //! restart). A permanent `<prefix>hb:<worker>` marker records that the worker
 //! ever heartbeated, so a legacy bridge without heartbeats is never declared
@@ -21,8 +22,8 @@
 //! Clearing goes through the normal apply path (`CLEAR_ALL_AT_TIER` at every
 //! tier), so hit counts, pruning and parity semantics hold. A worker that
 //! restarted re-reports as it fills its cache, which is what makes the clear
-//! right: the phantom prefixes a restart used to leave behind are gone. A worker
-//! that was cleared while still serving does NOT get those placements back
+//! right: a restart leaves no phantom prefixes behind. A worker that was cleared
+//! while still serving does NOT get those placements back
 //! immediately - it only re-reports blocks it stores from then on - so a clear
 //! is deliberately conservative:
 //!
@@ -35,8 +36,8 @@
 //!   session replays that worker's buffer from the start instead of resuming
 //!   past it, and whatever the worker still holds is reported again.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use redis::cluster::ClusterClientBuilder;
@@ -152,16 +153,34 @@ impl Heartbeat {
 }
 
 async fn probe_tcp(target: &str) -> bool {
-    let Ok(mut addrs) = target.to_socket_addrs() else {
-        return false;
-    };
-    let Some(addr) = addrs.next() else {
-        return false;
+    // Resolution counts against the probe timeout and must not block the
+    // runtime thread the bridge forwards events on.
+    let connect = async {
+        let addr = tokio::net::lookup_host(target).await.ok()?.next()?;
+        tokio::net::TcpStream::connect(addr).await.ok()
     };
     matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(PROBE_TIMEOUT, connect).await,
+        Ok(Some(_))
     )
+}
+
+/// Removes a worker from liveness, for a bridge that runs without a heartbeat.
+/// Best effort: a marker left behind costs one clear of a worker still serving.
+pub async fn retire_heartbeat(config: &ValkeyConfig, worker_id: &str) {
+    let mut pipe = redis::pipe();
+    pipe.cmd("DEL")
+        .arg(marker_key(&config.key_prefix, worker_id))
+        .arg(alive_key(&config.key_prefix, worker_id))
+        .ignore();
+    match connect_conn(config).await {
+        Ok(mut conn) => {
+            if let Err(status) = conn.exec(&pipe).await {
+                warn!(worker_id, %status, "could not retire the heartbeat marker");
+            }
+        }
+        Err(status) => warn!(worker_id, %status, "could not retire the heartbeat marker"),
+    }
 }
 
 /// Which heartbeating workers are alive and which have expired.
@@ -277,6 +296,15 @@ impl LivenessWatcher {
             );
             return Ok(false);
         }
+        // The census is a snapshot: a worker that heartbeated since keeps the
+        // placements it just reported.
+        if self.alive_now(worker).await? {
+            debug!(
+                worker,
+                "heartbeat returned before the clear; leaving it alone"
+            );
+            return Ok(false);
+        }
         // The bridge must replay this worker from the start of its buffer, not
         // from a checkpoint that is now ahead of what the index holds.
         self.forget_checkpoint(worker).await;
@@ -285,6 +313,14 @@ impl LivenessWatcher {
         }
         info!(worker, "heartbeat expired; placements cleared");
         Ok(true)
+    }
+
+    async fn alive_now(&self, worker: &str) -> Result<bool, Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("EXISTS")
+            .arg(alive_key(self.backend.key_prefix(), worker));
+        let flags: Vec<i64> = self.backend.conn().run(&pipe).await?;
+        Ok(flags.first() == Some(&1))
     }
 
     /// Best effort: a surviving checkpoint costs a longer replay, not data.
@@ -366,6 +402,14 @@ impl LivenessWatcher {
     }
 }
 
+/// The database the URL selects, which keyspace notifications are scoped to.
+/// Cluster mode has only database 0.
+fn valkey_db(url: &str) -> i64 {
+    redis::parse_redis_url(url)
+        .and_then(|url| url.path().trim_start_matches('/').parse().ok())
+        .unwrap_or(0)
+}
+
 /// Held only to keep the subscription open; dropping it unsubscribes.
 #[allow(dead_code)]
 enum SubscribedConnection {
@@ -378,7 +422,9 @@ async fn subscribe_expired(
     valkey: &ValkeyConfig,
     tx: mpsc::UnboundedSender<PushInfo>,
 ) -> Result<SubscribedConnection, Status> {
-    const PATTERN: &str = "__keyevent@*__:expired";
+    // Per database, not `@*`: the same key name expiring in another database of
+    // the same server is not this index's worker.
+    let pattern = format!("__keyevent@{}__:expired", valkey_db(&valkey.url));
     if valkey.cluster {
         let client = ClusterClientBuilder::new(cluster_nodes(&valkey.url))
             .use_protocol(ProtocolVersion::RESP3)
@@ -387,7 +433,7 @@ async fn subscribe_expired(
             .build()
             .map_err(valkey_status)?;
         let mut conn = client.get_async_connection().await.map_err(valkey_status)?;
-        conn.psubscribe(PATTERN).await.map_err(valkey_status)?;
+        conn.psubscribe(&pattern).await.map_err(valkey_status)?;
         Ok(SubscribedConnection::Cluster(conn))
     } else {
         // Push notifications need RESP3; the URL query is how redis-rs selects it.
@@ -401,25 +447,29 @@ async fn subscribe_expired(
             .get_multiplexed_async_connection_with_config(&config)
             .await
             .map_err(valkey_status)?;
-        conn.psubscribe(PATTERN).await.map_err(valkey_status)?;
+        conn.psubscribe(&pattern).await.map_err(valkey_status)?;
         Ok(SubscribedConnection::Standalone(conn))
     }
 }
 
-/// Adds `E` and `x` to `notify-keyspace-events` when the server lets us. A
-/// managed service that refuses `CONFIG` keeps its own setting; the sweep still
-/// covers liveness there.
+/// Adds `E` and `x` to `notify-keyspace-events` where `CONFIG` is allowed; the
+/// sweep covers liveness on a service that refuses it.
 async fn ensure_expiry_notifications(conn: &mut Conn) {
     let mut pipe = redis::pipe();
     pipe.cmd("CONFIG").arg("GET").arg("notify-keyspace-events");
-    let current: Vec<Vec<String>> = match conn.run(&pipe).await {
+    // A map on RESP3, a flat array on RESP2; `HashMap` reads both.
+    let current: Vec<HashMap<String, String>> = match conn.run(&pipe).await {
         Ok(current) => current,
         Err(status) => {
             warn!(%status, "CONFIG GET refused; relying on the liveness sweep unless notify-keyspace-events already includes Ex");
             return;
         }
     };
-    let current = current.into_iter().flatten().nth(1).unwrap_or_default();
+    let current = current
+        .into_iter()
+        .next()
+        .and_then(|mut reply| reply.remove("notify-keyspace-events"))
+        .unwrap_or_default();
     let has_expired = current.contains('A') || current.contains('x');
     if current.contains('E') && has_expired {
         return;
@@ -459,6 +509,17 @@ mod tests {
             worker_of_expired_key("{p}:", "{p}:alive:http://10.0.0.1:30000"),
             Some("http://10.0.0.1:30000".to_string())
         );
+    }
+
+    /// Notifications are per database, so the subscription pattern must name the
+    /// one the URL selects and not `@*`.
+    #[test]
+    fn database_of_a_valkey_url() {
+        assert_eq!(valkey_db("valkey://127.0.0.1:6379"), 0);
+        assert_eq!(valkey_db("valkey://127.0.0.1:6379/"), 0);
+        assert_eq!(valkey_db("valkey://127.0.0.1:6379/3"), 3);
+        assert_eq!(valkey_db("valkeys://user:pass@host:6380/7"), 7);
+        assert_eq!(valkey_db("not a url"), 0);
     }
 
     #[test]

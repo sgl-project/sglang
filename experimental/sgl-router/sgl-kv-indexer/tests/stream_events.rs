@@ -413,9 +413,86 @@ async fn private_group_rebuilds_an_in_memory_index_from_the_beginning() {
     );
 }
 
-/// The lease is the only thing serializing applies, so the central invariant is
-/// that a consumer without it applies nothing. Each consumer gets its own
-/// backend, which is the only way to see who applied what.
+/// A private group left behind by an unclean exit must not be resumed at its old
+/// read position, or a fresh in-memory index silently never rebuilds.
+#[tokio::test]
+async fn a_private_group_left_behind_still_rebuilds_from_the_beginning() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let sink = StreamSink::connect(&server.config(&prefix), DEFAULT_STREAM_MAXLEN)
+        .await
+        .unwrap();
+    let reference = InMemoryKvIndexerBackend::new();
+    let requests = vec![report("w0", 1, None, &[70, 71]), revoke("w0", 2, &[71])];
+    for request in &requests {
+        reference
+            .apply_external_kv_batch(request.clone())
+            .await
+            .unwrap();
+        sink.publish(request).await.unwrap();
+    }
+
+    // What a killed consumer leaves: the group exists and has read to the end.
+    let mut raw = server.raw().await;
+    let _: redis::Value = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(format!("{prefix}events"))
+        .arg("rebuild-memory-b")
+        .arg("$")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    let rebuilt = Arc::new(InMemoryKvIndexerBackend::new());
+    let shared: Arc<dyn KvIndexerBackend> = rebuilt.clone();
+    let consumer = start_consumer(
+        &server,
+        &prefix,
+        StreamConsumerConfig::private("memory-b"),
+        shared,
+    )
+    .await;
+    wait_for_parity(
+        rebuilt.as_ref(),
+        &reference,
+        &[70, 71],
+        "rebuild after a crash",
+    )
+    .await;
+    consumer.stop().await;
+}
+
+/// A shared group is created at the tail because the keyspace is the snapshot,
+/// which is false on a first deployment: an empty index must replay the window.
+#[tokio::test]
+async fn a_first_indexer_replays_what_was_published_before_it() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let sink = StreamSink::connect(&server.config(&prefix), DEFAULT_STREAM_MAXLEN)
+        .await
+        .unwrap();
+    let reference = InMemoryKvIndexerBackend::new();
+    let requests = vec![
+        report("w0", 1, None, &[80, 81]),
+        report("w1", 1, None, &[80]),
+    ];
+    for request in &requests {
+        reference
+            .apply_external_kv_batch(request.clone())
+            .await
+            .unwrap();
+        sink.publish(request).await.unwrap();
+    }
+
+    // The bridges published first: this is the fleet's very first indexer.
+    let backend = server.backend(&prefix).await;
+    let consumer = start_consumer(&server, &prefix, shared("indexer-first"), backend.clone()).await;
+    wait_for_parity(&backend, &reference, &[80, 81], "first deployment").await;
+    consumer.stop().await;
+}
+
+/// The lease is the only thing serializing applies, so a consumer without it must
+/// apply nothing. A backend per consumer is what shows who applied what.
 #[tokio::test]
 async fn a_consumer_without_the_lease_applies_nothing() {
     let server = require_valkey!();
@@ -471,10 +548,8 @@ async fn a_consumer_without_the_lease_applies_nothing() {
     standby.stop().await;
 }
 
-/// Applies are idempotent but not commutative, so a takeover must drain what the
-/// dead holder left pending BEFORE reading anything new: a REPORT stuck in the
-/// dead consumer's pending list, applied after the REVOKE that followed it,
-/// leaves the block present forever.
+/// Applies are idempotent but not commutative, so a takeover must drain the dead
+/// holder's pending entries before newer ones, or a REPORT outlives its REVOKE.
 #[tokio::test]
 async fn a_takeover_applies_pending_entries_before_newer_ones() {
     let server = require_valkey!();
@@ -534,9 +609,8 @@ async fn a_takeover_applies_pending_entries_before_newer_ones() {
     consumer.stop().await;
 }
 
-/// A flushed or restored Valkey loses the consumer group. Without recreating it
-/// the consumer retries NOGROUP forever and silently stops applying, so the index
-/// freezes while the fleet keeps publishing.
+/// A consumer group that disappears must be recreated, or the consumer retries
+/// NOGROUP forever and the index freezes while the fleet publishes.
 #[tokio::test]
 async fn a_group_that_disappears_is_recreated_and_consumption_continues() {
     let server = require_valkey!();

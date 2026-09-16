@@ -103,6 +103,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         if let Some(group) = env_string(CONSUMER_GROUP_ENV)?.filter(|g| !g.is_empty()) {
             consumer_config.group = group;
+            // Only the auto-generated private group belongs to one process; a
+            // named one is shared with whoever else uses that name.
+            consumer_config.destroy_group_on_exit = false;
+            if choice == BackendChoice::Memory {
+                tracing::warn!(
+                    group = %consumer_config.group,
+                    "an in-memory index in a named group acknowledges entries no other \
+                     member of that group will see; give it a group of its own"
+                );
+            }
         }
         match env_string(STREAM_START_ENV)?.as_deref() {
             None => {}
@@ -149,6 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         key_prefix = valkey.as_ref().map(|v| v.key_prefix.as_str()).unwrap_or(""),
         "starting SGLang KV Indexer"
     );
+    if event_source == EventSource::Stream {
+        // Stream applies hold a lease, a gRPC call does not, so mixing both sinks
+        // for one fleet reintroduces the interleaving the lease prevents.
+        tracing::warn!(
+            "consuming the event stream while still serving ApplyExternalKvBatch: \
+             point every bridge of a fleet at one sink, not both"
+        );
+    }
     server_builder_with_max_concurrent_streams(max_concurrent_streams)
         .add_service(service)
         .serve_with_shutdown(addr, until(shutdown_rx))

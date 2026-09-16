@@ -231,10 +231,8 @@ async fn heartbeat_does_not_vouch_for_an_unreachable_worker() {
     assert_eq!((alive, marked), (0, 0));
 }
 
-/// A Valkey failover or a restore that brings back the markers but not the
-/// volatile heartbeats makes every worker look dead at once. Clearing then turns
-/// one infrastructure event into a fleet-wide loss of cache affinity, so the
-/// watcher must refuse and say so.
+/// Every worker looking dead at once is a Valkey event, not a fleet death, so the
+/// watcher must refuse to clear and say so.
 #[tokio::test]
 async fn a_fleet_that_looks_entirely_dead_is_not_cleared() {
     let server = require_valkey!();
@@ -276,10 +274,8 @@ async fn a_fleet_that_looks_entirely_dead_is_not_cleared() {
     assert_eq!(held_hashes(&backend, "w1", &[4, 5]).await, vec![4, 5]);
 }
 
-/// A cleared worker must be replayed from the start of its buffer, so the clear
-/// also drops the bridge's sequence checkpoint; leaving it means the bridge
-/// resumes past events the index no longer has and the worker stays empty until
-/// its cache churns.
+/// Clearing a worker must drop its bridge checkpoint, or the next session resumes
+/// past events the index no longer holds.
 #[tokio::test]
 async fn clearing_a_worker_drops_its_bridge_checkpoint() {
     let server = require_valkey!();
