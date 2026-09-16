@@ -1425,7 +1425,9 @@ class DeepseekV4HipRadixBackend(
             out_cache_loc = seq_lens.new_zeros(num_tokens)
         return self.init_forward_metadata_prefill(
             seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
+            # Draft extend attends only to SWA; compressed attention never reads
+            # this page-table placeholder. Match CUDA's one-page allocation.
+            max_seq_len=self.page_size,
             req_pool_indices=req_pool_indices,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
