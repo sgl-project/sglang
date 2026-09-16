@@ -1,21 +1,16 @@
 //! Rid-keyed parking of finished results between an MM worker and the
 //! scheduler drain.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+
+use pyo3::prelude::*;
+use sglang_mm::pipeline::Tensor;
 
 use super::shm::{ShmSegment, shm_name};
 
-/// One parked result: the buffers the drain-time Python adapter needs (the
-/// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`).
-///
-/// TODO(mm-families): these fields are the shape the only current family
-/// (qwen_vl) produces; generalize to a named-tensor handoff when a family
-/// needs a different one.
-///
-/// Constructed from outside the module only by tests; the worker parks every
-/// real entry itself.
-pub struct MmEncodedEntry {
+/// The built-in Qwen drain shape.
+pub struct QwenMmEncodedEntry {
     pub features: FeatureStore,
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
@@ -25,6 +20,78 @@ pub struct MmEncodedEntry {
     /// Flattened row-major `[3, input_len]` M-RoPE positions.
     pub mrope: Vec<i64>,
     pub mrope_delta: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[pyclass(frozen, eq, hash, skip_from_py_object)]
+pub enum MmModality {
+    Image,
+    Video,
+    Audio,
+}
+
+/// Placeholder and boundary tokens consumed by `MultimodalProcessorOutput`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[pyclass(frozen, get_all, skip_from_py_object)]
+pub struct MmTokenIds {
+    pub im_token_id: Option<i32>,
+    pub im_start_id: Option<i32>,
+    pub im_end_id: Option<i32>,
+    pub video_token_id: Option<i32>,
+    pub audio_token_id: Option<i32>,
+    pub audio_start_id: Option<i32>,
+    pub audio_end_id: Option<i32>,
+}
+
+/// One media item produced by an external processor, including its features
+/// and inclusive token spans in the expanded prompt.
+pub struct ExternalMmItem {
+    pub modality: MmModality,
+    pub feature: Tensor,
+    pub hash: u64,
+    pub offsets: Vec<(u32, u32)>,
+    /// Processor-owned integer attributes, such as a clip index and count.
+    pub model_specific_data: BTreeMap<String, i64>,
+}
+
+/// Encoded data produced by an external processor implementation and consumed
+/// by its Python integration.
+pub struct ExternalMmEncodedEntry {
+    pub items: Vec<ExternalMmItem>,
+    pub token_ids: MmTokenIds,
+}
+
+impl ExternalMmEncodedEntry {
+    pub(super) fn validate(&self, input_len: usize) -> Result<(), String> {
+        for (index, item) in self.items.iter().enumerate() {
+            let elements = item
+                .feature
+                .shape
+                .iter()
+                .try_fold(1usize, |size, &dim| size.checked_mul(dim));
+            if elements != Some(item.feature.data.len()) {
+                return Err(format!(
+                    "multimodal item {index}: feature shape does not match its data"
+                ));
+            }
+            if item
+                .offsets
+                .iter()
+                .any(|&(start, end)| start > end || end as usize >= input_len)
+            {
+                return Err(format!(
+                    "multimodal item {index}: token offsets are outside the expanded prompt"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Encoded data parked between a multimodal worker and the scheduler drain.
+pub enum MmEncodedEntry {
+    Qwen(QwenMmEncodedEntry),
+    External(ExternalMmEncodedEntry),
 }
 
 /// Where a result's feature buffers live between worker and drain.
