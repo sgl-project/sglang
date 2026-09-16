@@ -600,7 +600,8 @@ struct TopKRegister : TopKRadixBase<12> {
     }
     const auto num_padding = kVecSize - tail_start + problem.input_start;
     if (tx == 0 && num_padding > 0) {
-      atomicSub(&smem->histogram[kHistSize - 1], num_padding);
+      // Ask the histogram's own binning where the platform's NaN landed.
+      atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
       atomicAdd(&smem->histogram[0], num_padding);
     }
     __syncthreads();
@@ -679,7 +680,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     });
     const auto num_padding = problem.input_start;
     if (tx == 0 && num_padding != 0) {
-      atomicSub(&smem->histogram[kHistSize - 1], num_padding);
+      atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
       atomicAdd(&smem->histogram[0], num_padding);
     }
     __syncthreads();
