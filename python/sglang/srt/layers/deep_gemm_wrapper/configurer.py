@@ -45,7 +45,7 @@ DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
-def _supports_sparse_indexer() -> bool:
+def _supports_paged_sparse_mqa_logits() -> bool:
     if not DEEPGEMM_BLACKWELL:
         return False
     import deep_gemm
@@ -59,4 +59,4 @@ def _supports_sparse_indexer() -> bool:
     )
 
 
-DEEPGEMM_SPARSE_INDEXER = _supports_sparse_indexer()
+DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()
