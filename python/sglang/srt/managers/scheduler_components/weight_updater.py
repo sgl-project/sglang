@@ -239,15 +239,12 @@ class SchedulerWeightUpdaterManager:
         ):
             cleanup_success, cleanup_message = (
                 self.tp_worker.destroy_weights_update_group(
-                    DestroyWeightsUpdateGroupReqInput(
-                        group_name=recv_req.group_name
-                    )
+                    DestroyWeightsUpdateGroupReqInput(group_name=recv_req.group_name)
                 )
             )
             success = False
             message = (
-                "NCCL M2N Phase 2 does not support a draft/speculative model "
-                "runner."
+                "NCCL M2N Phase 2 does not support a draft/speculative model " "runner."
             )
             if not cleanup_success:
                 message += f" Cleanup also failed: {cleanup_message}"
@@ -288,12 +285,14 @@ class SchedulerWeightUpdaterManager:
         with self._observe_weight_load("distributed"):
             if recv_req.load_format == "nccl_m2n":
                 try:
+                    if not self._weight_update_sync_base:
+                        raise ValueError("M2N requires a sync_base=True session")
                     if recv_req.selector not in ("target", "all"):
                         raise ValueError(
                             "NCCL M2N Phase 2 can update only the target model runner"
                         )
                     if recv_req.m2n_group_names is None:
-                        self.tp_worker.model_runner.receive_weights_from_m2n(
+                        self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n(
                             recv_req.group_name
                         )
                     else:
@@ -304,7 +303,7 @@ class SchedulerWeightUpdaterManager:
                             raise ValueError(
                                 "The first m2n_group_names entry must match group_name"
                             )
-                        self.tp_worker.model_runner.receive_weights_from_m2n_groups(
+                        self.tp_worker.model_runner.weight_updater.receive_weights_from_m2n_groups(
                             recv_req.m2n_group_names
                         )
                     success, message = (
