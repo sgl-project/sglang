@@ -3906,6 +3906,39 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
+            if (
+                get_platform().is_sm100
+                and 0 < q.shape[0] <= 8
+                and layer.tp_q_head_num == 16
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 512
+                and self.head_dim_v == 512
+                and self.softmax_scale == 512**-0.5
+                and swa_k_cache.shape[-1] == 584
+                and (extra_k_cache is None or extra_k_cache.shape[-1] == 584)
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                from sglang.kernels.ops.attention.dsv4.swapab_attention import (
+                    swapab_attention,
+                )
+
+                # Put the 16 real TP4 heads in the MMA N dimension. The caller
+                # applies inverse RoPE to the BF16 result as on the FlashMLA path.
+                return swapab_attention(
+                    q[..., :16, :],
+                    swa_k_cache,
+                    swa_page_indices,
+                    swa_topk_lengths,
+                    attn_sink,
+                    extra_k_cache,
+                    extra_indices,
+                    extra_topk_lengths,
+                )
+
             if get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
