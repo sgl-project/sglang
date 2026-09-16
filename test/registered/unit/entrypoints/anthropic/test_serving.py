@@ -289,9 +289,7 @@ class TestAnthropicServing(unittest.TestCase):
         ]
 
         self.assertEqual(content_events[0]["content_block"]["type"], "thinking")
-        # Signature is absent (None and excluded) — never emit empty
-        # string, which would fail downstream Anthropic signature verifiers.
-        self.assertNotIn("signature", content_events[0]["content_block"])
+        self.assertEqual(content_events[0]["content_block"]["signature"], "sglang")
         self.assertEqual(content_events[1]["delta"]["type"], "thinking_delta")
         self.assertEqual(content_events[1]["delta"]["thinking"], "think first")
         # No empty signature_delta event between thinking_delta and content_block_stop.
@@ -772,6 +770,7 @@ class TestAnthropicServing(unittest.TestCase):
         # thinking block first, then text block
         self.assertEqual(anthropic_response.content[0].type, "thinking")
         self.assertEqual(anthropic_response.content[0].thinking, "2 + 2 = 4")
+        self.assertEqual(anthropic_response.content[0].signature, "sglang")
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
 
