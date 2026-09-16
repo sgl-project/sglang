@@ -123,11 +123,17 @@ def _prepare_edit_images(
     ]
 
 
+def _has_explicit_output_size(batch: Req) -> bool:
+    extra = getattr(batch, "extra", {}) or {}
+    explicit_fields = set(extra.get("explicit_fields", ()))
+    return bool(explicit_fields.intersection({"size", "width", "height"}))
+
+
 def _resolve_edit_output_size(
     batch: Req, edit_images: list[Image.Image]
 ) -> tuple[int, int]:
     """Preserve the first input image's aspect ratio for SenseNova image edits."""
-    if not edit_images:
+    if not edit_images or _has_explicit_output_size(batch):
         return int(batch.width), int(batch.height)
 
     target_pixels = int(batch.width) * int(batch.height)

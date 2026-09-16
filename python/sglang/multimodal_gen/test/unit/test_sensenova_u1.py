@@ -778,6 +778,35 @@ def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
     assert abs((out_width / out_height) - 2.0) < 0.05
 
 
+def test_sensenova_u1_it2i_preserves_explicit_output_size():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace the text",
+        width=1024,
+        height=1024,
+    )
+    sampling._explicit_fields = {"width", "height"}
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (1600, 800))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert model.it2i_calls[0]["image_size"] == (1024, 1024)
+
+
 def test_sensenova_u1_generation_stage_rejects_cfg_zero_star_for_it2i():
     sampling = SenseNovaU1SamplingParams(
         prompt="edit",
