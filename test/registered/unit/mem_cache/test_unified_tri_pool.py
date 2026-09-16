@@ -202,6 +202,58 @@ class TestUnifiedTriPool(unittest.TestCase):
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.available_size(), before)
 
+    def test_pd_short_tail_fits_beyond_joint_capacity(self):
+        for lazy in (False, True):
+            for tail_len in (0, 5):
+                with self.subTest(lazy=lazy, tail_len=tail_len):
+                    _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
+                    full = allocator.full_attn_allocator
+                    length = allocator.available_size() + 4
+                    self.assertFalse(allocator.can_reserve(length, length))
+                    self.assertTrue(allocator.can_reserve(length, tail_len))
+                    prefix = torch.tensor([0], dtype=torch.int64)
+                    seq = torch.tensor([length], dtype=torch.int64)
+                    with patch.object(
+                        full,
+                        "alloc_extend",
+                        side_effect=lambda *a, **kw: full.alloc(length),
+                    ):
+                        virtual = allocator.alloc_extend_swa_tail(
+                            prefix,
+                            prefix,
+                            seq,
+                            seq,
+                            torch.tensor([-1]),
+                            length,
+                            tail_len,
+                        )
+                    self.assertIsNotNone(virtual)
+                    self.assertEqual(full.allocated_count(), length)
+                    self.assertEqual(
+                        allocator.swa_attn_allocator.allocated_count(),
+                        -(-tail_len // 4) * 4,
+                    )
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
+                    allocator.free(virtual)
+                    self.assertEqual(full.allocated_count(), 0)
+                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_pd_tail_rejects_full_capacity_shortfall(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        full = allocator.full_attn_allocator
+        length = full.available_size() + 4
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([length], dtype=torch.int64)
+        with patch.object(full, "alloc_extend") as extend:
+            self.assertIsNone(
+                allocator.alloc_extend_swa_tail(
+                    prefix, prefix, seq, seq, torch.tensor([-1]), length, 0
+                )
+            )
+        extend.assert_not_called()
+        self.assertEqual(full.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
     def test_empty_float_is_transparent_to_the_ends(self):
         _, allocator, _, _ = self._build()
         fa = allocator.full_attn_allocator
