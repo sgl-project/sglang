@@ -362,17 +362,6 @@ struct FlashIndexQKernel {
   /// \param payload `[num_tokens * heads, kHeadDim / 2]` int8.
   /// \param scale `[num_tokens * heads]` int32, the four ue8m0 block exponents
   ///        packed little-endian.
-  static void run_index_q(
-      const tvm::ffi::TensorView input,
-      const tvm::ffi::TensorView freqs_cis,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView payload,
-      const tvm::ffi::TensorView scale) {
-    launch(input, freqs_cis, positions, payload, scale, std::nullopt, std::nullopt, 0.0f);
-  }
-
-  /// \brief `run_index_q` plus the indexer's head-weight epilogue.
-  ///
   /// \param head_weights `[num_tokens, heads]` bf16, the raw `weights_proj(x)`.
   /// \param weights_out `[num_tokens, heads]` fp32, receives
   ///        `float(bf16(head_weights * weight_scale))`, i.e. `head_weights(x).float()`.

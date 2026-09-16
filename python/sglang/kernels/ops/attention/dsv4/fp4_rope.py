@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 # Payload bytes plus one ue8m0 exponent per 32 elements, per compressed token.
 SLOT_BYTES = 68
-INDEX_PAGE_SIZE = 64
 
 
 @cache_once
@@ -49,7 +48,6 @@ def _jit_index_q_module(head_dim: int, rope_dim: int) -> Module:
         *args,
         cuda_files=["deepseek_v4/fp4_rope.cuh"],
         cuda_wrappers=[
-            ("index_q", f"FlashIndexQKernel<{args}>::run_index_q"),
             ("index_q_weights", f"FlashIndexQKernel<{args}>::run_index_q_weights"),
         ],
     )
@@ -94,39 +92,6 @@ def index_k_norm_rope_pack_store(
     ).index_k(input, norm_weight, freqs_cis, positions, loc, cache, float(eps))
 
 
-def index_q_rope_pack(
-    input: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate, quantize twice and pack one indexer query per (token, head).
-
-    :param input: ``[num_tokens, heads, index_head_dim]`` bf16 contiguous --
-                  ``wq_b(q_lora)`` viewed per head.
-    :param freqs_cis: ``[max_pos, rope_head_dim]`` fp32, real/imag interleaved --
-                      ``torch.view_as_real(freqs).flatten(-2)``. Indexed
-                      in-kernel, so pass the whole table rather than a gather.
-    :param positions: ``[num_tokens]`` int32 or int64. A query rotates by its
-                      own position, so this is used unmasked.
-    :return: ``(payload, scale)`` -- ``[num_tokens * heads, index_head_dim // 2]``
-             int8 and ``[num_tokens * heads]`` int32, the four ue8m0 block
-             exponents packed little-endian. Exactly what the paged MQA logits
-             kernel takes and what the Triton path returns without a cache.
-
-    .. note:: Two quantization stages, not one -- see
-       :func:`index_k_norm_rope_pack_store`. Neither can be dropped.
-    """
-    num_tokens, heads, head_dim = input.shape
-    rows = num_tokens * heads
-    payload = input.new_empty((rows, head_dim // 2), dtype=torch.int8)
-    scale = input.new_empty((rows,), dtype=torch.int32)
-
-    _jit_index_q_module(head_dim, freqs_cis.shape[-1]).index_q(
-        input, freqs_cis, positions, payload, scale
-    )
-    return payload, scale
-
-
 def index_q_rope_pack_weights(
     input: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -134,7 +99,8 @@ def index_q_rope_pack_weights(
     head_weights: torch.Tensor,
     weight_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`index_q_rope_pack` plus the indexer's head weights, one launch.
+    """Rotate, quantize twice and pack one indexer query per (token, head), plus
+    the indexer's head weights, one launch.
 
     Head weights match ``head_weights(x).float()``: multiply in fp32,
     round to nearest-even bf16, then widen to fp32.
@@ -144,8 +110,9 @@ def index_q_rope_pack_weights(
     :param weight_scale: ``softmax_scale * heads**-0.5``; rounded to fp32 in the
                          kernel exactly as torch rounds a Python scalar for a
                          bf16 tensor multiply.
-    :return: ``(payload, scale, weights)`` -- the first two as
-             :func:`index_q_rope_pack`, ``weights`` ``[num_tokens, heads]`` fp32.
+    :return: ``(payload, scale, weights)`` -- ``[num_tokens * heads, index_head_dim // 2]``
+             int8, ``[num_tokens * heads]`` int32 (the four ue8m0 block exponents
+             packed little-endian) and ``[num_tokens, heads]`` fp32.
     """
     num_tokens, heads, head_dim = input.shape
     rows = num_tokens * heads
