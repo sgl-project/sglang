@@ -316,7 +316,7 @@ struct FlashC1DecodeKernel {
   }
 };
 
-// ensure that C++ wrapper can work
+// The JIT module names and wrappers spell the layouts as bare enumerators.
 using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang

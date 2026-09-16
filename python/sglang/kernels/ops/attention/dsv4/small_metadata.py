@@ -1,5 +1,7 @@
 """Small-batch V4.1 page and compression metadata."""
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -108,7 +110,20 @@ def _low_ratio_metadata(
     tl.store(PAGE2 + row * PADDED + cols, -1, cols < PADDED)
 
 
-def low_ratio_metadata(seq_lens, out_loc, topk):
+class LowRatioMetadata(NamedTuple):
+    """Per-request slots and lengths of the ratio-1 and ratio-2 compressed caches."""
+
+    c1_out_loc: torch.Tensor
+    c1_seq_lens: torch.Tensor
+    c1_sparse_lens: torch.Tensor
+    c1_page_indices: torch.Tensor
+    c2_out_loc: torch.Tensor
+    c2_seq_lens: torch.Tensor
+    c2_sparse_lens: torch.Tensor
+    c2_page_indices: torch.Tensor
+
+
+def low_ratio_metadata(seq_lens, out_loc, topk) -> LowRatioMetadata:
     assert seq_lens.numel() == out_loc.numel()
     rows = seq_lens.numel()
     kw = dict(device=seq_lens.device, dtype=torch.int32)
@@ -126,4 +141,4 @@ def low_ratio_metadata(seq_lens, out_loc, topk):
     _low_ratio_metadata[(rows,)](
         seq_lens, out_loc, *outputs, topk, padded, triton.next_power_of_2(padded)
     )
-    return outputs
+    return LowRatioMetadata(*outputs)

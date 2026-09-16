@@ -15,7 +15,6 @@
 
 #include <bit>
 #include <cstdint>
-#include <optional>
 
 namespace sglang {
 
@@ -66,7 +65,6 @@ constexpr uint32_t kC2VecSize = 2;
 /// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding
 /// happens once and no fp8 rounding follows it.
 template <
-    bool kStore,
     bool kVerify,
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -140,9 +138,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   fp32_vec_t staged, freq;
   bf16_vec_t weight, out;
   weight.load(params.norm_weight, tx);
-  if constexpr (kStore) {
-    if (tx >= kNopeThreads) freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
-  }
+  if (tx >= kNopeThreads) freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
 
   // With two scores `exp(-|s0 - s1|)` is the whole softmax: one exp, argument
   // always <= 0, so no max-subtraction pass and no overflow.
@@ -191,94 +187,91 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   PDLTriggerSecondary<kUsePDL>();
 
-  if constexpr (kStore) {
-    // ---- main-KV branch: RoPE tail, fp4 fake-quant, 584-byte store ----
-    // Match finish()'s bf16 rounding before RoPE.
+  // ---- main-KV branch: RoPE tail, fp4 fake-quant, 584-byte store ----
+  // Match finish()'s bf16 rounding before RoPE.
+#pragma unroll
+  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+    const auto [x, y] = cast<fp32x2_t>(out[i]);
+    staged[i * 2 + 0] = x;
+    staged[i * 2 + 1] = y;
+  }
+
+  if (tx >= kNopeThreads) {
+    // Match rope_tail()'s bf16 rounding before fake quantization.
+    // Only odd positions reach here; the latent represents `pos - 1`.
+    freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto [x, y] = cast<fp32x2_t>(out[i]);
+      const auto x_real = staged[i * 2 + 0];
+      const auto x_imag = staged[i * 2 + 1];
+      const auto f_real = x_real * freq[i * 2 + 0] - x_imag * freq[i * 2 + 1];
+      const auto f_imag = x_real * freq[i * 2 + 1] + x_imag * freq[i * 2 + 0];
+      const auto rotated = cast<bf16x2_t>(fp32x2_t{f_real, f_imag});
+      const auto [r0, r1] = cast<fp32x2_t>(rotated);
+      staged[i * 2 + 0] = r0;
+      staged[i * 2 + 1] = r1;
+    }
+  }
+
+  if constexpr (kLayout == KVLayout::V41_FP4) {
+    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
+    // fake quantization, minus the dequantization.
+    const int32_t out_loc = raw_out_loc >> 1;
+    const auto kv_row = Paged::row(params.kvcache, out_loc);
+    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+  }
+
+  // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
+  {
+    float amax = fabsf(staged[0]);
+#pragma unroll
+    for (uint32_t i = 1; i < kVecSize; ++i) {
+      amax = fmaxf(amax, fabsf(staged[i]));
+    }
+    amax = warp::reduce_max<kFp4Lanes>(amax);
+    const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      const auto [x, y] = deepseek_v4::fp4::fake_quant_compressed_kv_x2({staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
       staged[i * 2 + 0] = x;
       staged[i * 2 + 1] = y;
     }
+  }
 
-    if (tx >= kNopeThreads) {
-      // Match rope_tail()'s bf16 rounding before fake quantization.
-      // Only odd positions reach here; the latent represents `pos - 1`.
-      freq.load(params.freqs_cis + (pos - 1) * kRopeDim, tx - kNopeThreads);
+  // `raw_out_loc / ratio`; ratio 2 makes it a shift.
+  const int32_t out_loc = raw_out_loc >> 1;
+  const auto kv_row = Paged::row(params.kvcache, out_loc);
+
+  if constexpr (kLayout == KVLayout::V41) {
+    // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
+    return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+  }
+
+  const auto value_ptr = kv_row.data;
+
+  if (tx >= kNopeThreads) {
+    bf16_vec_t rope_out;
 #pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto x_real = staged[i * 2 + 0];
-        const auto x_imag = staged[i * 2 + 1];
-        const auto f_real = x_real * freq[i * 2 + 0] - x_imag * freq[i * 2 + 1];
-        const auto f_imag = x_real * freq[i * 2 + 1] + x_imag * freq[i * 2 + 0];
-        const auto rotated = cast<bf16x2_t>(fp32x2_t{f_real, f_imag});
-        const auto [r0, r1] = cast<fp32x2_t>(rotated);
-        staged[i * 2 + 0] = r0;
-        staged[i * 2 + 1] = r1;
-      }
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      rope_out[i] = cast<bf16x2_t>(fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]});
     }
-
-    if constexpr (kLayout == KVLayout::V41_FP4) {
-      // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
-      // fake quantization, minus the dequantization.
-      const int32_t out_loc = raw_out_loc >> 1;
-      const auto kv_row = Paged::row(params.kvcache, out_loc);
-      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
+    rope_out.store(value_ptr + (kHeadDim - kRopeDim), tx - kNopeThreads);
+  } else {
+    // fp8 e4m3 with one ue8m0 scale per 64 elements.
+    auto abs_max = fabsf(staged[0]);
+#pragma unroll
+    for (uint32_t i = 1; i < kVecSize; ++i) {
+      abs_max = fmaxf(abs_max, fabsf(staged[i]));
     }
-
-    // FP4/E4M3 fake-quant over 16 elements, i.e. kFp4Lanes threads.
-    {
-      float amax = fabsf(staged[0]);
+    abs_max = warp::reduce_max<kFp8Lanes>(abs_max);
+    const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
+    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
 #pragma unroll
-      for (uint32_t i = 1; i < kVecSize; ++i) {
-        amax = fmaxf(amax, fabsf(staged[i]));
-      }
-      amax = warp::reduce_max<kFp4Lanes>(amax);
-      const auto scale = deepseek_v4::fp4::compressed_kv_scale(amax);
-#pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto [x, y] =
-            deepseek_v4::fp4::fake_quant_compressed_kv_x2({staged[i * 2 + 0], staged[i * 2 + 1]}, scale);
-        staged[i * 2 + 0] = x;
-        staged[i * 2 + 1] = y;
-      }
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx * (kVecSize / 2) + i] =
+          pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
     }
-
-    // `raw_out_loc / ratio`; ratio 2 makes it a shift.
-    const int32_t out_loc = raw_out_loc >> 1;
-    const auto kv_row = Paged::row(params.kvcache, out_loc);
-
-    if constexpr (kLayout == KVLayout::V41) {
-      // fp8 with one ue8m0 scale per 32 elements over the whole row, RoPE included.
-      return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, staged);
-    }
-
-    const auto value_ptr = kv_row.data;
-
-    if (tx >= kNopeThreads) {
-      bf16_vec_t rope_out;
-#pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        rope_out[i] = cast<bf16x2_t>(fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]});
-      }
-      rope_out.store(value_ptr + (kHeadDim - kRopeDim), tx - kNopeThreads);
-    } else {
-      // fp8 e4m3 with one ue8m0 scale per 64 elements.
-      auto abs_max = fabsf(staged[0]);
-#pragma unroll
-      for (uint32_t i = 1; i < kVecSize; ++i) {
-        abs_max = fmaxf(abs_max, fabsf(staged[i]));
-      }
-      abs_max = warp::reduce_max<kFp8Lanes>(abs_max);
-      const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
-      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-#pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx * (kVecSize / 2) + i] =
-            pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
-      }
-      kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
-    }
+    kv_row.scale[tx / kFp8Lanes] = scale_ue8m0;
   }
 }
 
@@ -288,47 +281,21 @@ struct FlashC2DecodeKernel {
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
-  template <bool kStore, bool kVerify, typename PosT, typename LocT>
+  template <bool kVerify, typename PosT, typename LocT>
   static constexpr auto kernel =
-      flash_c2_decode_kernel<kStore, kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+      flash_c2_decode_kernel<kVerify, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
 
   /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <bool kStore, bool kVerify>
+  template <bool kVerify>
   static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kStore, kVerify, int32_t, int32_t> : kernel<kStore, kVerify, int32_t, int64_t>;
-    return loc_i32 ? kernel<kStore, kVerify, int64_t, int32_t> : kernel<kStore, kVerify, int64_t, int64_t>;
+    if (pos_i32) return loc_i32 ? kernel<kVerify, int32_t, int32_t> : kernel<kVerify, int32_t, int64_t>;
+    return loc_i32 ? kernel<kVerify, int64_t, int32_t> : kernel<kVerify, int64_t, int64_t>;
   }
 
   // The sum of squares is reduced through a fixed-size shared array, so the CTA
   // has to be a whole number of warps.
   static_assert(kHeadDim % (4 * device::kWarpThreads) == 0, "head_dim must be a multiple of 128");
   static_assert(std::has_single_bit(kPageSize), "the page/slot split needs a power-of-two page");
-
-  /// \brief Pool + norm only. The main-KV write stays with the caller.
-  static void run_decode(
-      const tvm::ffi::TensorView kv_input,
-      const tvm::ffi::TensorView kv_state,
-      const tvm::ffi::TensorView kv_output,
-      const tvm::ffi::TensorView norm_weight,
-      const tvm::ffi::TensorView positions,
-      const tvm::ffi::TensorView req,
-      const tvm::ffi::TensorView raw_out_loc,
-      const float eps,
-      const int64_t ring_size) {
-    launch(
-        kv_input,
-        kv_state,
-        kv_output,
-        norm_weight,
-        positions,
-        req,
-        raw_out_loc,
-        eps,
-        ring_size,
-        std::nullopt,
-        std::nullopt,
-        /*draft_len=*/1);
-  }
 
   /// \brief `run_decode_fusion` for a target-verify block.
   ///
@@ -363,8 +330,6 @@ struct FlashC2DecodeKernel {
   }
 
  private:
-  using MaybeTensor = std::optional<tvm::ffi::TensorView>;
-
   static void launch(
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_state,
@@ -375,8 +340,8 @@ struct FlashC2DecodeKernel {
       const tvm::ffi::TensorView raw_out_loc,
       const float eps,
       const int64_t ring_size,
-      const MaybeTensor freqs_cis,
-      const MaybeTensor kvcache,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
       const int64_t draft_len) {
     using namespace host;
 
@@ -397,14 +362,11 @@ struct FlashC2DecodeKernel {
     TensorMatcher({N}).with_dtype<int64_t>().with_device(device_).verify(req);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(loc_dtype).with_device(device_).verify(raw_out_loc);
 
-    const auto store = freqs_cis.has_value();
-    if (store) {
-      // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
-      TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(*freqs_cis);
-      // The pool allocates the buffer as uint8 and hands it out viewed as its
-      // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
-      TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(*kvcache);
-    }
+    // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
+    TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(freqs_cis);
+    // The pool allocates the buffer as uint8 and hands it out viewed as its
+    // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
+    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
@@ -418,11 +380,11 @@ struct FlashC2DecodeKernel {
         .kv_state = static_cast<float*>(kv_state.data_ptr()),
         .kv_output = static_cast<bf16_t*>(kv_output.data_ptr()),
         .norm_weight = static_cast<const bf16_t*>(norm_weight.data_ptr()),
-        .freqs_cis = store ? static_cast<const float*>(freqs_cis->data_ptr()) : nullptr,
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .req = static_cast<const int64_t*>(req.data_ptr()),
         .raw_out_loc = raw_out_loc.data_ptr(),
-        .kvcache = store ? static_cast<uint8_t*>(kvcache->data_ptr()) : nullptr,
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
         .ring_size = static_cast<uint32_t>(ring_size),
         .eps = eps,
     };
@@ -431,22 +393,18 @@ struct FlashC2DecodeKernel {
     const auto loc_i32 = loc_dtype.is_type<int32_t>();
     if (is_verify) {
       const auto block = static_cast<uint32_t>(draft_len);
-      const auto k = select<true, true>(pos_i32, loc_i32);
+      const auto k = select<true>(pos_i32, loc_i32);
       LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
-    } else if (store) {
-      const auto k = select<true, false>(pos_i32, loc_i32);
-      LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
-          .enable_pdl(kUsePDL)(k, params);
     } else {
-      const auto k = select<false, false>(pos_i32, loc_i32);
+      const auto k = select<false>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }
   }
 };
 
-// ensure that C++ wrapper can work
+// The JIT module names and wrappers spell the layouts as bare enumerators.
 using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang
