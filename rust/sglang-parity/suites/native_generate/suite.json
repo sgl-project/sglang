@@ -1,0 +1,211 @@
+{
+  "name": "native_generate",
+  "http": {
+    "method": "POST",
+    "path": "/generate"
+  },
+  "streaming": {
+    "fields": {
+      "/text": "text",
+      "/output_ids": "tokens",
+      "/index": "index",
+      "/meta_info/id": "constant",
+      "/meta_info/prompt_tokens": "constant",
+      "/meta_info/response_sent_to_client_ts": "first",
+      "/meta_info/e2e_latency": "terminal",
+      "/meta_info/weight_versions": "terminal",
+      "/meta_info/completion_tokens": "counter",
+      "/meta_info/reasoning_tokens": "counter",
+      "/meta_info/cached_tokens": "counter",
+      "/meta_info/num_retractions": "counter",
+      "/meta_info/output_token_logprobs_length": "counter",
+      "/meta_info/cached_tokens_details": "snapshot",
+      "/meta_info/dp_rank": "snapshot",
+      "/meta_info/weight_version": "snapshot",
+      "/meta_info/finish_reason": "finish_reason",
+      "/meta_info/input_token_logprobs": "input_logprobs",
+      "/meta_info/input_top_logprobs": "input_logprobs",
+      "/meta_info/input_token_ids_logprobs": "input_logprobs",
+      "/meta_info/output_token_logprobs": "output_logprobs",
+      "/meta_info/output_top_logprobs": "output_logprobs",
+      "/meta_info/output_token_ids_logprobs": "output_logprobs"
+    }
+  },
+  "comparison": {
+    "base": "exact_json",
+    "per_result_value_exceptions": [
+      {
+        "path": "/meta_info/id",
+        "require": "non_empty_string",
+        "reason": "Each request receives its own identifier."
+      },
+      {
+        "path": "/meta_info/e2e_latency",
+        "require": "non_negative_number",
+        "reason": "Elapsed time varies across runs."
+      },
+      {
+        "path": "/meta_info/response_sent_to_client_ts",
+        "presence": "optional",
+        "require": "non_negative_number",
+        "reason": "Send times vary. When provided, streaming timestamps belong to the first data event of each result and are retained in the reconstructed response."
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "greedy_json",
+      "equivalence_group": "greedy",
+      "body": {
+        "text": "The capital of France is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": false
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "greedy_stream",
+      "equivalence_group": "greedy",
+      "body": {
+        "text": "The capital of France is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "one_token_json",
+      "equivalence_group": "one_token",
+      "body": {
+        "text": "The capital of Japan is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 1,
+          "sampling_seed": 42
+        },
+        "stream": false
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "one_token_stream",
+      "equivalence_group": "one_token",
+      "body": {
+        "text": "The capital of Japan is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 1,
+          "sampling_seed": 42
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "batch_json",
+      "equivalence_group": "batch",
+      "body": {
+        "text": [
+          "The capital of France is",
+          "The largest ocean is"
+        ],
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": false
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "batch_stream",
+      "equivalence_group": "batch",
+      "body": {
+        "text": [
+          "The capital of France is",
+          "The largest ocean is"
+        ],
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "logprobs_json",
+      "equivalence_group": "logprobs",
+      "body": {
+        "text": "The capital of France is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "return_logprob": true,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 5,
+        "stream": false
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "logprobs_stream",
+      "equivalence_group": "logprobs",
+      "body": {
+        "text": "The capital of France is",
+        "sampling_params": {
+          "temperature": 0,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "return_logprob": true,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 5,
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "sampling_json",
+      "equivalence_group": "sampling",
+      "body": {
+        "text": "Write a short sentence about the sea.",
+        "sampling_params": {
+          "temperature": 0.7,
+          "top_p": 0.9,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": false
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "sampling_stream",
+      "equivalence_group": "sampling",
+      "body": {
+        "text": "Write a short sentence about the sea.",
+        "sampling_params": {
+          "temperature": 0.7,
+          "top_p": 0.9,
+          "max_new_tokens": 8,
+          "sampling_seed": 42
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    }
+  ]
+}

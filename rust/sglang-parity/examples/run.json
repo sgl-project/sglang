@@ -1,0 +1,17 @@
+{
+  "environment": {
+    "backend": "auto",
+    "setup_timeout_secs": 1800
+  },
+  "server": {
+    "model": "/path/to/model",
+    "args": [],
+    "env": {},
+    "port": 30000,
+    "seed": 42
+  },
+  "startup_timeout_secs": 600,
+  "request_timeout_secs": 120,
+  "shutdown_timeout_secs": 60,
+  "output_dir": "target/parity"
+}
