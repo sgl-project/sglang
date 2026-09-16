@@ -552,9 +552,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def flush_pending_backups(self) -> None:
         """
-        Submit host backups queued while caching this step's finished requests.
-        A cache whose write-back submits inline has nothing left to flush.
+        Submit queued host backups.
+        Caches without deferred backups have nothing to flush.
         """
+        pass
 
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()

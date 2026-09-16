@@ -1594,8 +1594,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        # Queued, not submitted: flush_pending_backups merges every node backed
-        # up in this step (all pools, all requests) into one D2H op.
+        # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
         )
@@ -3353,8 +3352,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
-        """Submit the D2H ops queued while caching finished requests, so the
-        batch that produced them issues them instead of the next step."""
+        """Submit pending D2H backups as a merged operation."""
         if self.linker is not None or self.cache_controller is None:
             return
         self.cache_controller.start_writing()

@@ -4649,9 +4649,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
-        # The batch that queued host backups also issues them, so a node is
-        # never left tree-committed but un-submitted across a scheduler step.
-        # A cache without queued write-back inherits the base no-op.
+        # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
         self._record_step_counters(batch, result)
