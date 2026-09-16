@@ -125,15 +125,33 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .expect("default http client builds");
+    // Peer bootstrap is enabled only when a peer selector is configured.
+    // Without one there is nobody to pull a snapshot from, so the tracker is
+    // pre-settled and `/readyz` behaves exactly as it did before this feature
+    // existed.
+    let kv_peer_selector = match &cfg.discovery {
+        sgl_router::config::DiscoveryBackend::K8s(k) => k.peer_selector.clone(),
+        _ => None,
+    };
     let kv_index = if prefix_index.is_some() {
         sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
             kv_event_http,
             Arc::clone(&block_size_oracle),
         )
     } else {
-        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+        let bootstrap = Arc::new(match (&cfg.model.cache_aware, &kv_peer_selector) {
+            (Some(ca), Some(_)) => {
+                sgl_router::policies::kv_events::BootstrapTracker::new_with_fetch_cap(
+                    std::time::Duration::from_millis(ca.bootstrap_timeout_ms),
+                    std::time::Duration::from_millis(ca.bootstrap_fetch_timeout_cap_ms),
+                )
+            }
+            _ => sgl_router::policies::kv_events::BootstrapTracker::disabled(),
+        });
+        sgl_router::policies::kv_events::KvEventIndex::new_with_bootstrap(
             kv_event_http,
             Arc::clone(&block_size_oracle),
+            bootstrap,
         )
     };
     let policies = Arc::new(
@@ -174,11 +192,9 @@ async fn main() -> Result<()> {
     // as the prefix source there is nothing to graft into. The CLI already
     // rejects that combination; this keeps the invariant local to the wiring.
     if let (Some(selector), sgl_router::config::DiscoveryBackend::K8s(k8s)) = (
-        match &cfg.discovery {
-            sgl_router::config::DiscoveryBackend::K8s(k) => k.peer_selector.as_ref(),
-            _ => None,
-        }
-        .filter(|_| kv_index.snapshot_source().is_some()),
+        kv_peer_selector
+            .as_ref()
+            .filter(|_| kv_index.snapshot_source().is_some()),
         &cfg.discovery,
     ) {
         // Peers are only usable on the family this router actually listens on
