@@ -10,7 +10,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.srt.layers.attention.dsv4 import torch_quant as tq
+import kv_quant_reference as tq
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -330,9 +330,9 @@ class TestV41KVStore(CustomTestCase):
         holds the quantized rope_tail of the pre-RoPE latent the kernel publishes
         (bitwise; the fp8 layout after the model's fp4 fake quantization), and the
         latent is the torch RMSNorm to within an fp32-reduction-order bf16 ulp."""
-        from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
-        from sglang.kernels.ops.attention.dsv4.c2 import (
-            c2_decode_or_verify_norm_rope_store,
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import c1_decode_norm_rope_store
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c2_decode_norm_rope_store,
         )
 
         g = torch.Generator(device="cuda").manual_seed(4)
@@ -443,7 +443,7 @@ class TestV41KVStore(CustomTestCase):
                         dtype=torch.uint8,
                         device="cuda",
                     )
-                    latent = c2_decode_or_verify_norm_rope_store(
+                    latent = c2_decode_norm_rope_store(
                         kv_input,
                         state,
                         w,

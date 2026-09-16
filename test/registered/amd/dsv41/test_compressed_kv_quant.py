@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.torch_quant import (
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
@@ -47,7 +47,7 @@ class TestCompressedKVQuant(CustomTestCase):
     )
     def test_cuda_compressor_scale_boundaries(self):
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-        from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import c1_decode_norm_rope_store
 
         maxima = torch.tensor(
             [0, 2**-12, 6 * 2**-9, 6 * 1.0625, 6 * 1.1875, 6 * 448, 1e6, 8.25],
