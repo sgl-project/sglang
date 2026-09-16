@@ -394,6 +394,11 @@ pub trait Worker: Send + Sync + fmt::Debug {
         &self.metadata().models
     }
 
+    /// Snapshot the current models, including any lazy-discovery updates.
+    fn models_snapshot(&self) -> Vec<ModelCard> {
+        self.models().to_vec()
+    }
+
     /// Set models for this worker (for lazy discovery).
     /// Default implementation does nothing - only BasicWorker supports this.
     fn set_models(&self, _models: Vec<ModelCard>) {
@@ -841,6 +846,15 @@ impl Worker for BasicWorker {
         }
         // Fall back to metadata.models (empty = wildcard = supports nothing until discovery)
         self.metadata.supports_model(model_id)
+    }
+
+    fn models_snapshot(&self) -> Vec<ModelCard> {
+        if let Ok(guard) = self.models_override.read() {
+            if let Some(models) = guard.as_ref() {
+                return models.clone();
+            }
+        }
+        self.metadata.models.clone()
     }
 
     fn set_models(&self, models: Vec<ModelCard>) {
@@ -1309,8 +1323,41 @@ mod tests {
     use super::*;
     use crate::core::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        DPAwareWorkerBuilder,
+        BasicWorkerBuilder, DPAwareWorkerBuilder,
     };
+
+    #[test]
+    fn test_models_snapshot_falls_back_to_registered_models() {
+        let worker = BasicWorkerBuilder::new("http://localhost:8000")
+            .models(vec![ModelCard::new("registered")])
+            .build();
+        assert_eq!(worker.models_snapshot()[0].id, "registered");
+    }
+
+    #[test]
+    fn test_models_snapshot_tracks_refreshes_without_mutating_older_snapshots() {
+        let worker = BasicWorkerBuilder::new("http://localhost:8000")
+            .models(vec![ModelCard::new("registered")])
+            .build();
+        let mut discovered = ModelCard::new("discovered");
+        discovered.context_length = Some(4096);
+        worker.set_models(vec![discovered]);
+        let first = worker.models_snapshot();
+        assert_eq!(first[0].id, "discovered");
+        assert_eq!(first[0].context_length, Some(4096));
+        worker.set_models(vec![ModelCard::new("replacement")]);
+        assert_eq!(worker.models_snapshot()[0].id, "replacement");
+        assert_eq!(first[0].id, "discovered");
+    }
+
+    #[test]
+    fn test_models_snapshot_preserves_an_explicit_empty_update() {
+        let worker = BasicWorkerBuilder::new("http://localhost:8000")
+            .models(vec![ModelCard::new("registered")])
+            .build();
+        worker.set_models(vec![]);
+        assert!(worker.models_snapshot().is_empty());
+    }
 
     #[test]
     fn test_parse_bootstrap_host_strips_dp_rank_suffix() {

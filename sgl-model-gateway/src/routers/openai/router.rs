@@ -428,7 +428,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut seen_models = HashSet::new();
 
         for worker in &external_workers {
-            for model_card in worker.models() {
+            for model_card in worker.models_snapshot() {
                 let owned_by = model_card
                     .provider
                     .as_ref()

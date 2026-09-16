@@ -867,6 +867,63 @@ fn oracle_config_validation_requires_config_when_enabled() {
     }
 }
 
+/// Model discovery must read the same data that set_models updates.
+#[tokio::test]
+async fn test_openai_models_return_refreshed_metadata_and_keep_it_on_refresh_failure() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = calls.clone();
+    let backend = Router::new().route(
+        "/v1/models",
+        axum::routing::get(move || {
+            let captured = captured.clone();
+            async move {
+                let index = captured.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = match index {
+                    0 => (StatusCode::OK, json!({"data": [{"id": "discovered-one"}]})),
+                    1 => (StatusCode::OK, json!({"data": [{"id": "discovered-two"}]})),
+                    _ => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({"error": "unavailable"}),
+                    ),
+                };
+                (status, Json(body))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    struct ServerTask(tokio::task::JoinHandle<()>);
+    impl Drop for ServerTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = ServerTask(tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    }));
+    let ctx = crate::common::test_app::create_test_app_context().await;
+    crate::common::test_app::register_external_worker(&ctx, &url, Some(vec!["registered"]));
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
+    for expected in ["discovered-one", "discovered-two", "discovered-two"] {
+        let response = router
+            .get_models(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["data"].as_array().unwrap().len(), 1);
+        assert_eq!(result["data"][0]["id"], expected);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
 #[test]
 fn oracle_config_validation_accepts_dsn_only() {
     let config = RouterConfig::builder()
