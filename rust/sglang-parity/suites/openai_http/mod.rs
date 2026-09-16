@@ -433,7 +433,14 @@ impl OpenAiPolicy {
                 .clone()
                 .ok_or_else(|| invalid("", "JSON evidence unavailable"))?;
             if case.expect_status >= 400 {
-                if !value["error"].is_object() || !value["error"]["message"].is_string() {
+                let error = if value.get("error").is_some_and(Value::is_object) {
+                    &value["error"]
+                } else if value["object"] == "error" {
+                    &value
+                } else {
+                    return Err(invalid("/error", "expected structured error envelope"));
+                };
+                if !error["message"].is_string() {
                     return Err(invalid("/error", "expected structured error with message"));
                 }
                 return Ok(value.into());

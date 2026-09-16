@@ -206,7 +206,14 @@ pub(super) fn reconstruct(
                     }
                     state.origins.entry(path).or_default().push(event_index);
                 }
-                if continuous && !value.get("usage").is_some_and(Value::is_object) {
+                // Role-only and empty terminal deltas are control events.
+                let content = if chat {
+                    &entry["delta"]["content"]
+                } else {
+                    &entry["text"]
+                };
+                let has_content = content.as_str().is_some_and(|s| !s.is_empty());
+                if continuous && has_content && !value.get("usage").is_some_and(Value::is_object) {
                     return Err(invalid("/usage", "requested continuous usage missing"));
                 }
                 state.finished = terminal;

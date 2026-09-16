@@ -347,3 +347,23 @@ fn error_responses_and_malformed_unary_contracts_remain_distinct() {
         );
     }
 }
+
+#[test]
+fn chat_control_events_need_no_continuous_usage_and_native_errors_are_preserved() {
+    let (c, p) = case("chat_continuous_usage");
+    let mut values = stream(true);
+    values[1]["usage"] = usage_event(true)["usage"].clone();
+    assert!(p.prepare(&c, &capture(values)).is_ok());
+    let (c, p) = case("chat_invalid_max_tokens");
+    let value = json!({"object":"error","message":"invalid tokens","code":400,"param":null});
+    let response = p
+        .prepare(
+            &c,
+            &HttpObservation {
+                json: Some(value.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(response.value, value);
+}
