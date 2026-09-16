@@ -380,12 +380,6 @@ class MambaPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # When can_use_write_back_jit is True on the HostPoolGroup,
-            # start_writing() keeps host_indices on CPU (for MLA staged kernel).
-            # Move dst_indices to CUDA here to satisfy the kernel's requirement.
-            if dst_indices.device.type != "cuda":
-                dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
                 dst=dst,
@@ -460,6 +454,11 @@ class MambaPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
         if self.layout in ["page_first", "page_first_direct"]:
+            if io_backend == "kernel" and host_indices.device != device_indices.device:
+                # The mamba JIT kernel wants both index tensors on the device;
+                # the staged MHA/MLA write path hands us CPU host indices.
+                # Convert once here rather than per conv/temporal tensor.
+                host_indices = host_indices.to(device_indices.device, non_blocking=True)
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
                 self._copy_tensor_all_layers_lf_pf(
