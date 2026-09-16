@@ -41,6 +41,11 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
     DeepseekV4AttnBackend,
+)
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DSV4AttnMetadata as SharedDSV4AttnMetadata,
+)
+from sglang.srt.layers.attention.deepseek_v4_backend import (
     _pad_last_dim,
 )
 from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMetadata
@@ -87,6 +92,7 @@ if TYPE_CHECKING:
         FP4PrefillWorkspace,
     )
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+    from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -459,9 +465,10 @@ class DSV4AttnMetadata:
 
     def init_compression_metadata(self, unified_swa_pages: int = 0):
         assert self.page_table.dim() == 2
-        assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
-            f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
-        )
+        assert (
+            self.raw_out_loc.ndim == 1
+            and self.raw_out_loc.shape[0] <= self.seq_lens_casual.shape[0]
+        ), f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
 
         (
             self.c4_out_loc,
@@ -523,41 +530,7 @@ class DSV4AttnMetadata:
         "c2_out_loc",
     ]
 
-    def apply_cp_reindex(self) -> None:
-        cp_rank = get_parallel().attn_cp_rank
-        cp_size = get_parallel().attn_cp_size
-        idx = slice(cp_rank, None, cp_size)
-        pre_global_len = self.seq_lens_casual.shape[0]
-        assert pre_global_len % cp_size == 0, (
-            f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "
-            "CP round-robin requires padding to ensure divisibility."
-        )
-        expected_local_len = pre_global_len // cp_size
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name, None)
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
-            setattr(self, field_name, val[idx].contiguous())
-        for field_name in self._CP_REINDEX_OPTIONAL_FIELDS:
-            val = getattr(self, field_name)
-            if val is not None:
-                setattr(self, field_name, val[idx].contiguous())
-
-        for field_name in self._CP_REINDEX_FIELDS:
-            val = getattr(self, field_name)
-            assert val.shape[0] == expected_local_len, (
-                f"apply_cp_reindex post-condition: {field_name}.shape[0]={val.shape[0]} "
-                f"!= expected_local_len={expected_local_len} (cp_size={cp_size})"
-            )
-        for field_name in self._CP_GLOBAL_FIELDS:
-            val = getattr(self, field_name, None)
-            if val is None:
-                continue
-            assert val.shape[0] == pre_global_len, (
-                f"apply_cp_reindex post-condition: global field {field_name}.shape[0]={val.shape[0]} "
-                f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
-            )
+    apply_cp_reindex = SharedDSV4AttnMetadata.apply_cp_reindex
 
     def init_flashmla_related(self, is_prefill: bool = False):
         assert self.index_topk in (512, 1024), (
@@ -974,10 +947,16 @@ class DeepseekV4HipRadixBackend(
         # Whether num_tokens == sum(extend_seq_lens) exactly, which lets the
         # token map skip an implicit D2H.
         exact_num_tokens: bool = True,
+        cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
     ) -> DSV4Metadata:
         from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
             ExpandPrefillCausally,
         )
+
+        padded_num_tokens = out_cache_loc.shape[0]
+        if cp_metadata is not None:
+            padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            out_cache_loc = out_cache_loc[:num_tokens]
 
         # extend_start_loc and the CPU mirrors below only feed the torch
         # fallback; the triton kernel cumsums extend_seq_lens on device, so
@@ -990,7 +969,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             num_tokens=num_tokens,
-            padded_num_tokens=out_cache_loc.shape[0],
+            padded_num_tokens=padded_num_tokens,
         )
         seq_lens_casual = _expanded.seq_lens_casual
         req_pool_indices_repeated = _expanded.req_pool_indices_repeated
@@ -1012,6 +991,13 @@ class DeepseekV4HipRadixBackend(
             and extend_seq_lens_cpu is not None
             and sum(extend_seq_lens_cpu) == num_tokens
         )
+        if cp_metadata is not None:
+            # Queries are local; stores still cover every real global token.
+            core_attn_metadata.apply_cp_reindex(
+                num_tokens=num_tokens, local_index=cp_metadata.local_index
+            )
+            if need_compress:
+                core_attn_metadata.init_flashmla_related(is_prefill=True)
         self._attach_unified_kv_prefill_meta(
             core_attn_metadata,
             req_pool_indices,
@@ -1856,6 +1842,8 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> DSV4Metadata:
+        from sglang.srt.layers.cp.utils import is_cp_active
+
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_seq_lens = forward_batch.extend_seq_lens
         assert (
@@ -1877,6 +1865,9 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=not is_draft,
+            cp_metadata=forward_batch.attn_cp_metadata
+            if is_cp_active(forward_batch)
+            else None,
         )
 
     # ---- decoder SWA bounded replay ---------------------------------------
@@ -2696,14 +2687,20 @@ class DeepseekV4HipRadixBackend(
     def _low_ratio_index_topk_dense(
         self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
     ) -> None:
-        # The shared CP caller supplies local rows per request. Its CUDA dense
-        # implementation requires DeepGEMM; retain the torch reference on HIP.
-        req = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64),
-            q_lens.to(torch.int64),
-            output_size=x.shape[0],
+        if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
+            req = torch.repeat_interleave(
+                forward_batch.req_pool_indices.to(torch.int64),
+                q_lens.to(torch.int64),
+                output_size=x.shape[0],
+            )
+            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+            return
+        self.forward_metadata.core_metadata.drop_folded_sparse_indices(
+            layer.compress_ratio
         )
-        self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+        low_ratio_index_topk_hip_extend(
+            self, layer, x, q_lora, pos, forward_batch, query_lens_cpu=q_lens_cpu
+        )
 
     def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
         """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;

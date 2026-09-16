@@ -528,16 +528,19 @@ class TestLowRatioPrepareStreams(CustomTestCase):
         )
         x = torch.empty(5, 16, device="cuda")
         pos = torch.tensor([2, 4, 6, 8, 10], device="cuda")
-        DeepseekV4HipRadixBackend._low_ratio_index_topk_dense(
-            backend,
-            None,
-            x,
-            x,
-            pos,
-            batch,
-            torch.tensor([2, 0, 3], device="cuda"),
-            [2, 0, 3],
-        )
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True):
+            DeepseekV4HipRadixBackend._low_ratio_index_topk_dense(
+                backend,
+                None,
+                x,
+                x,
+                pos,
+                batch,
+                torch.tensor([2, 0, 3], device="cuda"),
+                [2, 0, 3],
+            )
         call = backend._low_ratio_index_topk_torch.call_args.args
         self.assertEqual(call[3].tolist(), [7, 7, 11, 11, 11])
         self.assertIs(call[4], pos)
@@ -585,6 +588,194 @@ class TestLowRatioPrepareStreams(CustomTestCase):
             torch.testing.assert_close(
                 output, (x + 1) * 3 + (x * 2 + x + 1) + (x * 4 + 5)
             )
+
+
+@unittest.skipUnless(is_hip(), "HIP context-parallel prefill")
+class TestLowRatioContextParallel(CustomTestCase):
+    def test_local_indexer_matches_global_rows(self):
+        for extend in ([5, 1, 6], [4, 1, 6]):
+            with self.subTest(extend=extend):
+                self._check_local_indexer(extend)
+
+    def _check_local_indexer(self, extend):
+        from unittest.mock import patch
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            store_fp4_index_k_cache_split,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+        from sglang.srt.layers.cp import base as cp_base
+        from sglang.srt.layers.cp.interleave import (
+            InterleaveContextParallelMetadata,
+            InterleaveCPStrategy,
+            interleave_rows_per_request,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        torch.manual_seed(481)
+        device = "cuda"
+        backend = _make_backend(
+            block_size=5, device=device, low_ratios=(1, 2), is_dspark_draft=False
+        )
+        context = 1536
+        slots = NUM_REQ_SLOTS * context
+        backend.req_to_token = torch.arange(
+            slots, device=device, dtype=torch.int32
+        ).view(NUM_REQ_SLOTS, context)
+        backend.token_to_kv_pool.full_to_swa_index_mapping = torch.arange(
+            slots, device=device, dtype=torch.int64
+        )
+        backend.token_to_kv_pool.translate_loc_from_full_to_swa = lambda idx: idx
+        backend.token_to_kv_pool.get_index_k_page_size = lambda ratio: 64
+        backend.dsa_topk_backend = SimpleNamespace(should_use_topk_v2=lambda: False)
+        req = torch.tensor([4, 1, 3], device=device, dtype=torch.int32)
+        seq = [prefix + length for prefix, length in zip([1100, 1300, 100], extend)]
+        positions = torch.cat(
+            [torch.arange(s - e, s, device=device) for s, e in zip(seq, extend)]
+        )
+        repeated = req.repeat_interleave(torch.tensor(extend, device=device))
+        out_loc = backend.req_to_token[repeated.long(), positions].long()
+        batch = SimpleNamespace(
+            seq_lens_cpu=seq,
+            extend_seq_lens_cpu=extend,
+            req_pool_indices=req,
+            input_ids=torch.arange(12, device=device),
+            positions=positions,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=torch.tensor(extend, device=device, dtype=torch.int32),
+            out_cache_loc=out_loc,
+        )
+        kwargs = dict(
+            max_seq_len=max(seq),
+            req_pool_indices=req,
+            seq_lens=torch.tensor(seq, device=device, dtype=torch.int32),
+            seq_lens_cpu=seq,
+            out_cache_loc=out_loc,
+            num_tokens=sum(extend),
+            extend_seq_lens=torch.tensor(extend, device=device, dtype=torch.int32),
+            extend_seq_lens_cpu=extend,
+        )
+        queries = fake_quant_fp4(
+            torch.randn(sum(extend), 32, 128, device=device, dtype=torch.bfloat16)
+        )
+        weights = torch.rand(sum(extend), 32, device=device, dtype=torch.bfloat16)
+        indexer = SimpleNamespace(
+            n_local_heads=32,
+            n_heads=32,
+            index_topk=512,
+            weights_proj_hip_max_tokens=0,
+            queries=lambda q, freqs, positions: q,
+            head_weights=lambda x: x,
+            candidate_topk_blocks=8,
+            candidate_block_size=8,
+        )
+        for ratio in (1, 2):
+            k = fake_quant_fp4(
+                torch.randn(slots // ratio, 128, device=device, dtype=torch.bfloat16)
+            )
+            payload = torch.empty(
+                slots // ratio // 64, 1, 4, 64, 16, device=device, dtype=torch.uint8
+            ).view(torch.float4_e2m1fn_x2)
+            scales = torch.empty(
+                slots // ratio // 64, 1, 4, 64, device=device, dtype=torch.uint8
+            )
+            store_fp4_index_k_cache_split(
+                k,
+                payload,
+                scales,
+                torch.arange(slots // ratio, device=device, dtype=torch.int32),
+                page_size=64,
+                rne=True,
+            )
+            backend.token_to_kv_pool.get_index_k_fp4_payload_buffer = lambda layer: (
+                payload
+            )
+            backend.token_to_kv_pool.get_index_k_fp4_scale_buffer = lambda layer: scales
+            layer = SimpleNamespace(
+                indexer=indexer, compress_ratio=ratio, layer_id=0, freqs_cis=None
+            )
+            full = backend.init_forward_metadata_prefill(**kwargs)
+            expected = []
+            for rank in (None, 0, 1, 2, 3):
+                if rank is None:
+                    metadata, rows, lens = full, slice(None), extend
+                else:
+                    rows = slice(rank, None, 4)
+                    lens = interleave_rows_per_request(extend, rank, 4)
+                    batch.attn_cp_metadata = InterleaveContextParallelMetadata(
+                        per_rank_actual_token=[3] * 4, total_seq_lens=sum(extend)
+                    )
+                    with (
+                        get_parallel().override(attn_cp_size=4, attn_cp_rank=rank),
+                        patch.object(
+                            cp_base, "_STRATEGY", InterleaveCPStrategy(cp_size=4)
+                        ),
+                    ):
+                        metadata = backend._init_forward_metadata_prefill_from_batch(
+                            batch,
+                            max_seq_len=max(seq),
+                            req_pool_indices=req,
+                            seq_lens=kwargs["seq_lens"],
+                            seq_lens_cpu=torch.tensor(seq),
+                        )
+                    for field in full.core_metadata._CP_REINDEX_FIELDS:
+                        torch.testing.assert_close(
+                            getattr(metadata.core_metadata, field)[: sum(lens)],
+                            getattr(full.core_metadata, field)[rows],
+                            rtol=0,
+                            atol=0,
+                        )
+                    for field in full.core_metadata._CP_GLOBAL_FIELDS:
+                        torch.testing.assert_close(
+                            getattr(metadata.core_metadata, field),
+                            getattr(full.core_metadata, field),
+                            rtol=0,
+                            atol=0,
+                        )
+                backend.forward_metadata = metadata
+                backend.candidate_masks = None
+                for stage in ("source", "consumer"):
+                    indexer.is_candidate_source = stage == "source"
+                    indexer.uses_candidates = stage == "consumer"
+                    with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False):
+                        if rank is None:
+                            backend._low_ratio_index_topk_dense(
+                                layer,
+                                weights,
+                                queries,
+                                positions,
+                                batch,
+                                torch.tensor(lens, device=device),
+                                lens,
+                            )
+                        else:
+                            with get_parallel().override(
+                                attn_cp_size=4, attn_cp_rank=rank
+                            ):
+                                backend._forward_low_ratio_sources_cp(
+                                    layer=layer,
+                                    x=weights[rows],
+                                    q_lora=queries[rows],
+                                    positions=positions[rows],
+                                    forward_batch=batch,
+                                    run_compressor=False,
+                                    run_indexer=True,
+                                )
+                    result = (
+                        metadata.core_metadata.sparse_page_indices(ratio),
+                        metadata.core_metadata.sparse_raw_indices(ratio),
+                    )
+                    if rank is None:
+                        expected.append(tuple(t.clone() for t in result))
+                    else:
+                        for actual, global_result in zip(
+                            result, expected[stage == "consumer"]
+                        ):
+                            torch.testing.assert_close(
+                                actual[: sum(lens)], global_result[rows], rtol=0, atol=0
+                            )
+                            self.assertTrue((actual[sum(lens) :] == -1).all())
 
 
 if __name__ == "__main__":
