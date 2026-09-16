@@ -26,6 +26,11 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation.common.bootstrap_auth import (
+    bootstrap_auth_headers,
+    get_bootstrap_auth_token,
+    is_bootstrap_write_authorized,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -184,6 +189,7 @@ class CommonKVManager(BaseKVManager):
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        self.bootstrap_auth_token = get_bootstrap_auth_token()
         self.dist_init_addr = get_parallel().dist_init_addr
         parallel = get_parallel()
         self.attn_tp_size = parallel.attn_tp_size
@@ -1025,8 +1031,31 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
+    def _sync_bootstrap_auth_token(self, local_token: Optional[str]) -> Optional[str]:
+        """Broadcast rank-0's bootstrap write token so multi-node prefill
+        ranks PUT with the same secret the leader's bootstrap server expects.
+        """
+        if not self.dist_init_addr or get_parallel().nnodes == 1:
+            return local_token
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                "torch.distributed must be initialised before "
+                "CommonKVManager registers to the bootstrap server in "
+                "multi-node prefill mode."
+            )
+
+        return get_world_group().broadcast_object(local_token, src=0)
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
+        token = (
+            getattr(self, "bootstrap_auth_token", None) or get_bootstrap_auth_token()
+        )
+        if self.dist_init_addr and get_parallel().nnodes > 1:
+            token = self._sync_bootstrap_auth_token(token)
+        self.bootstrap_auth_token = token
+
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -1088,9 +1117,10 @@ class CommonKVManager(BaseKVManager):
 
     def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        headers = bootstrap_auth_headers(getattr(self, "bootstrap_auth_token", None))
         for attempt in range(max_retries):
             try:
-                response = requests.put(url, json=payload, timeout=5)
+                response = requests.put(url, json=payload, timeout=5, headers=headers)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
@@ -1460,8 +1490,11 @@ class CommonKVSender(BaseKVSender):
             "bootstrap_room": self.bootstrap_room,
             "dp_rank": self.kv_mgr.attn_dp_rank,
         }
+        headers = bootstrap_auth_headers(
+            getattr(self.kv_mgr, "bootstrap_auth_token", None)
+        )
         try:
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, timeout=5, headers=headers)
             if response.status_code != 200:
                 logger.error(
                     f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
@@ -1894,9 +1927,12 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, auth_token: Optional[str] = None):
         self.host = host
         self.port = port
+        self.auth_token = (
+            auth_token if auth_token is not None else get_bootstrap_auth_token()
+        )
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -1952,9 +1988,21 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
 
+    def _unauthorized_write_response(
+        self, request: web.Request
+    ) -> Optional[web.Response]:
+        if is_bootstrap_write_authorized(
+            request.headers.get("Authorization"), self.auth_token
+        ):
+            return None
+        return web.Response(text="Unauthorized", status=401)
+
     async def _handle_route(self, request: web.Request):
         method = request.method
         if method == "PUT":
+            denied = self._unauthorized_write_response(request)
+            if denied is not None:
+                return denied
             return await self._handle_route_put(request)
         elif method == "GET":
             return await self._handle_route_get(request)
@@ -1964,6 +2012,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
     async def _handle_route_put(self, request: web.Request):
+        denied = self._unauthorized_write_response(request)
+        if denied is not None:
+            return denied
         data = await request.json()
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
@@ -2104,6 +2155,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
+        denied = self._unauthorized_write_response(request)
+        if denied is not None:
+            return denied
         data = await request.json()
         bootstrap_room = int(data["bootstrap_room"])
         dp_rank = int(data["dp_rank"])
@@ -2166,6 +2220,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.info(
                 f"CommonKVBootstrapServer started successfully on {self.host}:{self.port}"
             )
+            if self.auth_token:
+                logger.info(
+                    "PD bootstrap mutating endpoints (PUT /route, POST "
+                    "/register_dp_rank) require an Authorization bearer token"
+                )
+            else:
+                logger.warning(
+                    "PD bootstrap has no auth token; PUT /route and POST "
+                    "/register_dp_rank will reject unauthenticated writes"
+                )
             self._loop.run_forever()
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)

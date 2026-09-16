@@ -1769,6 +1769,16 @@ def _set_envs_and_config(server_args: ServerArgs):
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
 
+    # PD bootstrap mutating HTTP (PUT /route) is fail-closed. Generate a
+    # process-tree secret before scheduler spawn so the tokenizer-side
+    # bootstrap server and the scheduler-side register_to_bootstrap share it.
+    if cfg.disaggregation_mode == "prefill":
+        from sglang.srt.disaggregation.common.bootstrap_auth import (
+            ensure_bootstrap_auth_token,
+        )
+
+        ensure_bootstrap_auth_token(api_key=cfg.api_key)
+
     _log_legacy_kernel_cache_dirs()
 
 

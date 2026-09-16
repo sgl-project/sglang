@@ -687,6 +687,11 @@ class Envs:
     # Retained only to reject the removed setting during startup.
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(None)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
+    # Shared secret for PD bootstrap mutating HTTP (PUT /route, POST
+    # /register_dp_rank). Unset is fail-closed: unauthenticated writes are rejected.
+    # Engine auto-generates one for prefill before subprocess spawn when neither
+    # this nor --api-key is set.
+    SGLANG_DISAGGREGATION_BOOTSTRAP_AUTH_TOKEN = EnvStr(None)
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
