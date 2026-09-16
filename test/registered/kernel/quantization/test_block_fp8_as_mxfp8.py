@@ -304,14 +304,14 @@ class TestPrefillAutotune(_OptInCase):
                 self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
 
     def test_tuned_prefill_against_fp32_reference(self):
-        self.enterContext(
-            patch(
-                "sglang.srt.runtime_context.get_exec",
-                return_value=SimpleNamespace(
-                    deterministic=SimpleNamespace(enable_deterministic_inference=False)
-                ),
-            )
+        runtime_patch = patch(
+            "sglang.srt.runtime_context.get_exec",
+            return_value=SimpleNamespace(
+                deterministic=SimpleNamespace(enable_deterministic_inference=False)
+            ),
         )
+        runtime_patch.start()
+        self.addCleanup(runtime_patch.stop)
         from flashinfer.autotuner import autotune
 
         from sglang.kernels.ops.quantization.fp8_kernel import (
