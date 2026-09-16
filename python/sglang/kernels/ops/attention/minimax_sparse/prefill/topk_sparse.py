@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -22,13 +22,9 @@ _is_hip = is_hip()
 
 @functools.cache
 def _sparse_subk_divisor() -> int:
-    """How many sub-tiles a CDNA KV tile is split into: 2 on gfx950, 4 on gfx942,
-    0 (no sub-tiling) elsewhere."""
-    if is_gfx95_supported():
-        return 2
-    if is_gfx942_supported():
-        return 4
-    return 0
+    """How many sub-tiles a KV tile is split into: 2 on gfx950, where it was measured;
+    0 (the single-tile loop, unchanged from before) everywhere else, gfx942 included."""
+    return 2 if is_gfx95_supported() else 0
 
 
 def _sparse_subk(block_size_k: int) -> int:
