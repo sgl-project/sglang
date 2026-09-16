@@ -784,6 +784,9 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Let decode ranks contribute embedded CPU memory to a Mooncake store used
+    # by prefill-side external-cache linkers, without enabling cache I/O on decode.
+    SGLANG_MOONCAKE_STORE_CONTRIBUTOR = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
