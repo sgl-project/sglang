@@ -1,29 +1,17 @@
 // Fused deferred-MoE finalize -> 1shot lamport push all-reduce [-> RMSNorm]
-// over the CustomAllReduceV2 push plane, for decode-sized batches (bf16).
+// over the CustomAllReduceV2 push plane, for decode-sized batches (bf16). The
+// hidden width, top_k and cluster geometry are template parameters; the
+// shared-expert add and the RMSNorm epilogue are optional.
 //
-// A generalisation of the K3 `finalize_push_norm` kernel
-// (csrc/kimi_k3/comm/ar_fusion.cuh): the hidden width, top_k and cluster
-// geometry are template parameters chosen from Python, the shared-expert add
-// and the RMSNorm epilogue are optional, and the result goes to a separate
-// output tensor. Per token row t:
-//
-//   local[t] = sum_k expert_weights[t, k] * gemm2_out[idx[t * top_k + k]]
-//              (+ shared_output[t])                     -- stage 1, registers only
-//   out[t]   = sum over ranks of local[t]               -- stage 2
-//   out[t]   = out[t] * rsqrt(mean(out[t]^2) + eps) * w -- kNorm only
-//
-// `idx == -1` marks a dropped slot (EP: the token was routed to an expert
-// that is not local) and contributes nothing. Accumulation is fp32; the bf16
-// rounding points are exactly the unfused path's: the routed combine (what
-// TRT-LLM's finalize returns), the `+ shared` (torch's bf16 add) and the
-// all-reduce output, so the plain (kNorm=false) result equals TRT-LLM finalize
-// -> `shared.add_(routed)` -> fp32-accumulating bf16 all-reduce in rank order,
-// and the staged vector is bit-identical to what the unfused path reduces.
+// `idx == -1` marks a dropped slot (EP: the token was routed to an expert that
+// is not local) and contributes nothing. Accumulation is fp32 and the bf16
+// rounding points are exactly the unfused path's (moe_runner/flashinfer_trtllm.py
+// finalize -> `shared.add_(routed)` -> fp32-accumulating bf16 all-reduce in rank
+// order), so the kNorm=false result is bit-identical to it.
 //
 // The rank-local finalize never materializes in global memory: each thread
 // computes one 16B vector of it and pushes it straight into every peer's push
-// slot with unicast `st.relaxed.sys` stores, exactly like the generic
-// `all_reduce_1shot_push_kernel`, so no multicast mapping is required.
+// slot with unicast `st.relaxed.sys` stores, so no multicast mapping is needed.
 //
 // Push-plane protocol (see include/sgl_kernel/distributed/communicator.cuh):
 //   * every rank owns 2 phases x kWorldSize slots of `slot_bytes`; a round
@@ -32,13 +20,11 @@
 //     reduces, and restores the +0.0 markers before it exits;
 //   * +0.0 payload words are remapped to -0.0 (numerically identical) so a
 //     written word is never 0 and `word == 0` means "not arrived yet";
-//   * the phase counters are per block of the GENERIC push kernel, which
-//     launches `num_blocks` blocks and flips one counter each. This kernel
-//     uses one counter per row cluster (flipped by the cluster's leader block
-//     after a cluster barrier, since every block of the cluster reads it) and
-//     a trailing "bumper" cluster flips every remaining one, so the whole
-//     array keeps one parity and the two kernel families can share the plane
-//     freely (single-stream calls are serialized);
+//   * the generic push kernel owns one phase counter per block; this kernel
+//     uses one per row cluster (flipped by the cluster's leader block after a
+//     cluster barrier) plus a trailing "bumper" cluster that flips every
+//     remaining one, so the whole array keeps one parity and both kernel
+//     families can share the plane;
 //   * every rank must call with the same num_tokens / hidden / top_k / epilogue:
 //     slots are addressed by 16B vector index of the [T, hidden] row view.
 #include <sgl_kernel/ffi.h>
@@ -81,7 +67,7 @@ SGL_DEVICE void barrier_cluster_wait() {
 }
 
 template <uint32_t kWorldSize, typename WeightT>
-struct FinalizeAllReduceParams {
+struct MoeFinalizeAllReduceParams {
   bf16_t* out;                // [num_tokens, kHiddenDim], output-only
   const bf16_t* gemm2;        // [P, kHiddenDim], permuted / padded rows
   const int32_t* idx;         // [num_tokens * kTopK], -1 = dropped slot
@@ -89,11 +75,10 @@ struct FinalizeAllReduceParams {
   const bf16_t* shared;       // [num_tokens, kHiddenDim] (kHasShared only)
   const bf16_t* norm_weight;  // [kHiddenDim] (kNorm only)
   float norm_eps;             // kNorm only
-  // Caller's promise that everything this kernel reads before its PDL wait is
-  // complete when the preceding kernel merely *triggers*: no all-reduce on this
-  // plane right before it, and the routing metadata's producers finished (not
-  // just the immediate predecessor -- PDL completion is not transitive through
-  // early-triggering kernels). False (the safe default) waits first.
+  // Caller's promise that everything read before the PDL wait is complete when
+  // the predecessor merely *triggers*: no all-reduce on this plane right before
+  // it, and the routing metadata's producers finished (PDL completion is not
+  // transitive through early-triggering kernels). False (the default) waits first.
   bool prefetch_metadata;
   uint32_t rank;
   uint32_t num_tokens;
@@ -111,7 +96,10 @@ struct FinalizeAllReduceParams {
 
 template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE void mhc_quant_vec(
-    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& value, uint32_t token, uint32_t hvec) {
+    const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params,
+    const StageVec& value,
+    uint32_t token,
+    uint32_t hvec) {
   using namespace device;
   fp32x2_t v[4];
   float amax = 0.0f;
@@ -143,12 +131,12 @@ SGL_DEVICE void mhc_quant_vec(
   }
 }
 
-/// Apply HC=4 post mixing to an already BF16-rounded all-reduce vector.
-/// Match mhc_post_split_h: round comb[0]*residual[0], then FMA post*x,
-/// then FMA the remaining three residual streams in order.
+/// HC=4 post mixing of an already BF16-rounded all-reduce vector, in
+/// mhc_post_split_h's order: round comb[0]*residual[0], FMA post*x, then the
+/// remaining three residual streams.
 template <uint32_t kHiddenDim, bool kCollapse = false, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE StageVec mhc_post_vec(
-    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& red, uint32_t token, uint32_t hvec) {
+    const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& red, uint32_t token, uint32_t hvec) {
   using namespace device;
   StageVec residual[4];
   fp32x2_t collapsed[4] = {};
@@ -195,10 +183,9 @@ SGL_DEVICE StageVec mhc_post_vec(
 }
 
 /// Row geometry: one 16B vector per thread, one cluster per row, so the block
-/// size follows from the hidden width and the cluster size. The cluster size
-/// is the tuning knob (dims per block = kHiddenDim / kClusterSize).
+/// size follows from the hidden width and the cluster size (the tuning knob).
 template <uint32_t kHiddenDim, uint32_t kClusterSize>
-struct AllReduceNormTrait {
+struct RowClusterTrait {
   static constexpr uint32_t kRowVecs = kHiddenDim / 8;             // 16B vectors per row
   static constexpr uint32_t kBlockSize = kRowVecs / kClusterSize;  // threads per block
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
@@ -211,16 +198,10 @@ struct AllReduceNormTrait {
 
 // --- stage 1: the deferred finalize of one 16B vector ------------------------
 // The shared-expert vector is loaded first so that load is in flight while the
-// routing rows and the kTopK gathers are fetched; the routed combine is then
-// accumulated in ascending k from zero, rounded to bf16, and the shared vector
-// is added with one more bf16 rounding (see the header: the unfused path's
-// numerics, preserving the rank-local rounding points).
-// Threads of the same token read the same kTopK indices / weights (a broadcast
-// load per warp). FP32 routing weights retain their precision in the multiply;
-// bf16 weights can use Blackwell's mixed-precision FMA.
+// routing rows and the kTopK gathers are fetched.
 template <uint32_t kHiddenDim, uint32_t kTopK, bool kHasShared, bool kUsePDL, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE StageVec
-finalize_vec(const FinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
+finalize_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
   using namespace device;
   const auto* idx = params.idx + static_cast<int64_t>(token) * kTopK;
   const auto* weights = params.weights + static_cast<int64_t>(token) * kTopK;
@@ -274,10 +255,8 @@ finalize_vec(const FinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_
       }
     }
   }
-  // Same rounding as the unfused path: TRT-LLM's finalize returns the routed
-  // combine rounded to bf16, and `shared.add_(routed)` then rounds the bf16 +
-  // bf16 sum once more (torch adds in fp32). Reproducing both roundings keeps
-  // the staged vector bit-identical to the unfused rank-local result.
+  // Two deliberate roundings -- the routed combine, then the bf16 + bf16 add --
+  // keep the staged vector bit-identical to the unfused rank-local result.
   StageVec out;
 #pragma unroll
   for (uint32_t j = 0; j < 4; ++j) {
@@ -293,13 +272,10 @@ finalize_vec(const FinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_
 }
 
 // --- the kernel --------------------------------------------------------------
-// Grid: dim3(num_tokens [+ 1], kClusterSize) with the cluster laid along y, so
-// blockIdx.x is the token row (and its phase counter: PushEpoch's default) and
-// blockIdx.y the rank inside the cluster. When rows do not own every counter
-// of the plane, one extra cluster (blockIdx.x == num_tokens) is the bumper: it
-// only flips the counters [num_tokens, num_push_counters) and exits; with
-// num_tokens == num_push_counters no bumper is launched. The plane holds
-// num_sm counters, so decode batches always fit.
+// Grid dim3(num_tokens [+ 1], kClusterSize) with the cluster along y, so
+// blockIdx.x is the token row (and its phase counter) and blockIdx.y the rank
+// inside the cluster. The extra cluster (blockIdx.x == num_tokens) is the
+// bumper: it only flips the leftover counters [num_tokens, num_push_counters).
 template <
     uint32_t kWorldSize,
     uint32_t kHiddenDim,
@@ -311,12 +287,12 @@ template <
     typename WeightT,
     bool kMhc = false,
     bool kQuant = false>
-__global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBlockSize)
+__global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
-        const __grid_constant__ FinalizeAllReduceParams<kWorldSize, WeightT> params) {
+        const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
   namespace cg = cooperative_groups;
   using namespace device;
-  using T = AllReduceNormTrait<kHiddenDim, kClusterSize>;
+  using T = RowClusterTrait<kHiddenDim, kClusterSize>;
   constexpr uint32_t kRowVecs = T::kRowVecs;
   constexpr uint32_t kBlockSize = T::kBlockSize;
   constexpr uint32_t kNumWarps = T::kNumWarps;
@@ -327,13 +303,8 @@ __global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBloc
   // this thread's vector within a row: cluster rank picks the block's chunk
   const auto hvec = cluster_rank * kBlockSize + tx;
 
-  // Under PDL this grid may start while the preceding kernel is still running.
-  // If that kernel is an all-reduce on this plane, it is still flipping the
-  // phase counters and resetting slot markers: reading the epoch now would see
-  // a half-done state and the poll below would never complete. Only a caller
-  // who knows the predecessor is a compute kernel (the MoE GEMM in the model)
-  // may defer the wait to finalize_vec, past the routing-metadata prefetch;
-  // the second wait there is then a no-op.
+  // Reading the epoch before the PDL wait can see a predecessor all-reduce
+  // mid-flip on this plane; prefetch_metadata defers the wait to finalize_vec.
   if (!params.prefetch_metadata) PDLWaitPrimary<kUsePDL>();
 
   if (row_idx == params.num_tokens) {
@@ -481,8 +452,8 @@ struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
   using TensorView = tvm::ffi::TensorView;
-  using Params = FinalizeAllReduceParams<kWorldSize, WeightT>;
-  using Trait = AllReduceNormTrait<kHiddenDim, kClusterSize>;
+  using Params = MoeFinalizeAllReduceParams<kWorldSize, WeightT>;
+  using Trait = RowClusterTrait<kHiddenDim, kClusterSize>;
 
   template <bool kHasShared, bool kNorm>
   static constexpr auto kernel = moe_finalize_all_reduce_kernel<
@@ -725,8 +696,7 @@ struct MoeFinalizeAllReduceKernel {
                                           << push.slot_bytes << "-byte push slot (reduce the batch or enlarge "
                                           << "max_push_size)";
     // one cluster (and phase counter) per row; the bumper cluster is launched
-    // only when counters are left over for it to flip (num_tokens < num_blocks),
-    // so a batch that owns every counter runs without it
+    // only when counters are left over for it to flip
     CHECK_HOST(num_tokens <= push.num_blocks)
         << "num_tokens = " << num_tokens << " exceeds the " << push.num_blocks << " push phase counters of the plane";
     const uint32_t num_clusters = num_tokens + (num_tokens < push.num_blocks ? 1 : 0);
