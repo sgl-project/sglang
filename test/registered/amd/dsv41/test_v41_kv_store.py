@@ -7,11 +7,11 @@ follow the decode kernel's own reference quantizer.
 
 import unittest
 
-from sglang.test import dsv41_kv_quant_reference as tq
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
