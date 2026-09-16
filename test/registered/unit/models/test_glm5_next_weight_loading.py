@@ -68,6 +68,9 @@ class TestGlm5NextWeightLoading(unittest.TestCase):
             ),
             num_fused_shared_experts=0,
             quant_config=None,
+            model=SimpleNamespace(
+                decoder=SimpleNamespace(self_attn=SimpleNamespace(kv_b_proj=object()))
+            ),
             named_parameters=lambda: iter(
                 [("model.decoder.mlp.experts.w2_weight_scale_inv", scale_param)]
             ),
