@@ -470,5 +470,110 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
 
+class TestUmbpMultiBufferLayerMapping(CustomTestCase):
+    """A logical layer may own several buffers of one component.
+
+    ``_with_packed_draft_mapping`` attaches MTP draft depth N to target layer N,
+    so that layer maps to a TUPLE of buffer indices. The UMBP range builder used
+    to assume a one-to-one layer/buffer bijection, which made UMBP + DSA + MTP
+    raise before any bytes moved.
+    """
+
+    @staticmethod
+    def _entry(components, layer_mapping, *, packed=True):
+        return DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=components,
+            layer_mapping=layer_mapping,
+            page_size=2,
+            rows_are_pages=False,
+            packed=packed,
+        )
+
+    def test_packed_draft_mapping_orders_layers_by_first_buffer(self):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _with_packed_draft_mapping,
+        )
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            _ordered_layers,
+        )
+
+        # Two target layers plus one draft layer packed onto target layer 0.
+        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(3)]
+        mapping = _with_packed_draft_mapping(
+            {0: 0, 1: 1}, target_device_layer_num=2, draft_layer_num=1
+        )
+        self.assertEqual(mapping, {0: (0, 2), 1: 1})
+
+        entry = self._entry([buffers], mapping)
+        self.assertEqual(_ordered_layers(entry), [0, 1])
+
+    def test_mapped_indices_must_tile_the_component(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            _ordered_layers,
+        )
+
+        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(3)]
+        # Buffer 2 is mapped by nobody, so the object would silently omit it.
+        with self.assertRaisesRegex(ValueError, "does not partition"):
+            _ordered_layers(self._entry([buffers], {0: 0, 1: 1}))
+
+    def test_interleaved_kv_layer_maps_to_both_buffers(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            _ordered_layers,
+        )
+
+        # The page_unified MHA shape: one component, [k0, v0, k1, v1].
+        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(4)]
+        entry = self._entry([buffers], {0: (0, 1), 1: (2, 3)})
+        self.assertEqual(_ordered_layers(entry), [0, 1])
+
+    def test_range_items_emits_every_buffer_of_a_multi_buffer_layer(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            UMBPDirectLinker,
+            _PoolRangePlan,
+        )
+
+        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(4)]
+        entry = self._entry([buffers], {0: (0, 1), 1: (2, 3)})
+        plan = _PoolRangePlan(
+            name=PoolName.KV, keys=["k"], locations=[0], entries_per_page=1, entry=entry
+        )
+
+        items = UMBPDirectLinker._range_items(
+            object.__new__(UMBPDirectLinker), plan, [0, 1]
+        )
+
+        # One list per logical layer, each carrying that layer's two buffers in
+        # (component, buffer) order -- the order the object is serialized in.
+        self.assertEqual([len(layer) for layer in items], [2, 2])
+        offsets = [item[3] for layer in items for item in layer]
+        self.assertEqual(offsets, entry._component_offsets[0])
+
+    def test_unpacked_entry_refuses_a_multi_buffer_layer(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            UMBPDirectLinker,
+            _PoolRangePlan,
+        )
+
+        buffers = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(4)]
+        entry = self._entry([buffers], {0: (0, 1), 1: (2, 3)}, packed=False)
+        plan = _PoolRangePlan(
+            name=PoolName.KV,
+            keys=["a", "b"],
+            locations=[0],
+            entries_per_page=2,
+            entry=entry,
+        )
+        linker = object.__new__(UMBPDirectLinker)
+
+        # One object per (page, component) cannot express a layer that spans
+        # two buffers of the same component: it has no object to put them in.
+        with self.assertRaisesRegex(ValueError, "no object partition"):
+            UMBPDirectLinker._layer_group_ranges(linker, plan, [0, 1])
+
+
 if __name__ == "__main__":
     unittest.main()
