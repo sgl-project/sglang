@@ -1,5 +1,6 @@
 """Q normalization/quantization parity, including strided and replayed inputs."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,7 +11,7 @@ import torch
 from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -94,3 +95,7 @@ def test_deterministic_modes_keep_original_norm(batch_invariant, deterministic):
         y, q = MQALayer._normalize_q_lora(layer, x)
     assert q is y
     assert torch.equal(y, layer.q_norm(x))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
@@ -87,6 +89,97 @@ class TestDSV41PDPrefillCPDecodeDP(CustomTestCase):
         # prompt tail locally.
         self._validate_features(_make_feature_config(role="decode"))
 
+    def test_cp4_prefill_dp4_decode_is_accepted(self):
+        prefill = _make_feature_config(role="prefill")
+        prefill.attn_cp_size = 4
+        prefill.moe_a2a_backend = "none"
+        self._validate_features(prefill)
+
+        decode = _make_feature_config(role="decode")
+        decode.dp_size = 4
+        self._validate_features(decode)
+
+    def test_v41_text_only_is_allowed_with_pd(self):
+        from sglang.srt.arg_groups import model_hook
+
+        cfg = SimpleNamespace(
+            language_model_only=True,
+            encoder_only=False,
+            language_only=False,
+            enable_prefix_mm_cache=False,
+            enable_broadcast_mm_inputs_process=False,
+            mm_enable_dp_encoder=False,
+            disaggregation_mode="prefill",
+        )
+        args = SimpleNamespace(
+            LANGUAGE_MODEL_ONLY_ARCHITECTURES=("DeepseekV4ForCausalLM",)
+        )
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v41",
+                architectures=["DeepseekV4ForCausalLM"],
+            )
+        )
+        with (
+            patch.object(model_hook, "resolving_view", return_value=cfg),
+            patch.object(model_hook, "model_config_of", return_value=model),
+        ):
+            model_hook.handle_language_model_only(args)
+            model.hf_config.model_type = "deepseek_v4"
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                model_hook.handle_language_model_only(args)
+
+    def test_cp_prepares_image_ids_before_sharding_without_mutating_scheduler_ids(self):
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        embeds = torch.zeros((3, 4))
+        model = SimpleNamespace(
+            vision=object(),
+            config=SimpleNamespace(image_token_id=17),
+            _prepare_mm_embeddings=Mock(return_value=embeds),
+        )
+        mode = SimpleNamespace(
+            is_decode=lambda: False,
+            is_target_verify=lambda: False,
+            is_decode_or_idle=lambda: False,
+        )
+        batch = SimpleNamespace(forward_mode=mode, mm_inputs=[object()])
+        scheduler_ids = torch.tensor([3, MM_PAD_SHIFT_VALUE + 5, 4])
+        model_ids, model_embeds = DeepseekV4ForCausalLM.prepare_language_model_inputs(
+            model, scheduler_ids, batch
+        )
+        self.assertEqual(model_ids.tolist(), [3, 17, 4])
+        self.assertEqual(scheduler_ids.tolist(), [3, MM_PAD_SHIFT_VALUE + 5, 4])
+        self.assertIs(model_embeds, embeds)
+        model._prepare_mm_embeddings.assert_called_once_with(scheduler_ids, batch)
+
+    def test_fake_transfer_keeps_chunk_kv_without_inserting_radix_entry(self):
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        req = SimpleNamespace(
+            skip_radix_cache_insert=True,
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            kv=SimpleNamespace(req_pool_idx=0),
+            get_fill_ids=lambda: [1, 2, 3],
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+        )
+        cache = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[11, 12, 13, 14]], dtype=torch.int32)
+            ),
+            cache_unfinished_req=Mock(),
+        )
+        maybe_cache_unfinished_req(req, cache)
+        self.assertEqual(req.prefix_indices.tolist(), [11, 12, 13])
+        cache.cache_unfinished_req.assert_not_called()
+
+        req.bootstrap_host = "ordinary-skip"
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        maybe_cache_unfinished_req(req, cache)
+        self.assertEqual(req.prefix_indices.numel(), 0)
+
     def test_server_local_cp_dp_and_decode_cp_are_rejected(self):
         prefill = _make_feature_config(role="prefill")
         prefill.dp_size = 8
@@ -125,7 +218,7 @@ class TestDSV41PDPrefillCPDecodeDP(CustomTestCase):
         response = Mock(status_code=200)
         response.json.return_value = dict(
             attn_tp_size=1,
-            attn_cp_size=8,
+            attn_cp_size=4,
             dp_size=1,
             pp_size=1,
             page_size=256,
