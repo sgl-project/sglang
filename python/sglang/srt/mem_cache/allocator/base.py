@@ -69,17 +69,61 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # The scheduler calls these unconditionally, with no allocator-type branches
     # on its side; byte-accounted composites override the token-count defaults.
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        return PrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        """Clip generation to the empty-pool budget; None means prompt cannot fit.
+
+        token_capacity is the scheduler's configured capacity, including its
+        distributed token scaling. Shared pools use their physical byte layout.
+        """
+        paged_input = -(-input_tokens // self.page_size) * self.page_size
+        return max(
+            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
+        )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
-        ``num_tokens`` or nothing evictable remains."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
+        ``num_tokens`` or nothing evictable remains.
 
-        evict_from_tree_cache(tree_cache, num_tokens)
+        Return whether capacity was realized, or None if it still needs checking.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        shortfall = num_tokens - self.available_size()
+        if shortfall > 0:
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            _evict_until_allocatable(tree_cache, self, num_tokens)
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
         """Whether the next decode step's ``num_tokens`` allocation fits after
         evicting reclaimable cache. The retract loop converges on this same
-        check, so a shortfall here retracts instead of failing in alloc."""
+        check, so a shortfall here retracts instead of failing in alloc.
+        ``requests`` and ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 

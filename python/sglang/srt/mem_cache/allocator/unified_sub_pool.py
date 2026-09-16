@@ -239,6 +239,31 @@ def _full_tokens_before_mamba_recheck(
     return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
 
 
+def install_move_gate(
+    targets,
+    *,
+    slot: str,
+    gate: Callable[[], bool],
+    feature: str,
+    lazy_compaction: bool,
+) -> None:
+    """Point every member of a composite at one compaction gate.
+
+    A gate that reaches only some members is not a weaker gate, it is no gate:
+    the ungated end relocates its own pages under the same in-flight transfer.
+    So the member list is stated once per composite (`_move_gate_targets`) and
+    every gate installs over it, rather than each setter naming the members it
+    happens to remember.
+    """
+    assert lazy_compaction, (
+        f"{feature} with the unified memory pool requires lazy compaction "
+        "(eager free-path compaction moves pages under in-flight transfers)."
+    )
+    assert slot in ("disagg_move_gate", "host_transfer_move_gate"), slot
+    for target in targets:
+        setattr(target, slot, gate)
+
+
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
@@ -320,9 +345,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A non-owner
         # consumes the owner's ids, so the two counts are unrelated.
+        assert virtual_num_pages is None or not is_id_owner, (
+            "only a non-owner allocator may use another pool's virtual-id space"
+        )
         self.num_virtual_ids = (
             self.num_pages if virtual_num_pages is None else virtual_num_pages
         )
+        assert self.num_virtual_ids > 0, "virtual page count must be positive"
         # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
         self.virtual_to_physical = torch.full(
             (self.num_virtual_ids + 1,),
@@ -529,6 +558,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
             f"min_page_index={self.min_page_index}, "
             f"num_pages={self.num_pages}, "
+            f"num_virtual_ids={self.num_virtual_ids}, "
             f"watermark_physical={self.watermark_physical}, "
             f"allocated_pages={self._allocated_pages()}"
         )
