@@ -3,6 +3,8 @@ import json
 import unittest
 import warnings
 
+import xgrammar as xgr
+
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -14,6 +16,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
     _parse_gemma4_args,
@@ -36,8 +39,8 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_cpu_ci(est_time=70, suite="base-c-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
 
 
 @functools.lru_cache(maxsize=None)
@@ -373,7 +376,7 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(result.normal_text, "Here you go.")
 
     def test_empty_name_is_allowed_on_the_canonical_path(self):
-        source = "<|content_invoke_tool_json|>" '{"name":"","args":{}}<|end_message|>'
+        source = '<|content_invoke_tool_json|>{"name":"","args":{}}<|end_message|>'
         result = InklingDetector().detect_and_parse(source, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "")
@@ -1305,7 +1308,6 @@ class TestLlama32Detector(unittest.TestCase):
 
 
 class TestKimiK2Detector(unittest.TestCase):
-
     def setUp(self):
         """Set up test tools and detector."""
         self.tools = [
@@ -1374,7 +1376,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1423,7 +1424,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1458,7 +1458,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1531,7 +1530,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             "function<｜tool▁sep｜>",
             "get_tour",
             "ist_att",
-            "ractions\n```" 'json\n{"',
+            'ractions\n```json\n{"',
             'city": "',
             'Beijing"}\n',
             "```<｜tool▁call▁end｜>",
@@ -1718,9 +1717,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -1773,9 +1772,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -1866,9 +1865,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Verify that the no-parameter function was correctly parsed
         self.assertEqual(
@@ -1926,9 +1925,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should still parse correctly even with whitespace-only content
         self.assertEqual(
@@ -2128,9 +2127,9 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -3675,11 +3674,199 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNone(self.detector.get_structural_tag(self.tools))
 
             parser = FunctionCallParser(self.tools, "glm47")
+            self.assertEqual(
+                "full_assistant_ebnf",
+                parser.get_structure_constraint("required")[0],
+            )
+            strict_tools = [
+                tool.model_copy(
+                    update={
+                        "function": tool.function.model_copy(update={"strict": True})
+                    }
+                )
+                for tool in self.tools
+            ]
+            parser = FunctionCallParser(strict_tools, "glm47")
             constraint = parser.get_structure_constraint("required")
 
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+
+class TestGlm47FullAssistantGrammar(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+
+    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
+        tools = [
+            Tool(type="function", function=Function(name=name, parameters=parameters))
+            for name in ("alpha", "beta")
+        ]
+        parser = FunctionCallParser(tools, "glm47")
+        constraint = parser.get_structure_constraint(
+            choice, parallel_tool_calls=parallel, thinking_mode=thinking
+        )
+        self.assertIsNotNone(constraint)
+        return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(constraint[1]))
+
+    def _accepts(self, grammar, text):
+        matcher = xgr.GrammarMatcher(grammar)
+        return matcher.accept_string(text) and matcher.is_completed()
+
+    def test_tool_choice_and_parallel_calls(self):
+        alpha = "<tool_call>alpha</tool_call>"
+        beta = "<tool_call>beta</tool_call>"
+        named = ToolChoice(function=ToolChoiceFuncName(name="alpha"))
+        for thinking in (False, True):
+            prefix = "analysis</think>" if thinking else ""
+            for parallel in (False, True):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(
+                        thinking=thinking, parallel=parallel, choice=choice
+                    ):
+                        grammar = self._compile(
+                            choice=choice, parallel=parallel, thinking=thinking
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + "Hello"),
+                            choice in ("auto", "none"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha), choice != "none"
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + beta),
+                            choice in ("auto", "required"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha * 2),
+                            parallel and choice != "none",
+                        )
+
+    def test_enum_json_types_and_boolean_schemas(self):
+        cases = [
+            ({"enum": [1, 2]}, ["1", "2"], ["3"]),
+            ({"enum": [True, False]}, ["true", "false"], ["True", "1"]),
+            (
+                {"type": ["string", "null"], "enum": ["ok", None]},
+                ["ok", "null"],
+                ["None", "bad"],
+            ),
+            ({"enum": [{"x": 1}, [True, None]]}, ['{"x": 1}', "[true, null]"], ["{}"]),
+            (True, ["anything"], []),
+            (False, ["anything"], []),
+        ]
+        for schema, accepted, rejected in cases:
+            with self.subTest(schema=schema):
+                grammar = self._compile({"properties": {"p": schema}})
+                for values, expected in ((accepted, True), (rejected, False)):
+                    for value in values:
+                        text = f"<tool_call>alpha<arg_key>p</arg_key><arg_value>{value}</arg_value></tool_call>"
+                        self.assertEqual(self._accepts(grammar, text), expected, text)
+
+    def test_composed_and_unresolved_schemas_allow_arguments(self):
+        schemas = [
+            {keyword: [{"properties": {"city": {"type": "string"}}}]}
+            for keyword in ("allOf", "anyOf", "oneOf")
+        ]
+        schemas += [
+            {
+                "properties": {"country": {"type": "string"}},
+                "allOf": [{"properties": {"city": {"type": "string"}}}],
+            },
+            {
+                "$ref": "#/$defs/args",
+                "$defs": {"args": {"properties": {"city": {"type": "string"}}}},
+            },
+            {
+                "anyOf": [
+                    {"properties": {"city": {"enum": [1]}}},
+                    {"properties": {"city": {"enum": ["Paris"]}}},
+                ]
+            },
+        ]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                grammar = self._compile(schema)
+                arg = "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}</tool_call>")
+                )
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>")
+                )
+                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
+
+    def test_incomplete_composition_branches_allow_arguments(self):
+        city = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        }
+        country = {
+            "type": "object",
+            "properties": {"country": {"type": "string"}},
+            "required": ["country"],
+            "additionalProperties": False,
+        }
+        branches = [
+            {"$ref": "#/$defs/by_country"},
+            {"patternProperties": {"^country$": {"type": "string"}}},
+            {"properties": {"region": {"type": "string"}}, "allOf": [country]},
+            {"additionalProperties": {"type": "string"}},
+            True,
+            {},
+            {"properties": {}},
+        ]
+        text = "<tool_call>alpha<arg_key>country</arg_key><arg_value>France</arg_value></tool_call>"
+        for branch in branches:
+            for nested in (False, True):
+                with self.subTest(branch=branch, nested=nested):
+                    schema = {
+                        "type": "object",
+                        "anyOf": [
+                            city,
+                            {"allOf": [{"oneOf": [branch]}]} if nested else branch,
+                        ],
+                        "$defs": {"by_country": country},
+                    }
+                    grammar = self._compile(schema, choice="required", parallel=False)
+                    self.assertTrue(self._accepts(grammar, text))
+                    self.assertFalse(
+                        self._accepts(grammar, text.replace("</arg_key>", ""))
+                    )
+                    self.assertFalse(self._accepts(grammar, text + text))
+
+    def test_complete_compositions_restrict_argument_names(self):
+        schema = {
+            "allOf": [
+                {"properties": {"city": {"type": "string"}}},
+                {
+                    "anyOf": [
+                        {"oneOf": [{"properties": {"country": {"type": "string"}}}]}
+                    ]
+                },
+            ]
+        }
+        grammar = self._compile(schema, choice="required", parallel=False)
+        for key, accepted in (("city", True), ("country", True), ("unknown", False)):
+            text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>Paris</arg_value></tool_call>"
+            self.assertEqual(self._accepts(grammar, text), accepted)
+
+    def test_escaped_property_names(self):
+        for key in ['a"b', "path\\name", "line\nbreak", "tab\tkey", "control\x01key"]:
+            with self.subTest(key=key):
+                grammar = self._compile({"properties": {key: {"type": "string"}}})
+                text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>v</arg_value></tool_call>"
+                self.assertTrue(self._accepts(grammar, text))
 
 
 class TestLing3Detector(unittest.TestCase):
@@ -4500,9 +4687,7 @@ class TestLfm2Detector(unittest.TestCase):
     def test_reserved_kwarg_with_nested_quote_recovered(self):
         """A keyword-named parameter holding a nested-quote command needs
         the rename and requote rewrites to compose."""
-        text = (
-            "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]" "<|tool_call_end|>"
-        )
+        text = "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]<|tool_call_end|>"
         result = self.detector.detect_and_parse(text, self.tools)
 
         self.assertEqual(len(result.calls), 1)
@@ -4720,9 +4905,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4762,9 +4947,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4802,9 +4987,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4841,9 +5026,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4878,9 +5063,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should have name but incomplete parameters
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4916,9 +5101,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll remember that.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4961,9 +5146,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -5011,9 +5196,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -5265,9 +5450,9 @@ class TestQwen25Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5515,9 +5700,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return normal_text, tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -5556,9 +5741,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 2)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -5623,9 +5808,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         self.assertIn("Hello!", normal_text)
         self.assertIn("Let me also check", normal_text)
         self.assertEqual(len(tool_calls_by_index), 2)

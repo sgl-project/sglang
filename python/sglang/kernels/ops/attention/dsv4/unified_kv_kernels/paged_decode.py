@@ -59,6 +59,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_gfx1250_supported
+
+_is_gfx1250_supported = is_gfx1250_supported()
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 
@@ -903,12 +906,28 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
-    return _sparse_attn_v4_paged_decode_triton(
-        q,
-        unified_kv,
-        kv_indices,
-        kv_indptr,
-        attn_sink,
-        softmax_scale,
-        kv_scales=kv_scales,
-    )
+    if _is_gfx1250_supported:
+        # aiter ships only on ROCm, and this module is imported by a CPU-registered
+        # test, so the import has to sit behind the same gate as the call.
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+        return pa_decode_sparse(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            has_invalid=False,
+            kv_scales=kv_scales,
+        )
+    else:
+        return _sparse_attn_v4_paged_decode_triton(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            kv_scales=kv_scales,
+        )

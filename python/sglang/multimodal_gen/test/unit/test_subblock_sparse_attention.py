@@ -2,8 +2,9 @@
 """SubBlock block-sparse attention backend.
 
 The schedule and adapter tests are pure CPU. The numerical tests need either
-an SM90 GPU with SGLang's CuTe-DSL dependencies or an SM100 GPU with
-FlashInfer's ``bsa_attn_blk64_fwd`` and are skipped otherwise.
+an SM90 GPU with SGLang's CuTe-DSL dependencies, an SM100 GPU with
+FlashInfer's ``bsa_attn_blk64_fwd``, or an SM120 GPU with FlashInfer's
+``bsa_attn_sm120_blk64_fwd`` and are skipped otherwise.
 
 The trick that makes the sparse kernel checkable against dense attention: at
 ``sparsity`` just above 0 every block is inside the budget, so the block-sparse
@@ -20,10 +21,10 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.router import (
+    SubBlockRouter,
     _snap_up_to_8,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
-    SubBlockSparseAttentionBackend,
     SubBlockSparseAttentionImpl,
     SubBlockSparseSchedule,
     _dit_layer_index,
@@ -52,6 +53,12 @@ def _subblock_kernel_available() -> bool:
             )
 
             load_bsa_attn_blk64_fwd()
+        elif capability == (12, 0):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+                load_bsa_attn_sm120_blk64_fwd,
+            )
+
+            load_bsa_attn_sm120_blk64_fwd()
         else:
             return False
     except Exception:
@@ -60,7 +67,8 @@ def _subblock_kernel_available() -> bool:
 
 
 requires_subblock_kernel = unittest.skipUnless(
-    _subblock_kernel_available(), "needs an SM90 or SM100 SubBlock attention kernel"
+    _subblock_kernel_available(),
+    "needs an SM90, SM100, or SM120 SubBlock attention kernel",
 )
 
 
@@ -156,9 +164,25 @@ class TestSubBlockSparseSchedule(unittest.TestCase):
         self.assertEqual(schedule.skip_first_layers, 0)
         self.assertEqual(schedule.n_k, 4)
         self.assertEqual(schedule.n_q, 4)
+        self.assertEqual(schedule.compute_mode, "bf16")
+
+    def test_sage_fp8_uses_16_token_key_subblocks_by_default(self):
+        with _patch_schedule({"compute_mode": "sage_fp8"}):
+            schedule = SubBlockSparseSchedule.from_server_args()
+        self.assertEqual(schedule.n_k, 8)
+
+    def test_explicit_sage_fp8_n_k_is_respected(self):
+        with _patch_schedule({"compute_mode": "sage_fp8", "n_k": 4}):
+            schedule = SubBlockSparseSchedule.from_server_args()
+        self.assertEqual(schedule.n_k, 4)
 
     def test_rejects_out_of_range_values(self):
-        for config in ({"sparsity": 1.0}, {"n_k": 3}, {"skip_first_steps": -1}):
+        for config in (
+            {"sparsity": 1.0},
+            {"n_k": 3},
+            {"skip_first_steps": -1},
+            {"compute_mode": "fp8"},
+        ):
             with self.subTest(config=config), _patch_schedule(config):
                 with self.assertRaises(ValueError):
                     SubBlockSparseSchedule.from_server_args()
@@ -178,18 +202,24 @@ class TestBudgetGranularity(unittest.TestCase):
         self.assertEqual(_snap_up_to_8(3, 5), 5)
 
 
-class TestSubBlockSparseBackend(unittest.TestCase):
-    def test_the_advertised_builder_can_be_built(self):
-        """`AttentionMetadataBuilder.__init__` is abstract; a builder that does
-        not override it makes `get_builder_cls()()` a TypeError."""
-        builder = SubBlockSparseAttentionBackend.get_builder_cls()()
-        builder.prepare()
-        metadata = builder.build(current_timestep=7)
-        self.assertIsInstance(
-            metadata, SubBlockSparseAttentionBackend.get_metadata_cls()
+class TestRouterGeometry(unittest.TestCase):
+    def test_sm90_sage_fp8_preserves_16_token_pooling_cells(self):
+        router = SubBlockRouter(
+            n_q=4,
+            n_k=8,
+            block_size_k=128,
+            budget_granularity=1,
         )
-        self.assertEqual(metadata.current_timestep, 7)
+        self.assertEqual(64 // router.n_q, 16)
+        self.assertEqual(router.block_size_k // router.n_k, 16)
+        self.assertEqual(router.budget_granularity, 1)
 
+    def test_rejects_non_divisible_block_geometry(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            SubBlockRouter(n_q=4, n_k=8, block_size_k=100)
+
+
+class TestSubBlockSparseBackend(unittest.TestCase):
     def test_sm90_adapter_uses_presorted_indices_and_64x64_blocks(self):
         captured = {}
 
@@ -289,6 +319,12 @@ class TestSubBlockGating(unittest.TestCase):
         q = torch.empty(1, 8192, NUM_HEADS, HEAD_DIM, dtype=torch.float32)
         with _patch_step(20):
             self.assertFalse(impl._sparse_ready(q, q))
+
+    def test_sage_fp8_builds_the_sm90_64x128_router(self):
+        impl = self._impl("blocks.9.attn", compute_mode="sage_fp8")
+        self.assertEqual(impl.router.block_size_k, 128)
+        self.assertEqual(impl.router.n_k, 8)
+        self.assertEqual(impl.router.budget_granularity, 1)
 
 
 @requires_subblock_kernel
@@ -489,6 +525,11 @@ class TestSubBlockNumerics(unittest.TestCase):
     def test_sm100_kernel_backed_mixed_query_mask(self):
         if torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("requires the SM100 SubBlock kernel")
+        self._assert_kernel_backed_mixed_query_mask()
+
+    def test_sm120_kernel_backed_mixed_query_mask(self):
+        if torch.cuda.get_device_capability() != (12, 0):
+            self.skipTest("requires the SM120 SubBlock kernel")
         self._assert_kernel_backed_mixed_query_mask()
 
     def test_skipped_step_is_bitwise_dense(self):

@@ -26,7 +26,7 @@ try:
 except ImportError:
     KERNELS_AVAILABLE = False
 
-register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
@@ -232,6 +232,41 @@ def test_mtp_single_step_decode(N: int):
         f"fail_rate={state_fail_rate:.2f}%"
     )
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_verify_scratch_pitch_uses_allocated_steps():
+    # Gear below the allocated step dim must not spill into the neighbor block.
+    N, T, ALLOCATED = 2, 4, 8
+    H, HV, K, V = 16, 32, 128, 128
+
+    A_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        N, T, H, HV, K, V
+    )
+    buffer = torch.full(
+        (N + 1, ALLOCATED, HV, V, K), float("nan"), dtype=torch.float32, device="cuda"
+    )
+
+    run_fused_mtp(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        state,
+        indices,
+        cu_seqlens,
+        disable_state_update=True,
+        intermediate_states_buffer=buffer,
+        intermediate_state_indices=indices,
+        cache_steps=T,
+    )
+
+    assert not torch.isnan(buffer[:N, :T]).any()
+    assert torch.isnan(buffer[N:]).all()
+    assert torch.isnan(buffer[:N, T:]).all()
 
 
 if __name__ == "__main__":

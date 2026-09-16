@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_lora,
     get_serving,
 )
@@ -424,9 +425,14 @@ class RuntimeHandle:
 
     def get_server_info(self) -> str:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
+        # `resolved_dict` answers with what resolution decided; the launch
+        # command answers with what was asked for, and the two are not
+        # derivable from each other. The HTTP and in-process readbacks both
+        # carry it, so this one does too.
+        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
         result.update(self.scheduler_info)
-        result["kv_events"] = (
-            self.tokenizer_manager.server_args.describe_kv_events_publisher()
+        result["kv_events"] = describe_kv_events_publisher(
+            self.tokenizer_manager.server_args
         )
         return json.dumps(msgspec_to_builtins(result), default=str)
 
@@ -544,9 +550,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

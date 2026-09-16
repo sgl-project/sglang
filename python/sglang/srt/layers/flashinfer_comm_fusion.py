@@ -13,13 +13,16 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_platform,
+    get_resources,
+)
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
     is_flashinfer_available,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -38,27 +41,27 @@ _flashinfer_allreduce_supports_trigger_completion = False
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
     """Whether the mnnvl backend is usable on the current system."""
-    if is_sm100_supported():
+    if get_platform().is_sm100:
         return True
-    return is_sm90_supported() and not is_multi_node
+    return get_platform().is_sm90 and not is_multi_node
 
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    if not (is_sm90_supported() or is_sm100_supported()):
+    if not (get_platform().is_sm90 or get_platform().is_sm100):
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
 
     if backend == "auto":
         if is_multi_node:
-            if is_sm100_supported():
+            if get_platform().is_sm100:
                 return "mnnvl"
             raise ValueError(
                 "FlashInfer allreduce fusion does not support multi-node on "
                 "non-Blackwell systems."
             )
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             return "mnnvl"
         return "trtllm"
 
@@ -630,7 +633,6 @@ class FlashInferWorkspaceManager:
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
     """The per-group fusion workspace manager; the instances live on
     ``ctx.resources`` (one per comm group, created lazily)."""
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     name = (
@@ -763,7 +765,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
@@ -783,7 +785,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
+    fp32_acc: bool = True,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -799,7 +801,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         max_token_num: Maximum token number
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
-        fp32_acc: Whether to use fp32 precision
+        fp32_acc: Accumulate the allreduce in fp32 (trtllm backend only; the
+            mnnvl backends always accumulate in fp32)
         use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
@@ -863,8 +866,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         rms_gamma=weight,
         rms_eps=eps,
         use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     _flashinfer_comm.allreduce_fusion(**kwargs)
@@ -974,9 +978,10 @@ def flashinfer_allreduce(
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         launch_with_pdl=True,
-        fp32_acc=False,
         output=output,
     )
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = True
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
     _flashinfer_comm.allreduce_fusion(**kwargs)
@@ -1018,7 +1023,6 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     for name in (
