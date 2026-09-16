@@ -29,7 +29,7 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.ops.misc import get_max_active_clusters
+    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
 
     args = make_cpp_args(is_arch_support_pdl())
     # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
