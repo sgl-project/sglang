@@ -1,6 +1,6 @@
 export const config = {
   modelName: "Qwen-Image 2.1",
-  supportedHardware: ["b200"],
+  supportedHardware: ["h200"],
   groupHardware: false,
   matchDims: [],
 
@@ -28,7 +28,7 @@ export const config = {
       default: "resident",
       options: [
         { id: "resident", label: "Resident", flags: ["--performance-mode speed"], recommended: true },
-        { id: "offload", label: "Layerwise offload", flags: ["--dit-layerwise-offload true"], soft: true, softReason: "Full-checkpoint validation is pending." },
+        { id: "offload", label: "Layerwise offload", flags: ["--dit-layerwise-offload true"], soft: true, softReason: "CLI offload is tested; this server recipe remains unverified." },
       ],
     },
     {
@@ -82,7 +82,7 @@ export const config = {
 
   commandBuilder: {
     defaultSelection: {
-      hw: "b200",
+      hw: "h200",
       nodes: 1,
       gpus_per_node: 1,
       topology_mode: "auto",
@@ -95,7 +95,9 @@ export const config = {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 2 },
       },
-      verifiedRecipes: [],
+      verifiedRecipes: [
+        { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
+      ],
       autoTopology: (s) => ({
         tp_size: 1,
         ulysses_degree: Number(s.gpus_per_node),

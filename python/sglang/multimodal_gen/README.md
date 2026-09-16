@@ -77,6 +77,24 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
+### Qwen-Image 2.1
+
+The native `QwenImage21Pipeline` supports text-to-image and reference-image
+conditioning with Qwen3-VL, a single-stream block-causal DiT, and the 64-channel
+VAE. Use an authorized checkpoint directory:
+
+```bash
+sglang generate --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
+  --prompt "A capybara reading a book by candlelight" \
+  --height 1024 --width 1024 --num-inference-steps 40 --guidance-scale 1 \
+  --seed 0 --save-output
+```
+
+Add `--image-path /path/to/input.png` for editing. Dimensions must be multiples
+of 32. Full-checkpoint generation and editing have been tested on H200; see the
+[model cookbook](../../../docs/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1.mdx)
+for component requirements and optimization boundaries.
+
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
@@ -120,21 +138,3 @@ We learnt and reused code from the following projects:
 - [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVideo on Sept. 24, 2025.
 - [xDiT](https://github.com/xdit-project/xDiT). We used the parallelism library from it.
 - [diffusers](https://github.com/huggingface/diffusers) We used the pipeline design from it.
-
-### Qwen-Image 2.1
-
-The native `QwenImage21Pipeline` supports text-to-image and reference-image
-conditioning with Qwen3-VL, a single-stream block-causal DiT, and the 64-channel
-VAE. Use an authorized checkpoint directory:
-
-```bash
-sglang generate --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
-  --prompt "A capybara reading a book by candlelight" \
-  --height 1024 --width 1024 --num-inference-steps 40 --guidance-scale 1 \
-  --seed 0 --save-output
-```
-
-Add `--image-path /path/to/input.png` for editing. Dimensions must be multiples
-of 32. Full-checkpoint validation is pending; see the
-[model cookbook](../../../docs/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1.mdx)
-for component requirements and optimization boundaries.

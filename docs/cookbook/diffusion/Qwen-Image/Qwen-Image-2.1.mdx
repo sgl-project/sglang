@@ -16,7 +16,7 @@ Install the runtime dependencies with `uv pip install "sglang[diffusion]" --prer
 then install this integration from its source checkout with
 `uv pip install -e "python[diffusion]"`. Use an authorized checkpoint directory in
 place of `/models/qwen-image-2.1`. The recipes below target NVIDIA CUDA on Linux;
-full-checkpoint deployment and image-quality validation are pending.
+the full checkpoint has been exercised on H200 with generation and editing requests.
 
 <Deployment config={config} />
 
@@ -48,7 +48,8 @@ alpha channel. Save generated images as PNG to preserve transparency.
 
 Text conditioning uses the last decoder layer's output before the final
 normalization, matching the reference implementation with Transformers
-4.57.3. SGLang selects this native hidden state explicitly, so keep the
+4.57.3. Vision position interpolation also follows its BF16 rounding order.
+SGLang selects these native semantics explicitly, so keep the
 repository's installed dependencies instead of downgrading the entire runtime.
 Reference comparisons should use Transformers 4.57.3; the same
 `hidden_states[-1]` expression can have different semantics in newer versions.
@@ -103,9 +104,11 @@ Positive and negative prompts have separate request-owned prefix caches.
 TP uses native parallel projections. Ulysses and Ring shard target-image
 attention while keeping the condition prefix replicated. The target token
 count, `(height / 16) × (width / 16)`, must be divisible by the SP degree. Encoder
-parallelism uses the shared native encoder runtime. VAE tiling and parallel
-tiled decode use the standard VAE runtime; tiled decode can differ from full
-image decode near tile boundaries.
+parallelism uses the shared native encoder runtime. VAE tiling is disabled by
+default for both encoding and decoding. Enable
+`--vae-tiling true` for tiled encoding and decoding; `--vae-sp true` also distributes tiles
+across the configured GPUs. These paths use the standard VAE runtime; tiled
+decode can differ from full image decode near tile boundaries.
 
 Cache-DiT hooks operate on target-image transformer blocks. Breakable CUDA
 Graph execution fills each request's prefix caches eagerly, then replays
@@ -118,4 +121,6 @@ causal text runs use exact masked SDPA. Sage and Cache-DiT can change numerical
 results and require application-specific quality checks.
 
 See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
-for validation scope. No full-checkpoint latency or quality claim is made here.
+for tested configurations and remaining validation boundaries. These checks
+are functional and numerical comparisons, not latency benchmarks or broad
+image-quality evaluations.
