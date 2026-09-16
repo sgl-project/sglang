@@ -310,6 +310,9 @@ message OpenAIResponse {
 
 message StartProfileRequest {
   optional string output_dir = 1;
+  // Positive number of forward steps to profile before stopping automatically.
+  // Omit to profile until StopProfile is called.
+  optional int32 num_steps = 2;
 }
 
 message StartProfileResponse {

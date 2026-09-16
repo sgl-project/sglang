@@ -377,9 +377,10 @@ impl PyBridge {
         &self,
         rid: &str,
         output_dir: Option<&str>,
+        num_steps: Option<i32>,
     ) -> PyResult<Receiver<ResponseChunk>> {
         self.submit_json(rid, move |py, runtime_handle, callback| {
-            runtime_handle.call_method1(py, "start_profile", (output_dir, callback))?;
+            runtime_handle.call_method1(py, "start_profile", (output_dir, callback, num_steps))?;
             Ok(())
         })
     }
