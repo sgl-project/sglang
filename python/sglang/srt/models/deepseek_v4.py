@@ -463,27 +463,38 @@ def _apply_wo_a_bf16_matmul(
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
     verify batches up to 384 rows and large prefill batches write token-major
-    output directly to avoid the layout copy before wo_b. ROCm decode can use
+    output directly to avoid the layout copy before wo_b. gfx950 also uses the
+    direct output for large prefill batches. ROCm decode can use
     aiter batched GEMM with an optional fp8-grid operand; other cases use torch.einsum.
     """
     global _wo_a_aiter_batched_gemm_disabled
     if (
-        _is_cuda
-        and (
+        (
             (
-                is_decode
-                and o.shape[0] == 1
-                and (get_platform().is_blackwell or get_platform().is_sm90)
+                _is_cuda
+                and (
+                    (
+                        is_decode
+                        and o.shape[0] == 1
+                        and (get_platform().is_blackwell or get_platform().is_sm90)
+                    )
+                    or (
+                        is_target_verify
+                        and 0 < o.shape[0] <= 384
+                        and get_platform().is_blackwell
+                    )
+                    or (
+                        is_prefill
+                        and 4096 <= o.shape[0] <= 65536
+                        and get_platform().is_blackwell
+                    )
+                )
             )
             or (
-                is_target_verify
-                and 0 < o.shape[0] <= 384
-                and get_platform().is_blackwell
-            )
-            or (
-                is_prefill
+                _is_hip
+                and _is_gfx95_supported
+                and is_prefill
                 and 4096 <= o.shape[0] <= 65536
-                and get_platform().is_blackwell
             )
         )
         and o.shape[1:] == (2, 4096)
@@ -503,7 +514,7 @@ def _apply_wo_a_bf16_matmul(
         result = torch.empty(
             (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
         )
-        # cuBLAS accepts the strided destination, preserving the einsum
+        # BLAS accepts the strided destination, preserving the einsum
         # reduction while producing the contiguous layout consumed by wo_b.
         # Draft warmup/capture can enter with grad tracking enabled.
         with torch.no_grad():
