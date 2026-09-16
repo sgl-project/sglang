@@ -409,6 +409,10 @@ def _run_small_sort(
 _pending_quant_input: ContextVar[torch.Tensor | None] = ContextVar(
     "aiter_pending_quant_input", default=None
 )
+# the sort-time quant, handed on to the patched fused_dynamic_mxfp8_quant_moe_sort
+_emitted_quant: ContextVar[tuple[torch.Tensor, torch.Tensor] | None] = ContextVar(
+    "aiter_emitted_quant", default=None
+)
 
 
 @functools.cache
@@ -441,13 +445,15 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and hidden_states.shape[-1] % 2048 == 0
             and topk_ids.numel() <= 256
         )
-        token = _pending_quant_input.set(hidden_states if emit else None)
+        input_token = _pending_quant_input.set(hidden_states if emit else None)
+        emitted_token = _emitted_quant.set(None)
         try:
             return orig_fused_moe(
                 hidden_states, w1, w2, topk_weight, topk_ids, *args, **kwargs
             )
         finally:
-            _pending_quant_input.reset(token)
+            _emitted_quant.reset(emitted_token)
+            _pending_quant_input.reset(input_token)
 
     @functools.wraps(orig_sorting_impl)
     def sorting_impl_wrapper(
@@ -507,7 +513,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 int(num_experts),
             )
             if quant_ret is not None:
-                sorted_ids._premx_quant = quant_ret
+                _emitted_quant.set(quant_ret)
             return (
                 sorted_ids,
                 sorted_weights,
@@ -533,9 +539,9 @@ def apply_aiter_small_moe_sort_patch() -> None:
 
     @functools.wraps(orig_mx_quant)
     def mx_quant_wrapper(input, sorted_ids, *args, **kwargs):
-        pre = getattr(sorted_ids, "_premx_quant", None)
+        pre = _emitted_quant.get()
         if pre is not None and pre[0].shape == input.shape:
-            del sorted_ids._premx_quant
+            _emitted_quant.set(None)
             return pre
         return orig_mx_quant(input, sorted_ids, *args, **kwargs)
 
