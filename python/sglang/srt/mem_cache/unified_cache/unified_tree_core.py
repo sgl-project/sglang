@@ -1704,6 +1704,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def peek_host_eviction_candidates(
+        self, component_type: ComponentType, num_tokens: int
+    ) -> list[tuple[NodeId, int, Optional[list[str]]]]:
+        comp = self.components_by_type.get(component_type)
+        if comp is None or component_type != BASE_COMPONENT_TYPE:
+            return []
+        return comp.peek_host_eviction_candidates(num_tokens)
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
@@ -2075,9 +2083,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         return True
 
-    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+    def _is_host_leaf(
+        self, node: UnifiedTreeNode, *, ignore_children: bool = False
+    ) -> bool:
         """H-leaf: evicted, Full host value present, no children, unlocked on
-        both tiers, not root.
+        both tiers, not root. ``ignore_children`` answers "would this be an
+        H-leaf once its children are gone" for eviction-order simulation.
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership. In-flight DMA
@@ -2092,7 +2103,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # a live segment's anchor, and _evict_host_leaf would delete it.
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
-        if len(node.children) > 0:
+        if not ignore_children and len(node.children) > 0:
             return False
         return True
 
