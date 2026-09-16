@@ -353,9 +353,42 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         except Exception:
             self._tokenizer_auto_adds_specials = True
+        self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
         self._chat_template_cache: OrderedDict[
             bytes, tuple[str, tuple[int, ...], str]
         ] = OrderedDict()
+
+    def _probe_prompt_text_round_trip(self) -> bool:
+        """Does rendering the chat template to text and re-encoding lose anything?
+
+        mistral_common tokenizers emit control tokens ([INST],
+        [AVAILABLE_TOOLS], ...) that have no text form. Rendering to a string
+        turns them into literal characters and re-encoding also prepends a
+        second BOS, so the model sees the letters "AVAILABLE_TOOLS" instead of
+        the control token that frames the tool block. Encoding straight to ids
+        is the only faithful route on such tokenizers, so compare the two here
+        once and remember which to trust.
+        """
+        probe = [{"role": "user", "content": "x"}]
+        try:
+            tokenizer = self.tokenizer_manager.tokenizer
+            rendered = tokenizer.apply_chat_template(
+                probe, tokenize=False, add_generation_prompt=True, return_dict=False
+            )
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
+            via_text = tokenizer.encode(rendered, **encode_kwargs)
+            via_ids = tokenizer.apply_chat_template(
+                probe, tokenize=True, add_generation_prompt=True, return_dict=False
+            )
+            return list(via_text) != list(via_ids)
+        except Exception:
+            # A template that needs kwargs this probe does not supply tells us
+            # nothing; keep the long-standing text path.
+            return False
 
     def _handle_last_assistant_message(
         self,
@@ -1056,8 +1089,23 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        if is_multimodal and not chat_encoding.spec_renders_prompt_ids(
-            self.chat_encoding_spec
+        # A lossy text round-trip makes the rendered prompt unusable, so send the
+        # ids instead. Only when nothing needs placeholder expansion: with media
+        # attached the MM processor still has to tokenize the text itself.
+        prefers_prompt_ids = (
+            self._prompt_text_round_trip_is_lossy
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+            and not (
+                processed_messages.image_data
+                or processed_messages.video_data
+                or processed_messages.audio_data
+            )
+        )
+        if (
+            is_multimodal
+            and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
+            and not prefers_prompt_ids
         ):
             return "text", processed_messages.prompt
         if isinstance(processed_messages.prompt_ids, str):
@@ -1644,9 +1692,22 @@ class OpenAIServingChat(OpenAIServingBase):
             return_dict=False,
             **template_kwargs,
         )
-        prompt_ids = self.tokenizer_manager.tokenizer.encode(
-            rendered_prompt, **encode_kwargs
-        )
+        if self._prompt_text_round_trip_is_lossy:
+            # rendered_prompt is still produced, for logging and the cache key,
+            # but it is not what the model gets: re-encoding it would drop the
+            # control tokens the template just emitted.
+            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **template_kwargs,
+            )
+        else:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                rendered_prompt, **encode_kwargs
+            )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
