@@ -240,13 +240,15 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
         self.assertTrue(torch.all(got_w[:, -s:] == 1.0))
 
     def test_pad_fold_matches_separate_fill(self):
-        """HAS_PADDING fold == separate padded-fill(0) then append+remap.
+        """HAS_PADDING fold == the separate two-step padded path it replaces.
 
-        The fusion folds the padded-topk_ids fill into this kernel: rows
-        >= num_token_non_padded get pad_fill_id in every routed slot. With
-        pad_fill_id=0 this is bit-identical to the previous path that filled the
-        padded region with 0 (topk_ids=0 -> remap 0 + 0//nlr = 0) via a separate
-        _fill_padded_rows launch before append+remap ran.
+        On padded rows (>= num_token_non_padded) the fold does two things the
+        old path did in separate launches: fill pad_fill_id into every routed
+        id slot (was _fill_padded_rows on topk_ids, before append+remap), and
+        zero the full k+s weight row -- routed and shared alike (was
+        _zero_topk_weights_padded_region on topk_weights, after append+remap).
+        With pad_fill_id=0 the ids match bit-for-bit (remap 0 -> 0 + 0//nlr = 0),
+        and the weights match the post-zeroing baseline.
         """
         for m, k, npr, ep_size, ep_rank, s in self.CASES:
             for n_valid in (0, max(m // 2, 1), m):
@@ -256,7 +258,9 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                     )
                     topk_ids, topk_weights = self._make_inputs(m, k, npr)
 
-                    # Baseline: pre-fill padded rows to 0, no fold.
+                    # Baseline: pre-fill padded ids to 0, append+remap, then the
+                    # separate _zero_topk_weights_padded_region pass that zeroed
+                    # the whole padded weight row.
                     base_ids = topk_ids.clone()
                     base_ids[n_valid:] = 0
                     exp_ids, exp_w = fused_append_remap_shared_experts_deepep(
@@ -267,6 +271,7 @@ class TestFusedAppendRemapPerRankSharedSlots(CustomTestCase):
                         shared_id_base,
                         num_local_routed,
                     )
+                    exp_w[n_valid:] = 0.0
 
                     # Fused: fold the fill (no pre-fill), pad_fill_id=0.
                     ntnp = torch.tensor(
