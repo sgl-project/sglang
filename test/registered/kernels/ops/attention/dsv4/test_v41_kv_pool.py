@@ -9,11 +9,11 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
-from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test import dsv41_kv_quant_reference as tq
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
