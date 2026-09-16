@@ -1,12 +1,21 @@
 """Independent packed-FP4 cache oracle for the AMD store and reader tests."""
+
 from typing import Optional
+
 import torch
+
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    quantize_k_cache_v41 as quantize_k_cache_v41,
     dequantize_k_cache_v41 as dequantize_k_cache_v41,
+)
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv as fake_quant_compressed_kv,
 )
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    quantize_k_cache_v41 as quantize_k_cache_v41,
+)
+
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
 
 def quantize_to_e2m1_codes(x: torch.Tensor) -> torch.Tensor:
     """Round to the nearest e2m1 value with the semantics of
@@ -78,5 +87,3 @@ def dequantize_k_cache_v41_fp4(pages: torch.Tensor, page_size: int) -> torch.Ten
     values = dequantize_e2m1_codes(codes).view(num_pages, page_size, 32, 16)
     out = values * scale.view(torch.float8_e4m3fn).float().unsqueeze(-1)
     return out.view(num_pages, page_size, 512).to(torch.bfloat16)
-
-
