@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Small, checkpoint-free CUDA IPC tests in independent spawned processes.
+"""Checkpoint-free CUDA IPC lifecycle tests in independent spawned processes.
 
 Fatal/abandoned-client tests intentionally leave counted sends outstanding;
 the bounded generation policy retains those until the producer exits. No test

@@ -122,7 +122,7 @@ resolution/publication and component overrides are integrated in a later stage.
 
 ```bash
 python -m pytest test/registered/unit/model_loader/test_weight_cache_common.py -q
-python -m pytest test/registered/model_loading/test_weight_cache_common_ipc.py -q -s
+python -m pytest test/registered/e2e/model_loader/test_weight_cache_common_ipc.py -q -s
 python -m pytest test/registered/unit/model_loader/test_weight_cache_protocol.py -q
 ```
 

@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
-from sglang.multimodal_gen.utils import get_mixed_precision_state
+from sglang.multimodal_gen.runtime.utils.precision import get_mixed_precision_state
 
 
 def _resolved():

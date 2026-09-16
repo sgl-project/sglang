@@ -133,6 +133,44 @@ def test_preflight_failure_does_not_start_worker():
     context.assert_not_called()
 
 
+@pytest.mark.parametrize("gpu_ids,base_gpu_id", [([1], 0), (None, 1)])
+def test_cache_launch_uses_spawn_and_current_scheduler_signature(gpu_ids, base_gpu_id):
+    from sglang.multimodal_gen.runtime import launch_server
+
+    args = make_args()
+    args.gpu_ids = gpu_ids
+    args.base_gpu_id = base_gpu_id
+    reader, writer = Mock(), Mock()
+    reader.recv.return_value = {"status": "ready"}
+    context = Mock()
+    context.Pipe.return_value = (reader, writer)
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weight_cache.preflight.preflight"
+        ) as preflight,
+        patch.object(launch_server.mp, "get_context", return_value=context) as spawn,
+        patch.object(launch_server.mp, "Process") as default_process,
+        patch.object(launch_server.mp, "Pipe") as default_pipe,
+    ):
+        processes = launch_server.launch_server(args, launch_http_server=False)
+
+    preflight.assert_called_once_with(args)
+    spawn.assert_called_once_with("spawn")
+    default_process.assert_not_called()
+    default_pipe.assert_not_called()
+    context.Pipe.assert_called_once_with(duplex=False)
+    context.Process.assert_called_once_with(
+        target=launch_server.run_scheduler_process,
+        args=(1, 0, args, writer),
+        name="sglang-diffusionWorker-0",
+        daemon=True,
+    )
+    context.Process.return_value.start.assert_called_once_with()
+    assert processes == [context.Process.return_value]
+    writer.close.assert_called_once_with()
+    reader.close.assert_called_once_with()
+
+
 def test_physical_gpu_compatibility_does_not_include_local_ordinal():
     from sglang.multimodal_gen.runtime.weight_cache import identity
 
