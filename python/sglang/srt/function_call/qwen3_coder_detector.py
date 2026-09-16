@@ -19,6 +19,16 @@ from sglang.srt.function_call.utils import (
 logger = logging.getLogger(__name__)
 
 
+# A double quote between two word characters can never be a JSON delimiter, so it must be a
+# quote the model forgot to escape inside a string. Hebrew abbreviations write gershayim as an
+# ASCII quote (סה"כ, ש"ח), which turns an otherwise valid object argument into a string.
+_INNER_QUOTE = re.compile(r'(?<=[^\W_])"(?=[^\W_])')
+
+
+def _escape_inner_quotes(value: str) -> str:
+    return _INNER_QUOTE.sub(r'\\"', value)
+
+
 class Qwen3CoderDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
@@ -163,6 +173,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_value = json.loads(param_value)
                     return param_value
                 except Exception:
+                    repaired = _escape_inner_quotes(param_value)
+                    if repaired != param_value:
+                        try:
+                            return json.loads(repaired)
+                        except Exception:
+                            pass
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
