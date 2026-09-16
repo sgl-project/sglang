@@ -443,6 +443,10 @@ def moe_fused_gate(
     grid = (triton.cdiv(M, BLOCK_M),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
+    # Never alias an output as the fallback for an unused pointer arg: when
+    # Dynamo cannot analyze the kernel (PDL inline asm) it treats every pointer
+    # as mutated and writes both aliases back, clobbering `indices`.
+    _unused_i32 = torch.empty(1, dtype=torch.int32, device=scores.device)
     _router_triton_kernel[grid](
         scores,
         bias if bias is not None else scores,
@@ -451,7 +455,7 @@ def moe_fused_gate(
         num_token_non_padded,
         weights,
         indices,
-        packed_out if packed_out is not None else indices,
+        packed_out if packed_out is not None else _unused_i32,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
