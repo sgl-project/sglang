@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Inference-only Beam with native paged attention and tensor-parallel MoE."""
+"""Inference-only Beam model compatible with HuggingFace weights."""
 
 import math
 from typing import Iterable, Optional, Tuple

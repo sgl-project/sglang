@@ -58,18 +58,78 @@ def _normalize_rope_parameters(raw) -> dict:
 
 
 class BeamConfig(PretrainedConfig):
-    """Beam configuration with explicit attention and dense/MoE layer schedules.
+    r"""
+    This is the configuration class to store the configuration of a [`BeamForCausalLM`].
+    It is used to instantiate a Beam model according to the specified arguments,
+    defining the model architecture. Instantiating a configuration with the defaults
+    will yield a configuration similar to that of Beam-1.0-500B-A24B.
 
-    ``layer_types`` selects the attention kind per layer: ``sliding_attention``
-    layers use RoPE and the sliding window, ``full_attention`` layers use NoPE
-    with SSMax query scaling. ``mlp_layer_types`` selects ``dense`` or
-    ``sparse`` (MoE) feed-forward blocks. ``rope_parameters`` is keyed by
-    attention layer type and ``full_attention`` must be ``None``. Attention
-    width is ``num_attention_heads * head_dim`` and need not equal
-    ``hidden_size``. The default schedule includes a final full-attention
-    layer; explicitly supplied layer arrays are preserved. Native BF16 serving
-    uses BF16 residual arithmetic and, by default, BF16 LM-head projection
-    output followed by FP32 softcap and logprobs.
+    Configuration objects inherit from [`PretrainedConfig`] and can be used to control
+    the model outputs. Read the documentation from [`PretrainedConfig`] for more
+    information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 151936):
+            Vocabulary size of the Beam model.
+        hidden_size (`int`, *optional*, defaults to 5120):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 20480):
+            Dimension of the dense SwiGLU MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 52):
+            Number of decoder layers.
+        num_attention_heads (`int`, *optional*, defaults to 48):
+            Number of query heads for each attention layer.
+        num_key_value_heads (`int`, *optional*, defaults to 8):
+            Number of key/value heads for grouped-query attention.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimension of each attention head, independent of
+            `hidden_size // num_attention_heads`.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            Activation of the SwiGLU MLPs. Native Beam supports only `"silu"`.
+        max_position_embeddings (`int`, *optional*, defaults to 1048576):
+            The maximum sequence length that this model might ever be used with.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation of the truncated normal initializer.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            Epsilon used by the RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether the model returns key/value caches.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the input and output embeddings. Native Beam requires `False`.
+        rope_parameters (`dict`, *optional*):
+            RoPE configuration keyed by attention layer type. The
+            `"sliding_attention"` entry holds `rope_type` (only `"default"`) and
+            `rope_theta` (defaults to 10000.0); `"full_attention"` must be `None`
+            because full-attention layers run without rotary embeddings.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether the attention projections use a bias. Native Beam requires `False`.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout ratio for the attention probabilities.
+        sliding_window (`int`, *optional*, defaults to 512):
+            Number of visible positions in sliding-attention layers.
+        layer_types (`list[str]`, *optional*):
+            Per-layer attention type, each `"sliding_attention"` (RoPE, sliding
+            window) or `"full_attention"` (NoPE, SSMax query scaling). Defaults to
+            full attention on every sixth layer and on the final layer.
+        mlp_layer_types (`list[str]`, *optional*):
+            Per-layer feed-forward type, each `"dense"` or `"sparse"`. Defaults to
+            the first three layers dense and the rest sparse.
+        moe_intermediate_size (`int`, *optional*, defaults to 2560):
+            Intermediate size of each routed expert.
+        num_experts (`int`, *optional*, defaults to 256):
+            Total number of routed experts.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of experts selected for each token.
+        norm_topk_prob (`bool`, *optional*, defaults to `True`):
+            Whether to normalize the selected routing scores. Native Beam requires `True`.
+        n_group (`int`, *optional*, defaults to 8):
+            Number of expert groups used for routing.
+        topk_group (`int`, *optional*, defaults to 4):
+            Number of expert groups retained for each token.
+        routed_scaling_factor (`float`, *optional*, defaults to 2.5):
+            Multiplier applied to the combined routed-expert output.
+        final_logit_softcapping (`float`, *optional*, defaults to 30.0):
+            Tanh soft cap applied to the output logits in FP32.
     """
 
     model_type = "beam"
