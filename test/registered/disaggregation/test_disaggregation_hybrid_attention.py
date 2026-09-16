@@ -43,7 +43,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
             "--tp",
             "4",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -64,7 +64,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
             "--base-gpu-id",
             "4",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -117,7 +117,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -140,7 +140,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
             "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -194,7 +194,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
             "--tp",
             "2",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -219,7 +219,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
             "--base-gpu-id",
             "2",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(2, 4))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -271,7 +271,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             "--tp",
             "4",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -292,7 +292,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
             "--base-gpu-id",
             "4",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -345,7 +345,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -368,7 +368,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "--mamba-radix-cache-strategy",
             "extra_buffer",
         ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

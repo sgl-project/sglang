@@ -76,6 +76,24 @@ impl Runtime {
             self.mm_wiring.tokenizer.clone(),
             self.mm_results.clone(),
         )?);
+        self.spawn_mm_pool(workers, ctx);
+        Ok(())
+    }
+
+    pub fn start_mm_workers_with_processor(
+        &self,
+        processor: Arc<dyn crate::multi_modality::worker::MmProcessor>,
+        workers: usize,
+    ) {
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
+            processor,
+            self.mm_wiring.tokenizer.clone(),
+            self.mm_results.clone(),
+        ));
+        self.spawn_mm_pool(workers, ctx);
+    }
+
+    fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
@@ -84,7 +102,6 @@ impl Runtime {
                 ctx.clone(),
             )
         });
-        Ok(())
     }
 
     /// Stop the runtime and join every worker thread (with a bounded wait).
