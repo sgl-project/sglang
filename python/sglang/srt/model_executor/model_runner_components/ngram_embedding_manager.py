@@ -171,9 +171,7 @@ class NgramEmbeddingManager:
         """Refresh extend predecessors after prefix hits, retraction, or slot reuse."""
         n1 = self.engram_hasher.max_ngram_size - 1
         if batch.forward_mode.is_prebuilt():
-            # PD decode runs no EXTEND for this request, so the row its first
-            # DECODE reads is written here: the n - 1 tokens before the one
-            # prefill sampled, which is the token decode feeds next.
+            # PD decode skips EXTEND, so seed its first DECODE with the preceding n - 1 tokens.
             history = self.engram_hasher.history
             rows = []
             for req in batch.reqs:

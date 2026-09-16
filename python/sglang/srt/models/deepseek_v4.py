@@ -1835,10 +1835,7 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        # kv_score depends only on x, so its CP all-gather can start before the
-        # projections and be collected inside forward_core_compressor below --
-        # the projections are what hides it. No-op unless the CP+TBO path armed
-        # _cp_prefetch_comm_stream.
+        # CP projections hide the KV-score all-gather; forward_core_compressor joins it.
         if (
             _is_hip
             and self.compressor is not None
@@ -2357,9 +2354,7 @@ class MQALayer(MqaAttentionBase):
                             except (AttributeError, TypeError):
                                 pass
                 elif _is_gfx942_supported:
-                    # Uninitialized padded TP heads inject NaN into attention on gfx942
-                    # (fnuz), so zero-init there; other archs tolerate new_empty and skip
-                    # the per-forward memset.
+                    # gfx942 attention reads padded heads, so zero them to prevent NaNs.
                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
                 else:
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)

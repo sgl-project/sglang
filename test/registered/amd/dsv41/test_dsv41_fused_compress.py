@@ -18,9 +18,7 @@ register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 HIDDEN = 2048
 HEAD_DIM = 512
-# `[0] * 2 + [2] * 18 + [1] * 20` as the served model lays the ratios out; the
-# ratio-2 and ratio-1 source layers are read back off the pool rather than
-# assumed.
+# Read ratio-1/2 source layers from the pool rather than assuming the model ordering.
 RATIOS = [0] * 2 + [2] * 18 + [1] * 20
 KV_SOURCE_LAYERS = (2, 8, 14, 20)
 POOL_PAGE_SIZE = 256

@@ -781,10 +781,7 @@ class EngramEmbedding(nn.Module):
 
     def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
         if is_hip() and values.is_cuda:
-            # Exactly one shard owns each row; every other shard contributes
-            # zero bits. Integer addition reconstructs BF16 values exactly,
-            # including subnormals that floating custom all-reduce flushes.
-            # Pack two BF16 values per int32 without copying or widening.
+            # Integer addition preserves all BF16 bits because exactly one shard owns each row.
             inplace_all_reduce(
                 values.view(torch.int32), group_name=get_parallel().tp_group.unique_name
             )

@@ -19,9 +19,7 @@ struct FusedKNormRopeQFlashMLAParams {
   const void* __restrict__ positions;   // (B,) PosT
   const int32_t* __restrict__ out_loc;  // (B,) int32 -> cache slot id
   uint8_t* __restrict__ kvcache;        // (npages, kPageBytes) uint8
-  // Row stride for `kv` in elements. Required because the upstream caller often
-  // passes `qkv_a[..., q_lora_rank:]`, a non-contiguous slice whose stride[0]
-  // equals `q_lora_rank + kHeadDim` rather than `kHeadDim`.
+  // KV may be a strided qkv_a slice, so row stride can exceed kHeadDim.
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
@@ -88,9 +86,7 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
     const auto warp_sum = warp::reduce_sum(sum_of_squares);
     if (lane_id == 0) partial_sums[warp_id] = warp_sum;
     __syncthreads();
-    // Replicate the per-warp partial sums onto all lanes of one warp and
-    // reduce. Every group of `kBlockItemNumWarps` lanes ends up with the
-    // global sum.
+    // Replicate warp partials so each lane group receives the same global sum.
     sum_of_squares = warp::reduce_sum<kFusedKNumWarps>(partial_sums[lane_id % kFusedKNumWarps]);
     const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
@@ -124,18 +120,12 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
     }
   }
 
-  // A negative out_loc marks a slot with no KV write target (e.g. the -1
-  // sentinel from the full->SWA translation for out-of-window tokens or
-  // padded rows); skip the row instead of writing out of bounds. Checked
-  // here, not at the load, so the out_loc prefetch overlaps the norm above.
+  // Negative locations have no write target; defer the check to overlap its load with normalization.
   if (out_loc < 0) return;
 
   const auto row = Paged::row(params.kvcache, out_loc);
   if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
-    // V4.1 layouts: every dim is quantized, with one scale per 32 (fp8) or 16 (fp4)
-    // values. The reference quantizes the bf16 tensor kv_norm produces and rotates
-    // the tail in bf16, so round the normed values to the storage dtype, rotate,
-    // round again, then quantize the whole row.
+    // Match the reference: round normalization and RoPE to BF16 before quantizing every dimension.
     using Packed = packed_t<DType>;
     PDLTriggerSecondary<kUsePDL>();
 
