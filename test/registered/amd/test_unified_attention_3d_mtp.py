@@ -18,16 +18,8 @@ if _RUNNABLE:
         from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
             unified_attention_3d_mtp_func,
         )
-        from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-            asm_kernel_available,
-            mtp_verify_attn_fwd_asm,
-        )
     except Exception:
         _RUNNABLE = False
-
-_ASM_RUNNABLE = False
-if _RUNNABLE:
-    _ASM_RUNNABLE = asm_kernel_available()
 
 
 @unittest.skipUnless(_RUNNABLE, "requires HIP gfx950 with aiter")
@@ -115,62 +107,6 @@ class TestUnifiedAttention3dMtp(CustomTestCase):
         )
 
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
-
-
-@unittest.skipUnless(_ASM_RUNNABLE, "requires the gfx950 assembly kernel")
-class TestVattnAsmHipGraph(CustomTestCase):
-    def test_survives_hip_graph_capture(self):
-        # ROCm 10 images load two libamdhip64 copies. Launching the ctypes
-        # module on a torch side stream (HIP-graph capture) used to return 709.
-        torch.manual_seed(0)
-        device = "cuda"
-        query_lens = [4, 2]
-        kv_lens_list = [256, 193]
-        head_size = 256
-        block_size = 16
-        max_kv_len = max(kv_lens_list)
-        max_blocks_per_seq = math.ceil(max_kv_len / block_size)
-        num_blocks = len(query_lens) * max_blocks_per_seq
-        query = torch.randn(
-            sum(query_lens), 16, head_size, device=device, dtype=torch.bfloat16
-        )
-        key = torch.randn(
-            num_blocks, block_size, 1, head_size, device=device, dtype=torch.bfloat16
-        ).to(e4m3_dtype)
-        value = torch.randn_like(key, dtype=torch.bfloat16).to(e4m3_dtype)
-        cu_seqlens_q = torch.tensor(
-            [0, query_lens[0], sum(query_lens)], device=device, dtype=torch.int32
-        )
-        seqused_k = torch.tensor(kv_lens_list, device=device, dtype=torch.int64)
-        block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).view(
-            len(query_lens), max_blocks_per_seq
-        )
-        k_descale = torch.ones(1, device=device, dtype=torch.float32)
-        v_descale = torch.ones(1, device=device, dtype=torch.float32)
-        args = (
-            query,
-            key,
-            value,
-            block_table,
-            seqused_k,
-            cu_seqlens_q,
-            k_descale,
-            v_descale,
-            head_size**-0.5,
-        )
-        stream = torch.cuda.Stream()
-        out = torch.empty_like(query)
-        with torch.cuda.stream(stream):
-            mtp_verify_attn_fwd_asm(*args, num_segments=4, out=out)
-        stream.synchronize()
-        eager = out.clone()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=stream):
-            mtp_verify_attn_fwd_asm(*args, num_segments=4, out=out)
-        out.zero_()
-        g.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(out, eager, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

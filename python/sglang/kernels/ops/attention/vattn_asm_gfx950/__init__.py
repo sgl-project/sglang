@@ -5,9 +5,7 @@ KV cache, GQA ratios 16 and 8.
 vattn3_core.s (split-KV main kernel, one code object per GQA ratio) and vred.s
 (segment reduce) ship as source and are assembled at first use with ROCm clang
 into a per-process temp dir; launches go through ctypes hipModuleLaunchKernel
-on the current torch stream, using the libamdhip64 already mapped by PyTorch
-(ROCm 10 wheels also ship a second copy on LD_LIBRARY_PATH). Kernarg ABI is
-guarded three ways:
+on the current torch stream. Kernarg ABI is guarded three ways:
   1. single ctypes.Structure(_pack_=1) definition, fields filled by name;
   2. sizeof() asserted against the expected constant at import;
   3. sizeof() cross-checked against the .amdhsa_kernarg_size the kernel itself
@@ -23,6 +21,8 @@ import subprocess
 import tempfile
 
 import torch
+
+from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG2E = 1.4426950408889634
@@ -96,48 +96,17 @@ def _declared_kernarg_size(source_file):
     return int(m.group(1))
 
 
-def _mapped_amdhip64_paths():
-    """Absolute paths of libamdhip64 already mapped into this process."""
-    paths = []
-    seen = set()
-    try:
-        with open("/proc/self/maps") as f:
-            for line in f:
-                path = line.rsplit(" ", 1)[-1].strip()
-                if "libamdhip64.so" not in path or not path.startswith("/"):
-                    continue
-                if path not in seen:
-                    seen.add(path)
-                    paths.append(path)
-    except OSError:
-        pass
-    return paths
-
-
-def _select_amdhip64_path(mapped_paths):
-    """HIP library that owns torch.cuda.Stream handles.
-
-    ROCm 10 wheels map PyTorch to ``_rocm_sdk_core`` while ``LD_LIBRARY_PATH``
-    points at a second ``_rocm_sdk_devel`` copy of the same SONAME.
-    ``CDLL("libamdhip64.so")`` opens devel; launching that module on a torch
-    side stream or HIP graph then returns hipErrorContextIsDestroyed (709).
-    """
-    if not mapped_paths:
-        return "libamdhip64.so"
-    for path in mapped_paths:
-        if "_rocm_sdk_core" in path:
-            return path
-    return mapped_paths[0]
-
-
 def _hip_lib():
     global _hip
     if _hip is None:
-        if torch.version.hip and torch.cuda.is_available():
-            # Maps are empty until torch loads HIP. Opening the soname first
-            # can pin us to _rocm_sdk_devel on ROCm 10 images.
-            torch.cuda.current_device()
-        _hip = ctypes.CDLL(_select_amdhip64_path(_mapped_amdhip64_paths()))
+        # ROCm 10 images carry two libamdhip64 of the same SONAME: torch loads
+        # the one under _rocm_sdk_core, while LD_LIBRARY_PATH points at the
+        # _rocm_sdk_devel copy. Binding the devel one still loads the module,
+        # but every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709). Initialize CUDA so torch's copy is
+        # mapped, then bind to that.
+        torch.cuda.current_device()
+        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
