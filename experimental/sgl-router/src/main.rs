@@ -50,34 +50,34 @@ async fn main() -> Result<()> {
     let (sigterm, sigint) = install_signal_handlers()?;
     log_startup(&config);
 
-    // Load tokenizers and create the shared catalog of workers available for routing.
+    // Load tokenizers used to prepare requests for routing.
     let tokenizers =
         Arc::new(TokenizerRegistry::load_from_config(&config).context("load tokenizers")?);
-    let worker_registry = Arc::new(WorkerRegistry::default());
 
-    // Set up cache lookup and monitor workers for KV-cache and engine-load updates.
+    // Monitor engine-reported KV-cache events and load statistics for routing.
     let external_prefix_index = build_external_prefix_index(&config)?;
-    let kv_event_index = start_kv_event_monitor(external_prefix_index.is_some());
+    let engine_state = start_engine_state_monitor(external_prefix_index.is_some());
 
     // Build the policies that choose which workers receive each request.
     let routing_policies = Arc::new(
         build_policy_registry(
             &config,
-            kv_event_index.tree(),
-            kv_event_index.block_size_oracle(),
+            engine_state.tree(),
+            engine_state.block_size_oracle(),
         )
         .context("build policy registry")?,
     );
 
-    // Track active requests and periodically remove stale load records.
-    let (active_load, load_janitor) = start_load_monitor(&config);
+    // Track this router's in-flight proxied requests and clean up stale entries.
+    let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
 
-    // Discover workers and let the manager register, update, and remove them.
+    // Discovery feeds worker changes to the manager, which maintains this routing catalog.
+    let worker_registry = Arc::new(WorkerRegistry::default());
     let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
         &config,
         &worker_registry,
-        &kv_event_index,
-        &active_load,
+        &engine_state,
+        &local_inflight_requests,
     )
     .await?;
 
@@ -87,8 +87,8 @@ async fn main() -> Result<()> {
         tokenizers,
         worker_registry,
         routing_policies,
-        active_load,
-        &kv_event_index,
+        local_inflight_requests,
+        &engine_state,
         external_prefix_index,
     )?;
     app_context.mark_ready();
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
     worker_manager_handle.abort();
-    load_janitor.shutdown().await;
+    inflight_cleanup.shutdown().await;
     log_shutdown(&server_result, inflight_drain_secs);
     server_result
 }
@@ -203,43 +203,44 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     }
 }
 
-fn start_kv_event_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
+fn start_engine_state_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .expect("default http client builds");
     if use_external_indexer {
-        // External indexing still needs worker hash metadata, but no local KV-event tree.
+        // External indexing still needs worker hash metadata and engine load, but no local KV tree.
         KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new())
     } else {
         KvEventIndex::new_with_http(http)
     }
 }
 
-fn start_load_monitor(config: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) {
+fn start_local_inflight_tracker(config: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) {
     let timeout_secs = config.active_load.stale_request_timeout_secs;
-    let active_load =
+    let local_inflight_requests =
         ActiveLoadRegistry::new(Arc::new(SystemTimeClock), Duration::from_secs(timeout_secs));
     // Reap stale requests at one tenth of their timeout, bounded to 1–60 seconds.
     let sweep_interval = Duration::from_secs((timeout_secs / 10).clamp(1, 60));
-    let handle = spawn_janitor(Arc::clone(&active_load), sweep_interval);
-    (active_load, handle)
+    let inflight_cleanup = spawn_janitor(Arc::clone(&local_inflight_requests), sweep_interval);
+    (local_inflight_requests, inflight_cleanup)
 }
 
 async fn start_worker_discovery_and_manager(
     config: &Config,
     worker_registry: &Arc<WorkerRegistry>,
-    kv_event_index: &Arc<KvEventIndex>,
-    active_load: &Arc<ActiveLoadRegistry>,
+    engine_state: &Arc<KvEventIndex>,
+    local_inflight_requests: &Arc<ActiveLoadRegistry>,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let (worker_events, discovery_handle) =
         spawn_discovery(config).await.context("spawn discovery")?;
+    // Keep engine subscriptions and local request counters in sync with worker membership.
     let worker_manager_handle = tokio::spawn(manager::run_with_config(
         worker_events,
         Arc::clone(worker_registry),
         Some(Arc::new(config.clone())),
-        Some(Arc::clone(kv_event_index)),
-        Some(Arc::clone(active_load)),
+        Some(Arc::clone(engine_state)),
+        Some(Arc::clone(local_inflight_requests)),
     ));
     Ok((discovery_handle, worker_manager_handle))
 }
@@ -249,11 +250,11 @@ fn build_app_context(
     tokenizers: Arc<TokenizerRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     routing_policies: Arc<PolicyRegistry>,
-    active_load: Arc<ActiveLoadRegistry>,
-    kv_event_index: &KvEventIndex,
+    local_inflight_requests: Arc<ActiveLoadRegistry>,
+    engine_state: &KvEventIndex,
     external_prefix_index: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
-    let block_size_oracle = kv_event_index.block_size_oracle();
+    let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
             .context("build proxy client")?,
@@ -265,7 +266,7 @@ fn build_app_context(
         proxy,
         worker_registry,
         routing_policies,
-        active_load,
+        local_inflight_requests,
     );
     app_context.prefix_index = external_prefix_index;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
@@ -274,10 +275,10 @@ fn build_app_context(
             .cache_aware
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(kv_event_index.tree(), Arc::clone(&block_size_oracle)));
+    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.block_size_oracle = block_size_oracle;
-    app_context.engine_load = kv_event_index.engine_load();
-    app_context.kv_metrics = kv_event_index.metrics_source();
+    app_context.engine_load = engine_state.engine_load();
+    app_context.kv_metrics = engine_state.metrics_source();
     Ok(Arc::new(app_context))
 }
 
