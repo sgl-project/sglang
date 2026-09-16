@@ -6,7 +6,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _partial(
+def _sharded_greedy_partial_kernel(
     B,
     X,
     P,
@@ -34,7 +34,7 @@ def _partial(
 
 
 @triton.jit
-def _finish(
+def _sharded_greedy_finish_kernel(
     P,
     OUT,
     BS: tl.constexpr,
@@ -78,7 +78,7 @@ def sharded_greedy_step(bias, base_local, *, group, vocab_start, gather=None):
     parts = triton.cdiv(base_local.shape[1], block)
     assert parts > 0
     partial = torch.empty((rows, parts, 2), device=bias.device, dtype=torch.float32)
-    _partial[(rows, parts)](
+    _sharded_greedy_partial_kernel[(rows, parts)](
         bias,
         base_local,
         partial,
@@ -97,7 +97,7 @@ def sharded_greedy_step(bias, base_local, *, group, vocab_start, gather=None):
     else:
         gathered = group.all_gather(partial, dim=0) if group.world_size > 1 else partial
     result = torch.empty(rows, device=bias.device, dtype=torch.int64)
-    _finish[(rows,)](
+    _sharded_greedy_finish_kernel[(rows,)](
         gathered,
         result,
         rows,

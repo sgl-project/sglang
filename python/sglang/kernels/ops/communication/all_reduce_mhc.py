@@ -11,9 +11,9 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication.all_reduce_fusion import (
-    _require_cluster_launch_arch,
     default_cluster_size,
     get_registered_comm,
+    require_cluster_launch_arch,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -22,8 +22,8 @@ _MHC_HIDDEN_DIM = 5120
 
 
 @cache_once
-def _module(world_size, top_k, cluster_size, weight_dtype):
-    _require_cluster_launch_arch()
+def _jit_mhc_module(world_size, top_k, cluster_size, weight_dtype):
+    require_cluster_launch_arch()
     args = make_cpp_args(
         world_size,
         _MHC_HIDDEN_DIM,
@@ -61,7 +61,7 @@ def _moe_finalize_all_reduce_mhc_op(
 ) -> None:
     comm = get_registered_comm(world_size)
     assert comm is not None
-    _module(world_size, top_k, cluster_size, weights.dtype).run(
+    _jit_mhc_module(world_size, top_k, cluster_size, weights.dtype).run(
         comm,
         out,
         gemm2,
@@ -137,7 +137,7 @@ def _moe_finalize_all_reduce_mhc_norm_op(
 ) -> None:
     comm = get_registered_comm(world_size)
     assert comm is not None
-    _module(world_size, top_k, cluster_size, weights.dtype).run_norm(
+    _jit_mhc_module(world_size, top_k, cluster_size, weights.dtype).run_norm(
         comm,
         out,
         gemm2,
@@ -241,8 +241,8 @@ def all_reduce_mhc_norm(
 
 
 @cache_once
-def _quant_module(world_size, top_k, cluster_size, weight_dtype):
-    _require_cluster_launch_arch()
+def _jit_mhc_quant_module(world_size, top_k, cluster_size, weight_dtype):
+    require_cluster_launch_arch()
     args = make_cpp_args(
         world_size,
         _MHC_HIDDEN_DIM,
@@ -286,7 +286,7 @@ def _moe_finalize_all_reduce_mhc_quant_op(
 ) -> None:
     comm = get_registered_comm(world_size)
     assert comm is not None
-    _quant_module(world_size, top_k, cluster_size, weights.dtype).run(
+    _jit_mhc_quant_module(world_size, top_k, cluster_size, weights.dtype).run(
         comm,
         out,
         gemm2,

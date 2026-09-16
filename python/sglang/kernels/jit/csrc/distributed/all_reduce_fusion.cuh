@@ -67,7 +67,7 @@ SGL_DEVICE void barrier_cluster_wait() {
 }
 
 template <uint32_t kWorldSize, typename WeightT>
-struct FinalizeAllReduceParams {
+struct MoeFinalizeAllReduceParams {
   bf16_t* out;                // [num_tokens, kHiddenDim], output-only
   const bf16_t* gemm2;        // [P, kHiddenDim], permuted / padded rows
   const int32_t* idx;         // [num_tokens * kTopK], -1 = dropped slot
@@ -96,7 +96,10 @@ struct FinalizeAllReduceParams {
 
 template <uint32_t kHiddenDim, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE void mhc_quant_vec(
-    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& value, uint32_t token, uint32_t hvec) {
+    const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params,
+    const StageVec& value,
+    uint32_t token,
+    uint32_t hvec) {
   using namespace device;
   fp32x2_t v[4];
   float amax = 0.0f;
@@ -133,7 +136,7 @@ SGL_DEVICE void mhc_quant_vec(
 /// remaining three residual streams.
 template <uint32_t kHiddenDim, bool kCollapse = false, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE StageVec mhc_post_vec(
-    const FinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& red, uint32_t token, uint32_t hvec) {
+    const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, const StageVec& red, uint32_t token, uint32_t hvec) {
   using namespace device;
   StageVec residual[4];
   fp32x2_t collapsed[4] = {};
@@ -182,7 +185,7 @@ SGL_DEVICE StageVec mhc_post_vec(
 /// Row geometry: one 16B vector per thread, one cluster per row, so the block
 /// size follows from the hidden width and the cluster size (the tuning knob).
 template <uint32_t kHiddenDim, uint32_t kClusterSize>
-struct AllReduceNormTrait {
+struct RowClusterTrait {
   static constexpr uint32_t kRowVecs = kHiddenDim / 8;             // 16B vectors per row
   static constexpr uint32_t kBlockSize = kRowVecs / kClusterSize;  // threads per block
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
@@ -198,7 +201,7 @@ struct AllReduceNormTrait {
 // routing rows and the kTopK gathers are fetched.
 template <uint32_t kHiddenDim, uint32_t kTopK, bool kHasShared, bool kUsePDL, uint32_t kWorldSize, typename WeightT>
 SGL_DEVICE StageVec
-finalize_vec(const FinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
+finalize_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
   using namespace device;
   const auto* idx = params.idx + static_cast<int64_t>(token) * kTopK;
   const auto* weights = params.weights + static_cast<int64_t>(token) * kTopK;
@@ -284,12 +287,12 @@ template <
     typename WeightT,
     bool kMhc = false,
     bool kQuant = false>
-__global__ __launch_bounds__(AllReduceNormTrait<kHiddenDim, kClusterSize>::kBlockSize)
+__global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
-        const __grid_constant__ FinalizeAllReduceParams<kWorldSize, WeightT> params) {
+        const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
   namespace cg = cooperative_groups;
   using namespace device;
-  using T = AllReduceNormTrait<kHiddenDim, kClusterSize>;
+  using T = RowClusterTrait<kHiddenDim, kClusterSize>;
   constexpr uint32_t kRowVecs = T::kRowVecs;
   constexpr uint32_t kBlockSize = T::kBlockSize;
   constexpr uint32_t kNumWarps = T::kNumWarps;
@@ -449,8 +452,8 @@ struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
   using TensorView = tvm::ffi::TensorView;
-  using Params = FinalizeAllReduceParams<kWorldSize, WeightT>;
-  using Trait = AllReduceNormTrait<kHiddenDim, kClusterSize>;
+  using Params = MoeFinalizeAllReduceParams<kWorldSize, WeightT>;
+  using Trait = RowClusterTrait<kHiddenDim, kClusterSize>;
 
   template <bool kHasShared, bool kNorm>
   static constexpr auto kernel = moe_finalize_all_reduce_kernel<

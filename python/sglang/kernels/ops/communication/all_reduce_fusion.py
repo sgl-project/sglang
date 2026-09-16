@@ -108,7 +108,7 @@ def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool
 # shared-add and norm variants are compiled into it and picked at call time.
 
 
-def _require_cluster_launch_arch() -> None:
+def require_cluster_launch_arch() -> None:
     if is_hip_runtime() or get_jit_cuda_arch().major < 9:
         raise RuntimeError(
             "fused all-reduce cluster kernels require CUDA SM90 or newer"
@@ -123,7 +123,7 @@ def _jit_module(
     cluster_size: int,
     weight_dtype: torch.dtype,
 ) -> Module:
-    _require_cluster_launch_arch()
+    require_cluster_launch_arch()
     assert cluster_size in valid_cluster_sizes(hidden_dim), (
         f"cluster_size={cluster_size} is not valid for hidden_dim={hidden_dim}; "
         f"choose from {valid_cluster_sizes(hidden_dim)}"

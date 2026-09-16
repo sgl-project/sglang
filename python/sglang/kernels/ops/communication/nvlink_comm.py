@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import Communicator
 
 
-SUPPORTED_OPS: Final = ["all_reduce", "all_gather", "reduce_scatter"]
+_PRIMITIVES: Final = ["all_reduce", "all_gather", "reduce_scatter"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -35,12 +35,12 @@ def get_multicast_ptr(tensor: torch.Tensor) -> int:
 def _jit_pull_module(dtype: torch.dtype, num_unroll: int) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        "nvl_comm_pull",
+        "nvlink_comm_pull",
         *args,
         f"unroll{num_unroll}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
-            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in SUPPORTED_OPS
+            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in _PRIMITIVES
         ],
     )
 
@@ -49,12 +49,12 @@ def _jit_pull_module(dtype: torch.dtype, num_unroll: int) -> Module:
 def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        "nvl_comm_push",
+        "nvlink_comm_push",
         *args,
         f"world{world_size}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
-            (n, f"NVLinkComm<{args}>::{n}_push<{world_size}>") for n in SUPPORTED_OPS
+            (n, f"NVLinkComm<{args}>::{n}_push<{world_size}>") for n in _PRIMITIVES
         ],
     )
 
