@@ -237,6 +237,11 @@ pub(crate) async fn connect_conn(config: &ValkeyConfig) -> Result<Conn, Status> 
     }
 }
 
+/// The set every worker that ever reported a placement is added to.
+pub(crate) fn workers_key(prefix: &str) -> String {
+    format!("{prefix}workers")
+}
+
 pub(crate) fn cluster_nodes(url: &str) -> Vec<String> {
     url.split(',')
         .map(|node| node.trim().to_string())
@@ -868,8 +873,7 @@ impl ValkeyKvIndexerBackend {
     }
 
     /// Revokes every placement of `worker_id` at every tier through the normal
-    /// apply path, keeping its address and spec. Returns false when the worker
-    /// holds nothing, so callers can log and count only real clears.
+    /// apply path, keeping its address and spec. False when it held nothing.
     pub async fn clear_worker(&self, worker_id: &str) -> Result<bool, Status> {
         let tiers = [TierType::TierHbm, TierType::TierDram, TierType::TierSsd];
         let mut pipe = redis::pipe();
@@ -938,7 +942,7 @@ impl ValkeyKvIndexerBackend {
     }
 
     fn workers_key(&self) -> String {
-        format!("{}workers", self.prefix)
+        workers_key(&self.prefix)
     }
 
     fn placement_field(worker: &str, tier: i32) -> String {

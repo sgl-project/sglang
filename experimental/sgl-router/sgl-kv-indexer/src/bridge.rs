@@ -20,7 +20,7 @@
 //!   the batch timestamp, and answered with `AllBlocksCleared` because that
 //!   worker's cache is empty.
 //! * Worker liveness, when a Valkey configuration is present: a TTL key
-//!   refreshed only while the worker's own port answers.
+//!   refreshed while the worker's own port answers, when an address is set.
 //!
 //! Still absent: an incarnation token (a restart is inferred, not announced) and
 //! any acknowledgement of what the indexer actually applied.
@@ -36,7 +36,7 @@ use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
-use crate::liveness::{Heartbeat, DEFAULT_HEARTBEAT_TTL};
+use crate::liveness::{retire_heartbeat, Heartbeat, DEFAULT_HEARTBEAT_TTL};
 use crate::stream::{StreamSink, DEFAULT_STREAM_MAXLEN};
 use crate::valkey_backend::{connect_conn, Conn, ValkeyConfig, DEFAULT_KEY_PREFIX};
 
@@ -367,6 +367,12 @@ where
             ttl,
             stop_rx,
         ))),
+        // A marker left from an earlier session would read as a worker that
+        // heartbeats and has expired, which liveness clears for good.
+        (Some(valkey), None) => {
+            retire_heartbeat(valkey, &config.worker_id).await;
+            None
+        }
         _ => None,
     };
     let result = tokio::select! {
@@ -564,9 +570,8 @@ async fn run_session(
     last_seq: &mut Option<u64>,
     checkpoint: Option<&Checkpoint>,
 ) -> Result<(), BridgeError> {
-    // Whatever the worker still buffers since we last saw it, before live events.
-    // A replay that cannot be served costs recovery, not the session: the live
-    // stream is still worth consuming.
+    // Whatever the worker still buffers since we last saw it, before live events;
+    // a replay that cannot be served costs recovery, not the session.
     if let Err(error) = replay(config, &mut forwarder, last_seq, None).await {
         if error.is_permanent() {
             return Err(error);
@@ -576,10 +581,8 @@ async fn run_session(
     if let Some(checkpoint) = checkpoint {
         checkpoint.store(*last_seq).await;
     }
-    // Newest batch timestamp forwarded. A sequence at or below `last_seq` is
-    // either a restarted publisher, whose batches are newer than anything seen,
-    // or a batch already forwarded because the replay and the live stream
-    // overlap. Only the first may clear the worker.
+    // Newest batch timestamp forwarded: a sequence at or below `last_seq` is a
+    // restarted publisher only if its batch is newer, else a replay overlap.
     let mut newest_ts = f64::MIN;
 
     loop {
@@ -682,9 +685,8 @@ impl Checkpoint {
     }
 }
 
-/// Asks the worker's replay socket for every buffered batch after `last_seq`
-/// and forwards the ones below `until` (the live stream delivers the rest).
-/// A no-op without a replay endpoint.
+/// Forwards what the worker still buffers after `last_seq`, up to `until`
+/// exclusive. A no-op without a replay endpoint.
 async fn replay(
     config: &BridgeConfig,
     forwarder: &mut Forwarder,
@@ -755,8 +757,7 @@ async fn replay(
     info!(start, replayed, "replayed buffered KV event batches");
     if let Some(first) = dropped_before {
         // A hole would leave the index claiming blocks the worker may no longer
-        // hold, with nothing to correct it. Clearing costs this worker's affinity
-        // until it reports again, which is recoverable; a hole is not.
+        // hold, with nothing to correct it; a cleared worker re-reports.
         warn!(
             start,
             first,
@@ -982,9 +983,7 @@ fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
 }
 
 /// The timestamp SGLang stamps on a batch at publish time (`KVEventBatch[0]`).
-/// It is how a restarted publisher is told from a batch already forwarded: a
-/// replayed batch carries its original timestamp, a new incarnation's first
-/// batch carries a fresh one.
+/// A replayed batch keeps its original one, a new incarnation's is fresh.
 fn decode_batch_timestamp(payload: &[u8]) -> Option<f64> {
     let mut cursor = Cursor::new(payload);
     let value = read_value(&mut cursor).ok()?;

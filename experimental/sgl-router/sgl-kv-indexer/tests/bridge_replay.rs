@@ -28,7 +28,7 @@ use sgl_kv_indexer::{
     server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
     DEFAULT_STREAM_MAXLEN,
 };
-use test_net::free_addr;
+use test_net::bound_incoming;
 use test_valkey::{fresh_prefix, ValkeyServer};
 use test_zmq::{batch, batch_at, removed, stored, FakePublisher};
 
@@ -39,11 +39,11 @@ async fn start_indexer() -> (Arc<InMemoryKvIndexerBackend>, String) {
     let backend = Arc::new(InMemoryKvIndexerBackend::new());
     let shared: Arc<dyn KvIndexerBackend> = backend.clone();
     let svc = KvIndexerService::new(shared).into_server();
-    let addr = free_addr();
+    let (addr, incoming) = bound_incoming().await;
     tokio::spawn(async move {
         server_builder()
             .add_service(svc)
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .expect("server serve");
     });
@@ -201,9 +201,8 @@ async fn a_sequence_reset_clears_the_worker_before_new_events() {
     bridge.stop().await;
 }
 
-/// A restarted bridge must resume from its checkpoint and ask the worker only
-/// for what it missed; without the checkpoint it would replay the whole buffer
-/// and briefly re-report blocks that later events removed.
+/// A restarted bridge must resume from its checkpoint, asking the worker only
+/// for what it missed rather than for the whole buffer.
 #[tokio::test]
 async fn restarted_bridge_resumes_from_its_valkey_checkpoint() {
     let Some(server) = ValkeyServer::start() else {
@@ -251,10 +250,8 @@ async fn restarted_bridge_resumes_from_its_valkey_checkpoint() {
     );
 }
 
-/// A batch that arrives twice - the connect-time replay and the live stream can
-/// cover the same sequence - must be recognised by its timestamp and skipped. If
-/// a sequence below the last one forwarded were taken for a publisher restart, an
-/// overlap would clear a healthy worker's whole placement set.
+/// A batch delivered twice, by the replay and by the live stream, must be skipped
+/// on its timestamp and must not be read as a publisher restart.
 #[tokio::test]
 async fn a_replayed_batch_arriving_again_is_not_mistaken_for_a_restart() {
     let (backend, indexer) = start_indexer().await;
@@ -285,10 +282,8 @@ async fn a_replayed_batch_arriving_again_is_not_mistaken_for_a_restart() {
     bridge.stop().await;
 }
 
-/// When the worker's bounded replay buffer has already dropped the batches the
-/// bridge missed, nothing will ever deliver them. Carrying the hole would leave
-/// the index claiming blocks the worker may no longer hold, so the bridge clears
-/// that worker instead.
+/// A gap the worker's buffer can no longer serve must clear that worker, rather
+/// than leave the index claiming blocks nothing will ever correct.
 #[tokio::test]
 async fn a_replay_that_cannot_reach_our_sequence_clears_the_worker() {
     let (backend, indexer) = start_indexer().await;

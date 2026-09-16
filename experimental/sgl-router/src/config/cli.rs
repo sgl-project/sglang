@@ -706,13 +706,27 @@ impl RoutingArgs {
 
 impl CacheArgs {
     fn into_config(self, policy: PolicyKind) -> Result<Option<CacheAwareConfig>> {
-        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
-            if !self.kv_indexer_endpoint.is_empty() {
-                CachePrefixProvider::Indexer
-            } else {
-                CachePrefixProvider::RadixTree
-            }
-        });
+        // A space-delimited flag picks up empty tokens from a trailing or doubled
+        // space, and those must not reach the client as endpoints.
+        let kv_indexer_endpoints: Vec<String> = self
+            .kv_indexer_endpoint
+            .iter()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
+        ensure!(
+            self.kv_indexer_endpoint.is_empty() || !kv_indexer_endpoints.is_empty(),
+            "--kv-indexer-endpoint was given no usable address; it takes one or more \
+             endpoints with a scheme, e.g. `http://10.0.0.1:50051`"
+        );
+        let default_prefix_provider = if kv_indexer_endpoints.is_empty() {
+            CachePrefixProvider::RadixTree
+        } else {
+            CachePrefixProvider::Indexer
+        };
+        let cache_prefix_provider = self
+            .cache_prefix_provider
+            .unwrap_or(default_prefix_provider);
         ensure!(
             self.cache_prefix_provider.is_none() || policy == PolicyKind::CacheAware,
             "--cache-prefix-provider requires --policy cache_aware"
@@ -722,7 +736,7 @@ impl CacheArgs {
             "--kv-indexer-query-timeout-ms must be greater than zero"
         );
         ensure!(
-            self.kv_indexer_query_timeout_ms.is_none() || !self.kv_indexer_endpoint.is_empty(),
+            self.kv_indexer_query_timeout_ms.is_none() || !kv_indexer_endpoints.is_empty(),
             "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
         );
         ensure!(
@@ -730,12 +744,12 @@ impl CacheArgs {
             "--kv-indexer-query-max-inflight must be greater than zero"
         );
         ensure!(
-            self.kv_indexer_query_max_inflight.is_none() || !self.kv_indexer_endpoint.is_empty(),
+            self.kv_indexer_query_max_inflight.is_none() || !kv_indexer_endpoints.is_empty(),
             "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
         );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
-        if !self.kv_indexer_endpoint.is_empty() && !cache_aware_uses_indexer {
+        if !kv_indexer_endpoints.is_empty() && !cache_aware_uses_indexer {
             return Err(if policy == PolicyKind::CacheAware {
                 anyhow!("--kv-indexer-endpoint requires --cache-prefix-provider indexer")
             } else {
@@ -743,7 +757,7 @@ impl CacheArgs {
             });
         }
         ensure!(
-            !cache_aware_uses_indexer || !self.kv_indexer_endpoint.is_empty(),
+            !cache_aware_uses_indexer || !kv_indexer_endpoints.is_empty(),
             "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
         );
         let kv_indexer_query_timeout_ms = self
@@ -756,8 +770,8 @@ impl CacheArgs {
             return Ok(None);
         }
         let kv_indexer_endpoint =
-            (!self.kv_indexer_endpoint.is_empty()).then(|| KvIndexerEndpointConfig {
-                urls: self.kv_indexer_endpoint,
+            (!kv_indexer_endpoints.is_empty()).then_some(KvIndexerEndpointConfig {
+                urls: kv_indexer_endpoints,
                 query_timeout_ms: kv_indexer_query_timeout_ms,
                 query_max_inflight: kv_indexer_query_max_inflight,
             });
@@ -1906,6 +1920,42 @@ mod tests {
         assert_eq!(indexer.urls, vec!["http://indexer:50051".to_string()]);
         assert_eq!(indexer.query_timeout_ms, 75);
         assert_eq!(indexer.query_max_inflight, 17);
+    }
+
+    /// Empty tokens from a doubled or trailing space must not reach the client,
+    /// and a flag given nothing usable must fail rather than fall back.
+    #[test]
+    fn normalizes_the_indexer_endpoint_list() {
+        let indexer = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            " http://a:50051  http://b:50051 ",
+        ]))
+        .unwrap()
+        .model
+        .cache_aware
+        .expect("cache-aware config")
+        .kv_indexer_endpoint
+        .expect("indexer config");
+        assert_eq!(
+            indexer.urls,
+            vec!["http://a:50051".to_string(), "http://b:50051".to_string()]
+        );
+
+        let error = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-indexer-endpoint",
+            "   ",
+        ]))
+        .expect_err("a list with no usable address must be rejected")
+        .to_string();
+        assert!(error.contains("no usable address"), "{error}");
     }
 
     #[test]

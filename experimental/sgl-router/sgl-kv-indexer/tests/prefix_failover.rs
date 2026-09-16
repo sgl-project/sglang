@@ -24,7 +24,7 @@ use sgl_kv_indexer::{
     server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService,
     PrefixIndex, PrefixIndexConfig, PrefixIndexError, PrefixOutcome,
 };
-use test_net::free_addr;
+use test_net::bound_incoming;
 use tokio::sync::oneshot;
 use tonic::Status;
 
@@ -129,13 +129,13 @@ impl Server {
             .await
             .expect("seed");
 
-        let addr = free_addr();
+        let (addr, incoming) = bound_incoming().await;
         let svc = KvIndexerService::new(backend.clone()).into_server();
         let (shutdown, rx) = oneshot::channel();
         tokio::spawn(async move {
             server_builder()
                 .add_service(svc)
-                .serve_with_shutdown(addr, async move {
+                .serve_with_incoming_shutdown(incoming, async move {
                     let _ = rx.await;
                 })
                 .await
@@ -267,32 +267,54 @@ async fn every_endpoint_down_reports_a_transient_failure_within_the_deadline() {
     );
 }
 
-/// A restarted endpoint is used again once the preferred one fails, so the
-/// rotation continues rather than pinning to the last survivor forever.
+/// Preference must keep moving on one client: rotating only once would pin the
+/// fleet to a single survivor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preference_rotates_back_when_the_current_endpoint_dies() {
+async fn preference_keeps_rotating_on_the_same_client() {
     let mut first = Server::start(&HASHES, Behaviour::Answer).await;
     let mut second = Server::start(&HASHES, Behaviour::Answer).await;
-    let index = client(&[&first.url, &second.url], Duration::from_secs(2));
+    let third = Server::start(&HASHES, Behaviour::Answer).await;
+    let index = client(
+        &[&first.url, &second.url, &third.url],
+        Duration::from_secs(2),
+    );
 
-    index.match_prefix(HASHES.to_vec()).await.expect("query");
+    index.match_prefix(HASHES.to_vec()).await.expect("first");
+    assert_eq!(
+        (
+            first.backend.queries(),
+            second.backend.queries(),
+            third.backend.queries()
+        ),
+        (1, 0, 0)
+    );
+
     first.stop().await;
     index.match_prefix(HASHES.to_vec()).await.expect("failover");
-    assert_eq!(second.backend.queries(), 1);
+    // The dead endpoint was probed once more to discover it was gone.
+    assert_eq!((second.backend.queries(), third.backend.queries()), (1, 0));
 
-    // Now the survivor goes away and a replacement takes the first slot's place.
-    let replacement = Server::start(&HASHES, Behaviour::Answer).await;
-    let index = client(&[&replacement.url, &second.url], Duration::from_secs(2));
+    // The same client must rotate again, without being rebuilt.
     second.stop().await;
-    let outcome = index.match_prefix(HASHES.to_vec()).await.expect("query");
-    assert_eq!(matched(&outcome).len(), 1);
-    assert_eq!(replacement.backend.queries(), 1);
+    index
+        .match_prefix(HASHES.to_vec())
+        .await
+        .expect("second failover");
+    assert_eq!(third.backend.queries(), 1);
+
+    // And stay on the survivor rather than walking the dead ones again. A stopped
+    // server cannot count a query, so its counter standing still is the evidence.
+    index.match_prefix(HASHES.to_vec()).await.expect("sticky");
+    assert_eq!(third.backend.queries(), 2);
+    assert_eq!(
+        (first.backend.queries(), second.backend.queries()),
+        (1, 1),
+        "neither dead endpoint served anything after its failover"
+    );
 }
 
 /// A preferred endpoint that accepts the connection and never answers must not
-/// be able to spend the whole query deadline: without a per-attempt share the
-/// loop times out on it and breaks with no budget left, so the endpoint list
-/// gives no protection against the most common indexer failure there is.
+/// spend the whole deadline, or the endpoint list protects against nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hung_preferred_endpoint_still_fails_over_inside_the_deadline() {
     let hung = Server::start(&HASHES, Behaviour::Hang).await;
