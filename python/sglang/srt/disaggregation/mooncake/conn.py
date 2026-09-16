@@ -2720,6 +2720,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             return
 
         self.chunk_staging_infos = []
+        self._staging_total_pages = 0 if kv_indices is None else len(kv_indices)
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
