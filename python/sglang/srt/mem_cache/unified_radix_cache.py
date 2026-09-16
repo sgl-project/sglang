@@ -2046,6 +2046,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return None
+        # A recompute after L2 eviction re-creates the node with backuped=False, so the
+        # flag alone would re-write content L3 holds; stale positives heal on prefetch miss.
+        if self.storage_existence_cache.covers_all(PoolName.KV, spec.hash_value):
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2941,7 +2945,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
+        if operation.deadline_expired:
             # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
             return
         chain = operation.all_hash_values
@@ -3351,6 +3355,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         node_id, lock_params = entry
                         self.dec_host_lock_ref(node_id, lock_params)
                     self._write_behind_inflight.pop(operation.id, None)
+                    # Added unconditionally: completed_tokens can diverge across ranks on
+                    # backend failure and a divergent belief desyncs the rank collectives.
+                    if operation.hash_value:
+                        self.storage_existence_cache.add(
+                            PoolName.KV, operation.hash_value
+                        )
                 if (
                     log_metrics
                     and self.enable_storage_metrics
