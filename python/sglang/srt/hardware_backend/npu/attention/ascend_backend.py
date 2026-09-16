@@ -10,7 +10,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -382,7 +382,6 @@ class AscendAttnBackend(AttentionBackend):
                     int(self.speculative_num_draft_tokens), is_draft_worker=True
                 )
             )
-        self.is_draft_worker = model_runner.is_draft_worker
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -409,12 +408,6 @@ class AscendAttnBackend(AttentionBackend):
             assert not self.is_hybrid_swa, (
                 "Hybrid swa is not supply with `needs_cpu_seq_lens=False`."
             )
-            if not self.is_draft_worker and not is_deepseek_dsa(
-                model_runner.model_config.hf_config
-            ):
-                logger.warning(
-                    "When target model is not dsa arch, set `needs_cpu_seq_lens=False` may cause hang when inference."
-                )
             self.needs_cpu_seq_lens = False
 
         # head num padding
