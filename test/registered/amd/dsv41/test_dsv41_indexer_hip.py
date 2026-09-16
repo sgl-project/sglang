@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -494,6 +495,158 @@ class TestIndexerHeadWeightsHip(CustomTestCase):
             differ / total,
             2e-3,
             f"{differ} of {total} elements differ from the served chain",
+        )
+
+
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "V4.1 low-ratio HIP caller is gfx950 only"
+)
+class TestOversizedPrefillRequestChunking(CustomTestCase):
+    """The V4.1 low-ratio caller must enforce the logits budget within one request."""
+
+    @staticmethod
+    def _candidate_blocks(row_ids):
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            CandidateBlocks,
+        )
+
+        ids = torch.as_tensor(row_ids, dtype=torch.int32).reshape(-1, 1)
+        rows = ids.shape[0]
+        return CandidateBlocks(
+            ids=ids,
+            compact_lens=torch.ones(rows, dtype=torch.int32),
+            compact_page_table=torch.zeros((rows, 1), dtype=torch.int32),
+            compact_page_size=1,
+            block_size=1,
+        )
+
+    def _run(self, rows, rows_per_chunk, *, publish=False, consume=False):
+        from sglang.srt.layers.attention.dsv4 import low_ratio_backend_hip as hip
+
+        page_indices = torch.full((rows, 1), -1, dtype=torch.int32)
+        raw_indices = torch.full((rows, 1), -1, dtype=torch.int32)
+        core = SimpleNamespace(
+            sparse_page_indices=lambda _ratio: page_indices,
+            sparse_raw_indices=lambda _ratio: raw_indices,
+        )
+        indexer_metadata = SimpleNamespace(
+            page_table=torch.zeros((rows, 1), dtype=torch.int32),
+            compressed_seq_lens=torch.arange(1, rows + 1, dtype=torch.int32),
+            compressed_page_size=INDEX_PAGE_SIZE,
+        )
+        metadata = SimpleNamespace(
+            core_metadata=core,
+            late_layer_tail=None,
+            fp4_low_ratio_prefill_workspaces={1: None},
+            low_ratio_indexer_metadata=lambda _ratio: indexer_metadata,
+        )
+        pool = SimpleNamespace(
+            get_index_k_fp4_payload_buffer=lambda _layer_id: torch.empty(0),
+            get_index_k_fp4_scale_buffer=lambda _layer_id: torch.empty(0),
+        )
+        candidates = self._candidate_blocks(range(rows)) if consume else None
+        backend = SimpleNamespace(
+            token_to_kv_pool=pool,
+            forward_metadata=metadata,
+            low_ratio_identity_skip=False,
+            candidate_masks=[candidates] if consume else None,
+        )
+        indexer = SimpleNamespace(
+            index_topk=1,
+            is_candidate_source=publish,
+            uses_candidates=consume,
+            candidate_topk_blocks=1,
+            candidate_block_size=1,
+        )
+        layer = SimpleNamespace(compress_ratio=1, indexer=indexer, layer_id=0)
+        forward_batch = SimpleNamespace(
+            seq_lens_cpu=[max(rows, 1)],
+            extend_seq_lens_cpu=[rows],
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        )
+        pos = torch.arange(rows, dtype=torch.int64)
+        score_sizes = []
+        consumed_ids = []
+
+        def score(**kwargs):
+            chunk_rows = kwargs["q_fp4"].shape[0]
+            score_sizes.append(chunk_rows)
+            return torch.zeros((chunk_rows, 1))
+
+        def select(**kwargs):
+            if kwargs["consume"] is not None:
+                consumed_ids.append(kwargs["consume"][0].ids.flatten().tolist())
+            if kwargs["publish"] is not None:
+                row_ids = (kwargs["compress_lens"] - 1).tolist()
+                kwargs["publish"].append(self._candidate_blocks(row_ids))
+
+        indexer_inputs = (
+            torch.zeros((rows, 1, 1), dtype=torch.uint8),
+            torch.zeros((rows, 1), dtype=torch.uint8),
+            torch.zeros((rows, 1), dtype=torch.bfloat16),
+        )
+        with (
+            mock.patch.object(
+                hip, "logits_rows_per_chunk", new=lambda *_args: rows_per_chunk
+            ),
+            mock.patch.object(
+                hip, "_indexer_inputs", new=lambda *_args: indexer_inputs
+            ),
+            mock.patch.object(hip, "aiter_fp4_paged_mqa_logits", new=score),
+            mock.patch.object(hip, "_select_topk_extend_hip", new=select),
+        ):
+            hip.low_ratio_index_topk_hip_extend(
+                backend,
+                layer,
+                torch.empty((rows, 1)),
+                torch.empty((rows, 1)),
+                pos,
+                forward_batch,
+            )
+        return SimpleNamespace(
+            score_sizes=score_sizes,
+            consumed_ids=consumed_ids,
+            published=backend.candidate_masks,
+        )
+
+    def test_measured_oor_shape_is_eight_budgeted_score_calls(self):
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            LOW_RATIO_PAGE_TABLE_BUCKET,
+            logits_rows_per_chunk,
+        )
+
+        score_width = 237568
+        page_table = torch.empty((1, 3712), dtype=torch.int32, device="meta")
+        rows_per_chunk = logits_rows_per_chunk(page_table, LOW_RATIO_PAGE_TABLE_BUCKET)
+        self.assertEqual(rows_per_chunk, 2259)
+
+        result = self._run(16260, rows_per_chunk)
+
+        self.assertEqual(result.score_sizes, [2259] * 7 + [447])
+        self.assertTrue(all(size <= rows_per_chunk for size in result.score_sizes))
+        self.assertLessEqual(max(result.score_sizes) * score_width * 4, 2 * 1024**3)
+
+    def test_candidate_source_publishes_one_request_in_row_order(self):
+        result = self._run(5, 2, publish=True)
+
+        self.assertEqual(result.score_sizes, [2, 2, 1])
+        self.assertEqual(len(result.published), 1)
+        self.assertEqual(result.published[0].ids.flatten().tolist(), list(range(5)))
+
+    def test_candidate_consumer_slices_the_request_by_local_row_offset(self):
+        result = self._run(5, 2, consume=True)
+
+        self.assertEqual(result.score_sizes, [2, 2, 1])
+        self.assertEqual(result.consumed_ids, [[0, 1], [2, 3], [4]])
+
+    def test_request_grouping_keeps_empty_and_oversized_request_boundaries(self):
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            _request_groups,
+        )
+
+        self.assertEqual(
+            _request_groups([0, 2, 5, 1], 2),
+            [(0, 2, 0, 2), (2, 3, 2, 7), (3, 4, 7, 8)],
         )
 
 
