@@ -2336,6 +2336,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Mask marking chunked (not-yet-finished) prefill requests whose sampled
     # pseudo next-token must NOT be written into the ngram token table.
     ne_skip_token_table_update: torch.Tensor = None
+    # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
+    # of each request's first extend token (NgramEmbeddingManager).
+    ne_history: Optional[torch.Tensor] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
