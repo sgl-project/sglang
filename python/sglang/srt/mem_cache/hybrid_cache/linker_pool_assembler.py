@@ -419,6 +419,46 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _build_mamba_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    full_kv_pool = kvcache.full_kv_pool
+    full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    mamba_cache = mamba_pool.mamba_cache
+    layers = range(mamba_pool.num_mamba_layers)
+    mamba_components = [[conv[layer] for layer in layers] for conv in mamba_cache.conv]
+    mamba_components.append([mamba_cache.temporal[layer] for layer in layers])
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_kv_pool,
+            components=[full_kv_pool.kv_buffer],
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        DevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=mamba_components,
+            layer_mapping=mamba_layer_mapping,
+            # One row per state slot, addressed by slot id, not token position.
+            page_size=1,
+            rows_are_pages=True,
+        ),
+    ]
+    # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
+    return DevicePoolGroup(
+        entries, len(full_layer_mapping | mamba_layer_mapping), page_size
+    )
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,
