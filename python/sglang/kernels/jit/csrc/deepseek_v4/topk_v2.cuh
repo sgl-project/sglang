@@ -45,7 +45,25 @@ constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
+#ifdef USE_ROCM
+// HIP reads the second __launch_bounds__ argument as waves per SIMD, CUDA as
+// blocks per SM, so kOccupancy asks ROCm for 2 waves/SIMD -- below the 4 a
+// 1024-thread block already forces. Do NOT translate kOccupancy into this:
+// "kOccupancy blocks per CU" is 8 waves/SIMD, which caps the allocator at
+// 512/8 = 64 VGPRs and spills, and a second resident block is unreachable with
+// a grid of batch_size. wave64 is a literal because __AMDGCN_WAVEFRONT_SIZE__
+// is gone in ROCm 7 and warpSize is not constexpr.
+inline constexpr uint32_t kSimdsPerCu = 4;
+inline constexpr uint32_t kWavefrontSize = 64;  // CDNA
+inline constexpr uint32_t kWavesPerBlock = kBlockSize / kWavefrontSize;
+inline constexpr uint32_t kMinWavesPerSimd = kWavesPerBlock / kSimdsPerCu;
+static_assert(kMinWavesPerSimd > 0, "kBlockSize must cover at least one wave per SIMD");
+#define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kMinWavesPerSimd)
+#else
+// topk_small_batch_cluster_kernel shadows kOccupancy with its own template
+// parameter and CLUSTER_TOPK_KERNEL relies on that, so leave the CUDA spelling.
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
