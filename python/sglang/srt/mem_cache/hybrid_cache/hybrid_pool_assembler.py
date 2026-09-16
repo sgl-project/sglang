@@ -165,6 +165,13 @@ def build_kv_host_pool(
     )
 
 
+def _mamba_host_ratio() -> float:
+    """Host-to-device ratio for the Mamba state cache: --hicache-mamba-ratio,
+    falling back to --hicache-ratio (the KV pool's ratio) when unset."""
+    ratio = get_memory().hicache_mamba_ratio
+    return get_memory().hicache_ratio if ratio is None else ratio
+
+
 def _split_hicache_size(
     hicache_size: int, kv_pools: tuple[Any, ...]
 ) -> tuple[float, ...]:
@@ -878,7 +885,7 @@ def build_hybrid_mamba_stack(
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
@@ -979,7 +986,7 @@ def build_hybrid_mamba_swa_stack(
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
-        get_memory().hicache_ratio,
+        _mamba_host_ratio(),
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,

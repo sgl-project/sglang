@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _mamba_host_ratio,
     _split_hicache_size,
     build_full_draft_pools,
 )
@@ -74,6 +75,26 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestMambaHostRatio(CustomTestCase):
+    """--hicache-mamba-ratio sizes the host Mamba state cache on its own; unset,
+    it follows --hicache-ratio as before."""
+
+    def _publish(self, **kwargs):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(ServerArgs(model_path="dummy", **kwargs), role="scheduler")
+        self.addCleanup(reset_context)
+
+    def test_defaults_to_hicache_ratio(self):
+        self._publish(hicache_ratio=3.0)
+        self.assertEqual(_mamba_host_ratio(), 3.0)
+
+    def test_independent_ratio_wins(self):
+        self._publish(hicache_ratio=3.0, hicache_mamba_ratio=0.5)
+        self.assertEqual(_mamba_host_ratio(), 0.5)
 
 
 class TestDraftSidecarPoolDispatch(CustomTestCase):

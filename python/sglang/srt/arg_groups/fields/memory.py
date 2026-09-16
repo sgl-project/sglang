@@ -115,6 +115,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_mamba_ratio: A[
+        Optional[float],
+        "The ratio of the size of the host Mamba (SSM) state cache to the size of the device Mamba state pool, for hybrid models under hierarchical cache. Defaults to --hicache-ratio. Each cached state is a full SSM state (tens of MB), one per cached node, so with --hicache-ratio sized for KV the state cache can take a large share of host memory; size it by the number of sequences that must stay resumable instead.",
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(
