@@ -4705,10 +4705,10 @@ class DeepseekV4Model(nn.Module):
                 next_norm = self.layers[i + 1].input_layernorm
             if (
                 self.config.model_type == "deepseek_v41"
+                and get_platform().is_blackwell
                 and i + 1 < self.end_layer
                 and tail is None
                 and hidden_states.is_cuda
-                and get_platform().is_blackwell
                 and 0 < hidden_states.shape[0] <= 8
                 and (
                     forward_batch.forward_mode.is_decode()
