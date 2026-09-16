@@ -36,7 +36,12 @@
 //! [`super::tree::HashTree::restore_snapshot`] stays module-internal so that
 //! step cannot be skipped.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::Mutex;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use super::tree::SnapshotNode;
 
@@ -123,6 +128,86 @@ pub struct PeerSnapshot {
     pub nodes: Vec<SnapshotNode>,
 }
 
+/// Sibling replicas a snapshot may be pulled from, kept current by peer
+/// discovery.
+///
+/// Empty disables peer bootstrap without any other configuration — but "empty"
+/// has two meanings and conflating them is the failure mode this type exists
+/// to prevent, so it tracks enough state to tell them apart.
+#[derive(Debug, Default)]
+pub struct PeerRegistry {
+    peers: Mutex<Vec<String>>,
+    /// Whether peer discovery has reported at least once, even with an empty
+    /// result.
+    ///
+    /// WHY this matters: an empty peer set is ambiguous. It means either "the
+    /// watch has not delivered yet" — routine, since worker discovery
+    /// regularly wins the race against it — or "this replica genuinely has no
+    /// siblings". Treating the first as the second makes a joining replica give
+    /// up before its peers are even known and boot cold, which silently
+    /// defeats the whole feature. Only after a sync is an empty set
+    /// conclusive.
+    synced: AtomicBool,
+    /// Whether a non-empty peer set has ever been observed.
+    ///
+    /// The peer set legitimately dips to empty for an instant — an
+    /// EndpointSlice repack deletes the last slice before its replacement
+    /// arrives, and during a rolling update every sibling can be `notReady` at
+    /// once. A bootstrap retry loop samples [`Self::known_to_have_no_peers`]
+    /// many times per boot, so it has many chances to catch such a dip, and one
+    /// hit is permanent for that boot. Once siblings have been seen, "empty" is
+    /// treated as transient and the loop keeps waiting rather than concluding
+    /// this replica is alone.
+    ever_had_peers: AtomicBool,
+}
+
+impl PeerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the peer set wholesale, as a relist or a slice event produces.
+    pub fn replace(&self, peers: Vec<String>) {
+        self.synced.store(true, Ordering::Relaxed);
+        if !peers.is_empty() {
+            self.ever_had_peers.store(true, Ordering::Relaxed);
+        }
+        let mut guard = self.peers.lock();
+        if *guard != peers {
+            info!(count = peers.len(), peers = ?peers, "kv-bootstrap: peer set updated");
+        }
+        *guard = peers;
+    }
+
+    pub fn len(&self) -> usize {
+        self.peers.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.lock().is_empty()
+    }
+
+    /// Whether peer discovery has reported at least once. An empty peer set is
+    /// only conclusive once this is true.
+    pub fn synced(&self) -> bool {
+        self.synced.load(Ordering::Relaxed)
+    }
+
+    /// True when discovery has confirmed this replica has no siblings, so
+    /// there is no point waiting for one.
+    pub fn known_to_have_no_peers(&self) -> bool {
+        self.synced() && self.is_empty() && !self.ever_had_peers.load(Ordering::Relaxed)
+    }
+
+    /// Candidate peers in shuffled order, so simultaneous boots spread their
+    /// snapshot fetches instead of stampeding whichever peer sorts first.
+    pub fn candidates(&self) -> Vec<String> {
+        let mut peers = self.peers.lock().clone();
+        peers.shuffle(&mut rand::thread_rng());
+        peers
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +277,50 @@ mod tests {
         let snap: PeerSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snap.nodes.len(), 1);
         assert!(snap.nodes[0].tiers.is_empty());
+    }
+
+    #[test]
+    fn a_transient_empty_peer_set_is_not_conclusive() {
+        let reg = PeerRegistry::new();
+        assert!(
+            !reg.known_to_have_no_peers(),
+            "before any sync, empty means the watch has not delivered",
+        );
+
+        reg.replace(vec!["http://a:30000".into()]);
+        assert!(reg.synced());
+        assert!(!reg.known_to_have_no_peers());
+
+        // An EndpointSlice repack, or a rolling update with every sibling
+        // notReady, empties the set for an instant. Having once seen siblings
+        // is what keeps that from reading as "I am alone".
+        reg.replace(vec![]);
+        assert!(reg.is_empty());
+        assert!(
+            !reg.known_to_have_no_peers(),
+            "a dip after siblings were seen is transient, not conclusive",
+        );
+    }
+
+    #[test]
+    fn a_synced_empty_set_with_no_history_means_no_siblings() {
+        let reg = PeerRegistry::new();
+        reg.replace(vec![]);
+        assert!(reg.synced());
+        assert!(reg.known_to_have_no_peers());
+    }
+
+    #[test]
+    fn candidates_shuffle_without_losing_entries() {
+        let reg = PeerRegistry::new();
+        let peers: Vec<String> = (0..16).map(|i| format!("http://p{i}:30000")).collect();
+        reg.replace(peers.clone());
+
+        let mut got = reg.candidates();
+        assert_eq!(got.len(), peers.len());
+        got.sort();
+        let mut want = peers;
+        want.sort();
+        assert_eq!(got, want, "shuffling must not drop or duplicate a peer");
     }
 }

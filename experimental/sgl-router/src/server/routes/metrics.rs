@@ -10,6 +10,7 @@
 //! discovered" failure mode is observable.
 
 use crate::discovery::WorkerMode;
+use crate::policies::kv_events::bootstrap::PeerRegistry;
 use crate::policies::kv_events::{KvIndexMetrics, Tiers, ACCOUNTING_REASONS};
 use crate::server::app_context::AppContext;
 use crate::server::metrics::{escape_label, WorkerSnapshot};
@@ -71,11 +72,40 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             ctx.block_size_oracle.get().unwrap_or(0),
         ));
     }
+    if let Some(index) = ctx.kv_index.as_ref() {
+        body.push_str(&render_kv_peers(&index.peers()));
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+/// Render the peer-discovery series.
+///
+/// Emitted only where peer bootstrap could run at all (this router maintains
+/// its own tree), so a 0 here means "the selector matched no ready sibling",
+/// never "this build has no such feature". `synced` is what separates the two
+/// readings of a zero peer count that matter operationally: not yet told, vs
+/// told and genuinely alone. An RBAC failure on the router's own Service shows
+/// up as `synced 0` that never becomes 1.
+fn render_kv_peers(peers: &PeerRegistry) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP sgl_router_kv_bootstrap_peers Ready sibling router replicas this replica could pull a cache-aware tree snapshot from. 0 with sgl_router_kv_bootstrap_peers_synced=1 means the fleet genuinely has no other ready replica; 0 with synced=0 means peer discovery has not reported yet (check RBAC for endpointslices on the router's own Service).\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_bootstrap_peers gauge\n");
+    out.push_str(&format!("sgl_router_kv_bootstrap_peers {}\n", peers.len()));
+    out.push_str(
+        "# HELP sgl_router_kv_bootstrap_peers_synced 1 once peer discovery has reported at least once, even with an empty result. Until then an empty peer set is not evidence of anything.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_bootstrap_peers_synced gauge\n");
+    out.push_str(&format!(
+        "sgl_router_kv_bootstrap_peers_synced {}\n",
+        u8::from(peers.synced()),
+    ));
+    out
 }
 
 /// Render the storage-tier series: what the tree holds per worker and tier,
@@ -181,6 +211,67 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The two readings of a zero peer count an operator has to tell apart:
+    /// "discovery has not reported yet" and "this replica is genuinely alone".
+    /// Only `synced` separates them, so both series are contract.
+    #[tokio::test]
+    async fn kv_peer_series_distinguish_unsynced_from_alone() {
+        let peers = PeerRegistry::new();
+        let before = render_kv_peers(&peers);
+        assert!(before.contains("sgl_router_kv_bootstrap_peers 0\n"));
+        assert!(before.contains("sgl_router_kv_bootstrap_peers_synced 0\n"));
+
+        peers.replace(vec![]);
+        let alone = render_kv_peers(&peers);
+        assert!(alone.contains("sgl_router_kv_bootstrap_peers 0\n"));
+        assert!(
+            alone.contains("sgl_router_kv_bootstrap_peers_synced 1\n"),
+            "a synced empty set is a different fact from an unsynced one",
+        );
+
+        peers.replace(vec!["http://a:30000".into(), "http://b:30000".into()]);
+        let warm = render_kv_peers(&peers);
+        assert!(warm.contains("sgl_router_kv_bootstrap_peers 2\n"));
+        assert!(warm.contains("sgl_router_kv_bootstrap_peers_synced 1\n"));
+    }
+
+    /// A router with no local tree cannot peer-bootstrap at all, so the series
+    /// are absent rather than a confidently wrong 0. The live wiring is part
+    /// of the claim, hence the full scrape.
+    #[tokio::test]
+    async fn kv_peer_series_follow_the_local_tree() {
+        use crate::policies::kv_events::KvEventIndex;
+
+        let scrape = |ctx: Arc<AppContext>| async move {
+            let res = crate::server::app::build_router(ctx)
+                .oneshot(
+                    Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        assert!(
+            !scrape(Arc::new(AppContext::stub()))
+                .await
+                .contains("sgl_router_kv_bootstrap_peers"),
+            "a router with no local tree emits no peer series at all",
+        );
+
+        let index = KvEventIndex::new();
+        index.peers().replace(vec!["http://sibling:30000".into()]);
+        let mut ctx = AppContext::stub();
+        ctx.kv_index = index.snapshot_source();
+        let body = scrape(Arc::new(ctx)).await;
+        assert!(body.contains("sgl_router_kv_bootstrap_peers 1\n"));
+        assert!(body.contains("sgl_router_kv_bootstrap_peers_synced 1\n"));
+    }
 
     /// The tier series are what a coverage dashboard joins on, so their names
     /// and label keys are contract: per-worker blocks by tier with zeros
