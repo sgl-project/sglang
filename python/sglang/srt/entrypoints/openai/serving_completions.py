@@ -374,7 +374,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
-                    token_ids=chunk_token_ids,
+                    response_token_ids=chunk_token_ids,
                     prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
@@ -609,7 +609,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                token_ids=(
+                response_token_ids=(
                     ret_item["output_ids"] if request.return_token_ids else None
                 ),
                 prompt_token_ids=(

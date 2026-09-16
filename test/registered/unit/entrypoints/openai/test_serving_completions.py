@@ -249,8 +249,11 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
-        self.assertEqual(response.choices[0].token_ids, [3, 4])
+        self.assertEqual(response.choices[0].response_token_ids, [3, 4])
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
+        dumped_choice = response.model_dump()["choices"][0]
+        self.assertNotIn("token_ids", dumped_choice)
+        self.assertEqual(dumped_choice["response_token_ids"], [3, 4])
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -383,10 +386,14 @@ class ServingCompletionTestCase(unittest.TestCase):
                     data = json.loads(raw[len("data: ") :])
                     choices.extend(data.get("choices", []))
 
-                token_ids = [tid for c in choices for tid in c.get("token_ids", [])]
+                token_ids = [
+                    tid for c in choices for tid in c.get("response_token_ids", [])
+                ]
                 text = "".join(c["text"] for c in choices)
                 self.assertEqual(text, "abc")
                 self.assertEqual(token_ids, [5, 6, 7])
+                for choice in choices:
+                    self.assertNotIn("token_ids", choice)
                 self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
                 for choice in choices[1:]:
                     self.assertNotIn("prompt_token_ids", choice)
