@@ -65,17 +65,19 @@ def _fp4_e2m1_code_rne(x):
 
 
 @triton.jit
-def _quantize_fp4_indexer_kernel(
-    x,
-    x_fp4,
-    x_sf,
+def quantize_fp4_indexer_row(
+    values,
+    v0,
+    v1,
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    """One row of ``quantize_fp4_indexer_tensor``: ``values`` is the fp32 ``[BLOCK_N]`` row,
+    ``v0`` / ``v1`` its even / odd elements as fp32 ``[BLOCK_N // 2]``. Returns
+    ``(packed codes [BLOCK_N // 2], packed ue8m0 exponents)``, the two stores of the
+    standalone kernel below."""
     offs = tl.arange(0, BLOCK_N)
-    values = tl.load(x + token_id * BLOCK_N + offs).to(tl.float32)
     abs_values = tl.abs(values)
 
     amax0 = tl.max(tl.where(offs < GROUP_N, abs_values, 0.0), axis=0)
@@ -100,7 +102,6 @@ def _quantize_fp4_indexer_kernel(
     exp3 = _ceil_ue8m0_exp(sf3)
 
     packed_sf = exp0 | (exp1 << 8) | (exp2 << 16) | (exp3 << 24)
-    tl.store(x_sf + token_id, packed_sf)
 
     pair_offsets = tl.arange(0, BLOCK_N // 2)
     offs0 = pair_offsets * 2
@@ -112,8 +113,8 @@ def _quantize_fp4_indexer_kernel(
     scale0 = (scale_exp0 << 23).to(tl.float32, bitcast=True)
     scale1 = (scale_exp1 << 23).to(tl.float32, bitcast=True)
 
-    v0 = tl.load(x + token_id * BLOCK_N + offs0).to(tl.float32) / scale0
-    v1 = tl.load(x + token_id * BLOCK_N + offs1).to(tl.float32) / scale1
+    v0 = v0 / scale0
+    v1 = v1 / scale1
     if RNE:
         code0 = _fp4_e2m1_code_rne(v0)
         code1 = _fp4_e2m1_code_rne(v1)
@@ -121,6 +122,29 @@ def _quantize_fp4_indexer_kernel(
         code0 = _fp4_e2m1_code(v0)
         code1 = _fp4_e2m1_code(v1)
     packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    return packed, packed_sf
+
+
+@triton.jit
+def _quantize_fp4_indexer_kernel(
+    x,
+    x_fp4,
+    x_sf,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    pair_offsets = tl.arange(0, BLOCK_N // 2)
+    row = x + token_id * BLOCK_N
+    values = tl.load(row + offs).to(tl.float32)
+    v0 = tl.load(row + pair_offsets * 2).to(tl.float32)
+    v1 = tl.load(row + pair_offsets * 2 + 1).to(tl.float32)
+    packed, packed_sf = quantize_fp4_indexer_row(
+        values, v0, v1, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N, RNE=RNE
+    )
+    tl.store(x_sf + token_id, packed_sf)
     tl.store(x_fp4 + token_id * (BLOCK_N // 2) + pair_offsets, packed)
 
 

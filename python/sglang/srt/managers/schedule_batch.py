@@ -120,7 +120,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -2441,6 +2440,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Longest sequence across the attention-DP group this step (decode graph
+    # variants keyed by context length must agree on every rank).
+    dp_max_seq_len: Optional[int] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None

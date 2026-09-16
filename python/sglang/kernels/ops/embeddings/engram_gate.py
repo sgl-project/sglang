@@ -1,5 +1,7 @@
 """Fused FP32 Engram gate with a single final cast to the activation dtype."""
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -13,11 +15,14 @@ def _engram_gate_kernel(
     QW,
     KW,
     O,
+    IDS,
+    image_token_id,
     D: tl.constexpr,
     HC: tl.constexpr,
     EPS: tl.constexpr,
     CLAMP: tl.constexpr,
     B: tl.constexpr,
+    KEEP_IMAGE_ROWS: tl.constexpr,
 ):
     row = tl.program_id(0)
     token = row // HC
@@ -35,7 +40,12 @@ def _engram_gate_kernel(
     dot = tl.sum((x * weight) * key, 0) * rstd * (D**-0.5)
     gate = tl.sigmoid(libdevice.copysign(tl.sqrt(tl.maximum(tl.abs(dot), CLAMP)), dot))
     value = tl.load(KV + token * (HC + 1) * D + HC * D + col, mask, 0).to(tl.float32)
-    tl.store(O + row * D + col, x + gate * value, mask)
+    out = x + gate * value
+    if KEEP_IMAGE_ROWS:
+        # image tokens keep x: the model's where(input_ids == image_token_id, x, gated)
+        is_image = tl.load(IDS + token) == image_token_id
+        out = tl.where(is_image, x, out)
+    tl.store(O + row * D + col, out, mask)
 
 
 def fused_engram_gate(
@@ -45,7 +55,11 @@ def fused_engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    image_select: Optional[Tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
+    """``image_select = (input_ids [T], image_token_id)`` keeps ``x`` on the rows whose input id is
+    the image token, as the model's ``torch.where`` after the gate does (bitwise: the kept bf16
+    rows round-trip through fp32 exactly)."""
     assert x.ndim == 3 and kv.ndim == 2
     t, hc, d = x.shape
     assert kv.shape == (t, (hc + 1) * d)
@@ -58,6 +72,9 @@ def fused_engram_gate(
         a.dtype in (torch.bfloat16, torch.float32) for a in (x, kv, q_weight, k_weight)
     )
     out = torch.empty_like(x)
+    if image_select is not None:
+        input_ids, image_token_id = image_select
+        assert input_ids.shape == (t,) and input_ids.stride(0) == 1, input_ids.shape
     if t:
         _engram_gate_kernel[(t * hc,)](
             x,
@@ -65,11 +82,14 @@ def fused_engram_gate(
             q_weight,
             k_weight,
             out,
+            input_ids if image_select is not None else out,
+            image_token_id if image_select is not None else 0,
             d,
             hc,
             eps,
             clamp_value,
             triton.next_power_of_2(d),
+            KEEP_IMAGE_ROWS=image_select is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )

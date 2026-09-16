@@ -11,10 +11,13 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.layers.attention.dsv4 import torch_quant as tq
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_gfx95_supported
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 REFERENCE = {
     KVLayout.V41: tq.quantize_k_cache_v41,
@@ -28,11 +31,13 @@ DEQUANT = {
 ONE_CODE_RTOL = {KVLayout.V41: 0.13, KVLayout.V41_FP4: 0.51}
 
 
-def _sm100():
-    return (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] >= 10
+def _supported_gpu():
+    return torch.cuda.is_available() and (
+        is_gfx95_supported()
+        or (
+            torch.version.cuda is not None
+            and torch.cuda.get_device_capability()[0] >= 10
+        )
     )
 
 
@@ -74,7 +79,7 @@ def reference_pages(layout, page_size, num_pages, locs, values, page_bytes):
     return REFERENCE[layout](full, page_bytes=page_bytes)
 
 
-@unittest.skipUnless(_sm100(), "the V4.1 KV layouts are SM100 kernels")
+@unittest.skipUnless(_supported_gpu(), "V4.1 KV stores require SM100 or gfx950")
 class TestV41KVStore(CustomTestCase):
     def assert_tokens_equal(self, cache, ref, layout, page_size, locs):
         got_data, got_scale = token_rows(cache, layout, page_size, locs)
