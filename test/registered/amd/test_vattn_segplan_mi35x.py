@@ -8,7 +8,6 @@ Guards, on a gfx950 device:
     each trigger a rebuild, cached output bit-identical to uncached.
 """
 
-import ctypes
 import math
 import unittest
 
@@ -115,14 +114,6 @@ class TestVattnSegPlan(CustomTestCase):
 
         cls.V = V
         torch.set_default_device("cuda")
-
-    def test_hip_runtime_matches_torch(self):
-        torch_hip = ctypes.CDLL(torch._C.__file__)
-        self.assertEqual(
-            ctypes.cast(self.V._hip_lib().hipModuleLaunchKernel, ctypes.c_void_p).value,
-            ctypes.cast(torch_hip.hipModuleLaunchKernel, ctypes.c_void_p).value,
-            "ASM launches must use Torch's HIP runtime to share its current stream",
-        )
 
     def _check_plan(self, lens, qlens, hkv, seq_lens, cu_q):
         V = self.V

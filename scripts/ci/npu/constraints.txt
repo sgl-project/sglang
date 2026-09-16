@@ -1,5 +1,0 @@
-# ModelScope 1.40.1 imports symbols added in modelscope-hub 0.4.3 but
-# incorrectly permits 0.4.2. Keep the tested pair while the NPU mirror
-# serves hub 0.4.2; update both together after the mirror catches up.
-modelscope==1.40.0
-modelscope-hub==0.4.2

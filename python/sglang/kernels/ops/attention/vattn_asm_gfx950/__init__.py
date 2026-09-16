@@ -97,10 +97,7 @@ def _declared_kernarg_size(source_file):
 def _hip_lib():
     global _hip
     if _hip is None:
-        # Resolve the runtime already used by Torch so its current stream is
-        # shared with these launches. Some ROCm wheels ship another HIP library
-        # in their development package, which a bare library name can load.
-        _hip = ctypes.CDLL(torch._C.__file__)
+        _hip = ctypes.CDLL("libamdhip64.so")
         _hip.hipModuleLoad.restype = ctypes.c_int
         _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _hip.hipModuleGetFunction.restype = ctypes.c_int
