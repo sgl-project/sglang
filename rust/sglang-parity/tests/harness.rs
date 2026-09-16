@@ -16,6 +16,70 @@ use support::{
 };
 
 #[tokio::test]
+async fn generated_content_drives_all_checks_and_records_its_own_evidence() {
+    use sglang_parity::{CheckTarget, HttpCase, HttpObservation, PreparedResponse, ResponsePolicy};
+
+    struct ContentPolicy;
+    impl ResponsePolicy for ContentPolicy {
+        fn prepare(
+            &self,
+            case: &HttpCase,
+            observation: &HttpObservation,
+        ) -> Result<PreparedResponse, Vec<Violation>> {
+            let mut prepared = EchoPolicy.prepare(case, observation)?;
+            prepared.value = json!({"value": prepared.value["value"]});
+            Ok(prepared)
+        }
+    }
+
+    let fixture = Fixture::new();
+    let mut unary = case("unary", "/json", "normal");
+    let mut stream = case("streaming", "/sse", "normal");
+    unary["equivalence_group"] = json!("content");
+    stream["equivalence_group"] = json!("content");
+    let mut suite = suite(vec![unary, stream]);
+    suite.check = CheckTarget::GeneratedContent;
+    suite.comparison.per_result_value_exceptions.clear();
+    let report = run(&fixture.config, &suite, &ContentPolicy).await.unwrap();
+    assert_eq!(report.check, CheckTarget::GeneratedContent);
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(fixture.preparations().len(), 1);
+    assert_eq!(report.equivalence.len(), 2);
+    for case in &report.cases {
+        assert_eq!(case.parity.status, Status::Pass);
+        for side in case.implementations.values() {
+            assert_eq!(side.repeatability.status, Status::Pass);
+            for attempt in &side.attempts {
+                assert!(attempt.final_json.is_none());
+                assert!(attempt.equivalence.is_none());
+                assert!(!attempt.directory.join("final.json").exists());
+                assert_eq!(attempt.prepared_path(), attempt.output_json.as_deref());
+                assert_eq!(
+                    read_json(attempt.prepared_path().unwrap()),
+                    json!({"value": suite.cases[0].body["value"]})
+                );
+                assert!(
+                    fs::read_to_string(&attempt.observation.as_ref().unwrap().raw_body)
+                        .unwrap()
+                        .contains("trace")
+                );
+            }
+        }
+    }
+    let saved: sglang_parity::Report =
+        serde_json::from_value(read_json(report.directory.join("report.json"))).unwrap();
+    assert_eq!(saved.check, report.check);
+    let view = ReportView::new(&saved, &report.directory);
+    let text = view.terminal(None, false).unwrap();
+    assert!(text.contains("Generated content parity"));
+    assert!(text.contains("Output integrity"));
+    assert!(text.contains("8/8 passed"));
+    let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
+    assert!(html.contains("python/unary/1/output.json"));
+    assert!(!html.contains("python/unary/1/final.json"));
+}
+
+#[tokio::test]
 async fn managed_json_and_sse_run_matches_describe_requests_and_artifacts() {
     let fixture = Fixture::new();
     let mut unary = case("unary", "/json", "normal");
@@ -727,6 +791,39 @@ fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python(
         serde_json::from_slice::<Value>(&external.stdout).unwrap(),
         default_json
     );
+    for api in ["native_generate", "openai_http"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sglang-parity"))
+            .args(["--suite", api, "--check", "generated-content", "--describe"])
+            .arg("--config")
+            .arg(&config_path)
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for profile in effective["profiles"].as_array().unwrap() {
+            assert_eq!(profile["suite"]["check"], "generated-content");
+            assert_eq!(
+                profile["suite"]["comparison"]["per_result_value_exceptions"],
+                json!([])
+            );
+            assert!(
+                profile["suite"]["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|case| case["expect_status"].as_u64().unwrap() < 400)
+            );
+        }
+        assert!(output.stderr.is_empty());
+    }
+    assert!(fixture.lifecycle().is_empty());
+    assert!(fixture.preparations().is_empty());
+    assert!(!fixture.config.output_dir.exists());
     // Missing profile definitions must fail, never silently reduce coverage.
     let mut incomplete = serde_json::to_value(&fixture.config).unwrap();
     incomplete["profiles"] = json!({});

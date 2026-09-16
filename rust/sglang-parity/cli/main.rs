@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sglang_parity::environment::{self, Backend};
 use sglang_parity::report::ReportView;
-use sglang_parity::{Report, RunConfig, describe, describe_plan, run, run_plan};
+use sglang_parity::{CheckTarget, Report, RunConfig, describe, describe_plan, run, run_plan};
 
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
@@ -15,7 +15,7 @@ mod native_generate;
 #[path = "../suites/openai_http/mod.rs"]
 mod openai_http;
 
-const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate|openai_http] [--suite-file <suite.json>] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
+const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate|openai_http] [--suite-file <suite.json>] [--check full-response|generated-content] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--check defaults to full-response.\n--describe validates and prints the effective specification without installing environments or starting services.";
 
 #[derive(Default)]
 enum Suite {
@@ -27,6 +27,7 @@ enum Suite {
 #[derive(Default)]
 struct Arguments {
     suite: Suite,
+    check: CheckTarget,
     config: Option<PathBuf>,
     report: Option<PathBuf>,
     case: Option<String>,
@@ -50,7 +51,8 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
         match argument.as_str() {
             "--describe" => result.describe = true,
             "--update-env-lock" => result.update_env_lock = true,
-            "--config" | "--suite" | "--suite-file" | "--backend" | "--report" | "--case" => {
+            "--config" | "--suite" | "--suite-file" | "--backend" | "--report" | "--case"
+            | "--check" => {
                 let value = arguments
                     .next()
                     .filter(|value| !value.starts_with("--"))
@@ -60,6 +62,13 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
                     "--report" => result.report = Some(value.into()),
                     "--case" => result.case = Some(value),
                     "--suite-file" => result.suite_file = Some(value.into()),
+                    "--check" => {
+                        result.check = match value.as_str() {
+                            "full-response" => CheckTarget::FullResponse,
+                            "generated-content" => CheckTarget::GeneratedContent,
+                            _ => return Err(format!("unsupported check target {value:?}")),
+                        }
+                    }
                     "--backend" => {
                         result.backend = Some(match value.as_str() {
                             "mlx" => Backend::Mlx,
@@ -90,9 +99,15 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
             return Err("--report cannot be combined with run or environment options".into());
         }
     } else if result.update_env_lock {
-        if ["--config", "--describe", "--suite", "--suite-file"]
-            .iter()
-            .any(|option| seen.contains(*option))
+        if [
+            "--config",
+            "--describe",
+            "--suite",
+            "--suite-file",
+            "--check",
+        ]
+        .iter()
+        .any(|option| seen.contains(*option))
         {
             return Err("--update-env-lock cannot be combined with run or suite options".into());
         }
@@ -163,26 +178,28 @@ async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::
         .transpose()?;
     match arguments.suite {
         Suite::Native => {
+            let spec = external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC);
+            let plan = match arguments.check {
+                CheckTarget::FullResponse => native_generate::load_plan(spec, &config),
+                check => native_generate::load_plan_for_check(spec, &config, check),
+            };
             execute_plan(
                 &config,
-                native_generate::load_plan(
-                    external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC),
-                    &config,
-                )
-                .map_err(std::io::Error::other)?,
+                plan.map_err(std::io::Error::other)?,
                 arguments.describe,
                 color,
             )
             .await
         }
         Suite::OpenAi => {
+            let spec = external.as_deref().unwrap_or(openai_http::DEFAULT_SPEC);
+            let plan = match arguments.check {
+                CheckTarget::FullResponse => openai_http::load_plan(spec, &config),
+                check => openai_http::load_plan_for_check(spec, &config, check),
+            };
             execute_plan(
                 &config,
-                openai_http::load_plan(
-                    external.as_deref().unwrap_or(openai_http::DEFAULT_SPEC),
-                    &config,
-                )
-                .map_err(std::io::Error::other)?,
+                plan.map_err(std::io::Error::other)?,
                 arguments.describe,
                 color,
             )
@@ -261,6 +278,15 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_obsolete_options() {
         for args in [
+            vec!["--config", "run.json", "--check", "output"],
+            vec!["--report", "report.json", "--check", "generated-content"],
+            vec![
+                "--update-env-lock",
+                "--backend",
+                "mlx",
+                "--check",
+                "full-response",
+            ],
             vec!["--config", "--describe"],
             vec!["--report", "report.json", "--describe"],
             vec!["--report", "report.json", "--config", "run.json"],
@@ -309,6 +335,23 @@ mod tests {
             assert!(arguments.update_env_lock);
             assert_eq!(arguments.backend, Some(backend));
             assert!(arguments.config.is_none());
+        }
+        for (name, expected) in [
+            (None, CheckTarget::FullResponse),
+            (Some("full-response"), CheckTarget::FullResponse),
+            (Some("generated-content"), CheckTarget::GeneratedContent),
+        ] {
+            let mut args = vec!["--config", "run.json"];
+            if let Some(name) = name {
+                args.extend(["--check", name]);
+            }
+            assert_eq!(
+                parse(args.into_iter().map(String::from))
+                    .unwrap()
+                    .unwrap()
+                    .check,
+                expected
+            );
         }
     }
 }

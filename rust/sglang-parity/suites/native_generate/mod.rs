@@ -1,14 +1,14 @@
-//! Native `/generate` requests and lossless response validation.
+//! Native `/generate` requests and validation for the selected comparison target.
 //!
-//! The specification owns comparison exceptions. This module only interprets
-//! generation frames, checks their lifecycle, and reconstructs the complete
-//! response. Streaming fields require an explicit lifecycle; their complete
-//! values survive reconstruction for the core comparator.
+//! Full-response checks preserve complete fields and their declared lifecycle.
+//! Generated-content checks reuse text reconstruction and termination checks,
+//! retaining only text. The specification declares both comparison contracts.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sglang_parity::CheckTarget;
 use sglang_parity::compare::{ComparisonRules, ComparisonScope, Violation};
 use sglang_parity::http::{CaptureMode, HttpCase, HttpObservation, HttpRequest, Isolation};
 use sglang_parity::plan::{ExecutionPlan, ProfilePlan, Requirements};
@@ -25,8 +25,27 @@ struct SuiteSpec {
     http: HttpSpec,
     comparison: ComparisonRules,
     #[serde(default)]
+    generated_content: ContentRules,
+    #[serde(default)]
     streaming: Option<StreamingRules>,
     cases: Vec<CaseSpec>,
+}
+
+/// The finite content projection supported by this API policy.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ContentRules {
+    fields: Vec<String>,
+    text: String,
+}
+
+impl Default for ContentRules {
+    fn default() -> Self {
+        Self {
+            fields: vec!["/text".into()],
+            text: "exact".into(),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -69,6 +88,7 @@ struct Prerequisite {
 
 /// One interpretation of streaming output, shared by both implementations.
 pub struct GeneratePolicy {
+    check: CheckTarget,
     incremental: bool,
     expectations: BTreeMap<String, Vec<Expectation>>,
     streaming: StreamingRules,
@@ -186,6 +206,15 @@ const INPUT_LOGPROBS: [&str; 3] = [
 
 /// Compile one API policy per explicitly selected startup profile.
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<GeneratePolicy>, String> {
+    load_plan_for_check(text, config, CheckTarget::FullResponse)
+}
+
+/// Compile the same requests with validation scoped to the selected target.
+pub fn load_plan_for_check(
+    text: &str,
+    config: &RunConfig,
+    check: CheckTarget,
+) -> Result<ExecutionPlan<GeneratePolicy>, String> {
     let spec: SuiteSpec = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let resolved = config.resolve_profiles()?;
     for case in &spec.cases {
@@ -203,7 +232,7 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<Generat
         }
     }
     // Validate declarations even if filtering would otherwise conceal an error.
-    compile(spec.clone(), config)?;
+    compile(spec.clone(), config, check)?;
     let mut profiles = Vec::new();
     for profile in resolved {
         let mut selected = spec.clone();
@@ -213,7 +242,10 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<Generat
         }
         let mut profile_config = config.clone();
         profile_config.server = profile.server.clone();
-        let (suite, policy) = compile(selected, &profile_config)?;
+        let (suite, policy) = compile(selected, &profile_config, check)?;
+        if suite.cases.is_empty() {
+            continue;
+        }
         profiles.push(ProfilePlan {
             profile,
             suite,
@@ -225,7 +257,11 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<Generat
     Ok(plan)
 }
 
-fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), String> {
+fn compile(
+    spec: SuiteSpec,
+    config: &RunConfig,
+    check: CheckTarget,
+) -> Result<(HttpSuite, GeneratePolicy), String> {
     if spec.name != "native_generate" {
         return Err("the native_generate implementation requires name=native_generate".into());
     }
@@ -233,6 +269,9 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
         return Err("native_generate requires POST /generate".into());
     }
     spec.comparison.validate()?;
+    if spec.generated_content != ContentRules::default() {
+        return Err("native generated_content requires fields=[\"/text\"] and text=exact".into());
+    }
     if let Some(rules) = &spec.streaming {
         rules.validate()?;
     }
@@ -240,13 +279,17 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
         return Err("a suite must contain at least one case".into());
     }
     let negative = spec.cases[0].expect_status >= 400;
-    if negative && !spec.comparison.per_result_value_exceptions.is_empty() {
+    if check == CheckTarget::FullResponse
+        && negative
+        && !spec.comparison.per_result_value_exceptions.is_empty()
+    {
         return Err("HTTP error suites require an empty value-exception list".into());
     }
     let mut names = BTreeSet::new();
     let mut expectations = BTreeMap::new();
+    let mut excluded_cases = Vec::new();
     let mut cases = Vec::with_capacity(spec.cases.len());
-    for case in spec.cases {
+    for mut case in spec.cases {
         if case.name.trim().is_empty() || !names.insert(case.name.clone()) {
             return Err("case names must be non-empty and unique".into());
         }
@@ -266,7 +309,7 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
                 case.name
             ));
         }
-        if (case.expect_status >= 400) != negative {
+        if check == CheckTarget::FullResponse && (case.expect_status >= 400) != negative {
             return Err(
                 "success and HTTP error cases require separate suite specifications".into(),
             );
@@ -274,7 +317,19 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
         if !case.body.is_object() {
             return Err(format!("{}: body must be a JSON object", case.name));
         }
-        let (capture, comparison_scope) = if negative {
+        if check == CheckTarget::GeneratedContent {
+            if case.expect_status >= 400 {
+                excluded_cases.push(serde_json::json!({
+                    "name": case.name,
+                    "reason": "expected HTTP error; no generated content to compare",
+                }));
+                continue;
+            }
+            // Native scenario assertions concern metadata, not generated text.
+            Expectation::validate_all(&case.expectations)?;
+            case.expectations.clear();
+        }
+        let (capture, comparison_scope) = if negative && check == CheckTarget::FullResponse {
             (CaptureMode::Json, ComparisonScope::Root)
         } else {
             let shape =
@@ -363,6 +418,7 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
     let incremental = config.server.incremental_output();
     Ok((
         HttpSuite {
+            check,
             name: spec.name,
             response_implementation: "native_generate::GeneratePolicy".into(),
             output_mode: if incremental {
@@ -371,13 +427,25 @@ fn compile(spec: SuiteSpec, config: &RunConfig) -> Result<(HttpSuite, GeneratePo
                 "cumulative"
             }
             .into(),
-            response_policy: Some(
-                serde_json::json!({"streaming": spec.streaming, "expectations": expectations}),
-            ),
-            comparison: spec.comparison,
+            response_policy: Some(serde_json::json!({
+                "streaming": spec.streaming,
+                "expectations": expectations,
+                "generated_content": spec.generated_content,
+                "excluded_cases": excluded_cases,
+            })),
+            comparison: if check == CheckTarget::GeneratedContent {
+                ComparisonRules {
+                    per_result_value_exceptions: Vec::new(),
+                    per_result_numeric_rules: Vec::new(),
+                    ..spec.comparison
+                }
+            } else {
+                spec.comparison
+            },
             cases,
         },
         GeneratePolicy {
+            check,
             incremental,
             expectations,
             streaming: spec.streaming.unwrap_or_default(),
@@ -488,7 +556,7 @@ impl ResponsePolicy for GeneratePolicy {
         }
         let shape = request_shape(&case.body).map_err(|error| vec![Violation::new("", error)])?;
         let mut prepared: PreparedResponse = match case.capture {
-            CaptureMode::Json => prepare_json(case, observation, shape).map(Into::into),
+            CaptureMode::Json => prepare_json(case, observation, shape, self.check).map(Into::into),
             CaptureMode::Sse => self.prepare_stream(case, observation, shape),
         }?;
         if let Some(expectations) = self.expectations.get(&case.name) {
@@ -505,6 +573,7 @@ fn prepare_json(
     case: &HttpCase,
     observation: &HttpObservation,
     shape: Shape,
+    check: CheckTarget,
 ) -> Result<Value, Vec<Violation>> {
     let Some(value) = observation.json.as_ref() else {
         return Err(vec![Violation::new("", "missing JSON response")]);
@@ -534,13 +603,15 @@ fn prepare_json(
         } else {
             String::new()
         };
-        match validate_frame(result, &path, true) {
+        match validate_frame(result, &path, true, check) {
             Ok(_) => {
                 let mut state = ResultState::default();
-                if let Err(error) = state.accept(result, false, &path) {
+                if let Err(error) = state.accept(result, false, &path, check) {
                     violations.push(error);
                 }
-                if let Err(error) = validate_requested_logprobs(case, index, result, &path) {
+                if check == CheckTarget::FullResponse
+                    && let Err(error) = validate_requested_logprobs(case, index, result, &path)
+                {
                     violations.push(error);
                 }
             }
@@ -548,7 +619,19 @@ fn prepare_json(
         }
     }
     if violations.is_empty() {
-        Ok(value.clone())
+        if check == CheckTarget::GeneratedContent {
+            let mut results: Vec<_> = values
+                .into_iter()
+                .map(|value| serde_json::json!({"text": value["text"]}))
+                .collect();
+            Ok(if shape.batch {
+                Value::Array(results)
+            } else {
+                results.remove(0)
+            })
+        } else {
+            Ok(value.clone())
+        }
     } else {
         Err(violations)
     }
@@ -623,21 +706,39 @@ impl GeneratePolicy {
                     String::new()
                 };
                 let state = &mut states[index];
+                validate_frame(&value, &path, false, self.check)?;
                 if state.finished {
+                    if self.check == CheckTarget::GeneratedContent
+                        && value.get("text").is_none()
+                        && value["meta_info"]["finish_reason"].is_null()
+                    {
+                        return Ok(());
+                    }
                     return Err(Violation::new(
                         path,
                         "result emitted data after termination",
                     ));
                 }
-                validate_frame(&value, &path, false)?;
-                state.accept_fields(
-                    &value,
-                    &self.streaming,
-                    self.incremental,
-                    event_index,
-                    &path,
-                )?;
-                state.accept(&value, self.incremental, &path)?;
+                if self.check == CheckTarget::FullResponse {
+                    state.accept_fields(
+                        &value,
+                        &self.streaming,
+                        self.incremental,
+                        event_index,
+                        &path,
+                    )?;
+                } else if value.get("text").is_some() {
+                    if self.incremental {
+                        state
+                            .origins
+                            .entry("/text".into())
+                            .or_default()
+                            .push(event_index);
+                    } else {
+                        state.origins.insert("/text".into(), vec![event_index]);
+                    }
+                }
+                state.accept(&value, self.incremental, &path, self.check)?;
                 Ok(())
             })();
             if let Err(mut violation) = result {
@@ -649,14 +750,20 @@ impl GeneratePolicy {
             violations.push(Violation::new("", "missing [DONE] event"));
         }
         for (index, state) in states.iter().enumerate() {
-            if !state.finished {
+            if !state.finished
+                || (self.check == CheckTarget::GeneratedContent && state.text.is_none())
+            {
                 violations.push(Violation::new(
                     if shape.batch {
                         format!("/{index}")
                     } else {
                         String::new()
                     },
-                    "result did not terminate",
+                    if state.finished {
+                        "result never provided text"
+                    } else {
+                        "result did not terminate"
+                    },
                 ));
             }
         }
@@ -671,7 +778,7 @@ impl GeneratePolicy {
             } else {
                 String::new()
             };
-            let prepared = state.finish(self.incremental, shape.batch);
+            let prepared = state.finish(self.incremental, shape.batch, self.check);
             let value = prepared.value;
             origins.extend(
                 prepared
@@ -679,7 +786,10 @@ impl GeneratePolicy {
                     .into_iter()
                     .map(|(field, events)| (format!("{path}{field}"), events)),
             );
-            validate_requested_logprobs(case, index, &value, &path).map_err(|error| vec![error])?;
+            if self.check == CheckTarget::FullResponse {
+                validate_requested_logprobs(case, index, &value, &path)
+                    .map_err(|error| vec![error])?;
+            }
             values.push(value);
         }
         let value = if shape.batch {
@@ -696,11 +806,12 @@ impl GeneratePolicy {
     }
 }
 
-fn validate_frame<'a>(
-    value: &'a Value,
+fn validate_frame(
+    value: &Value,
     path: &str,
     terminal: bool,
-) -> Result<&'a Map<String, Value>, Violation> {
+    check: CheckTarget,
+) -> Result<(), Violation> {
     let object = value
         .as_object()
         .ok_or_else(|| Violation::new(path, "result must be an object"))?;
@@ -710,12 +821,40 @@ fn validate_frame<'a>(
             "error response in a successful generation",
         ));
     }
-    let meta = value
-        .get("meta_info")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Violation::new(format!("{path}/meta_info"), "meta_info must be an object")
-        })?;
+    let meta = value.get("meta_info").and_then(Value::as_object);
+    if check == CheckTarget::FullResponse && meta.is_none() {
+        return Err(Violation::new(
+            format!("{path}/meta_info"),
+            "meta_info must be an object",
+        ));
+    }
+    match meta.and_then(|meta| meta.get("finish_reason")) {
+        Some(Value::Null) if !terminal => {}
+        None if check == CheckTarget::GeneratedContent && !terminal => {}
+        Some(Value::Object(reason))
+            if reason
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "stop" | "length")) => {}
+        _ => {
+            return Err(Violation::new(
+                format!("{path}/meta_info/finish_reason"),
+                "expected a normal finish reason, or null before termination",
+            ));
+        }
+    }
+    if check == CheckTarget::GeneratedContent {
+        if object.get("text").is_some_and(|text| !text.is_string())
+            || (terminal && !object.get("text").is_some_and(Value::is_string))
+        {
+            return Err(Violation::new(
+                format!("{path}/text"),
+                "text must be a string",
+            ));
+        }
+        return Ok(());
+    }
+    let meta = meta.expect("validated metadata object");
     for key in ["prompt_tokens", "completion_tokens"] {
         if meta.get(key).and_then(Value::as_u64).is_none() {
             return Err(Violation::new(
@@ -733,20 +872,6 @@ fn validate_frame<'a>(
             format!("{path}/meta_info/id"),
             "result id must be a non-empty string",
         ));
-    }
-    match meta.get("finish_reason") {
-        Some(Value::Null) if !terminal => {}
-        Some(Value::Object(reason))
-            if reason
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| matches!(kind, "stop" | "length")) => {}
-        _ => {
-            return Err(Violation::new(
-                format!("{path}/meta_info/finish_reason"),
-                "expected a normal finish reason, or null before termination",
-            ));
-        }
     }
     if !object.contains_key("text") && !object.contains_key("output_ids") {
         return Err(Violation::new(
@@ -769,8 +894,7 @@ fn validate_frame<'a>(
             "output_ids must contain non-negative integers",
         ));
     }
-    validate_metadata(meta, path)?;
-    Ok(meta)
+    validate_metadata(meta, path)
 }
 
 fn validate_metadata(meta: &Map<String, Value>, path: &str) -> Result<(), Violation> {
@@ -926,7 +1050,37 @@ impl ResultState {
         Ok(())
     }
 
-    fn accept(&mut self, value: &Value, incremental: bool, path: &str) -> Result<(), Violation> {
+    fn accept(
+        &mut self,
+        value: &Value,
+        incremental: bool,
+        path: &str,
+        check: CheckTarget,
+    ) -> Result<(), Violation> {
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            if incremental {
+                self.text.get_or_insert_default().push_str(text);
+            } else {
+                if self.text.as_ref().is_some_and(|old| !text.starts_with(old)) {
+                    return Err(Violation::new(
+                        format!("{path}/text"),
+                        "cumulative text is not a prefix extension",
+                    ));
+                }
+                self.text = Some(text.into());
+            }
+        } else if self.text.is_some() && !incremental && check == CheckTarget::FullResponse {
+            return Err(Violation::new(
+                format!("{path}/text"),
+                "cumulative text disappeared",
+            ));
+        }
+        if check == CheckTarget::GeneratedContent {
+            self.finished = value
+                .pointer("/meta_info/finish_reason")
+                .is_some_and(|reason| !reason.is_null());
+            return Ok(());
+        }
         let meta = value["meta_info"].as_object().expect("validated metadata");
         // Existing delta positions already agreed on a previous frame. If either
         // optional family is arriving for the first time, validate all overlap.
@@ -955,24 +1109,6 @@ impl ResultState {
                     "completion count moved backwards",
                 ));
             }
-        }
-        if let Some(text) = value.get("text").and_then(Value::as_str) {
-            if incremental {
-                self.text.get_or_insert_default().push_str(text);
-            } else {
-                if self.text.as_ref().is_some_and(|old| !text.starts_with(old)) {
-                    return Err(Violation::new(
-                        format!("{path}/text"),
-                        "cumulative text is not a prefix extension",
-                    ));
-                }
-                self.text = Some(text.into());
-            }
-        } else if self.text.is_some() && !incremental {
-            return Err(Violation::new(
-                format!("{path}/text"),
-                "cumulative text disappeared",
-            ));
         }
         if let Some(ids) = value.get("output_ids").and_then(Value::as_array) {
             merge_sequence(
@@ -1081,7 +1217,15 @@ impl ResultState {
         Ok(())
     }
 
-    fn finish(self, incremental: bool, batch: bool) -> PreparedResponse {
+    fn finish(self, incremental: bool, batch: bool, check: CheckTarget) -> PreparedResponse {
+        if check == CheckTarget::GeneratedContent {
+            return PreparedResponse {
+                value: serde_json::json!({"text": self.text.expect("validated generated text")}),
+                origins: self.origins,
+                equivalence: None,
+                assertions: Vec::new(),
+            };
+        }
         let mut value = self.last.expect("every result terminated");
         for (field, first) in self.first {
             let (parent, key) = field.rsplit_once('/').expect("validated field pointer");

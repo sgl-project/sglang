@@ -13,7 +13,12 @@ fn plan() -> ExecutionPlan<OpenAiPolicy> {
 }
 
 fn case(name: &str) -> (HttpCase, OpenAiPolicy) {
-    let profile = plan()
+    case_for_check(name, CheckTarget::FullResponse)
+}
+
+fn case_for_check(name: &str, check: CheckTarget) -> (HttpCase, OpenAiPolicy) {
+    let profile = load_plan_for_check(DEFAULT_SPEC, &config(), check)
+        .unwrap()
         .profiles
         .into_iter()
         .find(|p| p.suite.cases.iter().any(|c| c.name == name))
@@ -656,7 +661,7 @@ fn scenario_assertions_distinguish_inactive_and_populated_values() {
         }
         for (value, passes) in [(valid, true), (invalid, false)] {
             *response.pointer_mut(path).unwrap() = value;
-            let result = expectation.evaluate(&response, &c);
+            let result = expectation.evaluate(&response, &c, CheckTarget::FullResponse);
             assert_eq!(result.violations.is_empty(), passes, "{spec}: {response}");
         }
     }
@@ -664,13 +669,13 @@ fn scenario_assertions_distinguish_inactive_and_populated_values() {
     cold["usage"]["prompt_tokens_details"] = json!({"cached_tokens":0});
     assert!(
         Expectation::CachedTokens { positive: false }
-            .evaluate(&cold, &c)
+            .evaluate(&cold, &c, CheckTarget::FullResponse)
             .violations
             .is_empty()
     );
     assert!(
         !Expectation::CachedTokens { positive: true }
-            .evaluate(&cold, &c)
+            .evaluate(&cold, &c, CheckTarget::FullResponse)
             .violations
             .is_empty()
     );
@@ -678,7 +683,12 @@ fn scenario_assertions_distinguish_inactive_and_populated_values() {
     for check in ["reasoning_tokens", "cached_tokens"] {
         let expectation: Expectation =
             serde_json::from_value(json!({"check":check,"positive":true})).unwrap();
-        assert!(!expectation.evaluate(&unary(true), &c).violations.is_empty());
+        assert!(
+            !expectation
+                .evaluate(&unary(true), &c, CheckTarget::FullResponse)
+                .violations
+                .is_empty()
+        );
     }
 }
 
@@ -712,20 +722,36 @@ fn logprob_alternative_scenarios_require_sampled_data_and_preserve_empty_shapes(
                     .unwrap();
                 assert_eq!(prepared.value, response);
                 assert_eq!(
-                    expectation.evaluate(&response, &c).violations.is_empty(),
+                    expectation
+                        .evaluate(&response, &c, CheckTarget::FullResponse)
+                        .violations
+                        .is_empty(),
                     populated == (alternatives > 0)
                 );
                 if chat {
                     let ids = Expectation::TokenIds;
-                    assert!(ids.evaluate(&response, &c).violations.is_empty());
+                    assert!(
+                        ids.evaluate(&response, &c, CheckTarget::FullResponse)
+                            .violations
+                            .is_empty()
+                    );
                     response["choices"][0]["logprobs"]["content"][0]
                         .as_object_mut()
                         .unwrap()
                         .remove("token_id");
-                    assert!(!ids.evaluate(&response, &c).violations.is_empty());
+                    assert!(
+                        !ids.evaluate(&response, &c, CheckTarget::FullResponse)
+                            .violations
+                            .is_empty()
+                    );
                 }
                 response["choices"][0]["logprobs"] = json!({});
-                assert!(!expectation.evaluate(&response, &c).violations.is_empty());
+                assert!(
+                    !expectation
+                        .evaluate(&response, &c, CheckTarget::FullResponse)
+                        .violations
+                        .is_empty()
+                );
             }
         }
     }
@@ -914,4 +940,306 @@ fn empty_chat_outputs_are_valid_but_keep_null_empty_and_missing_distinct() {
         values[0].equivalence.as_ref().unwrap().value,
         values[2].equivalence.as_ref().unwrap().value
     );
+}
+
+#[test]
+fn generated_content_selects_generation_cases_and_content_assertions() {
+    let plan = load_plan_for_check(DEFAULT_SPEC, &config(), CheckTarget::GeneratedContent).unwrap();
+    let full = load_plan(DEFAULT_SPEC, &config()).unwrap();
+    for (profile, original) in plan.profiles.iter().zip(&full.profiles) {
+        assert_eq!(profile.suite.check, CheckTarget::GeneratedContent);
+        assert!(
+            profile
+                .suite
+                .comparison
+                .per_result_value_exceptions
+                .is_empty()
+        );
+        assert!(profile.suite.comparison.per_result_numeric_rules.is_empty());
+        let excluded = profile.suite.response_policy.as_ref().unwrap()["excluded_cases"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            profile.suite.cases.len() + excluded.len(),
+            original.suite.cases.len()
+        );
+        for case in &profile.suite.cases {
+            assert_eq!(case.expect_status, 200);
+            assert!(case.assertions.iter().all(|name| matches!(
+                name.as_str(),
+                "content" | "reasoning_content" | "tool_calls" | "no_refusal"
+            )));
+        }
+    }
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    spec["generated_content"]["text"] = json!("trim");
+    assert!(
+        load_plan_for_check(&spec.to_string(), &config(), CheckTarget::GeneratedContent).is_err()
+    );
+}
+
+#[test]
+fn generated_content_ignores_metadata_and_uses_one_view_for_json_and_sse() {
+    for chat in [false, true] {
+        let prefix = if chat { "chat" } else { "completion" };
+        let (json_case, policy) = case_for_check(
+            &format!("{prefix}_logprobs_json"),
+            CheckTarget::GeneratedContent,
+        );
+        let (stream_case, _) = case_for_check(
+            &format!("{prefix}_logprobs_stream"),
+            CheckTarget::GeneratedContent,
+        );
+        let mut value = unary(chat);
+        for key in ["id", "created", "usage", "model", "object"] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        value["choices"][0]["logprobs"] = json!("irrelevant");
+        let json = policy
+            .prepare(
+                &json_case,
+                &HttpObservation {
+                    json: Some(value),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut values = stream(chat);
+        values.pop();
+        for (i, value) in values.iter_mut().enumerate() {
+            value["id"] = json!(i);
+            value["created"] = json!(-i32::try_from(i).unwrap());
+            value["usage"] = json!("irrelevant");
+            value["choices"][0]["logprobs"] = json!("irrelevant");
+            if chat {
+                value["choices"][0]["delta"]["metadata"] = json!({"chunk":i});
+                value["choices"][0]["delta"]["role"] = json!(i);
+            }
+        }
+        values.push(json!({"choices":[{"index":0,"usage":{"total_tokens":123}}]}));
+        values.push(json!({"choices":[],"sglext":{"input_ids":[1,2,3]}}));
+        let mut observation = capture(values);
+        let metadata_index = observation.events.len() - 2;
+        observation.events[metadata_index].event = "sglext_ids".into();
+        let sse = policy.prepare(&stream_case, &observation).unwrap();
+        assert_eq!(json.value, sse.value);
+        assert!(json.equivalence.is_none() && sse.equivalence.is_none());
+        assert!(
+            json.assertions
+                .iter()
+                .chain(&sse.assertions)
+                .all(|a| a.violations.is_empty())
+        );
+        let path = if chat {
+            "/choices/0/message/content"
+        } else {
+            "/choices/0/text"
+        };
+        assert!(!sse.origins[path].is_empty());
+        assert_eq!(json.value.pointer(path), Some(&json!("Hi")));
+        let mut changed = json.value.clone();
+        *changed.pointer_mut(path).unwrap() = json!("Hi\n");
+        assert_eq!(
+            sglang_parity::compare::compare_json(&json.value, &changed).len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn generated_content_retains_stream_integrity_and_required_containers() {
+    for chat in [false, true] {
+        let prefix = if chat { "chat" } else { "completion" };
+        let (case, policy) = case_for_check(
+            &format!("{prefix}_greedy_stream"),
+            CheckTarget::GeneratedContent,
+        );
+        for mutation in [
+            "index",
+            "missing_choice",
+            "after_finish",
+            "type",
+            "missing_content",
+            "wrong_container",
+            "trailing_wrong_container",
+            "abort",
+            "error",
+            "done",
+        ] {
+            let mut values = stream(chat);
+            let last = values.len() - 2;
+            match mutation {
+                "index" => values[0]["choices"][0]["index"] = json!(3),
+                "missing_choice" => values.retain(|v| v["choices"].as_array().unwrap().is_empty()),
+                "after_finish" => values.insert(last + 1, values[1].clone()),
+                "type" => {
+                    if chat {
+                        values[1]["choices"][0]["delta"]["content"] = json!(7);
+                    } else {
+                        values[1]["choices"][0]["text"] = json!(7);
+                    }
+                }
+                "missing_content" => {
+                    for value in &mut values[..=last] {
+                        value["choices"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(if chat { "delta" } else { "text" });
+                    }
+                }
+                "wrong_container" => {
+                    values[0]["choices"][0]["message"] = json!({"content":"hidden"})
+                }
+                "trailing_wrong_container" => {
+                    values.push(json!({"choices":[{"index":0,"message":{"content":"hidden"}}]}))
+                }
+                "abort" => values[last]["choices"][0]["finish_reason"] = json!("abort"),
+                "error" => values[0] = json!({"error":{"message":"failed"}}),
+                _ => {}
+            }
+            let mut observation = capture(values);
+            if mutation == "done" {
+                observation.events.pop();
+            }
+            assert!(
+                policy.prepare(&case, &observation).is_err(),
+                "chat={chat}: {mutation}"
+            );
+        }
+        let (case, _) = case_for_check(
+            &format!("{prefix}_greedy_json"),
+            CheckTarget::GeneratedContent,
+        );
+        for mutation in ["container", "choice", "content", "abort"] {
+            let mut value = unary(chat);
+            match mutation {
+                "container" => value = json!([]),
+                "choice" => value["choices"] = json!([]),
+                "content" => {
+                    value["choices"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(if chat { "message" } else { "text" });
+                }
+                _ => value["choices"][0]["finish_reason"] = json!("abort"),
+            }
+            assert!(
+                policy
+                    .prepare(
+                        &case,
+                        &HttpObservation {
+                            json: Some(value),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err(),
+                "chat={chat}: {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn generated_chat_content_normalizes_only_empty_payloads() {
+    let (case, policy) = case_for_check("chat_empty_stop_json", CheckTarget::GeneratedContent);
+    let mut baseline = None;
+    for message in [
+        json!({}),
+        json!({"content":null,"reasoning_content":null,"refusal":null,"tool_calls":null}),
+        json!({"content":"","reasoning_content":"","refusal":"","tool_calls":[]}),
+    ] {
+        let mut value = unary(true);
+        value["choices"][0]["message"] = message;
+        let prepared = policy
+            .prepare(
+                &case,
+                &HttpObservation {
+                    json: Some(value),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(prepared.assertions.iter().all(|a| a.violations.is_empty()));
+        if let Some(baseline) = &baseline {
+            assert_eq!(&prepared.value, baseline);
+        } else {
+            baseline = Some(prepared.value);
+        }
+    }
+    for field in ["content", "reasoning_content", "refusal"] {
+        let mut value = unary(true);
+        value["choices"][0]["message"] = json!({field:"\n"});
+        let prepared = policy
+            .prepare(
+                &case,
+                &HttpObservation {
+                    json: Some(value),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(Some(prepared.value), baseline, "{field}");
+    }
+}
+
+#[test]
+fn generated_content_routes_tools_and_choices_without_comparing_ids() {
+    let (mut case, policy) = case_for_check("chat_greedy_stream", CheckTarget::GeneratedContent);
+    case.body["n"] = json!(2);
+    let values = vec![
+        json!({"choices":[{"index":1,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}]}),
+        json!({"choices":[{"index":1,"delta":{"tool_calls":[{"index":0,"id":"two","function":{"arguments":" \"Paris\"}"}}]},"finish_reason":"tool_calls"}]}),
+    ];
+    let stream = policy.prepare(&case, &capture(values.clone())).unwrap();
+    assert_eq!(stream.value["choices"][0]["index"], 0);
+    let tool_path = "/choices/1/message/tool_calls/0";
+    assert_eq!(
+        stream.value.pointer(tool_path).unwrap(),
+        &json!({"type":"function","function":{"name":"weather","arguments":"{\"city\": \"Paris\"}"}})
+    );
+    assert_eq!(stream.origins["/choices/1/message/tool_calls"], vec![0, 2]);
+    let mut annotated = values.clone();
+    let call = &mut annotated[0]["choices"][0]["delta"]["tool_calls"][0];
+    call["metadata"] = json!({"trace": 7});
+    call["function"]["metadata"] = json!(null);
+    assert_eq!(
+        policy.prepare(&case, &capture(annotated)).unwrap().value,
+        stream.value
+    );
+    let mut json_case = case.clone();
+    json_case.request.capture = CaptureMode::Json;
+    let json = json!({"choices":[
+        {"index":1,"message":{"tool_calls":[{"type":"function","function":{"name":"weather","arguments":"{\"city\": \"Paris\"}"}}]},"finish_reason":"stop"},
+        {"index":0,"message":{"content":"Hi"},"finish_reason":"length"}
+    ]});
+    assert_eq!(
+        stream.value,
+        policy
+            .prepare(
+                &json_case,
+                &HttpObservation {
+                    json: Some(json),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .value
+    );
+    for mutation in ["index", "arguments", "name", "type"] {
+        let mut values = values.clone();
+        let call = &mut values[0]["choices"][0]["delta"]["tool_calls"][0];
+        match mutation {
+            "index" => {
+                call.as_object_mut().unwrap().remove("index");
+            }
+            "arguments" => call["function"]["arguments"] = json!(7),
+            "name" => call["function"]["name"] = json!(null),
+            _ => call["type"] = json!("unsupported"),
+        }
+        assert!(
+            policy.prepare(&case, &capture(values)).is_err(),
+            "{mutation}"
+        );
+    }
 }

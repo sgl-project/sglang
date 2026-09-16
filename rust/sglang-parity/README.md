@@ -50,7 +50,9 @@ When changing models, update the `--revision` in every overridden argument list
 and review model-specific cases such as the Qwen3 reasoning checks.
 
 The command runs the complete [`native_generate` suite](suites/native_generate/suite.json),
-including metadata checks and both streaming modes. No `--suite-file` is needed.
+including metadata checks and both streaming modes. The default check is
+`full-response`; choose `generated-content` to compare the generated payload.
+No `--suite-file` is needed.
 Existing configurations must define every profile referenced by the suite;
 missing profiles are configuration errors, not a request to run fewer tests.
 
@@ -90,9 +92,48 @@ incremental profile bindings produce 48 case executions. Each available executio
 runs twice per implementation, in addition to prerequisites and readiness probes.
 On MLX, 32 executions are available and 16 require CUDA. These are the currently
 declared scenarios; additional API behavior needs additional cases.
-Custom request fields are sent unchanged and their responses are compared in full.
+Custom request fields are sent unchanged; `full-response` compares the complete response.
 New API features may also require extending the suite's protocol validation and
 unit tests; matching responses alone do not prove every requested option was honored.
+
+## Choose the check
+
+Both built-in suites support two explicit checks. From `rust/`:
+
+```sh
+# Generated payload only, using the Native API.
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/mlx.json \
+  --suite native_generate --check generated-content
+
+# Generated payload only, using the OpenAI APIs.
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json \
+  --suite openai_http --check generated-content
+
+# Complete response contract, including metadata (the default).
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json \
+  --suite openai_http --check full-response
+```
+
+Append `--describe` to review the selected check without starting services.
+The check is recorded in the effective suite and report and applies to
+repeatability, Python/Rust parity, and declared JSON/SSE equivalence.
+
+| Check | Compared values | Validation and scenario checks |
+| --- | --- | --- |
+| `full-response` (default) | Complete JSON or reconstructed SSE response, with the suite's declared value exceptions and precision rules | Full response validation and all configured scenario assertions |
+| `generated-content` | Native text; OpenAI Completion choice index and text; Chat choice index, text, reasoning, refusal, and tool-call type, name and raw arguments | Output integrity and content, reasoning, tool-call and refusal assertions |
+
+Generated-content checks omit token IDs, all logprobs, usage, cache statistics,
+weight versions, timing, response IDs and other metadata. Empty, null and absent
+optional payloads are treated as no generated content. Finish reasons establish
+completion and error integrity but their exact values, and matched-stop metadata,
+are not compared. Tool arguments remain exact strings; no tool is executed.
+Metadata assertions are omitted from this check. An HTTP error or incomplete
+output still cannot count as matching generated content.
+
+Generated-content reports explicitly show `Check: Generated content parity` and
+`Metadata: Not checked`. A passing content check proves agreement only for the
+generated payload. Use `full-response` to check the complete response contract.
 
 ## Multiple startup profiles in one run
 
@@ -214,12 +255,13 @@ original checkout has since changed branches.
     logs/server-<number>.log
     <case>/<attempt>/
       request.json / response.body / final.json / events.json
+      output.json          # generated-content checks instead of final.json
       before_each/<step>/...
 ```
 
 Each attempt records its actual service log. Reports group by profile and retain
 the five-line default case summary. Scenario results remain separate from
-response validation and parity. `--case profile/case` selects an execution;
+response validation (or output integrity) and parity. `--case profile/case` selects an execution;
 an unqualified name works only when unique. Old reports and the original
 single-profile artifact layout remain readable.
 
@@ -373,7 +415,7 @@ and cumulative/incremental output mode. It starts no services and makes no netwo
 requests. Execution and reporting use that same resolved object. Runtime settings
 cannot override comparison rules, and there are no per-case comparison overrides.
 
-Comparison is strict over the entire JSON tree: object key order is irrelevant;
+For `full-response`, comparison is strict over the entire JSON tree: object key order is irrelevant;
 keys, array order and length, all values, and missing versus `null` matter. There
 are no tolerances, text normalization, or implicit field exclusions. Suites may
 explicitly declare numeric precision rules below. The native specification
@@ -486,11 +528,16 @@ layout:
       response.body
       events.json          # SSE captures, including partial captures
       final.json           # complete result after successful API validation
+      output.json          # generated payload after output integrity checks
   rust/
     ...
 ```
 
-`report.json` records environment evidence, attempts, validation errors,
+Only the artifact for the selected check is required: `final.json` for
+`full-response`, or `output.json` for `generated-content`. Raw response bytes and
+SSE events remain available for both checks.
+
+`report.json` records the selected check, environment evidence, attempts, validation errors,
 repeatability, parity and equivalence differences, field origins, and artifact paths. Each
 difference has a JSON path, kind, and both values. Runtime failures and unexecuted
 attempts remain visible.
@@ -498,11 +545,13 @@ Streaming field origins map reconstructed JSON Pointers to zero-based indices in
 `events.json`; nested differences inherit the nearest ancestor's source. Reports
 show reconstructed values separately from comparison values and can expand the
 source events. Source records contain indices, not copies of events. Old reports
-without these records remain readable and keep their saved verdicts.
+without these records remain readable and keep their saved verdicts. Reports
+without a `check` field default to `full-response`; viewing a report never
+reprojects its responses or recomputes its comparisons.
 
 Interrupted runs preserve a partial report and the bytes received so far.
 
-Reports start with the saved suite, streaming output mode, commit, backend, and
+Reports start with the saved suite, selected check, streaming output mode, commit, backend, and
 check totals, then group diagnostics by test case. Each case shows its request,
 response validation, Python and Rust repeatability, parity, and related case
 equivalence. A valid response and a stable implementation can still disagree
@@ -516,6 +565,11 @@ greedy_stream · POST /generate · SSE · cumulative · expected HTTP 200
   Details: --case greedy_stream · report.html#case-1
 ```
 
+For generated-content runs, the same five-line layout uses `Output integrity`
+and `Content parity` in place of `Response` and `Parity`. Totals and expanded
+details use `Output integrity` instead of `Response validation`, and the report
+marks metadata as not checked.
+
 The compact view includes check statuses, a short parity reason, and a detail
 pointer. Long reason previews are explicitly marked as truncated; complete
 field differences, response diagnostics, and evidence remain available through
@@ -527,10 +581,12 @@ live under the recorded left-hand case. Counts describe difference occurrences,
 not independent bugs. Skipped and unfinished checks include diagnostic reasons.
 
 Open `report.html` for the case directory, expanded failure details, requests,
-reconstructed final JSON, recorded comparison rules, and raw response/SSE/log
+reconstructed final JSON or generated output JSON, recorded comparison rules, and raw response/SSE/log
 links. Comparison values are labeled separately from reconstructed values:
 value exceptions may replace timestamps with `0`, but a missing field remains
-`<missing>`, distinct from JSON `null`. A missing artifact is shown as unavailable
+`<missing>`, distinct from JSON `null`. Content reports label values from
+`output.json` as generated output and retain their source-event origins.
+A missing artifact is shown as unavailable
 and does not change the recorded test verdict. JSON previews are limited to
 64 KiB, with links to complete artifacts. The HTML uses system fonts, follows
 the system's light/dark theme, and stacks comparison columns on narrow screens.
@@ -653,7 +709,7 @@ embeddings remain outside this suite.
 #### Empty and populated response scenarios
 
 The same specification includes `expectations` for real-service scenario checks.
-These run on the original, reconstructed response before comparison exceptions.
+For `full-response`, these run on the original, reconstructed response before comparison exceptions.
 A missing positive field or an untriggered stop/cache/tool condition fails the
 scenario assertion; it never counts as verified coverage. Protocol-valid responses
 remain available for parity even when a scenario assertion fails.
@@ -704,7 +760,7 @@ keeps the first ID and its event origin, while raw events retain every ID.
 Choices are always reconstructed by `index`, never by ID. Creation timestamps
 and the other declared constant fields retain their existing checks.
 
-There are two deliberately separate comparisons:
+With `--check full-response`, there are two deliberately separate comparisons:
 
 - **Python/Rust parity and repeatability** use the complete JSON or reconstructed
   SSE result in `final.json`. Only declared ID/time values are replaced;
@@ -716,19 +772,26 @@ There are two deliberately separate comparisons:
   message/delta are excluded only from this semantic view. The paired streaming
   request requires final usage. Other fields remain visible to full parity.
 
+With `--check generated-content`, parity and repeatability read `output.json`;
+JSON/SSE equivalence uses the same generated-payload contract. It contains
+Completion text or Chat content, reasoning/refusal text and function calls,
+routed by choice index. Tool-call IDs, logprobs, usage and other metadata are
+excluded. Only content-related scenario assertions run. Output integrity still
+checks that the response completed and the generated payload can be reconstructed.
+
 Allowing Completion IDs to vary does not relax JSON/SSE result equivalence:
 every declared pair still compares each indexed choice's content, reasoning, tool
 calls, refusal, finish reason and logprobs, along with the model and complete final usage. Independent JSON
 and SSE requests need not produce the same literal ID.
 
-The OpenAI suite specification explicitly compares log probabilities at `float32`
+For full-response checks, the OpenAI suite specification explicitly compares log probabilities at `float32`
 precision: Chat content/refusal logprobs and their top alternatives, and
 Completion `token_logprobs` and `top_logprobs` values. This removes differences
 such as `-0.24555965` versus `-0.24555964767932892`, which map to the same `f32`.
 Different `f32` values still fail; `token_id`, offsets, usage, nulls and missing
 fields keep their exact comparisons.
 
-Reports link each comparison to its own values and event origins. Existing
-native suites and older reports continue using their original full-result
-equivalence. Real service differences remain failures; a successful environment
+Reports link each comparison to its own values and event origins. Older reports
+continue using their recorded full-response checks and equivalence. Real service
+differences within the selected check remain failures; a successful environment
 setup does not imply protocol or parity success.

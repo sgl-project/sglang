@@ -1,5 +1,13 @@
 {
   "name": "openai_http",
+  "generated_content": {
+    "completion": ["index", "text"],
+    "chat": ["index", "message.content", "message.reasoning_content", "message.refusal", "message.tool_calls"],
+    "tool_call": ["type", "function.name", "function.arguments"],
+    "text": "exact",
+    "empty_text": "missing_null_or_empty_string",
+    "empty_tool_calls": "missing_null_or_empty_array"
+  },
   "comparison": {
     "base": "exact_json",
     "per_result_numeric_rules": [

@@ -41,11 +41,22 @@ fn default_output_dir() -> PathBuf {
     PathBuf::from("target/parity")
 }
 
+/// The response view an API policy validates and prepares for comparison.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckTarget {
+    #[default]
+    FullResponse,
+    GeneratedContent,
+}
+
 /// The single resolved specification used by describe, execution, and reporting.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpSuite {
     pub name: String,
+    #[serde(default)]
+    pub check: CheckTarget,
     pub response_implementation: String,
     pub output_mode: String,
     /// Opaque API rules retained for review; only the suite interprets them.
@@ -298,6 +309,9 @@ impl<P> ExecutionPlan<P> {
         }
         let mut ids = BTreeSet::new();
         for entry in &self.profiles {
+            if entry.suite.check != self.profiles[0].suite.check {
+                return Err("all profiles must use the same check target".into());
+            }
             if !valid_name(&entry.profile.id) || !ids.insert(&entry.profile.id) {
                 return Err("profile names must be valid and unique".into());
             }

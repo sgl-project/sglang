@@ -46,6 +46,17 @@ fn absent_or_null(value: Option<&Value>) -> bool {
 }
 
 impl Expectation {
+    pub(super) fn applies_to(&self, check: CheckTarget) -> bool {
+        check == CheckTarget::FullResponse
+            || matches!(
+                self,
+                Self::Content { .. }
+                    | Self::Reasoning { .. }
+                    | Self::ToolCalls { .. }
+                    | Self::NoRefusal
+            )
+    }
+
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::Logprobs { .. } => "logprobs",
@@ -77,7 +88,12 @@ impl Expectation {
         Ok(())
     }
 
-    pub(super) fn evaluate(&self, response: &Value, case: &HttpCase) -> AssertionResult {
+    pub(super) fn evaluate(
+        &self,
+        response: &Value,
+        case: &HttpCase,
+        target: CheckTarget,
+    ) -> AssertionResult {
         let mut violations = Vec::new();
         let mut check = |path: String, valid: bool| {
             if !valid {
@@ -250,7 +266,8 @@ impl Expectation {
                                         let args = call["function"]["arguments"]
                                             .as_str()
                                             .and_then(|s| serde_json::from_str::<Value>(s).ok());
-                                        choice["finish_reason"] == "tool_calls"
+                                        (target == CheckTarget::GeneratedContent
+                                            || choice["finish_reason"] == "tool_calls")
                                             && call["function"]["name"] == expected["name"]
                                             && args.as_ref() == arguments.as_ref()
                                     }
@@ -266,11 +283,13 @@ impl Expectation {
                                 format!("{prefix}/{key}/refusal"),
                                 absent_or_null(message.get("refusal")) || message["refusal"] == "",
                             );
-                            check(
-                                format!("{prefix}/logprobs/refusal"),
-                                absent_or_null(lp.get("refusal"))
-                                    || lp["refusal"].as_array().is_some_and(Vec::is_empty),
-                            );
+                            if target == CheckTarget::FullResponse {
+                                check(
+                                    format!("{prefix}/logprobs/refusal"),
+                                    absent_or_null(lp.get("refusal"))
+                                        || lp["refusal"].as_array().is_some_and(Vec::is_empty),
+                                );
+                            }
                         }
                         _ => unreachable!("response-wide expectation"),
                     }

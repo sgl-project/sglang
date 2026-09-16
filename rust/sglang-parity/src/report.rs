@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::CheckTarget;
 use crate::artifacts::write_atomic;
 use crate::compare::{ComparisonScope, DifferenceKind};
 use crate::http::CaptureMode;
@@ -35,23 +36,29 @@ struct Evidence<'a> {
 }
 
 impl Evidence<'_> {
-    fn file(&self) -> Option<&PathBuf> {
+    fn file(&self) -> Option<&Path> {
         let attempt = self.attempt?;
         if self.semantic
             && let Some(evidence) = &attempt.equivalence
         {
             return Some(&evidence.file);
         }
-        attempt.final_json.as_ref()
+        attempt.prepared_path()
     }
 
     fn projected(&self) -> bool {
         self.semantic && self.attempt.is_some_and(|a| a.equivalence.is_some())
     }
 
+    fn output(&self) -> bool {
+        !self.projected() && self.attempt.is_some_and(|a| a.output_json.is_some())
+    }
+
     fn value_label(&self) -> &'static str {
         if self.projected() {
             "Semantic equivalence value"
+        } else if self.output() {
+            "Generated output value (before exceptions)"
         } else {
             "Reconstructed value (before exceptions)"
         }
@@ -160,7 +167,7 @@ impl Validation {
                 attempted += 1;
                 if !attempt.violations.is_empty() {
                     result.invalid += 1;
-                } else if attempt.final_json.is_some()
+                } else if attempt.prepared_path().is_some()
                     && attempt
                         .observation
                         .as_ref()
@@ -250,7 +257,7 @@ impl<'a> ReportView<'a> {
         for (index, case) in report.cases.iter().enumerate() {
             view.comparisons.push(Comparison {
                 kind: CheckKind::Parity,
-                category: "Python <-> Rust parity".into(),
+                category: view.parity_label().into(),
                 name: case.name.clone(),
                 id: format!("parity-{index}"),
                 check: &case.parity,
@@ -402,7 +409,7 @@ impl<'a> ReportView<'a> {
             writeln!(
                 out,
                 "\n  {:<width$} {}  {}",
-                "Response validation",
+                self.validation_label(),
                 terminal_status(status(validation.status()), color),
                 validation.summary()
             )
@@ -473,7 +480,12 @@ impl<'a> ReportView<'a> {
         let validation = Validation::for_cases(std::iter::once(case));
         writeln!(
             out,
-            "  Response {} · Repeat Python {} / Rust {}",
+            "  {} {} · Repeat Python {} / Rust {}",
+            if self.generated_content() {
+                "Output integrity"
+            } else {
+                "Response"
+            },
             terminal_status(status(validation.status()), color),
             repeat("python"),
             repeat("rust")
@@ -497,7 +509,8 @@ impl<'a> ReportView<'a> {
         });
         writeln!(
             out,
-            "  Parity {}{}",
+            "  {} {}{}",
+            self.compact_parity_label(),
             terminal_status(status(case.parity.status), color),
             if reason.is_empty() {
                 String::new()
@@ -587,6 +600,8 @@ impl<'a> ReportView<'a> {
                     "      {}: {}",
                     if side.projected() {
                         "semantic equivalence"
+                    } else if side.output() {
+                        "generated output"
                     } else {
                         "reconstructed"
                     },
@@ -647,6 +662,18 @@ impl<'a> ReportView<'a> {
                 .collect::<Vec<_>>()
                 .join("; ");
         }
+        result.push((
+            "Check",
+            if self.generated_content() {
+                "Generated content parity"
+            } else {
+                "Full response parity"
+            }
+            .into(),
+        ));
+        if self.generated_content() {
+            result.push(("Metadata", "Not checked".into()));
+        }
         for (label, pointer) in [
             ("Commit", "/plan/commit"),
             ("Backend", "/plan/profile/backend"),
@@ -663,6 +690,34 @@ impl<'a> ReportView<'a> {
             ));
         }
         result
+    }
+
+    fn generated_content(&self) -> bool {
+        self.report.check == CheckTarget::GeneratedContent
+    }
+
+    fn validation_label(&self) -> &'static str {
+        if self.generated_content() {
+            "Output integrity"
+        } else {
+            "Response validation"
+        }
+    }
+
+    fn parity_label(&self) -> &'static str {
+        if self.generated_content() {
+            "Content parity"
+        } else {
+            "Python <-> Rust parity"
+        }
+    }
+
+    fn compact_parity_label(&self) -> &'static str {
+        if self.generated_content() {
+            "Content parity"
+        } else {
+            "Parity"
+        }
     }
 
     fn case_suite(&self, name: &str) -> Option<(&HttpSuite, &crate::http::HttpCase)> {
@@ -772,7 +827,7 @@ impl<'a> ReportView<'a> {
 
     fn totals(&self) -> Vec<(String, String)> {
         let mut totals = vec![(
-            "Response validation".into(),
+            self.validation_label().into(),
             Validation::for_cases(self.report.cases.iter()).summary(),
         )];
         for side in ["python", "rust"] {
@@ -787,7 +842,7 @@ impl<'a> ReportView<'a> {
             ));
         }
         totals.push((
-            "Python <-> Rust parity".into(),
+            self.parity_label().into(),
             format!(
                 "{} · {} differences",
                 counts(self.report.cases.iter().map(|case| case.parity.status)),
@@ -904,7 +959,11 @@ impl<'a> ReportView<'a> {
                 );
             }
             if !attempt.violations.is_empty() {
-                return Some("Comparison skipped: a required response failed validation");
+                return Some(if self.generated_content() {
+                    "Comparison skipped: required output failed integrity checks"
+                } else {
+                    "Comparison skipped: a required response failed validation"
+                });
             }
             if self
                 .report
@@ -957,7 +1016,7 @@ impl<'a> ReportView<'a> {
             for side in [comparison.left, comparison.right] {
                 if let Some(path) = side.file() {
                     files
-                        .entry(path.clone())
+                        .entry(path.to_owned())
                         .or_insert_with(|| self.read_json(path));
                 }
             }
@@ -1039,6 +1098,9 @@ impl<'a> ReportView<'a> {
         if let Some(path) = &attempt.final_json {
             paths.push(("reconstructed response", path.clone()));
         }
+        if let Some(path) = &attempt.output_json {
+            paths.push(("generated output", path.clone()));
+        }
         if let Some(observation) = &attempt.observation {
             paths.push(("raw response", observation.raw_body.clone()));
         }
@@ -1111,7 +1173,13 @@ impl<'a> ReportView<'a> {
             )
             .unwrap();
         }
-        out.push_str("</section><p class=\"muted\">Response validation checks each response. Repeatability compares two runs of one implementation. Parity compares Python with Rust. Case equivalence compares declared related cases. Differences count occurrences, not independent bugs.</p><p class=\"muted\">Comparison values include declared replacements. &lt;missing&gt; means an absent field; null is a present JSON value; &lt;unavailable&gt; means evidence could not be read. Reconstructed values come from final.json before value exceptions.</p>");
+        out.push_str("</section><p class=\"muted\">");
+        if self.generated_content() {
+            out.push_str("Output integrity checks that generated content can be reconstructed. Content parity compares Python with Rust. Metadata is not checked. Generated output values come from output.json before value exceptions. ");
+        } else {
+            out.push_str("Response validation checks each response. Parity compares Python with Rust. Reconstructed values come from final.json before value exceptions. ");
+        }
+        out.push_str("Repeatability compares two runs of one implementation. Case equivalence compares declared related cases. Differences count occurrences, not independent bugs.</p><p class=\"muted\">Comparison values include declared replacements. &lt;missing&gt; means an absent field; null is a present JSON value; &lt;unavailable&gt; means evidence could not be read. This view preserves recorded verdicts and does not recompute comparisons.</p>");
         let diagnostics = self.run_diagnostics();
         if !diagnostics.is_empty() {
             out.push_str("<section><h2>Run diagnostics</h2><ul>");
@@ -1124,8 +1192,9 @@ impl<'a> ReportView<'a> {
         for (index, case) in self.report.cases.iter().enumerate() {
             write!(
                 out,
-                "<li><a href=\"#case-{index}\">{}</a><span>Parity {} · {} differences</span></li>",
+                "<li><a href=\"#case-{index}\">{}</a><span>{} {} · {} differences</span></li>",
                 escape(&case.name),
+                self.compact_parity_label(),
                 badge(case.parity.status),
                 case.parity.differences.len()
             )
@@ -1173,7 +1242,8 @@ impl<'a> ReportView<'a> {
             let validation = Validation::for_cases(std::iter::once(case));
             write!(
                 out,
-                "<div><dt>Response validation</dt><dd>{} {}</dd></div>",
+                "<div><dt>{}</dt><dd>{} {}</dd></div>",
+                self.validation_label(),
                 badge(validation.status()),
                 validation.summary()
             )
@@ -1193,7 +1263,11 @@ impl<'a> ReportView<'a> {
             out.push_str("</dl>");
             let diagnostics = self.case_diagnostics(case);
             if !diagnostics.is_empty() {
-                out.push_str("<h3>Response diagnostics</h3><ul>");
+                out.push_str(if self.generated_content() {
+                    "<h3>Output integrity diagnostics</h3><ul>"
+                } else {
+                    "<h3>Response diagnostics</h3><ul>"
+                });
                 for message in diagnostics {
                     write!(out, "<li>{}</li>", escape(&message)).unwrap();
                 }
@@ -1360,10 +1434,18 @@ impl<'a> ReportView<'a> {
                     "Request JSON",
                     &self.read_json(&attempt.directory.join("request.json")),
                 );
-                if let Some(path) = &attempt.final_json
+                if let Some(path) = attempt.prepared_path()
                     && let Some(value) = files.get(path)
                 {
-                    self.html_preview(out, "Reconstructed JSON (before value exceptions)", value);
+                    self.html_preview(
+                        out,
+                        if attempt.output_json.is_some() {
+                            "Generated output JSON (before value exceptions)"
+                        } else {
+                            "Reconstructed JSON (before value exceptions)"
+                        },
+                        value,
+                    );
                 }
             }
         }
@@ -1607,6 +1689,12 @@ mod tests {
     #[test]
     fn cases_keep_check_categories_evidence_and_equivalence_counts_distinct() {
         let report = recorded();
+        assert_eq!(report.check, CheckTarget::FullResponse);
+        assert!(
+            report.cases[0].implementations["python"].attempts[0]
+                .output_json
+                .is_none()
+        );
         let directory = tempfile::tempdir().unwrap();
         let view = ReportView::new(&report, directory.path());
         let text = view.terminal(None, false).unwrap();
@@ -1619,6 +1707,7 @@ mod tests {
             "Parity FAIL: 2 missing in Rust",
             "Equivalence: 0/1 passed · 1 FAIL",
             "Streaming mode: Unavailable",
+            "Check: Full response parity",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
@@ -1668,6 +1757,104 @@ mod tests {
                     .contains(message)
             );
         }
+    }
+
+    #[test]
+    fn generated_content_reports_use_output_evidence_and_preserve_recorded_checks() {
+        let mut report = recorded();
+        report.check = CheckTarget::GeneratedContent;
+        let directory = tempfile::tempdir().unwrap();
+        for case in &mut report.cases {
+            for side in case.implementations.values_mut() {
+                for attempt in &mut side.attempts {
+                    let path = attempt.directory.join("output.json");
+                    let local = directory
+                        .path()
+                        .join(path.strip_prefix(&report.directory).unwrap());
+                    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+                    std::fs::write(&local, r#"{"time":123.25,"nullable":null}"#).unwrap();
+                    attempt.output_json = Some(path);
+                    attempt.final_json = None;
+                    attempt.origins = [("/time".into(), vec![0])].into();
+                    attempt
+                        .observation
+                        .as_mut()
+                        .unwrap()
+                        .events
+                        .push(crate::sse::SseEvent {
+                            event: "message".into(),
+                            id: None,
+                            data: r#"{"time":123.25}"#.into(),
+                        });
+                }
+            }
+        }
+        // Keep a different full-response artifact to prove content evidence wins.
+        let attempt = &mut report.cases[0]
+            .implementations
+            .get_mut("python")
+            .unwrap()
+            .attempts[0];
+        attempt.final_json = Some(attempt.directory.join("final.json"));
+        std::fs::write(
+            directory.path().join("python/json/1/final.json"),
+            r#"{"time":999.75}"#,
+        )
+        .unwrap();
+        let recorded_checks = serde_json::to_value(&report).unwrap();
+        let view = ReportView::new(&report, directory.path());
+        let compact = view.terminal(None, false).unwrap();
+        for expected in [
+            "Check: Generated content parity",
+            "Metadata: Not checked",
+            "Output integrity",
+            "8/8 passed",
+            "Content parity FAIL: 2 missing in Rust",
+        ] {
+            assert!(
+                compact.contains(expected),
+                "missing {expected:?} in {compact}"
+            );
+        }
+        assert!(!compact.contains("Response validation"));
+        for case in &report.cases {
+            let block = compact
+                .split("\n\n")
+                .find(|block| block.starts_with(&format!("{} · ", case.name)))
+                .unwrap();
+            assert_eq!(block.lines().count(), 5, "{block}");
+        }
+        let expanded = view.terminal(Some("json"), false).unwrap();
+        for expected in [
+            "Python: 0",
+            "generated output: 123.25",
+            "source event indices (zero-based): [0]",
+            "generated output:",
+            "output.json",
+        ] {
+            assert!(expanded.contains(expected), "missing {expected:?}");
+        }
+        assert!(!expanded.contains("999.75"));
+        let html = view.html();
+        for expected in [
+            "<dt>Check</dt><dd><code>Generated content parity</code>",
+            "<dt>Metadata</dt><dd><code>Not checked</code>",
+            "Generated output value (before exceptions)",
+            "Generated output JSON (before value exceptions)",
+            "href=\"python/json/1/output.json\"",
+            "Source events (zero-based indices)",
+            "does not recompute comparisons",
+        ] {
+            assert!(html.contains(expected), "missing {expected:?}");
+        }
+        assert!(!html.contains("Response validation"));
+        assert!(!html.contains("999.75"));
+        assert_eq!(serde_json::to_value(&report).unwrap(), recorded_checks);
+        std::fs::remove_file(directory.path().join("python/json/1/output.json")).unwrap();
+        let expanded = view.terminal(Some("json"), false).unwrap();
+        assert!(expanded.contains("generated output: <unavailable>"));
+        assert!(!expanded.contains("999.75"));
+        assert_eq!(report.exit_code(), 1);
     }
 
     #[test]

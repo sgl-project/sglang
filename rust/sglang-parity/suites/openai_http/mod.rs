@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sglang_parity::compare::ComparisonRules;
 use sglang_parity::{
-    CaptureMode, ComparisonScope, EquivalenceValue, ExecutionPlan, HttpCase, HttpObservation,
-    HttpRequest, HttpSuite, Isolation, PreparedResponse, ProfilePlan, ResponsePolicy, RunConfig,
-    Violation,
+    CaptureMode, CheckTarget, ComparisonScope, EquivalenceValue, ExecutionPlan, HttpCase,
+    HttpObservation, HttpRequest, HttpSuite, Isolation, PreparedResponse, ProfilePlan,
+    ResponsePolicy, RunConfig, Violation,
 };
 
 mod expectations;
@@ -27,6 +27,8 @@ struct Specification {
     comparison: ComparisonRules,
     streaming: StreamingRules,
     equivalence: Vec<String>,
+    #[serde(default = "content_rules")]
+    generated_content: Value,
     cases: Vec<Case>,
 }
 
@@ -70,6 +72,7 @@ enum Rule {
 }
 
 pub struct OpenAiPolicy {
+    check: CheckTarget,
     rules: StreamingRules,
     expectations: BTreeMap<String, Vec<Expectation>>,
 }
@@ -86,9 +89,33 @@ const SEMANTICS: [&str; 8] = [
 ];
 
 pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiPolicy>, String> {
+    load_plan_for_check(text, config, CheckTarget::FullResponse)
+}
+
+fn content_rules() -> Value {
+    json!({
+        "completion": ["index", "text"],
+        "chat": ["index", "message.content", "message.reasoning_content", "message.refusal", "message.tool_calls"],
+        "tool_call": ["type", "function.name", "function.arguments"],
+        "text": "exact",
+        "empty_text": "missing_null_or_empty_string",
+        "empty_tool_calls": "missing_null_or_empty_array"
+    })
+}
+
+pub fn load_plan_for_check(
+    text: &str,
+    config: &RunConfig,
+    check: CheckTarget,
+) -> Result<ExecutionPlan<OpenAiPolicy>, String> {
     let spec: Specification = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if spec.name != "openai_http" || spec.equivalence != SEMANTICS {
         return Err("openai_http requires its declared equivalence projection".into());
+    }
+    if spec.generated_content != content_rules() {
+        return Err(
+            "unsupported generated content rules; extend the policy and its tests first".into(),
+        );
     }
     // The finite rule vocabulary documents the supported contract, not a DSL.
     let defaults: Specification = serde_json::from_str(DEFAULT_SPEC).map_err(|e| e.to_string())?;
@@ -178,6 +205,7 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
             let stream = object.remove("stream").unwrap();
             modes.insert(stream.as_bool().unwrap());
             if stream == true
+                && check == CheckTarget::FullResponse
                 && case.body.pointer("/stream_options/include_usage") != Some(&json!(true))
             {
                 return Err(format!(
@@ -212,6 +240,7 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
             .cases
             .iter()
             .filter(|c| c.profiles.contains(&profile.id))
+            .filter(|c| check == CheckTarget::FullResponse || c.expect_status == 200)
         {
             let mut body = case.body.clone();
             body.as_object_mut()
@@ -234,7 +263,12 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
                     comparison_scope: ComparisonScope::Root,
                 },
                 equivalence_group: case.equivalence_group.clone(),
-                assertions: case.expectations.iter().map(|e| e.name().into()).collect(),
+                assertions: case
+                    .expectations
+                    .iter()
+                    .filter(|e| e.applies_to(check))
+                    .map(|e| e.name().into())
+                    .collect(),
                 before_each: case
                     .before_each
                     .iter()
@@ -264,11 +298,31 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
         let expectations: BTreeMap<_, _> = spec
             .cases
             .iter()
-            .filter(|c| c.profiles.contains(&profile.id) && !c.expectations.is_empty())
-            .map(|c| (c.name.clone(), c.expectations.clone()))
+            .filter(|c| c.profiles.contains(&profile.id))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.expectations
+                        .iter()
+                        .filter(|e| e.applies_to(check))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, expectations)| !expectations.is_empty())
             .collect();
+        let excluded_cases: Vec<_> = spec.cases.iter()
+            .filter(|c| check == CheckTarget::GeneratedContent && c.profiles.contains(&profile.id) && c.expect_status != 200)
+            .map(|c| json!({"name": c.name, "reason": "expected error response has no generated content"}))
+            .collect();
+        let mut comparison = spec.comparison.clone();
+        if check == CheckTarget::GeneratedContent {
+            comparison.per_result_value_exceptions.clear();
+            comparison.per_result_numeric_rules.clear();
+        }
         let incremental = profile.server.incremental_output();
         let suite = HttpSuite {
+            check,
             name: spec.name.clone(),
             response_implementation: "openai_http".into(),
             output_mode: if incremental {
@@ -282,14 +336,17 @@ pub fn load_plan(text: &str, config: &RunConfig) -> Result<ExecutionPlan<OpenAiP
                 "wire_content": "OpenAI SSE delta, independent of backend output mode",
                 "equivalence": spec.equivalence,
                 "expectations": expectations,
+                "generated_content": spec.generated_content,
+                "excluded_cases": excluded_cases,
             })),
-            comparison: spec.comparison.clone(),
+            comparison,
             cases,
         };
         plans.push(ProfilePlan {
             profile,
             suite,
             policy: OpenAiPolicy {
+                check,
                 rules: spec.streaming.clone(),
                 expectations,
             },
@@ -493,8 +550,9 @@ impl OpenAiPolicy {
         case: &HttpCase,
         observation: &HttpObservation,
     ) -> Result<PreparedResponse, Violation> {
+        let content_only = self.check == CheckTarget::GeneratedContent;
         let mut prepared = if case.capture == CaptureMode::Sse {
-            streaming::reconstruct(case, observation, &self.rules)?
+            streaming::reconstruct(case, observation, &self.rules, self.check)?
         } else {
             let value = observation
                 .json
@@ -513,8 +571,15 @@ impl OpenAiPolicy {
                 }
                 return Ok(value.into());
             }
-            envelope(&value, case, false)?;
-            usage(&value["usage"])?;
+            if content_only {
+                if !value.is_object() || value.get("error").is_some() || value["object"] == "error"
+                {
+                    return Err(invalid("", "expected successful generation object"));
+                }
+            } else {
+                envelope(&value, case, false)?;
+                usage(&value["usage"])?;
+            }
             let count = choice_count(&case.body, is_chat(&case.path))?;
             let choices = value["choices"]
                 .as_array()
@@ -537,15 +602,20 @@ impl OpenAiPolicy {
                         "expected terminal reason",
                     ));
                 }
+                if content_only {
+                    successful_finish(&choice["finish_reason"])?;
+                }
                 if is_chat(&case.path) {
-                    assistant_message(&choice["message"], "/choices/message")?;
+                    assistant_message(&choice["message"], "/choices/message", content_only)?;
                 } else if !choice["text"].is_string() {
                     return Err(invalid("/choices/text", "expected text"));
                 }
-                if let Some(value) = choice.get("logprobs") {
+                if !content_only && let Some(value) = choice.get("logprobs") {
                     logprobs(value, is_chat(&case.path))?;
                 }
-                if requested_logprobs(case) && !choice.get("logprobs").is_some_and(Value::is_object)
+                if !content_only
+                    && requested_logprobs(case)
+                    && !choice.get("logprobs").is_some_and(Value::is_object)
                 {
                     return Err(invalid("/choices/logprobs", "requested logprobs missing"));
                 }
@@ -558,19 +628,42 @@ impl OpenAiPolicy {
         if let Some(expectations) = self.expectations.get(&case.name) {
             prepared.assertions = expectations
                 .iter()
-                .map(|e| e.evaluate(&prepared.value, case))
+                .map(|e| e.evaluate(&prepared.value, case, self.check))
                 .collect();
         }
-        if case.equivalence_group.is_some() {
+        if content_only {
+            let content = project_content(&prepared, is_chat(&case.path));
+            prepared.value = content.value;
+            prepared.origins = content.origins;
+        } else if case.equivalence_group.is_some() {
             prepared.equivalence = Some(project(&prepared, is_chat(&case.path))?);
         }
         Ok(prepared)
     }
 }
 
-fn assistant_message(message: &Value, path: &str) -> Result<(), Violation> {
-    if message["role"] != "assistant" {
+fn successful_finish(reason: &Value) -> Result<(), Violation> {
+    if matches!(reason.as_str(), Some("abort" | "error")) {
+        return Err(invalid(
+            "/choices/finish_reason",
+            "generation aborted or failed",
+        ));
+    }
+    Ok(())
+}
+
+fn assistant_message(message: &Value, path: &str, content_only: bool) -> Result<(), Violation> {
+    if !message.is_object() {
+        return Err(invalid(path, "expected message object"));
+    }
+    if !content_only && message["role"] != "assistant" {
         return Err(invalid(path, "expected assistant role"));
+    }
+    if content_only && message.get("function_call").is_some_and(|v| !v.is_null()) {
+        return Err(invalid(
+            path,
+            "legacy function_call content is not supported",
+        ));
     }
     for key in ["content", "reasoning_content", "refusal"] {
         if message
@@ -586,8 +679,9 @@ fn assistant_message(message: &Value, path: &str) -> Result<(), Violation> {
             .ok_or_else(|| invalid(path, "expected tool call array"))?;
         let mut ids = BTreeSet::new();
         for (index, call) in calls.iter().enumerate() {
-            if call["id"].as_str().is_none_or(str::is_empty)
-                || !ids.insert(call["id"].as_str().unwrap())
+            if (!content_only
+                && (call["id"].as_str().is_none_or(str::is_empty)
+                    || !ids.insert(call["id"].as_str().unwrap())))
                 || call["type"] != "function"
                 || call["function"]["name"].as_str().is_none_or(str::is_empty)
                 || !call["function"]["arguments"].is_string()
@@ -603,6 +697,70 @@ fn assistant_message(message: &Value, path: &str) -> Result<(), Violation> {
     // is valid even without another payload; scenario assertions check whether
     // a particular request actually produced the expected output.
     Ok(())
+}
+
+/// Canonical generated content, shared by all checks in content mode.
+fn project_content(response: &PreparedResponse, chat: bool) -> EquivalenceValue {
+    let mut choices: Vec<_> = response.value["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .collect();
+    choices.sort_by_key(|(_, choice)| choice["index"].as_u64());
+    let mut origins = BTreeMap::new();
+    let mut values = Vec::new();
+    for (position, (source, choice)) in choices.into_iter().enumerate() {
+        let source_key = if chat {
+            if choice.get("message").is_some() {
+                "message"
+            } else {
+                "delta"
+            }
+        } else {
+            "text"
+        };
+        let mut value = json!({"index": choice["index"]});
+        if chat {
+            let message = &choice[source_key];
+            let calls: Vec<_> = message["tool_calls"].as_array().into_iter().flatten().map(|call| {
+                json!({"type":call["type"], "function":{"name":call["function"]["name"], "arguments":call["function"]["arguments"]}})
+            }).collect();
+            value["message"] = json!({
+                "content": message["content"].as_str().unwrap_or_default(),
+                "reasoning_content": message["reasoning_content"].as_str().unwrap_or_default(),
+                "refusal": message["refusal"].as_str().unwrap_or_default(),
+                "tool_calls": calls,
+            });
+        } else {
+            value["text"] = choice["text"].clone();
+        }
+        let fields: &[&str] = if chat {
+            &["content", "reasoning_content", "refusal", "tool_calls"]
+        } else {
+            &["text"]
+        };
+        for field in fields {
+            let source_path = if chat {
+                format!("/choices/{source}/{source_key}/{field}")
+            } else {
+                format!("/choices/{source}/text")
+            };
+            let destination = if chat {
+                format!("/choices/{position}/message/{field}")
+            } else {
+                format!("/choices/{position}/text")
+            };
+            if let Some(events) = response.origins.get(&source_path) {
+                origins.insert(destination, events.clone());
+            }
+        }
+        values.push(value);
+    }
+    EquivalenceValue {
+        value: json!({"choices":values}),
+        origins,
+    }
 }
 
 fn requested_logprobs(case: &HttpCase) -> bool {

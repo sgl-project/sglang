@@ -10,6 +10,7 @@ fn load(spec: &str, config: &RunConfig) -> Result<(HttpSuite, GeneratePolicy), S
     compile(
         serde_json::from_str(spec).map_err(|error| error.to_string())?,
         config,
+        CheckTarget::FullResponse,
     )
 }
 
@@ -1103,4 +1104,209 @@ fn scenario_assertions_require_real_values_and_do_not_reject_valid_responses() {
         )
         .unwrap();
     assert!(prepared.assertions.is_empty());
+}
+
+fn content_case(name: &str, incremental: bool) -> (HttpCase, GeneratePolicy) {
+    let (suite, policy) = compile(
+        serde_json::from_str(DEFAULT_SPEC).unwrap(),
+        &config(incremental),
+        CheckTarget::GeneratedContent,
+    )
+    .unwrap();
+    (
+        suite
+            .cases
+            .into_iter()
+            .find(|case| case.name == name)
+            .unwrap(),
+        policy,
+    )
+}
+
+#[test]
+fn generated_content_selects_successes_and_removes_metadata_rules() {
+    let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
+    spec["cases"].as_array_mut().unwrap().push(json!({
+        "name":"invalid", "expect_status":400, "body":{"input_ids":[]}
+    }));
+    let (suite, _) = compile(
+        serde_json::from_value(spec.clone()).unwrap(),
+        &config(false),
+        CheckTarget::GeneratedContent,
+    )
+    .unwrap();
+    assert_eq!(suite.cases.len(), 24);
+    assert_eq!(suite.check, CheckTarget::GeneratedContent);
+    assert!(suite.comparison.per_result_value_exceptions.is_empty());
+    assert!(suite.comparison.per_result_numeric_rules.is_empty());
+    assert!(suite.cases.iter().all(|case| case.assertions.is_empty()));
+    assert_eq!(
+        suite.response_policy.as_ref().unwrap()["excluded_cases"][0]["name"],
+        "invalid"
+    );
+    assert!(suite.cases.iter().any(|case| !case.before_each.is_empty()));
+    spec["generated_content"]["fields"] = json!(["/output_ids"]);
+    assert!(
+        compile(
+            serde_json::from_value(spec).unwrap(),
+            &config(false),
+            CheckTarget::GeneratedContent
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn generated_content_json_ignores_metadata_but_preserves_text_and_integrity() {
+    let (case, policy) = content_case("logprobs_json", false);
+    for text in ["Hello world", "", "Hello world\n"] {
+        let response = json!({
+            "text":text, "output_ids":"ignored", "future_field":[1,2],
+            "meta_info":{
+                "id":null, "prompt_tokens":-1, "completion_tokens":"invalid",
+                "finish_reason":{"type":"stop", "matched":"ignored"},
+                "output_token_logprobs":false, "e2e_latency":-1
+            }
+        });
+        let prepared = policy.prepare(&case, &json_observation(response)).unwrap();
+        assert_eq!(prepared.value, json!({"text":text}));
+        assert!(prepared.origins.is_empty());
+        assert!(prepared.assertions.is_empty());
+        assert!(prepared.equivalence.is_none());
+    }
+    for response in [
+        json!({"text":null,"meta_info":{"finish_reason":{"type":"stop"}}}),
+        json!({"output_ids":[1],"meta_info":{"finish_reason":{"type":"stop"}}}),
+        json!({"text":"Hello","meta_info":{"finish_reason":null}}),
+        json!({"text":"Hello","meta_info":{"finish_reason":{"type":"abort"}}}),
+        json!({"text":"Hello","meta_info":{"finish_reason":{"type":"stop"}},"error":{}}),
+    ] {
+        assert!(
+            policy
+                .prepare(&case, &json_observation(response.clone()))
+                .is_err(),
+            "{response}"
+        );
+    }
+    let left = policy.prepare(&case, &json_observation(fixture())).unwrap();
+    let mut different = fixture();
+    different["text"] = json!("Hello world\n");
+    let right = policy.prepare(&case, &json_observation(different)).unwrap();
+    assert_eq!(
+        sglang_parity::compare_json(&left.value, &right.value)[0].path,
+        "/text"
+    );
+}
+
+#[test]
+fn generated_content_streams_reuse_text_reconstruction_and_sources() {
+    for incremental in [false, true] {
+        let (case, policy) = content_case("logprobs_stream", incremental);
+        let mut stream = events(incremental);
+        for index in 0..stream.len() - 1 {
+            modify_event(&mut stream, index, |value| {
+                value["output_ids"] = json!(-1);
+                value["meta_info"]["id"] = json!(index);
+                value["meta_info"]["completion_tokens"] = json!(-1);
+                value["meta_info"]["output_token_logprobs"] = json!("invalid");
+                value["meta_info"]["unrecognized"] = json!({"anything":true});
+            });
+        }
+        // Nonterminal content does not need metadata; a normal terminal is
+        // still required before DONE. Metadata after it is not output.
+        modify_event(&mut stream, 0, |value| {
+            value.as_object_mut().unwrap().remove("meta_info");
+        });
+        stream.insert(
+            stream.len() - 1,
+            event(json!({"meta_info":{"usage":"ignored"}})),
+        );
+        let prepared = policy.prepare(&case, &observation(stream)).unwrap();
+        assert_eq!(prepared.value, json!({"text":"Hello world"}));
+        assert_eq!(prepared.origins.len(), 1);
+        assert_eq!(
+            prepared.origins["/text"],
+            if incremental { vec![0, 1] } else { vec![1] }
+        );
+    }
+}
+
+#[test]
+fn generated_content_stream_rejects_incomplete_or_inconsistent_output() {
+    let (case, policy) = content_case("greedy_stream", false);
+    let good = events(false);
+    let mut cases = Vec::new();
+    let mut stream = good.clone();
+    modify_event(&mut stream, 1, |value| value["text"] = json!("different"));
+    cases.push(stream);
+    let mut stream = good.clone();
+    stream.pop();
+    cases.push(stream);
+    let mut stream = good.clone();
+    modify_event(&mut stream, 1, |value| {
+        value["meta_info"]["finish_reason"] = Value::Null
+    });
+    cases.push(stream);
+    let mut stream = good.clone();
+    stream.insert(
+        2,
+        event(json!({"text":"extra","meta_info":{"finish_reason":null}})),
+    );
+    cases.push(stream);
+    let mut stream = good.clone();
+    modify_event(&mut stream, 0, |value| value["text"] = json!(false));
+    cases.push(stream);
+    cases.push(vec![
+        event(json!({"meta_info":{"finish_reason":{"type":"length"}}})),
+        done(),
+    ]);
+    for stream in cases {
+        assert!(policy.prepare(&case, &observation(stream)).is_err());
+    }
+}
+
+#[test]
+fn generated_content_batch_restores_order_and_checks_cardinality() {
+    let expected = json!([{"text":"Hello world"}, {"text":"Goodbye moon"}]);
+    for incremental in [false, true] {
+        let (case, policy) = content_case("batch_stream", incremental);
+        let mut stream = Vec::new();
+        for (index, position) in [(1, 0), (0, 0), (1, 1), (0, 1)] {
+            let text = match (index, position, incremental) {
+                (0, 0, _) => "Hello",
+                (1, 0, _) => "Goodbye",
+                (0, 1, true) => " world",
+                (1, 1, true) => " moon",
+                (0, _, _) => "Hello world",
+                _ => "Goodbye moon",
+            };
+            stream.push(event(json!({"index":index,"text":text,"meta_info":{
+                "finish_reason":if position == 1 {json!({"type":"length"})} else {Value::Null}
+            }})));
+        }
+        stream.push(done());
+        let prepared = policy.prepare(&case, &observation(stream.clone())).unwrap();
+        assert_eq!(prepared.value, expected);
+        assert_eq!(
+            prepared.origins["/0/text"],
+            if incremental { vec![1, 3] } else { vec![3] }
+        );
+        assert_eq!(
+            prepared.origins["/1/text"],
+            if incremental { vec![0, 2] } else { vec![2] }
+        );
+        modify_event(&mut stream, 0, |value| value["index"] = json!(2));
+        assert!(policy.prepare(&case, &observation(stream)).is_err());
+    }
+    let (case, policy) = content_case("batch_json", false);
+    let mut response = json!(batch_fixture());
+    assert_eq!(
+        policy
+            .prepare(&case, &json_observation(response.clone()))
+            .unwrap()
+            .value,
+        expected
+    );
+    response.as_array_mut().unwrap().pop();
+    assert!(policy.prepare(&case, &json_observation(response)).is_err());
 }

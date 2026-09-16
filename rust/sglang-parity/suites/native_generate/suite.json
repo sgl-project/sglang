@@ -1,5 +1,9 @@
 {
   "name": "native_generate",
+  "generated_content": {
+    "fields": ["/text"],
+    "text": "exact"
+  },
   "http": {
     "method": "POST",
     "path": "/generate"

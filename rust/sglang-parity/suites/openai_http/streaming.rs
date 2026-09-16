@@ -14,7 +14,9 @@ pub(super) fn reconstruct(
     case: &HttpCase,
     observation: &HttpObservation,
     rules: &StreamingRules,
+    check: CheckTarget,
 ) -> Result<PreparedResponse, Violation> {
+    let content_only = check == CheckTarget::GeneratedContent;
     let chat = is_chat(&case.path);
     let count = choice_count(&case.body, chat)?;
     let mut choices: BTreeMap<usize, Choice> = BTreeMap::new();
@@ -31,7 +33,9 @@ pub(super) fn reconstruct(
             if done {
                 return Err(invalid("", "event after [DONE]"));
             }
-            if !matches!(event.event.as_str(), "" | "message") {
+            if !(matches!(event.event.as_str(), "" | "message")
+                || content_only && event.event == "sglext_ids")
+            {
                 return Err(invalid("", "SSE event type rule not covered"));
             }
             if event.data == "[DONE]" {
@@ -40,15 +44,20 @@ pub(super) fn reconstruct(
             }
             let value: Value =
                 serde_json::from_str(&event.data).map_err(|_| invalid("", "invalid event JSON"))?;
-            if value.get("error").is_some() {
+            if !value.is_object() {
+                return Err(invalid("", "expected response object"));
+            }
+            if value.get("error").is_some() || value["object"] == "error" {
                 return Err(invalid("/error", "in-band error"));
             }
-            envelope(&value, case, true)?;
+            if !content_only {
+                envelope(&value, case, true)?;
+            }
             let entries = value["choices"]
                 .as_array()
                 .ok_or_else(|| invalid("/choices", "expected choices array"))?;
             for (key, item) in value.as_object().unwrap() {
-                if key == "choices" {
+                if key == "choices" || content_only {
                     continue;
                 }
                 let rule = rules
@@ -107,7 +116,10 @@ pub(super) fn reconstruct(
                         .or_insert_with(|| vec![event_index]);
                 }
             }
-            if entries.is_empty() && !value.get("usage").is_some_and(Value::is_object) {
+            if !content_only
+                && entries.is_empty()
+                && !value.get("usage").is_some_and(Value::is_object)
+            {
                 return Err(invalid("/choices", "empty choices requires final usage"));
             }
             let mut seen = BTreeSet::new();
@@ -120,14 +132,38 @@ pub(super) fn reconstruct(
                 if !seen.insert(index) {
                     return Err(invalid("/choices/index", "duplicate choice within event"));
                 }
+                if content_only {
+                    let wrong_containers = if chat {
+                        ["message", "text"]
+                    } else {
+                        ["message", "delta"]
+                    };
+                    for key in wrong_containers {
+                        if entry.get(key).is_some_and(|value| !value.is_null()) {
+                            return Err(invalid(
+                                &format!("/choices/{index}/{key}"),
+                                "unexpected generated content container in stream",
+                            ));
+                        }
+                    }
+                }
                 let state = choices.entry(index).or_default();
                 if state.finished {
+                    if content_only
+                        && entry["finish_reason"].is_null()
+                        && !has_generated_content(entry, chat)?
+                    {
+                        continue;
+                    }
                     return Err(invalid(
                         &format!("/choices/{index}"),
                         "choice output after termination",
                     ));
                 }
                 let terminal = entry["finish_reason"].is_string();
+                if content_only {
+                    successful_finish(&entry["finish_reason"])?;
+                }
                 if let Some(reason) = entry.get("finish_reason")
                     && !reason.is_null()
                     && reason.as_str().is_none_or(|s| s.is_empty())
@@ -139,6 +175,11 @@ pub(super) fn reconstruct(
                     .as_object()
                     .ok_or_else(|| invalid("/choices", "expected choice object"))?;
                 for (key, item) in object {
+                    if content_only
+                        && !matches!(key.as_str(), "index" | "text" | "delta" | "finish_reason")
+                    {
+                        continue;
+                    }
                     let path = format!("/choices/{index}/{key}");
                     match fields
                         .get(key)
@@ -169,6 +210,18 @@ pub(super) fn reconstruct(
                                 .as_object_mut()
                                 .unwrap();
                             for (field, value) in delta {
+                                if content_only
+                                    && !matches!(
+                                        field.as_str(),
+                                        "content"
+                                            | "reasoning_content"
+                                            | "refusal"
+                                            | "tool_calls"
+                                            | "function_call"
+                                    )
+                                {
+                                    continue;
+                                }
                                 let path = format!("{path}/{field}");
                                 match rules
                                     .delta
@@ -177,7 +230,7 @@ pub(super) fn reconstruct(
                                 {
                                     Rule::Text => append_text(target, field, value, &path)?,
                                     Rule::ToolCalls => {
-                                        merge_tools(&mut state.tools, value, &path)?;
+                                        merge_tools(&mut state.tools, value, &path, content_only)?;
                                         // Preserve explicit null/empty arrays even when no calls arrive.
                                         target.entry(field).or_insert_with(|| value.clone());
                                     }
@@ -232,7 +285,11 @@ pub(super) fn reconstruct(
                             || entry["delta"]["tool_calls"]
                                 .as_array()
                                 .is_some_and(|a| !a.is_empty())));
-                if continuous && has_content && !value.get("usage").is_some_and(Value::is_object) {
+                if !content_only
+                    && continuous
+                    && has_content
+                    && !value.get("usage").is_some_and(Value::is_object)
+                {
                     return Err(invalid("/usage", "requested continuous usage missing"));
                 }
                 state.finished = terminal;
@@ -247,7 +304,7 @@ pub(super) fn reconstruct(
     if !done || choices.len() != count || choices.values().any(|c| !c.finished) {
         return Err(invalid("", "stream ended without all choices and [DONE]"));
     }
-    if include_usage && !final_usage {
+    if !content_only && include_usage && !final_usage {
         return Err(invalid("/usage", "requested final usage missing"));
     }
     let mut values = Vec::new();
@@ -264,14 +321,21 @@ pub(super) fn reconstruct(
         }
         let value = Value::Object(state.value);
         if chat {
-            assistant_message(&value["delta"], &format!("/choices/{index}/delta"))?;
+            assistant_message(
+                &value["delta"],
+                &format!("/choices/{index}/delta"),
+                content_only,
+            )?;
         } else if !value["text"].is_string() {
             return Err(invalid(
                 &format!("/choices/{index}/text"),
                 "missing completion text",
             ));
         }
-        if requested_logprobs(case) && !value.get("logprobs").is_some_and(Value::is_object) {
+        if !content_only
+            && requested_logprobs(case)
+            && !value.get("logprobs").is_some_and(Value::is_object)
+        {
             return Err(invalid(
                 &format!("/choices/{index}/logprobs"),
                 "requested logprobs missing",
@@ -300,6 +364,53 @@ fn constant(
     }
     target.insert(key.into(), value.clone());
     Ok(())
+}
+
+/// Metadata may follow termination, but malformed or further content may not.
+fn has_generated_content(entry: &Value, chat: bool) -> Result<bool, Violation> {
+    if !chat {
+        return match entry.get("text") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::String(text)) => Ok(!text.is_empty()),
+            _ => Err(invalid("/choices/text", "expected text delta")),
+        };
+    }
+    let Some(delta) = entry.get("delta") else {
+        return Ok(false);
+    };
+    let delta = delta
+        .as_object()
+        .ok_or_else(|| invalid("/choices/delta", "expected delta object"))?;
+    let mut content = false;
+    for (key, value) in delta {
+        let path = format!("/choices/delta/{key}");
+        match key.as_str() {
+            "content" | "reasoning_content" | "refusal" => {
+                if !value.is_null() {
+                    content |= !value
+                        .as_str()
+                        .ok_or_else(|| invalid(&path, "expected string or null delta"))?
+                        .is_empty();
+                }
+            }
+            "tool_calls" => {
+                if !value.is_null() {
+                    content |= !value
+                        .as_array()
+                        .ok_or_else(|| invalid(&path, "expected tool call array"))?
+                        .is_empty();
+                }
+            }
+            "function_call" if !value.is_null() => {
+                return Err(invalid(
+                    &path,
+                    "legacy function_call content is not supported",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(content)
 }
 
 fn append_text(
@@ -357,6 +468,7 @@ fn merge_tools(
     target: &mut BTreeMap<usize, serde_json::Map<String, Value>>,
     value: &Value,
     path: &str,
+    content_only: bool,
 ) -> Result<(), Violation> {
     if value.is_null() {
         return Ok(());
@@ -374,6 +486,9 @@ fn merge_tools(
             .ok_or_else(|| invalid(path, "expected tool call object"))?;
         let state = target.entry(index).or_default();
         for (key, value) in call {
+            if content_only && !matches!(key.as_str(), "index" | "type" | "function") {
+                continue;
+            }
             let path = format!("{path}/{index}/{key}");
             match key.as_str() {
                 "index" => constant(state, key, value, &path)?,
@@ -396,6 +511,9 @@ fn merge_tools(
                         .unwrap();
                     for (field, value) in function {
                         if !matches!(field.as_str(), "name" | "arguments") {
+                            if content_only {
+                                continue;
+                            }
                             return Err(invalid(
                                 &format!("{path}/{field}"),
                                 "tool function rule not covered",

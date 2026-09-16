@@ -32,7 +32,7 @@ pub struct EquivalenceEvidence {
     pub origins: BTreeMap<String, Vec<usize>>,
 }
 
-/// A complete reconstructed response, before applying comparison exceptions.
+/// The API-owned view for the selected check target, before comparison exceptions.
 #[derive(Clone, Debug)]
 pub struct PreparedResponse {
     pub equivalence: Option<EquivalenceValue>,
@@ -55,14 +55,14 @@ impl From<Value> for PreparedResponse {
     }
 }
 
-/// Validate an API response and reconstruct its complete, unmasked result.
+/// Validate and reconstruct the response view declared by the suite's check target.
 pub trait ResponsePolicy {
-    /// Validate the API contract and reconstruct the complete response.
+    /// Validate the selected contract and prepare its comparison view.
     ///
-    /// Implementations must preserve fields or explicitly reject unsupported
-    /// semantics, never silently discard differences. Return violations for
-    /// invalid responses, including in-band errors. This method performs no I/O
-    /// and receives no implementation identity.
+    /// Full-response policies preserve fields or reject unsupported semantics.
+    /// Generated-content policies retain only their explicitly declared content,
+    /// while still rejecting malformed or incomplete output and in-band errors.
+    /// This method performs no I/O and receives no implementation identity.
     fn prepare(
         &self,
         case: &HttpCase,
@@ -198,6 +198,8 @@ pub struct Attempt {
     pub directory: PathBuf,
     pub observation: Option<HttpObservation>,
     pub final_json: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_json: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub origins: BTreeMap<String, Vec<usize>>,
     pub violations: Vec<Violation>,
@@ -246,6 +248,8 @@ pub struct ProfileResult {
 /// All completed and incomplete work, with paths to unmodified observations.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
+    #[serde(default)]
+    pub check: crate::CheckTarget,
     pub state: String,
     pub directory: PathBuf,
     pub effective_suite: PathBuf,
@@ -462,6 +466,7 @@ async fn execute<P: ResponsePolicy>(
     let mut state = RunArtifacts {
         artifacts,
         report: Some(Report {
+            check: plan.profiles[0].suite.check,
             state: "preparing".into(),
             directory: PathBuf::new(),
             effective_suite: effective_path,
@@ -729,6 +734,7 @@ async fn execute_profile<P: ResponsePolicy>(
                     .push(attempt);
                 state.save()?;
                 let capture = Capture {
+                    check: entry.suite.check,
                     client,
                     artifacts: &state.artifacts,
                     policy: &entry.policy,
@@ -827,12 +833,18 @@ async fn execute_profile<P: ResponsePolicy>(
 }
 
 impl Attempt {
+    /// Locate the recorded view without interpreting API-specific fields.
+    pub fn prepared_path(&self) -> Option<&std::path::Path> {
+        self.output_json.as_deref().or(self.final_json.as_deref())
+    }
+
     fn pending(directory: PathBuf, server_log: PathBuf) -> Self {
         Self {
             directory,
             server_log: Some(server_log),
             observation: None,
             final_json: None,
+            output_json: None,
             equivalence: None,
             equivalence_value: None,
             origins: BTreeMap::new(),
@@ -851,6 +863,7 @@ impl Attempt {
 }
 
 struct Capture<'a, P> {
+    check: crate::CheckTarget,
     client: &'a reqwest::Client,
     artifacts: &'a Artifacts,
     policy: &'a P,
@@ -887,9 +900,18 @@ impl<P: ResponsePolicy> Capture<'_, P> {
         if observation.transport_error.is_none() && attempt.violations.is_empty() {
             match self.policy.prepare(case, &observation) {
                 Ok(prepared) => {
-                    let path = directory.join("final.json");
+                    let content_only = self.check == crate::CheckTarget::GeneratedContent;
+                    let path = directory.join(if content_only {
+                        "output.json"
+                    } else {
+                        "final.json"
+                    });
                     self.artifacts.write_json(&path, &prepared.value)?;
-                    attempt.final_json = Some(path);
+                    if content_only {
+                        attempt.output_json = Some(path);
+                    } else {
+                        attempt.final_json = Some(path);
+                    }
                     attempt.origins = prepared.origins;
                     if let Some(projection) = prepared.equivalence {
                         let file = directory.join("equivalence.json");
