@@ -610,19 +610,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         with self.draft_tp_context(self.draft_model_runner.tp_group):
+            # The dense DFLASH draft is captured even under dp attention: its
+            # collectives live inside the per-DP attn-TP group and idle DP
+            # ranks skip the draft step, so the graph runs per DP rank with no
+            # cross-DP collective to keep in lockstep (see
+            # DecodeCudaGraphRunner._forward_is_dp_local).
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
-            if get_parallel().enable_dp_attention and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention.
-                capture_decode_cuda_graph = False
-                if self.ps.tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
             if is_cuda() and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -978,8 +973,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
+        # NPU emits int32 cache locations (see NPUGraphRunner._cache_loc_dtype)
+        # and its cache_loc_update op can write straight into this buffer,
+        # skipping the per-step temporary + dtype-converting copy.
+        verify_loc_dtype = torch.int32 if is_npu() else torch.int64
         self._draft_verify_out_cache_loc_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.int64, device=device
+            (new_cap, block_size), dtype=verify_loc_dtype, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
@@ -987,6 +986,49 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def _prepare_dflash_block_eager(
+        self,
+        *,
+        draft_input: DFlashDraftInputV2,
+        block_ids: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        positions_2d: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        bs: int,
+        block_size: int,
+        device,
+    ) -> None:
+        """Eager (non-triton) draft block prep for platforms without GPU triton.
+
+        On NPU the cache locations are written straight into the persistent
+        verify buffer (int32), avoiding a per-step temporary allocation and a
+        dtype-converting copy; other platforms keep the allocate-then-copy
+        shape.
+        """
+        block_ids.fill_(int(self._mask_token_id))
+        block_ids[:, 0].copy_(draft_input.bonus_tokens)
+        torch.add(
+            prefix_lens.unsqueeze(1),
+            self._block_pos_offsets,
+            out=positions_2d,
+        )
+        end_offset = prefix_lens + block_size
+        out_view = verify_out_cache_loc_2d.reshape(-1)
+        verify_out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=req_pool_indices,
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            start_offset=prefix_lens,
+            end_offset=end_offset,
+            batch_size=bs,
+            draft_token_num=block_size,
+            device=device,
+            out=out_view,
+        )
+        if verify_out_cache_loc is not out_view:
+            # Platform path could not honor `out`; copy into the buffer.
+            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -2372,43 +2414,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH Triton prepare_block failed; falling back to eager path: %s",
                     e,
                 )
-                block_ids.fill_(int(self._mask_token_id))
-                block_ids[:, 0].copy_(draft_input.bonus_tokens)
-                torch.add(
-                    prefix_lens.unsqueeze(1),
-                    self._block_pos_offsets,
-                    out=positions_2d,
-                )
-                end_offset = prefix_lens + block_size
-                verify_out_cache_loc = assign_extend_cache_locs_func(
+                self._prepare_dflash_block_eager(
+                    draft_input=draft_input,
+                    block_ids=block_ids,
+                    prefix_lens=prefix_lens,
+                    positions_2d=positions_2d,
+                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                     req_pool_indices=batch.req_pool_indices,
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    start_offset=prefix_lens,
-                    end_offset=end_offset,
-                    batch_size=bs,
-                    draft_token_num=block_size,
+                    bs=bs,
+                    block_size=block_size,
                     device=device,
                 )
-                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
         else:
-            block_ids.fill_(int(self._mask_token_id))
-            block_ids[:, 0].copy_(draft_input.bonus_tokens)
-            torch.add(
-                prefix_lens.unsqueeze(1),
-                self._block_pos_offsets,
-                out=positions_2d,
-            )
-            end_offset = prefix_lens + block_size
-            verify_out_cache_loc = assign_extend_cache_locs_func(
+            self._prepare_dflash_block_eager(
+                draft_input=draft_input,
+                block_ids=block_ids,
+                prefix_lens=prefix_lens,
+                positions_2d=positions_2d,
+                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 req_pool_indices=batch.req_pool_indices,
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                start_offset=prefix_lens,
-                end_offset=end_offset,
-                batch_size=bs,
-                draft_token_num=block_size,
+                bs=bs,
+                block_size=block_size,
                 device=device,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         if self._full_embed_gpu is not None:
             # Replicated lookup avoids the mismatched attn-TP all_reduce
@@ -2484,6 +2512,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Mirror DSpark's dp-local draft: the dense DFLASH draft runs
+        # attn-TP-local with no cross-DP collective, so under dp attention its
+        # graph eligibility follows the batch's DP graph vote (require_mlp_sync
+        # in can_run_graph checks this flag). Default False on a hand-built
+        # ForwardBatch would permanently block the draft graph replay.
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
         if self.selector is not None:
             self._selector_sample = None
