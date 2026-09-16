@@ -148,6 +148,30 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
         )
 
 
+def resolve_head_group_num(local_kv_heads: int) -> int:
+    """How many head groups this rank's page_unified pool is cut into.
+
+    The pool has to be allocated before any storage backend attaches, so the
+    cut is read from the server args here rather than from the attach-time
+    plan; plan_unified_kv() re-derives the same number from the same argument
+    and the two are checked against each other when the backend attaches.
+    """
+    from sglang.srt.runtime_context import get_memory
+
+    memory = get_memory()
+    if memory.hicache_storage_key_scheme != "unified":
+        return 1
+    head_group = memory.hicache_storage_head_group
+    if head_group is None:
+        return 1
+    if local_kv_heads % head_group != 0:
+        raise ValueError(
+            f"--hicache-storage-head-group {head_group} must divide this rank's "
+            f"{local_kv_heads} kv heads."
+        )
+    return local_kv_heads // head_group
+
+
 def normalize_dtype(dtype: object) -> str:
     """``torch.bfloat16`` -> ``"bfloat16"``."""
     return str(dtype).removeprefix("torch.")
