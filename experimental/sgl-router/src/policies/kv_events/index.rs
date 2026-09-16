@@ -29,13 +29,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
+use super::bootstrap::{PeerSnapshot, WireWorker, SNAPSHOT_FORMAT};
 use super::discovery::{fetch_event_config, EventConfig};
 use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 use super::tally::{EventKind, EventTally};
@@ -86,6 +89,48 @@ impl KvIndexMetrics {
     }
 }
 
+/// A built snapshot together with its already-encoded JSON body.
+///
+/// WHY the body is cached and not just the struct: the producer serves this to
+/// every booting sibling, and `serde_json` on a multi-megabyte tree costs about
+/// as much as the tree walk that produced it. Caching only the struct amortises
+/// the walk across the TTL but re-encodes per request, so a boot herd pays the
+/// encode N times for one identical document.
+struct CachedSnapshot {
+    /// When this snapshot's CONTENTS were sampled — the instant before the
+    /// cursors were read — not when the build finished.
+    ///
+    /// The whole freshness contract hangs on this being the earlier of the
+    /// two. A consumer asking for "no older than N" is asking what the
+    /// snapshot covers, and it covers the publisher's stream as of the cursor
+    /// read; a walk plus encode of a multi-megabyte tree takes long enough
+    /// that stamping completion would claim coverage the document does not
+    /// have, which is exactly the gap `max_age_ms` exists to close.
+    ///
+    /// One residual, unavoidable at this layer: a cursor reflects what this
+    /// replica had APPLIED, so the stamp still overstates by the producer's
+    /// own receive-to-apply latency. That is sub-millisecond against a window
+    /// that would otherwise be seconds.
+    exported_at: Instant,
+    body: Bytes,
+}
+
+/// Encode a snapshot for the wire.
+///
+/// `PeerSnapshot` is a plain `Serialize` struct with no non-string map keys,
+/// so this cannot actually fail; an empty body on the impossible branch keeps
+/// the caller total, and the route turns it into a non-success status rather
+/// than a 200 a consumer would fail to decode.
+fn encode_snapshot(snap: &PeerSnapshot) -> Bytes {
+    match serde_json::to_vec(snap) {
+        Ok(v) => Bytes::from(v),
+        Err(e) => {
+            warn!(error = %e, "kv-bootstrap: snapshot serialisation failed");
+            Bytes::new()
+        }
+    }
+}
+
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
@@ -122,6 +167,10 @@ pub struct KvEventIndex {
     /// Applied events by kind and storage medium, for the `/metrics` scrape.
     /// Written only by the pump.
     tally: Arc<EventTally>,
+    /// Most recently built peer snapshot and when it was built. Async mutex
+    /// because it gates the build, and a waiter must yield its worker rather
+    /// than block it — see [`KvEventIndex::peer_snapshot_body`].
+    snapshot_cache: AsyncMutex<Option<CachedSnapshot>>,
     /// Worker-sourced `page_size` shared with prefix providers.
     /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
     /// establishes the value; subsequent workers that disagree are
@@ -204,6 +253,7 @@ impl KvEventIndex {
             live_workers,
             cursors,
             tally,
+            snapshot_cache: AsyncMutex::new(None),
             block_size_oracle,
         })
     }
@@ -234,6 +284,241 @@ impl KvEventIndex {
             tree: Arc::clone(&self.tree),
             tally: Arc::clone(&self.tally),
         })
+    }
+
+    /// This replica as a bootstrap source, or `None` when it maintains no
+    /// local tree.
+    ///
+    /// Symmetric with [`Self::metrics_source`] and for the same reason: in
+    /// metadata-only mode an external Indexer is the routing signal, no KV
+    /// subscription is opened, and the tree is a structural zero. Serving an
+    /// empty snapshot from it would hand a booting sibling a `producer_ready`
+    /// answer with nothing behind it; answering "no snapshot here" is both
+    /// true and what the consumer already knows how to handle.
+    pub fn snapshot_source(self: &Arc<Self>) -> Option<Arc<Self>> {
+        self.maintain_tree.then(|| Arc::clone(self))
+    }
+
+    /// This replica's snapshot, encoded and ready to serve, rebuilt if the
+    /// cached one is older than `max_age`.
+    ///
+    /// Single-flighted: the async mutex means a boot herd shares one tree walk
+    /// rather than each request paying for its own. A waiter yields its
+    /// runtime worker instead of blocking it, which matters because the walk
+    /// and the encode are both multi-second on a fleet-sized tree.
+    ///
+    /// There is deliberately no struct-returning twin. The encode happens as
+    /// part of filling the cache, so an accessor that handed back only the
+    /// `PeerSnapshot` would still pay a multi-megabyte `serde_json` pass and a
+    /// blocking-pool round trip, then discard the result — a trap for the next
+    /// caller who just wants to read a field.
+    pub async fn peer_snapshot_body(&self, max_age: Duration) -> Bytes {
+        let mut cache = self.snapshot_cache.lock().await;
+        if let Some(c) = cache.as_ref() {
+            if c.exported_at.elapsed() < max_age {
+                return c.body.clone();
+            }
+        }
+
+        // Stamped BEFORE the cursors are read, so the entry never claims to
+        // cover more of the publisher's stream than it does. See
+        // `CachedSnapshot::exported_at`.
+        let exported_at = Instant::now();
+
+        // Read the cursors BEFORE walking the tree, never after.
+        //
+        // WHY the order is load-bearing: `export_snapshot` releases the tree
+        // lock every few thousand records, so it is not one instant, and the
+        // pump mutates the tree before advancing the cursor. Reading cursors
+        // last can therefore report a sequence whose effects the walk only
+        // partially captured — and the consumer would then filter its own copy
+        // of that batch as already-reflected, losing a `BlockRemoved`
+        // permanently. Reading them first makes the watermark lag the tree
+        // instead: the consumer replays deltas the snapshot already has, and
+        // insert/remove are idempotent, so it converges.
+        let cursor_by_worker: Vec<(KvWorkerId, i64)> = self
+            .cursors
+            .lock()
+            .iter()
+            .map(|(w, seq)| (w.clone(), *seq))
+            .collect();
+        let tree = Arc::clone(&self.tree);
+        let walked = tokio::task::spawn_blocking(move || tree.export_snapshot()).await;
+        let (worker_table, nodes) = match walked {
+            Ok(v) => v,
+            Err(e) => {
+                // The walk panicked or the runtime is shutting down. Answer
+                // with a snapshot that declares itself useless rather than a
+                // partial tree, and do NOT cache it: a consumer skips a
+                // `producer_ready: false` peer, so the next request should get
+                // a real attempt rather than a cached refusal. Encoding inline
+                // is fine — this body is a handful of bytes.
+                warn!(error = %e, "kv-bootstrap: snapshot walk failed; reporting not-ready to peers");
+                return encode_snapshot(&self.not_ready_snapshot());
+            }
+        };
+        let index_of: HashMap<&KvWorkerId, u32> = worker_table
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w, i as u32))
+            .collect();
+        let cursors: Vec<(u32, i64)> = cursor_by_worker
+            .iter()
+            .filter_map(|(w, seq)| index_of.get(w).map(|&i| (i, *seq)))
+            .collect();
+        let hash_config = self.block_size_oracle.hash_config();
+        let (block_size, is_bigram) = hash_config.unwrap_or((0, false));
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size,
+            is_bigram,
+            // "Am I worth copying?" Requiring a non-empty tree makes the very
+            // first replica of a cold fleet a non-source until it has learned
+            // something from live events, and keeps two replicas in a rolling
+            // update from bootstrapping off each other and both inheriting
+            // nothing. Requiring a resolved `hash_config` keeps a snapshot
+            // from claiming a hashing identity it has not established yet —
+            // every block in such a body is one the recipient can never match.
+            producer_ready: hash_config.is_some() && !nodes.is_empty(),
+            workers: worker_table
+                .iter()
+                .map(|w| WireWorker {
+                    url: w.url.clone(),
+                    dp_rank: w.dp_rank,
+                })
+                .collect(),
+            cursors,
+            nodes,
+        };
+        // Encode on the blocking pool for the same reason the walk goes there:
+        // serialising a multi-megabyte tree is CPU-bound with no await point,
+        // and this runs on the runtime that is also proxying requests.
+        let body = match tokio::task::spawn_blocking(move || encode_snapshot(&snap)).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Runtime shutting down or the encode panicked. Answer this
+                // caller without caching, so a later request retries.
+                warn!(error = %e, "kv-bootstrap: snapshot encode failed");
+                return Bytes::new();
+            }
+        };
+        *cache = Some(CachedSnapshot {
+            exported_at,
+            body: body.clone(),
+        });
+        body
+    }
+
+    /// Build this replica's cursor table alone, with no tree.
+    ///
+    /// Deliberately NOT a smaller [`Self::peer_snapshot_body`]. A splice probe
+    /// asks one question — "is your cursor for this rank above my watermark?"
+    /// — and the cursors live in their own map, which the export reads
+    /// independently of, and before, the tree walk. Serving them therefore
+    /// costs a read of that map, where answering the same question from a full
+    /// export costs a walk, a multi-megabyte serialise and a compress. On a
+    /// 168-engine fleet that difference measured as ~650 MB (~160 MB gzipped)
+    /// per peer per probe.
+    ///
+    /// Every observed rank is reported, including ones whose blocks this
+    /// replica no longer holds (`BlockRemoved`-only history,
+    /// `AllBlocksCleared`, eviction). The full export's cursor table is
+    /// narrower — it is filtered to ranks that still carry a node, because a
+    /// graft recipient needs a block source, not a witness. The witness
+    /// question has no such constraint: having SEEN the publisher's stream at
+    /// seq N is evidence even after the blocks are gone. So this table is a
+    /// superset of the full export's, and a caller comparing the two bodies
+    /// must not expect set equality.
+    ///
+    /// Takes no `max_age` and touches no cache: the cursors are read live, so
+    /// the answer is strictly fresher than any freshness a caller could
+    /// request. Reading live also removes the accuracy cost of the cached
+    /// path, where a cursor stale by up to the producer TTL could miss
+    /// advancement that had just happened and report a splice as continuous
+    /// when it was not.
+    ///
+    /// `nodes` is always empty, which makes this body ungraftable by
+    /// construction rather than by discipline: a consumer refuses an empty
+    /// node list as a cold producer, so a bootstrap fetch can never be
+    /// silently satisfied by a cursors-only answer.
+    pub fn peer_cursors_body(&self) -> Bytes {
+        let hash_config = self.block_size_oracle.hash_config();
+        let (block_size, is_bigram) = hash_config.unwrap_or((0, false));
+        // One pass under one short lock: worker `i` of the table and cursor
+        // entry `i` are pushed from the same map entry, so the pairing
+        // `cursors[i].0 == i` is structural rather than comment-enforced. The
+        // pump takes this lock twice per batch, so keep the hold cheap.
+        let (workers, cursors) = {
+            let guard = self.cursors.lock();
+            let mut workers: Vec<WireWorker> = Vec::with_capacity(guard.len());
+            let mut cursors: Vec<(u32, i64)> = Vec::with_capacity(guard.len());
+            for (i, (w, seq)) in guard.iter().enumerate() {
+                workers.push(WireWorker {
+                    url: w.url.clone(),
+                    dp_rank: w.dp_rank,
+                });
+                cursors.push((i as u32, *seq));
+            }
+            (workers, cursors)
+        };
+        let snap = PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size,
+            is_bigram,
+            // Same question the full export answers — "am I worth copying?" —
+            // read off the tree directly, because this path never builds a
+            // `nodes` vec to measure instead.
+            producer_ready: hash_config.is_some() && self.tree.node_count() > 0,
+            workers,
+            cursors,
+            nodes: Vec::new(),
+        };
+        // Encoded inline, unlike the tree export: this body is one entry per
+        // rank, so a blocking-pool hop would cost more than the serialise.
+        encode_snapshot(&snap)
+    }
+
+    /// (test-only) Apply one stored block and its cursor directly, bypassing
+    /// the pump, so route tests get an index whose cursors-only and full
+    /// exports actually differ. On an empty index the two bodies are
+    /// indistinguishable, which is what makes a test built on one unable to
+    /// fail when the cursors-only branch breaks. Production applies events
+    /// only through the pump channel; this exists because seeding from outside
+    /// `kv_events` cannot reach the internals, by design.
+    #[cfg(test)]
+    pub(crate) fn seed_stored_block_for_test(
+        &self,
+        worker: &KvWorkerId,
+        seq: i64,
+        block_hash: i64,
+    ) {
+        self.tree
+            .insert_tiered(worker, None, &[block_hash], Tiers::DEVICE);
+        self.cursors.lock().insert(worker.clone(), seq);
+    }
+
+    /// (test-only) Record a cursor for a rank whose blocks this replica does
+    /// not hold — the `BlockRemoved`-only / evicted history that makes the
+    /// cursors-only table a strict superset of the full export's.
+    #[cfg(test)]
+    pub(crate) fn seed_cursor_only_for_test(&self, worker: &KvWorkerId, seq: i64) {
+        self.cursors.lock().insert(worker.clone(), seq);
+    }
+
+    /// A snapshot that declares itself useless, for the paths that must answer
+    /// without a tree. A consumer skips a `producer_ready: false` peer and
+    /// retries elsewhere.
+    fn not_ready_snapshot(&self) -> PeerSnapshot {
+        let (block_size, is_bigram) = self.block_size_oracle.hash_config().unwrap_or((0, false));
+        PeerSnapshot {
+            format: SNAPSHOT_FORMAT,
+            block_size,
+            is_bigram,
+            producer_ready: false,
+            workers: Vec::new(),
+            cursors: Vec::new(),
+            nodes: Vec::new(),
+        }
     }
 
     /// Shared accessor for the engine-load table. Load values are written solely by the pump
