@@ -10,7 +10,7 @@ from sglang.srt.layers import sampler as sampler_module
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 class TestFlashInferMinPSampling(CustomTestCase):
@@ -28,6 +28,7 @@ class TestFlashInferMinPSampling(CustomTestCase):
             top_ks=torch.tensor([4], dtype=torch.int32, device="cuda"),
             top_ps=torch.tensor([0.82], device="cuda"),
             min_ps=torch.tensor([0.1], device="cuda"),
+            sampling_mask_batch_indices=torch.tensor([0], device="cuda"),
         )
         captured = {}
 
@@ -46,7 +47,7 @@ class TestFlashInferMinPSampling(CustomTestCase):
                 side_effect=capture_min_p_input,
             ),
         ):
-            sampler_module.Sampler._sample_from_probs(
+            _, sampling_mask_capture = sampler_module.Sampler._sample_from_probs(
                 None,
                 original_probs.clone(),
                 sampling_info,
@@ -75,6 +76,12 @@ class TestFlashInferMinPSampling(CustomTestCase):
 
         self.assertEqual(expected_support, [0, 1, 2, 3])
         self.assertEqual(actual_support, expected_support)
+        self.assertEqual(
+            torch.nonzero(sampling_mask_capture.weights > 0, as_tuple=False)[
+                :, 1
+            ].tolist(),
+            expected_support,
+        )
 
 
 if __name__ == "__main__":
