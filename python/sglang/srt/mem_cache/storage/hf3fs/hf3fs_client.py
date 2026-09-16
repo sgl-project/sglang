@@ -87,8 +87,8 @@ class Hf3fsMockClient(Hf3fsClient):
             size = tensor.numel() * tensor.itemsize
 
             try:
-                # Executor jobs may share this client and its file descriptor.
-                bytes_read = os.pread(self.file, size, offset)
+                os.lseek(self.file, offset, os.SEEK_SET)
+                bytes_read = os.read(self.file, size)
 
                 if len(bytes_read) == size:
                     # Convert bytes to tensor and copy to target
@@ -122,7 +122,8 @@ class Hf3fsMockClient(Hf3fsClient):
                 tensor_bytes = tensor.contiguous().view(torch.uint8).flatten()
                 data = tensor_bytes.numpy().tobytes()
 
-                bytes_written = os.pwrite(self.file, data, offset)
+                os.lseek(self.file, offset, os.SEEK_SET)
+                bytes_written = os.write(self.file, data)
 
                 if bytes_written == size:
                     results.append(size)
