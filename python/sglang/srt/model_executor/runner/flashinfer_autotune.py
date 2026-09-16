@@ -249,12 +249,13 @@ def _drop_diverged_autotune_cache(
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     # The gate below decides on the same inputs load_configs does.
-    from flashinfer.autotuner import _collect_metadata, autotune
+    from flashinfer.autotuner import AutoTuner, _collect_metadata, autotune
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
     sync_group = _autotune_tactic_sync_group(mr.tp_group)
-    if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+    reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
+    if reuse_cache:
         autotune_cache = cache_path
         if sync_group is not None:
             _drop_diverged_autotune_cache(cache_path, sync_group, _collect_metadata())
@@ -277,16 +278,26 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
+        # autotune(cache=...) clears all file-loaded tactics on entry. In a
+        # speculative worker, loading the draft cache would then discard the
+        # target's prefill tactics after a restart (freshly profiled tactics
+        # live in a different cache and mask this on the first startup).
+        # The public load/save API merges the target and draft entries instead.
+        tuner = AutoTuner.get()
+        if reuse_cache and autotune_cache.is_file():
+            tuner.load_configs(str(autotune_cache))
         with (
             _autotune_process_group(sync_group),
             autotune(
                 True,
-                cache=str(autotune_cache),
+                cache=None if reuse_cache else str(autotune_cache),
                 skip_ops=skip_ops,
             ),
             autotune_dummy_run_mode(run_lm_head=run_lm_head),
         ):
             yield
+        if reuse_cache:
+            tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
