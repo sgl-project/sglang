@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from PIL import Image
+from transformers import BatchFeature
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
@@ -27,9 +30,30 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
+    QwenImage21EncodingStage,
     QwenImage21InputValidationStage,
     collapse_image_slots,
 )
+
+
+def test_prompt_conditioning_uses_pre_final_norm_hidden_state():
+    hidden = torch.arange(24).reshape(1, 6, 4).float()
+    inputs = BatchFeature(
+        data={
+            "input_ids": torch.tensor([[1, 2, 99, 99, 3, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+        }
+    )
+    processor = Mock(return_value=inputs)
+    processor.tokenizer.convert_tokens_to_ids.return_value = 99
+    processor.apply_chat_template.return_value = [[1]]
+    encoder = Mock(return_value=SimpleNamespace(hidden_states=(hidden,)))
+    stage = QwenImage21EncodingStage(encoder, processor, None, None)
+    stage.use_declared_component = Mock(return_value=nullcontext(encoder))
+    actual, slots = stage.encode_prompt("edit", [], "cpu")
+    torch.testing.assert_close(actual, hidden[0, [1, 2, 4]])
+    assert slots.tolist() == [False, True, False]
+    encoder.model.language_model.norm.assert_not_called()
 
 
 def test_condition_slots_expand_to_actual_latent_grid():

@@ -42,6 +42,17 @@ The checkpoint directory must contain `model_index.json` and the `processor`,
 processor must include the Qwen3-VL tokenizer assets. SGLang loads all three
 neural components natively. A separate tokenizer directory is not required.
 
+The checkpoint's VAE uses RGBA input and output with 64-channel latents. PNG
+reference images retain their alpha channel; RGB inputs receive an opaque
+alpha channel. Save generated images as PNG to preserve transparency.
+
+Text conditioning uses the last decoder layer's output before the final
+normalization, matching the reference implementation with Transformers
+4.57.3. SGLang selects this native hidden state explicitly, so keep the
+repository's installed dependencies instead of downgrading the entire runtime.
+Reference comparisons should use Transformers 4.57.3; the same
+`hidden_states[-1]` expression can have different semantics in newer versions.
+
 Use `--model-id Qwen-Image-2.1` when the checkpoint directory has a different
 name. The model ID is a routing identifier; it does not grant access to model
 weights. Keep checkpoint access credentials in your environment.
