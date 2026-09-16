@@ -1177,6 +1177,102 @@ def act_and_mul_triton(
     )
 
 
+# ============================================================
+# Fused silu_and_mul + per_token_group_quant_fp8 kernel
+# ============================================================
+
+_fp8_type = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
+_FP8_MAX = torch.finfo(_fp8_type).max
+
+
+@triton.jit
+def _fused_silu_mul_quant_fp8_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    num_tokens,
+    hidden_dim,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
+):
+    """Fused kernel: silu(gate) * up -> fp8 quantize with block-wise scales."""
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    mask_m = offs_m < num_tokens
+    mask_k = offs_k < hidden_dim
+    mask = mask_m[:, None] & mask_k[None, :]
+    two_d = hidden_dim * 2
+    base_ptrs = input_ptr + offs_m[:, None] * two_d + offs_k[None, :]
+    gate = tl.load(base_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(base_ptrs + hidden_dim, mask=mask, other=0.0).to(tl.float32)
+    # DeepSeek-V4 SwiGLU clamp: gate clamped to [-inf, L], up clamped to [-L, L]
+    if HAS_SWIGLU_LIMIT:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    result = (gate * tl.sigmoid(gate)) * up
+    group_max = tl.max(tl.abs(result), axis=1)
+    scale = group_max / FP8_MAX
+    scale = tl.where(scale > EPS, scale, EPS)
+    result_scaled = result / scale[:, None]
+    result_fp8 = tl.clamp(result_scaled, -FP8_MAX, FP8_MAX).to(
+        output_ptr.dtype.element_ty
+    )
+    out_ptrs = output_ptr + offs_m[:, None] * hidden_dim + offs_k[None, :]
+    tl.store(out_ptrs, result_fp8, mask=mask)
+    num_groups = hidden_dim // GROUP_SIZE
+    scale_mask = mask_m & (pid_g < num_groups)
+    scale_ptrs = scale_ptr + offs_m * num_groups + pid_g
+    tl.store(scale_ptrs, scale, mask=scale_mask)
+
+
+def fused_silu_mul_quant_fp8(x, group_size, swiglu_limit=0.0):
+    """Fused Triton kernel: silu_and_mul + per_token_group_quant_fp8 in one launch.
+
+    Args:
+        x: [num_tokens, 2 * hidden_dim], bf16/fp16, contiguous row-major
+        group_size: quantization group size (e.g. 128 for DeepSeek-V4 block-wise FP8)
+        swiglu_limit: SwiGLU clamp limit (0 = no clamp, 10.0 for DeepSeek-V4).
+            When > 0, gate is clamped to [-inf, L] and up to [-L, L] before
+            silu(gate) * up, matching the DeepSeek-V4 activation contract.
+
+    Returns:
+        (x_fp8, x_scale):
+            x_fp8: [num_tokens, hidden_dim], fp8
+            x_scale: [num_tokens, hidden_dim // group_size], float32, row-major
+    """
+    assert x.is_contiguous(), "Input must be contiguous"
+    num_tokens = x.shape[0]
+    hidden_dim = x.shape[1] // 2
+    num_groups = hidden_dim // group_size
+    assert hidden_dim % group_size == 0
+    x_fp8 = torch.empty(num_tokens, hidden_dim, device=x.device, dtype=_fp8_type)
+    x_scale = torch.empty(num_tokens, num_groups, device=x.device, dtype=torch.float32)
+    BLOCK_M = 128
+    grid = (triton.cdiv(num_tokens, BLOCK_M), num_groups)
+    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
+    _fused_silu_mul_quant_fp8_kernel[grid](
+        x,
+        x_fp8,
+        x_scale,
+        num_tokens,
+        hidden_dim,
+        FP8_MAX=_FP8_MAX,
+        EPS=1e-10,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        num_warps=4,
+    )
+    return x_fp8, x_scale
+
+
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
