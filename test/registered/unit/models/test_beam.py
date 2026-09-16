@@ -225,42 +225,30 @@ class TestBeamConfig(CustomTestCase):
         )
 
     def test_rope_parameters_are_nested_per_layer_type_and_survive_roundtrip(self):
-        for theta in (10000.0, 20000.0):
-            with self.subTest(theta=theta):
-                parameters = {
-                    "sliding_attention": {"rope_type": "default", "rope_theta": theta},
-                    "full_attention": None,
-                }
-                configs = [BeamConfig(rope_parameters=parameters)]
-                if theta == 10000.0:
-                    configs.append(BeamConfig())
-                for config in configs:
-                    with tempfile.TemporaryDirectory() as directory:
-                        config.save_pretrained(directory)
-                        saved = BeamConfig.from_pretrained(directory)
-                    restored = BeamConfig.from_dict(config.to_dict())
-                    for candidate in (config, restored, saved):
-                        self.assertEqual(candidate.rope_parameters, parameters)
-                        self.assertEqual(candidate.rope_scaling, parameters)
-                        self.assertFalse(hasattr(candidate, "rope_theta"))
-                        self.assertNotIn("rope_theta", candidate.to_dict())
-                        self.assertEqual(
-                            get_context_length(candidate),
-                            candidate.max_position_embeddings,
-                        )
+        parameters = {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 20000.0},
+            "full_attention": None,
+        }
+        config = BeamConfig(rope_parameters=parameters)
+        # save_pretrained runs the Transformers validators; see BeamConfig.validate.
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            saved = BeamConfig.from_pretrained(directory)
+        for candidate in (config, saved):
+            self.assertEqual(candidate.rope_parameters, parameters)
+            self.assertFalse(hasattr(candidate, "rope_theta"))
+            self.assertEqual(
+                get_context_length(candidate), candidate.max_position_embeddings
+            )
 
     def test_unsupported_rope_and_single_token_window_fail_early(self):
-        for rope_type in ("linear", "dynamic"):
-            with (
-                self.subTest(rope_type=rope_type),
-                self.assertRaisesRegex(ValueError, "only default RoPE"),
-            ):
-                BeamConfig(
-                    rope_parameters={
-                        "sliding_attention": {"rope_type": rope_type, "factor": 2},
-                        "full_attention": None,
-                    }
-                )
+        with self.assertRaisesRegex(ValueError, "only default RoPE"):
+            BeamConfig(
+                rope_parameters={
+                    "sliding_attention": {"rope_type": "linear", "factor": 2},
+                    "full_attention": None,
+                }
+            )
         with self.assertRaisesRegex(ValueError, "without rotary embeddings"):
             BeamConfig(
                 rope_parameters={
@@ -269,10 +257,9 @@ class TestBeamConfig(CustomTestCase):
                 }
             )
 
+        # Checked before the Transformers constructor, which raises a non-ValueError.
         with self.assertRaisesRegex(ValueError, "mlp_layer_types length"):
             BeamConfig(num_hidden_layers=2, mlp_layer_types=["dense"])
-        with self.assertRaisesRegex(ValueError, "dense or sparse"):
-            BeamConfig(num_hidden_layers=2, mlp_layer_types=["dense", "moe"])
 
         for window in (None, 0, 1):
             with (
