@@ -63,6 +63,22 @@ logger = logging.getLogger(__name__)
 _deep_gemm_layout_memory_budget_initialized = False
 
 
+def _normalize_prefill_capture_num_tokens(
+    capture_num_tokens: list[int],
+    *,
+    alignment: int,
+    max_capture_tokens: int,
+) -> list[int]:
+    aligned_capture_num_tokens = {
+        ceil_align(int(num_tokens), alignment) for num_tokens in capture_num_tokens
+    }
+    return sorted(
+        num_tokens
+        for num_tokens in aligned_capture_num_tokens
+        if num_tokens <= max_capture_tokens
+    )
+
+
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
@@ -435,14 +451,10 @@ def capture_prefill_graph(
     # each row can contain at most context_length tokens. Their product is
     # therefore the largest aggregate-token bucket capture can represent.
     max_capture_tokens = max_capture_requests * context_length
-    alignment = get_cuda_graph_batch_size_alignment()
-    aligned_capture_num_tokens = {
-        ceil_align(int(num_tokens), alignment) for num_tokens in prefill_config.bs
-    }
-    capture_num_tokens = sorted(
-        num_tokens
-        for num_tokens in aligned_capture_num_tokens
-        if num_tokens <= max_capture_tokens
+    capture_num_tokens = _normalize_prefill_capture_num_tokens(
+        prefill_config.bs,
+        alignment=get_cuda_graph_batch_size_alignment(),
+        max_capture_tokens=max_capture_tokens,
     )
     # Resolve the aligned, context- and request-capacity-bounded buckets once
     # before constructing the runner so every backend consumes the same config.
