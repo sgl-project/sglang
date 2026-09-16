@@ -700,6 +700,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                     (2, expected_extent),
                 )
 
+
 class TestDSV41SM90CandidateSlots(CustomTestCase):
     def test_target_verify_uses_decode_compressor_path(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
@@ -777,9 +778,7 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             c2_indexer_metadata=SimpleNamespace(
                 max_compressed_seq_len=width,
                 use_topk_v2=use_topk_v2,
-                compressed_seq_lens=torch.full(
-                    (len(req),), width, dtype=torch.int32
-                ),
+                compressed_seq_lens=torch.full((len(req),), width, dtype=torch.int32),
                 topk_metadata=torch.empty(0),
             ),
         )
@@ -857,9 +856,9 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             valid = torch.arange(positions.shape[1]) < candidate_lens[:, None]
             safe_positions = positions.clamp_max(width - 1)
             slots = req_to_token[req_rows[:, None], safe_positions * ratio] // ratio
-            return score(q, weights, slots, candidate_lens, table, page_size).masked_fill(
-                ~valid, -torch.inf
-            )
+            return score(
+                q, weights, slots, candidate_lens, table, page_size
+            ).masked_fill(~valid, -torch.inf)
 
         def topk_v2(scores, lens, page_table, out, page_size, metadata):
             self.assertEqual(lens.dtype, torch.int32)
@@ -1052,6 +1051,8 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             torch.tensor([2, 2, 0, 0, 0, 1]),
             ([261, 262, 7, 8, 9, 130], [132, 133, 260, 261, 262, 3]),
         )
+
+
 class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """SWA writes must translate live locations for idle or missing/mismatched caches.
     A matching cache on an active forward must be reused.
