@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv41_small_metadata import low_ratio_metadata
+from sglang.kernels.ops.attention.dsv4.metadata_kernel import build_low_ratio_metadata
 from sglang.kernels.ops.speculative.dspark.commit_swa import committed_swa_locations
 from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -38,10 +38,10 @@ def test_compression_graph(rows, topk, dtype):
     lens = torch.zeros(rows, device="cuda", dtype=torch.int32)
     loc = torch.zeros(rows, device="cuda", dtype=dtype)
     for _ in range(3):
-        low_ratio_metadata(lens, loc, topk)
+        build_low_ratio_metadata(lens, loc, topk)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = low_ratio_metadata(lens, loc, topk)
+        out = build_low_ratio_metadata(lens, loc, topk)
     fields = [
         f"c{ratio}_{suffix}"
         for ratio in (1, 2)

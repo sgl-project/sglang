@@ -13,11 +13,11 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
-from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
-from sglang.srt.layers.attention.dsv4.torch_quant import (
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
+from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix

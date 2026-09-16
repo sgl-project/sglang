@@ -3004,12 +3004,12 @@ class DeepseekV4AttnBackend(
         """Fused compressor write, index-key projection, then fused index-key write.
         Both write kernels consume metadata dtypes directly and suppress padded stores.
         """
-        from sglang.kernels.ops.attention.dsv4.c1 import c1_decode_norm_rope_store
-        from sglang.kernels.ops.attention.dsv4.c2 import (
-            c2_decode_or_verify_norm_rope_store,
-        )
         from sglang.kernels.ops.attention.dsv4.fp4_rope import (
             index_k_norm_rope_pack_store,
+        )
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c1_decode_norm_rope_store,
+            c2_decode_norm_rope_store,
         )
 
         pool = self.token_to_kv_pool
@@ -3043,7 +3043,7 @@ class DeepseekV4AttnBackend(
             # CompressStatePool stores each request's pending pairs in a position ring.
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
-            latent = c2_decode_or_verify_norm_rope_store(
+            latent = c2_decode_norm_rope_store(
                 compressor.project_fused(x),
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
@@ -4393,12 +4393,14 @@ class DeepseekV4AttnBackend(
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
-            from sglang.kernels.ops.attention.dsv41_small_metadata import (
-                low_ratio_metadata,
-                page_table_positions_small,
+            from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
+                build_low_ratio_metadata,
+            )
+            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+                build_page_table_positions_small,
             )
 
-            build_pages = page_table_positions_small
+            build_pages = build_page_table_positions_small
         prep = build_pages(
             req_to_token=req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -4495,7 +4497,7 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             low_ratio_buffers = (
-                low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                build_low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
                 if small_metadata
                 else None
             )

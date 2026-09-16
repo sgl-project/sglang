@@ -181,8 +181,8 @@ def _reference(t, ratio: int):
     from sglang.kernels.ops.attention.dsv4.rope_pack_indexer import (
         rope_fake_quant_pack_indexer,
     )
+    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
-    from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_compressed_kv
 
     if ratio == 1:
         pooled = t.compressor.wkv(t.x)
