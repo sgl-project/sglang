@@ -39,9 +39,6 @@ SGL_DEVICE fp32x2_t fake_quant_compressed_kv_x2(fp32x2_t x, float scale) {
 }
 
 /// \brief Per-block ue8m0 scale and its reciprocal, from the block's absmax.
-///
-/// Both come out of one biased exponent, so the reciprocal costs a subtract
-/// rather than a division.
 SGL_DEVICE fp32x2_t block_scale(float amax) {
   const auto exponent = fp8::cast_to_ue8m0(fmaxf(amax, kAmaxFloor) * (1.0f / kMax));
   return {__uint_as_float(static_cast<uint32_t>(exponent) << 23), fp8::inv_scale_ue8m0(exponent)};
@@ -49,9 +46,8 @@ SGL_DEVICE fp32x2_t block_scale(float amax) {
 
 /// \brief Round a pair onto the e2m1 grid and back, through `scale`.
 ///
-/// `cvt.rn.satfinite.e2m1x2.f32` rounds to nearest even and saturates to +-6;
-/// every e2m1 value is exact in fp16. Adding `0.0f` during scaling clears negative
-/// zero to match `torch.sign(0) == 0` in `torch_quant.round_fp4`.
+/// Every e2m1 value is exact in fp16, so the roundtrip is lossless. Adding `0.0f` during
+/// scaling clears negative zero to match `torch.sign(0) == 0` in `torch_quant.round_fp4`.
 SGL_DEVICE fp32x2_t fake_quant_x2(fp32x2_t x, float scale, float inv_scale) {
   const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
