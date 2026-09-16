@@ -789,6 +789,14 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if !tree_core.device_lru_list(SWA).in_list(Some(x)) {
                 break None;
             }
+            if tree_core.component_state(SWA).evict_device_last_backup == Some(x)
+                && !tree_core.arena.node(x).backuped()
+            {
+                cursor = tree_core
+                    .device_lru_list(SWA)
+                    .get_prev_no_lock(x, &tree_core.arena);
+                continue;
+            }
             assert!(
                 tree_core.arena.has_device_value(x, SWA),
                 "Swa eviction cursor on a valueless node {x}"
@@ -802,6 +810,18 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             if tree_core.evictable_device_leaves.contains(x) {
                 break Some(x);
+            }
+            if tree_core.is_write_back
+                && tree_core.swa_write_back_eviction_barrier_enabled
+                && !tree_core.arena.node(x).backuped()
+            {
+                // A later Full backup cannot recover SWA data after this
+                // internal node is tombstoned. Pause on the same cursor so
+                // the Controller can preserve the dirty path first.
+                tree_core.component_state_mut(SWA).evict_device_backup_node = Some(x);
+                tree_core.component_state_mut(SWA).evict_device_last_backup = Some(x);
+                cursor = Some(x);
+                break None;
             }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(

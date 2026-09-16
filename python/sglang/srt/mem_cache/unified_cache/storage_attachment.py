@@ -394,15 +394,19 @@ class StorageAttachment:
                     cache.buffer_pipeline.release_anchor_lock(handle)
                 controller.append_host_mem_release(
                     host_indices=info.host_indices[:completed_tokens],
-                    extra_pools=[
-                        x for xfers in info.comp_xfers.values() for x in xfers
-                    ],
+                    extra_pools=(
+                        [x for xfers in info.comp_xfers.values() for x in xfers]
+                        if info.operation.pool_transfers_done
+                        else None
+                    ),
                 )
                 controller.prefetch_tokens_occupied = max(
                     0,
                     controller.prefetch_tokens_occupied
                     - cache._prefetch_occupied_span(
-                        info.prefetch_key, info.host_indices
+                        info.prefetch_key,
+                        info.host_indices,
+                        operation=info.operation,
                     ),
                 )
             except Exception:

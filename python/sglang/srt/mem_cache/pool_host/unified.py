@@ -293,14 +293,29 @@ class _SharedPageEnvelopeHostBacking:
             extension_bytes += extension_pages * side.page_bytes
         return extension_bytes <= self._current_gap_bytes()
 
-    def _can_fit_packed(self, page_counts: dict[str, int]) -> bool:
+    def _can_fit_state(
+        self,
+        live_page_counts: dict[str, int],
+        free_logical_page_counts: dict[str, int],
+        request_page_counts: dict[str, int],
+    ) -> bool:
         used_bytes = 0
-        for name, page_count in page_counts.items():
-            side = self.sides[name]
-            if page_count > self._logical_free_page_count(side):
+        for name, page_count in request_page_counts.items():
+            if page_count > free_logical_page_counts[name]:
                 return False
-            used_bytes += (side.live_page_count + page_count) * side.page_bytes
+            side = self.sides[name]
+            used_bytes += (live_page_counts[name] + page_count) * side.page_bytes
         return used_bytes <= self._allocatable_bytes
+
+    def _can_fit_packed(self, page_counts: dict[str, int]) -> bool:
+        return self._can_fit_state(
+            {name: side.live_page_count for name, side in self.sides.items()},
+            {
+                name: self._logical_free_page_count(side)
+                for name, side in self.sides.items()
+            },
+            page_counts,
+        )
 
     def _begin_compaction(self) -> list:
         if self._layout_lease_state.depth:
@@ -533,6 +548,48 @@ class _SharedPageEnvelopeHostBacking:
                 self.sides[name].free_logical_extents = extents
             return results
 
+    def can_fit_many_then(
+        self,
+        requests: Sequence[tuple[str, int]],
+        following_requests: Sequence[tuple[str, int]],
+        *,
+        empty: bool = False,
+    ) -> bool:
+        """Whether both allocation groups fit in order without mutating state."""
+        with self.lock:
+            _, first_page_counts = self._request_page_counts(requests)
+            _, following_page_counts = self._request_page_counts(following_requests)
+            if empty:
+                live_page_counts = {name: 0 for name in self.sides}
+                free_logical_page_counts = {
+                    name: side.page_num for name, side in self.sides.items()
+                }
+            else:
+                live_page_counts = {
+                    name: side.live_page_count for name, side in self.sides.items()
+                }
+                free_logical_page_counts = {
+                    name: self._logical_free_page_count(side)
+                    for name, side in self.sides.items()
+                }
+            if not self._can_fit_state(
+                live_page_counts, free_logical_page_counts, first_page_counts
+            ):
+                return False
+            live_after_first = {
+                name: live_page_counts[name] + first_page_counts[name]
+                for name in self.sides
+            }
+            free_after_first = {
+                name: free_logical_page_counts[name] - first_page_counts[name]
+                for name in self.sides
+            }
+            return self._can_fit_state(
+                live_after_first,
+                free_after_first,
+                following_page_counts,
+            )
+
     def free(self, name: str, indices: torch.Tensor) -> int:
         with self.lock:
             side = self.sides[name]
@@ -599,6 +656,8 @@ class _SharedPageEnvelopeHostBacking:
 
 class UnifiedPageEnvelopeHostPool(HostKVCache):
     """Host mirror that transfers complete unified-memory page envelopes."""
+
+    stores_page_envelope = True
 
     def __init__(
         self,

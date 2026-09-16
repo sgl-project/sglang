@@ -366,7 +366,7 @@ pub struct PoolTransferResult {
 }
 
 /// A device->host backup work item for the cache to execute.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BackupKV {
     /// Backup these nodes device->host in order, stopping at the first failure; the
     /// caller orders them parent-before-child for write-through and child-first for
@@ -461,6 +461,11 @@ pub struct ComponentState {
     /// leaf may be freed: the leaf's parent for Full, the LRU predecessor for
     /// SWA and Mamba.
     pub(crate) evict_device_cursor: Option<NodeIdx_>,
+    /// Internal node whose component value must be backed up before the walk
+    /// can tombstone it. The Controller consumes this request between steps.
+    pub(crate) evict_device_backup_node: Option<NodeIdx_>,
+    /// A resumed, still-unbacked victim is skipped after failed host allocation.
+    pub(crate) evict_device_last_backup: Option<NodeIdx_>,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
 }
@@ -517,6 +522,7 @@ pub struct EvictionStepResult {
     pub tracker: HashMap<ComponentType, usize>,
     pub device_frees: HashMap<ComponentType, Vec<Tensor>>,
     pub host_frees: HashMap<ComponentType, Vec<Tensor>>,
+    pub backup_kv: Option<BackupKV>,
 }
 
 /// The radix tree mechanism: owns the tree structure, per-node values, the
@@ -558,6 +564,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
+    /// Whether dirty internal SWA nodes must be backed up before eviction.
+    pub(crate) swa_write_back_eviction_barrier_enabled: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
     /// Queued placement events, drained by take_events.
@@ -670,6 +678,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
         state.evict_device_cursor = None;
+        state.evict_device_backup_node = None;
+        state.evict_device_last_backup = None;
     }
 
     /// Finish the component's device-eviction bookkeeping; panics if no walk
@@ -682,6 +692,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = false;
         state.evict_device_cursor = None;
+        state.evict_device_backup_node = None;
+        state.evict_device_last_backup = None;
     }
 
     /// Add newly evictable device tokens to the component's evictable size.
@@ -741,6 +753,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
+            swa_write_back_eviction_barrier_enabled: false,
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
@@ -2167,6 +2180,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &mut result.device_frees,
                 &mut result.host_frees,
             );
+        let backup_node = self
+            .component_state_mut(component_type)
+            .evict_device_backup_node
+            .take();
+        if let Some(backup_node) = backup_node {
+            assert!(node_id.is_none());
+            result.backup_kv =
+                Some(self.build_backup_kv_action_(self.arena.node(backup_node), true));
+        }
         for (ct, total) in tracker {
             let delta = total - baseline.get(&ct).copied().unwrap_or(0);
             if delta > 0 {
@@ -2224,10 +2246,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((None, result))
     }
 
-    /// Write-back fallback when a D-leaf's D->H backup fails under host
-    /// memory pressure: drop the subtree rooted at the unbacked leaf so
-    /// device eviction keeps making progress instead of leaving its KV
-    /// unevictable until host space frees up.
+    /// Drop an unlocked subtree when its write-back cannot reserve host KV.
     pub fn drop_subtree_no_host(
         &mut self,
         node_id: NodeId,
@@ -2236,47 +2255,37 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
-            assert!(
-                self.is_evictable_device_leaf_(node),
-                "node {node_id} is not a D-leaf"
-            );
             // A failed backup never issues the D->H copy, so the subtree root has
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
-            if node.is_host_locked() {
-                return Ok((false, result));
-            }
         }
-        let mut descendants: Vec<NodeIdx_> = Vec::new();
-        let mut stack: Vec<NodeIdx_> = self
-            .arena
-            .node(node_id)
-            .children
-            .values()
-            .copied()
-            .collect();
+        let mut subtree: Vec<NodeIdx_> = Vec::new();
+        let mut stack = vec![node_id];
         while let Some(cur_id) = stack.pop() {
             let cur = self.arena.node(cur_id);
-            if cur.is_device_locked() || cur.is_host_locked() {
+            if cur.is_device_locked()
+                || cur.is_host_locked()
+                || cur.write_through_pending_id.is_some()
+                || cur.is_load_back_pending()
+            {
                 return Ok((false, result));
             }
-            descendants.push(cur_id);
+            subtree.push(cur_id);
             stack.extend(cur.children.values().copied());
         }
-        for &desc_id in descendants.iter().rev() {
-            {
-                let desc = self.arena.node(desc_id);
-                // Host-only by construction: a device descendant would contradict
-                // this node being a D-leaf, and D-leaves evict before ancestors.
-                assert!(
-                    desc.evicted() && desc.backuped(),
-                    "node {desc_id} not host-only"
-                );
-                assert!(desc.write_through_pending_id.is_none());
-            }
+        for &desc_id in subtree[1..].iter().rev() {
+            let desc = self.arena.node(desc_id);
+            let medium = if desc.evicted() {
+                StorageMedium::Cpu
+            } else {
+                if desc.backuped() {
+                    self.record_remove_event_(desc_id, StorageMedium::Cpu);
+                }
+                StorageMedium::Gpu
+            };
             self.release_all_component_layers_(
                 desc_id,
-                StorageMedium::Cpu,
+                medium,
                 &mut result.tracker,
                 &mut result.device_frees,
                 &mut result.host_frees,
@@ -2806,6 +2815,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Mark the host tier (HiCache) as wired.
     pub fn set_hicache_enabled(&mut self) {
         self.enable_hicache = true;
+    }
+
+    /// Preserve dirty internal SWA nodes before cache-mode write-back eviction.
+    pub fn enable_swa_write_back_eviction_barrier(&mut self) {
+        self.swa_write_back_eviction_barrier_enabled = true;
     }
 
     /// Mark the host tier as buffer-only; wired after the host pools are built.

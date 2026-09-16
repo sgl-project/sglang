@@ -86,6 +86,7 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        self._evict_device_last_backup_id: Optional[NodeId] = None
 
     component_type = ComponentType.SWA
 
@@ -701,6 +702,7 @@ class SWAComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
+        self._evict_device_last_backup_id = None
         if self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
@@ -733,6 +735,15 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_lru_no_lock()
             )
+        x = self._evict_device_cursor
+        if (
+            x is not None
+            and x.id == self._evict_device_last_backup_id
+            and not x.backuped
+        ):
+            self._evict_device_cursor = (
+                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
+            )
         if (
             tracker[ct] >= self._evict_device_request_cnt
             or self._evict_device_cursor is None
@@ -749,6 +760,15 @@ class SWAComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
+        if (
+            self.tree_core.is_write_back
+            and self.tree_core.swa_write_back_eviction_barrier_enabled
+            and not x.backuped
+        ):
+            # Back up a dirty internal SWA node before its device value is lost.
+            self._evict_device_last_backup_id = x.id
+            self.request_backup_before_device_eviction(x.id)
+            return None
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
         self.tree_core._evict_component_and_detach_lru(
@@ -770,6 +790,7 @@ class SWAComponent(TreeComponent):
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
+        self._evict_device_last_backup_id = None
 
     def acquire_component_lock(
         self,
@@ -1048,12 +1069,27 @@ class SWAComponent(TreeComponent):
             if not unbacked_swa_nodes:
                 return None
             unbacked_swa_nodes.reverse()
+            allocator = self._unified_allocator()
+            if allocator is not None:
+                full_values = []
+                for unbacked_node in unbacked_swa_nodes:
+                    full_value = unbacked_node.component_data[BASE_COMPONENT_TYPE].value
+                    assert full_value is not None
+                    assert len(full_value) == len(
+                        unbacked_node.component_data[ct].value
+                    )
+                    full_values.append(full_value)
+                device_indices = allocator.translate_swa_indices_for_transfer(
+                    torch.cat(full_values)
+                )
+            else:
+                device_indices = torch.cat(
+                    [n.component_data[ct].value for n in unbacked_swa_nodes]
+                ).to(torch.int64)
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=torch.cat(
-                        [n.component_data[ct].value for n in unbacked_swa_nodes]
-                    ).to(torch.int64),
+                    device_indices=device_indices,
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
             ]

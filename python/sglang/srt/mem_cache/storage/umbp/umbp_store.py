@@ -919,6 +919,7 @@ class UMBPStore(HiCacheStorage):
         # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
         self._kv_anchor_is_logical = False
+        self._kv_anchor_is_page_envelope = False
         self._registered_regions: set = set()
 
         self.client = UMBPClient(cfg)
@@ -1003,6 +1004,7 @@ class UMBPStore(HiCacheStorage):
 
         # A logical anchor owns indices; side pools carry the data.
         self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
+        self._kv_anchor_is_page_envelope = self.mem_pool_host.stores_page_envelope
         self._zero_copy_registered = False
 
         # Side-pool registration needs the mode even for a logical anchor.
@@ -1165,68 +1167,61 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
     # ------------------------------------------------------------------
-    def _get_mha_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mha_suffix}_k")
-            key_list.append(f"{key_}_{self.mha_suffix}_v")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
-    def _get_mha_split_heads_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = (
-            self.mem_pool_host.get_split_heads_page_buffer_meta(
-                indices, self.split_factor
-            )
+    def _anchor_key_suffixes(self) -> tuple[str, ...]:
+        if self._kv_anchor_is_page_envelope:
+            return (f"_{self.mha_suffix}_kv",)
+        if self.is_mla_backend:
+            return (f"_{self.mla_suffix}_k",)
+        ranks = (
+            self.mha_suffix
+            if self.storage_config and self.storage_config.should_split_heads
+            else (self.mha_suffix,)
         )
-        key_list = []
-        for key_ in keys:
-            for suffix in self.mha_suffix:
-                key_list.append(f"{key_}_{suffix}_k")
-                key_list.append(f"{key_}_{suffix}_v")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
+        return tuple(
+            f"_{rank}_{component}" for rank in ranks for component in ("k", "v")
+        )
 
-    def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
+    def _anchor_keys(self, keys) -> tuple[list[str], int]:
+        suffixes = self._anchor_key_suffixes()
+        return [f"{key}{suffix}" for key in keys for suffix in suffixes], len(suffixes)
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
-        if self.is_mla_backend:
-            return self._get_mla_buffer_meta(keys, host_indices)
+        key_list, _ = self._anchor_keys(keys)
+        if (
+            not self._kv_anchor_is_page_envelope
+            and not self.is_mla_backend
+            and self.storage_config
+            and self.storage_config.should_split_heads
+        ):
+            ptr_list, element_size_list = (
+                self.mem_pool_host.get_split_heads_page_buffer_meta(
+                    host_indices, self.split_factor
+                )
+            )
         else:
-            if self.storage_config and self.storage_config.should_split_heads:
-                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-            else:
-                return self._get_mha_buffer_meta(keys, host_indices)
+            ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
+                host_indices
+            )
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
 
     def _batch_postprocess(self, results: List[bool], is_set_operate=False):
         """Convert per-key-component results to per-page results.
 
-        For MHA: each page has K+V → group pairs.
-        For MLA: each page has K only.
+        Unified page envelopes and MLA have one object per page. Ordinary MHA
+        has K+V pairs, or one pair per split rank.
         """
-        if self.is_mla_backend:
+        group_size = len(self._anchor_key_suffixes())
+        if group_size == 1:
             return list(results)
-        else:
-            if self.storage_config and self.storage_config.should_split_heads:
-                group_size = self.split_factor * 2
-                groups = [
-                    results[i : i + group_size]
-                    for i in range(0, len(results), group_size)
-                ]
-                return [all(g) for g in groups]
-            else:
-                # Group K/V pairs
-                kv_pairs = zip(results[::2], results[1::2])
-                return [k and v for k, v in kv_pairs]
+        result_count = len(results)
+        if not (self.storage_config and self.storage_config.should_split_heads):
+            result_count -= result_count % group_size
+        return [
+            all(results[i : i + group_size]) for i in range(0, result_count, group_size)
+        ]
 
     # ------------------------------------------------------------------
     # Zero-copy v1 interface
@@ -1284,19 +1279,8 @@ class UMBPStore(HiCacheStorage):
         depths_per_page = [prefix_len + i for i in range(len(keys))]
 
         # Expand to match the key_strs layout produced by _batch_preprocess.
-        expanded = []
-        for d in depths_per_page:
-            if self.is_mla_backend:
-                expanded.append(d)  # MLA: 1 key per page
-            elif self.storage_config and self.storage_config.should_split_heads:
-                # split heads: 2 keys per split rank, split_factor ranks per page
-                for _ in range(self.split_factor):
-                    expanded.append(d)
-                    expanded.append(d)
-            else:
-                expanded.append(d)  # K
-                expanded.append(d)  # V
-        return expanded
+        objects_per_page = len(self._anchor_key_suffixes())
+        return [depth for depth in depths_per_page for _ in range(objects_per_page)]
 
     def batch_set_v1(
         self,
@@ -1354,23 +1338,7 @@ class UMBPStore(HiCacheStorage):
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         """Return count of consecutive existing keys from start."""
-        if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            query_keys = []
-            if self.storage_config and self.storage_config.should_split_heads:
-                for key in keys:
-                    for suffix in self.mha_suffix:
-                        query_keys.append(f"{key}_{suffix}_k")
-                        query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
-            else:
-                for key in keys:
-                    query_keys.append(f"{key}_{self.mha_suffix}_k")
-                    query_keys.append(f"{key}_{self.mha_suffix}_v")
-                key_multiplier = 2
-
+        query_keys, key_multiplier = self._anchor_keys(keys)
         hit_count = self.client.batch_exists_consecutive(query_keys)
         return hit_count // key_multiplier
 
