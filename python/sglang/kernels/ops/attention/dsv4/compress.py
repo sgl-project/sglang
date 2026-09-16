@@ -458,8 +458,6 @@ def compress_norm_rope_store(
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     fp4_k_write_metadata=None,
-    # Page layout of a FlashMLA (head_dim 512) main-KV cache: the 584-byte V4
-    # layout, or the V4.1 fp8 / fp4 formats (CUDA only).
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,

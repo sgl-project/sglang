@@ -72,10 +72,7 @@ constexpr int64_t kv_page_bytes(int64_t page_size) {
   return (page_size * Traits::kBytesPerToken + Traits::kPageAlign - 1) / Traits::kPageAlign * Traits::kPageAlign;
 }
 
-/// Addressing of a paged cache in one layout: a page is `1 << kPageBits` data rows followed
-/// by as many scale rows, padded to the layout's kPageAlign. Every member is a compile-time
-/// constant or a constant shift / multiply of the token index, so it folds to the same code
-/// as the hand-written arithmetic; the index keeps the caller's type `LocT`.
+/// Addressing of a paged cache: `1 << kPageBits` data rows then as many scale rows, padded to kPageAlign.
 template <KVLayout kLayout, uint32_t kPageBits>
 struct PagedKV {
   using Traits = KVLayoutTraits<kLayout>;
@@ -120,9 +117,7 @@ namespace v41 {
 
 /// The row helpers below quantize one 512-wide token spread over `512 / kVecSize` threads,
 /// thread `tx` holding elements `[kVecSize * tx, kVecSize * (tx + 1))` as fp32. They are
-/// warp-collective (sub-warp reductions under the full mask), so every thread of the token
-/// must call them together. `kVecSize` is even, a power of two and at most the tile size.
-/// NaN / inf inputs are not handled.
+/// warp-collective: every thread of the token must call them together. NaN / inf are not handled.
 
 /// Per-thread |max| over the vector.
 template <uint32_t kVecSize>
@@ -146,10 +141,8 @@ SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   static_assert(kVecSize % 2 == 0 && kTileLanes >= 1 && (kTileLanes & (kTileLanes - 1)) == 0);
 
   const float amax = warp::reduce_max<kTileLanes>(vec_amax(v));
-  // ceil(log2(max(amax / 448, 1e-4))) straight from the bits of amax: 448 = 1.75 * 2^8, so
-  // the quotient's exponent is amax's minus 8, plus one when amax's mantissa exceeds 1.75
-  // (the quotient is then just above a power of two), floored at 2^-13, the smallest power
-  // of two >= 1e-4. Exact for every finite amax, without the reference's fp32 division.
+  // ceil(log2(max(amax / 448, 1e-4))) exactly, from the bits of amax: 448 = 1.75 * 2^8, so the
+  // quotient's exponent is amax's minus 8, plus one when the mantissa exceeds 1.75, floored at 2^-13.
   const uint32_t bits = __float_as_uint(amax);
   const int32_t exponent =
       max(static_cast<int32_t>(bits >> 23) - 8 + static_cast<int32_t>((bits & 0x7FFFFFu) > 0x600000u), 114);
@@ -182,8 +175,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   AlignedVector<uint8_t, kVecSize / 2> out;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    // IEEE division by the rounded scale, as the reference divides; a reciprocal multiply
-    // could land on the other side of an e2m1 tie.
+    // IEEE division by the rounded scale, as the reference does; a reciprocal multiply could cross an e2m1 tie.
     out[i] = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
         fp32x2_t{__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}, __NV_E2M1, cudaRoundNearest));
   }
