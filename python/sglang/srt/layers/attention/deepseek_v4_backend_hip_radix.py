@@ -831,6 +831,11 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
+        # DSpark metadata can be rebuilt from device lengths, including replay.
+        # EAGLE and the online c128 planner still consume CPU lengths.
+        self.needs_cpu_seq_lens = (
+            not self.is_dspark or envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        )
         self.is_dspark_draft = self.is_draft_worker and self.is_dspark
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
@@ -940,11 +945,11 @@ class DeepseekV4HipRadixBackend(
         max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         out_cache_loc: torch.Tensor,
         num_tokens: int,
         extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: List[int],
+        extend_seq_lens_cpu: Optional[List[int]],
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
         compress_gpu_plan: bool = False,
@@ -1124,8 +1129,6 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
             )
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.tolist()
         return self.init_forward_metadata_target_verify_old(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -1175,12 +1178,18 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu = None
         else:
             seq_lens = seq_lens + self.target_verify_num_draft_tokens
-            seq_lens_cpu = [
-                x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
-            ]
-            extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
+            if seq_lens_cpu is None:
+                extend_seq_lens_cpu = None
+                extend_seq_lens = torch.full_like(
+                    seq_lens, self.target_verify_num_draft_tokens
+                )
+            else:
+                seq_lens_cpu = [
+                    x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
+                ]
+                extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
+                extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
             num_tokens = self.target_verify_num_draft_tokens * batch_size
-            extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
             exact_num_tokens = True
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
@@ -1198,7 +1207,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            compress_gpu_plan=ragged_layout is not None,
+            compress_gpu_plan=seq_lens_cpu is None,
             extend_start_loc=extend_start_loc,
             attach_decode_streams=True,
             exact_num_tokens=exact_num_tokens,
@@ -1638,7 +1647,7 @@ class DeepseekV4HipRadixBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_cpu = seq_lens.cpu() if self.needs_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
@@ -1660,14 +1669,12 @@ class DeepseekV4HipRadixBackend(
             )
             out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
 
-        assert seq_lens_cpu is not None
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
-
-        actual_max_seq_len = seq_lens_cpu.max().item()
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-        assert actual_max_seq_len <= chosen_max_seq_len
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
+            assert seq_lens_cpu.max().item() <= chosen_max_seq_len
 
         graph_key = bs
 
@@ -1724,9 +1731,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
-                # CPU mirror already available here (== seq_lens, no D2H);
-                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
-                seq_lens_cpu=seq_lens_cpu.tolist(),
+                seq_lens_cpu=(
+                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
                 ragged_layout=ragged_layout,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
@@ -1782,11 +1789,10 @@ class DeepseekV4HipRadixBackend(
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
-        assert seq_lens_cpu is not None
         max_seq_len = (
             max_seq_len_override
             if max_seq_len_override is not None
-            else int(seq_lens_cpu.max().item())
+            else (int(seq_lens_cpu.max().item()) if seq_lens_cpu is not None else self.MAX_SEQ_LEN_FOR_CAPTURE)
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():

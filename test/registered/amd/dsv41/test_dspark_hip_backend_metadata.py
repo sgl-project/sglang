@@ -65,6 +65,9 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     backend.speculative_num_steps = 0
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = block_size + 1
+    backend.is_dspark = True
+    backend.needs_cpu_seq_lens = False
+    backend._fp4_graph_row_limit = None
     backend.is_draft_worker = is_dspark_draft
     backend.is_dspark_draft = is_dspark_draft
     # The draft verifies gamma rows, the target gamma + 1 (bonus included).
@@ -194,6 +197,12 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
             )
 
     def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
+        self._check_block_window_replay(cpu_mirror=True)
+
+    def test_block_window_replay_without_cpu_lengths(self):
+        self._check_block_window_replay(cpu_mirror=False)
+
+    def _check_block_window_replay(self, *, cpu_mirror):
         """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
         a replay must refresh it in place for new lengths and slots."""
         block = 3
@@ -234,6 +243,9 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         width = core.swa_page_indices.shape[1]
 
         replay_batch = make_batch([150, 7], OUT_LOC_BASE + 100, cpu_extended=True)
+        if not cpu_mirror:
+            replay_batch.seq_lens_cpu = None
+            replay_batch.seq_lens_sum = None
         backend.init_forward_metadata_out_graph(replay_batch)
         self.assertIs(backend.forward_metadata, captured)
         for b, p in enumerate([150, 7]):
@@ -336,6 +348,55 @@ class TestLowRatioTargetVerifyHip(CustomTestCase):
         import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as module
 
         self.module = module
+
+    def test_target_verify_device_lengths_match_cpu_and_replay(self):
+        backend = _make_backend(block_size=4, device=self.device, is_dspark_draft=False)
+        backend.has_c128 = True
+        backend.token_to_kv_pool.swa_page_size = SWA_WINDOW
+        backend.token_to_kv_pool._unified_kv = False
+        backend.token_to_kv_pool.get_ring_size = lambda **kwargs: 128
+        prefix = torch.tensor([125, 255], dtype=torch.int32, device=self.device)
+        slots = torch.tensor([1, 4], dtype=torch.int32, device=self.device)
+        count = 2 * backend.target_verify_num_draft_tokens
+        out_loc = torch.arange(count, device=self.device) + OUT_LOC_BASE
+
+        def build(cpu_lengths):
+            return backend.init_forward_metadata_target_verify_old(
+                max_seq_len=MAX_CONTEXT - backend.target_verify_num_draft_tokens,
+                req_pool_indices=slots,
+                seq_lens=prefix,
+                seq_lens_cpu=cpu_lengths,
+                out_cache_loc=out_loc,
+                use_prefill_cuda_graph=True,
+            )
+
+        # Build the full compressor plan on device, not just the raw wrapper.
+        build(None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = build(None)
+        for lengths, request_slots in (([125, 255], [1, 4]), ([254, 381], [4, 2])):
+            prefix.copy_(torch.tensor(lengths, device=self.device))
+            slots.copy_(torch.tensor(request_slots, device=self.device))
+            out_loc.add_(count)
+            graph.replay()
+            reference = build(lengths)
+            for name in ("seq_lens_casual", "swa_page_indices", "swa_topk_lengths"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(captured.core_metadata, name),
+                        getattr(reference.core_metadata, name),
+                    ),
+                    name,
+                )
+            for name in ("plan_c", "plan_w"):
+                self.assertTrue(
+                    torch.equal(
+                        getattr(captured.c128_compress_metadata, name),
+                        getattr(reference.c128_compress_metadata, name),
+                    ),
+                    name,
+                )
 
     def test_target_verify_indexer_takes_the_decode_body(self):
         backend = _make_backend(
