@@ -420,7 +420,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
     try:
         import aiter.fused_moe as fm
         from aiter import dtypes
-        from aiter.jit.utils.chip_info import get_gfx  # noqa: F401  (import check)
 
         orig_fused_moe = fm.fused_moe
         orig_sorting_impl = fm._moe_sorting_impl
