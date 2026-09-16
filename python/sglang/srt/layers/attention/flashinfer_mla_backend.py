@@ -573,9 +573,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 "target-verify cuda-graph replay requires host-resident seq_lens_cpu"
             )
             ndt = spec_info.draft_token_num
-            is_dflash_verify = (
-                spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-            )
+            is_dflash_verify = spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
             self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
                 0, (bs + 1) * ndt, ndt, dtype=torch.int32
             )
