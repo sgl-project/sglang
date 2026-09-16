@@ -55,6 +55,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed import fp8_prefill_ar
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1158,7 +1159,15 @@ class DeepseekV2MoE(nn.Module):
             and not all_reduce_done
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            # PREFILL all-reduce site 2 of 2 (AR#2): the post-experts MoE combine.
+            # THIS is the live combine collective on DSV4.1 -- the analogous hook
+            # in `layers/moe/fused_moe_triton/layer.py` is dead code on this build
+            # (see fp8_prefill_ar's module docstring). Pass-through to the stock
+            # collective unless `SGLANG_FP8_PREFILL_AR2` is set and this is an
+            # extend forward clearing the token floor.
+            final_hidden_states = fp8_prefill_ar.maybe_fp8_all_reduce_ar2(
+                final_hidden_states, layer_id=self.layer_id
+            )
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1308,7 +1317,11 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            # PREFILL all-reduce site 2 of 2 (AR#2), non-dual-stream path. See the
+            # note on the dual-stream site above.
+            final_hidden_states = fp8_prefill_ar.maybe_fp8_all_reduce_ar2(
+                final_hidden_states, layer_id=self.layer_id
+            )
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:

@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.srt.distributed import fp8_prefill_ar
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
@@ -1687,6 +1688,12 @@ class RowParallelLinear(LinearBase):
                 )
                 if quantize_communications:
                     output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                elif getattr(self, "_fp8_prefill_ar", False):
+                    # Opt-in marker, set only on the DSV4 attention `wo_b`. Inside,
+                    # this still falls back to the stock collective unless the fp8
+                    # prefill AR is enabled AND this is an extend forward AND the
+                    # tensor clears the token floor -- so decode is untouched.
+                    output = fp8_prefill_ar.maybe_fp8_all_reduce(output_parallel)
                 else:
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:

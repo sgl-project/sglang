@@ -3756,11 +3756,21 @@ class DeepseekV4AttnBackend(
                 # drop it instead of attending on garbage heads (4x the work
                 # at attn-TP 4).
                 real_heads = layer.tp_q_head_num
-                if q.shape[0] > SM120_DECODE_MAX_TOKENS:
-                    if q.shape[-2] > real_heads:
-                        q = q[..., :real_heads, :].contiguous()
-                    if attn_sink is not None and attn_sink.shape[0] > real_heads:
-                        attn_sink = attn_sink[:real_heads]
+                # The `q.shape[0] > SM120_DECODE_MAX_TOKENS` gate that used to wrap
+                # this trim restricted it to PREFILL, because the OLD decode kernel
+                # needed q padded to 64 heads for its h_q specialization. The
+                # rewritten decode kernel does not: it takes arbitrary H via
+                # grid = (B, cdiv(H, BLOCK_H)) and h_mask = h_offs < H. Leaving the
+                # pad in place made decode run cdiv(64,16) = 4 head-tiles where only
+                # the first holds real heads -- 3/4 of the CTAs computing garbage.
+                # Measured 1.86x at B=48 (bs 8-10), free below that only because the
+                # SMs were idle anyway. Prefill already trimmed here and its output
+                # flows through the same `o = o.squeeze(1)`, so the consumer already
+                # handles real_heads.
+                if q.shape[-2] > real_heads:
+                    q = q[..., :real_heads, :].contiguous()
+                if attn_sink is not None and attn_sink.shape[0] > real_heads:
+                    attn_sink = attn_sink[:real_heads]
 
                 o = flash_mla_with_kvcache_sm120(
                     q=q,

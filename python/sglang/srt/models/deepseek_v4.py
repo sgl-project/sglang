@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
 )
+from sglang.srt.distributed import fp8_prefill_ar
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -276,6 +278,42 @@ def _get_mhc_ops() -> MhcOps:
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+# --- sm120 fp8 wo_a absorb GEMM (load-time re-quantisation) -------------------
+# The shipped fp8 wo_a path (``wo_a_fp8_gemm_enabled`` below) needs an Fp8Config
+# with 128x128 weight blocks.  The DSV4.1-Flash checkpoint ships 32x32 ue8m0
+# blocks and this deployment runs mxfp8/mxfp4, so wo_a is dequantised to bf16 at
+# load and the absorb BMM streams 2x the bytes it has to.  Measured on sm120 the
+# 128x128 DeepGEMM layout is actually *slower* than the bf16 bmm (0.63x); only
+# per-row 1x128 ue8m0 scales with recipe (1,1,128) win (1.62x).  So instead of
+# reusing the checkpoint scales we re-quantise the loaded bf16 weight once, at
+# the end of weight loading, into exactly that layout.  Off by default.
+_WO_A_FP8_REQUANT = os.environ.get("SGLANG_WO_A_FP8_REQUANT", "0") == "1"
+
+
+def _wo_a_requant_fp8_1x128(w: torch.Tensor):
+    """[G, R, D] bf16 -> (fp8_e4m3 [G, R, D], DeepGEMM-packed ue8m0 scales).
+
+    One ue8m0 (power-of-two) scale per row per 128-wide K block, which is
+    strictly finer than the checkpoint's 32x32 blocks along R and coarser along
+    D; the resulting scale tensor is what ``recipe=(1, 1, 128)`` expects.
+    """
+    import deep_gemm
+
+    G, R, D = w.shape
+    assert D % 128 == 0, f"wo_a K={D} must be a multiple of 128"
+    wf = w.float().view(G, R, D // 128, 128)
+    amax = wf.abs().amax(dim=-1).clamp_min(1e-10)
+    s = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    q = (
+        (wf / s.unsqueeze(-1))
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .view(G, R, D)
+        .contiguous()
+    )
+    sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(s.contiguous())
+    return q, sf
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
@@ -2098,6 +2136,27 @@ class MQALayer(MqaAttentionBase):
                     recipe=recipe,
                 )
                 o = output
+            elif (
+                getattr(self, "_wo_a_rq_w", None) is not None
+                and self._wo_a_rq_w.shape[0] == self.n_local_groups
+            ):
+                # Load-time-requantised fp8 absorb GEMM (see
+                # _wo_a_requant_fp8_1x128).  The activation quant already emits
+                # the group-major packed ue8m0 layout DeepGEMM wants.
+                import deep_gemm
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                rq_out = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_s),
+                    (self._wo_a_rq_w, self._wo_a_rq_sf),
+                    rq_out,
+                    recipe=(1, 1, 128),
+                )
+                o = rq_out
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
@@ -2116,6 +2175,21 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
+        if fp8_prefill_ar.ANY_ENABLED:
+            # PREFILL all-reduce site 1 of 2 (AR#1): the attention output
+            # collective, emitted inside `wo_b` (RowParallelLinear,
+            # reduce_results=True). `_fp8_prefill_ar` is an OPT-IN per-instance
+            # marker so the narrowed dtype reaches this linear and no other
+            # RowParallelLinear in the model.
+            #
+            # We also publish the real forward mode here for site 2 (the MoE
+            # combine), which has no `forward_batch` in scope -- sglang's
+            # ForwardContext carries only `attn_backend` -- and which always runs
+            # after attention within the same layer of the same forward. This
+            # runs whenever EITHER half is armed, because AR#2 depends on the
+            # published mode even when AR#1 is off.
+            fp8_prefill_ar.set_extend(forward_batch.forward_mode.is_extend())
+            self.wo_b._fp8_prefill_ar = True
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
@@ -2733,6 +2807,27 @@ class DeepseekV4DecoderLayer(nn.Module):
                 from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
                 return hc_combine_norm(
+                    x_flat, apply_pre, norm.weight, norm.variance_epsilon
+                )
+            from sglang.kernels.ops.layernorm.hc_combine_norm import (
+                MHC_FUSE_PREFILL_NORM,
+                hc_combine_norm_prefill,
+            )
+
+            if (
+                MHC_FUSE_PREFILL_NORM
+                and x.is_cuda
+                and get_platform().is_blackwell
+                and x.shape[0] > 8
+                and self.hc_mult == 4
+                and x_flat.shape[1] == 20480
+                and x.dtype == norm.weight.dtype == torch.bfloat16
+                and apply_pre.stride(1) == 1
+                and not norm.cast_x_before_out_mul
+                and norm.variance_size_override is None
+                and not is_batch_invariant_mode_enabled()
+            ):
+                return hc_combine_norm_prefill(
                     x_flat, apply_pre, norm.weight, norm.variance_epsilon
                 )
             return norm(hc_combine(x_flat, apply_pre, self.hc_mult, dtype))
@@ -4451,9 +4546,70 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _setup_requant_fp8_wo_a(self, is_nextn: bool) -> None:
+        """Install the sm120 fp8 absorb GEMM by re-quantising the bf16 wo_a."""
+        if is_nextn:
+            layers = [self.model.decoder]
+        else:
+            layers = [
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            ]
+        n = 0
+        for layer in layers:
+            attn = layer.self_attn
+            w = getattr(attn.wo_a, "weight", None)
+            if w is None or w.dtype != torch.bfloat16 or w.numel() == 0:
+                continue
+            G = attn.n_local_groups
+            R = attn.o_lora_rank
+            q, sf = _wo_a_requant_fp8_1x128(w.data.view(G, R, -1))
+            attn._wo_a_rq_w = q
+            attn._wo_a_rq_sf = sf
+            # Free the bf16 wo_a.  The requantised fp8 copy fully replaces it:
+            # the absorb-GEMM branch that reads ``_wo_a_rq_w`` is checked before
+            # the bf16 ``else``, and every other reader of ``wo_a.weight`` is
+            # gated on ``self.wo_a_fp8``, which is False whenever this path runs.
+            # Keeping both copies resident costs ~13% of the KV pool.
+            attn.wo_a.weight.data = torch.empty(0, dtype=w.dtype, device=w.device)
+            n += 1
+        if n:
+            # Force the activation-quant JIT kernel and the DeepGEMM einsum to
+            # compile now: the first call would otherwise land inside CUDA graph
+            # capture.
+            attn = (layers[0]).self_attn
+            G, R = attn.n_local_groups, attn.o_lora_rank
+            D = attn._wo_a_rq_w.shape[2]
+            dev = attn._wo_a_rq_w.device
+            for T in (1, 8, 24, 32):
+                probe = torch.zeros(T, G, D, device=dev, dtype=torch.bfloat16)
+                pq, ps = sglang_per_token_group_quant_fp8_dsv4_wo_a(probe)
+                out = torch.empty(T, G, R, device=dev, dtype=torch.bfloat16)
+                import deep_gemm
+
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (pq, ps),
+                    (attn._wo_a_rq_w, attn._wo_a_rq_sf),
+                    out,
+                    recipe=(1, 1, 128),
+                )
+            torch.cuda.synchronize()
+            # Return the freed bf16 wo_a blocks to the driver before the KV pool
+            # is sized off free HBM, otherwise the saving stays in the caching
+            # allocator and the pool does not grow.
+            torch.cuda.empty_cache()
+        logger.info(
+            "SGLANG_WO_A_FP8_REQUANT: installed fp8 wo_a on %d layers"
+            " (bf16 wo_a freed)",
+            n,
+        )
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+        elif _WO_A_FP8_REQUANT:
+            self._setup_requant_fp8_wo_a(is_nextn)
 
         if is_nextn:
             return

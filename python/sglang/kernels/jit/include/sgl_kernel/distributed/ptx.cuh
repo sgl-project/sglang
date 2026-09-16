@@ -110,11 +110,18 @@ SGL_DEVICE void ld_multimem_16B(V& x, const void* mc_addr, int64_t vec_offset) {
       asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.f16x2 {%0, %1, %2, %3}, [%4];"
                    : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
                    : "l"(mc_addr));
-    } else {
-      static_assert(std::is_same_v<V, device::AlignedVector<bf16x2_t, 4>>);  // 4x bf16x2
+    } else if constexpr (std::is_same_v<V, device::AlignedVector<bf16x2_t, 4>>) {  // 4x bf16x2
       asm volatile("multimem.ld_reduce.weak.add.acc::f32.v4.bf16x2 {%0, %1, %2, %3}, [%4];"
                    : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
                    : "l"(mc_addr));
+    } else {
+      // SGLANG_FP8_DECODE_AR: the fp8 instantiation of the all-reduce template
+      // pulls in this multicast path even though the fp8 wire only ever uses
+      // 1shot_push. multimem.ld_reduce has no fp8 variant, so turn what was a
+      // compile-time rejection into a runtime one -- the fp8 path never gets
+      // here (no multicast workspace on this node: no NVLink).
+      val = uint4{0, 0, 0, 0};
+      assert(false && "multimem ld_reduce: unsupported vector dtype");
     }
     x = *reinterpret_cast<const V*>(&val);
   }

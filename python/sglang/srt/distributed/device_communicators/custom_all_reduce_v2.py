@@ -29,6 +29,11 @@ from contextlib import contextmanager
 from typing import List, NamedTuple, Optional, Tuple
 
 import torch
+
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    _allow_pcie_p2p_custom_ar,
+    custom_ar_pcie_max_bytes,
+)
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
@@ -355,6 +360,12 @@ class CustomAllReduceV2:
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
+            return False
+        if (
+            _allow_pcie_p2p_custom_ar()
+            and inp_size > custom_ar_pcie_max_bytes()
+        ):
+            # Bandwidth-bound regime: the NCCL ring wins again above this size.
             return False
         if self.override_algo is not None:
             return inp_size <= self.max_size

@@ -9,6 +9,11 @@ from functools import partial
 from typing import Any, List, Optional, Union
 
 import torch
+
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    _allow_pcie_p2p_custom_ar,
+    custom_ar_pcie_max_bytes,
+)
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
@@ -265,6 +270,12 @@ class CustomAllreduce:
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
+            return False
+        if (
+            _allow_pcie_p2p_custom_ar()
+            and inp_size > custom_ar_pcie_max_bytes()
+        ):
+            # Bandwidth-bound regime: the NCCL ring wins again above this size.
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.

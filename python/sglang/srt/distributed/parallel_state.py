@@ -45,6 +45,7 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
+from sglang.srt.distributed import fp8_decode_ar
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -721,6 +722,18 @@ class GroupCoordinator:
                 group_name=self.unique_name,
                 outplace_all_reduce_method="auto",
             )
+
+        # SGLANG_FP8_DECODE_AR: narrow the DECODE tensor-parallel all-reduce's
+        # WIRE dtype to fp8-e4m3. Inert unless the env var is set. Placed here,
+        # above the method selection, on purpose: at k=5 the bf16 decode payload
+        # is 307,200 B -- just ABOVE the PCIe-P2P custom-AR ceiling (262,144 B),
+        # so it is routed to NCCL and never reaches CustomAllReduceV2 at all.
+        # Narrowing it first makes it 153,600 B, which BOTH halves the wire and
+        # returns it to the one-shot push kernel. Prefill (8192 rows) is excluded
+        # by `eligible`'s row ceiling, and the re-entrant call below cannot
+        # recurse: an fp8 tensor is never eligible.
+        if fp8_decode_ar.eligible(input_):
+            return fp8_decode_ar.narrow_all_reduce(input_, self.all_reduce)
 
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None

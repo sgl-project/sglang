@@ -380,6 +380,14 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
+            # Dense-only NVFP4 (opt in with SGLANG_DENSE_NVFP4=1).
+            from sglang.srt.layers.quantization.dense_nvfp4_online import (
+                DenseNvfp4LinearMethod,
+                dense_nvfp4_eligible,
+            )
+
+            if dense_nvfp4_eligible(prefix):
+                return DenseNvfp4LinearMethod(self, prefix)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(

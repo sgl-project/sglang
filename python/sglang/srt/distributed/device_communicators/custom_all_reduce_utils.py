@@ -439,6 +439,32 @@ def can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
+DEFAULT_CUSTOM_AR_PCIE_MAX_BYTES = 256 * 1024
+
+
+def _allow_pcie_p2p_custom_ar() -> bool:
+    """Opt in to one-shot custom all-reduce on PCIe-P2P-only (no NVLink) GPUs."""
+    return os.environ.get("SGLANG_CUSTOM_AR_ALLOW_PCIE_P2P", "0") == "1"
+
+
+def custom_ar_pcie_max_bytes() -> int:
+    """Byte ceiling for the PCIe-P2P custom all-reduce opt-in.
+
+    One-shot wins only while the collective is LATENCY-bound. Measured on
+    4x RTX PRO 6000 (sm120, PCIe gen5, no NVLink), bf16, in a captured graph:
+        10KB  17.44us NCCL ring-LL vs  2.47us one-shot  (7.05x)
+        40KB  18.58us            vs  4.47us            (4.16x)
+       160KB  23.79us            vs 14.59us            (1.63x)
+        1MB   63.92us            vs 87.74us            (0.73x  <-- ring wins)
+    Default ceiling sits between the last win and the crossover.
+    """
+    return int(
+        os.environ.get(
+            "SGLANG_CUSTOM_AR_PCIE_MAX_BYTES", DEFAULT_CUSTOM_AR_PCIE_MAX_BYTES
+        )
+    )
+
+
 def can_use_custom_all_reduce_with_nvlink(
     group: torch.distributed.ProcessGroup,
     device: torch.device,
@@ -490,12 +516,28 @@ def can_use_custom_all_reduce_with_nvlink(
     # where custom allreduce is not supported
     # this checks hardware and driver support for NVLink
     if world_size > 2 and not full_nvlink:
+        # Stock behaviour disables custom all-reduce here, on the assumption that
+        # the collective is BANDWIDTH-bound -- where a ring beats a one-shot IPC
+        # exchange. That assumption is false for small, LATENCY-bound payloads:
+        # a tp4 DeepSeek-V4 decode step issues ~88 all-reduces of only 10-40KB,
+        # where wire time is ~0.2% of the cost and one-shot is ~4x faster.
+        # Opt in with SGLANG_CUSTOM_AR_ALLOW_PCIE_P2P=1. The genuine can_p2p()
+        # probe below still runs and can still veto; a byte ceiling
+        # (custom_ar_pcie_max_bytes) keeps us out of the bandwidth-bound regime.
+        if not _allow_pcie_p2p_custom_ar() or world_size > 4:
+            logger.warning(
+                f"{cls_name} is disabled because it's not supported on"
+                " more than two PCIe-only GPUs. To silence this warning, "
+                "specify disable_custom_all_reduce=True explicitly."
+            )
+            return
         logger.warning(
-            f"{cls_name} is disabled because it's not supported on"
-            " more than two PCIe-only GPUs. To silence this warning, "
-            "specify disable_custom_all_reduce=True explicitly."
+            f"{cls_name}: NVLink absent, but SGLANG_CUSTOM_AR_ALLOW_PCIE_P2P=1 "
+            f"and world_size={world_size} <= 4 -- enabling one-shot custom "
+            f"all-reduce over PCIe P2P for payloads <= "
+            f"{custom_ar_pcie_max_bytes()} bytes."
         )
-        return
+        full_nvlink = True
 
     # test P2P capability, this checks software/cudaruntime support
     # this is expensive to compute at the first time

@@ -120,6 +120,19 @@ struct FloatTrait<float> {
   static constexpr uint32_t kNegZero = 0x80000000u;
 };
 
+#ifndef USE_ROCM
+// fp8-e4m3 on the wire (SGLANG_FP8_DECODE_AR). The lamport marker only has to
+// be a non-zero bit pattern that is numerically zero: with kAtom = 4 a uint32
+// atom holds FOUR fp8 values, and 0x80 flips the lowest-addressed one from +0
+// to -0 -- exactly what FloatTrait<bf16_t> already does for the low half of a
+// 4-byte atom (0x8000 widened to 0x00008000).
+template <>
+struct FloatTrait<fp8_e4m3_t> {
+  using type = uint8_t;
+  static constexpr uint8_t kNegZero = 0x80u;
+};
+#endif
+
 template <typename T, uint32_t N, uint32_t kAtom = sizeof(T)>
 struct LamportTrait {
   static_assert(kAtom >= sizeof(T) && (kAtom == 2 || kAtom == 4 || kAtom == 8));
