@@ -659,9 +659,9 @@ def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
         and logits.shape[0] <= 64
         and logits.shape[1] >= 4096
     ):
-        from sglang.kernels.ops.speculative.dspark.fast_argmax import fast_row_argmax
+        from sglang.kernels.ops.speculative.row_argmax import row_argmax
 
-        return fast_row_argmax(logits)
+        return row_argmax(logits)
     return torch.argmax(logits, dim=-1)
 
 

@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
-from sglang.kernels.ops.attention.dsv4.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
@@ -177,7 +177,7 @@ def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
     """
     if not torch.cuda.is_available() or torch.version.hip is not None:
         return -1
-    from sglang.kernels.ops.gemm.n32k5120 import MAX_M, can_use_n32k5120_gemm
+    from sglang.kernels.ops.gemm.small_gemm_bf16 import MAX_M, can_use_n32k5120_gemm
 
     return MAX_M if can_use_n32k5120_gemm(n_heads, hidden_size, 1) else -1
 
@@ -238,7 +238,7 @@ class DeepseekV41Indexer(nn.Module):
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
 
     def forward_wk(self, latent: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.gemm.n128k512 import (
+        from sglang.kernels.ops.gemm.small_gemm_bf16 import (
             can_use_n128k512_gemm,
             n128k512_gemm_bf16,
         )
@@ -264,7 +264,7 @@ class DeepseekV41Indexer(nn.Module):
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
-            from sglang.kernels.ops.gemm.n32k5120 import n32k5120_gemm_bf16
+            from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 
             return n32k5120_gemm_bf16(x, self.weights_proj.weight)
         w, _ = self.weights_proj(x)
