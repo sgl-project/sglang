@@ -120,6 +120,11 @@ def derive_namespace(
 
 
 def _validate_grid(namespace: KVCacheNamespace) -> None:
+    if not namespace.object_layout:
+        raise ValueError(
+            "the unified key scheme requires a non-empty object_layout: bytes "
+            f"with no declared order cannot be shared safely: {namespace}"
+        )
     if namespace.layer_partition < 0:
         raise ValueError(f"layer_partition must be non-negative: {namespace}")
     if namespace.page_size <= 0:
@@ -216,6 +221,7 @@ def plan_unified_kv(
     is_final_stage: bool,
     head_group: int | None = None,
     layer_partition: int | None = None,
+    object_layout: str = PAGE_UNIFIED_OBJECT_LAYOUT,
 ) -> UnifiedKVPlan:
     """Derive the namespace and this rank's chunk plan from deployment facts.
 
@@ -249,6 +255,7 @@ def plan_unified_kv(
         total_kv_heads=total_kv_heads,
         head_group=resolved_head_group,
         layer_partition=layer_partition or 0,
+        object_layout=object_layout,
     )
 
     layer_coords, layer_ranges = _layer_chunks(
