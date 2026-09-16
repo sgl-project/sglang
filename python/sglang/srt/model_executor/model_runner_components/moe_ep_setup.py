@@ -73,22 +73,6 @@ def prepare_moe_topk(
         log_info_on_rank0(logger, f"Prepared {num_prepared} Waterfill TopK modules.")
 
 
-def maybe_prebuild_deepep_v2_buffers(*, model, decode_cuda_graph_runner) -> None:
-    """Prebuild deepep_v2 buffers unless a captured decode graph already built them.
-
-    A captured decode graph already ran a dispatch that built the ElasticBuffer;
-    an EagerRunner means no capture happened, so prebuild is still needed.
-    """
-    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-
-    decode_runner_captured = decode_cuda_graph_runner is not None and not isinstance(
-        decode_cuda_graph_runner, EagerRunner
-    )
-    if decode_runner_captured:
-        return
-    prebuild_deepep_v2_buffers(model=model)
-
-
 def prebuild_deepep_v2_buffers(*, model) -> None:
     """Build every deepep_v2 dispatcher's ElasticBuffer at deployment time.
 
@@ -113,7 +97,9 @@ def prebuild_deepep_v2_buffers(*, model) -> None:
         num_prebuilt += 1
     if num_prebuilt:
         log_info_on_rank0(
-            logger, f"Prebuilt {num_prebuilt} DeepEP-V2 ElasticBuffer(s) at startup."
+            logger,
+            f"Prebuilt the DeepEP-V2 ElasticBuffer for {num_prebuilt} MoE layer(s) "
+            "at startup.",
         )
 
 

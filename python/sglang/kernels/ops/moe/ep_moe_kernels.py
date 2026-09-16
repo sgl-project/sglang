@@ -1338,46 +1338,6 @@ def ep_scatter_from_psum(
 
 
 @triton.jit
-def _fwd_kernel_ep_expand_m_indices_init(
-    psum_num_recv_tokens_per_expert,
-    m_indices,
-    BLOCK_E: tl.constexpr,
-):
-    cur_expert = tl.program_id(0)
-    cur_end = tl.load(psum_num_recv_tokens_per_expert + cur_expert)
-    prev_end = tl.load(
-        psum_num_recv_tokens_per_expert + cur_expert - 1,
-        mask=cur_expert > 0,
-        other=0,
-    )
-    cur_start = ((prev_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-    aligned_end = ((cur_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-
-    off_expert = tl.arange(0, BLOCK_E)
-    for start_m in tl.range(0, aligned_end - cur_start, BLOCK_E, num_stages=4):
-        idx = cur_start + start_m + off_expert
-        tl.store(m_indices + idx, cur_expert, mask=idx < aligned_end)
-
-
-@torch.no_grad()
-def ep_expand_init_m_indices_from_psum(
-    psum_num_recv_tokens_per_expert: torch.Tensor,
-    m_indices: torch.Tensor,
-):
-    BLOCK_E = 128
-    num_warps = 8
-    num_experts = psum_num_recv_tokens_per_expert.shape[0]
-    assert m_indices.shape[0] % BLOCK_E == 0
-    _fwd_kernel_ep_expand_m_indices_init[(num_experts,)](
-        psum_num_recv_tokens_per_expert,
-        m_indices,
-        num_warps=num_warps,
-        BLOCK_E=BLOCK_E,
-    )
-    return
-
-
-@triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,
     input_tensor,
@@ -2583,7 +2543,6 @@ def _fwd_kernel_fill_m_indices_from_psum(
     psum_ptr,
     m_indices_ptr,
     total_rows,
-    num_local_experts,
     ALIGN: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -2620,8 +2579,11 @@ def fill_m_indices_from_psum(
     assert total_rows % expert_alignment == 0, (
         f"total_rows {total_rows} not a multiple of expert_alignment {expert_alignment}"
     )
-    m_indices = torch.empty(
+    # -1 is DeepGEMM's "empty token" sentinel: uncovered rows are zero-filled and
+    # skipped instead of indexing the weight tensor out of bounds.
+    m_indices = torch.full(
         (total_rows,),
+        -1,
         device=psum_num_recv_tokens_per_expert.device,
         dtype=torch.int32,
     )
@@ -2629,41 +2591,11 @@ def fill_m_indices_from_psum(
         psum_num_recv_tokens_per_expert,
         m_indices,
         total_rows,
-        num_local_experts,
         ALIGN=expert_alignment,
         BLOCK_M=128,
         num_warps=4,
     )
     return m_indices
-
-
-@triton.jit
-def _fwd_kernel_scale_expanded_rows(
-    x_ptr,
-    x_stride0,
-    x_stride1,
-    weight_ptr,
-    HIDDEN: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    HIDDEN_IS_MULTIPLE: tl.constexpr,
-):
-    # In-place row scaling x[r,:] *= weight[r]; x_stride1 handles column-major
-    # views like the transposed fp8 down_input scale (hidden axis not unit-stride).
-    row = tl.program_id(0).to(tl.int64)
-    blk = tl.program_id(1)
-
-    offs = blk * BLOCK_H + tl.arange(0, BLOCK_H)
-    base = x_ptr + row * x_stride0 + offs * x_stride1
-
-    w = tl.load(weight_ptr + row).to(tl.float32)
-
-    if HIDDEN_IS_MULTIPLE:
-        v = tl.load(base)
-        tl.store(base, (v.to(tl.float32) * w).to(v.dtype))
-    else:
-        mask = offs < HIDDEN
-        v = tl.load(base, mask=mask)
-        tl.store(base, (v.to(tl.float32) * w).to(v.dtype), mask=mask)
 
 
 @torch.no_grad()
@@ -2677,38 +2609,17 @@ def scale_expanded_rows_(
     expanded GEMM output (or, folded earlier, into down_proj's transposed fp8
     input scale) before ElasticBuffer.combine (which ignores topk_weights in
     expand mode). `row_weights` must be a 1-D `[rows]` tensor (what DeepEP hands
-    back); the dtype/contiguous normalizations are no-ops on the hot path.
+    back).
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
-    rows, hidden = x.shape
+    rows, _ = x.shape
     assert row_weights.dim() == 1, (
         f"expected 1-D row_weights, got {row_weights.dim()}-D {tuple(row_weights.shape)}"
     )
     assert row_weights.numel() == rows, (
         f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
     )
-
-    if rows == 0:
-        return x
-
-    block_h = 2048 if hidden >= 2048 else triton.next_power_of_2(hidden)
-
-    weights = row_weights
-    if weights.dtype != torch.float32:
-        weights = weights.to(torch.float32)
-    if not weights.is_contiguous():
-        weights = weights.contiguous()
-
-    _fwd_kernel_scale_expanded_rows[(rows, ceil_div(hidden, block_h))](
-        x,
-        x.stride(0),
-        x.stride(1),
-        weights,
-        HIDDEN=hidden,
-        BLOCK_H=block_h,
-        HIDDEN_IS_MULTIPLE=(hidden % block_h == 0),
-        num_warps=4,
-    )
+    x.mul_(row_weights.to(x.dtype).unsqueeze(1))
     return x
 
 

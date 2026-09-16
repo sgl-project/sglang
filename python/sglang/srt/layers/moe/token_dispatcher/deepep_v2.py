@@ -117,15 +117,9 @@ def _ensure_fp8_quant_available() -> None:
 
 
 def _get_allow_hybrid_mode() -> bool:
-    # direct is NVLink-only and hangs across nodes; require explicit hybrid there.
-    mode = get_exec().moe.deepep_v2_mode
-    nnodes = get_parallel().nnodes
-    if mode == "direct" and nnodes > 1:
-        raise ValueError(
-            "--deepep-v2-mode direct is NVLink-only and cannot run across "
-            f"nodes (nnodes={nnodes}); pass --deepep-v2-mode hybrid."
-        )
-    return mode == "hybrid"
+    # Multi-node forces hybrid; direct + multi-node is rejected in server-args
+    # validation, so this stays a plain predicate.
+    return get_exec().moe.deepep_v2_mode == "hybrid" or get_parallel().nnodes > 1
 
 
 def _quantize_for_deepep_v2_dispatch(

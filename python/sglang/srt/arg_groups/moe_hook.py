@@ -25,7 +25,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import derive_attention_widths, get_platform
 from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -355,6 +355,11 @@ def handle_a2a_moe(server_args: Any):
                 "Remove --enforce-shared-experts-fusion when using "
                 "--moe-a2a-backend deepep_v2."
             )
+        if cfg.deepep_v2_mode == "direct" and cfg.nnodes > 1:
+            raise ValueError(
+                "--deepep-v2-mode direct is NVLink-only and cannot run across "
+                f"nodes (nnodes={cfg.nnodes}); pass --deepep-v2-mode hybrid."
+            )
         # Prefill reads host counts and is not graph-capturable.
         declare_resolution(
             server_args,
@@ -550,13 +555,17 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
-        # A per-DP chunk only scatters across attn-TP (and attn-CP) ranks when
-        # DP-attention or CP is on; otherwise each EP rank dispatches the full
-        # chunk. attn_tp_size mirrors derive_attention_widths (tp / attn_dp / cp).
-        if view.enable_dp_attention or view.attn_cp_size > 1:
-            attn_dp_size = view.dp_size if view.enable_dp_attention else 1
-            attn_tp_size = max(1, view.tp_size // attn_dp_size // view.attn_cp_size)
-            prefill_tokens = -(-prefill_tokens // attn_tp_size)
+        # A per-DP chunk is scattered across tp_size // attn_dp_size ranks before
+        # dispatch (CP shard at the model input, then attn-TP reduce-scatter), so
+        # that is the per-EP-rank divisor.
+        attn_dp_size, _ = derive_attention_widths(
+            tp_size=view.tp_size,
+            attn_cp_size=view.attn_cp_size,
+            dp_size=view.dp_size,
+            enable_dp_attention=view.enable_dp_attention,
+        )
+        scatter_ranks = max(1, view.tp_size // attn_dp_size)
+        prefill_tokens = -(-prefill_tokens // scatter_ranks)
         if prefill_tokens > capacity:
             raise ValueError(
                 "DeepEP v2 per-rank prefill budget exceeds "

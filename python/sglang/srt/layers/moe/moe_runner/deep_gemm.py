@@ -554,10 +554,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
-        deepep_v2_expanded = running_state.get(
-            "deepep_v2_expanded", False
-        ) and not running_state.get("deepep_v2_masked", False)
-        # ue8m0 scale is a power of two; folding w into it would need re-rounding.
+        deepep_v2_expanded = running_state.get("deepep_v2_expanded", False)
+        # Folding the row weight into down_input_scale needs a non-power-of-two
+        # scale; ue8m0 is a power of two, so it weights down_output before combine.
         fuse_weight_into_scale = (
             deepep_v2_expanded
             and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
