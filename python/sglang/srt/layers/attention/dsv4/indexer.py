@@ -1127,3 +1127,88 @@ class C4Indexer(nn.Module):
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
         )
+
+
+def fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
+    reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
+def fp32_jit_paged_topk(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
+    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
+    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.compressed_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.compressed_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.compressed_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.compressed_page_size,
+            raw_indices,
+        )
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level one of the two-level top-k: a bool mask over positions keeping the
+    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
+    in logits, so an all -inf block means not reachable yet; the block holding the
+    query's newest position is always kept."""
+    width = logits.size(-1)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        -1, top.indices, top.values > -torch.inf
+    )
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
