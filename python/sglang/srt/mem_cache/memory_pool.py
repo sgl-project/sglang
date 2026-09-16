@@ -25,7 +25,6 @@ from __future__ import annotations
 import abc
 import copy
 import dataclasses
-import functools
 import logging
 import math
 import os
@@ -117,6 +116,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
+if _is_xpu:
+    from sgl_kernel import store_cache_xpu
+
 
 def conv_window_dedup_enabled(
     is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
@@ -134,23 +136,6 @@ def conv_window_dedup_enabled(
         and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
-
-
-@functools.lru_cache(maxsize=1)
-def _get_store_cache_xpu():
-    """Return the fused ``store_cache_xpu`` kernel from sgl-kernel-xpu, or None.
-
-    The fused SYCL kernel replaces 2x ``index_put`` KV-cache writes with a
-    single kernel launch. It lives in the XPU build of ``sgl_kernel`` and may
-    be absent (older kernel, CPU-only install) — in that case we fall back to
-    ``index_put``. Cached so the import is attempted only once.
-    """
-    try:
-        from sgl_kernel import store_cache_xpu
-
-        return store_cache_xpu
-    except ImportError:
-        return None
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -187,21 +172,17 @@ def _set_kv_buffer_impl(
             size_limit=size_limit,
         )
 
+    # store_cache_xpu takes a single row_dim for both K and V; asymmetric KV
+    # falls through to the naive path below. The CUDA JIT store_cache above
+    # can't run on XPU, hence the separate dispatch.
     if _is_xpu and v_row_dim == row_dim:
-        # XPU uses the fused SYCL store_cache_xpu kernel from sgl-kernel-xpu
-        # (single launch instead of 2x index_put). The CUDA JIT store_cache
-        # above can't run on XPU, so this is a separate dispatch. Falls through
-        # to the naive index_put below when the kernel isn't installed.
-        store_cache_xpu = _get_store_cache_xpu()
-        if store_cache_xpu is not None:
-            store_cache_xpu(
-                k.view(-1, row_dim),
-                v.view(-1, row_dim),
-                k_cache.view(-1, row_dim),
-                v_cache.view(-1, row_dim),
-                indices,
-            )
-            return
+        return store_cache_xpu(
+            k.view(-1, row_dim),
+            v.view(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            indices,
+        )
 
     # store_cache_cpu takes a single row_dim for both K and V, so it only serves
     # equal-width rows; asymmetric KV falls through to the naive path below.

@@ -24,8 +24,9 @@ Run from test/registered::
 
   python3 -m unittest xpu.test_store_cache_xpu
 
-Requires Intel XPU and an sgl-kernel-xpu build that provides
-``store_cache_xpu`` (built from sgl-kernel-xpu main).
+Requires Intel XPU. ``store_cache_xpu`` is exported by the sgl-kernel-xpu
+wheel pinned in ``python/pyproject_xpu.toml``, so it is not optional: a missing
+op is a broken install and must fail loudly rather than skip.
 """
 
 from __future__ import annotations
@@ -51,16 +52,6 @@ def _reference_store(k, v, k_cache, v_cache, indices):
 @unittest.skipUnless(is_xpu(), "Intel XPU not available")
 class TestStoreCacheXPU(CustomTestCase):
     """store_cache_xpu, exercised through sglang's _set_kv_buffer_impl."""
-
-    @classmethod
-    def setUpClass(cls):
-        from sglang.srt.mem_cache.memory_pool import _get_store_cache_xpu
-
-        if _get_store_cache_xpu() is None:
-            raise unittest.SkipTest(
-                "sgl_kernel.store_cache_xpu not available; build sgl-kernel-xpu "
-                "from main (pip install -ve .) to enable the fused KV-cache path"
-            )
 
     def _store(self, k, v, k_cache, v_cache, indices):
         """Invoke sglang's KV-cache writer (the integration point)."""
@@ -195,26 +186,24 @@ class TestStoreCacheXPU(CustomTestCase):
     def _count_fused_calls(self, k, v, indices, cache_size, row_dim):
         """Run a store through sglang and return how many times the fused
         ``store_cache_xpu`` kernel was actually invoked."""
-        import sgl_kernel
-
         from sglang.srt.mem_cache import memory_pool
 
         calls = {"n": 0}
-        original = sgl_kernel.store_cache_xpu
+        # memory_pool imports the symbol at module level, so patch the binding
+        # it actually calls, not sgl_kernel's attribute.
+        original = memory_pool.store_cache_xpu
 
         def counting_store(*args, **kwargs):
             calls["n"] += 1
             return original(*args, **kwargs)
 
-        sgl_kernel.store_cache_xpu = counting_store
-        memory_pool._get_store_cache_xpu.cache_clear()
+        memory_pool.store_cache_xpu = counting_store
         try:
             k_cache = torch.zeros(cache_size, row_dim, dtype=k.dtype, device="xpu")
             v_cache = torch.zeros_like(k_cache)
             self._store(k, v, k_cache, v_cache, indices)
         finally:
-            sgl_kernel.store_cache_xpu = original
-            memory_pool._get_store_cache_xpu.cache_clear()
+            memory_pool.store_cache_xpu = original
         return calls["n"]
 
     def test_dispatches_to_fused_kernel(self):
