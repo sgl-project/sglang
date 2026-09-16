@@ -144,8 +144,14 @@ class DsparkDraftSampler:
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                     del step_idx
                     # In-graph philox noise: each replay advances the generator
-                    # and redraws.
-                    noise = self.exp_noise[:bs].exponential_()
+                    # and redraws. NPU does not support .exponential_() in-place.
+                    from sglang.srt.utils import is_npu
+
+                    noise = (
+                        self.exp_noise[:bs]
+                        if is_npu()
+                        else self.exp_noise[:bs].exponential_()
+                    )
                     return self._tp_sync.sync(
                         SpecTpSyncSite.DSPARK_GRAPH_SAMPLE,
                         SampleStepTokens.execute(

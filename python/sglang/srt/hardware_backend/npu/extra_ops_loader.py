@@ -134,3 +134,28 @@ class TorchOpLoader:
         self._loaded_library = library_path
         logger.info("Registered %s operators from %s", self._spec.name, library_path)
         return library_path
+
+
+_DSPARK_A5_SPARSE_ATTN_LOADER = TorchOpLoader(
+    OpLibSpec(
+        name="DSpark A5 KV-quant sparse-attention",
+        so_env="SGLANG_DSPARK_A5_EXTRA_OPS_SO",
+        namespace="_C_ascend",
+        required_ops=(
+            "npu_kv_quant_sparse_attn_sharedkv_v2_metadata",
+            "npu_kv_quant_sparse_attn_sharedkv_v2",
+        ),
+        pre_load_imports=("torch_npu",),
+    )
+)
+
+
+def initialize_dspark_a5_sparse_attn_ops() -> Optional[Path]:
+    """Load the standalone A5 DSpark sparse-attention extension.
+
+    The external extension is expected to contain both the metadata operator
+    and the attention operator and to register them under ``torch.ops._C_ascend``.
+    Loading is idempotent, including when another package registered the same
+    operators before SGLang initialized its attention backends.
+    """
+    return _DSPARK_A5_SPARSE_ATTN_LOADER.initialize()
