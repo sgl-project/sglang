@@ -1214,7 +1214,6 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-
             decode_tp_size_aligns_prefill_world_size = (
                 info.attn_cp_size > 1
                 and (self.is_mla_backend or self.is_hybrid_mla_backend)
