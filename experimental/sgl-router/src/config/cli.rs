@@ -17,6 +17,7 @@ use crate::config::{
     EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
     LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
     SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -113,6 +114,15 @@ pub struct Cli {
     /// Prefix-match source for native Cache-Aware.
     #[arg(long, value_enum)]
     pub cache_prefix_provider: Option<CachePrefixProvider>,
+    /// Label selector matching this router's OWN pods, so a booting replica can
+    /// find siblings to pull a cache-aware tree snapshot from. Unset disables
+    /// peer bootstrap and every replica starts cold.
+    #[arg(long)]
+    pub kv_peer_selector: Option<String>,
+    /// How long `/readyz` may stay 503 while this replica bootstraps its
+    /// cache-aware tree from a warm sibling. Defaults to 5000.
+    #[arg(long)]
+    pub kv_bootstrap_timeout_ms: Option<u64>,
 
     // ---- session-affinity tuning ----
     /// Header carrying the session ID for `--policy session_aware`.
@@ -331,6 +341,44 @@ impl Cli {
             return Err(anyhow!(
                 "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
             ));
+        }
+        // Peer bootstrap grafts into the router's OWN radix tree. With an
+        // external Indexer as the prefix source there is no local tree to graft
+        // into, and with any other policy nothing reads one — either way the
+        // flag would be accepted and then silently ignored, and the operator
+        // would see cold boots with no explanation.
+        if self.kv_peer_selector.is_some() || self.kv_bootstrap_timeout_ms.is_some() {
+            if self.policy != PolicyKind::CacheAware {
+                return Err(anyhow!(
+                    "--kv-peer-selector / --kv-bootstrap-timeout-ms require \
+                     --policy cache_aware"
+                ));
+            }
+            if cache_prefix_provider != CachePrefixProvider::RadixTree {
+                return Err(anyhow!(
+                    "--kv-peer-selector / --kv-bootstrap-timeout-ms require \
+                     --cache-prefix-provider radix_tree (there is no local tree to \
+                     bootstrap when an external Indexer is the prefix source)"
+                ));
+            }
+        }
+        // The peer selector is only carried on the k8s discovery backend (it
+        // needs a namespace to watch), so with any other backend it would be
+        // accepted and then silently ignored.
+        if self.kv_peer_selector.is_some() && !self.service_discovery {
+            return Err(anyhow!(
+                "--kv-peer-selector requires --service-discovery (peer replicas are \
+                 found via Kubernetes EndpointSlices)"
+            ));
+        }
+        if let Some(ms) = self.kv_bootstrap_timeout_ms {
+            if ms > MAX_KV_BOOTSTRAP_TIMEOUT_MS {
+                return Err(anyhow!(
+                    "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms \
+                     ceiling; /readyz stays 503 for this long, so a larger value would \
+                     outlast any reasonable readinessProbe"
+                ));
+            }
         }
         let tuned_cache_aware = self.policy == PolicyKind::CacheAware;
         let affinity_policy = matches!(
@@ -617,6 +665,9 @@ impl Cli {
             Some(CacheAwareConfig {
                 prefix_provider: cache_prefix_provider,
                 kv_indexer_endpoint,
+                bootstrap_timeout_ms: self
+                    .kv_bootstrap_timeout_ms
+                    .unwrap_or(DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS),
             })
         } else {
             None
@@ -717,6 +768,7 @@ impl Cli {
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.clone().unwrap_or_default(),
                     mode,
+                    peer_selector: self.kv_peer_selector.clone(),
                 })
             }
         };
@@ -864,6 +916,128 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("require --service-discovery"), "got: {err}");
+    }
+
+    // ---- peer bootstrap ----
+
+    #[test]
+    fn peer_selector_rides_on_the_k8s_backend() {
+        let c = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+            "--kv-bootstrap-timeout-ms",
+            "12000",
+        ]))
+        .unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => {
+                assert_eq!(k.peer_selector.as_deref(), Some("app=sgl-router"))
+            }
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            12_000,
+        );
+    }
+
+    #[test]
+    fn peer_bootstrap_is_off_by_default() {
+        let c = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+        ]))
+        .unwrap();
+        match &c.discovery {
+            DiscoveryBackend::K8s(k) => assert!(k.peer_selector.is_none()),
+            _ => panic!("expected k8s backend"),
+        }
+        assert_eq!(
+            c.model.cache_aware.as_ref().unwrap().bootstrap_timeout_ms,
+            DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+        );
+    }
+
+    /// Peers are found through EndpointSlices, so without k8s discovery the
+    /// flag would be accepted and then silently ignored.
+    #[test]
+    fn rejects_peer_selector_without_service_discovery() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://w:30000",
+            "--policy",
+            "cache_aware",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --service-discovery"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_peer_selector_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--policy cache_aware"), "got: {err}");
+    }
+
+    /// With an external Indexer there is no local tree to graft into, so the
+    /// flag would be accepted and then do nothing.
+    #[test]
+    fn rejects_peer_selector_with_an_external_indexer() {
+        let err = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+            "--cache-prefix-provider",
+            "indexer",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-peer-selector",
+            "app=sgl-router",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--cache-prefix-provider radix_tree"),
+            "got: {err}",
+        );
+    }
+
+    /// `Instant::now() + Duration::from_millis(n)` panics on overflow, so an
+    /// unbounded value would abort the process at startup instead.
+    #[test]
+    fn rejects_an_absurd_kv_bootstrap_timeout() {
+        let err = into_config_owned(with_model(&[
+            "--service-discovery",
+            "--selector",
+            "app=sglang",
+            "--policy",
+            "cache_aware",
+            "--kv-bootstrap-timeout-ms",
+            &u64::MAX.to_string(),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ceiling"), "got: {err}");
     }
 
     #[test]

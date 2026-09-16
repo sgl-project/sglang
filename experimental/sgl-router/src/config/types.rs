@@ -388,13 +388,46 @@ pub enum CachePrefixProvider {
 }
 
 /// Per-model Cache-Aware configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Prefix-match source for native Cache-Aware.
     pub prefix_provider: CachePrefixProvider,
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+    /// How long a freshly started replica may hold `/readyz` at 503 while it
+    /// pulls a cache-aware tree snapshot from a warm sibling.
+    ///
+    /// The deadline runs from the first worker discovery, not from process
+    /// start, so slow worker discovery does not eat the budget. On expiry the
+    /// replica serves anyway with whatever it has — a cold fleet has no warm
+    /// sibling to ask, so a gate without a deadline would never open.
+    ///
+    /// Only consulted when a peer selector is configured; see
+    /// [`K8sDiscoveryConfig::peer_selector`].
+    pub bootstrap_timeout_ms: u64,
 }
+
+impl Default for CacheAwareConfig {
+    fn default() -> Self {
+        Self {
+            prefix_provider: CachePrefixProvider::default(),
+            kv_indexer_endpoint: None,
+            bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+        }
+    }
+}
+
+/// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
+/// enough to sit inside a normal readinessProbe budget.
+pub const DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 5_000;
+
+/// Ceiling on `--kv-bootstrap-timeout-ms`.
+///
+/// `Instant::now() + Duration::from_millis(n)` panics on overflow, so an absurd
+/// value would abort the process at startup rather than being rejected at parse
+/// time. The ceiling is also well past any sane readinessProbe budget — this is
+/// how long `/readyz` may stay 503.
+pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 600_000;
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
 /// matches the router's other emitted/consumed metadata headers
@@ -605,6 +638,17 @@ pub struct K8sDiscoveryConfig {
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,
+    /// Label selector matching this router's OWN pods, so a booting replica can
+    /// find sibling replicas to pull a cache-aware tree snapshot from.
+    ///
+    /// `None` disables peer bootstrap and every replica starts cold — the
+    /// pre-existing behaviour. Watched in the same namespace as `namespace`,
+    /// which is why this lives here rather than on
+    /// [`crate::config::CacheAwareConfig`].
+    ///
+    /// Requires the router's ServiceAccount to have `get`/`list`/`watch` on
+    /// EndpointSlices for its own Service, in addition to the worker ones.
+    pub peer_selector: Option<String>,
 }
 
 /// Resolved discovery mode, produced by [`resolve_mode`] from the CLI
