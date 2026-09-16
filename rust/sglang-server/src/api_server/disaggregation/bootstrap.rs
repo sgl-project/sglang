@@ -156,6 +156,7 @@ struct Route {
     page_size: i64,
     #[serde(default)]
     kv_cache_dtype: Option<String>,
+    #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,

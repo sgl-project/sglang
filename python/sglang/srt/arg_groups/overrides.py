@@ -1820,6 +1820,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
+    # Unified arenas are fully backed before capture and cannot resize afterward.
+    if cfg.enable_unified_memory:
+        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:

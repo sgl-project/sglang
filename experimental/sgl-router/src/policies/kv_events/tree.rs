@@ -161,9 +161,22 @@ impl Tiers {
         .union(Self::HOST)
         .union(Self::DISK)
         .union(Self::EXTERNAL);
+    /// Every tier with its metric label, in bit order. [`TierCounts`] is
+    /// indexed by position in this table, and the order is preference order:
+    /// a device copy is served in place, a host copy by load-back from host
+    /// memory, local disk slower still, a remote pool slower again.
+    pub const SLOTS: [(Tiers, &'static str); TIER_SLOT_COUNT] = [
+        (Self::DEVICE, "device"),
+        (Self::HOST, "host"),
+        (Self::DISK, "disk"),
+        (Self::EXTERNAL, "external"),
+    ];
+
     /// The `StorageMedium` strings SGLang puts on the wire
     /// (`python/sglang/srt/disaggregation/kv_events.py`) and the tier each
-    /// lands on. The single source for the tree's ranking.
+    /// lands on. The single source for both the tree's ranking and the event
+    /// tally's medium labels, so a medium the tree ranks can never be one the
+    /// tally reports as unknown.
     pub const WIRE_MEDIA: [(&'static str, Tiers); 4] = [
         ("GPU", Self::DEVICE),
         ("CPU_PINNED", Self::HOST),
@@ -229,6 +242,16 @@ impl Tiers {
         self.0 &= !other.0;
     }
 
+    /// The bits set in both.
+    pub const fn intersection(self, other: Tiers) -> Tiers {
+        Tiers(self.0 & other.0)
+    }
+
+    /// The bits set here and not in `other`.
+    pub const fn difference(self, other: Tiers) -> Tiers {
+        Tiers(self.0 & !other.0)
+    }
+
     /// The bits set in either. `const` so the tier tables can be built from
     /// the individual tiers rather than from raw bit arithmetic.
     pub const fn union(self, other: Tiers) -> Tiers {
@@ -236,31 +259,73 @@ impl Tiers {
     }
 }
 
-// `ALL` has to stay in step with the individual tiers, and nothing about
-// adding a `pub const` tier would otherwise force it: a bit missing from
-// `ALL` is a bit an untagged `BlockRemoved` never clears — a permanently
-// stale owner, the one failure `for_remove` exists to prevent.
+/// Number of entries in [`Tiers::SLOTS`].
+pub const TIER_SLOT_COUNT: usize = 4;
+
+// The three tier tables have to stay in step, and nothing about adding a
+// `pub const` tier would otherwise force it:
+//
+// * a bit missing from `ALL` is a bit an untagged `BlockRemoved` never
+//   clears — a permanently stale owner, the one failure `for_remove` exists
+//   to prevent;
+// * a bit missing from `SLOTS` is never counted by `tally_tiers` nor
+//   decremented by `account_remove`, so the tier is invisible in
+//   `sgl_router_kv_tree_blocks` — this bug class, one tier later. The
+//   `debug_recount_occupancy` oracle cannot catch it either, because it
+//   walks the same `SLOTS`.
 const _: () = {
+    let mut union = Tiers(0);
+    let mut i = 0;
+    while i < TIER_SLOT_COUNT {
+        union = union.union(Tiers::SLOTS[i].0);
+        i += 1;
+    }
+    assert!(
+        union.0 == Tiers::ALL.0,
+        "Tiers::ALL must be exactly the union of Tiers::SLOTS",
+    );
     let mut i = 0;
     while i < Tiers::WIRE_MEDIA.len() {
         assert!(
             Tiers::ALL.contains(Tiers::WIRE_MEDIA[i].1),
-            "every wire medium must map to a tier `ALL` clears",
+            "every wire medium must map to a tier that SLOTS ranks",
         );
         i += 1;
     }
 };
 
+/// How many nodes one carrier holds on each tier, indexed like
+/// [`Tiers::SLOTS`]. A node held on device and host counts under both.
+pub type TierCounts = [u64; TIER_SLOT_COUNT];
+
+/// Count one node's worth of `bits` into `counts`.
+fn tally_tiers(counts: &mut TierCounts, bits: Tiers) {
+    for (slot, (tier, _)) in Tiers::SLOTS.iter().enumerate() {
+        if bits.contains(*tier) {
+            counts[slot] += 1;
+        }
+    }
+}
+
 /// Add `tiers` to `worker`'s hold in `carriers`, creating the entry on first
-/// sight. One lookup on the re-store path — under a hierarchical cache the
-/// host backup of a chain the worker already holds on device, the common
-/// case — and two on first sight. Never leaves an entry with no bits, which
-/// [`TreeState::remove`] relies on.
-fn add_tiers(carriers: &mut HashMap<KvWorkerId, Tiers>, worker: &KvWorkerId, tiers: Tiers) {
+/// sight, and return the bits that were newly set. One lookup on the re-store
+/// path — under a hierarchical cache the host backup of a chain the worker
+/// already holds on device, the common case — and two on first sight. Never
+/// leaves an entry with no bits, which [`TreeState::remove`] relies on.
+fn add_tiers(
+    carriers: &mut HashMap<KvWorkerId, Tiers>,
+    worker: &KvWorkerId,
+    tiers: Tiers,
+) -> Tiers {
     match carriers.get_mut(worker) {
-        Some(held) => held.insert(tiers),
+        Some(held) => {
+            let added = tiers.difference(*held);
+            held.insert(tiers);
+            added
+        }
         None => {
             carriers.insert(worker.clone(), tiers);
+            tiers
         }
     }
 }
@@ -371,7 +436,24 @@ struct TreeState {
     nodes: HashMap<NodeId, Node>,
     by_hash: HashMap<i64, HashSet<NodeId>>,
     next_id: NodeId,
+    /// Nodes each carrier holds, per tier. Booked at every site where a
+    /// carrier's tier bits on a node change (`account_add` /
+    /// `account_remove`), so a scrape reads it without walking the tree. A
+    /// carrier holding nothing has no row.
+    occupancy: HashMap<KvWorkerId, TierCounts>,
+    /// Times the occupancy bookkeeping contradicted itself, by reason. Both
+    /// reasons mean the same class of bug — bits added without being booked —
+    /// but the symptom the operator sees is a worker's
+    /// `sgl_router_kv_tree_blocks` rows vanishing while it still holds nodes,
+    /// which the metric's own HELP text says means "this worker publishes
+    /// nothing". A counter is the only thing separating those.
+    accounting_errors: [u64; ACCOUNTING_REASONS.len()],
 }
+
+/// Reasons in [`TreeState::accounting_errors`] order.
+pub const ACCOUNTING_REASONS: [&str; 2] = ["missing_row", "underflow"];
+const REASON_MISSING_ROW: usize = 0;
+const REASON_UNDERFLOW: usize = 1;
 
 const ROOT_ID: NodeId = 0;
 /// Sentinel block_hash for the root. Real workers can in principle emit
@@ -397,6 +479,8 @@ impl TreeState {
             nodes,
             by_hash: HashMap::new(),
             next_id: 1,
+            occupancy: HashMap::new(),
+            accounting_errors: [0; ACCOUNTING_REASONS.len()],
         }
     }
 
@@ -404,6 +488,74 @@ impl TreeState {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Book `delta` nodes-per-tier newly held by `worker` — one row lookup
+    /// for a whole chain, which is how `insert` uses it.
+    fn account_add(&mut self, worker: &KvWorkerId, delta: TierCounts) {
+        if delta.iter().all(|&c| c == 0) {
+            return;
+        }
+        match self.occupancy.get_mut(worker) {
+            Some(counts) => {
+                for (acc, d) in counts.iter_mut().zip(delta) {
+                    *acc += d;
+                }
+            }
+            None => {
+                self.occupancy.insert(worker.clone(), delta);
+            }
+        }
+    }
+
+    /// Book one node's worth of `removed` tier bits `worker` no longer holds.
+    fn account_remove(&mut self, worker: &KvWorkerId, removed: Tiers) {
+        let mut delta = TierCounts::default();
+        tally_tiers(&mut delta, removed);
+        self.account_remove_counts(worker, delta);
+    }
+
+    /// Book `delta` nodes-per-tier `worker` no longer holds, dropping the
+    /// carrier's row once it holds nothing.
+    ///
+    /// Takes a whole-carrier delta rather than one node's bits so
+    /// `clear_worker` can book a fleet-sized tree in ONE call: booking per
+    /// node would emit one `error!` per node on the failure path below, which
+    /// is hundreds of thousands of lines written while holding the tree's
+    /// write lock — every routing decision blocked behind a log flood.
+    fn account_remove_counts(&mut self, worker: &KvWorkerId, delta: TierCounts) {
+        if delta.iter().all(|&c| c == 0) {
+            return;
+        }
+        let Some(counts) = self.occupancy.get_mut(worker) else {
+            self.accounting_errors[REASON_MISSING_ROW] += 1;
+            error!(
+                worker = %worker.url,
+                dp_rank = worker.dp_rank,
+                "tree invariant violation: releasing tiers for a carrier with no occupancy row",
+            );
+            return;
+        };
+        let mut underflowed = false;
+        for (acc, d) in counts.iter_mut().zip(delta) {
+            underflowed |= *acc < d;
+            *acc = acc.saturating_sub(d);
+        }
+        if underflowed {
+            // Saturating so a release can never wrap the gauge — but then the
+            // all-zero test below would drop a row for a carrier that still
+            // holds nodes, and a missing series reads as "this worker
+            // publishes nothing". Count it so a release build is not blind;
+            // assert so a debug run stops at the release that exposed it.
+            self.accounting_errors[REASON_UNDERFLOW] += 1;
+            debug_assert!(
+                false,
+                "occupancy underflow: a tier was released that was never booked",
+            );
+        }
+        if counts.iter().all(|&c| c == 0) {
+            self.occupancy.remove(worker);
+        }
     }
 
     /// Insert a brand-new child under `parent_id` and wire up the reverse
@@ -501,6 +653,8 @@ impl TreeState {
         let mut current = self.resolve_parent(worker, parent_hash);
         let mut prev_hash = parent_hash;
         let now = now_millis();
+        // Occupancy is booked once for the whole chain, not per block.
+        let mut delta = TierCounts::default();
         for &h in block_hashes {
             let child_id = match self
                 .nodes
@@ -508,9 +662,13 @@ impl TreeState {
                 .and_then(|n| n.children.get(&h).copied())
             {
                 Some(id) => id,
+                // `break`, not `return`: the tier bits are already written
+                // into the nodes visited so far, so bailing without reaching
+                // `account_add` below would leave the occupancy gauge
+                // permanently short by exactly those blocks.
                 None => match self.create_child(current, h, prev_hash) {
                     Some(id) => id,
-                    None => return,
+                    None => break,
                 },
             };
             let Some(child) = self.nodes.get_mut(&child_id) else {
@@ -519,13 +677,15 @@ impl TreeState {
                     block_hash = h,
                     "tree invariant violation: child node missing immediately after fetch/create; aborting chain",
                 );
-                return;
+                break;
             };
-            add_tiers(&mut child.workers, worker, tiers);
+            let added = add_tiers(&mut child.workers, worker, tiers);
             child.last_used.store(now, Ordering::Relaxed);
+            tally_tiers(&mut delta, added);
             current = child_id;
             prev_hash = Some(h);
         }
+        self.account_add(worker, delta);
     }
 
     /// Clear `tiers` from `worker`'s hold on every node carrying any hash in
@@ -543,18 +703,24 @@ impl TreeState {
         for id in targets {
             // Node may already be gone if a previous prune in this batch
             // cascaded through it — skip silently.
-            let prunable = match self.nodes.get_mut(&id) {
+            let (prunable, released) = match self.nodes.get_mut(&id) {
                 Some(node) => {
+                    let mut released = Tiers::default();
                     if let Some(held) = node.workers.get_mut(worker) {
+                        released = held.intersection(tiers);
                         held.remove(tiers);
                         if held.is_empty() {
                             node.workers.remove(worker);
                         }
                     }
-                    node.workers.is_empty() && node.children.is_empty()
+                    (
+                        node.workers.is_empty() && node.children.is_empty(),
+                        released,
+                    )
                 }
-                None => false,
+                None => (false, Tiers::default()),
             };
+            self.account_remove(worker, released);
             if prunable {
                 self.prune_cascade(id);
             }
@@ -570,16 +736,23 @@ impl TreeState {
             .filter(|&id| id != ROOT_ID)
             .collect();
         let mut prune_candidates: Vec<NodeId> = Vec::new();
+        // Accumulated over every node, then booked once — see
+        // `account_remove_counts`.
+        let mut delta = TierCounts::default();
         for id in ids {
-            if let Some(node) = self.nodes.get_mut(&id) {
-                if node.workers.remove(worker).is_some()
-                    && node.workers.is_empty()
-                    && node.children.is_empty()
-                {
+            let removed = self.nodes.get_mut(&id).and_then(|node| {
+                node.workers
+                    .remove(worker)
+                    .map(|held| (held, node.workers.is_empty() && node.children.is_empty()))
+            });
+            if let Some((held, prunable)) = removed {
+                tally_tiers(&mut delta, held);
+                if prunable {
                     prune_candidates.push(id);
                 }
             }
         }
+        self.account_remove_counts(worker, delta);
         for id in prune_candidates {
             // Re-check: cascading prune from a sibling may have already
             // removed this id.
@@ -844,9 +1017,14 @@ impl TreeState {
             };
             // Force-prune even if the leaf still holds workers — eviction
             // intentionally evicts. We clear workers first so the cascade
-            // precondition holds.
-            if let Some(node) = self.nodes.get_mut(&victim) {
-                node.workers.clear();
+            // precondition holds, releasing each carrier's tiers as we go so
+            // the occupancy counters stay in step.
+            let carriers: Vec<(KvWorkerId, Tiers)> = match self.nodes.get_mut(&victim) {
+                Some(node) => node.workers.drain().collect(),
+                None => Vec::new(),
+            };
+            for (worker, held) in &carriers {
+                self.account_remove(worker, *held);
             }
             self.prune_cascade(victim);
         }
@@ -980,6 +1158,33 @@ impl HashTree {
         self.state.read().by_hash.len()
     }
 
+    /// Times the occupancy bookkeeping contradicted itself, by
+    /// [`ACCOUNTING_REASONS`]. Always zero on a correct tree; rendered so a
+    /// release build, where the debug assertion is compiled out, still says
+    /// so out loud.
+    pub fn accounting_errors(&self) -> [u64; ACCOUNTING_REASONS.len()] {
+        self.state.read().accounting_errors
+    }
+
+    /// Nodes each carrier holds on each tier, sorted by carrier. Rendered as
+    /// `sgl_router_kv_tree_blocks`; against the engine's own per-tier
+    /// occupancy for the same pod it is the tree's coverage of that tier —
+    /// the number that says whether a tier the engine holds is visible to
+    /// routing at all (module docs, "Storage tiers").
+    ///
+    /// Read off the incrementally maintained accounting rather than walked,
+    /// so a scrape costs one read lock. A carrier holding nothing has no row.
+    pub fn tier_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
+        let state = self.state.read();
+        let mut rows: Vec<(KvWorkerId, TierCounts)> = state
+            .occupancy
+            .iter()
+            .map(|(w, counts)| (w.clone(), *counts))
+            .collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
+    }
+
     /// Evict least-recently-used nodes until `node_count() <= max_size`.
     ///
     /// Strategy:
@@ -1011,6 +1216,32 @@ impl HashTree {
             .nodes
             .values()
             .all(|n| n.workers.values().all(|t| !t.is_empty()))
+    }
+
+    /// Recompute [`Self::tier_occupancy`] by walking every node — the oracle
+    /// the incrementally maintained counters are checked against.
+    ///
+    /// Its ceiling: it shares `tally_tiers` and [`Tiers::SLOTS`] with the code
+    /// it checks, so it proves only that incremental booking agrees with a
+    /// full walk. It is blind by construction to WHICH tier is right — a
+    /// SLOTS/bit mismatch would mis-tally identically on both sides. The
+    /// example-based tier tests and the compile-time coupling asserts own
+    /// that half.
+    fn debug_recount_occupancy(&self) -> Vec<(KvWorkerId, TierCounts)> {
+        let state = self.state.read();
+        let mut total: HashMap<KvWorkerId, TierCounts> = HashMap::new();
+        for (&id, node) in &state.nodes {
+            if id == ROOT_ID {
+                continue;
+            }
+            for (worker, held) in &node.workers {
+                let acc = total.entry(worker.clone()).or_default();
+                tally_tiers(acc, *held);
+            }
+        }
+        let mut rows: Vec<(KvWorkerId, TierCounts)> = total.into_iter().collect();
+        rows.sort_by(|a, b| (&a.0.url, a.0.dp_rank).cmp(&(&b.0.url, b.0.dp_rank)));
+        rows
     }
 }
 
@@ -1228,6 +1459,59 @@ mod tests {
         assert_eq!(tree.node_count(), 0);
     }
 
+    /// The per-tier occupancy is maintained incrementally at every mutation
+    /// site, so it is checked against a full recount after a sequence that
+    /// exercises all of them: tiered stores, partial and full removals,
+    /// `clear_worker`, and LRU eviction.
+    #[test]
+    fn tier_occupancy_matches_a_full_recount_after_mixed_mutations() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 1);
+        let c = worker("http://c", 0);
+
+        tree.insert_tiered(&a, None, &[1, 2, 3, 4], Tiers::DEVICE);
+        tree.insert_tiered(&a, None, &[1, 2], Tiers::HOST);
+        tree.insert_tiered(&b, None, &[1, 2, 3], Tiers::HOST);
+        tree.insert_tiered(&b, None, &[1, 2, 5, 6], Tiers::DEVICE);
+        tree.insert_tiered(&c, None, &[7], Tiers::for_store(Some("EXTERNAL")));
+        tree.insert_tiered(&c, None, &[8], Tiers::for_store(Some("NVLINK_PEER")));
+        for r in 0..40i64 {
+            tree.insert(&c, None, &[r * 4096 + 11, r * 4096 + 12]);
+        }
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+
+        // Spot-check the shape: a holds 4 device nodes and 2 host nodes.
+        let rows = tree.tier_occupancy();
+        let (_, a_counts) = rows.iter().find(|(w, _)| *w == a).unwrap();
+        assert_eq!(a_counts[0], 4, "device");
+        assert_eq!(a_counts[1], 2, "host");
+        assert_eq!(a_counts[2], 0, "disk");
+        let (_, c_counts) = rows.iter().find(|(w, _)| *w == c).unwrap();
+        assert_eq!(c_counts[3], 1, "external");
+        assert_eq!(
+            tree.match_prefix(None, &[8]).matched_blocks,
+            0,
+            "a store on an unrankable medium is booked nowhere because it is              never applied",
+        );
+
+        // Partial removal (device only) on a node held on both tiers, then a
+        // removal that clears the last tier and prunes.
+        tree.remove_tiered(&a, &[2], Tiers::DEVICE);
+        tree.remove_tiered(&a, &[4], Tiers::ALL);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+
+        // Whole-worker clear, then LRU eviction down to a small cap.
+        tree.clear_worker(&b);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+        assert!(tree.evict_lru(10) > 0);
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
+        assert!(
+            tree.tier_occupancy().iter().all(|(w, _)| *w != b),
+            "a cleared worker must leave no occupancy row",
+        );
+    }
+
     /// `DISK` (L3) and `EXTERNAL` (L4) are distinct tiers in the engine's own
     /// `StorageMedium`, so they must not share a bit: on a fleet running both,
     /// folding them would make an L3 eviction erase the router's knowledge of
@@ -1250,13 +1534,16 @@ mod tests {
         assert_eq!(tree.match_prefix(None, &[1]).matched_blocks, 0);
     }
 
-    /// `remove` and `prune_cascade` rely on "no bits ⇒ no entry" to know
-    /// when a node is prunable, and every mutation site has to preserve it —
-    /// exactly the shape that rots under a later refactor. A deterministic
-    /// random walk over every operation and every medium, with the invariant
-    /// asserted after EVERY step.
+    /// The occupancy counters are maintained incrementally at four mutation
+    /// sites, which is exactly the shape that rots under a later refactor. A
+    /// deterministic random walk over every operation and every medium, with
+    /// both invariants asserted after EVERY step:
+    ///
+    /// * `tier_occupancy()` equals a full node-walk recount, and
+    /// * no carrier entry with empty tiers exists (`remove` relies on
+    ///   "no bits ⇒ no entry" to know when a node is prunable).
     #[test]
-    fn carrier_invariant_holds_under_a_random_walk() {
+    fn occupancy_and_carrier_invariants_hold_under_a_random_walk() {
         // xorshift64*, so the walk is reproducible without a dev-dependency.
         struct Rng(u64);
         impl Rng {
@@ -1307,6 +1594,11 @@ mod tests {
                     _ => tree.insert_tiered(w, parent, &hashes, Tiers::for_store(medium)),
                 }
 
+                assert_eq!(
+                    tree.tier_occupancy(),
+                    tree.debug_recount_occupancy(),
+                    "seed {seed} step {step}: incremental occupancy diverged from a full recount",
+                );
                 assert!(
                     tree.debug_no_empty_carrier(),
                     "seed {seed} step {step}: a carrier is present holding no tier",
@@ -1318,7 +1610,8 @@ mod tests {
     /// `AllBlocksCleared` is the pod-restart / scale-down path
     /// (`remove_worker` clears every rank), so it must drop a carrier
     /// regardless of which tiers it held — a hold on any lower tier is still
-    /// a hold.
+    /// a hold. Asserted at the tree, not only through the rendered metric, so
+    /// a metrics refactor cannot take the coverage with it.
     #[test]
     fn clear_worker_drops_carriers_on_every_tier() {
         let tree = HashTree::new();
@@ -1335,6 +1628,11 @@ mod tests {
             "a host-only carrier must be cleared like any other",
         );
         assert_eq!(tree.match_prefix(None, &[3]).matched_blocks, 0);
+        assert!(
+            tree.tier_occupancy().iter().all(|(w, _)| *w != a),
+            "a cleared worker must leave no occupancy row on any tier",
+        );
+        assert_eq!(tree.tier_occupancy(), tree.debug_recount_occupancy());
     }
 
     /// `resolve_parent` disambiguates a shared hash by preferring a candidate

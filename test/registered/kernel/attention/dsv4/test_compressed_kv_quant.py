@@ -13,13 +13,36 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
+def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
+    """RoPE plus fake FP4 quantization, fused for CUDA BF16 inputs."""
+    if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
+            rope_tail_fake_quant_fp4,
+        )
+
+        return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
+    quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
+    return quant(rope_tail(x, freqs, rope_dim))
+
+
+def rope_tail(
+    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
+) -> torch.Tensor:
+    """Rotate the last rope_dim features of x [T, ..., D] with complex freqs [T, rope_dim // 2]."""
+    head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
+    tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
+    f = freqs.conj() if inverse else freqs
+    f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
+    rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
+    return torch.cat([head, rotated], dim=-1)
+
+
 class TestCompressedKVQuant(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_triton_matches_torch_for_both_quantization_rules(self):
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,
         )
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4, rope_tail
 
         generator = torch.Generator(device="cuda").manual_seed(17)
         for rows in (0, 1, 33, 129):

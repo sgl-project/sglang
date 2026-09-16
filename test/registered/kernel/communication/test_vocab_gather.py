@@ -9,7 +9,7 @@ shared output, and replay correctly inside a CUDA graph.
 
 Usage::
 
-    python test/registered/kernels/ops/communication/test_vocab_gather.py --num-gpu 4
+    python test/registered/kernel/communication/test_vocab_gather.py --num-gpu 4
 """
 
 from __future__ import annotations
