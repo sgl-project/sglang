@@ -399,6 +399,16 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.mqa import (
+            can_run_mqa_decode,
+            mqa_decode,
+        )
+
+        if can_run_mqa_decode(q, k_cache, page_table, context_lens, max_model_len):
+            return mqa_decode(
+                q, k_cache, page_table, context_lens, max_model_len, score_scale
+            )
     if not _is_npu and q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
