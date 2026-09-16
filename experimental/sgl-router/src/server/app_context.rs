@@ -11,7 +11,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::{BlockSizeOracle, KvIndexMetrics};
+use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
@@ -70,6 +70,12 @@ pub struct AppContext {
     /// is actually waiting on during the drain — `router_inflight_load` sees only the
     /// proxied subset.
     pub inflight_http: Arc<InflightHttp>,
+    /// The local KV-event index, when this router maintains a tree worth
+    /// sharing. `/internal/kv_snapshot` serves it to booting siblings; `None`
+    /// (external Indexer, or cache-aware routing off) makes that route a 404,
+    /// which a consumer reads the same way it reads an unreachable peer. See
+    /// [`KvEventIndex::snapshot_source`].
+    pub kv_index: Option<Arc<KvEventIndex>>,
     readiness: AtomicU8,
 }
 
@@ -127,6 +133,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
@@ -217,6 +224,7 @@ impl AppContext {
             radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
+            kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
