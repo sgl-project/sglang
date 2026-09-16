@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
+    config::{
+        CachePrefixProvider, Cli, Config, DiscoveryBackend, KvIndexerEndpointConfig, LogFormat,
+        PolicyKind,
+    },
     discovery::spawn_discovery,
     policies::{
         factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
@@ -85,6 +88,11 @@ async fn main() -> Result<()> {
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
+
+    // Before worker discovery: a bootstrap consults the peer set the moment the
+    // first worker appears, and an empty set there means that worker's ranks
+    // skip bootstrap entirely and run cold.
+    start_peer_watch(&config, &engine_state).await;
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
@@ -243,6 +251,53 @@ fn start_local_inflight_tracker(
     let sweep_interval = Duration::from_secs((timeout_secs / 10).clamp(1, 60));
     let inflight_cleanup = spawn_janitor(Arc::clone(&local_inflight_requests), sweep_interval);
     (local_inflight_requests, inflight_cleanup)
+}
+
+/// Watch this router's OWN pods, so a booting replica can find warm siblings to
+/// pull a cache-aware tree snapshot from.
+///
+/// A no-op unless a peer selector is configured AND this router maintains its
+/// own tree — with an external Indexer as the prefix source there is nothing to
+/// graft into. The CLI already rejects that combination; this keeps the
+/// invariant local to the wiring.
+async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
+    let DiscoveryBackend::K8s(k8s) = &config.discovery else {
+        return;
+    };
+    let Some(selector) = k8s.peer_selector.as_ref() else {
+        return;
+    };
+    if engine_state.snapshot_source().is_none() {
+        return;
+    }
+    // Peers are only usable on the family this router actually listens on — but
+    // an UNSPECIFIED address (`0.0.0.0`, `::`) names no family, it is the
+    // ordinary way to listen on both, so it must not be read as a preference.
+    // `None` keeps every slice.
+    let want_ipv6 = config
+        .server
+        .host
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| ip.is_ipv6());
+    // Non-fatal: routing does not depend on peer discovery. Losing it means
+    // replicas boot cold, which is the pre-existing behaviour.
+    if let Err(e) = sgl_router::discovery::k8s::spawn_peer_watch(
+        k8s.namespace.clone(),
+        selector.clone(),
+        engine_state.peers(),
+        want_ipv6,
+        i32::from(config.server.port),
+    )
+    .await
+    {
+        tracing::error!(
+            error = %e,
+            "kv-bootstrap: peer watch failed to start; replicas will boot with a cold \
+             cache-aware tree (check RBAC for endpointslices on the router's own Service)",
+        );
+    }
 }
 
 async fn start_worker_discovery_and_manager(
