@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_hip, is_xpu
 
 from .utils import make_name
 
@@ -137,6 +137,8 @@ def topk_transform_paged_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    row_starts: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -151,6 +153,16 @@ def topk_transform_paged_v2(
     * Both outputs given -- ``out_page_indices`` receives the page-table
       transform and ``out_raw_indices`` receives the selected raw indices.
 
+    ``row_starts`` / ``row_to_batch`` (optional, ``(rows,)`` int32) describe DSA
+    extend's packed scores: row ``i`` selects over ``scores[i, row_starts[i] :
+    row_starts[i] + seq_lens[i]]`` and maps through ``page_tables[row_to_batch[i]]``;
+    omitting both gives the decode layout (column 0, one table row per score row).
+    Selected indices stay row-local either way. ``row_to_batch`` is not range-checked.
+
+    NOTE: ``row_starts`` makes this call MODIFY ``scores`` IN PLACE -- it masks the
+    at most three columns its 16-byte-aligned read base pulls in ahead of each
+    window. Do not reuse ``scores`` afterwards, or pass a view with overlapping rows.
+
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
     values. The kernel reads lengths as ``uint32_t``: a negative entry
@@ -160,6 +172,18 @@ def topk_transform_paged_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    if row_starts is not None or row_to_batch is not None:
+        # Packed rows are compiled into the paged kernel under USE_ROCM only;
+        # every caller of them is ROCm-gated, so this is an invariant.
+        assert is_hip(), (
+            "topk_transform_paged_v2 packed rows (row_starts / row_to_batch) "
+            "are only supported on ROCm"
+        )
+        # The raw output bypasses the packed path's residue correction. Rejected
+        # in C++ too; repeated here to fail before the JIT module is built.
+        assert out_raw_indices is None, (
+            "topk_transform_paged_v2: row_starts is incompatible with out_raw_indices"
+        )
     if is_xpu():
         if out_raw_indices is not None:
             topk_transform_paged(
@@ -189,4 +213,6 @@ def topk_transform_paged_v2(
         page_size,
         metadata,
         out_raw_indices,
+        row_starts,
+        row_to_batch,
     )

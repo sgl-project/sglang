@@ -20,6 +20,9 @@ and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
 the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
 (8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
 included explicitly, across k in {512,1024,2048} and identity/perm page tables.
+
+``test_topk_v2_packed_rows`` covers the DSA extend layout on top of that: all
+requests packed into one score buffer, sharing a table row per request.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -410,6 +414,83 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     implicit = _run_ragged(scores.clone(), lengths, None, offsets, k)
     for i in range(len(rows)):
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
+
+
+@pytest.mark.skipif(
+    not is_hip(),
+    reason="packed rows (row_starts / row_to_batch) are compiled into the paged "
+    "kernel under USE_ROCM only; CUDA uses the ragged transform instead",
+)
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "extend_lens",
+    [
+        [7],  # one request
+        [4, 4],  # equal row counts
+        [1, 13, 2],  # ragged, including a single-row request
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
+    """DSA extend layout: batch-global packed scores + shared page-table rows.
+
+    Rows are causal within a request; a distinct page-table permutation per request
+    catches row/request index mix-ups, and the ragged case leaves most window starts
+    off the 16-byte load boundary (the production case).
+    """
+    torch.manual_seed(4242 + k + len(extend_lens))
+    device = "cuda"
+
+    # Keep every row longer than k so no row takes the trivial path.
+    prefix = k + 1024
+    kv_lens = [prefix + e for e in extend_lens]
+    k_offsets = [0]
+    for kv in kv_lens[:-1]:
+        k_offsets.append(k_offsets[-1] + kv)
+    total_kv = sum(kv_lens)
+
+    row_starts, lengths, row_to_batch = [], [], []
+    for i, e in enumerate(extend_lens):
+        for local in range(e):
+            row_starts.append(k_offsets[i])
+            lengths.append(kv_lens[i] - e + local + 1)
+            row_to_batch.append(i)
+    rows = len(lengths)
+
+    width = (total_kv + 3) & ~3
+    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+    row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
+
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(extend_lens), num_pages, "perm", device, per_row=True
+    )
+
+    out = torch.full((rows, k), -1, dtype=torch.int32, device=device)
+    metadata = plan_topk_v2(lengths_t)
+    # The kernel masks in place, so reference values must be read before the call.
+    scores_cpu = scores.cpu()
+    topk_transform_paged_v2(
+        scores,
+        lengths_t,
+        page_table,
+        out,
+        PAGE_SIZE,
+        metadata,
+        row_starts=row_starts_t,
+        row_to_batch=row_to_batch_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    for r in range(rows):
+        L, start, req = lengths[r], row_starts[r], row_to_batch[r]
+        window = scores_cpu[r, start : start + L]
+        ref = torch.topk(window, k, sorted=False).indices.tolist()
+        our = _invert(out_cpu[r], inv_cpu[req])
+        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
 if __name__ == "__main__":

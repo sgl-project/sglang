@@ -7,9 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -148,6 +151,35 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
+        # Packed PAGED extend (GLM DSA prefill, ROCm-only -- CUDA gets the same
+        # fusion from the RAGGED branch above): row_starts / row_to_batch absorb the
+        # per-row score offset and the many-rows-per-request page-table mapping. The
+        # conditions fall back (not raise) on shapes the kernel cannot take, notably
+        # a chunked-extend plan or a row stride that is not 16B-aligned.
+        if (
+            _is_hip
+            and self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and batch_idx_list is None
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0]
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+            and attn_metadata.topk_v2_plan is not None
+            and attn_metadata.topk_v2_plan.shape[0] == logits.shape[0] + 1
+            and attn_metadata.token_to_batch_idx is not None
+            and attn_metadata.token_to_batch_idx.shape[0] == logits.shape[0]
+        ):
+            return _topk_transform_v2_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                row_starts=row_starts,
+                row_to_batch=attn_metadata.token_to_batch_idx,
+            )
+
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
@@ -278,6 +310,8 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    row_starts: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -291,9 +325,14 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
-    This is a committed contract, not a best-effort path: ``topk_transform`` routes
-    here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
-    drops the page_size=1 table for exactly this case (see
+    ``row_starts`` / ``row_to_batch`` (optional, ``(num_rows,)`` int32) serve DSA
+    extend's packed batch-global scores: row ``i`` owns the window at
+    ``row_starts[i]`` and maps through page-table row ``row_to_batch[i]``. Omitting
+    both gives the decode layout; indices stay row-local either way.
+
+    This is a committed contract, not a best-effort path: ``topk_transform``
+    routes here only for shapes it has already validated, and for the decode case
+    the fused-decode CUDA graph drops the page_size=1 table (see
     ``dsa_drop_wide_page_table``). The preconditions below are therefore
     invariants the caller must uphold -- they assert (raise) on violation rather
     than fall back to the slow legacy path (which may not even have a page_size=1
@@ -337,7 +376,16 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_paged_v2(
+        logits,
+        lengths,
+        page_table,
+        out,
+        page_size,
+        plan,
+        row_starts=(None if row_starts is None else row_starts.to(torch.int32)),
+        row_to_batch=(None if row_to_batch is None else row_to_batch.to(torch.int32)),
+    )
     return out
 
 
