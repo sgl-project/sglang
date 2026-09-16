@@ -2088,10 +2088,20 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                     else:
+                        # Must equal self.pool_page_size, the page_size the
+                        # actual tensor (_build_hybrid_linear_kv_pool et al.)
+                        # was built with -- see pool_page_size's own docstring
+                        # ("a pool must page as its allocator does, or its
+                        # last page falls short"). That property only widens
+                        # by dcp_size for draft workers; using
+                        # attn_dcp_size unconditionally here paged the
+                        # allocator wider than the underlying buffer for
+                        # target workers, so alloc() eventually returned rows
+                        # past the buffer's last valid index (caught by the
+                        # external-cache-linker's own bounds check).
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
-                            page_size=get_schedule().page_size
-                            * get_parallel().attn_dcp_size,
+                            sizes.max_total_num_tokens,
+                            page_size=self.pool_page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,

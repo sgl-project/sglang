@@ -602,14 +602,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                         else _materialize_cpu_indices(indices)
                     )
                     cpu_indices[source_id] = prepared_indices
-                # NOTE: open issue -- some nodes' recorded device_indices for
-                # the FULL component drift past entry._row_count (observed
-                # starting exactly at, and growing monotonically beyond,
-                # max_total_num_tokens; the real allocator in allocator/paged.py
-                # never hands out a page in that range). Root cause not yet
-                # isolated; this range is the forensic detail needed to chase
-                # it further. The caller already treats a raised ValueError
-                # here as a soft offload failure, not a crash.
+                # Was tripped by a page_size mismatch between the token
+                # allocator and the pool it indexes (fixed in
+                # kv_cache_configurator.py); kept as a forensic aid since the
+                # caller already treats a raised ValueError here as a soft
+                # offload failure, not a crash.
                 try:
                     locations.extend(entry.prepare_locations(prepared_indices))
                 except ValueError:
