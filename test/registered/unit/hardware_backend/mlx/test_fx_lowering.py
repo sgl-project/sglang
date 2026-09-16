@@ -487,3 +487,9 @@ def test_review_flagged_ops_match_eager_through_the_export_path():
         torch.testing.assert_close(
             actual_item.cpu(), expected_item.cpu(), atol=0.008, rtol=0.03
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
