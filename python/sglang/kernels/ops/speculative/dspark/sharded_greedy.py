@@ -62,7 +62,12 @@ def _finish(
 
 
 def sharded_greedy_step(bias, base_local, *, group, vocab_start, gather=None):
-    """Match argmax of rank-ordered BuildStepLocal/all_gather, excluding padding.
+    """Fused BuildStepLocal + vocab gather + argmax, without materializing logits.
+
+    Equivalent to argmax of rank-ordered ``build_step_local``/all_gather over the
+    sharded vocab, excluding padding, but each rank reduces its own shard first so
+    the transport carries a few partial (value, index) pairs per row instead of
+    the full local logits.
 
     ``bias`` is the original GEMM's already-rounded result. Communication carries
     eight (value, global-index-bits) pairs per row; indices are transported as

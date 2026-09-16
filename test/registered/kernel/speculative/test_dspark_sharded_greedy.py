@@ -44,11 +44,13 @@ def group():
     )
 
 
-@pytest.mark.parametrize("nvlink", [False, True])
-@pytest.mark.parametrize("m", [1, 4, 64])
-@pytest.mark.parametrize("width,last", [(32320, 32320), (8192, 17), (8, 0)])
-@pytest.mark.parametrize("case", ["random", "tie", "nan", "inf"])
-def test_sharded_selection_graph(m, width, last, case, nvlink):
+_NVLINK = pytest.mark.parametrize("nvlink", [False, True])
+_ROWS = pytest.mark.parametrize("m", [1, 4, 64])
+_SHARDS = pytest.mark.parametrize("width,last", [(32320, 32320), (8192, 17), (8, 0)])
+
+
+def _replay_and_check(m, width, last, nvlink, perturb):
+    """Capture the 4-rank selection graph, then replay it under `perturb`."""
     g = group()
     transport = make_vocab_gather(
         g, local_width=width, prefer_nvlink=nvlink, symm_rows=0
@@ -79,15 +81,7 @@ def test_sharded_selection_graph(m, width, last, case, nvlink):
     for replay in range(4):
         storage.normal_()
         bias.normal_()
-        if case == "tie":
-            storage.zero_()
-            bias.zero_()
-        if case == "nan" and real:
-            base[:, replay % real] = float("nan")
-        if case == "inf":
-            storage.fill_(-float("inf"))
-            if replay % 2 and real:
-                base[:, replay % real] = float("inf")
+        perturb(replay, storage, base, bias, real)
         graph.replay()
         # Independent reference: gather complete, correctly padded FP32 logits.
         local = torch.full((m, width), -float("inf"), device="cuda")
@@ -96,6 +90,54 @@ def test_sharded_selection_graph(m, width, last, case, nvlink):
         ref = full[:, : (g.world_size - 1) * width + last].argmax(-1)
         torch.cuda.synchronize()
         assert torch.equal(out, ref)
+
+
+def _random(replay, storage, base, bias, real):
+    pass
+
+
+def _tie(replay, storage, base, bias, real):
+    storage.zero_()
+    bias.zero_()
+
+
+def _nan(replay, storage, base, bias, real):
+    if real:
+        base[:, replay % real] = float("nan")
+
+
+def _inf(replay, storage, base, bias, real):
+    storage.fill_(-float("inf"))
+    if replay % 2 and real:
+        base[:, replay % real] = float("inf")
+
+
+@_NVLINK
+@_ROWS
+@_SHARDS
+def test_random_logits(m, width, last, nvlink):
+    _replay_and_check(m, width, last, nvlink, _random)
+
+
+@_NVLINK
+@_ROWS
+@_SHARDS
+def test_ties_resolve_to_the_lowest_index(m, width, last, nvlink):
+    _replay_and_check(m, width, last, nvlink, _tie)
+
+
+@_NVLINK
+@_ROWS
+@_SHARDS
+def test_nan_propagates(m, width, last, nvlink):
+    _replay_and_check(m, width, last, nvlink, _nan)
+
+
+@_NVLINK
+@_ROWS
+@_SHARDS
+def test_infinities(m, width, last, nvlink):
+    _replay_and_check(m, width, last, nvlink, _inf)
 
 
 if __name__ == "__main__":
