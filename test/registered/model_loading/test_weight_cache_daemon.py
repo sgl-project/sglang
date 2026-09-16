@@ -29,8 +29,8 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # IPC handoff is exercised on every PR. Since the CI runner executes the whole
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner).
-register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=313, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=68, stage="base-b", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).

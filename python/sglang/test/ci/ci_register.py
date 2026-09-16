@@ -98,19 +98,6 @@ def register_amd_ci(
     return None
 
 
-def register_musa_ci(
-    est_time: float,
-    suite: Optional[str] = None,
-    nightly: bool = False,
-    disabled: Optional[str] = None,
-    *,
-    stage: Optional[str] = None,
-    runner_config: Optional[str] = None,
-):
-    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
-    return None
-
-
 def register_npu_ci(
     est_time: float,
     suite: Optional[str] = None,

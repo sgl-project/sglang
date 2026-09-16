@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=133, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=136, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65
@@ -39,7 +39,7 @@ class TestVLMTP4(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--trust-remote-code",
-                "--mamba-scheduler-strategy",
+                "--mamba-radix-cache-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",

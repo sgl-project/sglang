@@ -5,12 +5,13 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
-    declare_direct_writes,
     declare_resolution,
     model_config_of,
+    record_foreign_defaults,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -21,6 +22,37 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _should_auto_enable_hip_rejection_sampling(
+    *,
+    is_hip: bool,
+    use_rejection_sampling: bool,
+    algorithm: Optional[str],
+    token_map: Optional[str],
+    eagle_topk: int,
+    accept_threshold_single: float,
+    accept_threshold_acc: float,
+    enable_deterministic_inference: bool,
+) -> bool:
+    """Whether HIP may default ``speculative_use_rejection_sampling`` on.
+
+    Rejection sampling still cannot consume a reduced / hot draft vocab
+    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
+    would crash configs that previously ran greedy on HIP, including EAGLE3
+    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
+    EAGLE3 and any EAGLE run that already has a token map.
+    """
+    return (
+        is_hip
+        and not use_rejection_sampling
+        and algorithm == "EAGLE"
+        and token_map is None
+        and eagle_topk == 1
+        and accept_threshold_single == 1.0
+        and accept_threshold_acc == 1.0
+        and not enable_deterministic_inference
+    )
 
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
@@ -157,7 +189,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
-            declare_direct_writes(
+            record_foreign_defaults(
                 server_args,
                 "handle_speculative_decoding.custom_validate",
                 algo.validate_server_args,
@@ -175,26 +207,41 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
-        # A registered algorithm's callback lives outside this tree and sets
-        # fields on the record, so the writes are captured around the call.
-        declare_direct_writes(
-            server_args,
-            "handle_speculative_decoding.custom_algo",
-            algo.handle_server_args,
-        )
+        # Imported here and not above: the name is only bound inside the
+        # `speculative_algorithm is not None` branch, and this runs either way.
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+        if isinstance(algo, CustomSpecAlgo):
+            # A registered algorithm's callback lives outside this tree and
+            # assigns fields, so it gets the stand-in and its writes are
+            # declared.
+            record_foreign_defaults(
+                server_args,
+                "handle_speculative_decoding.custom_algo",
+                algo.handle_server_args,
+            )
+        else:
+            # The in-tree dispatcher, which declares. It needs the record
+            # itself: handed the stand-in, its `declare_resolution` calls would
+            # stash on that instead.
+            algo.handle_server_args(server_args)
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (cfg.device.startswith("cuda") or cfg.device == "npu"):
+    if not (
+        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+    ):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA and NPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
+    # DFLASH + dp attention is validated on NPU only.
+    if cfg.enable_dp_attention and not cfg.device == "npu":
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
+            "Currently DFLASH speculative decoding does not support dp "
+            "attention on non-NPU devices."
         )
 
     if cfg.pp_size != 1:
@@ -711,16 +758,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """
     cfg = resolving_view(server_args)
 
-    supported_draft_backends = (
-        "flashinfer",
-        "fa3",
-        "fa4",
-        "triton",
-        "trtllm_mha",
-        "ascend",
+    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    fallback_backend = (
+        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
     )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
@@ -802,7 +844,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
-
     cfg = resolving_view(server_args)
 
     if (
@@ -863,6 +904,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
         "HYV4ForCausalLM",
+        # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -907,7 +950,34 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if cfg.speculative_use_rejection_sampling:
+    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
+    # otherwise fall back to greedy (argmax) and silently ignore temperature and
+    # top_p. Default rejection sampling on -- it routes verify through the Triton
+    # chain sampler -- for configs that support it. See
+    # _should_auto_enable_hip_rejection_sampling for the cases we must not flip.
+    if _should_auto_enable_hip_rejection_sampling(
+        is_hip=get_platform().is_hip,
+        use_rejection_sampling=cfg.speculative_use_rejection_sampling,
+        algorithm=cfg.speculative_algorithm,
+        token_map=cfg.speculative_token_map,
+        eagle_topk=cfg.speculative_eagle_topk,
+        accept_threshold_single=cfg.speculative_accept_threshold_single,
+        accept_threshold_acc=cfg.speculative_accept_threshold_acc,
+        enable_deterministic_inference=cfg.enable_deterministic_inference,
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
+            "enabling speculative_use_rejection_sampling by default."
+        )
+
+    # resolved_view, not cfg: the block above may have just decided this field,
+    # and declare_resolution writes to the stash rather than the dataclass.
+    if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
         # the rejection-sampling kernel consumes; everything else (STANDALONE,
@@ -968,7 +1038,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
-    # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
+    # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
     view = resolved_view(server_args)
     if (

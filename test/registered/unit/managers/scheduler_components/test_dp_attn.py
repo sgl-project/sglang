@@ -12,7 +12,7 @@ from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
@@ -84,6 +84,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,

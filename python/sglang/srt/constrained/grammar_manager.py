@@ -14,6 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -31,7 +32,7 @@ class GrammarManager:
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
         self.grammar_queue: List[Req] = []
-        if not self.server_args.skip_tokenizer_init:
+        if not get_serving().skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,
                 scheduler.tokenizer,
@@ -159,7 +160,12 @@ class GrammarManager:
                 elif req.sampling_params.regex is not None:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
-                    key = ("ebnf", req.sampling_params.ebnf)
+                    key_type = (
+                        "full_assistant_ebnf"
+                        if req.sampling_params.ebnf_full_assistant
+                        else "ebnf"
+                    )
+                    key = (key_type, req.sampling_params.ebnf)
                 elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 

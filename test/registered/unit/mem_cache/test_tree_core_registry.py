@@ -9,7 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     EvictLayer,
     TreeComponent,
 )
@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:

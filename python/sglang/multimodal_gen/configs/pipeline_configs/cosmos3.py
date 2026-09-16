@@ -165,7 +165,7 @@ class Cosmos3Config(PipelineConfig):
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 
-    def adjust_num_frames(self, num_frames: int) -> int:
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         """Round ``num_frames`` so ``(n - 1) % 4 == 0`` for the VAE.
 
         Skips rounding when ``num_frames == 1`` (T2I path) so the single

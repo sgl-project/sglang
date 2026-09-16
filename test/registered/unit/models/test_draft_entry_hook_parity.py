@@ -9,13 +9,6 @@ and its weights are laid out for the other layout. That shipped once: the DSV4
 DSpark draft skipped its bundled shared-expert tensors until #33312 gave it the
 gate.
 
-`test_fusion_gate_coverage.py` walks the same registry but asks a different
-question: does this entry class *touch* the decision (read the flag, name a gated
-class)? That catches a class after it starts consuming the decision. It cannot
-catch one that should consume it and does not, which is what the DSpark class
-looked like: it built the family's *layer* classes, so the flag reader lived in
-another module and its own source named no gated class.
-
 This case asks the invariant directly instead: **presence parity between a draft
 entry class and its target**. Identity is deliberately not required -- a draft
 that delegates with adapted arguments (the Qwen3.5 MTP unwraps `text_config` and
@@ -29,7 +22,7 @@ from sglang.srt.models.registry import ModelRegistry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 # The hooks the loader resolves on the entry class where a draft/target
 # disagreement is a defect rather than a difference. Weight-name maps
