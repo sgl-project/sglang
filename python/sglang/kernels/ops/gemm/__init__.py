@@ -219,11 +219,11 @@ register_kernel(
     KernelSpec(
         op="gemm.n128k512",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.n128k512:n128k512_gemm_bf16",
+        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
-            description="[m, 512] @ [128, 512].T for decode batches m <= 32; the DeepSeek-V4.1 low-ratio index-key projection",
+            description="[m, 512] @ [128, 512].T for decode batches m <= 32",
         ),
         description="bf16 GEMM specialised for N = 128, K = 512 (sglang.kernels.jit, JIT-only).",
     )
@@ -232,11 +232,11 @@ register_kernel(
     KernelSpec(
         op="gemm.n32k5120",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.n32k5120:n32k5120_gemm_bf16",
+        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
         capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
-            description="[m, 5120] @ [32, 5120].T for decode batches m <= 32; the DeepSeek-V4.1 indexer head-weight projection",
+            description="[m, 5120] @ [32, 5120].T for decode batches m <= 32",
         ),
         description="bf16 GEMM specialised for N = 32, K = 5120 (sglang.kernels.jit, JIT-only).",
     )
