@@ -41,6 +41,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # workspace, so enabling more transports here also enlarges the router binary.
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
+[dev-dependencies]
+# Serving on a listener the test already bound, instead of a port it reserved
+# and released, is what keeps parallel test binaries off each other's ports.
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"

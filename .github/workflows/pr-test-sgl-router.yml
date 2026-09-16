@@ -218,6 +218,19 @@ jobs:
           echo "tier_2_build_duration_seconds=${BUILD_SECONDS}" >> "$GITHUB_ENV"
           echo "::notice title=Tier-2 build duration::${BUILD_SECONDS}s"
 
+      # The KV Indexer's Valkey-backed tests spawn a server from PATH on a unix
+      # socket and skip when there is none, so without this the whole
+      # stream/liveness/parity set reports success without executing a line.
+      # The last command fails the step if neither package installed, rather
+      # than letting the tests skip silently again.
+      - name: Install Valkey (KV Indexer tests)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends valkey-server \
+            || sudo apt-get install -y --no-install-recommends redis-server
+          command -v valkey-server || command -v redis-server
+
       - name: cargo test
         working-directory: experimental/sgl-router
         # Skip the tokenizer parity_matrix test here: ubuntu-latest has
