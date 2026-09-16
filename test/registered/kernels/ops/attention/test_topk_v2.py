@@ -82,8 +82,14 @@ FIXED_CONFIGS = [
 ]
 
 
-def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
-    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties."""
+def _assert_topk_close(
+    scores_cpu, ref_raw, our_raw, bs, seq_lens, k, max_permit_error=MAX_PERMIT_ERROR
+):
+    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties.
+
+    ``max_permit_error`` covers the fp16 coarse histogram swapping near-equal
+    scores; tests that pin exactness pass 0.
+    """
     bad = 0
     for i in range(bs):
         L = int(seq_lens[i])
@@ -100,7 +106,7 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
         assert len(our) == min(k, L), (
             f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
         )
-    assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
+    assert bad <= max_permit_error, f"{bad=} > {max_permit_error}"
 
 
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
@@ -306,6 +312,102 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
 
 
+# --- exactness when the coarse histogram cannot discriminate -----------------
+# The tests above draw from ``torch.randn``, which spreads scores over many
+# coarse bins and leaves the threshold bin far below the tie-staging capacity.
+# These distributions collapse a whole row into one coarse bin instead, so the
+# threshold bin overflows the staging buffer.
+NARROW_DISTRIBUTIONS = ["narrow", "narrow_bin", "tiny", "two_values", "all_equal"]
+
+
+def _single_bin_scores(kind, batch, width, device):
+    """Scores whose coarse bin carries no ordering information.
+
+    The bin comes from the top bits of the fp16 cast, so a band narrower than
+    one fp16 ulp -- or a magnitude that underflows fp16 -- gives one bin.
+    """
+    if kind == "narrow":
+        # Narrower than one fp32 ulp at 1.0 (1.19e-7): pins the tie count.
+        u = torch.rand(batch, width, dtype=torch.float32, device=device) * 2.0 - 1.0
+        return 1.0 + u * 1e-6
+    if kind == "narrow_bin":
+        # One coarse bin, ~1.7e5 distinct fp32 values: pins the ordering too.
+        return 1.0 + torch.rand(batch, width, dtype=torch.float32, device=device) * 0.02
+    if kind == "tiny":
+        # Below the fp16 subnormal floor: every score casts to zero.
+        return (
+            0.5 + torch.rand(batch, width, dtype=torch.float32, device=device)
+        ) * 1e-30
+    if kind == "two_values":
+        # Two adjacent fp32 values, ~half the row each: the refinement has to
+        # consume all 32 bits before the survivors are bit-identical, and more
+        # than kMaxNumTie of them still remain at that point.
+        hi = torch.tensor(1.0, dtype=torch.float32, device=device).nextafter(
+            torch.tensor(2.0, dtype=torch.float32, device=device)
+        )
+        pick = torch.rand(batch, width, device=device) < 0.5
+        return torch.where(pick, hi, torch.ones_like(hi))
+    # Control: the bin overflows too, but the candidates are bit-identical, so
+    # any subset is correct and this must keep passing.
+    return torch.full((batch, width), 0.5, dtype=torch.float32, device=device)
+
+
+def _narrow_seed(dist, *rest):
+    """Reproducible across processes -- ``hash(str)`` is salted per interpreter."""
+    seed = NARROW_DISTRIBUTIONS.index(dist)
+    for v in rest:
+        seed = seed * 100003 + int(v)
+    return seed
+
+
+@pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
+@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 32768)])
+@torch.inference_mode()
+def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
+    """No tolerance here: the threshold bin holds the whole row at k=2048, so a
+    dropped candidate is a wrong answer rather than a tie swap. Covers a
+    register-path and a streaming-path shape; tie staging is per-template.
+    """
+    torch.manual_seed(_narrow_seed(dist, batch, seq))
+    device = "cuda"
+    k = 2048
+    width = (seq + 3) & ~3
+    scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
+    )
+
+
+@pytest.mark.parametrize("dist", ["narrow_bin", "two_values"])
+@torch.inference_mode()
+def test_topk_v2_single_coarse_bin_dual_output(dist: str) -> None:
+    """A refined row must reach both dual-mode outputs identically.
+
+    The refinement writes into the staging buffer that the page transform then
+    copies to `out` and `raw_indices`, so overflow and dual output had no joint
+    coverage before.
+    """
+    batch, seq, k = 4, 8192, 2048
+    torch.manual_seed(_narrow_seed(dist, batch, seq, 1))
+    device = "cuda"
+    scores = _single_bin_scores(dist, batch, seq, device)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+
+    transformed_raw, direct_raw = _run_dual(scores, seq_lens, page_table, inv_cpu, k)
+    for row in range(batch):
+        assert sorted(transformed_raw[row]) == sorted(direct_raw[row])
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k, max_permit_error=0
+    )
+
+
 # --- ragged entry point ------------------------------------------------------
 # Rows select inside `[row_start, row_start + seq_len)` of their score row and
 # emit `position + offset`. The window start is an arbitrary token offset, so
@@ -398,6 +500,45 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
             allowed[start - start % 4 : start] = True
         stray = (changed[i] & ~allowed).nonzero().flatten().tolist()
         assert not stray, f"row {i} ({name}) wrote outside its masked head: {stray[:8]}"
+
+
+@pytest.mark.parametrize("dist", ["narrow_bin", "two_values"])
+@pytest.mark.parametrize("length", [8192, 40000])
+@torch.inference_mode()
+def test_topk_v2_ragged_single_coarse_bin(dist: str, length: int) -> None:
+    """Overflow refinement on an unaligned ragged window.
+
+    The refinement re-reads candidates through ``for_each_input`` and has to
+    agree with the collect pass on which elements exist. A window whose start is
+    not 4-aligned makes the kernel mask the columns it pulls in ahead of the
+    window, so this pins that the masked head stays out of both counts. Runs a
+    register-path and a streaming-path length with no tie tolerance.
+    """
+    k = 2048
+    torch.manual_seed(_narrow_seed(dist, length, 2))
+    device = "cuda"
+    starts = [0, 1, 2, 3, 5]
+    rows = len(starts)
+    width = (max(starts) + length + 3) & ~3
+    scores = torch.full(
+        (rows, width), OUTSIDE_SCORE, dtype=torch.float32, device=device
+    )
+    band = _single_bin_scores(dist, rows, length, device)
+    for i, s in enumerate(starts):
+        scores[i, s : s + length] = band[i]
+    before = scores.clone()
+    starts_t = torch.tensor(starts, dtype=torch.int32, device=device)
+    lengths = torch.full((rows,), length, dtype=torch.int32, device=device)
+
+    our_raw = _run_ragged(scores, lengths, starts_t, starts_t + 4321, k)
+
+    windows = torch.empty(rows, length, dtype=torch.float32)
+    for i, s in enumerate(starts):
+        windows[i] = before[i, s : s + length].cpu()
+    ref_raw = _reference(windows, lengths.cpu(), k)
+    _assert_topk_close(
+        windows, ref_raw, our_raw, rows, lengths.cpu(), k, max_permit_error=0
+    )
 
 
 def _assert_topk_values(window, indices, k):
