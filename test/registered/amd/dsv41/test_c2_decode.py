@@ -4,8 +4,8 @@ import sys
 
 import pytest
 import torch
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
     c2_decode_norm_rope_store,
 )
@@ -28,20 +28,48 @@ pytestmark = pytest.mark.skipif(
 EPS = 1e-6
 
 
-def _decode_pool_and_store(kv_input, kv_state, norm_weight, positions, req,
-                           raw_out_loc, eps, *, ring_size, out=None):
+def _decode_pool_and_store(
+    kv_input,
+    kv_state,
+    norm_weight,
+    positions,
+    req,
+    raw_out_loc,
+    eps,
+    *,
+    ring_size,
+    out=None,
+):
     # The fused API returns the pre-RoPE latent checked by this pool/state oracle.
     page_size = 128
     slots = int(raw_out_loc.max().item()) // 2 + 1
-    cache = torch.zeros(((slots + page_size - 1) // page_size,
-                         KVLayout.V4.page_bytes(page_size)), device=kv_input.device, dtype=torch.uint8)
-    freqs = torch.zeros((int(positions.max().item()) + 1, 64),
-                        device=kv_input.device, dtype=torch.float32)
+    cache = torch.zeros(
+        ((slots + page_size - 1) // page_size, KVLayout.V4.page_bytes(page_size)),
+        device=kv_input.device,
+        dtype=torch.uint8,
+    )
+    freqs = torch.zeros(
+        (int(positions.max().item()) + 1, 64),
+        device=kv_input.device,
+        dtype=torch.float32,
+    )
     freqs[:, 0::2] = 1
     return c2_decode_norm_rope_store(
-        kv_input, kv_state, norm_weight, positions, req, raw_out_loc, eps,
-        freqs, cache, page_size=page_size, ring_size=ring_size, out=out,
+        kv_input,
+        kv_state,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        freqs,
+        cache,
+        page_size=page_size,
+        ring_size=ring_size,
+        out=out,
     )
+
+
 # The 584-byte FlashMLA layout fixes head_dim at 512:
 # 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIM = 512
@@ -158,7 +186,7 @@ def _compare(got, expected, rows, ctx):
 
 
 def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], out=None, **kw):
-    """One `c2_decode_norm` call against the reference, returning the two pair states so
+    """One fused compressor call against the reference, returning the two pair states so
     callers can add their own assertions."""
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(
         n, dim, seed, ring_size=ring_size, **kw
@@ -234,7 +262,9 @@ def test_pair_state_carried_across_two_steps():
     args = (norm.weight.data,)
     kw = {"ring_size": ring}
     _decode_pool_and_store(first, got_state, *args, even, req, raw_out_loc, EPS, **kw)
-    got = _decode_pool_and_store(second, got_state, *args, odd, req, raw_out_loc, EPS, **kw)
+    got = _decode_pool_and_store(
+        second, got_state, *args, odd, req, raw_out_loc, EPS, **kw
+    )
 
     assert mask.all(), "step two must be all-odd"
     _compare(got, expected, mask, "two-step")

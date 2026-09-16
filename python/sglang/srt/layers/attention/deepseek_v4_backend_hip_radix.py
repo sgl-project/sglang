@@ -674,7 +674,9 @@ class DSV4Metadata:
         )
         if not self.core_attn_metadata.low_ratios:
             maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
-            maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
+            maybe_copy_inplace(
+                self.c4_compress_metadata, src=other.c4_compress_metadata
+            )
             maybe_copy_inplace(
                 self.c128_compress_metadata, src=other.c128_compress_metadata
             )
@@ -1861,7 +1863,11 @@ class DeepseekV4HipRadixBackend(
         max_seq_len = (
             max_seq_len_override
             if max_seq_len_override is not None
-            else (int(seq_lens_cpu.max().item()) if seq_lens_cpu is not None else self.MAX_SEQ_LEN_FOR_CAPTURE)
+            else (
+                int(seq_lens_cpu.max().item())
+                if seq_lens_cpu is not None
+                else self.MAX_SEQ_LEN_FOR_CAPTURE
+            )
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -2232,7 +2238,9 @@ class DeepseekV4HipRadixBackend(
     ) -> None:
         if not self.low_ratios:
             replay_batch = (
-                static_forward_batch if static_forward_batch is not None else forward_batch
+                static_forward_batch
+                if static_forward_batch is not None
+                else forward_batch
             )
             replay_metadata = self._build_forward_metadata(
                 replay_batch,
@@ -2261,8 +2269,6 @@ class DeepseekV4HipRadixBackend(
         self._refresh_fp4_prefill_workspace(forward_batch)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(live)
         self.forward_metadata = capture_metadata
-
-
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[

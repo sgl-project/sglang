@@ -124,10 +124,10 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             store_fp4_index_k_cache_split,
         )
+        from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _expand_index_page_table,
         )
-        from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(ratio)
         bs, n_full_pages = 4, 8
