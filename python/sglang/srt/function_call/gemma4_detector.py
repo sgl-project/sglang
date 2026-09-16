@@ -3,6 +3,7 @@ import logging
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -287,6 +288,12 @@ class Gemma4Detector(BaseFormatDetector):
 
             tool_indices = self._get_tool_indices(tools)
             for func_name, args_str in matches:
+                if func_name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
                 arguments = _parse_gemma4_args(args_str)
                 calls.append(
                     ToolCallItem(
