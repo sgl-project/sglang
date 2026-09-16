@@ -689,7 +689,10 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            results = self.storage_backend.batch_get_v2(
+                transfers_nonkv, extra_info=extra_info
+            )
             pool_hits = count_pool_hits(results)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
@@ -731,7 +734,10 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(backup_transfers)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            results = self.storage_backend.batch_set_v2(
+                backup_transfers, extra_info=extra_info
+            )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
