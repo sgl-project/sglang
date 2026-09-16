@@ -4108,7 +4108,7 @@ class DeepseekV4Model(nn.Module):
 
         self.engram_prefetch_stream = None
         if (
-            _is_cuda
+            (_is_cuda or _is_hip)
             and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
             and self.pp_group.world_size == 1
             and not is_dp_attention_enabled()
@@ -4117,11 +4117,15 @@ class DeepseekV4Model(nn.Module):
             and self.start_layer <= 14 < self.end_layer
             and self.layers[14].engram is not None
             and self.layers[14].engram.embed._shared
-            # Other backends may share mutable GEMM workspace across streams.
+            # These backends use per-call scratch rather than a shared GEMM workspace.
             and getattr(
                 self.layers[14].engram.wkv.quant_method, "mxfp8_dense_backend", None
             )
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            in (
+                Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
+                Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
+                Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+            )
         ):
             self.engram_prefetch_stream = torch.cuda.Stream()
             logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
