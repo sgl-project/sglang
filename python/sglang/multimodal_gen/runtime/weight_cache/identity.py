@@ -34,9 +34,13 @@ def consumed_files(prepared):
         Path(recipe.server_args.model_paths["transformer"]) / "config.json",
     ]
     files.extend(Path(path) for path in recipe.weight_files)
-    index = root / "transformer/diffusion_pytorch_model.safetensors.index.json"
-    if index.exists():
-        files.append(index)
+    for filename in (
+        "diffusion_pytorch_model.safetensors.index.json",
+        "model.safetensors.index.json",
+    ):
+        index = Path(recipe.server_args.model_paths["transformer"]) / filename
+        if index.exists():
+            files.append(index)
     # Exact consumed paths, including any index which selected the shards.
     if any(not path.absolute().is_relative_to(root.absolute()) for path in files):
         raise ValueError(
@@ -47,6 +51,19 @@ def consumed_files(prepared):
 
 def checkpoint_identity(prepared, args, *, verify=False):
     root, names = consumed_files(prepared)
+    # HF native releases may keep independently admitted pipelines below the
+    # immutable snapshot (e.g. FL2VA). Keep the exact subfolder in the identity;
+    # every consumed symlink must still resolve within this published repo.
+    snapshot = next(
+        (
+            candidate
+            for candidate in (root, *root.parents)
+            if candidate.parent.name == "snapshots"
+            and re.fullmatch(r"[0-9a-f]{40}", candidate.name)
+            and candidate.parent.parent.name.startswith("models--")
+        ),
+        None,
+    )
     stamps = {name: dataclasses.asdict(FileStamp.read(root / name)) for name in names}
     manifest_path = root / MANIFEST_FILENAME
     if manifest_path.exists():
@@ -58,12 +75,8 @@ def checkpoint_identity(prepared, args, *, verify=False):
         if verify:
             verify_manifest(root, manifest, list(names))
         identity = {"kind": "content_manifest", "digest": manifest.digest}
-    elif (
-        root.parent.name == "snapshots"
-        and re.fullmatch(r"[0-9a-f]{40}", root.name)
-        and root.parent.parent.name.startswith("models--")
-    ):
-        repo_root = root.parent.parent.resolve()
+    elif snapshot is not None:
+        repo_root = snapshot.parent.parent.resolve()
         if any(
             not (root / name).resolve(strict=True).is_relative_to(repo_root)
             for name in names
@@ -72,8 +85,10 @@ def checkpoint_identity(prepared, args, *, verify=False):
         identity = {
             "kind": "hf_snapshot",
             "repo": repo_root.name,
-            "revision": root.name,
+            "revision": snapshot.name,
         }
+        if root != snapshot:
+            identity["subfolder"] = root.relative_to(snapshot).as_posix()
     elif args.weight_cache_allow_weak_checkpoint_identity:
         import logging
 

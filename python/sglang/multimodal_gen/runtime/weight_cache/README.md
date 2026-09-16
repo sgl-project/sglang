@@ -1,7 +1,8 @@
 # Diffusion weight-cache recovery
 
-Two explicit native transformer adapters are supported: Wan2.1 T2V 1.3B and
-the original Qwen-Image (not Edit, Layered or 2512). Both require CUDA,
+Three explicit native transformer adapters are supported: Wan2.1 T2V 1.3B,
+original Qwen-Image (not Edit, Layered or 2512), and original MiniMax-H3 FL2VA
+(not Ref2VA, FastH3, pruned or Diffusers-layout H3). All require CUDA,
 single GPU/rank/node, bf16, resident non-FSDP weights, FA attention and eager
 execution. Other components use their ordinary loaders. Unsupported resolved
 configurations and missing/incompatible owners are errors, not disk fallback.
@@ -61,10 +62,33 @@ Storage aliases and exact object ties require a component state manifest on top
 of the existing tensor transport. The component layer does not implement Torch
 CUDA handle creation/reconstruction or a second serializer.
 
-Both adapters reuse the same ordinary loader, meta constructor, common admission
+All adapters reuse the same ordinary loader, meta constructor, common admission
 checks and fingerprint mechanics. Qwen's packed text QKV is imported in its
 ordinary finalized layout. RoPE frequencies, modulation caches and the small
 `timestep_zero` constant are process-local derived state, not shared weights.
+
+H3 retains the native mixed bf16/fp32 precision contract. Grouped QKV is reordered
+only by the ordinary loader, never again after import. Its persistent FP32 RoPE
+is shared in the loader's finalized parameter registration; its lazy timestep
+frequency buffer is process-local. Prepared and ordinary construction share
+partition resolution and release-metadata validation. AdaLN side/online caches
+are not supported by this adapter.
+
+For native MiniMax-H3, use the pinned **repository root** and
+`--model-variant fl2va` for both owner and client. A repository can also contain a
+different modular Diffusers pipeline at its root; do not rely on that default.
+HF identities include the selected snapshot subfolder and native
+`model.safetensors.index.json`. For example, run these in separate terminals:
+
+```bash
+python -m sglang.multimodal_gen.runtime.weight_cache.daemon \
+  --model-path /path/to/pinned/H3/snapshot --model-variant fl2va \
+  --performance-mode manual --attention-backend fa
+
+sglang serve --model-path /path/to/pinned/H3/snapshot --model-variant fl2va \
+  --weight-cache-mode client --performance-mode manual --attention-backend fa \
+  --component-residency transformer=resident text_encoder=layerwise-offload vae=component-offload
+```
 
 ## Lifecycle and current limits
 
@@ -88,6 +112,10 @@ ordinary finalized layout. RoPE frequencies, modulation caches and the small
 
 Component import latency is not total service readiness: Python startup,
 distributed setup, uncached text encoder/VAE loading and offload setup remain.
+Imported allocations belong to the owner and are not counted in the consumer's
+PyTorch allocator statistics. Do not interpret consumer-only allocated/reserved
+memory or derived "headroom" as total physical GPU usage; include the owner and
+its runtime/allocator overhead when budgeting memory.
 
 ## Verification
 
@@ -111,6 +139,18 @@ pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_qwen
 Use `SGLANG_WEIGHT_CACHE_QWEN_TEST_MODEL` for a local Qwen snapshot. Its default
 is the pinned original Qwen-Image revision, not an automatically selected variant.
 
+H3's acceptance test compares valid 4-second 1344×768 T2VA output at 4/8 sampling
+schedule points, validates both audio and video, checks all finalized parameters
+(including FP32 RoPE) before/after inference, and exercises mutation rejection,
+fatal owner loss and stale-generation restart. This is recovery parity testing,
+not certification of H3's separate multi-GPU `quality="high"` deployment profile.
+
+```bash
+pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_minimax_h3_1_gpu.py -v -s
+```
+
+`SGLANG_WEIGHT_CACHE_MINIMAX_TEST_MODEL` can select a local pinned repository root.
+
 `SGLANG_WEIGHT_CACHE_TEST_MODEL` can point to a local published mirror. The
 default uses a pinned HF revision. Readiness samples and median/p90 for both
 `/liveness` and `/health` are written to the pytest temporary output directory.
@@ -132,6 +172,10 @@ Qwen benchmark disables post-warmup automatic residency changes in both arms
 placement. Otherwise the cache's free-VRAM advantage could change uncached text
 encoder placement and confound the startup comparison. Synthetic warmup itself
 still runs in the `server` arm; this is a controlled-placement measurement.
+For native H3, use `--model-kind minimax-h3` and the pinned repository root. Both
+arms explicitly use manual placement (resident transformer, layerwise-offloaded
+text encoder, component-offloaded VAEs). Server warmup uses 96 requested frames
+at 24 fps and two schedule points; real parity requests use four schedule points.
 Because the owner also remains present in the ordinary arm, this benchmark needs
 VRAM for two resident DiTs plus the uncached components and activations. This
 extra ordinary copy is an A/B measurement requirement, not a cache-client
@@ -142,6 +186,9 @@ each warmup mode, alternates pair order, keeps an owner present in both modes,
 checks identical resolved placement and byte-exact generated images/videos, and probes
 both HTTP readiness endpoints every 50 ms. It saves raw samples, per-start logs,
 outputs, median/p90 and paired deltas; owner startup is reported separately.
+Output parity is checked within each warmup setting. Native H3 ordinary outputs
+can differ between settings; this benchmark does not assert cross-warmup output
+invariance.
 This is a warm-file recovery benchmark, without page-cache eviction or artificial
 I/O throttling. It does not assert a speedup merely because a regression limit
 passes. Use an idle GPU/host and do not edit installed Python code during a run.

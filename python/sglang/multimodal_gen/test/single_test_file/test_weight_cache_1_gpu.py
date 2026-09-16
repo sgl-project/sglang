@@ -89,7 +89,7 @@ def _wait_for(process, predicate, *, timeout=180):
         time.sleep(0.1)
 
 
-def _start_owner(model, socket_path, env, log):
+def _start_owner(model, socket_path, env, log, *, extra_args=()):
     process = subprocess.Popen(
         [
             sys.executable,
@@ -99,6 +99,7 @@ def _start_owner(model, socket_path, env, log):
             model,
             "--weight-cache-socket",
             str(socket_path),
+            *extra_args,
         ],
         env={**os.environ, **env},
         stdout=log,

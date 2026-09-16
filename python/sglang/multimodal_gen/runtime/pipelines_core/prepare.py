@@ -40,6 +40,7 @@ class PreparedPipeline:
     transformer: FrozenTransformerLoad
     execution_plan: PipelineExecutionPlan
     adapter_id: str
+    model_index_json: str
 
     @property
     def adapter(self):
@@ -49,6 +50,7 @@ class PreparedPipeline:
         # The resolver already updated this config. Do not discover or update it
         # again in materialization. Other components keep their ordinary loaders.
         recipe = self.transformer.thaw()
+        server_args.model_subfolder = recipe.server_args.model_subfolder
         server_args.pipeline_config.dit_config = recipe.init_params["config"]
         server_args.model_paths["transformer"] = recipe.server_args.model_paths[
             "transformer"
@@ -79,22 +81,34 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     if (
         server_args.backend == "diffusers"
         or server_args.disagg_role != "monolithic"
-        or server_args.model_subfolder
-        or server_args.model_variant
+        or (
+            (server_args.model_subfolder or server_args.model_variant)
+            and not getattr(adapter, "SUPPORTS_SUBFOLDER", False)
+        )
     ):
         if required:
             raise ValueError(
                 "Unsupported backend/role/subfolder/variant for weight cache"
             )
         return None
-    root = Path(
-        maybe_download_model(
-            server_args.model_path,
-            force_diffusers_model=True,
-            revision=server_args.revision,
+    args = copy.deepcopy(server_args)
+    # Do not recursively include an earlier plan in a frozen recipe.
+    args._prepared_pipeline = None
+    args._weight_cache_admission = None
+    if getattr(adapter, "SUPPORTS_SUBFOLDER", False):
+        model_path, model_index = pipeline_cls.resolve_model_config(
+            args.model_path, args
         )
-    )
-    model_index = json.loads((root / "model_index.json").read_text())
+        root = Path(model_path)
+    else:
+        root = Path(
+            maybe_download_model(
+                args.model_path,
+                force_diffusers_model=True,
+                revision=args.revision,
+            )
+        )
+        model_index = json.loads((root / "model_index.json").read_text())
     names = tuple(pipeline_cls._required_config_modules)
     if (
         model_index.get("_class_name") != adapter.PIPELINE_NAME
@@ -126,10 +140,6 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
                 f"Weight cache adapter supports {adapter.MODEL_LABEL} only"
             )
         return None
-    args = copy.deepcopy(server_args)
-    # Do not recursively include an earlier plan in a frozen recipe.
-    args._prepared_pipeline = None
-    args._weight_cache_admission = None
     if (
         pipeline_cls.component_loaders.get("transformer", TransformerLoader)
         is not TransformerLoader
@@ -147,6 +157,8 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
     transformer_backend, _ = args.resolve_component_attention_backend("transformer")
     attention = str(transformer_backend) if transformer_backend is not None else "fa"
     try:
+        if hasattr(adapter, "validate_model_index"):
+            adapter.validate_model_index(model_index)
         frozen = loader.prepare_customized(
             paths["transformer"],
             args,
@@ -205,4 +217,5 @@ def prepare_pipeline(pipeline_cls, server_args, *, required=False):
         frozen,
         PipelineExecutionPlan(pipeline_cls.__name__, tuple(components)),
         adapter.ADAPTER_ID,
+        json.dumps(model_index, sort_keys=True, separators=(",", ":")),
     )

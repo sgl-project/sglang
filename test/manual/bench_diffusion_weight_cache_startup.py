@@ -32,6 +32,10 @@ from sglang.multimodal_gen.test.single_test_file.test_weight_cache_1_gpu import 
     _start_owner,
     _stop_owner,
 )
+from sglang.multimodal_gen.test.single_test_file.test_weight_cache_minimax_h3_1_gpu import (
+    MINIMAX_FLAGS,
+    generate_minimax_h3,
+)
 from sglang.multimodal_gen.test.single_test_file.test_weight_cache_qwen_image_1_gpu import (
     generate_qwen_image,
 )
@@ -121,6 +125,7 @@ def run(options):
     model = str(Path(options.model_path).resolve(strict=True))
     records, references, placements = [], {}, {}
     qwen = options.model_kind == "qwen-image"
+    minimax = options.model_kind == "minimax-h3"
     with tempfile.TemporaryDirectory(prefix="sgl-wc-perf-") as runtime:
         socket_path = Path(runtime) / "owner.sock"
         env = {"SGLANG_DIFFUSION_WEIGHT_CACHE_DIR": runtime, "HF_HUB_OFFLINE": "1"}
@@ -131,14 +136,24 @@ def run(options):
             env["SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"] = "1"
         with (root / "owner.log").open("w") as log:
             owner_start = time.perf_counter()
-            owner = _start_owner(model, socket_path, env, log)
+            owner = _start_owner(
+                model,
+                socket_path,
+                env,
+                log,
+                extra_args=shlex.split(MINIMAX_FLAGS) if minimax else (),
+            )
             owner_seconds = time.perf_counter() - owner_start
             try:
                 for warmup in options.warmup:
                     flags = f"--num-gpus 1 --warmup-mode {warmup}"
+                    if minimax:
+                        flags = f"{MINIMAX_FLAGS} --warmup-mode {warmup}"
                     if qwen:
                         flags += " --attention-backend fa"
-                    if warmup == "server":
+                    if warmup == "server" and minimax:
+                        flags += " --warmup-resolutions 1344x768 --warmup-num-frames 96 --warmup-steps 2"
+                    elif warmup == "server":
                         flags += (
                             " --warmup-resolutions 1024x1024 --warmup-steps 1"
                             if qwen
@@ -158,7 +173,9 @@ def run(options):
                             )
                             context = manager.start()
                             try:
-                                if qwen:
+                                if minimax:
+                                    content = generate_minimax_h3(context, model, name)
+                                elif qwen:
                                     content = generate_qwen_image(context, model, name)
                                 else:
                                     content, _ = _generate(context, model, name)
@@ -213,7 +230,7 @@ def run(options):
                                     "model_kind": options.model_kind,
                                     "owner_start_seconds": owner_seconds,
                                     "owner_present_for_both_modes": True,
-                                    "post_warmup_auto_residency": not qwen,
+                                    "post_warmup_auto_residency": not (qwen or minimax),
                                     "poll_interval_seconds": 0.05,
                                     "storage_condition": "warm file cache, no eviction or throttling",
                                     "placement": placements,
@@ -239,7 +256,9 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--count", type=int, default=5)
-    parser.add_argument("--model-kind", choices=("wan", "qwen-image"), default="wan")
+    parser.add_argument(
+        "--model-kind", choices=("wan", "qwen-image", "minimax-h3"), default="wan"
+    )
     parser.add_argument(
         "--warmup", choices=("off", "server"), nargs="+", default=["off", "server"]
     )

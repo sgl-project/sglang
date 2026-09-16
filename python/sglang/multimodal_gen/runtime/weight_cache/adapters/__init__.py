@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Adapters are admitted by resolved capability, not model-name heuristics."""
 
-from . import dit_qwen_image, dit_wan
+from . import dit_minimax_h3, dit_qwen_image, dit_wan
 
-_ADAPTERS = {module.ADAPTER_ID: module for module in (dit_wan, dit_qwen_image)}
+_ADAPTERS = {
+    module.ADAPTER_ID: module for module in (dit_wan, dit_qwen_image, dit_minimax_h3)
+}
 
 
 def for_pipeline(pipeline_cls):

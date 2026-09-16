@@ -89,19 +89,20 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"supported: {sorted(subfolders)!r}"
             ) from exc
 
-    def _load_config(self):
-        model_variant = self.server_args.model_variant
+    @classmethod
+    def resolve_model_config(cls, model_path, server_args):
+        model_variant = server_args.model_variant
         if model_variant is not None:
-            semantic_subfolder = self.model_subfolder_for_variant(model_variant)
+            semantic_subfolder = cls.model_subfolder_for_variant(model_variant)
             if model_variant.strip().lower() == "hybrid" and not (
-                self.server_args.component_weights_paths.get("transformer")
-                or self.server_args.transformer_weights_path
+                server_args.component_weights_paths.get("transformer")
+                or server_args.transformer_weights_path
             ):
                 raise ValueError(
                     "MiniMax H3 --model-variant hybrid requires explicit merged "
                     "weights via --component-weights-paths.transformer"
                 )
-            explicit_subfolder = self.server_args.model_subfolder
+            explicit_subfolder = server_args.model_subfolder
             if (
                 explicit_subfolder is not None
                 and explicit_subfolder.strip().lower() != semantic_subfolder.lower()
@@ -112,12 +113,19 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     f"{semantic_subfolder!r}, model_subfolder="
                     f"{explicit_subfolder!r}"
                 )
-            self.server_args.model_subfolder = semantic_subfolder
-        model_index = super()._load_config()
-        self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+            server_args.model_subfolder = semantic_subfolder
+        model_path, model_index = super().resolve_model_config(model_path, server_args)
+        cls._release_metadata_from_config(model_index, server_args)
+        return model_path, model_index
+
+    @classmethod
+    def _release_metadata_from_config(cls, model_index, server_args):
+        metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+        model_variant = server_args.model_variant
         if (
             model_variant is not None
-            and self.release_metadata.partition != semantic_subfolder.lower()
+            and metadata.partition
+            != cls.model_subfolder_for_variant(model_variant).lower()
         ):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
@@ -126,12 +134,17 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         if model_variant is not None and model_variant.strip().lower() == "hybrid":
             # merged checkpoints share the native graph across all three tasks
             # keep the base partition contract strict unless explicitly selected
-            self.release_metadata = replace(
-                self.release_metadata,
+            metadata = replace(
+                metadata,
                 partition="hybrid",
                 tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
-        return model_index
+        return metadata
+
+    def configure_model_index(self, model_index):
+        self.release_metadata = self._release_metadata_from_config(
+            model_index, self.server_args
+        )
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role != RoleType.MONOLITHIC:
