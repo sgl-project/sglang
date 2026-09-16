@@ -49,7 +49,7 @@ import types
 import uuid
 import warnings
 from array import array
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -810,45 +810,227 @@ def get_used_cpu_memory():
         return psutil.virtual_memory().used
 
 
+_SYSFS_NODE_DIR = "/sys/devices/system/node/"
+
+
+def _numa_node_memory_mb():
+    # Physical MemTotal per NUMA node, keyed by the real node id: {node: MB}.
+    # Keyed by id rather than position because a cpuset-restricted process sees
+    # a subset of nodes, so the i-th usable node is not node{i}.
+    node_mem = {}
+    try:
+        for entry in os.listdir(_SYSFS_NODE_DIR):
+            match = re.fullmatch(r"node(\d+)", entry)
+            if match is None:
+                continue
+            with open(os.path.join(_SYSFS_NODE_DIR, entry, "meminfo"), "r") as f:
+                # MemTotal info is at the 1st line
+                # Expected format: "Node 0 MemTotal:       100000000 kB"
+                parts = f.readline().split()
+            if len(parts) >= 4 and parts[2] == "MemTotal:":
+                # Retrieved value in KB, need MB
+                node_mem[int(match.group(1))] = int(parts[3]) / 1024
+    except (OSError, ValueError):
+        return {}
+    return node_mem
+
+
+def _parse_cpu_list(spec: str):
+    # "0-31,64" -> {0,...,31,64}. Empty set when the spec is malformed.
+    cpus = set()
+    try:
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                cpus.update(range(int(lo), int(hi) + 1))
+            else:
+                cpus.add(int(part))
+    except ValueError:
+        return set()
+    return cpus
+
+
+def _cpu_to_numa_node():
+    # {cpu_id: numa_node}, or {} when the topology cannot be determined.
+    # Two independent sources so one missing piece is not fatal: sysfs first
+    # (no subprocess, present in most containers), then `lscpu` (works when
+    # sysfs is masked, e.g. some sandboxed runtimes). parse_lscpu_topology
+    # raises when lscpu is absent -- a slim image must not crash the server
+    # here, so it is caught.
+    mapping = {}
+    try:
+        for entry in os.listdir(_SYSFS_NODE_DIR):
+            match = re.fullmatch(r"node(\d+)", entry)
+            if match is None:
+                continue
+            with open(os.path.join(_SYSFS_NODE_DIR, entry, "cpulist"), "r") as f:
+                for cpu in _parse_cpu_list(f.read().strip()):
+                    mapping[cpu] = int(match.group(1))
+    except (OSError, ValueError):
+        mapping = {}
+    if mapping:
+        return mapping
+    try:
+        return {cpu: node for cpu, _core, _socket, node in parse_lscpu_topology()}
+    except Exception as e:
+        logger.warning("Cannot determine CPU/NUMA topology: %s", e)
+        return {}
+
+
+def _cpu_affinity():
+    # CPUs this process may run on (sched_getaffinity). Unlike sysfs and lscpu
+    # this is a syscall: it needs no mount and no permission, so it is the one
+    # signal that stays trustworthy inside a restricted container.
+    try:
+        return set(psutil.Process().cpu_affinity())
+    except Exception:
+        return set()
+
+
+def _usable_numa_nodes():
+    # {node: allowed cpus} for the nodes this process can actually run on.
+    cpu_to_node = _cpu_to_numa_node()
+    if not cpu_to_node:
+        return {}
+    allowed = _cpu_affinity() or set(cpu_to_node)
+    node_to_cpus = defaultdict(set)
+    for cpu in allowed:
+        if cpu in cpu_to_node:
+            node_to_cpus[cpu_to_node[cpu]].add(cpu)
+    return dict(node_to_cpus)
+
+
+def _cpu_is_affinity_restricted():
+    # True when this process is pinned to a subset of the machine's CPUs
+    # (docker --cpuset-cpus, taskset, a cpuset cgroup). Whole-machine memory is
+    # never a valid answer for such a process.
+    allowed = _cpu_affinity()
+    total = os.cpu_count() or 0
+    return bool(allowed) and total > 0 and len(allowed) < total
+
+
+def _bind_group_count():
+    # Number of ranks implied by SGLANG_CPU_OMP_THREADS_BIND ("0-31|32-63" -> 2),
+    # 1 when unset. Lets per-rank memory be divided even with no topology at all.
+    omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not omp_cpuids or omp_cpuids == "all":
+        return 1
+    return max(1, len([g for g in omp_cpuids.split("|") if g.strip()]))
+
+
+def _capacity_per_bind_group(omp_cpuids: str, node_mem: dict, cpu_to_node: dict):
+    # Per-rank capacities (MB) implied by SGLANG_CPU_OMP_THREADS_BIND, one entry
+    # per '|'-separated group. A rank spanning several NUMA nodes gets their sum;
+    # several ranks sharing one node split it. Empty list when the bind string
+    # cannot be mapped onto the topology.
+    groups = []
+    for group in omp_cpuids.split("|"):
+        nodes = {
+            cpu_to_node[cpu] for cpu in _parse_cpu_list(group) if cpu in cpu_to_node
+        }
+        nodes &= set(node_mem)
+        if not nodes:
+            return []
+        groups.append(nodes)
+    ranks_on_node = Counter(node for nodes in groups for node in nodes)
+    return [
+        sum(node_mem[node] / ranks_on_node[node] for node in nodes) for nodes in groups
+    ]
+
+
 def get_cpu_memory_capacity():
-    # Per-rank memory capacity cannot be determined for customized core settings
-    if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
-        return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
+    """Memory capacity available to ONE rank, in MB, or None when it cannot be
+    determined.
+
+    Resolution order, most to least authoritative:
+
+    1. SGLANG_CPU_MEMORY_CAPACITY_MB -- explicit escape hatch for environments
+       where probing is wrong (nested virtualization, sandboxed runtimes).
+    2. The cgroup memory limit, which is what actually bounds a container.
+    3. sched_getaffinity + per-NUMA-node MemTotal, to split that budget across
+       the ranks and nodes this process may use.
+
+    Never returns a whole-machine figure for a process that is demonstrably
+    restricted (pinned CPUs, a cgroup cap, or a custom core binding): the caller
+    turns this into mem_fraction_static = (capacity - reserved) / capacity, so a
+    host-wide value on a large-memory CPU box yields ~0.99 and leaves the KV
+    pool no headroom. None is the safe answer -- the caller then falls back to a
+    fixed fraction.
+    """
+    override = os.environ.get("SGLANG_CPU_MEMORY_CAPACITY_MB", "").strip()
+    if override:
+        try:
+            value = float(override)
+            if value > 0:
+                logger.info(
+                    "Using SGLANG_CPU_MEMORY_CAPACITY_MB=%s MB as the per-rank CPU "
+                    "memory capacity.",
+                    value,
+                )
+                return value
+        except ValueError:
+            pass
+        logger.warning(
+            "Ignoring invalid SGLANG_CPU_MEMORY_CAPACITY_MB=%r; expected a positive "
+            "number of MB.",
+            override,
+        )
 
     cgroup_limit = _read_cgroup_memory_max()
-    if cgroup_limit is not None:
-        # Memory-capped container: divide this cgroup's limit across the usable
-        # NUMA nodes (empty nodes are already dropped by get_cpu_ids_by_node).
-        per_numa_mem = cgroup_limit / n_numa_node
-        return float(per_numa_mem // (1 << 20))
+    n_ranks = _bind_group_count()
+    cpu_to_node = _cpu_to_numa_node()
+    usable_nodes = _usable_numa_nodes()
+    node_mem = {
+        node: mem
+        for node, mem in _numa_node_memory_mb().items()
+        if node in usable_nodes
+    }
 
-    # No cgroup limit (bare metal / full-machine container): use the smallest
-    # per-node physical MemTotal, matching the original host-based behavior.
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+    if not node_mem:
+        # No usable NUMA topology (sysfs masked and lscpu absent, or a machine
+        # that reports none). Fall back to a flat budget divided by the rank
+        # count -- but only from a source that is valid for THIS process.
+        if cgroup_limit is not None:
+            budget_mb = cgroup_limit / (1 << 20)
+        elif _cpu_is_affinity_restricted():
+            # Pinned to a subset of the machine with no cgroup cap: the host
+            # total says nothing about this process's share.
+            logger.warning(
+                "CPU is restricted to a subset of the machine but NUMA topology "
+                "and cgroup limit are both unavailable; CPU memory capacity is "
+                "unknown. Set SGLANG_CPU_MEMORY_CAPACITY_MB to specify it."
+            )
+            return None
+        else:
+            budget_mb = psutil.virtual_memory().total / (1 << 20)
+        return float(budget_mb / n_ranks)
+
+    if cgroup_limit is not None:
+        # Memory-capped container: the cgroup limit is an upper bound on the sum
+        # over usable nodes, so cap each node by its even share of it. Physical
+        # per-node memory still wins when it is the tighter of the two.
+        cgroup_per_node = cgroup_limit / (1 << 20) / len(node_mem)
+        node_mem = {node: min(mem, cgroup_per_node) for node, mem in node_mem.items()}
+
+    omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if omp_cpuids and omp_cpuids != "all":
+        # Custom core binding: derive each rank's share from the bind string and
+        # report the smallest, since this runs before ranks exist and the result
+        # is a single global default.
+        capacities = _capacity_per_bind_group(omp_cpuids, node_mem, cpu_to_node)
+        if capacities:
+            return float(min(capacities))
+        logger.warning(
+            "Could not map SGLANG_CPU_OMP_THREADS_BIND=%s onto the NUMA topology; "
+            "falling back to per-NUMA-node memory capacity.",
+            omp_cpuids,
+        )
+
+    # Default binding: one rank per NUMA node.
+    return float(min(node_mem.values()))
 
 
 def get_xpu_memory_capacity():
