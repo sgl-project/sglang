@@ -99,6 +99,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.forward_mode.is_decode()
         or forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
     )
 
 

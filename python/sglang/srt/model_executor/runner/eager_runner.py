@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -295,8 +296,17 @@ class EagerRunner(BaseRunner):
             or cp_v2_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                model_runner.ps.attn_dcp_size > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                # MLA target verify uses rank-local decode KV and LSE merge,
+                # not the prefill KV gather layout (or its prefix lengths).
+                and not (
+                    forward_batch.forward_mode.is_target_verify()
+                    and model_runner.model_config.attention_arch == AttentionArch.MLA
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (

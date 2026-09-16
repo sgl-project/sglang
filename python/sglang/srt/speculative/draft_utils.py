@@ -122,8 +122,7 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
-            # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
-            "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
+            "cutedsl_mla": self._create_cutedsl_mla_prefill_backend,
             "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
@@ -479,6 +478,19 @@ class DraftBackendFactory:
         return (
             "trtllm_mla",
             TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False),
+        )
+
+    def _create_cutedsl_mla_prefill_backend(self):
+        if not self.draft_model_runner.use_mla_backend:
+            raise ValueError(
+                "cutedsl_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+
+        return (
+            "cutedsl_mla",
+            CuteDslMLABackend(self.draft_model_runner, skip_prefill=False),
         )
 
     def _create_tokenspeed_mla_prefill_backend(self):
