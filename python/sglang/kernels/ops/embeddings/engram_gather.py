@@ -62,8 +62,13 @@ def engram_gather(
     [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
     may live in device or host memory. Ids outside the range produce zero rows.
     """
-    assert dim & (dim - 1) == 0 and dim % block_size == 0, (dim, block_size)
-    assert out.dtype == torch.bfloat16 and out.is_contiguous()
+    assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
+    assert dim % block_size == 0, (dim, block_size)
+    assert (
+        ids.is_cuda and ids.is_contiguous() and ids.dtype in (torch.int32, torch.int64)
+    )
+    assert out.is_contiguous() and out.dtype == torch.bfloat16
+    assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
     if n:
         _engram_gather_kernel[(n,)](
