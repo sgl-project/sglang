@@ -264,9 +264,7 @@ class TestQwen35DenseMxPolicy(CustomTestCase):
         cfg = self._policy_config()
         narrow = torch.nn.Module()
         narrow.output_size_per_partition = 64
-        self.assertIsNone(
-            self._routed(cfg, "model.layers.0.self_attn.o_proj", narrow)
-        )
+        self.assertIsNone(self._routed(cfg, "model.layers.0.self_attn.o_proj", narrow))
 
     def test_flag_off_leaves_every_layer_bf16(self):
         cfg = self._policy_config()
