@@ -549,7 +549,12 @@ class MambaComponent(TreeComponent):
 
         if is_finished:
             if cache_len is None:
-                cache_len = 0
+                # The last chunk was shorter than mamba_cache_chunk_size, so no new state
+                # was tracked. Re-insert the committed prefix so its deferred write-through
+                # fires; the node there already holds this request's locked state, so the
+                # insert reports mamba_exist and the ping-pong slot below is discarded
+                # (asserted in cleanup_after_caching_req).
+                cache_len = req.kv.cache_protected_len
             if self.cache.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
@@ -612,6 +617,18 @@ class MambaComponent(TreeComponent):
             mamba_value_inserted = (
                 insert_result is not None and not insert_result.mamba_exist
             )
+            if (
+                self.cache.enable_mamba_extra_buffer
+                and req.kv.mamba_last_track_seqlen is None
+                and insert_result is not None
+                and not insert_result.rotation_tail_declined
+            ):
+                # prepare_for_caching_req fell back to the committed prefix, whose
+                # node must already hold a state; an untracked slot must never land.
+                assert insert_result.mamba_exist, (
+                    "finish-time insert without a tracked Mamba state must hit an "
+                    "existing node"
+                )
             pool = self.cache.req_to_token_pool
 
             if self.int8_ckpt_pool is not None:
