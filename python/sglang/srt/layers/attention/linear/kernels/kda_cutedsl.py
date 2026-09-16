@@ -138,6 +138,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         num_tokens = q_n.shape[0]
         g_in = g[0][:num_tokens]  # raw forget gate; activated inside chunk_kda_cutedsl
         beta_in = beta[0][:num_tokens].to(torch.float32)
+        if kwargs.get("beta_is_raw"):
+            beta_in = beta_in.sigmoid()
         cu_seqlens = query_start_loc.to(torch.int32)
 
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the

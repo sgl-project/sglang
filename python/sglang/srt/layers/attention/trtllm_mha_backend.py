@@ -37,7 +37,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -90,7 +90,7 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
-    # CP-v2 zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
+    # CP zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
     zigzag_page_table: torch.Tensor = None
     zigzag_swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
@@ -242,7 +242,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -410,7 +409,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
     ) -> None:
         """Duplicate request rows once for the combined prev-then-next CP launch."""
-        if not is_cp_v2_active(forward_batch):
+        if not is_cp_active(forward_batch):
             return
 
         # TODO: Avoid materializing duplicated page tables to reduce zigzag CP
@@ -469,9 +468,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
-            max_bs=max_bs, max_context_len=self.max_context_len
-        )
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -822,7 +818,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
         return (
-            not is_cp_v2_active(forward_batch)
+            not is_cp_active(forward_batch)
             and save_kv_cache
             and k is not None
             and self.data_type == torch.float8_e4m3fn
@@ -888,7 +884,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
-                    self.forward_metadata, forward_batch, ragged_layout, bs
+                    self.forward_metadata,
+                    forward_batch,
+                    ragged_layout,
+                    bs,
+                    in_capture=in_capture,
                 )
         elif forward_mode.is_draft_extend_v2():
             self.forward_metadata = self.draft_extend_metadata[bs]
@@ -898,21 +898,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         if self.kv_index_translator.is_translating:
-            # Unified pool: refresh the capture-stable read table (this runs
+            # Unified pool: refill this mode's own page table (this runs
             # out-of-graph on BOTH capture and every replay-prep; the recorded
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
-            kv_view = self.kv_index_translator.build_index_table(
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
-                into=self.kv_read_tables,
-            )
             metadata = self.forward_metadata
-            if in_capture:
-                # Bind ONCE: the attention kernels bake these pointers at capture.
-                metadata.page_table = kv_view.ids[:bs]
-                if kv_view.sliding_window_ids is not None:
-                    metadata.swa_page_table = kv_view.sliding_window_ids[:bs]
+            # `cache_seqlens_int32` is what the attention kernels bound their
+            # page-table reads by, and the fused metadata call above wrote it.
+            # A target verify reads `draft_token_num` further than `seq_lens`
+            # goes, so filling to `seq_lens` leaves those columns untranslated.
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=metadata.cache_seqlens_int32,
+                sliding_window_out=metadata.swa_page_table,
+            )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
             if (
@@ -921,7 +921,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 n = forward_batch.out_cache_loc.shape[0]
                 self.cuda_graph_swa_out_cache_loc[n:].zero_()
-                if in_capture and self.kv_index_translator.is_translating:
+                if in_capture:
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
@@ -944,6 +944,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         ragged_layout: RaggedVerifyLayout,
         bs: int,
+        in_capture: bool = False,
     ) -> None:
         """Eagerly rebuild the target-verify graph metadata for ragged verify.
 
@@ -971,11 +972,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self._apply_cuda_graph_metadata(
@@ -1209,7 +1213,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1328,9 +1334,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         cache_loc = forward_batch.out_cache_loc
-        cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_active = is_cp_active(forward_batch)
 
-        # The fused path writes rank-local K/V directly to cache. CP-v2 needs
+        # The fused path writes rank-local K/V directly to cache. CP needs
         # the strategy to gather K/V into full logical token order first.
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1347,7 +1353,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
-                if cp_v2_active:
+                if cp_active:
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     cp_strategy.materialize_full_kv(
@@ -1421,8 +1427,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
@@ -1475,8 +1480,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     sinks=attention_sink,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                 )
-        elif self.use_fmha_v2 and not cp_v2_active:
-            # CP-v2 must go through cp_strategy.run_attention (per-shard
+        elif self.use_fmha_v2 and not cp_active:
+            # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
             paged_kv = torch.stack([k_cache, v_cache], dim=1)
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
@@ -1539,7 +1544,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out_dtype=self.q_data_type,
                 )
 
-            if cp_v2_active:
+            if cp_active:
                 cp_strategy = get_cp_strategy()
                 assert cp_strategy is not None
                 o = cp_strategy.run_attention(

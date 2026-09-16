@@ -20,7 +20,6 @@ from sglang.srt.utils import add_prefix
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionEmbeddings(nn.Module):
-
     def __init__(self, config: SiglipVisionConfig, use_data_parallel: bool = False):
         super().__init__()
         self.config = config
@@ -63,7 +62,6 @@ class SiglipVisionEmbeddings(nn.Module):
 
 # Copied from sglang.srt.models.clip.CLIPMLP
 class SiglipMLP(nn.Module):
-
     def __init__(
         self,
         config,
@@ -102,7 +100,6 @@ class SiglipMLP(nn.Module):
 
 # Copied from sglang.srt.models.clip.CLIPEncoderLayer
 class SiglipEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: SiglipVisionConfig,
@@ -233,7 +230,6 @@ class SiglipEncoder(nn.Module):
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: SiglipVisionConfig,

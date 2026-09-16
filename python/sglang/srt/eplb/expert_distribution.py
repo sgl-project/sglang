@@ -89,9 +89,9 @@ class ExpertDistributionRecorder(ABC):
         rank: int,
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
-            assert (
-                expert_location_metadata is not None
-            ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            assert expert_location_metadata is not None, (
+                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
@@ -265,9 +265,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert (
-            self._current_layer_idx.value is None
-        ), f"{self._current_layer_idx.value=}"
+        assert self._current_layer_idx.value is None, (
+            f"{self._current_layer_idx.value=}"
+        )
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -409,9 +409,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             device=get_device_namespace().device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
-        assert (
-            not get_exec().overlap.enable_two_batch_overlap
-        ), "DetailSinglePassGatherer does not support TBO yet"
+        assert not get_exec().overlap.enable_two_batch_overlap, (
+            "DetailSinglePassGatherer does not support TBO yet"
+        )
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
@@ -794,7 +794,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 assert (
                     self._expert_location_metadata.ep_size
                     == len(count_of_layer._buckets) - 1
-                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                ), (
+                    f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                )
                 for gpu_rank in range(self._expert_location_metadata.ep_size):
                     count = gpu_physical_count[layer_idx, gpu_rank]
                     if count > 0:

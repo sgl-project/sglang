@@ -970,7 +970,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
 
 
@@ -988,7 +988,9 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
         cls.sglang_thread = None
@@ -1078,7 +1080,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
 
 
