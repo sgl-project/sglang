@@ -11,8 +11,10 @@ This is the guardrail that fails when an upstream PR adds a field to a namespace
 class that has no ``_NS_PATH``, or adds one outside the taxonomy below.
 """
 
-import dataclasses
 import unittest
+
+import msgspec
+import msgspec.structs
 
 from sglang.srt.arg_groups.arg_utils import namespace_of
 from sglang.srt.server_args import ServerArgs
@@ -48,7 +50,7 @@ VALID_NAMESPACES = {
 
 
 def _field_names():
-    return {f.name for f in dataclasses.fields(ServerArgs)}
+    return {f.name for f in msgspec.structs.fields(ServerArgs)}
 
 
 class TestServerArgsNamespaces(CustomTestCase):

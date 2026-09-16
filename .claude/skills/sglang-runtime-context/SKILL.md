@@ -73,11 +73,9 @@ with what the operator typed, not with what resolution decided.**
   `TokenizerManager.record_config_updates(source, **fields)`, a named wrapper
   over `get_context().override`. One process keeps one log: the request dumps
   ship `get_context().overrides_log()`, and `config_value(name)` /
-  `resolved_config_dict(base)` answer from the bags. The exposure ratchet
-  resolves the wrapper, so a field recorded through it joins the post-publish
-  override surface exactly like a direct `override` and needs the same ordering
-  judgment against any supplied-instance read of it
-  (`test_supplied_instance_exposure_ratchet.py`).
+  `resolved_config_dict(base)` answer from the bags. Fields recorded through
+  the wrapper follow the same ordering rules as a direct `override`: a later
+  read must observe the updated bag, not the startup record.
 - **`model_path` and `served_model_name` are answered off the manager.** Both are
   `NS` leaves and `override` accepts them, but the tokenizer-side weight reload
   records only `load_format` and writes the two path fields as `TokenizerManager`
@@ -91,8 +89,11 @@ with what the operator typed, not with what resolution decided.**
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
   `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they
-  **declare** via `arg_groups.overrides.declare_late_resolution(server_args,
-  source, **fields)`, which refuses the published instance. The declaration lands
+  **declare** via `arg_groups.overrides.declare_resolution(server_args, source,
+  **fields)`, the same call the rest of the pipeline makes; there is no
+  `declare_late_resolution` any more. *When* a declaration is made is not
+  something the code marks — the guardrails that used to read that marker
+  cover these sites through the ordinary keyword scan instead. The declaration lands
   in the stash on that very object, so every holder of it carries the decision —
   the HTTP server, the multi-tokenizer workers it is serialized for, the
   schedulers it forks — and each of them publishes bags projected from it. The
@@ -151,8 +152,7 @@ bag to override at all.
   **retracted** — owner ruling (2026-08-15): a process holds at most one live
   config at a time (concurrent multi-Engine is unsupported; sequential rebuild
   stays legal, unit tests rely on it). Nothing in those files reads the instance
-  any more -- the exposure ratchet's pin set is empty, so the next such read is a
-  new entry that has to argue for itself. What
+  any more; review new instance reads against the raw-input contract. What
   genuinely stays per-instance is what differs per *worker* within one engine:
   `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
   `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
@@ -169,12 +169,9 @@ bag to override at all.
   attention pair and the encode-server `gpu_id` above are both this). The per-instance
   boundaries above are **not** exempt from this unless-clause (the multi-Engine
   exemption is retracted); each one gets its own disposition.
-  `test_supplied_instance_exposure_ratchet.py`
-  pins that set (empty today) — three spellings of the read: `server_args.field`,
-  literal-name `getattr(server_args, "field", default)`, and the parked form
-  (`self.x = server_args` in a method that takes the parameter, read as
-  `self.x.field` anywhere in the class) — and fails on a new one, so the
-  disposition gets picked when the read is written. Two shapes stay parameter-form on purpose: a helper the
+  Check direct attributes, `getattr`, and records stored on `self`; validate
+  the resolved value and any later overrides in behavior tests.
+  Two shapes stay parameter-form on purpose: a helper the
   *resolution pipeline* calls with a `resolved_view` (its parameter happens to be
   named `server_args`), and a factory whose contract is "build X from the record
   you are handed" (`create_kt_config_from_server_args`, `DllmConfig.from_server_args`).
@@ -399,18 +396,45 @@ through a view instead:
 - `resolved_view(server_args)` — snapshots the overlay when built, which is what
   a post-process pass wants: it reads the state at *its* slot.
 
-`test_resolution_reads_the_declarations` pins direct field reads at zero over the
-two scopes it can derive exactly (every `arg_groups` function taking a config,
-every `ServerArgs` handler the dispatcher reaches). Readers the pipeline calls
-from elsewhere (`ModelConfig`, the platform defaults, the spec-algo hook) have
-moved to the view as well — a field read there is the same bug, just one the
-derivation cannot enumerate.
+Resolution hooks and the helpers they call (`ModelConfig`, platform defaults,
+the spec-algo hook) must read through these views too. Keep coverage in
+`test_resolution_declarations.py`, `test_resolution_is_reproducible.py`, and
+`test_record_holds_the_raw_input.py` focused on the values callers observe.
 
 One consequence worth knowing: because the fields are the raw input, resolving a
 bare `dataclasses.replace` copy lands in the same place as the parent — the
-pipeline reads only its own input. `replace_resolved` is the way to copy a
-resolved record (it carries the declarations and the `model_config` memo, so the
-copy does not re-resolve at all).
+pipeline reads only its own input. **So a resolved record is not copied at
+all.** A caller that needs one field different for the process it is about to
+hand the record to — the Ray paths and their `dist_init_addr` — declares it on
+the record it holds (`declare_resolution`) and hands that over: the declaration
+travels inside the object, the receiving process projects its bags from it, and
+nothing re-resolves. There is no `ServerArgs.replace_resolved` any more, and the
+`model_config`-memo bug that copying used to cause (a copy marked resolved but
+arriving without the memo cannot refill it, because the guard refuses the write)
+is gone by construction rather than guarded.
+
+A bag `override` cannot stand in for this. It is *not* because overriding needs
+a publish — `set_server_args` is what projects the bags and `override` works as
+soon as the context holds a record — but because `override` writes bag leaves
+and by contract never touches the record, so its effect cannot travel inside an
+object to another process.
+
+### The declaration stash has one writer
+
+Everything that decides configuration goes through
+`declare_resolution(server_args, source, **fields)`. It validates the names,
+refuses the published config (the stash is projected at publish and never
+again, so a later declaration is a silent no-op), and appends. The other names
+around it are spellings, not mechanisms:
+
+| name | what it adds |
+|---|---|
+| `run_post_process_pass` | runs a pass at its slot and validates its return; declares through `declare_resolution`. A pass returning an **empty** dict is a validation, not a declaration, and stays legal on the published instance — `Engine(server_args=sa)` after `Engine.shutdown()` re-runs `check_server_args` on the very instance the context holds |
+| `record_foreign_defaults` | for a resolver this tree does not own (an out-of-tree platform plugin, a registered speculative algorithm), whose interface is to *assign* fields. It gets a stand-in whose reads fall through to `resolving_view`; what it assigned is declared. The record is never written, so the write seal has no exception. In-tree code does not go through it — `handle_platform_defaults` wraps the platform hook, and the in-tree speculative dispatcher is called directly, because handed the stand-in its own `declare_resolution` calls would stash on that instead |
+
+`resolution_projection` is gone; the whole-object readback is
+`ServerArgs.resolved_dict()`, which is what `/server_info` and its gRPC and
+in-process twins report.
 
 ### Adding a model-specific config adjustment
 
@@ -531,8 +555,10 @@ ONE thread — do not design for TBO threads that don't exist.
 
 ## Guardrails (these fail CI; what to do when they fire)
 
-1. **Strict mutation guard** (always on): bare `server_args.x = ...` after resolution
-   raises unconditionally in `ServerArgs.__setattr__` — this *is* the guarantee that
+1. **Strict mutation guard** (always on, and with no exception): bare
+   `server_args.x = ...` after resolution raises unconditionally in
+   `ServerArgs.__setattr__` — the named lift that out-of-tree plugins used to
+   ask for is gone, they assign onto a stand-in instead — this *is* the guarantee that
    no writer can desync the bags, so there is no writer ratchet any more. Change
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
@@ -621,7 +647,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
 `publish`, `_ConfigBag`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
-`declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
+`declare_resolution` and the spellings around it), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
 `test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
 `test_global_config_read_ratchet.py`,

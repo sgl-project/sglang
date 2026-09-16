@@ -18,11 +18,6 @@ from .utils import make_name
 
 @cache_once
 def _jit_topk_v1_module():
-    # topk (<= 1024) is a runtime argument, not a compile-time constant, so a
-    # single module serves every k. Baking it in via -DSGL_TOPK used to build one
-    # module per k, and since the macro fed a `constexpr` rather than a template
-    # parameter every module exported identically mangled symbols -- see the
-    # comment in topk_v1.cuh for how that broke the second module's launch.
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         make_name("topk_v1"),
@@ -34,16 +29,72 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    # v2 is universal: topk (<= 2048) is a runtime argument, not a compile-time
-    # constant, so a single module serves every k.
+    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
+
+    args = make_cpp_args(is_arch_support_pdl())
+    # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
+    # defaults, and a 0 would size the persistent pool to an empty grid.
+    extra_cuda_cflags = []
+    if is_arch_support_pdl():  # set the persistent cluster size after hopper
+        try:
+            occ_8_2 = get_max_active_clusters(8, occupancy=2)
+        except Exception:
+            pass
+        else:
+            if occ_8_2 > 0:
+                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C8_OCC2={occ_8_2}")
+        try:
+            occ_16_1 = get_max_active_clusters(16, occupancy=1)
+        except Exception:
+            pass
+        else:
+            if occ_16_1 > 0:
+                extra_cuda_cflags.append(f"-DSGL_TOPK_V2_MAX_C16_OCC1={occ_16_1}")
+    kernel = f"TopKKernel<{args}>"
     return load_jit(
         make_name("topk_v2"),
+        *args,
+        extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
-            ("topk_transform_paged", "TopKKernel::transform_paged"),
-            ("topk_transform_ragged", "TopKKernel::transform_ragged"),
-            ("topk_plan", "TopKKernel::plan"),
+            ("topk_transform_paged", f"{kernel}::transform_paged"),
+            ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+            ("topk_plan", f"{kernel}::plan"),
         ],
+    )
+
+
+@cache_once
+def _jit_topk_bf16_small_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk_bf16_small"),
+        *args,
+        cuda_files=["deepseek_v4/topk_bf16_small.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopKBF16Kernel<{args}>::transform")],
+    )
+
+
+def topk_transform_bf16_small(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """bf16 top-k for rows of at most 16384 scores (the DeepSeek-V4.1 sparse
+    indexer's consumer rows), fused with a page-table transform.
+
+    Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
+    ``seq_lens[b]`` scores (``k`` at most 2048); a selected index ``i`` is
+    written as ``page_table[b, i // page_size] * page_size + i % page_size``,
+    in no particular order, and ``-1`` fills the slots past
+    ``min(k, seq_lens[b])``. Selection is exact (two radix passes over the raw
+    bf16 bytes locate the k-th largest value); which of the elements equal to
+    it fill the last slots is arbitrary. NaN scores are not supported.
+    """
+    _jit_topk_bf16_small_module().topk_transform(
+        scores, seq_lens, page_table, out_page_indices, page_size
     )
 
 
@@ -75,21 +126,33 @@ def topk_transform_paged(
 _PLAN_METADATA_INTS_PER_BATCH = 2
 
 
-def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
-    """Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
+def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Tensor:
+    """
+    Preprocess the per-batch routing plan for :func:`topk_transform_paged_v2`.
+    NOTE: every entry of ``seq_lens`` must be NON-NEGATIVE.
 
-    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE. The device
-    kernel reads the int32 buffer as ``uint32_t``, so a negative length (e.g.
-    -4 from a DP-padded / idle-companion row) reinterprets as ~4e9, poisons
-    the plan, and drives the transform kernel into an illegal memory access.
-    Producers of padded rows must clamp their lengths to 0 (0 selects the
-    trivial all-(-1) output path, which is safe).
+    :param static_threshold: If a batch item has `seq_len` > `static_threshold`,
+                             prefer the cluster implementation.
+                             Negative number means internal heuristic.
     """
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
+
+
+def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
+    """Whether :func:`plan_topk_v2` writes a plan for these lengths. Small
+    batches and devices without clusters leave the plan buffer untouched."""
+    probe = torch.full(
+        (seq_lens.shape[0] + 1, _PLAN_METADATA_INTS_PER_BATCH),
+        -1,
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
+    return probe[0, 1].item() != -1
 
 
 def topk_transform_ragged_v2(
@@ -111,7 +174,7 @@ def topk_transform_ragged_v2(
     Unlike :func:`topk_transform_paged_v2` this needs no page table and no plan
     (the cluster path only pays off for very few rows, and prefill has many).
 
-    IMPORTANT: ``scores`` is written in place -- the <= 3 columns ahead of each
+    NOTE: ``scores`` is written in place -- the <= 3 columns ahead of each
     row's window that the 16-byte-aligned read base pulls in are masked out.
     They are invalid for that row and the buffer must have no other consumer.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
@@ -136,28 +199,37 @@ def topk_transform_paged_v2(
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
-    Two output modes, chosen by whether ``page_tables`` is given and resolved to
-    a device-side template parameter, so an unused page-table gather is compiled
-    out rather than skipped at runtime:
+    Output mode is chosen from ``page_tables`` and ``out_raw_indices`` and
+    resolved to a device-side template parameter, so an unused page-table gather
+    is compiled out rather than skipped at runtime:
 
     * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
       indices and no page table is read.
     * ``page_tables`` given -- ``out_page_indices`` receives the page-table
       transform of them.
+    * Both outputs given -- ``out_page_indices`` receives the page-table
+      transform and ``out_raw_indices`` receives the selected raw indices.
 
-    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
-    ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
-    values. The kernel reads lengths as ``uint32_t``: a negative entry
-    reinterprets as a ~4e9-token sequence, sending the row down the cluster
-    path over garbage scores and crashing with an illegal memory access
-    (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
-    the valid way to express "no tokens": the row takes the trivial path and
-    the output is all -1.
+    NOTE: every entry of `seq_lens` must be NON-NEGATIVE, and `metadata` must
+    come from :func:`plan_topk_v2` over the same `seq_lens` values.
+    A length of 0 is the valid way to express "no tokens": the row takes the
+    trivial path and the output is guaranteed to be all -1.
     """
     if is_xpu():
+        if out_raw_indices is not None:
+            topk_transform_paged(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
         torch.ops.sgl_kernel.topk_transform_paged(
             scores,
             seq_lens,
@@ -175,4 +247,5 @@ def topk_transform_paged_v2(
         out_page_indices,
         page_size,
         metadata,
+        out_raw_indices,
     )

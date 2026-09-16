@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -116,15 +117,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.v_data_ptrs = make_kernel_ptr_table(
+            self.v_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -359,12 +360,18 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if host_layer_id == 0:
+                    device_k = getattr(
+                        device_pool, "k_buffer_tensor", device_pool.k_buffer
+                    )
+                    device_v = getattr(
+                        device_pool, "v_buffer_tensor", device_pool.v_buffer
+                    )
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
+                        device_k=device_k,
                         host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
+                        device_v=device_v,
                         host_v=self.v_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
@@ -491,12 +498,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
+                # In FIA mode, k_buffer/v_buffer are per-layer lists;
+                # use the 5-D contiguous view for transfer_kv_dim_exchange.
+                device_k = getattr(device_pool, "k_buffer_tensor", device_pool.k_buffer)
+                device_v = getattr(device_pool, "v_buffer_tensor", device_pool.v_buffer)
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
+                    device_k=device_k,
                     host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
+                    device_v=device_v,
                     host_v=self.v_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,
@@ -765,10 +776,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         else:
             self.k_data_refs = []
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
 
     def get_size_per_token(self):
