@@ -33,7 +33,6 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
-from sglang.srt.entrypoints.sidecar_context import KvEventSource
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -331,8 +330,8 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
-    def describe_local_source(self, block_size: int) -> Optional[KvEventSource]:
-        """Return a source a separate local process can subscribe to, if any."""
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Describe a source accessible to a separate local process, if any."""
         return None
 
 
@@ -390,7 +389,6 @@ class ZmqEventPublisher(EventPublisher):
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
-        self._pub_bound = False
         self._local_pub_endpoint: Optional[str] = None
         self._local_replay_endpoint: Optional[str] = None
         self._replay: Optional[zmq.Socket] = None
@@ -424,28 +422,21 @@ class ZmqEventPublisher(EventPublisher):
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
 
-    def describe_local_source(self, block_size: int) -> KvEventSource:
-        """Describe the sockets this publisher actually created.
+    def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
+        """Report the bound socket, not a port reconstructed from global DP size.
 
-        Connect-style TCP and inproc publishers cannot serve a separate local
-        sidecar. Fail the opt-in launch instead of advertising an unusable source.
+        Connect-style publishers and inproc sockets have no subscribable local
+        endpoint. They keep working as before, but are not advertised to external
+        processes. Wildcard binds are reachable on loopback from this node.
         """
-        if block_size <= 0:
-            raise ValueError("Local KV-event sources require a positive block size")
-        if not self._pub_bound:
-            raise ValueError(
-                "--sidecar-scope local-telemetry requires a bound KV-event publisher"
-            )
 
-        def local_endpoint(endpoint: str) -> str:
+        def local_endpoint(endpoint: Optional[str]) -> Optional[str]:
+            if endpoint is None:
+                return None
             if endpoint.startswith("ipc://"):
                 return endpoint
-            parsed = parse_advertisable_tcp(endpoint)
-            if parsed is None:
-                raise ValueError(
-                    "--sidecar-scope local-telemetry requires a bound "
-                    f"TCP or IPC KV-event endpoint, got {endpoint!r}"
-                )
+            if parse_advertisable_tcp(endpoint) is None:
+                return None
             address = NetworkAddress.parse(endpoint[len("tcp://") :])
             host = address.host
             if host in ("*", "0.0.0.0"):
@@ -454,18 +445,19 @@ class ZmqEventPublisher(EventPublisher):
                 host = "::1"
             return NetworkAddress(host, address.port).to_tcp()
 
-        assert self._local_pub_endpoint is not None
-        return KvEventSource(
-            dp_rank=self._dp_rank,
-            endpoint=local_endpoint(self._local_pub_endpoint),
-            topic=self._topic_bytes.decode("utf-8"),
-            block_size=block_size,
-            replay_endpoint=(
-                local_endpoint(self._local_replay_endpoint)
-                if self._local_replay_endpoint is not None
-                else None
-            ),
-        )
+        endpoint = local_endpoint(self._local_pub_endpoint)
+        if endpoint is None:
+            return None
+        source = {
+            "dp_rank": self._dp_rank,
+            "endpoint": endpoint,
+            "topic": self._topic_bytes.decode("utf-8"),
+            "block_size": block_size,
+        }
+        replay_endpoint = local_endpoint(self._local_replay_endpoint)
+        if replay_endpoint is not None:
+            source["replay_endpoint"] = replay_endpoint
+        return source
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -522,7 +514,6 @@ class ZmqEventPublisher(EventPublisher):
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
                 self._pub.bind(self._endpoint)
-                self._pub_bound = True
                 self._local_pub_endpoint = self._pub.getsockopt_string(
                     zmq.LAST_ENDPOINT
                 )

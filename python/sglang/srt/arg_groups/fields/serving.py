@@ -10,11 +10,19 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+)
 
 import msgspec
 
-from sglang.srt.arg_groups.arg_utils import A, Arg
+from sglang.srt.arg_groups.arg_utils import (
+    A,
+    Arg,
+)
 from sglang.srt.utils.common import json_list_type
 
 
@@ -79,7 +87,8 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "default. Follower nodes expose GetServerInfo only. "
+        "In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
@@ -91,15 +100,6 @@ class Serving(msgspec.Struct):
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
         "or SGLANG_GRPC_PORT.",
     ] = None
-    sidecar_scope: A[
-        str,
-        Arg(
-            help="Where to launch the sidecar. 'leader' keeps the gRPC-only "
-            "contract; 'local-telemetry' also launches headless sidecars on nodes "
-            "with local KV-event publishers.",
-            choices=["leader", "local-telemetry"],
-        ),
-    ] = "leader"
     sidecar_args: A[
         Optional[List[str]],
         Arg(

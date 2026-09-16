@@ -264,7 +264,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.managers.scheduler_components.recv_skipper import SchedulerRecvSkipper
+from sglang.srt.managers.scheduler_components.recv_skipper import (
+    SchedulerRecvSkipper,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -1705,7 +1707,10 @@ class Scheduler(
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
         Use the LCM to preserve any existing deterministic-inference alignment."""
-        from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
+        from sglang.srt.configs.model_config import (
+            get_dsa_index_kpool,
+            is_deepseek_dsa,
+        )
 
         if not is_deepseek_dsa(self.model_config.hf_config):
             return
@@ -1834,10 +1839,10 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
-        if get_serving().sidecar_scope == "local-telemetry":
-            from sglang.srt.entrypoints.sidecar_context import LOCAL_KV_EVENT_SOURCES
-
-            result_dict[LOCAL_KV_EVENT_SOURCES] = (
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
                 )

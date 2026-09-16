@@ -10,18 +10,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lifecycle management for full and telemetry-only local sidecars."""
+"""Lifecycle management for an optional local native gRPC sidecar."""
 
 import argparse
-import dataclasses
 import importlib
-import json
 import logging
 import multiprocessing as mp
 import os
 
-from sglang.srt.entrypoints.sidecar_context import KvEventSource, SidecarContext
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_serving,
+)
 from sglang.srt.utils.common import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -29,28 +28,7 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 logger = logging.getLogger(__name__)
 
 SGLANG_GRPC_ENDPOINT_ENV = "SGLANG_GRPC_ENDPOINT"
-SGLANG_SIDECAR_CONTEXT_ENV = "SGLANG_SIDECAR_CONTEXT"
 _DEFAULT_SIDECAR_SHUTDOWN_TIMEOUT = 45.0
-
-
-def build_sidecar_context(sources: list[KvEventSource]) -> SidecarContext | None:
-    if get_serving().sidecar_scope != "local-telemetry":
-        return None
-    parallel = get_parallel()
-    if any(not 0 <= source.dp_rank < parallel.dp_size for source in sources):
-        raise ValueError("Local KV-event publisher rank is outside the DP topology")
-    return SidecarContext(
-        mode="full" if parallel.node_rank == 0 else "telemetry",
-        node_rank=parallel.node_rank,
-        nnodes=parallel.nnodes,
-        dp_size=parallel.dp_size,
-        dist_init_addr=(
-            NetworkAddress.parse(parallel.dist_init_addr).to_tcp()
-            if parallel.dist_init_addr
-            else None
-        ),
-        kv_event_sources=sources,
-    )
 
 
 def _loopback_host(host: str) -> str:
@@ -80,21 +58,9 @@ def _parse_sidecar_args(args: list[str] | None) -> tuple[list[str], float]:
     return provider_args, parsed.sidecar_shutdown_timeout
 
 
-def _run_sidecar(
-    module_name: str,
-    args: list[str],
-    endpoint: str | None,
-    context: SidecarContext | None = None,
-) -> None:
+def _run_sidecar(module_name: str, args: list[str], endpoint: str) -> None:
     kill_itself_when_parent_died()
-    if endpoint is None:
-        os.environ.pop(SGLANG_GRPC_ENDPOINT_ENV, None)
-    else:
-        os.environ[SGLANG_GRPC_ENDPOINT_ENV] = endpoint
-    if context is None:
-        os.environ.pop(SGLANG_SIDECAR_CONTEXT_ENV, None)
-    else:
-        os.environ[SGLANG_SIDECAR_CONTEXT_ENV] = json.dumps(dataclasses.asdict(context))
+    os.environ[SGLANG_GRPC_ENDPOINT_ENV] = endpoint
     try:
         main = getattr(importlib.import_module(module_name), "main")
     except (AttributeError, ImportError) as e:
@@ -118,17 +84,12 @@ class Sidecar:
         proc,
         module_name: str,
         shutdown_timeout: float,
-        *,
-        allow_clean_exit: bool = True,
     ):
         self.proc = proc
         self.module_name = module_name
         self.shutdown_timeout = shutdown_timeout
-        self._stopped = False
         self._watchdog = SubprocessWatchdog(
-            processes=[proc],
-            process_names=[module_name],
-            allow_clean_exit=allow_clean_exit,
+            processes=[proc], process_names=[module_name]
         )
 
     def start(self) -> None:
@@ -141,9 +102,6 @@ class Sidecar:
         )
 
     def stop(self) -> None:
-        if self._stopped:
-            return
-        self._stopped = True
         self._watchdog.stop()
         if self.proc.is_alive():
             self.proc.terminate()
@@ -156,31 +114,20 @@ class Sidecar:
             kill_process_tree(self.proc.pid, wait_timeout=self.shutdown_timeout)
 
 
-def start_sidecar(context: SidecarContext | None = None) -> Sidecar:
+def start_sidecar() -> Sidecar:
     module_name = get_serving().sidecar
     assert module_name is not None
     sidecar_args, shutdown_timeout = _parse_sidecar_args(get_serving().sidecar_args)
-    endpoint = (
-        None
-        if context is not None and context.mode == "telemetry"
-        else build_sidecar_endpoint(get_serving().host, get_serving().grpc_port)
-    )
-    mp_context = mp.get_context("spawn")
-    process_args = (module_name, sidecar_args, endpoint)
-    lifecycle_args = {}
-    if context is not None:
-        process_args += (context,)
-        lifecycle_args = dict(allow_clean_exit=False)
-    proc = mp_context.Process(
+    endpoint = build_sidecar_endpoint(get_serving().host, get_serving().grpc_port)
+    proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,
-        args=process_args,
+        args=(module_name, sidecar_args, endpoint),
     )
     sidecar = Sidecar(
         proc,
         module_name,
         shutdown_timeout=shutdown_timeout,
-        **lifecycle_args,
     )
     sidecar.start()
     return sidecar

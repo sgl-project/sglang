@@ -26,10 +26,6 @@ import psutil
 import setproctitle
 import zmq
 
-from sglang.srt.entrypoints.sidecar_context import (
-    LOCAL_KV_EVENT_SOURCES,
-    take_local_kv_event_sources,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -748,11 +744,14 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
-        # Pure DP launches TP groups in concurrent threads. Each group reports
-        # only sources owned by this node, before signalling its ready event.
-        sources = take_local_kv_event_sources(scheduler_info)
+        # Pure-DP TP groups launch concurrently. Their ready replies contain
+        # only publishers owned by schedulers on this node.
         with self.env_lock:
-            self.local_kv_event_sources.extend(sources)
+            self.local_kv_event_sources.extend(
+                source
+                for info in scheduler_info
+                for source in info.get("kv_event_sources", [])
+            )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -867,16 +866,20 @@ def run_data_parallel_controller_process(
         scheduler_pids = [
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-                "startup_time": controller.startup_time,
-                LOCAL_KV_EVENT_SOURCES: controller.local_kv_event_sources,
-                SCHEDULER_PIDS_ARG: scheduler_pids,
-            }
-        )
+        init_info = {
+            "status": "ready",
+            "max_total_num_tokens": controller.max_total_num_tokens,
+            "max_req_input_len": controller.max_req_input_len,
+            "startup_time": controller.startup_time,
+            SCHEDULER_PIDS_ARG: scheduler_pids,
+        }
+        if get_serving().grpc_port is not None and not (
+            get_serving().smg_grpc_mode or get_serving().grpc_mode
+        ):
+            init_info["kv_event_sources"] = sorted(
+                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            )
+        pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             controller.event_loop()
