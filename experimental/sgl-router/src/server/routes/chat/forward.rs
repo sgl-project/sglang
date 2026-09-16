@@ -3,11 +3,11 @@
 
 //! Plain and PD chat forwarding, including load tracking and streaming metrics.
 
+use super::preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::discovery::WorkerMode;
 use crate::policies::active_load::ActiveLoadGuard;
 use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
-use crate::server::chat_preparation::{generate_room_id, BootstrapFields, PreparedChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
@@ -25,13 +25,13 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 type LoadGuards = (LoadGuard, ActiveLoadGuard);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
-pub(crate) struct SelectedWorkers {
-    pub(crate) prefill: Arc<Worker>,
-    pub(crate) decode: Option<Arc<Worker>>,
-    pub(crate) track_dispatch_timestamps: bool,
+pub(super) struct SelectedWorkers {
+    pub(super) prefill: Arc<Worker>,
+    pub(super) decode: Option<Arc<Worker>>,
+    pub(super) track_dispatch_timestamps: bool,
 }
 
-pub(crate) async fn forward_chat_request(
+pub(super) async fn forward_chat_request(
     ctx: &AppContext,
     request: PreparedChatRequest,
     workers: SelectedWorkers,
@@ -66,26 +66,26 @@ pub(crate) async fn forward_chat_request(
     let expiration_token = active_request_guard.cancel_token().clone();
     let metrics = DispatchMetrics::new(ctx, &request, &prefill, request_started_at);
     // Both PD workers receive the same bootstrap room to coordinate KV transfer.
-    let bootstrap = decode.as_ref().map(|_| BootstrapFields {
-        host: prefill.bootstrap_host().to_string(),
-        port: prefill.bootstrap_port(),
-        room: generate_room_id(),
+    let pd = decode.map(|decode| {
+        let bootstrap = BootstrapFields {
+            host: prefill.bootstrap_host().to_string(),
+            port: prefill.bootstrap_port(),
+            room: generate_room_id(),
+        };
+        (decode, bootstrap)
     });
-    let body = request.into_outgoing_body(ctx, bootstrap.as_ref())?;
+    let body = request.into_outgoing_body(ctx, pd.as_ref().map(|(_, bootstrap)| bootstrap))?;
     let prefill_load_guards = (worker_load_guard, active_request_guard);
 
     // In PD mode, prefill runs independently and decode supplies the client response.
-    let (response_worker, response_load_guards) = if let Some(decode) = decode {
-        let bootstrap_room = bootstrap
-            .expect("PD dispatch requires bootstrap fields")
-            .room;
+    let (response_worker, response_load_guards) = if let Some((decode, bootstrap)) = pd {
         spawn_prefill_request(
             ctx,
             prefill,
             headers.clone(),
             body.clone(),
             prefill_load_guards,
-            bootstrap_room,
+            bootstrap.room,
         );
         let decode_load_guards = (
             decode.load_guard(),
@@ -301,18 +301,13 @@ impl DispatchMetrics {
             Ok(response) => response.status().as_u16(),
             Err(error) => error.status_code().as_u16(),
         };
-        let outcome_label = match outcome {
-            RequestOutcome::Success => "success",
-            RequestOutcome::Error => "error",
-            RequestOutcome::Cancelled => "cancelled",
-        };
         tracing::info!(
-            request_id,
+            request_id = %request_id,
             method = "POST",
             path = CHAT_PATH,
             model = %self.model,
             worker = %self.worker_url,
-            outcome = outcome_label,
+            outcome = outcome.as_str(),
             http_status,
             stream = self.streaming,
             latency_ms = elapsed.as_millis() as u64,

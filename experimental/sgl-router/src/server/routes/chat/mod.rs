@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+mod forward;
+mod preparation;
+
 use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::engine_load::EngineLoadSnapshot;
@@ -11,8 +14,6 @@ use crate::policies::selection::{
 };
 use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
-use crate::server::chat_forward::{forward_chat_request, SelectedWorkers};
-use crate::server::chat_preparation::{parse_routing_fields, PreparedChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::workers::Worker;
@@ -20,6 +21,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
+use forward::{forward_chat_request, SelectedWorkers};
+use preparation::{parse_routing_fields, PreparedChatRequest};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,7 +40,6 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    // Cheap parsing of routing fields.
     let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
         fields
@@ -56,7 +58,6 @@ pub async fn chat_completions(
         .get(&model)
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
-    // Validate sampling parameters and render/tokenize when needed.
     let request =
         PreparedChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
 
@@ -93,13 +94,13 @@ async fn select_workers(
     resolver: &PdPoolResolver,
 ) -> Result<SelectedWorkers, ApiError> {
     // Find cached prompt prefixes and capture engine load info.
-    let prefix_matches = lookup_prefix_matches(ctx, request).await?;
-    let load_snapshot = capture_load_snapshot(ctx, policy, candidates);
-    let routing_context = RoutingContext::new(ctx, headers, prefix_matches, load_snapshot)?;
+    let routing_context = RoutingContext {
+        prefix_matches: lookup_prefix_matches(ctx, request).await?,
+        load_snapshot: capture_load_snapshot(ctx, policy, candidates),
+        ..RoutingContext::from_headers(ctx, headers)?
+    };
 
-    // Select a plain or prefill worker.
     let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
-    // Select a decode peer for PD mode.
     let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
     Ok(SelectedWorkers {
         prefill,
@@ -130,12 +131,8 @@ struct RoutingContext<'a> {
 }
 
 impl<'a> RoutingContext<'a> {
-    fn new(
-        ctx: &AppContext,
-        headers: &'a HeaderMap,
-        prefix_matches: Option<ExternalPrefixSignal>,
-        load_snapshot: Option<EngineLoadSnapshot>,
-    ) -> Result<Self, ApiError> {
+    /// Header-derived selection inputs; prefix and load fields start empty.
+    fn from_headers(ctx: &AppContext, headers: &'a HeaderMap) -> Result<Self, ApiError> {
         // Buckets group workers by token limits and service targets; disabled means one pool per role.
         let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
             (
@@ -158,8 +155,8 @@ impl<'a> RoutingContext<'a> {
             .as_ref()
             .and_then(|config| nonempty_header(headers, &config.session_id_header));
         Ok(Self {
-            prefix_matches,
-            load_snapshot,
+            prefix_matches: None,
+            load_snapshot: None,
             ttft_slo_ms,
             tps_slo,
             routing_key,

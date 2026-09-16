@@ -18,20 +18,20 @@ use serde_json::{json, Number, Value};
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Validated routing inputs and the original body, ready for worker selection.
-pub(crate) struct PreparedChatRequest {
-    pub(crate) model: ModelId,
-    pub(crate) streaming: bool,
-    pub(crate) max_output_tokens: Option<u64>,
-    pub(crate) body: Bytes,
-    pub(crate) tokens: Option<RequestTokens>,
+pub(super) struct PreparedChatRequest {
+    pub(super) model: ModelId,
+    pub(super) streaming: bool,
+    pub(super) max_output_tokens: Option<u64>,
+    pub(super) body: Bytes,
+    pub(super) tokens: Option<RequestTokens>,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
-    pub(crate) input_token_count: usize,
+    pub(super) input_token_count: usize,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
 
 impl PreparedChatRequest {
-    pub(crate) fn prepare(
+    pub(super) fn prepare(
         ctx: &AppContext,
         model: ModelId,
         fields: RoutingFields,
@@ -71,7 +71,7 @@ impl PreparedChatRequest {
         })
     }
 
-    pub(crate) fn into_outgoing_body(
+    pub(super) fn into_outgoing_body(
         self,
         ctx: &AppContext,
         bootstrap: Option<&BootstrapFields>,
@@ -104,9 +104,9 @@ impl PreparedChatRequest {
 
 /// Routing and sampling fields retained by the lightweight request parser.
 #[derive(Debug, Default)]
-pub(crate) struct RoutingFields {
+pub(super) struct RoutingFields {
     stream: Option<bool>,
-    pub(crate) model: Option<String>,
+    pub(super) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
     sampling: [SamplingValue; SamplingField::ALL.len()],
@@ -374,14 +374,14 @@ fn estimate_prefill_tokens(body: &Bytes) -> usize {
 }
 
 /// The engine stores bootstrap rooms as signed int64 values.
-pub(crate) fn generate_room_id() -> u64 {
+pub(super) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
-pub(crate) struct BootstrapFields {
-    pub(crate) host: String,
-    pub(crate) port: Option<u16>,
-    pub(crate) room: u64,
+pub(super) struct BootstrapFields {
+    pub(super) host: String,
+    pub(super) port: Option<u16>,
+    pub(super) room: u64,
 }
 
 /// Append before the closing brace so injected values win over explicit nulls.
@@ -585,7 +585,7 @@ fn sampling_violation(spec: &ParamSpec, provided: SamplingValue) -> Option<Strin
     }
 }
 
-pub(crate) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
+pub(super) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
     let err = match serde_json::from_slice::<RoutingFields>(body) {
         Ok(fields) => return Ok(fields),
         Err(e) => e,
