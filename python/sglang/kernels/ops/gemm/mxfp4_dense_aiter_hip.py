@@ -76,8 +76,17 @@ def packed_bytes(weight_shape: tuple[int, int]) -> int:
     return n * k // 2 + n * k // _MX_BLOCK
 
 
-def run(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` in MXFP4, quantizing ``x`` on the way in."""
+def run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    out_features: int | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T`` in MXFP4, quantizing ``x`` on the way in.
+
+    ``out_features`` is accepted only to match the MXFP6 adapter's signature;
+    gemm_a4w4 takes N from the packed weight itself.
+    """
     ops = _ops()
     if ops is None:
         raise RuntimeError("AITER MXFP4 GEMM is unavailable")
