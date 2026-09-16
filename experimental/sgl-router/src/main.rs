@@ -167,6 +167,10 @@ async fn main() -> Result<()> {
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
     // Spawn discovery + manager tasks.
+    // The manager resolves each worker's wire protocol from its `/server_info`
+    // and stamps it onto the registered worker. The proxy holds one client per
+    // protocol and selects by the worker's protocol per request, so the manager
+    // needs no proxy handle.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
@@ -210,6 +214,7 @@ async fn main() -> Result<()> {
     });
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.engine_load = kv_index.engine_load();
+    app_ctx.kv_metrics = kv_index.metrics_source();
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 

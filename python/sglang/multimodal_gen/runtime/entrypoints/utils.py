@@ -219,6 +219,31 @@ class MaterializedOutput:
     fps: int = 0
 
 
+@dataclass(frozen=True)
+class RequestOutput:
+    """Map one final sample to its request, metrics and output filename."""
+
+    request: Req
+    request_index: int
+    sample_index: int
+    sample_count: int
+
+    def output_file_path(self):
+        return self.request.output_file_path(self.sample_count, self.sample_index)
+
+
+def map_request_outputs(requests: list[Req]) -> list[RequestOutput]:
+    outputs = []
+    for request_index, req in enumerate(requests):
+        count = req.sampling_params.num_samples_per_request
+        if count < 1:
+            raise ValueError(f"num_samples_per_request must be positive, got {count}")
+        outputs.extend(
+            RequestOutput(req, request_index, index, count) for index in range(count)
+        )
+    return outputs
+
+
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
     """Convert audio (torch / numpy) into a float32 numpy array in [-1, 1], best-effort."""
     if audio is None:
@@ -293,6 +318,11 @@ def _resolve_ffmpeg_exe() -> str:
     if not ffmpeg_ok:
         raise RuntimeError("ffmpeg not found")
     return ffmpeg_exe
+
+
+# ffmpeg's implicit libx264 default is `medium`. On diffusion output `fast` is
+# both quicker and measurably closer to the frames the model produced.
+X264_PRESET = "fast"
 
 
 def _x264_auto_thread_count(height: int) -> int:
@@ -402,6 +432,8 @@ def _try_save_cuda_video_direct(
         command += [
             "-vcodec",
             "libx264",
+            "-preset",
+            X264_PRESET,
             "-pix_fmt",
             "yuv420p",
             "-crf",
@@ -710,6 +742,7 @@ def _try_save_video_with_audio(
             quality=quality,
             audio_path=tmp_wav_path,
             audio_codec="aac",
+            output_params=["-preset", X264_PRESET],
         )
         return True
     except Exception as e:
@@ -943,6 +976,7 @@ def save_materialized_output(
                 format=output_format,
                 codec="libx264",
                 quality=quality,
+                output_params=["-preset", X264_PRESET],
             )
 
             _maybe_mux_audio_into_mp4(
