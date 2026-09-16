@@ -6,12 +6,14 @@ from unittest.mock import Mock, patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.sarvam_moe import (
     AttnForwardMethod,
     SarvamMLAForCausalLM,
     SarvamMLAModel,
     SarvamMoEMLADecoderLayer,
+    SarvamMoESparseMoeBlock,
     get_attn_forward_method,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -164,6 +166,54 @@ class TestSarvamDSpark(CustomTestCase):
                 get_attn_forward_method(forward_batch),
                 AttnForwardMethod.MLA_CONCAT_ROPE,
             )
+
+    def test_sparse_moe_declares_deepseek_v3_routing_contract(self):
+        config = SimpleNamespace(
+            hidden_size=16,
+            hidden_act="silu",
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=0,
+        )
+        captured_expert_kwargs = {}
+
+        def make_experts(**kwargs):
+            captured_expert_kwargs.update(kwargs)
+            return nn.Identity()
+
+        runtime = SimpleNamespace(moe=SimpleNamespace(ep_num_redundant_experts=0))
+        with (
+            patch(
+                "sglang.srt.models.sarvam_moe.get_parallel",
+                return_value=SimpleNamespace(tp_size=1),
+            ),
+            patch("sglang.srt.models.sarvam_moe.get_exec", return_value=runtime),
+            patch(
+                "sglang.srt.models.sarvam_moe.get_moe_runner_backend",
+                return_value=SimpleNamespace(
+                    is_flashinfer_trtllm=lambda: True,
+                    is_flashinfer_trtllm_routed=lambda: False,
+                ),
+            ),
+            patch(
+                "sglang.srt.models.sarvam_moe.get_moe_impl_class",
+                return_value=make_experts,
+            ),
+            patch(
+                "sglang.srt.models.sarvam_moe.TopK",
+                side_effect=lambda **_kwargs: nn.Identity(),
+            ),
+        ):
+            block = SarvamMoESparseMoeBlock(config, layer_id=1)
+
+        self.assertEqual(
+            captured_expert_kwargs["routing_method_type"],
+            RoutingMethodType.DeepSeekV3,
+        )
+        self.assertEqual(captured_expert_kwargs["routed_scaling_factor"], 2.5)
+        self.assertTrue(block.fuse_routed_scaling_in_moe)
+        self.assertEqual(block.gate.weight.dtype, torch.float32)
 
 
 if __name__ == "__main__":

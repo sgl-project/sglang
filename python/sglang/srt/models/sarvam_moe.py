@@ -4,6 +4,7 @@
 """
 
 import math
+from contextlib import nullcontext
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -40,9 +41,13 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import (
+    get_moe_runner_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -64,6 +69,7 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
+from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
@@ -92,7 +98,9 @@ if _is_cuda:
         from sgl_kernel import merge_state_v2
 
         from sglang.kernels.ops.attention.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
         from sglang.kernels.ops.gemm import bmm_fp8
+        from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
         _has_fp8_support = True
@@ -257,9 +265,16 @@ class SarvamMoESparseMoeBlock(nn.Module):
             "fp32": torch.float32,
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
+            "bf16_fp32": torch.bfloat16,
         }
         router_dtype_cfg = getattr(config, "router_dtype", "fp32")
         self.router_dtype = dtype_map.get(router_dtype_cfg, None)
+        self.router_logits_fp32 = router_dtype_cfg == "bf16_fp32"
+        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
+            num_experts=config.num_experts,
+            hidden_size=config.hidden_size,
+            weight_dtype=self.router_dtype or torch.get_default_dtype(),
+        )
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -286,6 +301,11 @@ class SarvamMoESparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
+        moe_runner_backend = get_moe_runner_backend()
+        self.fuse_routed_scaling_in_moe = (
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
@@ -294,13 +314,21 @@ class SarvamMoESparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            routing_method_type=RoutingMethodType.Renormalize,
+            routed_scaling_factor=(
+                self.routed_scaling_factor if self.fuse_routed_scaling_in_moe else None
+            ),
+            # Sarvam uses the DeepSeek-V3 noaux_tc contract: sigmoid scores,
+            # correction bias for expert selection, then normalized top-k
+            # weights. FlashInfer TRT-LLM consumes this tag when TopK routing
+            # is bypassed and performed inside the fused MoE kernel.
+            routing_method_type=RoutingMethodType.DeepSeekV3,
         )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
+            params_dtype=self.router_dtype,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
@@ -355,14 +383,27 @@ class SarvamMoESparseMoeBlock(nn.Module):
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.shared_experts(hidden_states)
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = (
+            hidden_states.to(self.router_dtype)
+            if self.router_dtype is not None
+            else hidden_states
+        )
+        if self.router_logits_fp32:
+            if _is_cuda:
+                if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+                    return tiny_gemm_bf16(
+                        hidden_states,
+                        self.gate.weight,
+                        out_dtype=torch.float32,
+                        max_m=self.tiny_router_gemm_max_tokens,
+                    )
+                return linear_bf16_fp32(hidden_states, self.gate.weight)
+            return F.linear(hidden_states.float(), self.gate.weight.float())
+        return F.linear(hidden_states, self.gate.weight)
+
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.router_dtype is not None:
-            router_logits = F.linear(
-                hidden_states.to(self.router_dtype),
-                self.gate.weight.to(self.router_dtype),
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
 
@@ -373,13 +414,20 @@ class SarvamMoESparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_out = self._forward_shared_experts(hidden_states)
+
+        # Keep routed MoE on the main stream so its final kernel can participate
+        # in PDL/all-reduce fusion; overlap the independent shared expert on the
+        # auxiliary stream. This is the same issue order as DeepSeek-V3.
+        final_hidden_states = self._forward_router_experts(hidden_states)
         with torch.cuda.stream(self.alt_stream):
-            final_hidden_states = self._forward_router_experts(hidden_states)
-            if self.routed_scaling_factor != 1.0:
-                final_hidden_states = final_hidden_states * self.routed_scaling_factor
+            shared_out = self._forward_shared_experts(hidden_states)
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states = final_hidden_states + shared_out
+        if self.fuse_routed_scaling_in_moe:
+            final_hidden_states.add_(shared_out)
+        elif self.routed_scaling_factor != 1.0:
+            final_hidden_states.mul_(self.routed_scaling_factor).add_(shared_out)
+        else:
+            final_hidden_states.add_(shared_out)
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
@@ -398,24 +446,20 @@ class SarvamMoESparseMoeBlock(nn.Module):
             hidden_states.clone() if self.shared_experts is not None else hidden_states
         )
 
-        if self.router_dtype is not None:
-            router_logits = F.linear(
-                hidden_states.to(self.router_dtype),
-                self.gate.weight.to(self.router_dtype),
-            )
-        else:
-            router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.shared_experts is not None:
             shared_out = self.shared_experts(identity)
-            if self.routed_scaling_factor != 1.0:
+            if self.fuse_routed_scaling_in_moe:
+                shared_out.add_(final_hidden_states)
+            elif self.routed_scaling_factor != 1.0:
                 shared_out.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             else:
                 shared_out.add_(final_hidden_states)
             final_hidden_states = shared_out
-        elif self.routed_scaling_factor != 1.0:
+        elif not self.fuse_routed_scaling_in_moe and self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
@@ -1089,6 +1133,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_orig = hidden_states
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -1118,7 +1163,16 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            if (
+                self.is_layer_sparse
+                and not self.mlp.experts.moe_runner_config.inplace
+                and not torch.compiler.is_compiling()
+            ):
+                mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+            else:
+                mlp_ctx = nullcontext()
+            with mlp_ctx:
+                hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
