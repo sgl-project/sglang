@@ -573,6 +573,7 @@ class TestLowRatioPrepareStreams(CustomTestCase):
             index_source_layer_ids=[],
         )
         with (
+            torch.device("cuda"),
             get_parallel().override(
                 tp_size=1, tp_rank=0, attn_tp_rank=0, attn_tp_size=1
             ),
