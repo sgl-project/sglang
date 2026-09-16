@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from typing import Any, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -93,6 +94,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        # Streaming argument-delivery mode per tool call index:
+        #   None   - undecided (buffering, nothing emitted yet)
+        #   "normal" - ordinary call: stream incremental JSON as before
+        #   "wrap"   - sole wrapper (arguments/input) detected: buffer and emit a
+        #              single repaired arguments blob at invoke completion
+        self._call_modes: dict[int, Optional[str]] = {}
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -111,6 +118,71 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if m.group("self_close"):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
+
+    #: Wrapper keys that DeepSeek V3.2/V4 sometimes nest the real arguments under
+    _WRAPPER_KEYS = ("arguments", "input")
+
+    @staticmethod
+    def _schema_allowed_keys(
+        tools: Optional[list[Tool]], func_name: str
+    ) -> Optional[set[str]]:
+        """Return the set of declared top-level parameter keys for ``func_name``.
+
+        ``None`` means the tool is unknown or no usable schema is available; in
+        that case callers must skip wrapper repair (never drop data blindly).
+        """
+        for tool in tools or []:
+            fn = getattr(tool, "function", None)
+            if fn is None or fn.name != func_name:
+                continue
+            params = getattr(fn, "parameters", None) or {}
+            if isinstance(params, dict):
+                props = params.get("properties")
+                if isinstance(props, dict):
+                    return set(props.keys())
+                return set()
+        return None
+
+    @classmethod
+    def _unwrap_arguments(
+        cls, params: Any, allowed: Optional[set[str]]
+    ) -> Optional[dict]:
+        """Collapse a single ``arguments`` / ``input`` wrapper if it is not a
+        declared tool parameter and the wrapped payload matches the schema.
+
+        Handles the shapes observed in the wild (DeepSeek V4 / V3.2):
+          * ``{"arguments": {"command": "..."}}``      -> ``{"command": "..."}``
+          * ``{"arguments": "{...}"}``                 -> same (JSON-string inner)
+          * ``{"arguments": "bare scalar"}``           -> mapped onto the sole
+            declared parameter when the tool declares exactly one field.
+
+        Returns ``None`` when the payload must be passed through untouched.
+        """
+        if allowed is None or not allowed or not isinstance(params, dict):
+            return None
+        keys = set(params)
+        wrapper = next(
+            (w for w in cls._WRAPPER_KEYS if keys == {w} and w not in allowed),
+            None,
+        )
+        if wrapper is None:
+            return None
+        inner = params[wrapper]
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except (json.JSONDecodeError, ValueError):
+                if len(allowed) == 1:
+                    return {next(iter(allowed)): inner}
+                return None
+        if isinstance(inner, dict):
+            if set(inner).issubset(allowed):
+                return inner
+            return None
+        # scalar inner value: only safe when the schema declares one field
+        if len(allowed) == 1:
+            return {next(iter(allowed)): inner}
+        return None
 
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
@@ -213,10 +285,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         invoke_match
                     )
                     func_args = self._parse_parameters_from_xml(invoke_content)
+                    params_obj = json.loads(func_args)
+                    unwrapped = self._unwrap_arguments(
+                        params_obj, self._schema_allowed_keys(tools, func_name)
+                    )
+                    if unwrapped is not None:
+                        params_obj = unwrapped
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": params_obj,
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
@@ -312,6 +390,41 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_content, allow_partial=not is_tool_end
                 )
 
+                # Classify the in-flight call once (and only while nothing has
+                # been emitted for it yet). Wrapper-only calls are buffered and
+                # repaired at completion; everything else streams exactly as
+                # before, so ordinary calls keep incremental argument deltas.
+                mode = self._call_modes.get(self.current_tool_id)
+                if mode is None:
+                    allowed = self._schema_allowed_keys(tools, func_name)
+                    if allowed is None or not allowed:
+                        mode = "normal"
+                    else:
+                        obj = None
+                        try:
+                            obj = json.loads(current_params)
+                        except (json.JSONDecodeError, ValueError, MalformedJSON):
+                            try:
+                                obj = _partial_json_loads(current_params, Allow.ALL)[0]
+                            except (json.JSONDecodeError, ValueError, MalformedJSON):
+                                obj = None
+                        if isinstance(obj, dict) and obj:
+                            keys = set(obj)
+                            wrapper = next(
+                                (
+                                    w
+                                    for w in self._WRAPPER_KEYS
+                                    if keys == {w} and w not in allowed
+                                ),
+                                None,
+                            )
+                            mode = "wrap" if wrapper is not None else "normal"
+                        # Empty dict / unparsable / partial fragments stay
+                        # undecided (None): they are only released at completion
+                        # through the normal is_tool_end branch below.
+                    if mode is not None:
+                        self._call_modes[self.current_tool_id] = mode
+
                 # 3. Calculate and send incremental arguments
                 sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
                 prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
@@ -320,15 +433,56 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 argument_diff = None
 
-                if is_tool_end:
-                    # If complete, send everything remaining
-                    argument_diff = current_params[sent_len:]
-                elif prev_params is not None:
-                    # If partial, send stable prefix diff
-                    if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
+                if mode == "wrap":
+                    # Buffered repair: never stream the nested wrapper; emit one
+                    # corrected arguments blob when the invoke completes.
+                    if is_tool_end:
+                        final_params = "{}"
+                        try:
+                            final_obj = json.loads(current_params)
+                        except (json.JSONDecodeError, ValueError, MalformedJSON):
+                            final_obj = None
+                        if isinstance(final_obj, dict):
+                            repaired = self._unwrap_arguments(
+                                final_obj,
+                                self._schema_allowed_keys(tools, func_name),
+                            )
+                            if repaired is not None:
+                                final_obj = repaired
+                            final_params = json.dumps(final_obj, ensure_ascii=False)
+                        argument_diff = final_params[sent_len:]
+                elif mode == "normal" or is_tool_end:
+                    # Ordinary incremental streaming. Undecided calls (no
+                    # parseable params yet) are only released at completion,
+                    # which preserves e.g. zero-argument invokes.
+                    if is_tool_end:
+                        # Belt-and-braces: a call that never reached a clear
+                        # classification (mode stayed None to the end) is still
+                        # guarded here - repair a sole arguments/input wrapper
+                        # on the final object so nothing leaks through.
+                        final_params = None
+                        if mode is None:
+                            try:
+                                final_obj = json.loads(current_params)
+                            except (json.JSONDecodeError, ValueError, MalformedJSON):
+                                final_obj = None
+                            if isinstance(final_obj, dict):
+                                repaired = self._unwrap_arguments(
+                                    final_obj,
+                                    self._schema_allowed_keys(tools, func_name),
+                                )
+                                if repaired is not None:
+                                    final_params = json.dumps(
+                                        repaired, ensure_ascii=False
+                                    )
+                        # If complete, send everything remaining
+                        argument_diff = (final_params or current_params)[sent_len:]
+                    elif prev_params is not None:
+                        # If partial, send stable prefix diff
+                        if current_params != prev_params:
+                            prefix = _find_common_prefix(current_params, prev_params)
+                            if len(prefix) > sent_len:
+                                argument_diff = prefix[sent_len:]
 
                 if argument_diff:
                     all_calls.append(
