@@ -33,7 +33,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 DCP_SIZES = [1, 2, 3, 4, 16]
 DIM = 3
-# _DCP_EXTEND_GATHER_PIECE_ROWS in deepseek_v2_attention_mla_npu.py.
+# The SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS default the NPU path serves with.
 SERVED_PIECE_ROWS = 1 << 18
 # From a cut at every local row up to the served budget, where every case
 # below fits in one piece.

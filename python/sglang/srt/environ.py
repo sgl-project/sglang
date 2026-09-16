@@ -953,6 +953,10 @@ class Envs:
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(False)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: gathered rows per prefix-gather collective, which caps
+    # the scratch a layer holds beside the gathered context. The default is
+    # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

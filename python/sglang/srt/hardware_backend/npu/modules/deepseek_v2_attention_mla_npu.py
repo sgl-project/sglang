@@ -531,9 +531,16 @@ def forward_dsa_prepare_npu(
 
 
 # Gathered rows per extend-gather collective. A bf16 latent row is 1024 bytes,
-# so a piece's scratch is at most 256 MiB (plus 32 MiB of rope key); a ~976k
-# prefix at dcp16 takes four collectives per layer instead of one.
-_DCP_EXTEND_GATHER_PIECE_ROWS = 1 << 18
+# so the default caps a piece's scratch at 256 MiB of latent KV plus 32 MiB of
+# rope key. At a ~976k prefix and dcp16 that is four pieces -- eight collectives
+# per layer, since the two keys move separately, against one for the whole
+# context before. The bytes moved are the same either way, and each piece is
+# still a 16.8 MiB send per rank, well into the bandwidth-bound regime; the
+# trade is launch overhead against the scratch held beside the output. Tunable
+# because that trade is arithmetic here and measurable only on the box.
+_dcp_extend_gather_piece_rows = envs.SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS.get()
+if _dcp_extend_gather_piece_rows <= 0:
+    _dcp_extend_gather_piece_rows = 1 << 62
 
 _last_dcp_extend_rows: Optional[Tuple[int, int]] = None
 
@@ -601,8 +608,8 @@ def _dcp_gather_extend_kv_npu(
     contiguous run per request.
 
     **Nothing the size of the context outlives one layer's attention.** The
-    prefix is gathered in pieces of at most ``_DCP_EXTEND_GATHER_PIECE_ROWS``
-    rows, and each piece -- the gathered rows, rank-major as
+    prefix is gathered in pieces of at most
+    ``SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS`` rows, and each piece -- the gathered rows, rank-major as
     ``all_gather_into_tensor`` writes them, then this chunk's own KV for the
     requests that end in it -- is written straight into its place in the output
     with one ``index_select`` (``plan_dcp_extend_gather``) before the next is
@@ -646,7 +653,7 @@ def _dcp_gather_extend_kv_npu(
             forward_batch.extend_seq_lens_cpu,
             parallel.dcp_size,
             parallel.dcp_rank,
-            _DCP_EXTEND_GATHER_PIECE_ROWS,
+            _dcp_extend_gather_piece_rows,
         )
         plan = plan._replace(
             pieces=[
