@@ -391,6 +391,19 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         self.assertAlmostEqual(k_scale, 0.012)
         self.assertAlmostEqual(v_scale, 0.018)
 
+    def test_dsa_mla_scale_recipe(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVCacheMethod,
+        )
+
+        m = NVFP4KVCacheMethod(num_layers=4, device="cpu")
+        m.configure_dsa_mla_scales()
+        expected = 100.0 / (448.0 * 6.0)
+        torch.testing.assert_close(
+            m.k_scales_gpu, torch.full((4,), expected, dtype=torch.float32)
+        )
+        self.assertEqual(m.k_scales_float, [expected] * 4)
+
     @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize->dequantize roundtrip on CUDA."""
@@ -633,6 +646,36 @@ class TestNVFP4DSAGather(CustomTestCase):
         error = (actual.float() - reference.float()).abs().mean()
         relative_error = error / reference.float().abs().mean()
         self.assertLess(relative_error.item(), 0.3)
+
+        # Capture the full gather -> TRTLLM-GEN chain using stable scratch.
+        fp8_scratch = torch.empty(
+            (topk, 1, head_dim),
+            dtype=torch.float8_e4m3fn,
+            device="cuda",
+        )
+        index_scratch = torch.empty_like(physical)
+
+        def run_nvfp4_attention():
+            graph_kv, graph_indices = gather_dequant_nvfp4_mla_cache_generation(
+                packed.view(torch.uint8),
+                scales.view(torch.uint8),
+                physical,
+                global_scale,
+                head_dim=head_dim,
+                page_size=page_size,
+                output=fp8_scratch,
+                compact_indices=index_scratch,
+            )
+            return run_attention(graph_kv, graph_indices)
+
+        run_nvfp4_attention()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = run_nvfp4_attention()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output.float(), actual.float())
 
 
 class TestFP4MXBlock16KVCacheMethod(CustomTestCase):

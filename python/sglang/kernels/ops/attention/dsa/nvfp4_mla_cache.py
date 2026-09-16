@@ -37,6 +37,11 @@ def _jit_nvfp4_mla_gather_module() -> Module:
     )
 
 
+def preload_nvfp4_mla_gather() -> None:
+    """Compile/load the CUDA gather before entering CUDA Graph capture."""
+    _jit_nvfp4_mla_gather_module()
+
+
 @triton.jit
 def _gather_dequant_nvfp4_mla_generation_kernel(
     data_ptr,

@@ -611,6 +611,43 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     major, _ = torch.cuda.get_device_capability()
     kv_cache_dtype = view.kv_cache_dtype
+    if kv_cache_dtype == "nvfp4":
+        unsupported_modes = []
+        for enabled, option in (
+            (getattr(view, "dcp_size", 1) > 1, "--dcp-size > 1"),
+            (getattr(view, "enable_prefill_cp", False), "--enable-prefill-cp"),
+            (getattr(view, "attn_cp_size", 1) > 1, "--attn-cp-size > 1"),
+            (getattr(view, "enable_hisparse", False), "--enable-hisparse"),
+            (
+                getattr(view, "enable_dsa_cache_layer_split", False),
+                "--enable-dsa-cache-layer-split",
+            ),
+            (
+                getattr(view, "enable_hierarchical_cache", False),
+                "--enable-hierarchical-cache",
+            ),
+            (
+                getattr(view, "enable_unified_memory", False),
+                "--enable-unified-memory",
+            ),
+            (
+                getattr(view, "enable_unified_cache_external_linker", False),
+                "--enable-unified-cache-external-linker",
+            ),
+            (getattr(view, "enable_lmcache", False), "--enable-lmcache"),
+            (getattr(view, "enable_flexkv", False), "--enable-flexkv"),
+            (
+                getattr(view, "disaggregation_mode", "null") != "null",
+                "PD disaggregation",
+            ),
+        ):
+            if enabled:
+                unsupported_modes.append(option)
+        if unsupported_modes:
+            raise ValueError(
+                "NVFP4 DSA does not yet support: " + ", ".join(unsupported_modes)
+            )
+
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}

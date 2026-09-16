@@ -2033,6 +2033,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dsa_prefill_backend=None,
                 dsa_decode_backend=None,
                 enable_hisparse=False,
+                dcp_size=1,
+                enable_prefill_cp=False,
+                attn_cp_size=1,
+                enable_dsa_cache_layer_split=False,
+                enable_hierarchical_cache=False,
+                enable_unified_memory=False,
+                enable_unified_cache_external_linker=False,
+                enable_lmcache=False,
+                enable_flexkv=False,
+                disaggregation_mode="null",
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2115,6 +2125,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "trtllm",
                 },
             )
+            for field, value in (
+                ("dcp_size", 2),
+                ("enable_prefill_cp", True),
+                ("attn_cp_size", 2),
+                ("enable_hisparse", True),
+                ("enable_dsa_cache_layer_split", True),
+                ("enable_hierarchical_cache", True),
+                ("enable_unified_memory", True),
+                ("enable_unified_cache_external_linker", True),
+                ("enable_lmcache", True),
+                ("enable_flexkv", True),
+                ("disaggregation_mode", "decode"),
+            ):
+                with self.subTest(nvfp4_unsupported=field):
+                    with self.assertRaisesRegex(ValueError, "does not yet support"):
+                        _dsa_split_backend_resolution(
+                            _view(kv_cache_dtype="nvfp4", **{field: value})
+                        )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),

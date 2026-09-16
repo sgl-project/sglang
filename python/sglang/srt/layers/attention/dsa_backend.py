@@ -529,6 +529,9 @@ class DeepseekSparseAttnBackend(
         self._nvfp4_generation_scratch: dict[
             int, tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._nvfp4_cuda_graph_scratch: Optional[tuple[torch.Tensor, torch.Tensor]] = (
+            None
+        )
 
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             _validate_flashinfer_sparse_mla_backend,
@@ -1248,6 +1251,27 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            from sglang.kernels.ops.attention.dsa.nvfp4_mla_cache import (
+                preload_nvfp4_mla_gather,
+            )
+
+            # Compile before capture: neither the SGLang JIT nor a cold Triton
+            # fallback may run while a CUDA graph is being recorded.
+            preload_nvfp4_mla_gather()
+            num_pairs = max_num_tokens * self.dsa_index_topk
+            padded_pairs = (
+                (num_pairs + self.real_page_size - 1) // self.real_page_size
+            ) * self.real_page_size
+            self._nvfp4_cuda_graph_scratch = (
+                torch.empty(
+                    (padded_pairs, 1, self.kv_cache_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=self.device,
+                ),
+                torch.empty(padded_pairs, dtype=torch.int32, device=self.device),
+            )
+
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -3369,6 +3393,16 @@ class DeepseekSparseAttnBackend(
         padded_rows = (
             (num_rows + self.real_page_size - 1) // self.real_page_size
         ) * self.real_page_size
+        if torch.cuda.is_current_stream_capturing():
+            buffers = self._nvfp4_cuda_graph_scratch
+            if buffers is None or buffers[0].shape[0] < padded_rows:
+                capacity = 0 if buffers is None else buffers[0].shape[0]
+                raise RuntimeError(
+                    "NVFP4 DSA CUDA Graph scratch is undersized: "
+                    f"required={padded_rows}, capacity={capacity}."
+                )
+            return buffers[0][:padded_rows], buffers[1][:num_rows]
+
         stream_key = torch.cuda.current_stream().cuda_stream
         buffers = self._nvfp4_generation_scratch.get(stream_key)
         if buffers is None or buffers[0].shape[0] < padded_rows:
