@@ -681,6 +681,110 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             "kv_indices_buf": self.cuda_graph_kv_indices,
         }
 
+    def prepare_host_metadata(self, fb_view) -> Optional[dict]:
+        """Host-eager phase for DFlash TARGET_VERIFY metadata glue split.
+
+        Fills the static ``fast_plan_*_cpu`` pinned arrays with this step's
+        plan inputs (DFlash invariant: seq_lens_cpu already includes
+        draft_token_num), then runs ``_cached_module.plan`` on those host
+        arrays. Both steps must re-run every replay and must not be captured.
+
+        Returns pointer-stable slices for :py:meth:`apply_device_metadata`,
+        or None so the glue graph keeps the single-phase path.
+        """
+        # Runtime mode must be TARGET_VERIFY. capture_forward_mode alone is
+        # not enough: an IDLE DP rank must not take the DFlash fast plan.
+        actual = getattr(fb_view, "actual_forward_mode", None)
+        if actual is None or not actual.is_target_verify():
+            return None
+        spec_info = fb_view.spec_info
+        if spec_info is None or spec_info.spec_input_type != SpecInputType.DFLASH_VERIFY:
+            return None
+        if (
+            spec_info.ragged_verify_layout is not None
+            or spec_info.custom_mask is not None
+        ):
+            return None
+        if get_parallel().dcp_enabled:
+            return None
+        seq_lens_cpu = fb_view.seq_lens_cpu
+        if seq_lens_cpu is None:
+            return None
+
+        bs = fb_view.batch_size
+        ndt = spec_info.draft_token_num
+        self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+            0, (bs + 1) * ndt, ndt, dtype=torch.int32
+        )
+        # DFlash: seq_lens_cpu already includes draft_token_num.
+        self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs].to(torch.int32)
+        self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+            self.fast_plan_kv_len_arr_cpu[:bs], dim=0
+        )
+
+        # Prefer the exact host sum; fall back to summing the pinned array
+        # (glue requires raw_bs == bs, so no padding term).
+        seq_lens_sum = fb_view.seq_lens_sum
+        if seq_lens_sum is None:
+            seq_lens_sum = int(self.fast_plan_kv_len_arr_cpu[:bs].sum())
+
+        wrapper_key = self._verify_graph_key(bs, spec_info)
+        wrapper = self.prefill_cuda_graph_metadata[wrapper_key]
+        # Host plan every replay — never inside the glue graph.
+        dflash_verify_host_plan(
+            wrapper,
+            self.fast_plan_qo_indptr_cpu[: bs + 1],
+            self.fast_plan_kv_indptr_cpu[: bs + 1],
+            self.fast_plan_kv_len_arr_cpu[:bs],
+            self.num_local_heads,
+            self.kv_lora_rank,
+            1,
+            True,
+            self.scaling,
+        )
+
+        return {
+            "qo_indptr_cpu": self.fast_plan_qo_indptr_cpu[: bs + 1],
+            "kv_indptr_cpu": self.fast_plan_kv_indptr_cpu[: bs + 1],
+            "kv_len_arr_cpu": self.fast_plan_kv_len_arr_cpu[:bs],
+            "kv_indices_buf": self.cuda_graph_kv_indices,
+            "bs": bs,
+            "wrapper_key": wrapper_key,
+            "seq_lens_sum": seq_lens_sum,
+        }
+
+    def apply_device_metadata(self, fb_view, host_inputs: Optional[dict]) -> None:
+        """Device phase for DFlash TARGET_VERIFY metadata glue split.
+
+        Graph-recordable only: kv_indices triton fill + small H2D mirrors.
+        ``_cached_module.plan`` already ran in :py:meth:`prepare_host_metadata`.
+        """
+        if host_inputs is None:
+            self.init_forward_metadata_out_graph(fb_view)
+            return
+
+        bs = host_inputs["bs"]
+        req_pool_indices = fb_view.req_pool_indices[:bs]
+        seq_lens = fb_view.seq_lens[:bs]
+        seq_lens_sum = host_inputs["seq_lens_sum"]
+        spec_info = fb_view.spec_info
+        wrapper = self.prefill_cuda_graph_metadata[host_inputs["wrapper_key"]]
+
+        kv_indices, _kv_indptr, _qo_indptr, _mask = spec_info.generate_attn_arg_prefill(
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            self.req_to_token,
+            kv_indices_buf=host_inputs["kv_indices_buf"],
+        )
+        dflash_verify_device_mirrors(
+            wrapper,
+            host_inputs["qo_indptr_cpu"],
+            host_inputs["kv_indptr_cpu"],
+            host_inputs["kv_len_arr_cpu"],
+        )
+        self.forward_metadata = PrefillMetadata(wrapper, False)
+
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
@@ -1470,3 +1574,56 @@ def fast_mla_dflash_verify_plan(
         )
     except Exception as e:
         raise RuntimeError(f"Error in alternate MLA dflash verify plan: {e}")
+
+
+def dflash_verify_host_plan(
+    self,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+    num_heads: int,
+    head_dim_ckv: int,
+    page_size: int,
+    causal: bool,
+    sm_scale: float,
+) -> None:
+    """Host-eager half of the DFlash verify plan (metadata-glue split).
+
+    Sets wrapper scalars and runs ``_cached_module.plan`` against the static
+    pinned CPU arrays. Must re-run every replay; must NOT be captured into a
+    CUDA graph (host-only workspace prep would freeze at capture-time values).
+    """
+    self._causal = causal
+    self._page_size = page_size
+    self._sm_scale = sm_scale
+    try:
+        self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in DFlash verify host plan: {e}")
+
+
+def dflash_verify_device_mirrors(
+    self,
+    qo_indptr_cpu: torch.Tensor,
+    kv_indptr_cpu: torch.Tensor,
+    kv_len_arr_cpu: torch.Tensor,
+) -> None:
+    """Device half of the DFlash verify plan (safe to CUDA-graph capture).
+
+    Non-blocking H2D refresh of the wrapper's small bound buffers from the
+    static pinned arrays prepared by ``dflash_verify_host_plan``'s caller.
+    No host sync, no ``_cached_module.plan``.
+    """
+    self._qo_indptr_buf.copy_(qo_indptr_cpu, non_blocking=True)
+    self._kv_indptr_buf.copy_(kv_indptr_cpu, non_blocking=True)
+    self._kv_len_arr_buf.copy_(kv_len_arr_cpu, non_blocking=True)
