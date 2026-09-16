@@ -23,14 +23,21 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
         """PD tail allocation must leave new FULL-only pages unbound in SWA,
         while preserving an existing partial page and binding the trailing KV."""
         for page_size in (4, 16):
-            for prefix_len, tail_pages in (
-                (page_size, 0),
-                (page_size, 1),
-                (page_size, 2),
-                (page_size + 2, 1),
+            for prefix_len, seq_len, tail_len in (
+                (page_size, 5 * page_size, 0),
+                (page_size, 5 * page_size, page_size),
+                (page_size, 5 * page_size, 2 * page_size),
+                (page_size + 2, 5 * page_size, page_size),
+                (page_size + 2, 5 * page_size, 4 * page_size - 2),
+                (page_size + 2, 2 * page_size - 1, page_size - 3),
+                (page_size + 2, 5 * page_size - 1, page_size),
+                (0, None, 1),
             ):
                 with self.subTest(
-                    page_size=page_size, prefix_len=prefix_len, tail_pages=tail_pages
+                    page_size=page_size,
+                    prefix_len=prefix_len,
+                    seq_len=seq_len,
+                    tail_len=tail_len,
                 ):
                     bundle = init_unified_swa_pools(
                         device="cuda",
@@ -51,12 +58,14 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         need_sort=False,
                     )
                     allocator = bundle.token_to_kv_pool_allocator
+                    if seq_len is None:
+                        seq_len = allocator.available_size() + page_size
+                        self.assertFalse(allocator.can_reserve(seq_len, seq_len))
                     prefix_capacity = -(-prefix_len // page_size) * page_size
                     prefix = allocator.alloc(prefix_capacity)[:prefix_len]
                     prefix_swa = allocator.translate_swa_indices_for_transfer(
                         prefix
                     ).clone()
-                    seq_len = 5 * page_size
                     prefix_cpu = torch.tensor([prefix_len], dtype=torch.int64)
                     seq_cpu = torch.tensor([seq_len], dtype=torch.int64)
                     extended = allocator.alloc_extend_swa_tail(
@@ -64,9 +73,13 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         prefix_lens_cpu=prefix_cpu,
                         seq_lens=seq_cpu.cuda(),
                         seq_lens_cpu=seq_cpu,
-                        last_loc=prefix[-1:],
+                        last_loc=(
+                            prefix[-1:]
+                            if prefix_len
+                            else torch.tensor([-1], device="cuda")
+                        ),
                         extend_num_tokens=seq_len - prefix_len,
-                        swa_tail_len=tail_pages * page_size,
+                        swa_tail_len=tail_len,
                     )
                     self.assertIsNotNone(extended)
                     self.assertEqual(extended.numel(), seq_len - prefix_len)
@@ -75,38 +88,39 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     swa_phys = allocator.translate_swa_indices_for_transfer(tokens)
                     self.assertTrue(bool((full_phys > 0).all()))
                     self.assertTrue(torch.equal(swa_phys[:prefix_len], prefix_swa))
-                    tail_start = seq_len - tail_pages * page_size
-                    full_only_pages = (
-                        tokens[prefix_capacity:tail_start:page_size] // page_size
-                    )
+                    tail_start = seq_len - tail_len
+                    new_pages = torch.unique(tokens[prefix_capacity:] // page_size)
+                    tail_pages = torch.unique(tokens[tail_start:] // page_size)
+                    full_only_pages = new_pages[~torch.isin(new_pages, tail_pages)]
                     self.assertTrue(
                         bool(
                             (allocator.swa_v2p_page_table[full_only_pages] == -1).all()
                         )
                     )
-                    self.assertTrue(
-                        bool((swa_phys[prefix_capacity:tail_start] == 0).all())
-                    )
-                    if tail_pages:
+                    if tail_len:
                         pages = allocator.swa_v2p_page_table[
-                            tokens[tail_start::page_size] // page_size
+                            tokens[tail_start:] // page_size
                         ]
                         self.assertTrue(bool((pages > 0).all()))
-                        expected = (
-                            pages[:, None] * page_size
-                            + torch.arange(page_size, device="cuda")
-                        ).flatten()
+                        expected = pages * page_size + tokens[tail_start:] % page_size
                         self.assertTrue(torch.equal(swa_phys[tail_start:], expected))
+                    self.assertEqual(
+                        allocator.swa_attn_allocator.allocated_count(),
+                        prefix_capacity
+                        + torch.isin(new_pages, tail_pages).sum().item() * page_size,
+                    )
                     if prefix_len < prefix_capacity:
+                        reused_tokens = min(prefix_capacity, seq_len) - prefix_len
                         self.assertTrue(
                             torch.equal(
-                                extended[: prefix_capacity - prefix_len],
+                                extended[:reused_tokens],
                                 prefix[-1]
-                                + torch.arange(
-                                    1, prefix_capacity - prefix_len + 1, device="cuda"
-                                ),
+                                + torch.arange(1, reused_tokens + 1, device="cuda"),
                             )
                         )
+                    allocator.free(tokens)
+                    self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
 
 if __name__ == "__main__":

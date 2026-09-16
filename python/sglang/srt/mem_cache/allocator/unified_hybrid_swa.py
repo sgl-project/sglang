@@ -395,6 +395,8 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        *,
+        num_swa_pages: Optional[int] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the full side's paged extend and report which virtual PAGES it
         newly took. Returns (virtual TOKEN ids, new virtual PAGE ids), or None
@@ -409,7 +411,10 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
             prefix_lens=prefix_lens_cpu,
         )
         need_tokens = num_new_pages * self.page_size
-        if not self.ensure_capacity(need_tokens, need_tokens):
+        swa_tokens = (
+            need_tokens if num_swa_pages is None else num_swa_pages * self.page_size
+        )
+        if not self.ensure_capacity(need_tokens, swa_tokens):
             return None
 
         # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
@@ -485,14 +490,22 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
         sink and is skipped by `free`'s `swa_v2p_page > 0` mask -- exactly the
         out-of-window state the ratchet produces via `free_swa`.
 
-        Admission is priced at the FULL side's page count, as plain
-        `alloc_extend` is: pessimistic when the tail is short, but it reuses
-        the composite's audited joint capacity path, and the bytes actually
-        held still follow the tail.
+        Admission prices FULL's new pages and only the new pages in the SWA
+        tail. A partial prefix page is already bound and costs no new SWA page.
         """
         assert len(prefix_lens_cpu) == 1
         assert 0 <= swa_tail_len <= extend_num_tokens
         with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            prefix_len = int(prefix_lens_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            first_new_page = (prefix_len + self.page_size - 1) // self.page_size
+            first_tail_page = (seq_len - swa_tail_len) // self.page_size
+            num_swa_pages = (
+                (seq_len + self.page_size - 1) // self.page_size
+                - max(first_new_page, first_tail_page)
+                if swa_tail_len
+                else 0
+            )
             extended = self._extend_in_virtual_space(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -500,6 +513,7 @@ class UnifiedSWAAllocatorBase(SWATokenToKVPoolAllocator):
                 seq_lens_cpu,
                 last_loc,
                 extend_num_tokens,
+                num_swa_pages=num_swa_pages,
             )
             if extended is None:
                 return None
@@ -1117,68 +1131,6 @@ class UnifiedSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         # A zero-reclaim plan can still depend on compaction before allocation.
         return self.ensure_capacity(num_tokens, required_swa)
 
-    def alloc_extend_swa_tail(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-        swa_tail_len: int,
-    ) -> Optional[torch.Tensor]:
-        """Allocate full KV for an extend and SWA KV only for its aligned tail."""
-        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
-            assert self.page_size > 1
-            assert len(seq_lens_cpu) == len(prefix_lens_cpu) == 1
-            prefix_len = int(prefix_lens_cpu[0])
-            seq_len = int(seq_lens_cpu[0])
-            assert seq_len - prefix_len == extend_num_tokens
-            assert 0 <= swa_tail_len <= extend_num_tokens
-            tail_start = seq_len - swa_tail_len
-            assert prefix_len <= tail_start
-            assert swa_tail_len == 0 or tail_start % self.page_size == 0, (
-                "unified SWA tail allocation requires a page-aligned tail; "
-                f"got extend_num_tokens={extend_num_tokens}, "
-                f"tail_len={swa_tail_len}, page_size={self.page_size}"
-            )
-
-            num_full_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-            num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
-            if not self.ensure_capacity(
-                num_full_pages * self.page_size,
-                num_swa_pages * self.page_size,
-            ):
-                return None
-
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_full_pages].clone()
-            tail_virtual_pages = (
-                new_virtual_pages[-num_swa_pages:]
-                if num_swa_pages > 0
-                else new_virtual_pages[:0]
-            )
-            out_indices = fa.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_new_pages=num_full_pages,
-            )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_extend_swa_tail: full.alloc_extend returned "
-                "None after the capacity check passed"
-            )
-            if num_swa_pages > 0:
-                self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
-            return out_indices
-
     def verify_byte_accounting(self) -> List[str]:
         return (
             _chain_byte_accounting_violations(
@@ -1306,69 +1258,78 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWAAllocatorBase):
         if (
             full_tokens < 0
             or swa_tokens < 0
-            or full_tokens != swa_tokens
             or full_evictable_tokens
             or swa_evictable_tokens
             or empty_pool
         ):
             return False
-        return full_tokens <= self.available_size()
+        return self._fits_page_demand(
+            math.ceil(full_tokens / self.page_size),
+            math.ceil(swa_tokens / self.page_size),
+        )
 
     def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
-        if full_tokens < 0 or swa_tokens < 0 or full_tokens != swa_tokens:
+        if full_tokens < 0 or swa_tokens < 0:
             return False
-        if full_tokens == 0:
+        if self.can_reserve(full_tokens, swa_tokens):
             return True
-        need_tokens = int(full_tokens)
-        if need_tokens <= self.available_size():
+        for allocator in self._flush_targets():
+            allocator.flush_for_allocation()
+        if self.can_reserve(full_tokens, swa_tokens):
             return True
-        return _relieve_for_alloc(self, need_tokens)
+        _float_open_short_side(
+            self.swa_attn_allocator,
+            {
+                self.full_attn_allocator: -(-full_tokens // self.page_size),
+                self.swa_attn_allocator: -(-swa_tokens // self.page_size),
+                self.mamba_allocator: 0,
+            },
+        )
+        return self.can_reserve(full_tokens, swa_tokens)
 
-    def _compute_available_size(self) -> int:
-        """Joint TOKENS for `alloc(N)`: N costs N full pages AND N swa pages, drawn
-        from DIFFERENT bands -- full extends only into the high band, the float into
-        either side but only ONE per batch alloc. Feasibility is monotone in N, so
-        binary search; the order matches the alloc path (full takes the high band).
-        """
+    def _fits_page_demand(self, full_pages: int, swa_pages: int) -> bool:
+        """Price FULL first, then SWA in one contiguous band on the float grid."""
         fa, sa = self.full_attn_allocator, self.swa_attn_allocator
-        e_f = fa.entry_bytes_per_page
-        # full is grow-down: its chain gap IS the high band.
-        b_high = fa._current_gap_bytes()
         h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
         h_s = sa._hole_pages()
         r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
         r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
-
-        def feasible(n: int) -> bool:
-            if n > h_f + r_f or n > h_s + r_s:
-                return False
-            ext_f = max(0, n - h_f)
-            if ext_f * e_f > b_high:
-                return False
-            ext_s = max(0, n - h_s)
-            # On the float's page grid, never in raw bytes: a byte budget
-            # credits a page `take_physical_pages` cannot yield.
-            full_low_after = fa._byte_low_frontier() - ext_f * e_f
-            if sa._is_frontier_transparent():
-                room = sa.pages_in_band(
-                    low_byte=sa._chain_high_frontier_below_bytes(),
-                    high_byte=full_low_after,
-                )
-                return ext_s <= room
-            p_low = sa.pages_in_band(
+        if full_pages > h_f + r_f or swa_pages > h_s + r_s:
+            return False
+        full_bytes = max(0, full_pages - h_f) * fa.entry_bytes_per_page
+        if full_bytes > fa._current_gap_bytes():
+            return False
+        ext_s = max(0, swa_pages - h_s)
+        full_low_after = fa._byte_low_frontier() - full_bytes
+        if sa._is_frontier_transparent():
+            room = sa.pages_in_band(
                 low_byte=sa._chain_high_frontier_below_bytes(),
-                high_byte=sa._byte_low_frontier(),
-            )
-            p_high = sa.pages_in_band(
-                low_byte=sa._byte_high_frontier(),
                 high_byte=full_low_after,
             )
-            return ext_s <= max(p_low, p_high)
+            return ext_s <= room
+        p_low = sa.pages_in_band(
+            low_byte=sa._chain_high_frontier_below_bytes(),
+            high_byte=sa._byte_low_frontier(),
+        )
+        p_high = sa.pages_in_band(
+            low_byte=sa._byte_high_frontier(),
+            high_byte=full_low_after,
+        )
+        return ext_s <= max(p_low, p_high)
 
+    def _compute_available_size(self) -> int:
+        """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
+        as tail allocation. FULL takes the high band before SWA binds its pages.
+        """
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        h_f = len(fa._free_phys_pages) if fa.lazy_compaction else 0
+        h_s = sa._hole_pages()
+        r_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        r_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
         lo_n, hi_n = 0, min(h_f + r_f, h_s + r_s)
         while lo_n < hi_n:
             mid = (lo_n + hi_n + 1) // 2
-            if feasible(mid):
+            if self._fits_page_demand(mid, mid):
                 lo_n = mid
             else:
                 hi_n = mid - 1
