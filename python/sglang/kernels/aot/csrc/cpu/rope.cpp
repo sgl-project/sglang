@@ -348,9 +348,8 @@ at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor&
 
   TORCH_CHECK(head_size % 2 == 0, "head_size must be even");
 
-  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {seqlen, head_size / 2}, cos.scalar_type());
-  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {seqlen, head_size / 2}, sin.scalar_type());
-  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(cos, {seqlen, head_size / 2}, cos.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(sin, {seqlen, head_size / 2}, sin.scalar_type());
 
   const auto input_dtype = input.scalar_type();
   const auto param_dtype = cos.scalar_type();

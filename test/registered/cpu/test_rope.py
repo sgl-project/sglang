@@ -332,11 +332,21 @@ class TestROPE(CustomTestCase):
 
             num_tokens = shape[0] if len(shape) == 3 else shape[1]
             head_size = shape[-1]
+            half_size = head_size // 2
 
-            angles = torch.randn(num_tokens, head_size // 2, dtype=torch.float32)
+            angles = torch.randn(num_tokens, half_size, dtype=torch.float32)
 
-            cos = angles.cos().to(param_dtype)
-            sin = angles.sin().to(param_dtype)
+            cos_dense = angles.cos().to(param_dtype)
+            sin_dense = angles.sin().to(param_dtype)
+
+            cos_storage = torch.empty(num_tokens, 2, half_size, dtype=param_dtype)
+            sin_storage = torch.empty(num_tokens, 2, half_size, dtype=param_dtype)
+
+            cos = cos_storage[:, 0, :]
+            sin = sin_storage[:, 0, :]
+
+            cos.copy_(cos_dense)
+            sin.copy_(sin_dense)
 
             output_ref = self.apply_rotary_embedding_reference(x, cos, sin)
             output_sgl = torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
@@ -346,12 +356,7 @@ class TestROPE(CustomTestCase):
             self.assertEqual(output_sgl.shape, x.shape)
             self.assertEqual(output_sgl.dtype, x.dtype)
 
-            if input_dtype == torch.float32:
-                atol = 1e-5
-                rtol = 1e-5
-            else:
-                atol = 1e-2
-                rtol = 1e-2
+            atol = rtol = precision[input_dtype]
 
             torch.testing.assert_close(output_ref, output_sgl, atol=atol, rtol=rtol)
 

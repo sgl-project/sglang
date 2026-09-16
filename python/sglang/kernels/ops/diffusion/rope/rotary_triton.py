@@ -154,9 +154,6 @@ def apply_rotary_embedding_cpu(
     if interleaved and cos.shape[-1] == head_size:
         cos = cos[..., ::2].contiguous()
         sin = sin[..., ::2].contiguous()
-    else:
-        cos = cos.contiguous()
-        sin = sin.contiguous()
 
     return torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
 
