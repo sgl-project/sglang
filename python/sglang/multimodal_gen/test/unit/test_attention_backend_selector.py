@@ -129,6 +129,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
         allow_global_backend_fallback: bool = False,
         server_args: object | None = None,
         backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
+        also_resolve_is_cross: tuple[bool, ...] = (),
     ):
         if server_args is None:
             server_args = _ServerArgs(backend.name.lower(), explicit=explicit)
@@ -155,7 +156,7 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 require_backend_selection=component_backend is not None,
             ),
         ):
-            return get_attn_backend(
+            resolved = get_attn_backend(
                 128,
                 torch.bfloat16,
                 supported_attention_backends=supported,
@@ -163,6 +164,18 @@ class TestAttentionBackendFallback(unittest.TestCase):
                 default_attention_backend=default_attention_backend,
                 is_cross_attention=is_cross_attention,
             )
+            # Component-scoped validation runs on context exit, so a test that
+            # configures a role must build a layer of that role somewhere.
+            for extra_is_cross in also_resolve_is_cross:
+                get_attn_backend(
+                    128,
+                    torch.bfloat16,
+                    supported_attention_backends=supported,
+                    attention_requirements=attention_requirements,
+                    default_attention_backend=default_attention_backend,
+                    is_cross_attention=extra_is_cross,
+                )
+            return resolved
 
     def test_implicit_platform_preference_falls_back(self):
         backend = self._resolve(
@@ -356,9 +369,72 @@ class TestAttentionBackendFallback(unittest.TestCase):
             is_cross_attention=False,
             supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
             backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+            also_resolve_is_cross=(True,),
         )
 
         self.assertIs(backend, _FakeSDPABackend)
+
+    def test_role_backend_requires_a_matching_layer(self):
+        # A role override on a component that builds no layers of that role is
+        # a silent no-op, which is the failure the component-wide check reports.
+        with self.assertRaisesRegex(
+            ComponentAttentionBackendNotAppliedError,
+            "constructed no cross-attention layers",
+        ):
+            self._resolve(
+                AttentionBackendEnum.TORCH_SDPA,
+                explicit=True,
+                is_cross_attention=False,
+                supported={AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
+                backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+            )
+
+    def test_role_override_does_not_mask_component_wide_failure(self):
+        # A layer that pins its own backend still fails the component-wide
+        # requirement even when a role override happens to name that backend.
+        with (
+            patch(f"{_SELECTOR}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                f"{_SELECTOR}.get_component_forced_attn_backend",
+                return_value=AttentionBackendEnum.AITER,
+            ),
+            patch(
+                f"{_SELECTOR}.get_global_server_args",
+                return_value=_ServerArgs("aiter", explicit=False),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                _FakePlatform,
+            ),
+            patch(
+                f"{_SELECTOR}.resolve_name",
+                side_effect=_FAKE_BACKENDS.__getitem__,
+            ),
+            self.assertRaisesRegex(
+                ComponentAttentionBackendNotAppliedError, "selected fa instead"
+            ),
+            component_attn_backend_context_manager(
+                AttentionBackendEnum.AITER,
+                component_name="text_encoder",
+                backend_by_role={AttentionRole.CROSS: AttentionBackendEnum.FA},
+                require_backend_selection=True,
+            ),
+        ):
+            # Cross-attention honors the role override.
+            get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={AttentionBackendEnum.FA},
+                is_cross_attention=True,
+            )
+            # Self-attention pins FA for correctness, ignoring aiter entirely.
+            get_attn_backend(
+                128,
+                torch.bfloat16,
+                supported_attention_backends={AttentionBackendEnum.FA},
+                selected_attention_backend=AttentionBackendEnum.FA,
+                is_cross_attention=False,
+            )
 
     def test_role_backend_overrides_component_wide(self):
         # Role-qualified selection takes precedence over the component-wide backend.
@@ -401,10 +477,12 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 attn_backend,
                 component_attn_name: str | None,
                 require_backend_selection: bool,
+                backend_by_role=None,
             ):
                 return component_attn_backend_context_manager(
                     attn_backend,
                     component_name=component_attn_name,
+                    backend_by_role=backend_by_role,
                     allow_global_backend_fallback=allow_global_backend_fallback,
                     require_backend_selection=require_backend_selection,
                 )
@@ -414,6 +492,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             component_quantizations = {}
             component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -508,6 +590,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
             def requested_component_attention_backend(_component_name):
                 return "fa"
 
@@ -575,6 +661,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
+
+            @staticmethod
             def requested_component_attention_backend(_component_name):
                 return "fa"
 
@@ -625,6 +715,10 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             component_quantizations = {}
             component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
+
+            @staticmethod
+            def resolve_component_backend_by_role(*_component_names):
+                return {}
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
