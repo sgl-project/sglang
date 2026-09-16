@@ -83,6 +83,73 @@ def _read_compact_gluon(
 
 
 @gluon.jit
+def _compact_qkpv(
+    kv,
+    valid,
+    qdot,
+    m,
+    den,
+    acc,
+    head_mask,
+    smem,
+    MF: gl.constexpr,
+    H: gl.constexpr,
+    BLOCK: gl.constexpr,
+    SCALE: gl.constexpr,
+):
+    return _qkpv_fp8(
+        kv,
+        kv,
+        valid,
+        qdot,
+        m,
+        den,
+        acc,
+        head_mask,
+        SCALE * 1.4426950408889634,
+        smem,
+        MF,
+        MF,
+        gl.DotOperandLayout(1, MF, 8),
+        gl.DotOperandLayout(1, MF, 8),
+        gl.DotOperandLayout(0, MF, 8),
+        512,
+        0,
+        512,
+        16,
+        BLOCK,
+        H % 16 == 0,
+        True,
+        True,
+    )
+
+
+@gluon.jit
+def _compact_tile(
+    Cache,
+    Indices,
+    t,
+    start,
+    length,
+    STRIDE: gl.constexpr,
+    CAPACITY: gl.constexpr,
+    PAGE: gl.constexpr,
+    CACHE_STRIDE: gl.constexpr,
+    FP4: gl.constexpr,
+    BUFFER: gl.constexpr,
+    G: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    col = start + gl.arange(0, BLOCK, layout=gl.SliceLayout(1, G))
+    slot = gl.load(Indices + t * STRIDE + col, col < length, -1)
+    valid = (col < length) & (slot >= 0) & (slot < CAPACITY)
+    kv = _read_compact_gluon(
+        Cache, gl.where(valid, slot, 0), valid, PAGE, CACHE_STRIDE, FP4, BUFFER, G
+    )
+    return kv, valid
+
+
+@gluon.jit
 def _compact_attention_kernel(
     Q,
     K,
@@ -149,42 +216,48 @@ def _compact_attention_kernel(
             else:
                 indices, lengths, width, stride, capacity = EI, EL, NE, EIS, EN
             length = gl.minimum(gl.load(lengths + t), width)
-            for start in range(split * BLOCK, length, SPLITS * BLOCK):
-                col = start + gl.arange(0, BLOCK, layout=gl.SliceLayout(1, G))
-                slot = gl.load(indices + t * stride + col, col < length, -1)
-                valid = (col < length) & (slot >= 0) & (slot < capacity)
-                if segment == 0:
-                    kv = _read_compact_gluon(
-                        K, gl.where(valid, slot, 0), valid, KP, KS, KFP4, KBUFFER, G
-                    )
-                else:
-                    kv = _read_compact_gluon(
-                        E, gl.where(valid, slot, 0), valid, EP, ES, EFP4, EBUFFER, G
-                    )
-                m, den, acc = _qkpv_fp8(
-                    kv,
-                    kv,
-                    valid,
-                    qdot,
-                    m,
-                    den,
-                    acc,
-                    h < H,
-                    SCALE * 1.4426950408889634,
-                    smem,
-                    MF,
-                    MF,
-                    gl.DotOperandLayout(1, MF, 8),
-                    gl.DotOperandLayout(1, MF, 8),
-                    gl.DotOperandLayout(0, MF, 8),
-                    512,
-                    0,
-                    512,
-                    16,
+            if segment == 0:
+                cache, page, cache_stride, fp4, buffer = K, KP, KS, KFP4, KBUFFER
+            else:
+                cache, page, cache_stride, fp4, buffer = E, EP, ES, EFP4, EBUFFER
+            if split * BLOCK < length:
+                kv, valid = _compact_tile(
+                    cache,
+                    indices,
+                    t,
+                    split * BLOCK,
+                    length,
+                    stride,
+                    capacity,
+                    page,
+                    cache_stride,
+                    fp4,
+                    buffer,
+                    G,
                     BLOCK,
-                    H % 16 == 0,
-                    True,
-                    True,
+                )
+                for start in range((split + SPLITS) * BLOCK, length, SPLITS * BLOCK):
+                    next_kv, next_valid = _compact_tile(
+                        cache,
+                        indices,
+                        t,
+                        start,
+                        length,
+                        stride,
+                        capacity,
+                        page,
+                        cache_stride,
+                        fp4,
+                        buffer,
+                        G,
+                        BLOCK,
+                    )
+                    m, den, acc = _compact_qkpv(
+                        kv, valid, qdot, m, den, acc, h < H, smem, MF, H, BLOCK, SCALE
+                    )
+                    kv, valid = next_kv, next_valid
+                m, den, acc = _compact_qkpv(
+                    kv, valid, qdot, m, den, acc, h < H, smem, MF, H, BLOCK, SCALE
                 )
     if SPLITS == 1:
         if HAS_SINK:
