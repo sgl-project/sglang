@@ -78,6 +78,60 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Advanced usage
+
+#### 4.2.1 Cache-DiT acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to speed up inference with minimal quality loss. Enable it by setting `SGLANG_CACHE_DIT_ENABLED=true`. For more details, see the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
+
+**Basic usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
+You can also enable it for a single offline job:
+
+```bash Command
+sglang generate \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --prompt "A cinematic mountain lake at sunrise, realistic photography." \
+  --width 2048 \
+  --height 2048 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --enable-cache-dit true \
+  --output-file-path output_sensenova_u15.png
+```
+
+**Advanced usage**
+
+SenseNova-U1 is supported for DBCache only, and only for requests that keep a stable cond/uncond pair per denoising step:
+
+- **DBCache knobs only.** `--cache-dit-params` accepts `Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`, `residual_diff_threshold`, and `max_continuous_cached_steps`. TaylorSeer and SCM keys are rejected with an error.
+- **Full-interval CFG only.** With `--guidance-scale` above `1.0`, Cache-DiT is skipped unless `cfg_interval` stays `(0, 1)`. Timestep-gated CFG produces a varying number of forwards per step, which the cache context cannot track.
+- **Breakable CUDA graphs win.** Under `--enable-breakable-cuda-graph` the per-request Cache-DiT switch is ignored and a warning is logged.
+
+SenseNova's text, prefix, and Think forwards share the Qwen3 decoder with the image denoising pass. Only the image denoising pass is wrapped, so enabling the cache does not change prompt understanding or the Think text.
+
+**Conservative preset for long-text benchmarks**
+
+For text-heavy evaluation datasets such as `longtext-bench`, start with the following conservative Cache-DiT settings:
+
+```bash
+export SGLANG_CACHE_DIT_ENABLED=true
+export SGLANG_CACHE_DIT_FN=4
+export SGLANG_CACHE_DIT_BN=2
+export SGLANG_CACHE_DIT_WARMUP=8
+export SGLANG_CACHE_DIT_RDT=0.10
+export SGLANG_CACHE_DIT_MC=1
+```
+
+This preset computes more transformer blocks, uses a longer warmup, applies a stricter residual threshold, and limits consecutive cached steps. It prioritizes text and layout fidelity over maximum acceleration. Treat it as a starting point and validate output quality on your target prompts.
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark

@@ -591,13 +591,41 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax-H3 (T2VA, FL2VA, and Ref2VA)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SenseNova</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SenseNova-U1.5-8B-MoT (DBCache only)</td>
+    </tr>
   </tbody>
 </table>
+
+### SenseNova-U1
+
+SenseNova shares one Qwen3 decoder between its text/prefix work and iterative
+image denoising. Cache-DiT wraps the decoder blocks for the image
+denoising passes only; prefixed text and Think forwards keep running the native
+layers, so enabling it never changes the prompt understanding or the Think text.
+
+- **DBCache only.** `cache_dit_params` accepts the five DBCache knobs
+  (`Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`,
+  `residual_diff_threshold`, `max_continuous_cached_steps`). TaylorSeer and SCM
+  keys are rejected for this model.
+- **Full-interval CFG only.** Requests with `guidance_scale > 1` are served
+  without Cache-DiT unless `cfg_interval` stays `(0, 1)`, because timestep-gated
+  CFG has a 1 -> 2 -> 1 forward rhythm per step.
+- **Breakable CUDA graphs win.** With `--enable-breakable-cuda-graph` the
+  Cache-DiT switch is ignored for every request.
+
+```bash
+sglang generate --model-path sensenova/SenseNova-U1.5-8B-MoT \
+    --prompt "A beautiful sunset over the mountains" \
+    --enable-cache-dit true
+```
 
 ## Performance Tips
 
 1. **Start with defaults**: The default parameters work well for most models
-2. **Use TaylorSeer**: It typically improves both speed and quality
+2. **Use TaylorSeer**: It typically improves both speed and quality (not
+   available on SenseNova-U1, which supports DBCache knobs only)
 3. **Tune R threshold**: Lower values = better quality, higher values = faster
 4. **SCM for extra speed**: Use `medium` preset for good speed/quality balance
 5. **Warmup matters**: Higher warmup = more stable caching decisions

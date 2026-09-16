@@ -22,6 +22,8 @@ from .configuration_neo_chat import NEOMoELLMConfig
 from .modeling_qwen3 import (
     Qwen3Attention,
     Qwen3RMSNorm,
+    cache_dit_attention_type,
+    cache_dit_decoder_layers,
     create_block_causal_mask,
 )
 from .transformers_compat import (
@@ -507,14 +509,22 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        layers = cache_dit_decoder_layers(
+            self,
+            update_cache=kwargs.get("update_cache", True),
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+        )
+
+        for decoder_layer in layers[: self.config.num_hidden_layers]:
+            attention_type = cache_dit_attention_type(self, decoder_layer)
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
