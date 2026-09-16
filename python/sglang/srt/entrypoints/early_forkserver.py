@@ -477,6 +477,19 @@ def _set_default_flashinfer_arch() -> None:
     )
 
 
+def _prime_setproctitle() -> None:
+    """setproctitle locates argv and environ on its first call and gives up
+    silently once the environment has been modified. A forked worker makes that
+    call after run() rewrote its environment and keeps the forkserver's command
+    line; do the first call here, before this process writes any variable,
+    with the title unchanged."""
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    setproctitle.setproctitle(setproctitle.getproctitle())
+
+
 def _in_forkserver_process() -> bool:
     """True inside the forkserver (spawned as ``python -c 'from
     multiprocessing.forkserver import main; ...'``) and hence in the workers it
@@ -495,6 +508,7 @@ def _configure_forkserver_process() -> None:
     """Forkserver / child side (module preloaded): make nested Process() calls
     (the DP controller launching schedulers) reuse the same forkserver and
     carry the launcher's environment; keep the preload imports fork-safe."""
+    _prime_setproctitle()  # before the first environment write in this process
     try:
         mp.set_start_method("forkserver", force=True)
     except RuntimeError:

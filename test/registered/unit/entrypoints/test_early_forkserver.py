@@ -9,11 +9,14 @@ file is trusted.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from unittest import mock
@@ -143,6 +146,57 @@ class TestSwitches(CustomTestCase):
             with mock.patch("multiprocessing.set_start_method") as set_method:
                 early_forkserver.start_early()
             set_method.assert_not_called()
+
+
+@unittest.skipUnless(os.path.exists("/proc/self/comm"), "needs Linux /proc")
+class TestForkedWorkerTitle(CustomTestCase):
+    def test_setproctitle_works_after_env_rewrite(self):
+        """A worker forked from the preloaded forkserver rewrites its environment
+        in run() before sglang sets its process title; setproctitle must still
+        rename it (it used to keep the forkserver's command line silently)."""
+        code = textwrap.dedent(
+            """
+            import multiprocessing as mp, os, time
+
+            def child(q):
+                snap = dict(os.environ)
+                os.environ.clear()
+                os.environ.update(snap)
+                import setproctitle
+
+                setproctitle.setproctitle("sglang::title_probe")
+                time.sleep(0.2)
+                q.put(1)
+                time.sleep(1.0)
+
+            if __name__ == "__main__":
+                ctx = mp.get_context("forkserver")
+                ctx.set_forkserver_preload(["sglang.srt.entrypoints.early_forkserver"])
+                q = ctx.Queue()
+                p = ctx.Process(target=child, args=(q,))
+                p.start()
+                q.get(timeout=120)
+                print(open(f"/proc/{p.pid}/comm").read().strip())
+                p.join()
+            """
+        )
+        env = dict(os.environ)
+        env["SGLANG_EARLY_FORKSERVER"] = "1"
+        # A file, not `-c`: the forked child re-imports __main__ to unpickle `child`.
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "title_probe.py")
+            with open(script, "w") as f:
+                f.write(code)
+            res = subprocess.run(
+                [sys.executable, script],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=300,
+            )
+        self.assertEqual(res.returncode, 0, res.stderr[-2000:])
+        # /proc/<pid>/comm holds the first 15 characters of the title
+        self.assertEqual(res.stdout.strip(), "sglang::title_probe"[:15])
 
 
 if __name__ == "__main__":
