@@ -6,11 +6,12 @@ from pydantic import ValidationError
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class CompletionLogprobsTest(unittest.TestCase):
+class CompletionLogprobsTest(CustomTestCase):
     def test_token_ids_preserve_distinct_tokens_with_identical_text(self):
         result = to_openai_style_logprobs(
             input_token_logprobs=[(None, 1, "\ufffd")],

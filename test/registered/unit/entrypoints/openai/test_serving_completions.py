@@ -4,7 +4,7 @@ Run with:
     python -m unittest discover -s test/registered/unit/entrypoints/openai -p test_serving_completions.py -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -64,11 +64,12 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingCompletionTestCase(unittest.TestCase):
+class ServingCompletionTestCase(CustomTestCase):
     """Bundle all prompt/echo tests in one TestCase."""
 
     # ---------- shared test fixtures ----------
     def setUp(self):
+        super().setUp()
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
