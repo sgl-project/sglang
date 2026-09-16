@@ -3799,6 +3799,7 @@ dependencies = [
  "flume",
  "futures",
  "hf-hub",
+ "http",
  "itertools",
  "minijinja",
  "numpy",

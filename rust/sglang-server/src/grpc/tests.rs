@@ -13,10 +13,13 @@ use crate::message::request::{GenerateRequest, Request as RuntimeRequest, Reques
 use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 
+mod parity;
+
 struct Harness {
     service: GrpcService,
     intake_rx: flume::Receiver<TmEvent>,
     abort_rx: flume::Receiver<AbortSource>,
+    activity: crate::tokenizer_manager::from_scheduler::ActivityCounter,
 }
 
 struct GenerationIntake {
@@ -30,22 +33,38 @@ impl Harness {
     fn new(response_capacity: usize, incremental: bool, response_timeout: Duration) -> Self {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
+        let activity: crate::tokenizer_manager::from_scheduler::ActivityCounter =
+            Default::default();
+        let args = crate::message::config::ServerArgs {
+            model_path: "/model".into(),
+            served_model_name: "model".into(),
+            model_config: crate::message::config::ModelConfig {
+                context_len: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let frontend = FrontendHandle::new(
             intake_tx,
             abort_tx,
             FrontendConfig {
                 response_capacity,
-                response_activity: Default::default(),
+                response_activity: activity.clone(),
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
-                metadata: FrontendMetadata::default(),
+                metadata: FrontendMetadata::from(&args),
             },
         );
+        let mut service = GrpcService::for_test(frontend, None, incremental, response_timeout);
+        let state = std::sync::Arc::get_mut(&mut service.openai).unwrap();
+        state.server_args = std::sync::Arc::new(args);
+        state.chat_formatter = Some(crate::openai::ChatFormatter::for_test());
         Self {
-            service: GrpcService::for_test(frontend, None, incremental, response_timeout),
+            service,
             intake_rx,
             abort_rx,
+            activity,
         }
     }
 

@@ -319,10 +319,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
-        let grpc_server = grpc_listener.map(|listener| {
-            let service = crate::grpc::GrpcService::new(frontend.clone(), &cfg.server_args);
-            (listener, service)
-        });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
@@ -341,13 +337,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 }
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
-                    let http = api_server::app::serve(
-                        http_listener,
+                    let state = Arc::new(crate::openai::OpenAiState::new(
                         frontend,
                         cfg.server_args.clone(),
-                        shutdown_rx.clone(),
-                    );
-                    if let Some((listener, service)) = grpc_server {
+                    ));
+                    let http =
+                        api_server::app::serve(http_listener, state.clone(), shutdown_rx.clone());
+                    if let Some(listener) = grpc_listener {
+                        let service = crate::grpc::GrpcService::new(state);
                         tokio::join!(http, crate::grpc::serve(listener, service, shutdown_rx));
                     } else {
                         http.await;
@@ -661,6 +658,19 @@ mod tests {
             .unwrap();
         let mut stream = client_runtime.block_on(async {
             let mut client = connect_grpc(grpc_addr).await;
+            let models = client
+                .list_models(proto::ListModelsRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(models.models.len(), 1);
+            let info = client
+                .get_model_info(proto::GetModelInfoRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let info: serde_json::Value = serde_json::from_str(&info.json_info).unwrap();
+            assert_eq!(info["served_model_name"], models.models[0].id);
             tokio::time::timeout(
                 Duration::from_secs(5),
                 client.generate(proto::GenerateRequest {

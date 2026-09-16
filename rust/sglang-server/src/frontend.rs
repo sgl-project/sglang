@@ -182,6 +182,11 @@ impl FrontendHandle {
             .map_err(FrontendError::InvalidArgument)
     }
 
+    /// Return the configured context limit for model-listing adapters.
+    pub(crate) fn max_context_length(&self) -> u64 {
+        self.inner.metadata.max_context_length
+    }
+
     /// Return static model metadata without exposing the full launch config.
     pub(crate) fn model_info(&self) -> ModelInfo {
         let metadata = &self.inner.metadata;

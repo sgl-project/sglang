@@ -1,199 +1,83 @@
-//! OpenAI-compatible generation endpoints.
-//!
-//! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. [`FrontendOutput`] remains the one backend
-//! output type for both unary and streaming responses.
-
-use axum::{Router, http::StatusCode, response::Response};
-use futures::StreamExt;
-use std::sync::Arc;
-
-mod chat;
-mod completions;
-mod models;
-mod reasoning;
-mod template;
-mod template_builtins;
-mod template_legacy;
-mod template_loader;
-mod tools;
-
-pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
+//! HTTP extraction and JSON/SSE framing for the shared OpenAI operations.
 
 use super::app::AppState;
-use super::frame::OutputAccumulator;
-use super::frontend_error_status;
-use crate::frontend::{
-    FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
+pub(super) use crate::openai::unix_seconds_u32;
+use crate::openai::{self, ChatRequest, OpenAiResponse};
+use axum::{
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
+    http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+    routing::post,
 };
-use crate::message::config::ServerArgs;
-use crate::tokenizer_manager::tokenizer;
-use crate::utils::response::error_response;
+use dynamo_protocols::types::CreateCompletionRequest;
+use futures::StreamExt;
+use std::convert::Infallible;
+use std::sync::Arc;
 
-const MAX_OPENAI_CHOICES: usize = 4096;
+mod models;
 
-/// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<Arc<AppState>> {
+pub(crate) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(models::routes())
-        .merge(completions::routes())
-        .merge(chat::routes())
+        .merge(chat_routes())
+        .merge(completion_routes())
 }
 
-/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
-/// endpoint. Tokenization is the tokenizer pool's job (the api server never
-/// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
-/// `--chat-template` name or a model-path-inferred legacy template resolve
-/// without it, so its absence must not disable chat.
-pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
-    // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
-    // there is none (text cannot be submitted), so chat is disabled.
-    if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
-        return None;
-    }
-    let config_file = tokenizer::resolve_model_file(
-        &server_args.tokenizer_path,
-        server_args.revision.as_deref(),
-        "tokenizer_config.json",
-    );
+pub(crate) fn chat_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/v1/chat/completions", post(chat_completions))
+}
 
-    match template::load_chat_formatter(
-        config_file.as_deref(),
-        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
-        server_args.model_config.model_type.as_deref(),
-        server_args.chat_template.as_deref(),
-    ) {
-        Ok(formatter) => {
-            tracing::info!(
-                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
-                "loaded OpenAI chat template"
-            );
-            Some(formatter)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            None
-        }
+pub(crate) fn completion_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/v1/completions", post(completions))
+}
+
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(Json(request)) => openai::chat_completions(&state, request)
+            .await
+            .into_response(),
+        Err(error) => openai_error(StatusCode::BAD_REQUEST, error.body_text(), false),
     }
 }
 
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+async fn completions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+) -> Response {
+    match body {
+        Ok(Json(request)) => openai::completions(&state, request).await.into_response(),
+        Err(error) => openai_error(StatusCode::BAD_REQUEST, error.body_text(), false),
+    }
 }
 
-fn unix_seconds_u32() -> u32 {
-    u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
-}
-
-/// The OpenAI error payload.
-pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
-    let message = message.into();
-    let error_type = if code == StatusCode::UNAUTHORIZED {
-        "AuthenticationError"
-    } else if code.is_server_error() {
-        "InternalServerError"
-    } else {
-        "BadRequestError"
-    };
-    serde_json::json!({
-        "error": {
-            "object": "error",
-            "message": message,
-            "type": error_type,
-            "param": null,
-            "code": code.as_u16(),
-        }
-    })
-}
-
-/// Form an OpenAI error response: unary → `code` plus the JSON `body`,
-/// streaming → 200 with one SSE error frame + `[DONE]`.
-pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
-    error_response(code, error_payload(code, message), stream)
-}
-
-/// Drain one submitted request to its terminal output, fold frames, and map
-/// semantic failures / truncation to `(status, message)` for the OpenAI error
-/// shape. The call owns cancellation and disarms itself.
-async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (StatusCode, String)> {
-    let mut accumulator = OutputAccumulator::default();
-    let output = loop {
-        match call.recv().await {
-            Some(FrontendEvent::Delta(output)) => accumulator.fold(&output),
-            Some(FrontendEvent::Finished(output)) => {
-                accumulator.fold(&output);
-                break accumulator.into_output();
+impl IntoResponse for OpenAiResponse {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Json(bytes) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response(),
+            Self::Stream(stream) => {
+                Sse::new(stream.map(|data| Ok::<_, Infallible>(Event::default().data(data))))
+                    .into_response()
             }
-            Some(FrontendEvent::Failed(error)) => {
-                let status = frontend_error_status(&error);
-                return Err((status, error.to_string()));
-            }
-            None => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "response truncated before completion".into(),
-                ));
-            }
+            Self::Error {
+                code,
+                message,
+                stream,
+            } => openai_error(code, message, stream),
         }
-    };
-    Ok(output)
-}
-
-async fn submit_generation(
-    state: &AppState,
-    request: FrontendRequest,
-    stream: bool,
-) -> Result<FrontendCall, Response> {
-    match state.frontend.generate(request).await {
-        Ok(call) => Ok(call),
-        // Same `error_response` rule: a committed stream gets 200 plus an
-        // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
-        // error shape, since this is the OpenAI frontend.
-        Err(FrontendError::Unavailable) => Err(openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
-            stream,
-        )),
-        Err(error) => Err(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error.to_string(),
-            stream,
-        )),
     }
 }
 
-fn indexed_decode_stream(
-    index: usize,
-    call: FrontendCall,
-) -> futures::stream::BoxStream<'static, (usize, FrontendEvent)> {
-    futures::stream::unfold((call, false), move |(mut call, finished)| async move {
-        if finished {
-            return None;
-        }
-        let event = call.recv().await?;
-        let finished = event.is_terminal();
-        Some(((index, event), (call, finished)))
-    })
-    .boxed()
+pub(crate) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
+    crate::utils::response::error_response(code, openai::error_payload(code, message), stream)
 }
-
-fn contains_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
-            object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
-                )
-            }) || object.values().any(contains_media)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-mod test_utils;

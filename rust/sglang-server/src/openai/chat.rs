@@ -1,19 +1,8 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
-use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-    routing::post,
-};
+use super::{OpenAiResponse as Response, json_response};
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
@@ -24,19 +13,20 @@ use dynamo_protocols::types::{
     TopLogprobs,
 };
 use futures::StreamExt;
+use http::StatusCode;
 use serde::Deserialize;
 
 use super::completions::completion_usage;
+use super::frontend_error_status;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{
     apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name, dynamo_tool_choice,
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    ChatFormatter, ChatTemplateKwargs, OpenAiState, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::frontend_error_status;
 use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -44,30 +34,18 @@ use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
-pub(super) fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/chat/completions", post(chat_completions))
-}
-
 #[derive(Deserialize)]
-struct ChatRequest {
+pub(crate) struct ChatRequest {
     #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
-) -> Response {
+pub(crate) async fn chat_completions(state: &OpenAiState, request: ChatRequest) -> Response {
     let ChatRequest {
         request,
         chat_template_kwargs,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
-    };
+    } = request;
     if request.model != state.server_args.served_model_name {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -152,7 +130,7 @@ async fn chat_completions(
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+        match prepare_chat_request(state, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -218,7 +196,7 @@ async fn chat_completions(
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(state, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -241,9 +219,8 @@ async fn chat_completions(
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
-        )
-        .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        );
+        Response::Stream(event_stream.boxed())
     } else {
         unary_chat(
             submitted,
@@ -266,7 +243,7 @@ async fn chat_completions(
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
 pub(super) async fn prepare_chat_request(
-    state: &AppState,
+    state: &OpenAiState,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
@@ -503,7 +480,7 @@ pub(super) async fn unary_chat(
         });
     }
 
-    Json(CreateChatCompletionResponse {
+    json_response(CreateChatCompletionResponse {
         id: response_id,
         choices,
         created,
@@ -516,7 +493,6 @@ pub(super) async fn unary_chat(
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         )),
     })
-    .into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -839,6 +815,7 @@ mod tests {
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
 
@@ -1028,6 +1005,7 @@ mod tests {
             None,
         )
         .await;
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -1064,6 +1042,7 @@ mod tests {
             None,
         )
         .await;
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
