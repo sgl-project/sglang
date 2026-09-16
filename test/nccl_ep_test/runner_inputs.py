@@ -57,7 +57,8 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
         *,
         buckets=(8, 16, 32),
         backend_factory=None,
-        share_inputs=False
+        share_inputs=False,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
     ):
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.device_module = torch.cuda
@@ -72,7 +73,7 @@ class SyntheticDecodeRunner(DecodeCudaGraphRunner):
         self.max_bs = self.max_num_token = max(self.capture_bs)
         self.captured_req_width = 1
         self.capture_forward_mode = ForwardMode.DECODE
-        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.capture_hidden_mode = capture_hidden_mode
         self.enable_return_hidden_states = False
         self.ragged_verify_mode = False
         self.require_mlp_tp_gather = self.require_mlp_sync = False

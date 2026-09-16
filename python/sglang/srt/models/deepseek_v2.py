@@ -584,6 +584,14 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self._nccl_ep_serial_shared_experts = (
+            get_moe_a2a_backend().is_nccl_ep() and get_moe_runner_backend().is_triton()
+        )
+        if (
+            self._nccl_ep_serial_shared_experts
+            and envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+        ):
+            raise ValueError("NCCL EP Triton requires serial shared experts")
         self.is_nextn = is_nextn
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
@@ -1207,6 +1215,10 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        # Disabling SBO alone does not disable this model's auxiliary stream.
+        # The NCCL EP Triton compatibility path keeps shared MLP and EP work
+        # ordered on the current stream, including full Graph capture.
+        shared_stream = None if self._nccl_ep_serial_shared_experts else self.alt_stream
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1219,12 +1231,12 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
+                if shared_stream is not None:
+                    shared_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(shared_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
+                        shared_output.record_stream(shared_stream)
+                        shared_event = shared_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1412,7 +1424,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
+            and shared_stream is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 

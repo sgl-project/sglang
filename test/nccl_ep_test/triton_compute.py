@@ -7,13 +7,17 @@ import torch
 import torch.nn.functional as F
 
 
-def configure_compute():
+def configure_compute(*, graph_enabled=False):
     from sglang.srt.arg_groups.arg_utils import NS
     from sglang.srt.runtime_context import get_context
 
     @dataclass
     class ComputeConfig:
         enable_fused_moe_sum_all_reduce: Annotated[bool, NS("exec.moe")] = False
+        enable_nccl_ep_cuda_graph: Annotated[bool, NS("exec.moe")] = graph_enabled
+        rl_on_policy_target: Annotated[str | None, NS("exec.deterministic")] = None
+        fp8_gemm_runner_backend: Annotated[str, NS("exec.kernel")] = "triton"
+        enable_symm_mem: Annotated[bool, NS("exec.comm")] = False
         enable_deterministic_inference: Annotated[bool, NS("exec.deterministic")] = (
             False
         )

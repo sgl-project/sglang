@@ -84,6 +84,46 @@ def server_args(model_path, **overrides):
     return ServerArgs(**options)
 
 
+@pytest.mark.parametrize(
+    "backend,symm_mem,configured,expected",
+    [
+        ("nccl_ep", False, None, "1"),
+        ("nccl_ep", False, "0", "1"),
+        ("nccl_ep", False, "1", "1"),
+        ("none", False, None, "0"),
+        ("none", False, "1", "1"),
+        ("none", True, "0", "1"),
+    ],
+)
+def test_engine_preserves_nccl_ep_device_api(
+    monkeypatch, backend, symm_mem, configured, expected
+):
+    import os
+    from unittest.mock import patch
+
+    from sglang.srt.entrypoints import engine
+
+    args = SimpleNamespace(
+        enable_symm_mem=symm_mem,
+        moe_a2a_backend=backend,
+        enable_nccl_nvls=False,
+        dcp_size=1,
+        enable_metrics=False,
+        attention_backend="triton",
+        custom_sigquit_handler=None,
+    )
+    monkeypatch.setattr(engine, "set_ulimit", lambda: None)
+    monkeypatch.setattr(engine, "assert_pkg_version", lambda *args: None)
+    monkeypatch.setattr(engine.signal, "signal", lambda *args: None)
+    monkeypatch.setattr(engine.mp, "set_start_method", lambda *args, **kwargs: None)
+    with patch.dict(os.environ):
+        os.environ.pop("NCCL_CUMEM_ENABLE", None)
+        if configured is not None:
+            os.environ["NCCL_CUMEM_ENABLE"] = configured
+        engine._set_envs_and_config(args)
+        assert os.environ["NCCL_CUMEM_ENABLE"] == expected
+
+
 def test_nccl_ep_defaults_to_eager_without_graph_opt_in(model_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kw: (9, 0))
     args = server_args(model_path)
@@ -192,6 +232,69 @@ def test_nccl_ep_gate_prefers_the_binding_library_version(model_path, monkeypatc
     monkeypatch.setattr(torch.cuda.nccl, "version", lambda: (2, 28, 9))
     args = server_args(model_path, enable_nccl_ep_cuda_graph=True)
     assert args.moe_a2a_backend == "nccl_ep"
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_followup_serving_recipe_resolves_per_rank_capacity(
+    tmp_path, monkeypatch, graph
+):
+    import argparse
+
+    from transformers import DeepseekV2Config, GenerationConfig
+
+    from sglang.srt.server_args import ServerArgs
+
+    torch.cuda.init()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda *args, **kw: (12, 0)
+    )
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    config = DeepseekV2Config(
+        hidden_size=2048,
+        intermediate_size=11008,
+        moe_intermediate_size=1408,
+        n_routed_experts=64,
+        n_shared_experts=2,
+        num_experts_per_tok=6,
+        num_hidden_layers=27,
+        num_attention_heads=16,
+        kv_lora_rank=512,
+        q_lora_rank=None,
+    )
+    config.architectures = ["DeepseekV2ForCausalLM"]
+    config.quantization_config = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    config.save_pretrained(tmp_path)
+    GenerationConfig().save_pretrained(tmp_path)
+    argv = ["--model-path", str(tmp_path)] + (
+        "--moe-a2a-backend nccl_ep --moe-runner-backend triton "
+        "--fp8-gemm-backend triton --attention-backend triton "
+        "--tp-size 2 --dp-size 2 --ep-size 2 --enable-dp-attention "
+        "--enable-dp-lm-head --moe-dense-tp-size 1 "
+        "--disable-shared-experts-fusion --disable-overlap-schedule "
+        "--nccl-ep-mode low_latency --nccl-ep-num-max-dispatch-tokens-per-rank 64 "
+        "--cuda-graph-bs-decode 1 8 16 32 --chunked-prefill-size 128 "
+        "--page-size 1 --context-length 512 --mem-fraction-static 0.6 "
+        "--max-running-requests 64 --enable-metrics"
+    ).split()
+    if graph:
+        argv.append("--enable-nccl-ep-cuda-graph")
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    resolved = ServerArgs.from_cli_args(parser.parse_args(argv))
+    assert resolved.tp_size == resolved.dp_size == resolved.ep_size == 2
+    assert resolved.moe_dense_tp_size == 1 and resolved.enable_dp_lm_head
+    assert resolved.disable_shared_experts_fusion
+    assert resolved.chunked_prefill_size == 64
+    assert resolved.nccl_ep_num_max_dispatch_tokens_per_rank == 64
+    assert resolved.cuda_graph_config.decode.backend == (
+        "full" if graph else "disabled"
+    )
+    assert resolved.cuda_graph_config.prefill.backend == "disabled"
 
 
 if __name__ == "__main__":
