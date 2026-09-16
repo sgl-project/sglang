@@ -611,3 +611,43 @@ local services. These tests check whether the checker can accept valid results a
 detect deliberate faults. The default suite against a real model is a separate
 acceptance run that compares the actual Python and Rust implementations. Follow
 the repository contribution guide and run `pre-commit run --all-files` before submitting.
+
+### OpenAI HTTP generation
+
+Use the same platform configuration with the OpenAI suite (run from `rust/`):
+
+```sh
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/mlx.json --suite openai_http
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json --suite openai_http
+```
+
+Add `--describe` to review resolved requests without preparing an environment or
+starting services. The default suite remains `native_generate`; `--suite-file`
+overrides the specification of the explicitly selected suite.
+
+`suites/openai_http/suite.json` defines both `POST /v1/completions` and
+`POST /v1/chat/completions`: JSON/SSE, greedy and seeded sampling, multiple
+choices, batch prompts, echo, multi-turn chat, logprobs, usage options, and
+invalid token limits. Only the bound `default` and `incremental` profiles run.
+Chat text cases disable thinking. Tools, reasoning-specific behavior, multimodal
+inputs, Responses and embeddings are not covered yet.
+
+OpenAI SSE always contains **deltas**, even when the backend profile uses
+cumulative native output. The suite validates every event and reconstructs each
+choice by index; different legal event fragmentation is not a parity failure.
+Unknown stream semantics fail validation rather than silently disappearing.
+
+There are two deliberately separate comparisons:
+
+- **Python/Rust parity and repeatability** use the complete JSON or reconstructed
+  SSE result in `final.json`. Only declared ID/time values are replaced;
+  missing fields, nulls and empty values remain distinct.
+- **JSON/SSE equivalence** uses `equivalence.json`: model, indexed content,
+  finish reasons, token logprobs and final usage. IDs and wire wrappers such as
+  message/delta are excluded only from this semantic view. The paired streaming
+  request requires final usage. Other fields remain visible to full parity.
+
+Reports link each comparison to its own values and event origins. Existing
+native suites and older reports continue using their original full-result
+equivalence. Real service differences remain failures; a successful environment
+setup does not imply protocol or parity success.

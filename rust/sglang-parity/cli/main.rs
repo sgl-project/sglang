@@ -12,10 +12,21 @@ use sglang_parity::{Report, RunConfig, describe, describe_plan, run, run_plan};
 #[path = "../suites/native_generate/mod.rs"]
 mod native_generate;
 
-const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate] [--suite-file <suite.json>] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
+#[path = "../suites/openai_http/mod.rs"]
+mod openai_http;
+
+const USAGE: &str = "Usage: sglang-parity --config <run.json> [--suite native_generate|openai_http] [--suite-file <suite.json>] [--describe]\n       sglang-parity --report <report.json> [--case <name>]\n       sglang-parity --update-env-lock --backend <mlx|cuda>\n\n--describe validates and prints the effective specification without installing environments or starting services.";
+
+#[derive(Default)]
+enum Suite {
+    #[default]
+    Native,
+    OpenAi,
+}
 
 #[derive(Default)]
 struct Arguments {
+    suite: Suite,
     config: Option<PathBuf>,
     report: Option<PathBuf>,
     case: Option<String>,
@@ -56,10 +67,13 @@ fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Option<Arguments
                             _ => return Err(format!("unsupported environment backend {value:?}")),
                         })
                     }
-                    _ if value != "native_generate" => {
-                        return Err(format!("unsupported suite {value:?}"));
+                    _ => {
+                        result.suite = match value.as_str() {
+                            "native_generate" => Suite::Native,
+                            "openai_http" => Suite::OpenAi,
+                            _ => return Err(format!("unsupported suite {value:?}")),
+                        }
                     }
-                    _ => {}
                 }
             }
             _ => return Err(format!("unknown option {argument}")),
@@ -147,28 +161,59 @@ async fn execute_inner(arguments: Arguments) -> Result<i32, Box<dyn std::error::
         .suite_file
         .map(std::fs::read_to_string)
         .transpose()?;
-    let plan = native_generate::load_plan(
-        external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC),
-        &config,
-    )
-    .map_err(std::io::Error::other)?;
+    match arguments.suite {
+        Suite::Native => {
+            execute_plan(
+                &config,
+                native_generate::load_plan(
+                    external.as_deref().unwrap_or(native_generate::DEFAULT_SPEC),
+                    &config,
+                )
+                .map_err(std::io::Error::other)?,
+                arguments.describe,
+                color,
+            )
+            .await
+        }
+        Suite::OpenAi => {
+            execute_plan(
+                &config,
+                openai_http::load_plan(
+                    external.as_deref().unwrap_or(openai_http::DEFAULT_SPEC),
+                    &config,
+                )
+                .map_err(std::io::Error::other)?,
+                arguments.describe,
+                color,
+            )
+            .await
+        }
+    }
+}
+
+async fn execute_plan<P: sglang_parity::ResponsePolicy>(
+    config: &RunConfig,
+    plan: sglang_parity::ExecutionPlan<P>,
+    describe_only: bool,
+    color: bool,
+) -> Result<i32, Box<dyn std::error::Error>> {
     // Preserve the original single-profile review format and artifact layout.
     let single = config.profiles.is_empty()
         && plan.profiles.len() == 1
         && plan.profiles[0].profile.id == "default";
-    if arguments.describe {
+    if describe_only {
         let value = if single {
-            serde_json::to_value(describe(&config, &plan.profiles[0].suite)?)?
+            serde_json::to_value(describe(config, &plan.profiles[0].suite)?)?
         } else {
-            serde_json::to_value(describe_plan(&config, &plan)?)?
+            serde_json::to_value(describe_plan(config, &plan)?)?
         };
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(0);
     }
     let report = if single {
-        run(&config, &plan.profiles[0].suite, &plan.profiles[0].policy).await?
+        run(config, &plan.profiles[0].suite, &plan.profiles[0].policy).await?
     } else {
-        run_plan(&config, &plan).await?
+        run_plan(config, &plan).await?
     };
     print!(
         "{}",

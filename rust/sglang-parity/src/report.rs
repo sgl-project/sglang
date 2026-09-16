@@ -27,6 +27,7 @@ type JsonFiles = BTreeMap<PathBuf, Result<Value, String>>;
 
 #[derive(Clone, Copy)]
 struct Evidence<'a> {
+    semantic: bool,
     case: &'a str,
     implementation: &'a str,
     repeat: usize,
@@ -34,6 +35,28 @@ struct Evidence<'a> {
 }
 
 impl Evidence<'_> {
+    fn file(&self) -> Option<&PathBuf> {
+        let attempt = self.attempt?;
+        if self.semantic
+            && let Some(evidence) = &attempt.equivalence
+        {
+            return Some(&evidence.file);
+        }
+        attempt.final_json.as_ref()
+    }
+
+    fn projected(&self) -> bool {
+        self.semantic && self.attempt.is_some_and(|a| a.equivalence.is_some())
+    }
+
+    fn value_label(&self) -> &'static str {
+        if self.projected() {
+            "Semantic equivalence value"
+        } else {
+            "Reconstructed value (before exceptions)"
+        }
+    }
+
     fn label(&self) -> String {
         format!(
             "{} / {} / attempt {}",
@@ -253,8 +276,13 @@ impl<'a> ReportView<'a> {
                     .cases
                     .iter()
                     .find(|case| case.name == name)
-                    .map(|case| evidence(case, side, 1))
+                    .map(|case| {
+                        let mut value = evidence(case, side, 1);
+                        value.semantic = true;
+                        value
+                    })
                     .unwrap_or(Evidence {
+                        semantic: false,
                         case: name,
                         implementation: side,
                         repeat: 1,
@@ -539,7 +567,9 @@ impl<'a> ReportView<'a> {
             .into_iter()
             .zip(&labels)
             {
-                let rule = value.and_then(|_| self.exception(side.case, &difference.path));
+                let rule = value
+                    .filter(|_| !side.projected())
+                    .and_then(|_| self.exception(side.case, &difference.path));
                 let text = plain(&value_text(value));
                 writeln!(
                     out,
@@ -554,7 +584,12 @@ impl<'a> ReportView<'a> {
                 .unwrap();
                 writeln!(
                     out,
-                    "      reconstructed: {}",
+                    "      {}: {}",
+                    if side.projected() {
+                        "semantic equivalence"
+                    } else {
+                        "reconstructed"
+                    },
                     plain(&self.original(side, &difference.path, files))
                 )
                 .unwrap();
@@ -920,7 +955,7 @@ impl<'a> ReportView<'a> {
                 continue;
             }
             for side in [comparison.left, comparison.right] {
-                if let Some(path) = side.attempt.and_then(|a| a.final_json.as_ref()) {
+                if let Some(path) = side.file() {
                     files
                         .entry(path.clone())
                         .or_insert_with(|| self.read_json(path));
@@ -931,11 +966,7 @@ impl<'a> ReportView<'a> {
     }
 
     fn original(&self, side: Evidence<'_>, pointer: &str, files: &JsonFiles) -> String {
-        match side
-            .attempt
-            .and_then(|a| a.final_json.as_ref())
-            .and_then(|p| files.get(p))
-        {
+        match side.file().and_then(|p| files.get(p)) {
             Some(Ok(value)) => value_text(value.pointer(pointer)),
             _ => "<unavailable>".into(),
         }
@@ -960,7 +991,12 @@ impl<'a> ReportView<'a> {
     }
 
     fn sources<'b>(side: Evidence<'b>, mut pointer: &str) -> Option<&'b [usize]> {
-        let origins = &side.attempt?.origins;
+        let attempt = side.attempt?;
+        let origins = if side.projected() {
+            &attempt.equivalence.as_ref()?.origins
+        } else {
+            &attempt.origins
+        };
         loop {
             if let Some(indices) = origins.get(pointer) {
                 return Some(indices);
@@ -992,6 +1028,9 @@ impl<'a> ReportView<'a> {
         }
         if let Some(observation) = &attempt.observation {
             paths.push(("raw response", observation.raw_body.clone()));
+        }
+        if let Some(evidence) = &attempt.equivalence {
+            paths.push(("semantic equivalence value", evidence.file.clone()));
         }
         let events = attempt.directory.join("events.json");
         if self
@@ -1247,8 +1286,9 @@ impl<'a> ReportView<'a> {
                         .map(|v| serde_json::to_string_pretty(v).expect("serializable JSON"))
                         .unwrap_or_else(|| "<missing>".into());
                     html_pre(out, &text);
-                    if let Some(reason) =
-                        value.and_then(|_| self.exception(side.case, &difference.path))
+                    if let Some(reason) = value
+                        .filter(|_| !side.projected())
+                        .and_then(|_| self.exception(side.case, &difference.path))
                     {
                         write!(
                             out,
@@ -1257,9 +1297,7 @@ impl<'a> ReportView<'a> {
                         )
                         .unwrap();
                     }
-                    out.push_str(
-                        "<details><summary>Reconstructed value (before exceptions)</summary>",
-                    );
+                    write!(out, "<details><summary>{}</summary>", side.value_label()).unwrap();
                     html_pre(out, &self.original(side, &difference.path, files));
                     out.push_str("</details>");
                     if let Some(indices) = Self::sources(side, &difference.path) {
@@ -1283,6 +1321,7 @@ impl<'a> ReportView<'a> {
         for (implementation, result) in &case.implementations {
             for (index, attempt) in result.attempts.iter().enumerate() {
                 let side = Evidence {
+                    semantic: false,
                     case: &case.name,
                     implementation,
                     repeat: index + 1,
@@ -1342,6 +1381,7 @@ fn html_pre(out: &mut String, text: &str) {
 
 fn evidence<'a>(case: &'a CaseResult, implementation: &'a str, repeat: usize) -> Evidence<'a> {
     Evidence {
+        semantic: false,
         case: &case.name,
         implementation,
         repeat,

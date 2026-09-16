@@ -31,5 +31,6 @@ pub use http::{CaptureMode, HttpCase, HttpObservation, HttpRequest, Isolation};
 pub use plan::{ExecutionPlan, ProfilePlan, ProfileSpec, Requirements, ResolvedProfile};
 pub use process::{Implementation, ServerConfig};
 pub use runner::{
-    HttpSuite, Report, ResponsePolicy, RunConfig, RunError, describe, describe_plan, run, run_plan,
+    EquivalenceValue, HttpSuite, PreparedResponse, Report, ResponsePolicy, RunConfig, RunError,
+    describe, describe_plan, run, run_plan,
 };

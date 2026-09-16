@@ -688,6 +688,7 @@ impl GeneratePolicy {
             values.remove(0)
         };
         Ok(PreparedResponse {
+            equivalence: None,
             value,
             origins,
             assertions: Vec::new(),
@@ -1109,6 +1110,7 @@ impl ResultState {
                 .remove("index");
         }
         PreparedResponse {
+            equivalence: None,
             assertions: Vec::new(),
             value,
             origins: self.origins,

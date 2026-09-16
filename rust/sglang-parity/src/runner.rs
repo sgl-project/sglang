@@ -16,9 +16,24 @@ pub use crate::plan::{HttpSuite, RunConfig};
 use crate::process::{Implementation, SglangProcess};
 use crate::progress::track;
 
+/// An API-owned semantic projection, used only for declared case equivalence.
+#[derive(Clone, Debug)]
+pub struct EquivalenceValue {
+    pub value: Value,
+    pub origins: BTreeMap<String, Vec<usize>>,
+}
+
+/// Recorded evidence for an explicit semantic projection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EquivalenceEvidence {
+    pub file: PathBuf,
+    pub origins: BTreeMap<String, Vec<usize>>,
+}
+
 /// A complete reconstructed response, before applying comparison exceptions.
 #[derive(Clone, Debug)]
 pub struct PreparedResponse {
+    pub equivalence: Option<EquivalenceValue>,
     /// Scenario checks never suppress comparison of an otherwise valid response.
     pub assertions: Vec<AssertionResult>,
     pub value: Value,
@@ -30,6 +45,7 @@ pub struct PreparedResponse {
 impl From<Value> for PreparedResponse {
     fn from(value: Value) -> Self {
         Self {
+            equivalence: None,
             value,
             origins: BTreeMap::new(),
             assertions: Vec::new(),
@@ -167,6 +183,10 @@ pub struct AssertionResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalence: Option<EquivalenceEvidence>,
+    #[serde(skip)]
+    equivalence_value: Option<Value>,
     #[serde(default)]
     pub assertions: Vec<AssertionResult>,
     #[serde(default)]
@@ -811,6 +831,8 @@ impl Attempt {
             server_log: Some(server_log),
             observation: None,
             final_json: None,
+            equivalence: None,
+            equivalence_value: None,
             origins: BTreeMap::new(),
             violations: Vec::new(),
             assertions: Vec::new(),
@@ -867,6 +889,15 @@ impl<P: ResponsePolicy> Capture<'_, P> {
                     self.artifacts.write_json(&path, &prepared.value)?;
                     attempt.final_json = Some(path);
                     attempt.origins = prepared.origins;
+                    if let Some(projection) = prepared.equivalence {
+                        let file = directory.join("equivalence.json");
+                        self.artifacts.write_json(&file, &projection.value)?;
+                        attempt.equivalence = Some(EquivalenceEvidence {
+                            file,
+                            origins: projection.origins,
+                        });
+                        attempt.equivalence_value = Some(projection.value);
+                    }
                     attempt.assertions = prepared.assertions;
                     if !case.assertions.is_empty() {
                         let actual: std::collections::BTreeSet<_> =
@@ -970,7 +1001,39 @@ fn compare_profile(
                     stable_value(&left.implementations[implementation.as_str()]),
                     stable_value(&right.implementations[implementation.as_str()]),
                 ) {
-                    (true, Some(left), Some(right)) => check(left, right, Status::Fail),
+                    (true, Some(left_value), Some(right_value)) => {
+                        let left_projection = left.implementations[implementation.as_str()]
+                            .attempts[0]
+                            .equivalence_value
+                            .as_ref();
+                        let right_projection = right.implementations[implementation.as_str()]
+                            .attempts[0]
+                            .equivalence_value
+                            .as_ref();
+                        let projections_stable = [left, right].iter().all(|case| {
+                            let attempts = &case.implementations[implementation.as_str()].attempts;
+                            attempts[0].equivalence_value == attempts[1].equivalence_value
+                        });
+                        if !projections_stable {
+                            report.runtime_errors.push(format!(
+                                "Equivalence group {group}: semantic projections changed between attempts for {} or {}",
+                                left.name, right.name
+                            ));
+                            skipped()
+                        } else {
+                            match (left_projection, right_projection) {
+                                (Some(left), Some(right)) => check(left, right, Status::Fail),
+                                (None, None) => check(left_value, right_value, Status::Fail),
+                                _ => {
+                                    report.runtime_errors.push(format!(
+                                    "Equivalence group {group}: {} and {} inconsistently provide semantic projections",
+                                    left.name, right.name
+                                ));
+                                    skipped()
+                                }
+                            }
+                        }
+                    }
                     _ => skipped(),
                 };
                 report.equivalence.push(EquivalenceResult {

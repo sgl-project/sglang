@@ -1,0 +1,814 @@
+{
+  "name": "openai_http",
+  "comparison": {
+    "base": "exact_json",
+    "per_result_value_exceptions": [
+      {
+        "path": "/id",
+        "presence": "optional",
+        "require": "non_empty_string",
+        "reason": "Response IDs vary per request; presence and type remain checked."
+      },
+      {
+        "path": "/created",
+        "presence": "optional",
+        "require": "non_negative_number",
+        "reason": "Creation times vary per request; presence and type remain checked."
+      }
+    ]
+  },
+  "streaming": {
+    "envelope": {
+      "id": "constant",
+      "created": "constant",
+      "object": "constant",
+      "model": "constant",
+      "system_fingerprint": "constant",
+      "service_tier": "constant",
+      "metadata": "constant",
+      "usage": "usage"
+    },
+    "completion": {
+      "index": "index",
+      "text": "text",
+      "logprobs": "logprobs",
+      "finish_reason": "terminal",
+      "matched_stop": "terminal"
+    },
+    "chat": {
+      "index": "index",
+      "delta": "delta",
+      "logprobs": "logprobs",
+      "finish_reason": "terminal",
+      "matched_stop": "terminal"
+    },
+    "delta": {
+      "role": "constant",
+      "content": "text",
+      "reasoning_content": "text",
+      "refusal": "text",
+      "tool_calls": "constant",
+      "function_call": "constant"
+    }
+  },
+  "equivalence": [
+    "model",
+    "content",
+    "finish_reason",
+    "logprobs",
+    "usage"
+  ],
+  "cases": [
+    {
+      "name": "completion_greedy_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_greedy"
+    },
+    {
+      "name": "completion_greedy_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_greedy"
+    },
+    {
+      "name": "completion_one_token_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_one_token"
+    },
+    {
+      "name": "completion_one_token_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_one_token"
+    },
+    {
+      "name": "completion_sampling_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "top_p": 0.8,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_sampling"
+    },
+    {
+      "name": "completion_sampling_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "top_p": 0.8,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_sampling"
+    },
+    {
+      "name": "completion_multiple_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_multiple"
+    },
+    {
+      "name": "completion_multiple_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_multiple"
+    },
+    {
+      "name": "completion_logprobs_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs"
+    },
+    {
+      "name": "completion_logprobs_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "logprobs": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_logprobs"
+    },
+    {
+      "name": "completion_batch_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": [
+          "The capital of France is",
+          "One plus one is"
+        ],
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_batch"
+    },
+    {
+      "name": "completion_batch_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": [
+          "The capital of France is",
+          "One plus one is"
+        ],
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_batch"
+    },
+    {
+      "name": "completion_echo_json",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "echo": true,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_echo"
+    },
+    {
+      "name": "completion_echo_stream",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "echo": true,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "completion_echo"
+    },
+    {
+      "name": "completion_no_usage",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "completion_continuous_usage",
+      "path": "/v1/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true,
+          "continuous_usage_stats": true
+        }
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "completion_invalid_max_tokens",
+      "path": "/v1/completions",
+      "profiles": [
+        "default"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": -1,
+        "seed": 42,
+        "prompt": "The capital of France is",
+        "stream": false
+      },
+      "expect_status": 400
+    },
+    {
+      "name": "chat_greedy_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_greedy"
+    },
+    {
+      "name": "chat_greedy_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_greedy"
+    },
+    {
+      "name": "chat_one_token_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_one_token"
+    },
+    {
+      "name": "chat_one_token_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_one_token"
+    },
+    {
+      "name": "chat_sampling_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "top_p": 0.8,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_sampling"
+    },
+    {
+      "name": "chat_sampling_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0.7,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "top_p": 0.8,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_sampling"
+    },
+    {
+      "name": "chat_multiple_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "n": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiple"
+    },
+    {
+      "name": "chat_multiple_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "n": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiple"
+    },
+    {
+      "name": "chat_logprobs_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 2,
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs"
+    },
+    {
+      "name": "chat_logprobs_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "logprobs": true,
+        "top_logprobs": 2,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_logprobs"
+    },
+    {
+      "name": "chat_multiturn_json",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be brief."
+          },
+          {
+            "role": "user",
+            "content": "My name is Ada."
+          },
+          {
+            "role": "assistant",
+            "content": "Hello Ada."
+          },
+          {
+            "role": "user",
+            "content": "What is my name?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiturn"
+    },
+    {
+      "name": "chat_multiturn_stream",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be brief."
+          },
+          {
+            "role": "user",
+            "content": "My name is Ada."
+          },
+          {
+            "role": "assistant",
+            "content": "Hello Ada."
+          },
+          {
+            "role": "user",
+            "content": "What is my name?"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "expect_status": 200,
+      "equivalence_group": "chat_multiturn"
+    },
+    {
+      "name": "chat_no_usage",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "chat_continuous_usage",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default",
+        "incremental"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": 8,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": true,
+        "stream_options": {
+          "include_usage": true,
+          "continuous_usage_stats": true
+        }
+      },
+      "expect_status": 200
+    },
+    {
+      "name": "chat_invalid_max_tokens",
+      "path": "/v1/chat/completions",
+      "profiles": [
+        "default"
+      ],
+      "body": {
+        "temperature": 0,
+        "max_tokens": -1,
+        "seed": 42,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Say hello in one short sentence."
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "stream": false
+      },
+      "expect_status": 400
+    }
+  ]
+}

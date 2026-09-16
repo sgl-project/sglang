@@ -230,6 +230,7 @@ impl ResponsePolicy for EchoPolicy {
             )]);
         }
         Ok(PreparedResponse {
+            equivalence: None,
             assertions: Vec::new(),
             value,
             origins: if case.capture == CaptureMode::Sse {

@@ -1210,3 +1210,64 @@ async fn scenario_failure_preserves_responses_comparisons_and_failure_exit_code(
         .unwrap();
     assert!(detailed.contains("expected target was not triggered"));
 }
+
+#[tokio::test]
+async fn semantic_equivalence_has_separate_verdicts_and_evidence() {
+    use sglang_parity::{
+        EquivalenceValue, HttpCase, HttpObservation, PreparedResponse, ResponsePolicy,
+    };
+    struct Policy;
+    impl ResponsePolicy for Policy {
+        fn prepare(
+            &self,
+            case: &HttpCase,
+            observation: &HttpObservation,
+        ) -> Result<PreparedResponse, Vec<Violation>> {
+            let mut prepared = EchoPolicy.prepare(case, observation)?;
+            if case.name != "missing" {
+                prepared.equivalence = Some(EquivalenceValue {
+                    value: json!({"meaning": if case.name == "different" { "different" } else { "same" }}),
+                    origins: prepared.origins.clone(),
+                });
+            }
+            Ok(prepared)
+        }
+    }
+    let fixture = Fixture::new();
+    let mut cases = Vec::new();
+    for (name, path, behavior) in [
+        ("json", "/json", "different"),
+        ("stream", "/sse", "normal"),
+        ("different", "/json", "normal"),
+        ("missing", "/json", "normal"),
+    ] {
+        let mut value = case(name, path, behavior);
+        value["equivalence_group"] = json!("semantics");
+        cases.push(value);
+    }
+    let report = run(&fixture.config, &suite(cases), &Policy).await.unwrap();
+    assert_eq!(report.cases[0].parity.status, Status::Fail);
+    assert_eq!(report.equivalence[0].check.status, Status::Pass);
+    assert_eq!(report.equivalence[1].check.status, Status::Fail);
+    assert_eq!(report.equivalence[2].check.status, Status::Skipped);
+    assert!(
+        report
+            .runtime_errors
+            .iter()
+            .any(|e| e.contains("inconsistently"))
+    );
+    let attempt = &report.cases[1].implementations["python"].attempts[0];
+    assert_eq!(
+        read_json(&attempt.equivalence.as_ref().unwrap().file),
+        json!({"meaning":"same"})
+    );
+    let reloaded: sglang_parity::Report =
+        serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+    let view = ReportView::new(&reloaded, &report.directory);
+    view.write_html().unwrap();
+    let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
+    assert!(html.contains("Semantic equivalence value"));
+    assert!(html.contains("equivalence.json"));
+    let detail = view.terminal(Some("different"), false).unwrap();
+    assert!(detail.contains("semantic equivalence:"));
+}
