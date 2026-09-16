@@ -2326,8 +2326,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+        """Whether the CUTLASS MoE path is in effect.
+
+        Reads the backend create_moe_runner() resolved for this device, not the
+        raw server argument, so a runner that "auto" resolved to CUTLASS takes
+        the CUTLASS path instead of falling through to the NotImplementedError
+        in apply(). Falls back to the global setting before create_moe_runner()
+        has run, matching how _moe_runner_backend is read elsewhere here.
+        """
+        return getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        ).is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
@@ -2915,6 +2924,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
+            elif get_platform().is_sm120:
+                # Consumer Blackwell (SM120/SM121, e.g. RTX PRO 6000). The
+                # TRTLLM NVFP4 MoE path is only implemented for SM100
+                # (B200/B300); on these parts apply_with_router_logits() falls
+                # through to the NotImplementedError below. CUTLASS does cover
+                # them, so pick it rather than a backend that cannot run.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_CUTLASS
             else:
                 # TRTLLM is currently the most performant and tested FP4 MoE
                 # backend, so use it as the default.
