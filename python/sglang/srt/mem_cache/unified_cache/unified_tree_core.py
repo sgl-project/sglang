@@ -709,6 +709,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only the FULL device slots on the node's root path; the SWA segment
+        lock is left alone since its receipt does not survive a window re-attach."""
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].acquire_component_lock(
+            node=node, result=IncLockRefResult()
+        )
+        self._update_evictable_leaf_sets(node)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
+            node=node, params=None
+        )
+        self._update_evictable_leaf_sets(node)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -871,6 +887,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             full_kv_hit_length,
             action,
         )
+
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Read-only FULL-device match, independent of auxiliary components; the
+        third result counts the whole deepest node (a partial match pins it all)."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched_len = 0
+        pinned_len = 0
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            value = child.component_data[BASE_COMPONENT_TYPE].value
+            if value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
+            matched_len += prefix_len
+            node = child
+            pinned_len += len(child.key)
+            if prefix_len < len(child.key):
+                break
+            key = key[prefix_len:]
+        return matched_len, node.id, pinned_len
 
     def _match_post_processor(
         self,
@@ -1161,7 +1203,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
-            self._unevict_node_on_insert(node, state.value[:prefix_len])
+            self._unevict_node_on_insert(
+                node,
+                state.value[:prefix_len],
+                session_id=state.params.session_id,
+            )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1235,6 +1281,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.key,
                 state.value,
                 priority=state.priority,
+                session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
@@ -1360,6 +1407,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        session_id: Optional[str] = None,
         rotation_base: Optional[int] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
@@ -1378,11 +1426,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
 
     def _unevict_node_on_insert(
-        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+        self,
+        node: UnifiedTreeNode,
+        fresh_value: torch.Tensor,
+        session_id: Optional[str] = None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1400,7 +1451,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(
+            node,
+            medium=StorageMedium.GPU,
+            session_id=session_id,
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -2116,6 +2171,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
+        self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
         return result
 
     def build_backup_spec(self, node_id: NodeId):
@@ -2177,6 +2233,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Route a build_hicache_transfers call to the component for the given type."""
@@ -2186,6 +2243,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_indices=host_indices,
             token_ids=token_ids,
             prefetch_tokens=prefetch_tokens,
+            staging_tokens=staging_tokens,
             last_hash=last_hash,
         )
 
@@ -2460,6 +2518,106 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
+
+    def _walk_span(self, key: RadixKey, end: int):
+        """Yield nodes and their matched spans along ``key`` through ``end``."""
+        node = self.root_node
+        pos = 0
+        remaining = key
+        while pos < end and len(remaining) > 0:
+            child = node.children.get(remaining.child_key(self.page_size))
+            if child is None or (child.evicted and not child.backuped):
+                return
+            prefix_len = child.key.match(remaining, page_size=self.page_size)
+            if prefix_len == 0:
+                return
+            yield child, pos, prefix_len
+            if prefix_len < len(child.key):
+                return
+            node = child
+            pos += prefix_len
+            remaining = remaining[prefix_len:]
+
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
+        ranges: list[tuple[int, int]] = []
+        for child, pos, prefix_len in self._walk_span(key, end):
+            seg_end = pos + prefix_len
+            if seg_end <= start:
+                continue
+            if child.component_data[ComponentType.SWA].value is not None:
+                continue
+            lo, hi = max(start, pos), min(end, seg_end)
+            if ranges and ranges[-1][1] == lo:
+                ranges[-1] = (ranges[-1][0], hi)
+            else:
+                ranges.append((lo, hi))
+            if hi >= end:
+                break
+        return ranges
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA slice to an existing tombstoned tree span."""
+        assert len(swa_values) == window_end - window_start, (
+            f"attach_swa_window size mismatch: got {len(swa_values)} "
+            f"for [{window_start}, {window_end})"
+        )
+        actions: list[CacheAction | ComponentAction] = []
+        covered = window_start
+        for child, pos, prefix_len in list(self._walk_span(key, window_end)):
+            seg_end = pos + prefix_len
+            if seg_end <= window_start:
+                continue
+            seg_start = max(pos, window_start)
+            assign_end = min(seg_end, window_end)
+            assert child.component_data[ComponentType.SWA].value is None, (
+                f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
+                f"of [{window_start}, {window_end})"
+            )
+            self._attach_swa_segment(
+                child,
+                pos,
+                seg_start,
+                assign_end,
+                swa_values[seg_start - window_start : assign_end - window_start],
+                actions,
+            )
+            covered = assign_end
+            if covered >= window_end:
+                break
+        assert covered == window_end, (
+            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
+        )
+        return actions
+
+    def _attach_swa_segment(
+        self,
+        node: UnifiedTreeNode,
+        node_start: int,
+        seg_start: int,
+        seg_end: int,
+        values: torch.Tensor,
+        actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        target = node
+        if seg_start > node_start:
+            _, action = self._split_node(target.key, target, seg_start - node_start)
+            if action is not None:
+                actions.append(action)
+        if seg_start + len(target.key) > seg_end:
+            fragment, action = self._split_node(target.key, target, seg_end - seg_start)
+            if action is not None:
+                actions.append(action)
+            target = fragment
+        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
