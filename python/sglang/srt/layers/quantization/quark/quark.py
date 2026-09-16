@@ -816,6 +816,29 @@ class QuarkConfig(QuantizationConfig):
                 if fnmatch.fnmatch(layer_name, name_pattern):
                     return layer_quant_config[name_pattern]
 
+            # A checkpoint may pin a layer's experts individually while SGLang
+            # builds one FusedMoE for them. GLM-5.3-Flash's MXFP4 export does:
+            # 864 entries name the layer's 288 experts as block FP8, and the
+            # module is ...mlp.experts. Without this the whole MoE inherits the
+            # global MXFP4 scheme and the unpacked FP8 weights meet a
+            # half-width packed parameter.
+            if layer_name.endswith(".experts"):
+                expert_prefix = layer_name + "."
+                expert_configs = [
+                    cfg
+                    for name, cfg in layer_quant_config.items()
+                    if name.startswith(expert_prefix)
+                ]
+                if expert_configs:
+                    first = expert_configs[0]
+                    if not all(deep_compare(cfg, first) for cfg in expert_configs):
+                        raise ValueError(
+                            f"Found different quantization configurations among the "
+                            f"experts of {layer_name}. SGLang builds one fused module "
+                            "for them and requires a single scheme."
+                        )
+                    return first
+
             layer_type = type(module).__name__
             layer_type_quant_config = cast(
                 dict[str, Any], self.quant_config.get("layer_type_quant_config")

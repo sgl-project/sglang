@@ -25,9 +25,22 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
-        return WeightsMapper(
+        n = text_config.num_hidden_layers
+        # Compose with the target model's mapper rather than replacing it: the
+        # loader applies this one for the draft model, and the quantization
+        # config is keyed on the checkpoint's own names, so the checkpoint
+        # prefixes have to be stripped here too.
+        #
+        # Only the transformer block lives under `decoder`; eh_proj, enorm and
+        # hnorm are its siblings directly under `model`. _map_name tries the
+        # longest substring first and stops at the first hit, so the three
+        # specific rules win over the catch-all.
+        return Glm5NextForConditionalGeneration.hf_to_sglang_mapper | WeightsMapper(
             orig_to_new_substr={
-                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
+                f"model.layers.{n}.eh_proj": "model.eh_proj",
+                f"model.layers.{n}.enorm": "model.enorm",
+                f"model.layers.{n}.hnorm": "model.hnorm",
+                f"model.layers.{n}": "model.decoder",
             },
         )
 
