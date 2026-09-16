@@ -122,8 +122,7 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
   // range-checked at once: `key` and `key - 1` both land in the finite band
   // [0x0401, 0xFBFF] -- every boundary a finite-score threshold produces. fp16
   // rounds to nearest, so the boundary is the midpoint between the fp16 values
-  // at `key` and `key - 1`. (Measured faster than a per-key dispatch: the two
-  // conversions are independent and issue in parallel.)
+  // at `key` and `key - 1`.
   if (key - 0x0401u <= 0xFBFFu - 0x0401u) {
     const float mid = 0.5f * (to_finite_val(key) + to_finite_val(key - 1));
     // fp32 -> fp16 rounds to nearest EVEN, so on the ~half of bins whose fp16
@@ -441,12 +440,9 @@ struct TopKRadixBase : TopKConfig {
     float v_hi;
     float v_lo;
     uint32_t warp_sum[kNumWarps];
-    // The coarse histogram is dead once find_threshold() has published
-    // threshold_bin, and the tie machinery only comes alive after that: the
-    // collect pass fills tie_values, then handle_tie works over them with
-    // tie_handle as scratch. Overlaying the two phases keeps the
-    // kMaxNumTie-candidate buffer from growing the block's shared-memory
-    // footprint. tie_handle and tie_values are live TOGETHER, so they sit
+    // The coarse histogram is dead once find_threshold() has published its
+    // boundaries, and the tie machinery only comes alive after that, so the two
+    // phases overlay. tie_handle and tie_values are live TOGETHER, so they sit
     // side by side inside the overlay, not in a union with each other.
     union {
       alignas(16) uint32_t histogram[kHistSize];

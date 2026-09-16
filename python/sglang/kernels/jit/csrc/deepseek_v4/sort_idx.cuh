@@ -16,19 +16,16 @@
 
 namespace sglang {
 
-/// Finalises the block table layer 20 publishes for DeepGEMM's sparse indexer:
-/// the top-k block ids a row selected (any order, -1 padded) become, in place,
-/// the same ids ascending with INT32_MAX past the row's count, plus each block
-/// as a pool slot / 8 (`page_table[b, id / bpp] * bpp + id % bpp`, `bpp` blocks
-/// per index page). A row with at most `topk` blocks keeps every block and gets
-/// the identity table without reading its input.
+/// Finalises the sparse indexer's block table: the top-k block ids a row
+/// selected (any order, -1 padded) become, in place, the same ids ascending with
+/// INT32_MAX past the row's count, plus each block as a pool slot / 8
+/// (`page_table[b, id / bpp] * bpp + id % bpp`, `bpp` blocks per index page). A
+/// row with at most `topk` blocks gets the identity table without reading its
+/// input.
 ///
-/// Counting sort over a bitmap of the row's blocks (one bit per block, 16 KiB
-/// for the 128K blocks of a 1M-token row): set the selected bits, exclusive-scan
-/// the popcounts, emit every set bit at its rank. A word with a single bit is
-/// emitted by its owner (one `ffs`, no loop); a word with more goes to a
-/// block-wide queue that the warps drain one word per step, one lane per bit,
-/// so a dense cluster of selected blocks is spread over all warps.
+/// Counting sort over a per-row bitmap (one bit per block, 16 KiB for a 1M-token
+/// row): single-bit words are emitted by their owner, denser words go to a
+/// block-wide queue the warps drain one lane per bit.
 struct SortConfig {
   static constexpr uint32_t kBlockSize = 1024;
   static constexpr uint32_t kOccupancy = 2;

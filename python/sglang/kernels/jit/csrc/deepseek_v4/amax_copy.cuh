@@ -14,14 +14,8 @@
 
 namespace sglang {
 
-/// Level-one keys of the DeepSeek-V4.1 two-level indexer: one key per block of
-/// kBlockTokens consecutive scores, the block's maximum score (`amax` in the
-/// model code, a plain max). Row `b` has `ceil(seq_len[b] / kBlockTokens)` keys;
-/// its newest block is written as +inf so the block top-k can never drop it,
-/// which also makes the scores past `seq_len` inside that block irrelevant.
-/// Nothing is written past the key count: the consumer takes the same count as
-/// the row length. Rows with at most `topk` blocks are skipped entirely (every
-/// block is selected anyway; `topk = 0` disables the skip).
+/// Level-one keys of the two-level indexer: the max of each kBlockTokens-score
+/// block, the row's newest block forced to +inf. Contract: AmaxCopyKernel.
 struct AmaxConfig {
   using DType = float;
   static constexpr uint32_t kBlockTokens = 8;  // scores per key

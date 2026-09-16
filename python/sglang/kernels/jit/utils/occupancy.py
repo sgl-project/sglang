@@ -32,21 +32,11 @@ def get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
 
     Asks the driver (``cudaOccupancyMaxActiveClusters``) rather than dividing SM
     count by cluster size: a cluster's blocks must be co-scheduled within one
-    GPC, so the answer falls short of ``num_sms * occupancy / cluster_size`` once
-    the cluster stops dividing a GPC evenly. On B200 (148 SMs) at occupancy 2 the
-    driver reports 33 clusters of 8 where the division says 37, and 14 of 16
-    where it says 18.
-
-    Probed with an empty kernel pinned to ``occupancy`` blocks per SM, so the
-    answer is the *scheduling* limit at that occupancy and nothing else. Pass the
-    occupancy the real kernel reaches (the second ``__launch_bounds__``
-    argument), not the one it asks for.
-
-    :param cluster_size: Blocks per cluster.
-    :param occupancy: Blocks per SM (``num_waves`` in ``csrc/occupancy/cluster_probe.cuh``).
-    :raises RuntimeError: On pre-sm90 devices, which have no clusters.
-    :raises ValueError: If nothing is schedulable, which a real device should
-                        never report for a cluster width it supports.
+    GPC, so the answer falls short of the division once the cluster stops
+    dividing a GPC evenly. The probe kernel is pinned to ``occupancy`` blocks per
+    SM, so pass the occupancy the real kernel reaches (its second
+    ``__launch_bounds__`` argument). Raises ``RuntimeError`` before sm90, which
+    has no clusters, and ``ValueError`` when nothing is schedulable.
     """
     result = _get_max_active_clusters(cluster_size, occupancy)
     if result == 0:
