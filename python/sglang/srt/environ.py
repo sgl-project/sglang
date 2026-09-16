@@ -770,6 +770,9 @@ class Envs:
     # exceed (storage write latency) x (host eviction rate) / (host pool tokens);
     # 0.05 leaves ~2x headroom for a ~1 s write and a 30M-token pool churning 1M tok/s.
     SGLANG_HICACHE_L3_EVICT_WRITE_RESERVE_FRACTION = EnvFloat(0.05)
+    # Hybrid models: anchor the L3 prefetch at the deepest host-backed Full-KV node;
+    # the all-components match stops at the last Mamba state and re-asks L3 for L2 pages.
+    SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

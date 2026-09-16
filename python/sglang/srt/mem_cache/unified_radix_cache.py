@@ -292,6 +292,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "anchor_advanced": 0,
+            "anchor_advanced_tokens": 0,
         }
         # Exclusive L2->L3 tiering: storage is written from the coldest host pages ahead
         # of eviction, not at L2 admission. Resolved in init_hicache.
@@ -520,6 +522,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     * self.cache_controller.mem_pool_host.size
                 ),
             )
+        if envs.SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV.get():
+            if (
+                self._tree_core_backend == "python"
+                and self.host_memory_mode != "buffer_only"
+            ):
+                self._prefetch_anchor_full_kv = True
+            else:
+                logger.warning(
+                    "SGLANG_HICACHE_PREFETCH_ANCHOR_FULL_KV needs the python tree "
+                    "core and a host cache tier; ignored"
+                )
 
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
@@ -1963,6 +1976,28 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["wb_issued_tokens"] += num_tokens
         self._write_behind_clean_tokens = clean
         stats["wb_clean_tokens"] += clean
+
+    def storage_prefetch_anchor(
+        self, req: Req, *, anchor: NodeId, matched_len: int
+    ) -> tuple[NodeId, int]:
+        """Hybrid models keep Mamba states only at the last leaves of a path, so
+        once a chain's tail is tiered to L3 the all-components anchor falls back
+        to an early node and the prefetch re-asks L3 for pages L2 already holds.
+        Advance to the deepest host-backed node of the Full-KV walk instead."""
+        if not self._prefetch_anchor_full_kv or req.full_kv_last_node is None:
+            return anchor, matched_len
+        tree_core = self.tree_core
+        full_kv_len = req.full_kv_hit_length
+        node = tree_core.node_by_id(req.full_kv_last_node)
+        while not tree_core.is_root(node.id) and not node.backuped:
+            full_kv_len -= len(node.key)
+            node = node.parent
+        if full_kv_len <= matched_len:
+            return anchor, matched_len
+        stats = self._prefetch_outcome_stats
+        stats["anchor_advanced"] += 1
+        stats["anchor_advanced_tokens"] += full_kv_len - matched_len
+        return node.id, full_kv_len
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)

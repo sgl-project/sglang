@@ -259,6 +259,8 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    # Deepest node of the Full-KV walk (device or host), regardless of other components.
+    full_kv_last_node: Any = None
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -282,6 +284,7 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        full_kv_last_node=root,
     )
 
 
@@ -405,6 +408,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         the root's NodeId for UnifiedRadixCache. extra_key scopes the root for
         implementations that shard trees per cache namespace."""
         return self.root_node
+
+    def storage_prefetch_anchor(
+        self, req: Req, *, anchor: Any, matched_len: int
+    ) -> tuple[Any, int]:
+        """The (node, matched_len) the L3 prefetch continues from; the match
+        result's own pair unless the cache can start deeper."""
+        return anchor, matched_len
 
     def is_backuped(self, node: Any) -> bool:
         """Whether the node's Full KV is present on host."""
