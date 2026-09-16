@@ -31,6 +31,10 @@ use tokio::{
 };
 
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Below this the heartbeat stays at INFO: a pod finishing a long streaming
+/// response during a routine rollout is normal, and warning on every rollout
+/// would train operators to filter router WARNs. Past it the pod risks being
+/// SIGKILLed with work still open, so the heartbeat escalates to WARN.
 const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 
 // Main components started by this binary:
@@ -109,14 +113,14 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     tracing::info!("listening on {listen_addr}");
-    let (server_result, inflight_drain_secs) = serve(listener, app_context, sigterm, sigint).await;
+    let outcome = serve(listener, app_context, sigterm, sigint).await;
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
-    log_shutdown(&server_result, inflight_drain_secs);
-    server_result
+    log_shutdown(&outcome.result, outcome.inflight_drain_secs);
+    outcome.result
 }
 
 // Respect RUST_LOG and tolerate an already-installed subscriber.
@@ -292,12 +296,20 @@ fn build_app_context(
     Ok(Arc::new(app_context))
 }
 
+/// How serving ended: the server's exit status and, when a termination signal
+/// started the in-flight drain, how long that drain ran (`None` means the
+/// server stopped without ever reaching the drain).
+struct ServeOutcome {
+    result: Result<()>,
+    inflight_drain_secs: Option<u64>,
+}
+
 async fn serve(
     listener: TcpListener,
     app_context: Arc<AppContext>,
     sigterm: Signal,
     sigint: Signal,
-) -> (Result<()>, Option<u64>) {
+) -> ServeOutcome {
     let app = build_router(Arc::clone(&app_context));
     let drain = app_context.config.server.shutdown_drain();
     let (drain_tx, drain_rx) = watch::channel(None);
@@ -314,7 +326,10 @@ async fn serve(
         .context("axum serve");
     heartbeat.abort();
     let inflight_drain_secs = drain_rx.borrow().map(|at| at.elapsed().as_secs());
-    (result, inflight_drain_secs)
+    ServeOutcome {
+        result,
+        inflight_drain_secs,
+    }
 }
 
 async fn report_drain_progress(
@@ -427,7 +442,10 @@ fn handle_further_signal(
     expedite_tx: &mut Option<oneshot::Sender<()>>,
     sigterm_first: bool,
 ) -> FurtherSignal {
-    // A closed receiver means the readiness pause already ended.
+    // A failed `send` means the pause already elapsed and dropped its receiver.
+    // That is the same "nothing to cut short" state as a spent sender and must
+    // fall through to the notice below; discarding the `Err` once swallowed the
+    // first post-pause signal (see the regression test).
     if let Some(tx) = expedite_tx.take() {
         if tx.send(()).is_ok() {
             return FurtherSignal::Expedited;
