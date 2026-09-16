@@ -589,6 +589,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -1466,9 +1467,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
@@ -2890,6 +2893,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
