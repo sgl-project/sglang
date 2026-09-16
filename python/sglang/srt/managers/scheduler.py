@@ -3564,6 +3564,7 @@ class Scheduler(
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
             or self.enable_unified_cache_external_linker
+            or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
