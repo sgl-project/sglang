@@ -19,6 +19,10 @@ export const config = (() => {
 const CONSUMER_12G = ["rtx4070", "rtx5070", "rtx3060"];
 const CONSUMER_16G = ["rtx4080", "rtx5080", "rtx5070ti", "rtx4060ti"];
 const CONSUMER_24G = ["rtx4090", "rtx3090"];
+// The only tier measured on a physical desktop rather than under an allocator
+// cap: an RTX 5090 with 60 GB of host RAM and a PCIe 5.0 NVMe, where the VRAM,
+// the host RAM and the drive are all real at once.
+const CONSUMER_32G = ["rtx5090"];
 // Workstation cards a home builder can actually buy. No hard-cap anchor was
 // measured for these sizes (the lab card is 24 GB and caps only shrink), so
 // their recipes are derived from the tier logic, not verified runs.
@@ -34,12 +38,23 @@ const CONSUMER_SINGLE = [
   ...CONSUMER_12G,
   ...CONSUMER_16G,
   ...CONSUMER_24G,
+  ...CONSUMER_32G,
   ...WORKSTATION_48G,
   ...WORKSTATION_96G,
   ...UNIFIED_128G,
 ];
-const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G];
+const CONSUMER_VRAM_16_PLUS = [...CONSUMER_16G, ...CONSUMER_24G, ...CONSUMER_32G];
 const CONSUMER_AMPERE = ["rtx3060", "rtx3090"];
+
+// The consumer recipes below are single-card. The 5090 is the one consumer
+// card with a verified two-card recipe (TP2, twenty resident layers -- half a
+// layer per GPU), so a two-card selection keeps the generic offload path.
+function consumerSingleCard(s) {
+  return (
+    CONSUMER_SINGLE.includes(s.hw)
+    && !(CONSUMER_32G.includes(s.hw) && Number(s.gpus_per_node) > 1)
+  );
+}
 
 function consumerFlags(s) {
   if (UNIFIED_128G.includes(s.hw)) return unified128Flags();
@@ -66,6 +81,13 @@ function consumerFlags(s) {
   // the plain recipe; even four resident layers measured slower there.
   if (CONSUMER_24G.includes(s.hw) && s.host_ram === "ram32") {
     flags.push("--dit-layerwise-resident-layers 6");
+  }
+  // Fourteen layers (~17 GiB) leave the decode its room on a 32 GB card and
+  // shrink the streamed set the host has to pin. Measured at a 60 GB host;
+  // a smaller host does not change what fits on the card, so the count holds
+  // there too and matters more, since fewer streamed layers get pinned.
+  if (CONSUMER_32G.includes(s.hw) && s.host_ram !== "ram96") {
+    flags.push("--dit-layerwise-resident-layers 14");
   }
   if (WORKSTATION_48G.includes(s.hw)) {
     flags.push("--dit-layerwise-resident-layers 40");
@@ -97,14 +119,23 @@ function consumerHints(s) {
   const midHost = s.host_ram === "ram64";
   if (bigHost) {
     if (CONSUMER_VRAM_16_PLUS.includes(s.hw)) {
-      hints.push("verified end to end: ~6 s per denoise step, 13 s decode");
+      hints.push(CONSUMER_32G.includes(s.hw)
+        ? "with the DiT pinned the denoise runs at this card's compute wall, measured at 5.14-5.17 s per step on a physical 5090; the decode holds all 36 blocks in their fp16 decode dtype and takes ~6.4 s"
+        : "verified end to end: ~6 s per denoise step, 13 s decode");
       hints.push("fewer resident layers than the 32 GB rows is not a typo: with the DiT pinned in a big host, streamed layers arrive at pinned-copy speed and GPU residency buys little; on a 32 GB host the stream is the bottleneck residency cuts");
     } else {
       hints.push("~6 s per step once the host pins the DiT; the decode holds all 36 blocks in their fp16 decode dtype and takes ~10 s");
     }
     return hints;
   }
-  if (CONSUMER_24G.includes(s.hw)) {
+  if (CONSUMER_32G.includes(s.hw)) {
+    if (midHost) {
+      hints.push("measured end to end on a physical desktop (RTX 5090, 60 GB host, PCIe 5.0 NVMe -- VRAM, host RAM and drive all real): 112.2 / 112.1 s per request at 864x480 / 124 frames / 20 steps, against ComfyUI's 140.9-145.9 s on the same weights and sampler settings. Text encoding 4.2 s, denoise 98.0-98.5 s (5.14-5.17 s/step), decode 6.4 s");
+      hints.push("at this host size the pin budget covers 34 of the 50 DiT layers, so only ~2 layers per step and the 46 GiB text encoder come off the drive -- 96 GiB per request, read with O_DIRECT and fully hidden behind compute (the compute thread waited 0.9 s per request)");
+    } else {
+      hints.push("derived, not yet measured at this host size: the card holds the same fourteen resident layers, but the pin budget covers only ~13 of the 36 streamed layers, so ~28 GiB per step comes off the drive. That stays hidden behind the 5.14 s/step compute wall on a drive delivering ~5.5 GiB/s or better (a PCIe 4.0 NVMe); a PCIe 3.0 drive becomes the clock at ~8.8 s/step");
+    }
+  } else if (CONSUMER_24G.includes(s.hw)) {
     hints.push("measured at 32 GB host under a 22 GiB cap (desktop headroom): ~8.5 s per denoise step with six resident layers, ~9.6 s decode -- ahead of ComfyUI (249-260 s at the 24 GiB cap); a headless card can raise to ten layers for under 1% more");
   } else if (CONSUMER_16G.includes(s.hw)) {
     hints.push("measured at 32 GB host: ~11.9 s per denoise step, ~11 s decode, ~250 s per request -- ahead of ComfyUI (292-301 s) under the same hard 16 GiB cap");
@@ -132,11 +163,15 @@ function consumerHints(s) {
   if (midHost) {
     hints.push("measured on a 12 GB card at a 48 GB host: ~9.6 s/step, ~218 s per request (ComfyUI 246-267 s); at 64 GB: ~8.1 s/step, ~180 s (ComfyUI 194-195 s); larger cards land at or below these");
   } else {
-    hints.push("a 32 GB host cannot cache the 108 GB checkpoint: NVMe is required, and real runs land above the quoted step time");
+    hints.push("a 32 GB host cannot cache the 108 GB checkpoint, so the drive is in the loop on every step -- see the rate it has to clear, below. A physical desktop that clears it reaches the quoted step times rather than falling short of them");
   }
   hints.push('the startup log should say "leaving ... GiB of weights on the checkpoint mapping" -- if it does not, the host is not the constraint you set');
   hints.push("every figure here is anchored at 480P: activations grow with the pixel count, so at 768P drop the resident DiT layers to 0 first, then video_vae to 24 if the decode still collides -- the flags trade speed for headroom in that order");
-  hints.push("on a physical 32 GB host the page cache cannot hold the per-step weight sweep, so every step re-reads ~40-65 GB from disk and the drive is the denoise clock: a real desktop 4090 with a 990 Pro measured 38 s/step (52.9 GB read per step). Resident DiT layers cut that read directly (~1 GB/step each), so raise them as far as VRAM allows; 64 GB of RAM caches the sweep and returns to the quoted times");
+  hints.push("what the drive has to deliver is computable: each step re-reads (50 - resident DiT layers - the layers the host pin budget covered) x 1.23 GiB, and the courier overlaps that read with compute, so the drive stops being the denoise clock once its sequential rate exceeds those bytes divided by this card's step time. A 32 GB host covers ~13 layers, which puts a 24 GB card at ~38 GiB/step and a 12/16 GB card at ~46 GiB/step: a PCIe 4.0 NVMe (6-7 GiB/s) clears both, a PCIe 3.0 drive (~3.2 GiB/s) becomes the clock, and a SATA SSD is not usable for this model");
+  hints.push("the 38 s/step a physical 4090 with a 990 Pro once measured (52.9 GB per step at ~1.4 GB/s) was the old path: the pinned-store pool rounded every block up to a power of two, so the pin budget over-committed and the machine had to run with pinning off, and the layers that stayed mapped faulted in 4 KiB at a time. Exact-size pins and O_DIRECT reads through the courier removed both -- on the physical 5090 the drive is now fully hidden behind compute. A 4090 on a 32 GB host is derived to return to its compute wall (~8.5 s/step) on a PCIe 4.0 drive; that machine has not been re-measured");
+  hints.push("resident DiT layers still remove 1.23 GiB/step of drive traffic each, but only while the streamed set is larger than the pin budget; once the read fits under the step's compute time, more resident layers buy nothing and only cost VRAM");
+  hints.push("warm at the shape you will serve (--warmup-resolutions WxH --warmup-num-frames N): the default warmup is 1344x768 x 124 frames, which cost 7.6 min of startup on the physical 5090 and sizes the residency plan for a request you are not going to make");
+  hints.push("the pin budget takes 95% of the memory available after loading, so on a machine you also use as a desktop expect swap pressure: the 5090 run above finished with its 8 GB swap file full. There is no supported knob for a smaller budget yet; giving the card more resident layers is the lever that exists, since a resident layer is one the host no longer has to pin");
   hints.push("on Windows run under WSL2, and keep the checkpoint inside the ext4 side (under ~), never on /mnt/c -- the NTFS bridge reads an order of magnitude slower and multiplies the disk clock");
   return hints;
 }
@@ -294,7 +329,7 @@ return {
           id: "auto",
           label: "Auto",
           flags: (s) => {
-            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
+            if (consumerSingleCard(s)) return consumerFlags(s);
             const recipe = config.commandBuilder.resource.verifiedRecipes.find((entry) =>
               entry.hw === s.hw && entry.nodes === Number(s.nodes)
               && entry.gpus_per_node === Number(s.gpus_per_node));
@@ -306,7 +341,7 @@ return {
                 "--dit-layerwise-resident-layers 20",
               ] : ["--performance-mode speed"];
           },
-          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
+          hints: (s) => (consumerSingleCard(s) ? consumerHints(s) : []),
           description: "Use the recommended placement for the selected hardware and resource shape.",
         },
         {
@@ -330,14 +365,14 @@ return {
           id: "offload",
           label: "Layerwise offload",
           flags: (s) => {
-            if (CONSUMER_SINGLE.includes(s.hw)) return consumerFlags(s);
+            if (consumerSingleCard(s)) return consumerFlags(s);
             return [
               "--performance-mode memory",
               "--layerwise-offload-components dit,text_encoder,vae",
               "--dit-layerwise-resident-layers 20",
             ];
           },
-          hints: (s) => (CONSUMER_SINGLE.includes(s.hw) ? consumerHints(s) : []),
+          hints: (s) => (consumerSingleCard(s) ? consumerHints(s) : []),
           soft: (s) => s.hw !== "rtx5090" && !CONSUMER_SINGLE.includes(s.hw),
           softReason: "Tuned and verified on the consumer cards. It runs on the datacenter GPUs too, where a resident recipe is simply faster.",
           recommendedWhen: (s) => s.hw === "rtx5090" || CONSUMER_SINGLE.includes(s.hw),

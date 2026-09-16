@@ -241,6 +241,12 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C4Indexer => "deepseek_v4_c4_indexer",
         PoolName::DeepseekV4C4IndexerScale => "deepseek_v4_c4_indexer_scale",
         PoolName::DeepseekV4C128 => "deepseek_v4_c128",
+        PoolName::DeepseekV4C1 => "deepseek_v4_c1",
+        PoolName::DeepseekV4C1Indexer => "deepseek_v4_c1_indexer",
+        PoolName::DeepseekV4C1IndexerScale => "deepseek_v4_c1_indexer_scale",
+        PoolName::DeepseekV4C2 => "deepseek_v4_c2",
+        PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
+        PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
@@ -261,6 +267,12 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c4_indexer" => Ok(PoolName::DeepseekV4C4Indexer),
         "deepseek_v4_c4_indexer_scale" => Ok(PoolName::DeepseekV4C4IndexerScale),
         "deepseek_v4_c128" => Ok(PoolName::DeepseekV4C128),
+        "deepseek_v4_c1" => Ok(PoolName::DeepseekV4C1),
+        "deepseek_v4_c1_indexer" => Ok(PoolName::DeepseekV4C1Indexer),
+        "deepseek_v4_c1_indexer_scale" => Ok(PoolName::DeepseekV4C1IndexerScale),
+        "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
+        "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
+        "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
@@ -514,6 +526,7 @@ pub struct InsertParamsBinding {
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
     pub cache_salt: Option<String>,
+    pub session_id: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
@@ -526,13 +539,14 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, chunked = false, priority = 0, mamba_value = None, track_adopted_ranges = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
         cache_salt: Option<String>,
+        session_id: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         swa_branching_seqlen: Option<usize>,
@@ -546,6 +560,7 @@ impl InsertParamsBinding {
             value,
             extra_key,
             cache_salt,
+            session_id,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
@@ -996,6 +1011,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         MatchResultBinding::from_match_result(py, result)
     }
 
+    /// Read-only FULL-device match, independent of auxiliary components.
+    fn match_full_device_prefix(
+        &self,
+        py: Python<'_>,
+        params: &MatchParamsBinding,
+    ) -> (usize, NodeId, usize) {
+        let key = K::key_from(Cow::Borrowed(&params.key));
+        let key = key.as_ref();
+        let namespace =
+            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+        py.allow_threads(|| self.core().match_full_device_prefix(key, namespace))
+    }
+
     /// The empty match result anchored at the root.
     fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
         let result = py.allow_threads(|| self.core().empty_match_result());
@@ -1023,6 +1051,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1059,6 +1088,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 params.extra_key.as_deref(),
                 params.cache_salt.as_deref(),
             ),
+            session_id: params.session_id.as_deref(),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1106,6 +1136,18 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .allow_threads(|| self.core().inc_lock_ref(node_id, skip))
             .map_err(node_access_error)?;
         Ok(IncLockRefResultBinding::from_result(result))
+    }
+
+    /// Pin only the FULL device values on a node's root path.
+    fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().inc_full_pin(node_id))
+            .map_err(node_access_error)
+    }
+
+    /// Release a FULL-only root-path pin.
+    fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+        py.allow_threads(|| self.core().dec_full_pin(node_id))
+            .map_err(node_access_error)
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -1481,6 +1523,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         host_indices: Option<PyTensor>,
         token_ids: Option<Vec<i64>>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<String>,
     ) -> PyResult<Option<Vec<Py<PyAny>>>> {
         let component_type = parse_component_type(component_type)?;
@@ -1495,6 +1538,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     host_indices,
                     token_ids.as_deref(),
                     prefetch_tokens,
+                    staging_tokens,
                     last_hash.as_deref(),
                 )
             })
@@ -1828,6 +1872,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     block_size,
                     medium,
                     cache_salt,
+                    session_id,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1837,6 +1882,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         block_size,
                         medium.as_str(),
                         cache_salt.map(|salt| salt.to_string()),
+                        session_id.map(|session_id| session_id.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;
@@ -2416,6 +2462,15 @@ macro_rules! tree_core_binding {
                 self.inner.match_prefix(py, params)
             }
 
+            /// Read-only FULL-device match, independent of auxiliary components.
+            fn match_full_device_prefix(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+            ) -> (usize, NodeId, usize) {
+                self.inner.match_full_device_prefix(py, params)
+            }
+
             /// The empty match result anchored at the root.
             fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
                 self.inner.empty_match_result(py)
@@ -2463,6 +2518,16 @@ macro_rules! tree_core_binding {
                 skip_lock_components: Vec<u8>,
             ) -> PyResult<IncLockRefResultBinding> {
                 self.inner.inc_lock_ref(py, node_id, skip_lock_components)
+            }
+
+            /// Pin only the FULL device values on a node's root path.
+            fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                self.inner.inc_full_pin(py, node_id)
+            }
+
+            /// Release a FULL-only root-path pin.
+            fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                self.inner.dec_full_pin(py, node_id)
             }
 
             /// Decrease the reference count on a node's component locks. The
@@ -2711,7 +2776,7 @@ macro_rules! tree_core_binding {
 
             /// Route a build_hicache_transfers call to the component for the given type.
             #[allow(clippy::too_many_arguments)]
-            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, last_hash = None))]
+            #[pyo3(signature = (component_type, node_id, phase, host_indices = None, token_ids = None, prefetch_tokens = 0, staging_tokens = 0, last_hash = None))]
             fn build_hicache_transfers(
                 &self,
                 py: Python<'_>,
@@ -2721,6 +2786,7 @@ macro_rules! tree_core_binding {
                 host_indices: Option<PyTensor>,
                 token_ids: Option<Vec<i64>>,
                 prefetch_tokens: usize,
+                staging_tokens: usize,
                 last_hash: Option<String>,
             ) -> PyResult<Option<Vec<Py<PyAny>>>> {
                 self.inner.build_hicache_transfers(
@@ -2731,6 +2797,7 @@ macro_rules! tree_core_binding {
                     host_indices,
                     token_ids,
                     prefetch_tokens,
+                    staging_tokens,
                     last_hash,
                 )
             }
