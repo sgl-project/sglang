@@ -1632,17 +1632,29 @@ def fused_experts_none_to_flashinfer_trtllm(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     """Dispatch to FP8 or FP4 FlashInfer TRT-LLM MoE based on quant_info type."""
+    # Lazy import like the other runners in this file: layers/moe/topk.py
+    # imports the layers.moe package, which imports this module (circular).
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    # The logits-based kernels need the BYPASSED top-k; a caller that already
+    # holds STANDARD / PACKED ids and weights (e.g. the collocated prefill-CP
+    # MoE, which routes on its local rows before gathering them) takes the
+    # routed kernels of the same backend.
+    topk_output = dispatch_output.topk_output
+    use_routed_topk = TopKOutputChecker.format_is_standard(
+        topk_output
+    ) or TopKOutputChecker.format_is_packed(topk_output)
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
         return fused_experts_none_to_flashinfer_trtllm_fp4(
-            dispatch_output, quant_info, runner_config
+            dispatch_output, quant_info, runner_config, use_routed_topk=use_routed_topk
         )
     if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
         return fused_experts_none_to_flashinfer_trtllm_fp8(
-            dispatch_output, quant_info, runner_config
+            dispatch_output, quant_info, runner_config, use_routed_topk=use_routed_topk
         )
     if isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
         return fused_experts_none_to_flashinfer_trtllm_bf16(
-            dispatch_output, quant_info, runner_config
+            dispatch_output, quant_info, runner_config, use_routed_topk=use_routed_topk
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
