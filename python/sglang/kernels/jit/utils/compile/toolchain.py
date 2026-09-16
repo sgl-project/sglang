@@ -13,10 +13,13 @@ and ``tvm_ffi.load_module`` for loading the result.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import pathlib
+import re
 import shutil
+import subprocess
 from typing import List, Tuple
 
 import torch
@@ -27,6 +30,68 @@ from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
 logger = logging.getLogger(__name__)
 
 
+def _declares_c23_rsqrt() -> bool:
+    """True when the host libc declares C23 ``rsqrt``/``rsqrtf``.
+
+    glibc >= 2.41 declares these as ``noexcept``. CUDA toolkits older than
+    13.2 declare them with no exception specifier, and nvcc then rejects every
+    translation unit that reaches ``<cmath>``:
+
+        bits/mathcalls.h: error: exception specification is incompatible with
+        that of previous function "rsqrt" (declared in crt/math_functions.h)
+
+    which takes out every JIT kernel build on the host. Probed from the header
+    rather than a glibc version so the check tracks the actual declaration.
+    """
+    for header in (
+        "/usr/include/x86_64-linux-gnu/bits/mathcalls.h",
+        "/usr/include/bits/mathcalls.h",
+    ):
+        try:
+            with open(header, "r") as fh:
+                return "(rsqrt," in fh.read()
+        except OSError:
+            continue
+    return False
+
+
+def _rsqrt_safe(home: str) -> bool:
+    """True when ``home``'s headers can be compiled against this host's libc.
+
+    CUDA 13.2 guards the clashing declarations behind ``_NV_RSQRT_SPECIFIER``;
+    toolkits without that macro cannot build here once the libc declares C23
+    ``rsqrt``. A toolkit whose header is unreadable is assumed fine, so an
+    unfamiliar layout degrades to today's behaviour instead of being skipped.
+    """
+    if not _declares_c23_rsqrt():
+        return True
+    header = os.path.join(
+        home, "targets", "x86_64-linux", "include", "crt", "math_functions.h"
+    )
+    if not os.path.exists(header):
+        header = os.path.join(home, "include", "crt", "math_functions.h")
+    try:
+        with open(header, "r") as fh:
+            return "_NV_RSQRT_SPECIFIER" in fh.read()
+    except OSError:
+        return True
+
+
+def _pip_cuda_home() -> str | None:
+    """Root of a pip-installed CUDA toolkit, if one shipped with the wheels."""
+    for mod in ("nvidia.cu13", "nvidia.cu12"):
+        try:
+            spec = importlib.util.find_spec(mod)
+        except (ImportError, ValueError):
+            continue
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        root = spec.submodule_search_locations[0]
+        if os.path.exists(os.path.join(root, "bin", "nvcc")):
+            return root
+    return None
+
+
 @cache_once
 def cuda_home() -> str:
     """CUDA install root, resolved the way tvm-ffi resolves it.
@@ -34,14 +99,47 @@ def cuda_home() -> str:
     `arch._jit_cuda_version` resolves nvcc the same way for its own purposes;
     the two must stay in agreement, since one picks the target and the other
     compiles for it.
+
+    One departure from tvm-ffi: if the toolkit we would otherwise pick cannot
+    compile against this host's libc (see ``_rsqrt_safe``), fall back to a
+    pip-installed toolkit that can. Without this, hosts with glibc >= 2.41 and
+    a system CUDA < 13.2 -- Ubuntu 26.04 being the common case -- fail every
+    JIT build with an error that names neither the toolkit nor the fix.
     """
     configured = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if configured is not None:
         return configured
+
     nvcc_path = shutil.which("nvcc")
-    if nvcc_path is not None:
-        return os.path.dirname(os.path.dirname(nvcc_path))
-    return "/usr/local/cuda"
+    primary = (
+        os.path.dirname(os.path.dirname(nvcc_path))
+        if nvcc_path is not None
+        else "/usr/local/cuda"
+    )
+    if _rsqrt_safe(primary):
+        return primary
+
+    fallback = _pip_cuda_home()
+    if fallback is not None and _rsqrt_safe(fallback):
+        logger.warning(
+            "CUDA toolkit at %s cannot compile against this host's libc: it "
+            "predates the _NV_RSQRT_SPECIFIER guard (CUDA 13.2) while glibc "
+            "declares C23 rsqrt/rsqrtf as noexcept. Using the pip-installed "
+            "toolkit at %s instead. Set CUDA_HOME to override.",
+            primary,
+            fallback,
+        )
+        return fallback
+
+    logger.warning(
+        "CUDA toolkit at %s predates the _NV_RSQRT_SPECIFIER guard (CUDA 13.2) "
+        "while this host's glibc declares C23 rsqrt/rsqrtf as noexcept, so JIT "
+        "builds are expected to fail with 'exception specification is "
+        "incompatible with that of previous function rsqrt'. Install CUDA "
+        ">= 13.2 and point CUDA_HOME at it.",
+        primary,
+    )
+    return primary
 
 
 @cache_once
@@ -59,7 +157,70 @@ def device_compiler_path() -> str:
     """
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
-    return os.path.join(cuda_home(), "bin", "nvcc")
+    nvcc = os.path.join(cuda_home(), "bin", "nvcc")
+    _warn_on_toolkit_version_skew(nvcc)
+    return nvcc
+
+
+def _header_cudart_version(home: str) -> Tuple[int, int] | None:
+    """``(major, minor)`` from ``CUDART_VERSION`` in the toolkit's headers."""
+    for rel in (
+        ("targets", "x86_64-linux", "include", "cuda_runtime_api.h"),
+        ("include", "cuda_runtime_api.h"),
+    ):
+        path = os.path.join(home, *rel)
+        try:
+            with open(path, "r") as fh:
+                for line in fh:
+                    if line.startswith("#define CUDART_VERSION"):
+                        value = int(line.split()[2])
+                        return value // 1000, (value % 1000) // 10
+        except (OSError, IndexError, ValueError):
+            continue
+    return None
+
+
+@cache_once
+def _warn_on_toolkit_version_skew(nvcc: str) -> None:
+    """Warn when nvcc and the CUDA headers beside it are different releases.
+
+    The pip CUDA distribution is a set of independently versioned wheels that
+    unpack into one tree, so ``nvidia-cuda-nvcc`` and ``nvidia-cuda-runtime``
+    can disagree. CCCL asserts the two match and aborts the build with
+
+        "CUDA compiler and CUDA toolkit headers are incompatible, please check
+        your include paths"
+
+    which points at include paths rather than at the package versions that
+    actually differ. Only a warning: mixed minor versions are usually fine for
+    builds that do not pull in CCCL.
+    """
+    header_version = _header_cudart_version(cuda_home())
+    if header_version is None:
+        return
+    try:
+        out = subprocess.run(
+            [nvcc, "--version"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    match = re.search(r"release (\d+)\.(\d+)", out)
+    if match is None:
+        return
+    nvcc_version = (int(match.group(1)), int(match.group(2)))
+    if nvcc_version == header_version:
+        return
+    logger.warning(
+        "CUDA toolkit at %s is inconsistent: nvcc is %d.%d but the CUDA runtime "
+        "headers are %d.%d. CCCL-based builds (flashinfer) reject this with "
+        "'CUDA compiler and CUDA toolkit headers are incompatible'. If these "
+        "came from pip, align them, e.g. "
+        "`pip install nvidia-cuda-runtime==%d.%d.*`.",
+        cuda_home(),
+        *nvcc_version,
+        *header_version,
+        *nvcc_version,
+    )
 
 
 @cache_once
@@ -160,7 +321,47 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + [f"-L{cuda_lib_dir()}", _cudart_link_flag()]
+
+
+@cache_once
+def cuda_lib_dir() -> str:
+    """Directory holding the CUDA runtime libraries under ``cuda_home()``.
+
+    A system toolkit keeps them in ``lib64``; the pip wheels use ``lib``.
+    Hardcoding ``lib64`` makes the link step search a directory that does not
+    exist on a pip-only install, so resolve it instead.
+    """
+    home = cuda_home()
+    for name in ("lib64", "lib"):
+        candidate = os.path.join(home, name)
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(home, "lib64")
+
+
+@cache_once
+def _cudart_link_flag() -> str:
+    """``-lcudart``, or a direct soname reference when the dev symlink is absent.
+
+    The pip CUDA wheels are runtime-only: they ship ``libcudart.so.13`` but no
+    unversioned ``libcudart.so``, so ``-lcudart`` fails with "cannot find
+    -lcudart" even though the library is right there. ld's ``-l:`` form takes
+    an exact filename, which lets a pip-only toolkit link without us having to
+    write symlinks into someone's site-packages.
+    """
+    lib_dir = cuda_lib_dir()
+    if os.path.exists(os.path.join(lib_dir, "libcudart.so")):
+        return "-lcudart"
+    try:
+        versioned = sorted(
+            name for name in os.listdir(lib_dir) if name.startswith("libcudart.so.")
+        )
+    except OSError:
+        return "-lcudart"
+    if versioned:
+        return f"-l:{versioned[-1]}"
+    return "-lcudart"
 
 
 def compilers() -> Tuple[str, str]:
