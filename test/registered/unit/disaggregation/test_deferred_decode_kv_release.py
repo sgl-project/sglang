@@ -8,6 +8,7 @@ that its transfer drained (CommonKVManager.is_abort_release_safe), or a timeout
 fires. See DecodeTransferQueue.resolve_deferred_releases.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +26,7 @@ def _make_manager():
     """A bare CommonKVManager carrying only the deferred-ack state the helpers
     touch (avoids the heavy real __init__)."""
     mgr = CommonKVManager.__new__(CommonKVManager)
+    mgr._deferred_abort_lock = threading.Lock()
     mgr._deferred_abort_ack_tracker = {}
     return mgr
 
@@ -64,7 +66,7 @@ class TestAbortAckAggregation(CustomTestCase):
         mgr.register_deferred_abort_room(room)
         mgr.note_abort_ack(room, 0)
         mgr.clear_deferred_abort_state(room)
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn((room, None), mgr._deferred_abort_ack_tracker)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
 
     def test_ack_before_register_is_dropped(self):
@@ -73,7 +75,7 @@ class TestAbortAckAggregation(CustomTestCase):
         mgr = _make_manager()
         room = 104
         mgr.note_abort_ack(room, 0)  # no register yet
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn((room, None), mgr._deferred_abort_ack_tracker)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=1))
 
     def test_late_ack_after_release_does_not_pollute_reused_room(self):
@@ -91,7 +93,7 @@ class TestAbortAckAggregation(CustomTestCase):
 
         # Late ack from A's other rank arrives after release -> dropped.
         mgr.note_abort_ack(room, 1)
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn((room, None), mgr._deferred_abort_ack_tracker)
 
         # Req B reuses room R.
         mgr.register_deferred_abort_room(room)
@@ -112,6 +114,23 @@ class TestAbortAckAggregation(CustomTestCase):
         mgr.register_deferred_abort_room(room)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
 
+    def test_overlapping_generations_keep_independent_ack_sets(self):
+        mgr = _make_manager()
+        room = 111
+        mgr.register_deferred_abort_room(room, generation="request-a")
+        mgr.register_deferred_abort_room(room, generation="request-b")
+
+        mgr.note_abort_ack(room, 0, generation="request-a")
+
+        self.assertTrue(
+            mgr.is_abort_release_safe(room, required_acks=1, generation="request-a")
+        )
+        self.assertFalse(
+            mgr.is_abort_release_safe(room, required_acks=1, generation="request-b")
+        )
+        mgr.clear_deferred_abort_state(room, generation="request-a")
+        self.assertIn((room, "request-b"), mgr._deferred_abort_ack_tracker)
+
 
 class _FakeIdxAllocator:
     def __init__(self):
@@ -125,6 +144,7 @@ def _make_queue(timeout=30.0):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
     q._deferred_releases = []
     q.deferred_kv_release_timeout = timeout
+    q.strict_deferred_kv_release = False
     q.enable_staging = False
     q.staging_handler = None
     q.tree_cache = object()
@@ -133,12 +153,13 @@ def _make_queue(timeout=30.0):
     return q
 
 
-def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
+def _make_decode_req(room, idx, mgr, n_prefill_ranks=1, generation=None):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
+        abort_generation=generation,
         clear=lambda: None,
     )
     return SimpleNamespace(
@@ -154,6 +175,15 @@ class TestResolveDeferredReleases(CustomTestCase):
         with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
         rel.assert_not_called()
+
+    def test_manager_capability_enables_strict_release(self):
+        q = _make_queue()
+        manager = SimpleNamespace(requires_strict_deferred_release=True)
+
+        q.configure_deferred_release(manager)
+
+        self.assertTrue(q.enable_deferred_kv_release)
+        self.assertTrue(q.strict_deferred_kv_release)
 
     def test_holds_until_drained_then_releases(self):
         mgr = _make_manager()
@@ -186,7 +216,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertEqual(q.metadata_buffers.bootstrap_room[idx], 0)
-        self.assertNotIn(room, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn((room, None), mgr._deferred_abort_ack_tracker)
         self.assertIsNone(dreq.kv_receiver)
 
     def test_releases_on_timeout_without_ack(self):
@@ -195,7 +225,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(timeout=30.0)
         dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
         # Force an already-expired deadline (no ack will ever arrive).
-        q._deferred_releases.append((dreq, float("-inf"), idx, 1))
+        q._deferred_releases.append((dreq, float("-inf"), idx, 1, None))
 
         with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
@@ -205,6 +235,32 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
         self.assertIsNone(dreq.kv_receiver)
 
+    def test_strict_release_never_expires_without_ack(self):
+        mgr = _make_manager()
+        room, idx = 301, 4
+        q = _make_queue(timeout=0.0)
+        q.strict_deferred_kv_release = True
+        dreq = _make_decode_req(
+            room, idx, mgr, n_prefill_ranks=1, generation="request-a"
+        )
+        mgr.register_deferred_abort_room(room, generation="request-a")
+        q._defer_release(dreq)
+
+        with patch.object(decode_mod, "release_kv_cache") as release:
+            q.resolve_deferred_releases()
+
+        release.assert_not_called()
+        self.assertEqual(len(q._deferred_releases), 1)
+        self.assertEqual(q._deferred_releases[0][1], float("inf"))
+
+    def test_memory_release_rejects_pending_deferred_holds(self):
+        q = _make_queue()
+        q.queue = []
+        q._deferred_releases.append((object(), float("inf"), 1, 1, None))
+
+        with self.assertRaisesRegex(RuntimeError, "drain acknowledgements"):
+            q.release_memory_occupation()
+
     def test_failed_release_is_isolated_and_not_retried(self):
         # A raising _do_release must drop the entry (no double-free on retry) and
         # not brick resolve for the remaining entries or subsequent calls.
@@ -213,8 +269,8 @@ class TestResolveDeferredReleases(CustomTestCase):
         good = _make_decode_req(700, 1, mgr)
         bad = _make_decode_req(701, 2, mgr)
         # Both already past deadline -> both selected for release.
-        q._deferred_releases.append((bad, float("-inf"), 2, 1))
-        q._deferred_releases.append((good, float("-inf"), 1, 1))
+        q._deferred_releases.append((bad, float("-inf"), 2, 1, None))
+        q._deferred_releases.append((good, float("-inf"), 1, 1, None))
 
         calls = []
 
@@ -237,10 +293,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         dreq = _make_decode_req(room=400, idx=9, mgr=mgr)
         q._defer_release(dreq)
         self.assertEqual(len(q._deferred_releases), 1)
-        held_req, deadline, held_idx, required = q._deferred_releases[0]
+        held_req, deadline, held_idx, required, generation = q._deferred_releases[0]
         self.assertIs(held_req, dreq)
         self.assertEqual(held_idx, 9)
         self.assertIsInstance(deadline, float)
+        self.assertIsNone(generation)
 
 
 if __name__ == "__main__":
