@@ -577,6 +577,10 @@ class Envs:
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # Explicit per-rank CPU memory capacity (MB), overriding NUMA/cgroup probing
+    # in get_cpu_memory_capacity where probing is wrong (nested virtualization,
+    # sandboxed runtimes). Unset -> probe.
+    SGLANG_CPU_MEMORY_CAPACITY_MB = EnvFloat(None)
 
     # ===================================================================
     # Scheduler token budgeting and admission

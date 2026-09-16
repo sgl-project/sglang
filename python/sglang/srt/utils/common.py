@@ -868,14 +868,6 @@ def _read_cgroup_memory_max():
     return _cgroup_memory_limit_and_used()[0]
 
 
-def get_available_cpu_memory():
-    # Total CPU memory capacity in bytes: the cgroup memory limit when the
-    # process is capped (e.g. a container started with docker --memory),
-    # otherwise the host total.
-    limit = _read_cgroup_memory_max()
-    return limit if limit is not None else psutil.virtual_memory().total
-
-
 def get_used_cpu_memory():
     # Usage in bytes of the cgroup dir that supplies the binding limit, so it is
     # the same scope as _read_cgroup_memory_max (memory.current there already
@@ -1038,22 +1030,18 @@ def get_cpu_memory_capacity():
     pool no headroom. None is the safe answer -- the caller then falls back to a
     fixed fraction.
     """
-    override = os.environ.get("SGLANG_CPU_MEMORY_CAPACITY_MB", "").strip()
-    if override:
-        try:
-            value = float(override)
-            if value > 0:
-                logger.info(
-                    "Using SGLANG_CPU_MEMORY_CAPACITY_MB=%s MB as the per-rank CPU "
-                    "memory capacity.",
-                    value,
-                )
-                return value
-        except ValueError:
-            pass
+    override = envs.SGLANG_CPU_MEMORY_CAPACITY_MB.get()
+    if override is not None:
+        if override > 0:
+            logger.info(
+                "Using SGLANG_CPU_MEMORY_CAPACITY_MB=%s MB as the per-rank CPU "
+                "memory capacity.",
+                override,
+            )
+            return override
         logger.warning(
-            "Ignoring invalid SGLANG_CPU_MEMORY_CAPACITY_MB=%r; expected a positive "
-            "number of MB.",
+            "Ignoring non-positive SGLANG_CPU_MEMORY_CAPACITY_MB=%r; expected a "
+            "positive number of MB.",
             override,
         )
 
