@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -24,18 +25,32 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheRequestHandle:
+    rid: str
+    attempt_id: int
+
+
+class CacheRequestOutcome(Enum):
+    SUCCESS = auto()
+    ABORT = auto()
 
 
 @runtime_checkable
@@ -78,6 +93,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
     # Logical-page KV sharding: rotation base of the chain the inserted
@@ -319,11 +335,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    buffer_pipeline: Optional[BufferModePipeline] = None
+    storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        labels = {"cache_type": self.__class__.__name__}
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__, get_parallel(), is_dp_attention_enabled()
+        )
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
@@ -345,6 +367,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Kernel-side unpinning during process reclaim can stall teardown for
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
+
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        """Release attempt state; caches without prefetch state have nothing to drop."""
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        """Finish an attempt without cancelling successful asynchronous cache work."""
+        if outcome != CacheRequestOutcome.SUCCESS:
+            self.release_aborted_request(handle)
 
     @abstractmethod
     def reset(self):
@@ -415,12 +445,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
         """
-        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        # Adjacent pieces whose seam falls inside one (DCP-widened) page would
+        # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
             self.token_to_kv_pool_allocator,
-            [(row[start:end], start) for start, end in ranges],
+            [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
         )
 
@@ -466,6 +498,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
+    def swa_transient_size(self):
+        """Allocated SWA tokens owned outside the request and tree views."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 
@@ -475,26 +511,32 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> Optional[Tuple[torch.Tensor, Any]]:
         """
-        Preparing KV cache loading from host to device.
+        Prepare host-to-device loading. None means retry admission; an empty
+        tensor can be a successful auxiliary-only load or a recompute fallback.
         """
         raise NotImplementedError()
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self,
+        handle: CacheRequestHandle,
+        fulfilled_tokens: int,
+        reason: Optional[str],
     ) -> None:
         """Resolve storage-hit accounting once a request is admitted.
 
         Non-storage caches have no lifecycle state to resolve.
         """
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
-        return self.pop_prefetch_loaded_tokens(req_id), None
+        return self.pop_prefetch_loaded_tokens(handle), None
 
     def ready_to_load_host_cache(self) -> Any:
         """
