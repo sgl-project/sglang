@@ -159,6 +159,9 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # DLLM block_extend paged wrappers to run: the captured bucket's set under a
+    # cuda graph, the backend's eager ones otherwise; None for non-DLLM models.
+    dllm_paged_wrappers: Optional[List[BatchPrefillWithPagedKVCacheWrapper]] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -390,6 +393,13 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        # The FlashInfer block_extend mask cannot be combined with sliding
+        # window (window_left>=0) or custom masks, so DLLM always uses a single
+        # full block-causal wrapper regardless of sliding_window_size.
+        if self.is_dllm_model:
+            self.num_wrappers = 1
+            self.dispatch_reason = None
+
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
@@ -480,6 +490,29 @@ class FlashInferAttnBackend(AttentionBackend):
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
+        # DLLM block-extend wrappers for the ragged/paged cascade. They carry
+        # the block-causal mask (query block >= kv block on the global block
+        # grid), so plan()/run() take q/kv offsets instead of causal.
+        if self.is_dllm_model and not skip_prefill:
+            self.dllm_block_size = self.dllm_config.block_size
+            self.dllm_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.prefill_backend,
+                block_extend=True,
+                block_size=self.dllm_block_size,
+            )
+            self.dllm_wrapper_paged = [
+                BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    backend=self.prefill_backend,
+                    block_extend=True,
+                    block_size=self.dllm_block_size,
+                )
+                for _ in range(self.num_wrappers)
+            ]
+
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
@@ -522,6 +555,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+        self.dllm_prefill_cuda_graph_metadata = {}  # For DLLM_EXTEND block_extend
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
@@ -751,9 +785,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                # Reconstructed, not read off the batch: the replay view has no
+                # extend_prefix_lens, and capture pre-fills one block per slot.
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=not self.use_paged,
+                prefill_wrappers=self.dllm_prefill_cuda_graph_metadata[bs],
+                # One paged kernel covers prefix and this block, so no ragged
+                # pass, and no fixed_split_size (flashinfer warns under graphs).
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
@@ -978,8 +1016,18 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
+            if self.is_dllm_model:
+                # DLLM extend runs the ragged (current chunk) + paged (prefix)
+                # cascade on the dedicated block_extend wrappers; extend_no_prefix
+                # must stay False so forward_extend takes the cascade branch.
+                use_ragged = (
+                    not self.enable_deterministic
+                    and not is_in_tc_piecewise_cuda_graph()
+                    and not self.use_paged
+                )
+                extend_no_prefix = False
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
+            elif self.is_multimodal or self.enable_mis:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -1028,6 +1076,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                dllm_paged_wrappers=(
+                    self.dllm_wrapper_paged
+                    if self.is_dllm_model and not self.skip_prefill
+                    else None
+                ),
             )
 
     def init_cuda_graph_state(
@@ -1071,6 +1124,26 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
+
+        if self.is_dllm_model and not self.skip_prefill:
+            # The paged side covers whole sequences at page_size 1, hence
+            # bs * max_context_len rather than the generic token-based size,
+            # plus the 256 entries call_begin_forward packs alongside them.
+            self.cuda_graph_dllm_qo_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cuda"
+            )
+            self.cuda_graph_dllm_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cuda"
+            )
+            self.cuda_graph_dllm_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device="cuda"
+            )
+            self.cuda_graph_dllm_q_offsets = torch.zeros(
+                (max_bs,), dtype=torch.int32, device="cuda"
+            )
+            self.cuda_graph_dllm_kv_indices = torch.zeros(
+                (max_bs * self.max_context_len + 256,), dtype=torch.int32, device="cuda"
+            )
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
         return [
@@ -1134,6 +1207,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
         return wrappers
+
+    def _create_dllm_prefill_wrappers(self, bs: int) -> list:
+        # One set per captured bs: cuda-graph mode pins _fixed_batch_size from
+        # qo_indptr_buf and the qo row count from the first plan(). The fixed
+        # buffers are singletons, so DLLM must not dispatch per layer.
+        assert self.num_wrappers == 1 and self.dispatch_reason is None
+        return [
+            BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                backend=self.prefill_backend,
+                qo_indptr_buf=self.cuda_graph_dllm_qo_indptr[: bs + 1],
+                paged_kv_indptr_buf=self.cuda_graph_dllm_kv_indptr[: bs + 1],
+                paged_kv_indices_buf=self.cuda_graph_dllm_kv_indices,
+                paged_kv_last_page_len_buf=self.cuda_graph_dllm_last_page_len[:bs],
+                block_extend=True,
+                block_size=self.dllm_block_size,
+                q_offsets_buf=self.cuda_graph_dllm_q_offsets[:bs],
+            )
+        ]
 
     @staticmethod
     def _full_cg_prefill_workspace_bytes(
@@ -1256,17 +1350,22 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-        elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
+        elif forward_mode.is_dllm_extend():
+            # Single paged block_extend kernel over the whole sequence; the KV
+            # write runs first, so no ragged prefix pass and no merge_state.
+            dllm_wrappers = self._create_dllm_prefill_wrappers(bs)
+            self.dllm_prefill_cuda_graph_metadata[bs] = dllm_wrappers
+            self.forward_metadata = PrefillMetadata(
+                dllm_wrappers, False, False, dllm_paged_wrappers=dllm_wrappers
+            )
+        elif forward_mode.is_target_verify():
             use_custom_mask = (
-                forward_mode.is_target_verify()
-                and spec_info is not None
+                spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(
-                prefill_wrappers, forward_mode.is_dllm_extend(), False
-            )
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
@@ -1332,6 +1431,62 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 
         # use paged attention
+        if self.is_dllm_model:
+            assert not self.forward_metadata.extend_no_prefix
+            assert not self.prefill_uses_dequant_workspace
+            # Captured buckets carry their own set; either way the mask and
+            # block size are baked in, so run() takes no causal, window, or
+            # sm_scale argument -- the scale is plan()'s 1 / sqrt(head_dim).
+            dllm_paged = self.forward_metadata.dllm_paged_wrappers
+            assert dllm_paged is not None
+            if self.forward_metadata.use_ragged:
+                # block_extend ragged+paged cascade over the current chunk and
+                # the prefix. Eager only: no cuda-graph ragged counterpart.
+                if k is None and v is None:
+                    k = kv_cache[0]
+                    v = kv_cache[1]
+                o1, s1 = self.dllm_wrapper_ragged.run(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    return_lse=True,
+                )
+                o2, s2 = dllm_paged[self._get_wrapper_idx(layer)].run(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    return_lse=True,
+                )
+                o, _ = _safe_merge_state(o1, s1, o2, s2)
+                if save_kv_cache:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                    )
+            else:
+                # One paged run over the whole sequence, so this block has to
+                # be in the KV cache before it starts -- write first.
+                assert k is None or save_kv_cache, (
+                    "DLLM paged block_extend reads the current block from the "
+                    "KV cache, which requires the write"
+                )
+                if k is not None and save_kv_cache:
+                    assert v is not None
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        *self._kv_write_scales(layer),
+                    )
+                o = dllm_paged[self._get_wrapper_idx(layer)].run(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                )
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
@@ -2194,6 +2349,41 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            # DLLM eager cascade: block_extend wants the chunk's global
+            # positions as q_offsets, the chunk offset as kv_offsets for the
+            # ragged half, and 0 (omitted) for the paged prefix.
+            if self.attn_backend.is_dllm_model:
+                assert not wrapper_paged.is_cuda_graph_enabled, (
+                    "DLLM has no cuda-graph ragged counterpart; captured "
+                    "buckets must plan the paged-only branch below"
+                )
+                q_offsets = prefix_lens.to(torch.int32)
+                self.attn_backend.dllm_wrapper_ragged.plan(
+                    qo_indptr=qo_indptr,
+                    kv_indptr=qo_indptr,
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    q_data_type=self.q_data_type,
+                    q_offsets=q_offsets,
+                    kv_offsets=q_offsets,
+                )
+                self.attn_backend.dllm_wrapper_paged[0].plan(
+                    qo_indptr=qo_indptr,
+                    paged_kv_indptr=kv_indptr,
+                    paged_kv_indices=kv_indices,
+                    paged_kv_last_page_len=self.kv_last_page_len[:bs],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=1,
+                    q_data_type=self.q_data_type,
+                    kv_data_type=self.data_type,
+                    q_offsets=q_offsets,
+                    kv_offsets=None,
+                )
+                return
+
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
@@ -2202,6 +2392,31 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
+        elif self.attn_backend.is_dllm_model and prefix_lens is not None:
+            # Paged-only DLLM path (deterministic / use_paged / piecewise CG,
+            # and every captured bucket). kv_indptr already covers prefix plus
+            # this block, so kv_offsets stays None and q_offsets is this
+            # block's global start.
+            dllm_wrapper = (
+                wrapper_paged
+                if wrapper_paged.is_cuda_graph_enabled
+                else self.attn_backend.dllm_wrapper_paged[0]
+            )
+            dllm_wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
+                paged_kv_indices=kv_indices,
+                paged_kv_last_page_len=self.kv_last_page_len[:bs],
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_dim,
+                page_size=1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                q_offsets=prefix_lens.to(torch.int32),
+                kv_offsets=None,
+            )
+            return
 
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
