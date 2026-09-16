@@ -64,7 +64,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import resolution_result, resolving_view
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolution_result,
+    resolving_view,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -87,7 +91,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule, publish
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    get_schedule,
+    publish,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -356,12 +365,12 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
         model_runner = ModelRunner(**runner_kwargs)
-        if cfg.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
-        if cfg.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             model_runner.finalize_startup_weight_load()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
@@ -432,9 +441,9 @@ def prepare_extend_inputs_for_correctness_test(
         req: Req = reqs[i]
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
-            # Use req.req_pool_idx instead of i to handle slot 0 padding correctly
+            # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
             req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : bench_args.cut_len
+                req.kv.req_pool_idx, : bench_args.cut_len
             ].to(req.prefix_indices.dtype)
             req.logprob_start_len = -1
         req.set_extend_range(
@@ -548,7 +557,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
@@ -899,9 +908,12 @@ def latency_test(
     initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel().config
+        parallel = get_parallel()
         set_gpu_proc_affinity(
-            parallel.pp_size, parallel.tp_size, parallel.nnodes, tp_rank
+            parallel.pp_size,
+            parallel.tp_size,
+            parallel.nnodes,
+            tp_rank,
         )
 
     # Configure the logger
@@ -1026,8 +1038,8 @@ def main(server_args, bench_args):
         decode = dict(graph_config.get(Phase.DECODE) or {})
         decode["max_bs"] = max(bench_args.batch_size)
         graph_config[Phase.DECODE] = decode
-    server_args = server_args.replace_resolved(
-        "benchmark.one_batch", cuda_graph_config=graph_config
+    declare_resolution(
+        server_args, "benchmark.one_batch", cuda_graph_config=graph_config
     )
     server_args.resolve_once()
     cfg = resolving_view(server_args)

@@ -16,15 +16,8 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    GetWeightsChecksumReqInput,
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
-    UpdateWeightFromTensorReqInput,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -32,6 +25,14 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
@@ -62,8 +63,8 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
-from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -89,8 +90,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         server_args: ServerArgs,
         gpu_id: int,
         port_args: PortArgs,
-        task_pipes_to_slaves: list = None,
-        result_pipes_from_slaves: list = None,
         local_rank: int | None = None,
     ):
         self.server_args = server_args
@@ -133,8 +132,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
-        self.task_pipes_to_slaves = task_pipes_to_slaves
-        self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -724,25 +721,38 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         replies to client, only on rank 0
         """
         if not should_not_return and self.receiver is not None and identity is not None:
-            # if the server is local, use temp file to spill the frame array instead of
-            # leaving it in OutputBatch to be pickled later
-            if is_local_endpoint(self.server_args.scheduler_endpoint):
+            with maybe_record_function("REPLY spill+pickle+send"):
+                # if the server is local, use temp file to spill the frame array
+                # instead of leaving it in OutputBatch to be pickled later
+                if is_local_endpoint(self.server_args.scheduler_endpoint):
+                    with self._record_return_stage(
+                        output_batch, "Scheduler.return_result.spill_arrays"
+                    ):
+                        output_batch.output = spill_large_arrays_to_file_refs(
+                            output_batch.output
+                        )
+
                 with self._record_return_stage(
-                    output_batch, "Scheduler.return_result.spill_arrays"
+                    output_batch, "Scheduler.return_result.pickle"
                 ):
-                    output_batch.output = spill_large_arrays_to_file_refs(
-                        output_batch.output
-                    )
+                    payload = pickle.dumps(output_batch)
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.pickle"
-            ):
-                payload = pickle.dumps(output_batch)
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.send"
+                ):
+                    self.receiver.send_multipart([identity, b"", payload])
 
-            with self._record_return_stage(
-                output_batch, "Scheduler.return_result.send"
-            ):
-                self.receiver.send_multipart([identity, b"", payload])
+    @staticmethod
+    def _req_label(items: list) -> str:
+        """Short request tag for profiler span names."""
+        req = items[0][1] if items else None
+        if isinstance(req, list) and req:
+            req = req[0]
+        # request_id is Optional; server warmup and bare server-test
+        # requests arrive without one.
+        if isinstance(req, Req) and req.request_id:
+            return req.request_id[:8]
+        return type(req).__name__
 
     def _return_item_result(
         self,
@@ -1231,7 +1241,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 continue
 
             try:
-                handler_result = self._dispatch_items(items)
+                with maybe_record_function(
+                    f"REQ {self._req_label(items)} dispatch+forward"
+                ):
+                    handler_result = self._dispatch_items(items)
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
@@ -1282,21 +1295,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self.receiver.close()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
-
-    def _broadcast_task(self, payload: dict[str, Any]) -> None:
-        """Broadcast a task to all slave worker processes."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        task = {"method": method, "kwargs": kwargs}
-        for pipe in self.task_pipes_to_slaves:
-            pipe.send(task)
-
-    def _collect_slave_results(self) -> List[dict[str, Any]]:
-        """Collect results from all slave worker processes."""
-        results = []
-        for pipe in self.result_pipes_from_slaves:
-            results.append(pipe.recv())
-        return results
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")

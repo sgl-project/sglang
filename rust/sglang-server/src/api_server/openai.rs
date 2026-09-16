@@ -1,7 +1,7 @@
 //! OpenAI-compatible generation endpoints.
 //!
 //! The HTTP adapter stays deliberately thin: Dynamo owns the standard OpenAI
-//! request and response primitives. Native [`ChunkEvent`] values remain the one
+//! request and response primitives. Scheduler [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
 use axum::{Router, http::StatusCode, response::Response};
@@ -14,9 +14,12 @@ mod completions;
 mod models;
 mod reasoning;
 mod template;
+mod template_builtins;
+mod template_legacy;
+mod template_loader;
 mod tools;
 
-pub(super) use template::ChatFormatter;
+pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
@@ -59,6 +62,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     match template::load_chat_formatter(
         config_file.as_deref(),
         (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
+        server_args.model_config.model_type.as_deref(),
         server_args.chat_template.as_deref(),
     ) {
         Ok(formatter) => {

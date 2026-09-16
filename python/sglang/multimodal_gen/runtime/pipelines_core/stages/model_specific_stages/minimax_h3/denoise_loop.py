@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -313,6 +319,7 @@ class MiniMaxH3DenoiseBranch:
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
         step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
         audio_x = self.audio_x_buffer
@@ -335,7 +342,7 @@ class MiniMaxH3DenoiseBranch:
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
         unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
-        return {
+        kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
@@ -343,6 +350,11 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
             "block_combined_indices": block_combined_indices,
         }
+        if adaln_slot is not None:
+            # Device scalar, never a Python int: an int would key one breakable
+            # CUDA graph per slot value and go stale when LRU reuses the slot.
+            kwargs["adaln_cache_slot"] = adaln_slot
+        return kwargs
 
     def _expand_step_timesteps(
         self,
@@ -447,6 +459,7 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -530,7 +543,7 @@ def minimax_h3_denoise_loop(
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
     # one pass here instead of topping up step by step inside the loop.
-    model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    adaln_plan_slots = model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
 
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
@@ -554,8 +567,20 @@ def minimax_h3_denoise_loop(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
                 step_timesteps=timestep_plan[step],
+                adaln_slot=(
+                    None if adaln_plan_slots is None else adaln_plan_slots[step]
+                ),
             )
-            with torch.inference_mode():
+            if attn_metadata is not None:
+                attn_metadata.current_timestep = step
+            if model_forward is None and attn_metadata is not None:
+                forward_cm: AbstractContextManager = set_forward_context(
+                    current_timestep=step,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                forward_cm = nullcontext()
+            with forward_cm, torch.inference_mode():
                 if model_forward is None:
                     v_video, v_audio = model(**fk)
                 else:

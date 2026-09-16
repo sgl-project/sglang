@@ -79,6 +79,12 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    # The runner's KVIndexTranslator; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    kv_index_translator = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -123,6 +129,8 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    supports_draft_extend_metadata_staging: bool = False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
@@ -144,6 +152,9 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.

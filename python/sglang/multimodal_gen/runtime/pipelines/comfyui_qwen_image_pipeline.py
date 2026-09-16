@@ -35,8 +35,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+    set_mixed_precision_policy,
+)
 
 logger = init_logger(__name__)
 
@@ -233,9 +235,6 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             use_fsdp = server_args.should_use_fsdp_for_component("transformer")
-            component_starts_on_cpu = server_args.should_start_component_on_cpu(
-                "transformer"
-            )
             if current_platform.is_mps():
                 use_fsdp = False
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")

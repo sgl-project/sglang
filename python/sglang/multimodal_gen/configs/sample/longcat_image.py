@@ -9,9 +9,19 @@ class LongCatImageSamplingParams(SamplingParams):
     guidance_scale: float = 4.5
     height: int = 1024
     width: int = 1024
-    # Override base class defaults to enable LongCat-specific features by default
     enable_cfg_renorm: bool = True
+    cfg_renorm_min: float = 0.0
     enable_prompt_rewrite: bool = True
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "cfg_renorm_min",
+                "enable_cfg_renorm",
+                "enable_prompt_rewrite",
+            }
+        )
 
 
 @dataclass

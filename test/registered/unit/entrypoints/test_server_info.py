@@ -21,11 +21,14 @@ Current coverage:
 """
 
 import asyncio
-import dataclasses
 import json
 import unittest
 from types import SimpleNamespace
 
+import msgspec
+import msgspec.structs
+
+from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -34,7 +37,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+
+class _CustomModelLoader:
+    pass
 
 
 def _stub_tokenizer_manager(
@@ -52,6 +59,45 @@ def _stub_tokenizer_manager(
     tokenizer_manager.startup_time = None
     tokenizer_manager.get_internal_state = get_internal_state
     return tokenizer_manager
+
+
+class TestModelInfoSerialization(CustomTestCase):
+    def test_model_info_serializes_custom_loader_class(self):
+        server_args = ServerArgs(model_path="dummy")
+        values = {
+            "weight_version": None,
+            "load_format": _CustomModelLoader,
+            "reasoning_parser": None,
+            "tool_call_parser": None,
+        }
+        tokenizer_manager = SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_image_understandable_model=False,
+                is_audio_understandable_model=False,
+                hf_config=SimpleNamespace(
+                    model_type="test", architectures=["TestModel"]
+                ),
+                embedding_model_spec=None,
+            ),
+            model_path="dummy",
+            served_model_name="dummy",
+            server_args=server_args,
+            is_generation=True,
+            config_value=values.__getitem__,
+        )
+        prior_state = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=tokenizer_manager)
+        )
+        publish(server_args, role="tokenizer")
+        try:
+            payload = asyncio.run(http_server.model_info())
+        finally:
+            http_server._global_state = prior_state
+            reset_context()
+
+        self.assertEqual(payload["load_format"], f"{__name__}._CustomModelLoader")
+        json.dumps(payload)
 
 
 def _call_server_info_with(
@@ -456,7 +502,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         info = _call_server_info_with(args)
 
-        for field in dataclasses.fields(ServerArgs):
+        for field in msgspec.structs.fields(ServerArgs):
             self.assertIn(
                 field.name,
                 info,
@@ -530,7 +576,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
     def test_requires_kv_events_config(self):
         args = ServerArgs(model_path="dummy", load_publish_endpoint="tcp://*:6000")
         with self.assertRaisesRegex(ValueError, "kv-events"):
-            args.check_load_publish_args()
+            check_load_publish_args(args)
 
     def test_rejects_non_bindable_endpoint(self):
         args = ServerArgs(
@@ -539,7 +585,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
             load_publish_endpoint="tcp://10.0.0.5:6000",
         )
         with self.assertRaisesRegex(ValueError, "bindable"):
-            args.check_load_publish_args()
+            check_load_publish_args(args)
 
     def test_rejects_endpoint_overlapping_the_kv_range(self):
         args = ServerArgs(
@@ -549,7 +595,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
             load_publish_endpoint="tcp://*:5558",
         )
         with self.assertRaisesRegex(ValueError, "overlaps"):
-            args.check_load_publish_args()
+            check_load_publish_args(args)
 
     def test_rejects_null_publisher(self):
         # publisher='null' disables KV events, so there is nothing to advertise
@@ -560,7 +606,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
             load_publish_endpoint="auto",
         )
         with self.assertRaisesRegex(ValueError, "null"):
-            args.check_load_publish_args()
+            check_load_publish_args(args)
 
     def test_rejects_unparseable_kv_events_config(self):
         args = ServerArgs(
@@ -569,7 +615,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
             load_publish_endpoint="auto",
         )
         with self.assertRaisesRegex(ValueError, "not parseable"):
-            args.check_load_publish_args()
+            check_load_publish_args(args)
 
     def test_off_and_valid_endpoint_pass(self):
         for endpoint in (None, "off", "OFF", "auto", "tcp://*:6000"):
@@ -581,7 +627,7 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
                     ),
                     load_publish_endpoint=endpoint,
                 )
-                args.check_load_publish_args()  # must not raise
+                check_load_publish_args(args)  # must not raise
 
 
 if __name__ == "__main__":
