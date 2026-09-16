@@ -19,6 +19,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    apply_attention_mhc as apply_attention_mhc,
+)
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     forward_hc_pre_from_prev_fused_boundary,
 )
 

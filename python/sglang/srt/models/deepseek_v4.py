@@ -2532,6 +2532,9 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
+        return self._project_wo_b(o)
+
+    def _project_wo_b(self, o):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
@@ -2539,7 +2542,9 @@ class MQALayer(MqaAttentionBase):
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=mhc is not None,
         )
-        if mhc is not None:
+        if mhc is not None and _is_hip:
+            _hip.apply_attention_mhc(o, mhc)
+        elif mhc is not None:
             from sglang.kernels.ops.communication.all_reduce_mhc import (
                 all_reduce_mhc_norm,
             )
