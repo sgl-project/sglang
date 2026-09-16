@@ -638,30 +638,30 @@ class GptOssDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=fuse_ffn_allreduce,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
             hidden_states = self.ffn(hidden_states, forward_batch)
 
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not fuse_mlp_allreduce:
+        if not fuse_ffn_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -1429,7 +1429,7 @@ def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]
             if w_blocks is not None:
                 weights_out_dict[name_prefix] = _WeightCreator(
                     partial(
-                        _dequant_mlp_weight,
+                        _dequant_ffn_weight,
                         debug_name=name_prefix,
                         w_blocks=w_blocks,
                         w_scales=w_scales,
@@ -1439,7 +1439,7 @@ def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]
     return list(weights_out_dict.items())
 
 
-def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
+def _dequant_ffn_weight(debug_name, w_blocks, w_scales):
     if get_parallel().tp_rank == 0:
         logger.info(f"Dequantize {debug_name} start")
 

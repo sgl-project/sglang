@@ -365,16 +365,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, state.hidden_states_ffn_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+            state.router_logits, _ = self.gate(state.hidden_states_ffn_input)
         else:
             state.router_logits = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        hidden_states = state.hidden_states_ffn_input
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
@@ -393,7 +393,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
+                hidden_states=state.pop("hidden_states_ffn_input"),
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
@@ -427,7 +427,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
 
     def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
+        state.hidden_states_ffn_output = state.pop("hidden_states_after_combine")
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -822,28 +822,28 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=fuse_ffn_allreduce,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
             hidden_states = self.ffn(hidden_states, forward_batch)
 
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -872,9 +872,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-    def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
+    def op_comm_prepare_ffn(self, state):
+        state.hidden_states_ffn_input, state.residual_after_comm_pre_ffn = (
+            self.layer_communicator.prepare_ffn(
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
@@ -883,8 +883,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
+            state.pop("hidden_states_ffn_output"),
+            state.pop("residual_after_comm_pre_ffn"),
             state.forward_batch,
         )
 

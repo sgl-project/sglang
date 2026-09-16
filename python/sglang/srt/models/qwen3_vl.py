@@ -169,8 +169,8 @@ class Qwen3_VisionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
-        return mlp_output
+        ffn_output, _ = self.linear_fc2(self.act(x_fc1))
+        return ffn_output
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):

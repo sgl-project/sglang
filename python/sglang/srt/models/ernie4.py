@@ -199,17 +199,17 @@ class Ernie4DecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = Ernie4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

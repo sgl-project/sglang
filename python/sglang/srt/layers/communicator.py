@@ -399,7 +399,7 @@ class LayerScatterModes:
     layer_input_mode: ScatterMode
     attn_mode: ScatterMode
     # Can be further split into e.g. ffn_input_mode and ffn_output_mode if needed
-    mlp_mode: ScatterMode
+    ffn_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
 
@@ -409,7 +409,7 @@ class LayerScatterModes:
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
-            mlp_mode=cls._compute_mlp_mode(context),
+            ffn_mode=cls._compute_ffn_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
         )
@@ -421,7 +421,7 @@ class LayerScatterModes:
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
-    def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
+    def _compute_ffn_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
@@ -460,23 +460,23 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
-        if mlp_mode == ScatterMode.SCATTERED:
+        ffn_mode = cls._compute_ffn_mode(context)
+        if ffn_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
+        if ffn_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
-        mlp_mode = cls._compute_mlp_mode(context)
+        ffn_mode = cls._compute_ffn_mode(context)
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
-        if mlp_mode == ScatterMode.SCATTERED:
+        if ffn_mode == ScatterMode.SCATTERED:
             if cls._should_gather_for_tbo(context):
                 return ScatterMode.TP_ATTN_FULL
             return ScatterMode.SCATTERED
-        if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
+        if ffn_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
@@ -558,7 +558,7 @@ class LayerCommunicator:
                 layer_scatter_modes=LayerScatterModes(
                     layer_input_mode=ScatterMode.SCATTERED,
                     attn_mode=ScatterMode.SCATTERED,
-                    mlp_mode=ScatterMode.SCATTERED,
+                    ffn_mode=ScatterMode.SCATTERED,
                     middle_residual_mode=ScatterMode.SCATTERED,
                     layer_output_mode=ScatterMode.SCATTERED,
                 ),
@@ -583,14 +583,14 @@ class LayerCommunicator:
             CommunicateWithAllReduceAndLayerNormFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
                 residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
+                hidden_states_output_mode=self.layer_scatter_modes.ffn_mode,
                 residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
                 context=self._context,
             )
         )
         self._communicate_summable_tensor_pair_fn = (
             CommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
+                hidden_states_input_mode=self.layer_scatter_modes.ffn_mode,
                 residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
                 output_mode=self.layer_scatter_modes.layer_output_mode,
                 context=self._context,
@@ -630,7 +630,7 @@ class LayerCommunicator:
         return hidden_states, residual
 
     def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
-        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
+        """True if ``prepare_ffn``'s post-attention RMSNorm leaves ``residual``
         untouched, so Eagle3 aux capture can keep its reference and skip the clone.
 
         Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
@@ -857,7 +857,7 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return tp_reduce_scatter(hidden_states, residual, self._context)
 
-    def prepare_mlp(
+    def prepare_ffn(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
@@ -865,7 +865,7 @@ class LayerCommunicator:
         cache=None,
     ):
         if self._sp_variant is not None and get_forward().sp_active:
-            return self._sp_variant.prepare_mlp(
+            return self._sp_variant.prepare_ffn(
                 hidden_states, residual, forward_batch, cache
             )
         if cache is not None:
@@ -922,7 +922,7 @@ class LayerCommunicator:
         return False
 
     # NOTE: This function will cause torch recompilation
-    def should_fuse_mlp_allreduce_with_next_layer(
+    def should_fuse_ffn_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
@@ -931,7 +931,7 @@ class LayerCommunicator:
         # TP_ATTN_FULL size, causing a shape mismatch.
         if (
             is_enable_moe_cp_allgather()
-            or self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL
+            or self.layer_scatter_modes.ffn_mode == ScatterMode.MOE_FULL
         ):
             return False
 
@@ -963,9 +963,9 @@ class LayerCommunicator:
             else 0
         )
 
-        # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
+        # When ffn_mode is SCATTERED, the MLP runs on scattered data with no TP
         # all-reduce, so there is nothing to fuse with the next layer.
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+        if self.layer_scatter_modes.ffn_mode == ScatterMode.SCATTERED:
             return False
 
         return (
@@ -1566,7 +1566,7 @@ class CommunicateSummableTensorPairFn:
         """Scatter MoE output back to TP_ATTN_FULL after MOE_FULL computation.
 
         After moe_tensor_model_parallel_all_reduce (which runs unconditionally since
-        mlp_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
+        ffn_reduce_scatter=False for this path), all ranks in the moe_cp group hold the
         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
         CP-local portion.
 

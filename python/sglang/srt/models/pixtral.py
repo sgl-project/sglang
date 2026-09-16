@@ -660,7 +660,7 @@ def apply_rotary_emb_vit(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-class FeedForward(nn.Module):
+class FFN(nn.Module):
     def __init__(self, args: VisionEncoderArgs):
         super().__init__()
         assert args.intermediate_size is not None
@@ -719,7 +719,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, args: VisionEncoderArgs):
         super().__init__()
         self.attention = Attention(args)
-        self.ffn = FeedForward(args)
+        self.ffn = FFN(args)
         self.attention_norm = RMSNorm(args.hidden_size, eps=1e-5)
         self.ffn_norm = RMSNorm(args.hidden_size, eps=1e-5)
 

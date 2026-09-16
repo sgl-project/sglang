@@ -259,7 +259,7 @@ class MiMoVisionTransformer(nn.Module):
         self.window_size = vision_config.window_size
         self.patch_size = vision_config.patch_size
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
-        mlp_hidden_size: int = vision_config.intermediate_size
+        ffn_hidden_size: int = vision_config.intermediate_size
         self.patch_embed = MiMoVisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -281,7 +281,7 @@ class MiMoVisionTransformer(nn.Module):
             [
                 MiMoVisionBlock(
                     dim=hidden_size,
-                    intermediate_dim=mlp_hidden_size,
+                    intermediate_dim=ffn_hidden_size,
                     num_heads=num_heads,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,

@@ -28,7 +28,7 @@ class TestDenseMlpScatterModeUnderPrefillCP(CustomTestCase):
                 is_previous_layer_sparse=False,
                 is_next_layer_sparse=False,
             )
-        self.assertEqual(modes.mlp_mode, ScatterMode.MOE_FULL)
+        self.assertEqual(modes.ffn_mode, ScatterMode.MOE_FULL)
         self.assertEqual(modes.layer_output_mode, ScatterMode.TP_ATTN_FULL)
 
 

@@ -51,15 +51,15 @@ def pad_to_original_num_tokens(
 
 
 def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
-    scatter_mlp = is_sparse and not get_moe_a2a_backend().is_none()
-    mlp_mode = ScatterMode.SCATTERED if scatter_mlp else ScatterMode.FULL
+    scatter_ffn = is_sparse and not get_moe_a2a_backend().is_none()
+    ffn_mode = ScatterMode.SCATTERED if scatter_ffn else ScatterMode.FULL
     middle_residual_mode = (
-        ScatterMode.SCATTERED if scatter_mlp else ScatterMode.TP_ATTN_FULL
+        ScatterMode.SCATTERED if scatter_ffn else ScatterMode.TP_ATTN_FULL
     )
     return LayerScatterModes(
         layer_input_mode=ScatterMode.TP_ATTN_FULL,
         attn_mode=ScatterMode.TP_ATTN_FULL,
-        mlp_mode=mlp_mode,
+        ffn_mode=ffn_mode,
         middle_residual_mode=middle_residual_mode,
         layer_output_mode=ScatterMode.TP_ATTN_FULL,
     )

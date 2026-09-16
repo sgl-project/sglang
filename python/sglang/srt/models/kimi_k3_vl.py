@@ -415,7 +415,7 @@ class MoonViTEncoderLayer(nn.Module):
         self,
         num_heads: int,
         hidden_dim: int,
-        mlp_dim: int,
+        ffn_dim: int,
         qkv_hidden_size: Optional[int] = None,
         norm_type: str = "layernorm",
         *,
@@ -435,7 +435,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         self.norm0 = _make_norm(norm_type, hidden_dim)
         self.norm1 = _make_norm(norm_type, hidden_dim)
-        self.ffn = MLP2([hidden_dim, mlp_dim, hidden_dim], activation, bias=linear_bias)
+        self.ffn = MLP2([hidden_dim, ffn_dim, hidden_dim], activation, bias=linear_bias)
         self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
         self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
         self.attention_backend = attention_backend
@@ -778,7 +778,7 @@ class KimiK3VisionTower(nn.Module):
                 "num_heads": num_heads,
                 "hidden_dim": hidden_size,
                 "qkv_hidden_size": getattr(config, "qkv_hidden_size", None),
-                "mlp_dim": intermediate_size,
+                "ffn_dim": intermediate_size,
                 "norm_type": getattr(config, "norm_type", "layernorm"),
                 "activation": activation,
                 "attn_bias": getattr(config, "attn_bias", True),

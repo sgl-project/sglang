@@ -430,12 +430,12 @@ class LagunaDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        mlp_types = config.mlp_layer_types
-        self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_previous_layer_sparse = layer_id > 0 and mlp_types[layer_id - 1] == "sparse"
+        ffn_types = config.mlp_layer_types
+        self.is_layer_sparse = ffn_types[layer_id] == "sparse"
+        is_previous_layer_sparse = layer_id > 0 and ffn_types[layer_id - 1] == "sparse"
         is_next_layer_sparse = (
             layer_id + 1 < config.num_hidden_layers
-            and mlp_types[layer_id + 1] == "sparse"
+            and ffn_types[layer_id + 1] == "sparse"
         )
 
         if self.is_layer_sparse:
@@ -491,29 +491,29 @@ class LagunaDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=fuse_ffn_allreduce,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
             hidden_states = self.ffn(
                 hidden_states,
                 forward_batch=forward_batch,
             )
 
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(

@@ -398,25 +398,25 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        mlp_layer_types = cfg.mlp_layer_types
+        ffn_layer_types = cfg.mlp_layer_types
         num_experts = cfg.num_experts
 
-        if len(mlp_layer_types) != cfg.num_hidden_layers:
+        if len(ffn_layer_types) != cfg.num_hidden_layers:
             raise ValueError(
                 "Expected len(mlp_layer_types) == num_hidden_layers, got "
-                f"{len(mlp_layer_types)} and {cfg.num_hidden_layers}"
+                f"{len(ffn_layer_types)} and {cfg.num_hidden_layers}"
             )
 
         def _is_sparse(lid: int) -> bool:
             if lid < 0 or lid >= cfg.num_hidden_layers:
                 return False
-            mlp_type = mlp_layer_types[lid]
-            if mlp_type not in ("sparse", "dense"):
+            ffn_type = ffn_layer_types[lid]
+            if ffn_type not in ("sparse", "dense"):
                 raise ValueError(
-                    f"Unsupported mlp_layer_types[{lid}]={mlp_type}; "
+                    f"Unsupported mlp_layer_types[{lid}]={ffn_type}; "
                     "expected 'sparse' or 'dense'"
                 )
-            return mlp_type == "sparse"
+            return ffn_type == "sparse"
 
         self.is_layer_sparse = _is_sparse(layer_id)
 

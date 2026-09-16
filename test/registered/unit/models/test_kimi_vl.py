@@ -87,7 +87,7 @@ class TestKimiVLEncoderParallelism(CustomTestCase):
             layer = MoonVitEncoderLayer(
                 num_heads=2,
                 hidden_dim=8,
-                mlp_dim=16,
+                ffn_dim=16,
                 prefix="vision_tower.encoder.blocks.0",
             )
 

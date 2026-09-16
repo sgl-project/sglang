@@ -668,11 +668,11 @@ class ForwardFlags:
         "is_extend_in_batch": False,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
-        # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
-        # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
+        # fuse_ffn_allreduce: next residual+LN absorbs the post-MLP all-reduce.
+        # ffn_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
-        "fuse_mlp_allreduce": False,
-        "mlp_reduce_scatter": False,
+        "fuse_ffn_allreduce": False,
+        "ffn_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
@@ -687,8 +687,8 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
-            "fuse_mlp_allreduce",
-            "mlp_reduce_scatter",
+            "fuse_ffn_allreduce",
+            "ffn_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "sp_active",
         }

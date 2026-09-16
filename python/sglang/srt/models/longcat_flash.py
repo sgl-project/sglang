@@ -434,7 +434,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        self.mlp_layer_scatter_modes = [
+        self.ffn_layer_scatter_modes = [
             LayerScatterModes.init_new(
                 layer_id=self.layer_id * 2 + i,
                 num_layers=config.num_hidden_layers,
@@ -445,9 +445,9 @@ class LongcatFlashDecoderLayer(nn.Module):
             )
             for i in range(2)
         ]
-        self.mlp_layer_communicator = [
+        self.ffn_layer_communicator = [
             LayerCommunicator(
-                layer_scatter_modes=self.mlp_layer_scatter_modes[i],
+                layer_scatter_modes=self.ffn_layer_scatter_modes[i],
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
                 qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
@@ -497,7 +497,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = attn_out
 
         # moe
-        hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
+        hidden_states, residual = self.moe_layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
         moe_hidden_states = hidden_states.clone()
@@ -507,7 +507,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             moe_hidden_states, moe_residual, forward_batch
         )
 
-        hidden_states, residual, prev_topk_indices = self.forward_mlp(
+        hidden_states, residual, prev_topk_indices = self.forward_ffn(
             hidden_states,
             positions,
             residual,
@@ -524,7 +524,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = moe_hidden_states + hidden_states
         return hidden_states, residual, prev_topk_indices
 
-    def forward_mlp(
+    def forward_ffn(
         self,
         hidden_states,
         positions,
@@ -554,7 +554,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # second_attn
-        hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
+        hidden_states, residual = self.ffn_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
         )
         if hidden_states.shape[0] != 0:
@@ -571,14 +571,14 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = attn_out
 
         # second_mlp
-        hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
+        hidden_states, residual = self.ffn_layer_communicator[1].prepare_ffn(
             hidden_states, residual, forward_batch
         )
         hidden_states = self.ffns[1](hidden_states)
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
+        hidden_states, residual = self.ffn_layer_communicator[1].postprocess_layer(
             hidden_states, residual, forward_batch
         )
 

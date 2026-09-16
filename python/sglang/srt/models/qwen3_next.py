@@ -464,27 +464,27 @@ class Qwen3GatedDeltaNet(nn.Module):
         return output
 
 
-def _apply_qwen3_next_mlp(
+def _apply_qwen3_next_ffn(
     layer: nn.Module,
     hidden_states: torch.Tensor,
     residual: Optional[torch.Tensor],
     forward_batch: ForwardBatch,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    hidden_states, residual = layer.layer_communicator.prepare_mlp(
+    hidden_states, residual = layer.layer_communicator.prepare_ffn(
         hidden_states, residual, forward_batch
     )
-    mlp_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+    ffn_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
         forward_batch
     )
-    fuse_mlp_allreduce = (
-        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+    fuse_ffn_allreduce = (
+        layer.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
             forward_batch
         )
     )
 
     with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
+        fuse_ffn_allreduce=fuse_ffn_allreduce,
+        ffn_reduce_scatter=ffn_reduce_scatter,
     ):
         if isinstance(layer.ffn, Qwen2MoeSparseMoeBlock):
             hidden_states = layer.ffn(
@@ -494,7 +494,7 @@ def _apply_qwen3_next_mlp(
         else:
             hidden_states = layer.ffn(hidden_states)
 
-    if fuse_mlp_allreduce:
+    if fuse_ffn_allreduce:
         hidden_states._sglang_needs_allreduce_fusion = True
     else:
         hidden_states, residual = layer.layer_communicator.postprocess_layer(
@@ -587,7 +587,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
-        hidden_states, residual = _apply_qwen3_next_mlp(
+        hidden_states, residual = _apply_qwen3_next_ffn(
             self, hidden_states, residual, forward_batch
         )
 
@@ -863,7 +863,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = _apply_qwen3_next_mlp(
+        hidden_states, residual = _apply_qwen3_next_ffn(
             self, hidden_states, residual, forward_batch
         )
 

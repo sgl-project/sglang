@@ -297,9 +297,9 @@ class CohereDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states_mlp = self.ffn(hidden_states)
+        hidden_states_ffn = self.ffn(hidden_states)
         # Add everything together
-        hidden_states = residual + hidden_states_attention + hidden_states_mlp
+        hidden_states = residual + hidden_states_attention + hidden_states_ffn
 
         return hidden_states, residual
 

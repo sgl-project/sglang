@@ -50,7 +50,7 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
-class HYV3FeedForward(nn.Module):
+class HYV3FFN(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -135,7 +135,7 @@ class HYV3MoEFused(nn.Module):
         )
 
         if getattr(config, "num_shared_experts", 0) > 0:
-            self.shared_ffn = HYV3FeedForward(
+            self.shared_ffn = HYV3FFN(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size
                 * config.num_shared_experts,
@@ -420,7 +420,7 @@ class HYV3DecoderLayer(nn.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         if layer_id < first_k_dense_replace:
-            self.ffn = HYV3FeedForward(
+            self.ffn = HYV3FFN(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,

@@ -551,25 +551,25 @@ class Dots3MoE(nn.Module):
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, state.hidden_states_ffn_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(state.hidden_states_ffn_input)
         else:
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        hidden_states_ffn_input = state.pop("hidden_states_ffn_input")
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+            state.forward_batch.forward_mode, hidden_states_ffn_input
         ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+            state.shared_output = self.shared_experts(hidden_states_ffn_input)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        hidden_states = state.hidden_states_ffn_input
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -594,7 +594,7 @@ class Dots3MoE(nn.Module):
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
             self.experts.deepep_dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
+                hidden_states=state.hidden_states_ffn_input,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
                 forward_batch=state.forward_batch,
@@ -644,7 +644,7 @@ class Dots3MoE(nn.Module):
         else:
             final_hidden_states *= self.routed_scaling_factor
 
-        state.hidden_states_mlp_output = final_hidden_states
+        state.hidden_states_ffn_output = final_hidden_states
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token.
@@ -1561,17 +1561,17 @@ class Dots3DecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = Dots3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1618,12 +1618,12 @@ class Dots3DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
 
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
@@ -1669,32 +1669,32 @@ class Dots3DecoderLayer(nn.Module):
             )
         )
 
-    def op_comm_prepare_mlp(self, state):
-        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
-            self.layer_communicator.prepare_mlp(
+    def op_comm_prepare_ffn(self, state):
+        state.hidden_states_ffn_input, state.residual_after_comm_pre_ffn = (
+            self.layer_communicator.prepare_ffn(
                 state.pop("hidden_states_after_attn"),
                 state.pop("residual_after_input_ln"),
                 state.forward_batch,
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
+    def op_ffn(self, state):
+        hidden_states = state.pop("hidden_states_ffn_input")
         if not (
             enable_moe_dense_fully_dp()
             and (not self.is_layer_sparse)
             and hidden_states.shape[0] == 0
         ):
-            state.hidden_states_mlp_output = self.ffn(
+            state.hidden_states_ffn_output = self.ffn(
                 hidden_states, state.forward_batch
             )
         else:
-            state.hidden_states_mlp_output = hidden_states
+            state.hidden_states_ffn_output = hidden_states
 
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
-            state.pop("hidden_states_mlp_output"),
-            state.pop("residual_after_comm_pre_mlp"),
+            state.pop("hidden_states_ffn_output"),
+            state.pop("residual_after_comm_pre_ffn"),
             state.forward_batch,
         )
 

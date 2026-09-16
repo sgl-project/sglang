@@ -30,7 +30,7 @@ class SconvType(IntEnum):
     K_LOCAL = 2
     V_LOCAL = 3
     ATTN = 4
-    MLP = 5
+    FFN = 5
 
 
 class ShortConvolution(nn.Module):

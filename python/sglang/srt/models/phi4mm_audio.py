@@ -27,9 +27,9 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataP
 from transformers import PretrainedConfig
 
 from sglang.srt.models.phi4mm_utils import (
+    FFN,
     AbsolutePositionalEncoding,
     ConvModule,
-    FeedForward,
     MeanVarianceNormLayer,
     MultiHeadedAttention,
     MultiSequential,
@@ -174,7 +174,7 @@ class ConformerEncoderLayer(nn.Module):
     ):
         super().__init__()
 
-        self.ffn_in = FeedForward(
+        self.ffn_in = FFN(
             d_model=d_model,
             d_inner=d_ffn,
             dropout_rate=dropout_rate,
@@ -211,7 +211,7 @@ class ConformerEncoderLayer(nn.Module):
             export=export,
         )
 
-        self.ffn_out = FeedForward(
+        self.ffn_out = FFN(
             d_model=d_model,
             d_inner=d_ffn,
             dropout_rate=dropout_rate,

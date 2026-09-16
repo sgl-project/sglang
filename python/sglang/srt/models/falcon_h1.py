@@ -47,7 +47,7 @@ class FalconH1MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         layer_id: int,
-        mlp_multipliers: List[float],
+        ffn_multipliers: List[float],
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         reduce_results: bool = True,
@@ -78,7 +78,7 @@ class FalconH1MLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.tp_size = get_parallel().tp_size
 
-        self.gate_multiplier, self.down_multiplier = mlp_multipliers
+        self.gate_multiplier, self.down_multiplier = ffn_multipliers
 
     def forward(
         self,
@@ -209,7 +209,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             layer_id=layer_id,
-            mlp_multipliers=config.mlp_multipliers,
+            ffn_multipliers=config.mlp_multipliers,
             quant_config=quant_config,
             prefix=add_prefix("ffn", prefix),
         )
@@ -351,13 +351,13 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             hidden_states = attention_hidden_states + mamba_hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with get_forward().scoped(ffn_reduce_scatter=ffn_reduce_scatter):
             hidden_states = self.ffn(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(

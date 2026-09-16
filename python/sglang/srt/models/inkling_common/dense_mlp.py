@@ -155,7 +155,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         self,
         n_shared_experts: int,
         d_model: int,
-        shared_d_mlp: int,
+        shared_d_ffn: int,
         layer_id: int,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
@@ -190,7 +190,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         self.moe_tp_size = tp_size
         self.tp_group = tp_group
 
-        local_intermediate_size = shared_d_mlp // self.moe_tp_size
+        local_intermediate_size = shared_d_ffn // self.moe_tp_size
         self.intermediate_size_per_partition = local_intermediate_size
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=n_shared_experts,

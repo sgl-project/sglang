@@ -185,8 +185,8 @@ class GPTJBlock(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        mlp_output = self.ffn(hidden_states)
-        hidden_states = attn_output + mlp_output + residual
+        ffn_output = self.ffn(hidden_states)
+        hidden_states = attn_output + ffn_output + residual
         return hidden_states
 
 

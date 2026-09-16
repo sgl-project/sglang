@@ -399,7 +399,7 @@ def _get_mobius_routed_bank(meta_ffn: nn.ModuleList, layer_id: int) -> nn.Module
 
 
 class _InternS2MobiusDecoderMixin:
-    def _init_mobius_mlp(
+    def _init_mobius_ffn(
         self,
         config: InternS2MobiusTextConfig,
         quant_config: QuantizationConfig | None,
@@ -411,7 +411,7 @@ class _InternS2MobiusDecoderMixin:
             prefix=add_prefix("ffn", layer_prefix),
         )
 
-    def _forward_mobius_mlp(
+    def _forward_mobius_ffn(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -439,18 +439,18 @@ class _InternS2MobiusDecoderMixin:
         forward_batch: ForwardBatch,
         meta_ffn: nn.ModuleList,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         # Model-side all-reduce fusion is intentionally disabled for baseline.
         with get_forward().scoped(
-            fuse_mlp_allreduce=False,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=False,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
-            hidden_states = self._forward_mobius_mlp(
+            hidden_states = self._forward_mobius_ffn(
                 hidden_states, forward_batch, meta_ffn
             )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -503,7 +503,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         )
 
         layer_prefix = prefix.removesuffix(".linear_attn")
-        self._init_mobius_mlp(config, quant_config, layer_prefix)
+        self._init_mobius_ffn(config, quant_config, layer_prefix)
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -636,7 +636,7 @@ class InternS2MobiusAttentionDecoderLayer(
         )
 
         layer_prefix = prefix.removesuffix(".self_attn")
-        self._init_mobius_mlp(config, quant_config, layer_prefix)
+        self._init_mobius_ffn(config, quant_config, layer_prefix)
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,

@@ -19,7 +19,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+from sglang.srt.layers.moe.utils import should_skip_ffn_all_reduce
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -830,7 +830,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer.reduce_results
             and self.base_layer.tp_size > 1
             and not skip_all_reduce
-            and not should_skip_mlp_all_reduce()
+            and not should_skip_ffn_all_reduce()
         )
 
         # Match the base layer's reduce group: layers built with

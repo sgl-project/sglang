@@ -485,11 +485,11 @@ class AfmoeDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = attn_residual + hidden_states
 
-        mlp_residual = hidden_states
+        ffn_residual = hidden_states
         hidden_states = self.pre_ffn_layernorm(hidden_states)
         hidden_states = self.ffn(hidden_states)
         hidden_states = self.post_ffn_layernorm(hidden_states)
-        hidden_states = mlp_residual + hidden_states
+        hidden_states = ffn_residual + hidden_states
 
         return hidden_states
 

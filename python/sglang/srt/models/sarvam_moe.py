@@ -1035,9 +1035,9 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             )
         else:
             if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
+                ffn_tp_rank, ffn_tp_size = 0, 1
             else:
-                mlp_tp_rank, mlp_tp_size = None, None
+                ffn_tp_rank, ffn_tp_size = None, None
             self.ffn = SarvamMoEMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1045,8 +1045,8 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("ffn", prefix),
                 reduce_results=False,
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                tp_rank=ffn_tp_rank,
+                tp_size=ffn_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1087,30 +1087,30 @@ class SarvamMoEMLADecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_ffn(
             hidden_states, residual, forward_batch
         )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+        fuse_ffn_allreduce = (
+            self.layer_communicator.should_fuse_ffn_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        ffn_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+            fuse_ffn_allreduce=fuse_ffn_allreduce,
+            ffn_reduce_scatter=ffn_reduce_scatter,
         ):
             hidden_states = self.ffn(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not mlp_reduce_scatter
-            and not fuse_mlp_allreduce
+            and not ffn_reduce_scatter
+            and not fuse_ffn_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if fuse_mlp_allreduce:
+        if fuse_ffn_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
