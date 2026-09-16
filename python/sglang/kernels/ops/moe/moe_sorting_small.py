@@ -410,16 +410,11 @@ _pending_quant_input: ContextVar[torch.Tensor | None] = ContextVar(
     "aiter_pending_quant_input", default=None
 )
 
-_patched = False
 
-
+@functools.cache
 def apply_aiter_small_moe_sort_patch() -> None:
     """Patch a stock aiter so decode-sized MoE sorting (+ stage1 mxfp8 quant) is one launch."""
-    global _patched
-    if _patched:
-        return
     if not is_gfx95_supported():
-        _patched = True
         return
 
     try:
@@ -432,7 +427,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
         orig_mx_quant = fm.fused_dynamic_mxfp8_quant_moe_sort
     except (ImportError, AttributeError) as exc:
         logger.info("aiter small-batch MoE sorting patch not applied: %s", exc)
-        _patched = True
         return
 
     @functools.wraps(orig_fused_moe)
@@ -549,5 +543,4 @@ def apply_aiter_small_moe_sort_patch() -> None:
     fm.fused_moe = fused_moe_wrapper
     fm._moe_sorting_impl = sorting_impl_wrapper
     fm.fused_dynamic_mxfp8_quant_moe_sort = mx_quant_wrapper
-    _patched = True
     logger.info("aiter small-batch MoE sorting patch applied")
