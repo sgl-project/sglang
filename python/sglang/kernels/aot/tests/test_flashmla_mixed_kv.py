@@ -190,3 +190,60 @@ def test_mixed_kv_capability_is_versioned():
     assert capabilities["mixed_kvcache_api_version"] == 1
     assert capabilities["mixed_kvcache_supported"]
     assert ["V4", MAIN_LAYOUT] in capabilities["supported_mixed_layout_pairs"]
+
+
+def test_mixed_kv_cuda_graph_replay():
+    (
+        q,
+        swa_cache,
+        swa,
+        swa_indices,
+        swa_lengths,
+        main_cache,
+        main,
+        main_indices,
+        main_lengths,
+        sink,
+    ) = _inputs(64)
+    q_static = q.clone()
+    sched, _ = get_mla_metadata()
+    kwargs = dict(
+        q=q_static,
+        swa_cache=swa_cache,
+        swa_indices=swa_indices,
+        main_cache_bytes=main_cache,
+        main_indices=main_indices,
+        swa_layout="V4",
+        main_layout=MAIN_LAYOUT,
+        main_page_slots=128,
+        main_page_bytes=128 * 384,
+        head_dim_v=512,
+        tile_scheduler_metadata=sched,
+        softmax_scale=512**-0.5,
+        attn_sink=sink,
+        swa_topk_length=swa_lengths,
+        main_topk_length=main_lengths,
+    )
+    flash_mla_with_mixed_kvcache(**kwargs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = flash_mla_with_mixed_kvcache(**kwargs)
+
+    q_static.copy_(q * 0.75)
+    graph.replay()
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(
+        q_static,
+        swa,
+        swa_indices,
+        swa_lengths,
+        main,
+        main_indices,
+        main_lengths,
+        sink,
+        512**-0.5,
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=2.01 / 128)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-6, rtol=8.01 / 65536)
