@@ -186,13 +186,21 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.speculative_algorithm is not None:
-        assert cfg.speculative_algorithm in (
+        # NEXTN is a documented alias for EAGLE. The global alias resolution
+        # runs later in the pipeline (handle_speculative_decoding), so normalize
+        # locally before the arch-specific check to avoid rejecting the valid
+        # CLI value --speculative-algorithm NEXTN.
+        speculative_algorithm = cfg.speculative_algorithm
+        if speculative_algorithm == "NEXTN":
+            speculative_algorithm = "EAGLE"
+
+        assert speculative_algorithm in (
             "EAGLE",
             "DSPARK",
         ), (
             f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
         )
-        if cfg.speculative_algorithm == "EAGLE":
+        if speculative_algorithm == "EAGLE":
             assert cfg.speculative_eagle_topk == 1, (
                 f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
             )
