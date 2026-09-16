@@ -78,9 +78,12 @@ def _jit_main_k_norm_rope_q_flashmla_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    layout: KVLayout,
 ):
     """ROCm only: the K kernel above with the in-place query rope in the same launch."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+    )
     return load_jit(
         make_name("main_k_norm_rope_q_flashmla_hip"),
         *args,
@@ -314,9 +317,8 @@ def fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     elif q is not None:
-        assert layout is KVLayout.V4, "fused HIP query RoPE requires the V4 KV layout"
         module = _jit_main_k_norm_rope_q_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size
+            kv.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward_with_q(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, q

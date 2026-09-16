@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from itertools import product
 
 import torch
 
@@ -13,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_k_norm_rope_flashmla,
     fused_rope_inplace,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -91,11 +93,11 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         and rope rows without a slot."""
         dev = "cuda"
         page_size = 256
-        for num_tokens, heads, pos_dtype, seed in (
-            (1, 16, torch.int64, 0),
-            (300, 16, torch.int32, 2),
+        for layout, (num_tokens, heads, pos_dtype, seed) in product(
+            (KVLayout.V4, KVLayout.V41),
+            ((1, 16, torch.int64, 0), (300, 16, torch.int32, 2)),
         ):
-            with self.subTest(num_tokens=num_tokens, heads=heads):
+            with self.subTest(layout=layout, num_tokens=num_tokens, heads=heads):
                 torch.manual_seed(seed)
                 kv = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16)
                 weight = (1 + 0.1 * torch.randn(HEAD_DIM, device=dev)).to(
@@ -110,7 +112,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 out_loc = out_loc.to(torch.int32)
                 if num_tokens > 2:
                     out_loc[1] = -1
-                page_bytes = -(-584 * page_size // 576) * 576
+                page_bytes = layout.page_bytes(page_size)
                 cache = torch.zeros(4, page_bytes, device=dev, dtype=torch.uint8)
                 cache_q = cache.clone()
                 q = (torch.randn(num_tokens, heads, HEAD_DIM, device=dev) * 3).to(
@@ -124,7 +126,15 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 )
                 got = q.clone()
                 fused_k_norm_rope_flashmla(
-                    kv, weight, 1e-6, freqs_cis, positions, out_loc, cache, page_size
+                    kv,
+                    weight,
+                    1e-6,
+                    freqs_cis,
+                    positions,
+                    out_loc,
+                    cache,
+                    page_size,
+                    layout=layout,
                 )
                 fused_k_norm_rope_flashmla(
                     kv,
@@ -136,6 +146,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                     cache_q,
                     page_size,
                     q=got,
+                    layout=layout,
                 )
                 self.assertTrue(torch.equal(got, expected))
                 self.assertTrue(torch.equal(got[..., :NOPE_DIM], q[..., :NOPE_DIM]))

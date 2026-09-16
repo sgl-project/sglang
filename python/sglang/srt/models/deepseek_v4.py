@@ -1705,7 +1705,10 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        if self.use_fused_qk_norm_rope:
+        if (
+            self.use_fused_qk_norm_rope
+            and get_token_to_kv_pool().kv_layout.value == "v4"
+        ):
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -1856,7 +1859,11 @@ class MQALayer(MqaAttentionBase):
         )
         do_fused_qk_norm_rope = (
             unified and (is_decode or fuse_verify or fuse_prefill)
-        ) or (not unified and self.use_fused_qk_norm_rope)
+        ) or (
+            not unified
+            and self.use_fused_qk_norm_rope
+            and get_token_to_kv_pool().kv_layout.value == "v4"
+        )
 
         if do_fused_qk_norm_rope:
             if _is_gfx95_supported or _is_gfx1250_supported:

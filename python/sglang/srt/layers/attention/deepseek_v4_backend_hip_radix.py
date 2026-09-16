@@ -2752,13 +2752,16 @@ class DeepseekV4HipRadixBackend(
 
             if extra_k_cache is not None:
                 extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                extra_cache_dim = token_to_kv_pool.get_extra_key_bytes_per_token(
+                    layer_id
+                )
                 extra_k_cache = extra_k_cache[
-                    :, : extra_page_size * k_cache_total_dim
+                    :, : extra_page_size * extra_cache_dim
                 ].view(
                     extra_k_cache.shape[0],
                     extra_page_size,
                     1,
-                    k_cache_total_dim,
+                    extra_cache_dim,
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
