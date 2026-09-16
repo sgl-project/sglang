@@ -421,7 +421,8 @@ class TestV41KVStore(CustomTestCase):
                     kv_old = torch.randn(n, 512, generator=g, device="cuda") * 2
                     kv_input = torch.cat([kv_new, score], dim=-1).contiguous()
                     req = torch.arange(n, device="cuda", dtype=torch.int64)
-                    # Odd positions complete a pair; one even (pending) row and one padded row.
+                    # Odd positions complete a pair; row 5 is even and rows 5/7
+                    # are padded graph rows that must remain completely inert.
                     pos = (
                         2
                         * torch.randint(
@@ -441,13 +442,19 @@ class TestV41KVStore(CustomTestCase):
                         )[:n].to(torch.int32)
                         + 1
                     ) * 2
-                    raw_out_loc[7] = 0
+                    raw_out_loc[[5, 7]] = 0
                     cache = torch.zeros(
                         num_pages,
                         layout.page_bytes(page_size),
                         dtype=torch.uint8,
                         device="cuda",
                     )
+                    latent_out = torch.full(
+                        (n, 512), 123, dtype=torch.bfloat16, device="cuda"
+                    )
+                    padded_out_before = latent_out[[5, 7]].clone()
+                    padded_state_row = req[5] * ring + pos[5] % ring
+                    padded_state_before = state[padded_state_row].clone()
                     latent = c2_decode_or_verify_norm_rope_store(
                         kv_input,
                         state,
@@ -461,6 +468,11 @@ class TestV41KVStore(CustomTestCase):
                         page_size=page_size,
                         ring_size=ring,
                         layout=layout,
+                        out=latent_out,
+                    )
+                    self.assertTrue(torch.equal(latent[[5, 7]], padded_out_before))
+                    self.assertTrue(
+                        torch.equal(state[padded_state_row], padded_state_before)
                     )
                     valid = (raw_out_loc != 0) & (pos % 2 == 1)
                     pooled = ((kv_old + kv_new) / 2).to(torch.bfloat16)
