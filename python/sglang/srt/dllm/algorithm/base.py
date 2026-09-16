@@ -67,9 +67,15 @@ class DllmAlgorithm:
         return self._run_sync(model_runner, forward_batch)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
+        return self._prompt_mask(forward_batch).sum(dim=1).tolist()
+
+    def _prompt_mask(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        prompt_mask = getattr(forward_batch, "dllm_prompt_mask", None)
+        if prompt_mask is not None:
+            return prompt_mask
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        return (input_ids != self.mask_id).sum(dim=1).tolist()
+        return input_ids != self.mask_id
 
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
