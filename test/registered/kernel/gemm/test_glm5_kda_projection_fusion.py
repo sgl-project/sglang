@@ -190,10 +190,11 @@ def test_bf16_projection_loading_and_outputs(
         "subclass",
     ],
 )
-def test_fp8_projection_eligibility(quantized_projection):
+def test_fp8_projection_eligibility(monkeypatch, quantized_projection):
+    import sglang.srt.layers.linear as linear
+    import sglang.srt.models.glm5_next as glm
     from sglang.srt.configs.glm5_next import Glm5NextTextConfig
     from sglang.srt.layers.quantization.fp8 import Fp8Config
-    from sglang.srt.models.glm5_next import Glm5NextLinearAttention
 
     prefix = "model.layers.0.self_attn"
     names = ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
@@ -210,6 +211,9 @@ def test_fp8_projection_eligibility(quantized_projection):
 
     config_cls = DerivedFp8Config if quantized_projection == "subclass" else Fp8Config
     quant_config = config_cls(ignored_layers=ignored)
+    parallel = SimpleNamespace(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0)
+    monkeypatch.setattr(glm, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(linear, "get_parallel", lambda: parallel)
     reset_context()
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
     try:
@@ -224,7 +228,7 @@ def test_fp8_projection_eligibility(quantized_projection):
             },
         )
         with torch.device("cuda"):
-            layer = Glm5NextLinearAttention(
+            layer = glm.Glm5NextLinearAttention(
                 0, 256, config, quant_config=quant_config, prefix=prefix
             )
         assert layer.do_fuse_qkvbfg == (quantized_projection is None)
