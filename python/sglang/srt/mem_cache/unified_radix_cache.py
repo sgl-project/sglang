@@ -1068,7 +1068,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             ranges = [(free_from, len(kv_indices))]
             if tail_free_start is not None:
-                ranges.append((tail_free_start, len(kv_indices_full)))
+                tail_free_end = len(kv_indices_full)
+                if ranges[-1][1] == tail_free_start:
+                    # Both tails are one request-owned span. Keep them together
+                    # so an allocator page crossing the boundary is freed once.
+                    ranges[-1] = (ranges[-1][0], tail_free_end)
+                else:
+                    assert ranges[-1][1] < tail_free_start
+                    ranges.append((tail_free_start, tail_free_end))
             self.free_kv_row(req.kv, ranges)
         else:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
