@@ -333,6 +333,42 @@ class _CudaNormalBuffer:
         return torch.empty(0), torch.empty(0), torch.empty(0), [], object(), object()
 
 
+class _LegacyNormalBuffer:
+    """The pre-bool-flags DeepEP normal-dispatch API used by CI."""
+
+    def __init__(self):
+        self.quant_mode = None
+
+    def get_dispatch_layout(self, *args, **kwargs):
+        return (
+            torch.ones(1, dtype=torch.int32),
+            None,
+            torch.ones(2, dtype=torch.int32),
+            torch.ones(1, 1, dtype=torch.bool),
+            None,
+        )
+
+    def dispatch(
+        self,
+        x,
+        *,
+        topk_idx,
+        topk_weights,
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        is_token_in_rank,
+        num_tokens_per_expert,
+        previous_event,
+        async_finish,
+        allocate_on_comm_stream,
+        expert_alignment,
+        config,
+        quant_mode,
+    ):
+        self.quant_mode = quant_mode
+        return torch.empty(0), torch.empty(0), torch.empty(0), [], object(), object()
+
+
 class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
     def test_mxfp4_output_dtype_enables_only_mxfp4(self):
         dispatcher = object.__new__(deepep._DeepEPDispatcherImplBase)
@@ -449,6 +485,39 @@ class TestDeepEPLowLatencyMxfp8Dispatch(unittest.TestCase):
         self.assertTrue(buffer.dispatch.call_args.kwargs["use_mxfp8"])
         self.assertFalse(buffer.dispatch.call_args.kwargs["use_fp8"])
         self.assertFalse(buffer.dispatch.call_args.kwargs["use_mxfp4"])
+
+    def test_normal_dispatch_uses_legacy_quant_mode_when_flags_are_unsupported(self):
+        dispatcher = object.__new__(deepep._DeepEPDispatcherImplNormal)
+        dispatcher.num_experts = 2
+        dispatcher.async_finish = False
+        dispatcher.use_fp8 = False
+        dispatcher.use_mxfp4 = False
+        dispatcher.use_mxfp8 = False
+        buffer = _LegacyNormalBuffer()
+        dispatcher._get_buffer = lambda: buffer
+
+        with (
+            patch.object(deepep, "_is_npu", True),
+            patch.object(deepep, "_deepep_precompile_tp_barrier"),
+            patch.object(
+                deepep.DeepEPConfig,
+                "get_instance",
+                return_value=SimpleNamespace(normal_dispatch_config=None),
+            ),
+            patch.object(
+                deepep,
+                "get_global_expert_distribution_recorder",
+                return_value=MagicMock(),
+            ),
+        ):
+            dispatcher._dispatch_core(
+                torch.zeros(1, 64),
+                torch.zeros(1, 1, dtype=torch.int64),
+                torch.ones(1, 1),
+                None,
+            )
+
+        self.assertEqual(buffer.quant_mode, "bf16")
 
     def test_cuda_normal_dispatch_omits_npu_quantization_flags(self):
         dispatcher = object.__new__(deepep._DeepEPDispatcherImplNormal)

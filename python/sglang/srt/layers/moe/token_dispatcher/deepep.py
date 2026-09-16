@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from contextlib import nullcontext
@@ -562,6 +563,35 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
+    def _get_quantization_kwargs(self, buffer: Buffer) -> dict:
+        if not _is_npu:
+            return {}
+
+        dispatch_params = inspect.signature(buffer.dispatch).parameters
+        flag_kwargs = {
+            "use_fp8": self.use_fp8,
+            "use_mxfp4": self.use_mxfp4,
+            "use_mxfp8": self.use_mxfp8,
+        }
+        if all(name in dispatch_params for name in flag_kwargs):
+            return flag_kwargs
+
+        if "quant_mode" in dispatch_params:
+            if self.use_mxfp4:
+                quant_mode = "mx_fp4_e2m1"
+            elif self.use_mxfp8:
+                quant_mode = "mx_fp8_e4m3"
+            elif self.use_fp8:
+                quant_mode = "int8"
+            else:
+                quant_mode = "bf16"
+            return {"quant_mode": quant_mode}
+
+        raise RuntimeError(
+            "Installed DeepEP normal dispatch does not support either "
+            "use_fp8/use_mxfp4/use_mxfp8 or quant_mode."
+        )
+
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
         (
             hidden_states,
@@ -611,15 +641,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # `handle` as a member variable works.
 
         _deepep_precompile_tp_barrier()
-        npu_quantization_opts = (
-            {
-                "use_fp8": self.use_fp8,
-                "use_mxfp4": self.use_mxfp4,
-                "use_mxfp8": self.use_mxfp8,
-            }
-            if _is_npu
-            else {}
-        )
+        npu_quantization_opts = self._get_quantization_kwargs(buffer)
         (
             recv_x,
             recv_topk_ids,
