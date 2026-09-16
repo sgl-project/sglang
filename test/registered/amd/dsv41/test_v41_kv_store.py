@@ -7,7 +7,7 @@ follow the decode kernel's own reference quantizer.
 
 import unittest
 
-import kv_quant_reference as tq
+from sglang.test import dsv41_kv_quant_reference as tq
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout

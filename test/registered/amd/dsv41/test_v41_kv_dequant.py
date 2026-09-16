@@ -3,7 +3,7 @@ pure-torch dequantizer of the fp8 (V41) and fp4 (V41_FP4) formats."""
 
 import unittest
 
-import kv_quant_reference as tq
+from sglang.test import dsv41_kv_quant_reference as tq
 import torch
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
