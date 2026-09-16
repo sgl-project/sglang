@@ -5,6 +5,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from urllib.parse import quote
 
 import torch
 
@@ -60,6 +61,19 @@ def _load_store_json(key: str) -> Optional[dict]:
     if store is None or not store.check([key]):
         return None
     return json.loads(store.get(key).decode())
+
+
+def _scale_cohort_key(
+    rank_offset: int, runtime_instance_id: str, operation_id: str
+) -> str:
+    """Return an operation-scoped key for one joining cohort.
+
+    Operation IDs are supplied by callers, so quote both identity components
+    before embedding them in the TCPStore key namespace.
+    """
+    runtime_key = quote(runtime_instance_id, safe="")
+    operation_key = quote(operation_id, safe="")
+    return f"{_SCALE_COHORT_KEY_PREFIX}/{runtime_key}/{operation_key}/{rank_offset}"
 
 
 def register_scale_operation(
@@ -124,12 +138,23 @@ def register_scale_cohort(
         member_id=member_id,
         cuda_graph_enabled=cuda_graph_enabled,
     )
-    _store_json(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", cohort.__dict__)
+    _store_json(
+        _scale_cohort_key(
+            rank_offset,
+            operation.runtime_instance_id,
+            operation.operation_id,
+        ),
+        cohort.__dict__,
+    )
     return cohort
 
 
-def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
-    value = _load_store_json(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}")
+def get_scale_cohort(
+    rank_offset: int, runtime_instance_id: str, operation_id: str
+) -> Optional[ScaleCohort]:
+    value = _load_store_json(
+        _scale_cohort_key(rank_offset, runtime_instance_id, operation_id)
+    )
     return ScaleCohort(**value) if value is not None else None
 
 
@@ -148,6 +173,8 @@ class ElasticEPState:
     ep_join_rank_offset: int = 0
     runtime_instance_id: Optional[str] = None
     operation_id: Optional[str] = None
+    operation_target_ep_size: Optional[int] = None
+    operation_expected_joining_member_ids: Optional[List[str]] = None
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -286,6 +313,10 @@ class ElasticEPStateManager:
         inst.pending_ep_size = n
         inst.runtime_instance_id = runtime_instance_id
         inst.operation_id = operation_id
+        inst.operation_target_ep_size = n
+        inst.operation_expected_joining_member_ids = list(
+            expected_joining_member_ids or []
+        )
         inst.scale_phase = "waiting_for_cohort"
         inst.last_error = None
         inst.pending_since = time.monotonic()

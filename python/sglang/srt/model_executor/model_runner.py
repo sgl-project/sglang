@@ -2236,11 +2236,21 @@ class ModelRunner:
         if self.tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
 
-            cohort = get_scale_cohort(effective_size)
+            runtime_instance_id = ElasticEPStateManager.get_runtime_instance_id()
+            operation_id = ElasticEPStateManager.get_operation_id()
+            cohort = (
+                get_scale_cohort(
+                    effective_size,
+                    runtime_instance_id,
+                    operation_id,
+                )
+                if runtime_instance_id is not None and operation_id is not None
+                else None
+            )
             self._pending_elastic_scale_update = ElasticScaleUpdateReq(
                 success=True,
                 effective_ep_size=target_size,
-                operation_id=ElasticEPStateManager.get_operation_id(),
+                operation_id=operation_id,
                 scale_phase="serving_expanded",
                 joining_rank_offset=effective_size,
                 joining_rank_count=target_size - effective_size,
@@ -2351,7 +2361,13 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort = get_scale_cohort(effective_size)
+            assert state.runtime_instance_id is not None
+            assert state.operation_id is not None
+            cohort = get_scale_cohort(
+                effective_size,
+                state.runtime_instance_id,
+                state.operation_id,
+            )
             if cohort is None:
                 return
             if (

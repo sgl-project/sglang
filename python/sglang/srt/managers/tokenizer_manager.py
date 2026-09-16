@@ -3463,6 +3463,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return {
             "instance_id": self.elastic_instance_id,
             "operation_id": self.elastic_operation_id,
+            "target_ep_size": self.elastic_operation_target,
             "operation_succeeded": self.elastic_operation_succeeded,
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
             "effective_ep_size": self.elastic_worker_count,
@@ -3486,6 +3487,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         operation_id = obj.operation_id or uuid.uuid4().hex
+        retry_unknown_submission = operation_id == self.elastic_operation_id
         if (
             obj.expected_instance_id is not None
             and obj.expected_instance_id != self.elastic_instance_id
@@ -3505,7 +3507,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
 
-        if operation_id == self.elastic_operation_id:
+        if retry_unknown_submission:
             if obj.new_ep_size != self.elastic_operation_target:
                 return ScaleElasticEPReqOutput(
                     success=False,
@@ -3538,50 +3540,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     pending_ep_size=self.elastic_pending_ep_size,
                     scale_phase=self.elastic_scale_phase,
                 )
-            return ScaleElasticEPReqOutput(
-                success=self.elastic_operation_succeeded is not False,
-                message=(
-                    self.elastic_last_error
-                    if self.elastic_operation_succeeded is False
-                    else f"Returning existing Elastic EP operation {operation_id}."
-                ),
-                operation_id=operation_id,
-                instance_id=self.elastic_instance_id,
-                old_ep_size=self.elastic_worker_count,
-                new_ep_size=obj.new_ep_size,
-                pending_ep_size=self.elastic_pending_ep_size,
-                scale_phase=self.elastic_scale_phase,
-            )
+            if self.elastic_scale_phase != "submission_unknown":
+                return ScaleElasticEPReqOutput(
+                    success=self.elastic_operation_succeeded is not False,
+                    message=(
+                        self.elastic_last_error
+                        if self.elastic_operation_succeeded is False
+                        else f"Returning existing Elastic EP operation {operation_id}."
+                    ),
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=self.elastic_worker_count,
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                    terminal=self.elastic_operation_succeeded is not None,
+                    effective_ep_size=self.elastic_worker_count,
+                )
+            self.elastic_scale_phase = "reconciling_submission"
+            self.elastic_last_error = None
+        else:
+            if self.elastic_pending_ep_size is not None:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message=(
+                        "A previous scale operation has not completed yet. Wait until "
+                        "all pending ranks have joined before issuing another scale."
+                    ),
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=self.elastic_worker_count,
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                    effective_ep_size=self.elastic_worker_count,
+                )
 
-        if self.elastic_pending_ep_size is not None:
-            return ScaleElasticEPReqOutput(
-                success=False,
-                conflict=True,
-                message=(
-                    "A previous scale operation has not completed yet. Wait until "
-                    "all pending ranks have joined before issuing another scale."
-                ),
-                operation_id=operation_id,
-                instance_id=self.elastic_instance_id,
-                old_ep_size=self.elastic_worker_count,
-                new_ep_size=obj.new_ep_size,
-                pending_ep_size=self.elastic_pending_ep_size,
-                scale_phase=self.elastic_scale_phase,
+            self.elastic_operation_id = operation_id
+            self.elastic_operation_target = obj.new_ep_size
+            self.elastic_operation_succeeded = None
+            self.elastic_expected_joining_member_ids = list(
+                obj.expected_joining_member_ids or []
             )
-
-        self.elastic_operation_id = operation_id
-        self.elastic_operation_target = obj.new_ep_size
-        self.elastic_operation_succeeded = None
-        self.elastic_expected_joining_member_ids = list(
-            obj.expected_joining_member_ids or []
-        )
-        self.elastic_pending_ep_size = obj.new_ep_size
-        self.elastic_scale_phase = "submitting"
-        self.elastic_last_error = None
-        self.elastic_joining_rank_offset = self.elastic_worker_count
-        self.elastic_joining_rank_count = obj.new_ep_size - self.elastic_worker_count
-        self.elastic_ready_rank_count = 0
-        self.elastic_joining_member_ids = list(obj.expected_joining_member_ids or [])
+            self.elastic_pending_ep_size = obj.new_ep_size
+            self.elastic_scale_phase = "submitting"
+            self.elastic_last_error = None
+            self.elastic_joining_rank_offset = self.elastic_worker_count
+            self.elastic_joining_rank_count = (
+                obj.new_ep_size - self.elastic_worker_count
+            )
+            self.elastic_ready_rank_count = 0
+            self.elastic_joining_member_ids = list(
+                obj.expected_joining_member_ids or []
+            )
         scheduler_obj = ScaleElasticEPReqInput(
             new_ep_size=obj.new_ep_size,
             operation_id=operation_id,
@@ -3598,6 +3610,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_scale_phase = "submission_unknown"
             self.elastic_last_error = f"Scale submission result is unknown: {exc}"
             raise
+        if not responses:
+            error = "Scale submission returned no scheduler responses."
+            self.elastic_scale_phase = "submission_unknown"
+            self.elastic_last_error = error
+            raise RuntimeError(error)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = (
@@ -3609,11 +3626,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 res.operation_id = operation_id
                 res.instance_id = self.elastic_instance_id
                 return res
-        self.elastic_pending_ep_size = responses[0].pending_ep_size
-        self.elastic_scale_phase = responses[0].scale_phase
+
+        pending_response = next(
+            (response for response in responses if not response.terminal),
+            None,
+        )
+        if pending_response is None:
+            self.elastic_worker_count = obj.new_ep_size
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "serving_expanded"
+            self.elastic_operation_succeeded = True
+            self.update_control_communicator_fan_out(obj.new_ep_size)
+        else:
+            self.elastic_pending_ep_size = pending_response.pending_ep_size
+            self.elastic_scale_phase = pending_response.scale_phase
         self.elastic_last_error = None
         responses[0].operation_id = operation_id
         responses[0].instance_id = self.elastic_instance_id
+        responses[0].pending_ep_size = self.elastic_pending_ep_size
+        responses[0].scale_phase = self.elastic_scale_phase
+        responses[0].terminal = pending_response is None
+        responses[0].effective_ep_size = self.elastic_worker_count
         return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
