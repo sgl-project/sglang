@@ -44,20 +44,24 @@ Bridges and the Router may point at any of them; a server restart keeps the
 index. Each bridge still owns its worker's event stream: two bridges reporting
 the same worker id to different servers interleave their batches.
 
-Neither backend has a sequence gate, incarnation fencing, replay recovery, or
-worker liveness TTL:
+What each deployment shape gives you:
 
-- An in-memory Indexer restart starts with an empty index. A Valkey-backed
-  restart does not.
-- A worker death is not detected; its last placements remain until revoked or,
-  for the `memory` backend, until the Indexer restarts.
-- Events published while a bridge is disconnected are not replayed.
-- A publisher sequence gap is logged and otherwise ignored.
-- Redelivered or reordered batches are applied again in arrival order.
-
-Individual report, revoke, and clear mutations are idempotent. A future
-Snapshot plus event-replay mechanism is required before production high
-availability can rebuild state safely after event loss.
+- An in-memory Indexer restart starts with an empty index, unless it consumes
+  the event stream, in which case it rebuilds from the retained window. A
+  Valkey-backed restart keeps the index.
+- With `KV_INDEXER_SINK=grpc`, batches sent while the indexer is down are lost.
+  With the stream sink they wait in the stream.
+- Events published while a bridge is disconnected are recovered from the
+  worker's replay buffer when `SGLANG_KV_REPLAY_ENDPOINT` is set; a sequence
+  gap on the live stream triggers the same bounded replay. Without it, they
+  are lost.
+- A publisher restart (sequence going backwards) clears the worker's
+  placements before its new events apply.
+- A worker death is detected by heartbeat expiry when the bridge heartbeats
+  and the indexer is Valkey-backed; otherwise its placements remain until
+  revoked.
+- Redelivered or reordered batches are applied again in arrival order;
+  individual report, revoke, and clear mutations are idempotent.
 
 ## In-memory data model
 
@@ -197,6 +201,9 @@ Key layout, under the prefix:
 | `w:<worker>` | hash | `addr` router-facing address, `spec` encoded `WorkerCacheSpec` |
 | `h:<worker>:<tier>` | set | reverse holdings, drives `CLEAR_ALL_AT_TIER` |
 | `hc` | hash | cumulative hit count per block |
+| `workers` | set | every worker id that ever applied a batch |
+| `events` | stream | the event log (`XADD MAXLEN ~`); `lease:events` names the active consumer |
+| `alive:<worker>`, `hb:<worker>` | string | heartbeat with TTL, and the permanent marker that the worker ever heartbeated |
 
 A placement costs one hash field, so a worker holding a hundred thousand blocks
 is a few megabytes; the index is small enough that a single slot is a capacity
@@ -219,6 +226,73 @@ to `INTERNAL`.
 
 The parity tests spawn `valkey-server` from `PATH` on a unix socket, or use
 `KV_INDEXER_TEST_VALKEY_URL` when set, and skip cleanly when neither exists.
+
+## Event log on Valkey Streams
+
+With the Valkey keyspace as the snapshot, the bridges can publish events to a
+Valkey stream instead of calling one indexer over gRPC, and indexers consume
+the stream through a consumer group. The bridge never needs an indexer to be
+up; a restarted or added indexer needs nothing from anyone.
+
+Bridge:
+
+```bash
+KV_INDEXER_SINK=stream \
+KV_INDEXER_VALKEY_URL=valkey://127.0.0.1:6379 \
+KV_INDEXER_WORKER_ID=worker-0 \
+KV_INDEXER_WORKER_ADDRESS=http://127.0.0.1:30000 \
+SGLANG_KV_EVENT_ENDPOINT=tcp://127.0.0.1:5567 \
+SGLANG_KV_REPLAY_ENDPOINT=tcp://127.0.0.1:5568 \
+  cargo run --release --bin kv-indexer-bridge
+```
+
+Indexer (as many as you like, one keyspace):
+
+```bash
+KV_INDEXER_BACKEND=valkey KV_INDEXER_EVENT_SOURCE=stream \
+KV_INDEXER_VALKEY_URL=valkey://127.0.0.1:6379 \
+KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
+  cargo run --release --bin kv-indexer-server
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `KV_INDEXER_SINK` (bridge) | `grpc` | `stream` appends batches to `<prefix>events` with `XADD MAXLEN ~`. |
+| `KV_INDEXER_STREAM_MAXLEN` (bridge) | `1000000` | Approximate retained entries; the replay window. |
+| `SGLANG_KV_REPLAY_ENDPOINT` (bridge) | unset | SGLang's replay ROUTER (`replay_endpoint` in `--kv-events-config`). When set, the bridge asks for every buffered batch after the last one it saw on connect and on a sequence gap. |
+| `KV_INDEXER_EVENT_SOURCE` (server) | `grpc` | `stream` also consumes the event stream. The gRPC apply endpoint stays served. |
+| `KV_INDEXER_CONSUMER_NAME` (server) | `<hostname>:<pid>` | Consumer name inside the group. |
+
+Ordering: applies are idempotent but not commutative, so consumers of the
+shared `indexers` group run under a lease (`<prefix>lease:events`, `SET NX PX`,
+renewed at a third of its 10 s TTL). One applies, the rest stand by and take
+over within a TTL, first reclaiming what the previous holder left pending
+(`XAUTOCLAIM`). Entries are never lost while they sit in the stream, only
+delayed. A malformed or rejected entry is logged and acknowledged, like the
+bridge's own handling of an undecodable batch; a transient failure leaves it
+pending and it is retried in order.
+
+An in-memory indexer with `KV_INDEXER_EVENT_SOURCE=stream` uses a private
+group created at `0` and dropped on exit, so it rebuilds its index from the
+retained window on every start.
+
+Sequence handling in the bridge, with or without a stream: a sequence that
+goes backwards means the worker's publisher restarted (its cache is empty), so
+the bridge emits `AllBlocksCleared` for the worker before the new events; a gap
+triggers a bounded replay when a replay endpoint is configured.
+
+## Worker liveness
+
+With a Valkey URL the bridge heartbeats `<prefix>alive:<worker>` (TTL
+`KV_INDEXER_HEARTBEAT_TTL_MS`, default 30000, `0` disables) at a third of the
+TTL, but only while the worker's address accepts a TCP connection, and sets a
+permanent `<prefix>hb:<worker>` marker the first time. A Valkey-backed indexer
+(`KV_INDEXER_LIVENESS`, default `1`) clears every placement of a marked worker
+whose key expired, through the normal apply path: instantly via keyspace
+expiry notifications (the indexer adds `Ex` to `notify-keyspace-events` when
+`CONFIG SET` is allowed) and by a sweep every `KV_INDEXER_LIVENESS_SWEEP_MS`
+(default 30000) as the backstop. Workers that never heartbeated are never
+declared dead. Size the TTL above a routine bridge restart.
 
 ## API
 
