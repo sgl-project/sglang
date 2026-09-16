@@ -33,6 +33,7 @@ import msgspec
 import zmq
 from pydantic import BaseModel
 
+from sglang.srt.entrypoints.sidecar_context import KvEventSource
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -330,6 +331,10 @@ class EventPublisher(ABC):
     def shutdown(self) -> None:
         """Shutdown the publisher."""
 
+    def describe_local_source(self, block_size: int) -> Optional[KvEventSource]:
+        """Return a source a separate local process can subscribe to, if any."""
+        return None
+
 
 class NullEventPublisher(EventPublisher):
     """No-op implementation (default when disabled)."""
@@ -385,6 +390,9 @@ class ZmqEventPublisher(EventPublisher):
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
+        self._pub_bound = False
+        self._local_pub_endpoint: Optional[str] = None
+        self._local_replay_endpoint: Optional[str] = None
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
@@ -415,6 +423,49 @@ class ZmqEventPublisher(EventPublisher):
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
+
+    def describe_local_source(self, block_size: int) -> KvEventSource:
+        """Describe the sockets this publisher actually created.
+
+        Connect-style TCP and inproc publishers cannot serve a separate local
+        sidecar. Fail the opt-in launch instead of advertising an unusable source.
+        """
+        if block_size <= 0:
+            raise ValueError("Local KV-event sources require a positive block size")
+        if not self._pub_bound:
+            raise ValueError(
+                "--sidecar-scope local-telemetry requires a bound KV-event publisher"
+            )
+
+        def local_endpoint(endpoint: str) -> str:
+            if endpoint.startswith("ipc://"):
+                return endpoint
+            parsed = parse_advertisable_tcp(endpoint)
+            if parsed is None:
+                raise ValueError(
+                    "--sidecar-scope local-telemetry requires a bound "
+                    f"TCP or IPC KV-event endpoint, got {endpoint!r}"
+                )
+            address = NetworkAddress.parse(endpoint[len("tcp://") :])
+            host = address.host
+            if host in ("*", "0.0.0.0"):
+                host = "127.0.0.1"
+            elif host == "::":
+                host = "::1"
+            return NetworkAddress(host, address.port).to_tcp()
+
+        assert self._local_pub_endpoint is not None
+        return KvEventSource(
+            dp_rank=self._dp_rank,
+            endpoint=local_endpoint(self._local_pub_endpoint),
+            topic=self._topic_bytes.decode("utf-8"),
+            block_size=block_size,
+            replay_endpoint=(
+                local_endpoint(self._local_replay_endpoint)
+                if self._local_replay_endpoint is not None
+                else None
+            ),
+        )
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
@@ -471,6 +522,10 @@ class ZmqEventPublisher(EventPublisher):
                     f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
                 )
                 self._pub.bind(self._endpoint)
+                self._pub_bound = True
+                self._local_pub_endpoint = self._pub.getsockopt_string(
+                    zmq.LAST_ENDPOINT
+                )
             else:
                 self._pub.connect(self._endpoint)
 
@@ -484,6 +539,9 @@ class ZmqEventPublisher(EventPublisher):
                 f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
             )
             self._replay.bind(self._replay_endpoint)
+            self._local_replay_endpoint = self._replay.getsockopt_string(
+                zmq.LAST_ENDPOINT
+            )
 
     def _publisher_thread(self) -> None:
         """Background thread that processes the event queue."""

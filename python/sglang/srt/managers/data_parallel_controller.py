@@ -26,6 +26,10 @@ import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.entrypoints.sidecar_context import (
+    LOCAL_KV_EVENT_SOURCES,
+    take_local_kv_event_sources,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
@@ -198,6 +202,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -743,6 +748,12 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
+        # Pure DP launches TP groups in concurrent threads. Each group reports
+        # only sources owned by this node, before signalling its ready event.
+        sources = take_local_kv_event_sources(scheduler_info)
+        with self.env_lock:
+            self.local_kv_event_sources.extend(sources)
+
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
         self.startup_time = aggregate_scheduler_startup_times(
@@ -862,6 +873,7 @@ def run_data_parallel_controller_process(
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
                 "startup_time": controller.startup_time,
+                LOCAL_KV_EVENT_SOURCES: controller.local_kv_event_sources,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )

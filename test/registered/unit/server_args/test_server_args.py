@@ -65,9 +65,7 @@ from sglang.srt.arg_groups.serving_hook import (
     ssl_verify_of,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import (
-    check_two_batch_overlap,
-)
+from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -1505,7 +1503,6 @@ class TestPortArgs(unittest.TestCase):
             PortArgs.init_new(server_args)
 
     def test_init_new_with_single_node_dp_attention(self):
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -2939,22 +2936,24 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(parsed.sidecar_args, argv)
 
     def test_start_sidecar_passes_endpoint_and_provider_argv_separately(self):
+        from sglang.srt.entrypoints.sidecar_context import SidecarContext
         from sglang.srt.runtime_context import get_context as get_context_for_config
 
-        server_args = SimpleNamespace(
-            sidecar="example.sidecar",
-            sidecar_args=[
-                "--sidecar-shutdown-timeout",
-                "42",
-                "--grpc-connections",
-                "2",
-            ],
-            host="127.0.0.1",
+        endpoint = "http://127.0.0.1:50051"
+        cases = (
+            (None, endpoint, {}),
+            (
+                SidecarContext("full", 0, 2, 8, "tcp://leader:5000", []),
+                endpoint,
+                {"allow_clean_exit": False},
+            ),
+            (
+                SidecarContext("telemetry", 1, 2, 8, "tcp://leader:5000", []),
+                None,
+                {"allow_clean_exit": False},
+            ),
         )
-        # Every value the sidecar reads is resolved config, so the case states
-        # them all through the context rather than half here and half in a
-        # stand-in the readers no longer consult.
-        override = get_context_for_config().override_server_args(
+        with get_context_for_config().override_server_args(
             grpc_port=50051,
             sidecar="example.sidecar",
             sidecar_args=[
@@ -2964,36 +2963,62 @@ class TestGrpcServerArgs(CustomTestCase):
                 "2",
             ],
             host="127.0.0.1",
-        )
-        override.install()
-        self.addCleanup(override.restore)
-        with (
-            patch("sglang.srt.entrypoints.sidecar.mp.get_context") as get_context,
-            patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
         ):
-            start_sidecar()
-
-        process_kwargs = get_context.return_value.Process.call_args.kwargs
-        self.assertEqual(process_kwargs["name"], "sglang_sidecar_example.sidecar")
-        self.assertEqual(process_kwargs["target"], _run_sidecar)
-        self.assertEqual(
-            process_kwargs["args"],
-            (
-                "example.sidecar",
-                ["--grpc-connections", "2"],
-                "http://127.0.0.1:50051",
-            ),
-        )
-        sidecar_class.assert_called_once_with(
-            get_context.return_value.Process.return_value,
-            "example.sidecar",
-            shutdown_timeout=42.0,
-        )
+            for context, expected_endpoint, lifecycle_args in cases:
+                with (
+                    self.subTest(context=context),
+                    patch(
+                        "sglang.srt.entrypoints.sidecar.mp.get_context"
+                    ) as mp_context,
+                    patch("sglang.srt.entrypoints.sidecar.Sidecar") as sidecar_class,
+                ):
+                    start_sidecar(context)
+                process_kwargs = mp_context.return_value.Process.call_args.kwargs
+                self.assertEqual(
+                    process_kwargs["name"], "sglang_sidecar_example.sidecar"
+                )
+                self.assertEqual(process_kwargs["target"], _run_sidecar)
+                expected_args = (
+                    "example.sidecar",
+                    ["--grpc-connections", "2"],
+                    expected_endpoint,
+                )
+                if context is not None:
+                    expected_args += (context,)
+                self.assertEqual(process_kwargs["args"], expected_args)
+                sidecar_class.assert_called_once_with(
+                    mp_context.return_value.Process.return_value,
+                    "example.sidecar",
+                    shutdown_timeout=42.0,
+                    **lifecycle_args,
+                )
+                sidecar_class.return_value.start.assert_called_once_with()
 
     def test_sidecar_requires_native_grpc(self):
         sa = self._args(sidecar="example.sidecar")
         with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
             handle_deprecated_args(sa)
+
+    def test_local_sidecar_configuration(self):
+        valid = dict(
+            sidecar="provider", sidecar_scope="local-telemetry", grpc_port=50051
+        )
+        handle_deprecated_args(self._args(**valid))
+        for changes, message in (
+            ({"sidecar": None}, "requires --sidecar"),
+            ({"sidecar_scope": "invalid"}, "must be leader or local-telemetry"),
+            ({"nnodes": 2}, "require --dist-init-addr"),
+            ({"max_ep_size": 8}, "static DP topology"),
+            ({"ep_join_mode": "scale"}, "static DP topology"),
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                handle_deprecated_args(self._args(**(valid | changes)))
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                handle_deprecated_args(self._args(**valid))
 
     def test_sidecar_rejects_legacy_grpc(self):
         sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)

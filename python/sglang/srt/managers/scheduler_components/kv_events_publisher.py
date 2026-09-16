@@ -2,12 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Optional,
-)
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 import zmq
@@ -18,6 +13,7 @@ from sglang.srt.disaggregation.kv_events import (
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.entrypoints.sidecar_context import KvEventSource
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 
 if TYPE_CHECKING:
@@ -92,6 +88,12 @@ class SchedulerKvEventsPublisher:
 
         if not self.send_metrics_from_scheduler.closed:
             sock_send(self.send_metrics_from_scheduler, kv_metrics)
+
+    def local_kv_event_sources(self, block_size: int) -> list[KvEventSource]:
+        if self.kv_event_publisher is None:
+            return []
+        source = self.kv_event_publisher.describe_local_source(block_size)
+        return [source] if source is not None else []
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:
