@@ -668,9 +668,14 @@ class Envs:
     # registry no longer reads this. Kept because a few model/arch call sites
     # still assert on it; do not use in new code.
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
-    # The tree-core registry falls back to Python for session-aware caching,
-    # C128/custom components, non-Linux platforms, unsupported PyTorch versions
-    # or devices, and installs with neither the Rust extension nor its sources.
+    # The tree-core registry falls back to Python for:
+    # - Session-aware caching.
+    # - C128 or other unsupported components.
+    # - Custom component overrides.
+    # - Non-Linux platforms.
+    # - Unsupported PyTorch versions.
+    # - Devices other than CPU or CUDA.
+    # - Installs with neither the Rust extension nor its sources.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     # TODO(DSV4): @ispobock this has bug on main branch when retract
