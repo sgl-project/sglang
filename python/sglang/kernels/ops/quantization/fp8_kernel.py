@@ -1713,12 +1713,16 @@ def w8a8_block_fp8_matmul_triton(
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 
-    hopper_tuned = get_platform().is_sm90 and (
-        config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
-    )
-    if hopper_tuned:
+    # This kernel uses portable tl.dot, not Hopper-only TMA/WGMMA instructions.
+    # SM120 tuned entries also include unswapped, single-split tile choices;
+    # their fallback entries omit SPLIT_K and retain the original kernel.
+    tuned_kernel = (
+        get_platform().is_sm90
+        and (config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1)
+    ) or (get_platform().is_sm120 and "SPLIT_K" in config)
+    if tuned_kernel:
         kernel = _w8a8_block_fp8_matmul_hopper
-    split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
+    split_k = config.get("SPLIT_K", 1) if tuned_kernel else 1
     if split_k > 1:
         assert split_k & (split_k - 1) == 0
         partials = torch.empty((split_k, M, N), device=A.device, dtype=torch.float32)
@@ -1731,7 +1735,7 @@ def w8a8_block_fp8_matmul_triton(
         blocks = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
-        return (blocks, split_k) if hopper_tuned else (blocks,)
+        return (blocks, split_k) if tuned_kernel else (blocks,)
 
     kernel[grid](
         A,
