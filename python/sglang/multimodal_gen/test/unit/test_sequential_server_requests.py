@@ -41,6 +41,7 @@ def harness(monkeypatch):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.setenv("SGLANG_SKIP_CONSISTENCY", "0")
     monkeypatch.setattr(test_server_common.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(test_server_common.current_platform, "is_hip", lambda: False)
     scenario = ScenarioConfig(
         stages_ms={"DenoisingStage": 10},
         denoise_step_ms={0: 5, 1: 5},
