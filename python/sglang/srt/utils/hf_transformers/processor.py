@@ -383,7 +383,6 @@ def get_processor(
             f"Please update transformers to a version supporting this model."
         )
 
-
     tokenizer = get_tokenizer_from_processor(processor)
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
