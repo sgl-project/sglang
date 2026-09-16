@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
+import sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller as hybrid_cc_module
 from sglang.srt.managers import cache_controller as cc_module
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
 from sglang.srt.mem_cache.hicache_storage import (
@@ -54,7 +55,6 @@ def _hybrid_ctrl(page_size=2):
 class TestHiCacheControllerRequestId(unittest.TestCase):
     def test_storage_hit_query_injects_request_id_into_batch_exists(self):
         ctrl = _hicache_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1", "h2", "h3"])
         ctrl.storage_backend.batch_exists.return_value = 3  # 3 of 4 pages hit
 
         op = SimpleNamespace(
@@ -63,9 +63,12 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
             prefix_keys=None,
             request_id="r-1",
         )
-        hash_value, count = ctrl._storage_hit_query(op)
+        with mock.patch.object(
+            cc_module, "get_storage_hash_str", return_value=["h0", "h1", "h2", "h3"]
+        ):
+            hash_value, count = ctrl._storage_hit_query(op)
+            extra = ctrl.storage_backend.batch_exists.call_args[0][1]
 
-        extra = ctrl.storage_backend.batch_exists.call_args[0][1]
         self.assertIsInstance(extra, HiCacheStorageExtraInfo)
         self.assertIsNone(extra.prefix_keys)
         self.assertEqual(extra.extra_info, {"request_id": "r-1"})
@@ -75,7 +78,6 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
     @mock.patch.object(cc_module, "STORAGE_BATCH_SIZE", 2)
     def test_storage_hit_query_prefix_keys_grow_per_batch(self):
         ctrl = _hicache_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1", "h2", "h3"])
 
         # `_storage_hit_query` mutates the shared ``prefix_keys`` list in place
         # after each batch returns, so snapshot each call's arguments as the
@@ -100,7 +102,10 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
             prefix_keys=["p0"],
             request_id="r-1",
         )
-        ctrl._storage_hit_query(op)
+        with mock.patch.object(
+            cc_module, "get_storage_hash_str", return_value=["h0", "h1", "h2", "h3"]
+        ):
+            ctrl._storage_hit_query(op)
 
         self.assertEqual(len(seen), 2)
         # First batch carries the original prefix; every batch carries request_id.
@@ -181,7 +186,6 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         # Prefetch read path: caller_id/caller_role + request_id are injected,
         # while trace fields stay empty when the op carries none (scenario 1).
         ctrl = _hicache_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1"])
         ctrl.storage_backend.batch_exists.return_value = 2
         op = SimpleNamespace(
             last_hash=None,
@@ -210,7 +214,6 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
         # Scenario 2: op carries the exported hicache thread span's trace_id/span_id
         # -> they are forwarded alongside caller/request attribution.
         ctrl = _hicache_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1"])
         ctrl.storage_backend.batch_exists.return_value = 2
         op = SimpleNamespace(
             last_hash=None,
@@ -280,7 +283,6 @@ class TestHiCacheControllerRequestId(unittest.TestCase):
 class TestHybridCacheControllerRequestId(unittest.TestCase):
     def test_storage_hit_query_no_pools_uses_batch_exists_with_request_id(self):
         ctrl = _hybrid_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1", "h2"])
         ctrl.storage_backend.batch_exists.return_value = 2
 
         op = SimpleNamespace(
@@ -290,10 +292,14 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             request_id="r-1",
             pool_transfers=None,
             pool_storage_result=MagicMock(),
+            assume_stored=False,
         )
-        hash_value, count = ctrl._storage_hit_query(op)
+        with mock.patch.object(
+            hybrid_cc_module, "get_storage_hash_str", return_value=["h0", "h1", "h2"]
+        ):
+            hash_value, count = ctrl._storage_hit_query(op)
+            extra = ctrl.storage_backend.batch_exists.call_args[0][1]
 
-        extra = ctrl.storage_backend.batch_exists.call_args[0][1]
         self.assertEqual(extra.prefix_keys, ["p0"])
         self.assertEqual(extra.extra_info, {"request_id": "r-1"})
         op.pool_storage_result.update_kv_hit_pages.assert_called_once_with(2)
@@ -302,7 +308,6 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
 
     def test_storage_hit_query_with_pools_uses_batch_exists_v2_with_request_id(self):
         ctrl = _hybrid_ctrl()
-        ctrl.get_hash_str = MagicMock(return_value=["h0", "h1", "h2"])
         ctrl.storage_backend.batch_exists_v2.return_value = PoolTransferResult(
             kv_hit_pages=2, extra_pool_hit_pages={}
         )
@@ -315,8 +320,12 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             request_id="r-1",
             pool_transfers=transfers,
             pool_storage_result=MagicMock(),
+            assume_stored=False,
         )
-        ctrl._storage_hit_query(op)
+        with mock.patch.object(
+            hybrid_cc_module, "get_storage_hash_str", return_value=["h0", "h1", "h2"]
+        ):
+            ctrl._storage_hit_query(op)
 
         args = ctrl.storage_backend.batch_exists_v2.call_args[0]
         self.assertEqual(args[0], ["h0", "h1", "h2"])
@@ -336,6 +345,8 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             is_terminated=lambda: False,
             hash_value=["h0", "h1"],
             request_id="r-1",
+            sidecar_hash_values=None,
+            sidecar_hit_pages=0,
         )
         ctrl._page_transfer_sidecar(op, kv_completed_pages=2)
 

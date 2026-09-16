@@ -633,7 +633,7 @@ class TestHiCacheCallerAttributionAndGate(unittest.TestCase):
     def test_get_thread_caller_info_format(self):
         from sglang.srt.observability.trace import get_thread_caller_info
 
-        trace_set_thread_info("Backup", 2, 1, 0)
+        trace_set_thread_info("Backup", tp_rank=2, pp_rank=1, dp_rank=0)
         info = get_thread_caller_info()
         self.assertIsNotNone(info)
         caller_id, caller_role = info
