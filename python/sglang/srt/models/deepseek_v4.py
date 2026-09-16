@@ -186,6 +186,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -4596,6 +4597,13 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (
+        backend.is_megamoe() and get_disagg().disaggregation_mode == "decode"
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4626,9 +4634,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if get_pp_group().world_size != 1 or not get_moe_a2a_backend().is_none():
+            if get_pp_group().world_size != 1 or not _v41_vision_a2a_supported():
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP and prefill CP without PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
+                    "MoE A2A is supported only with MegaMoE on a PD decode node"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
