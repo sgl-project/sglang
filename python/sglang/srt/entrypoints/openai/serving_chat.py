@@ -89,6 +89,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
+    strip_structural_tag_excludes,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -1259,6 +1260,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                if (
+                    tool_call_constraint is not None
+                    and tool_call_constraint[0] == "structural_tag"
+                    and self._reasoning_detector is not None
+                ):
+                    # Same ownership rule: the reasoning parser handles think
+                    # tokens, so the grammar must not forbid them in free text.
+                    strip_structural_tag_excludes(
+                        tool_call_constraint[1],
+                        (
+                            self._reasoning_detector.think_start_token,
+                            self._reasoning_detector.think_end_token,
+                        ),
+                    )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
