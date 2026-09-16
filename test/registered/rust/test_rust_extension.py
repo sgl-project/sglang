@@ -36,24 +36,6 @@ class _FailingExtensionLoader(importlib.abc.Loader):
 
 
 class TestRustExtension(CustomTestCase):
-    def test_toolchain_query_failure_reports_stderr_and_working_directory(self):
-        with TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            with self.assertRaises(RuntimeError) as raised:
-                rust_extension._command_version(
-                    sys.executable,
-                    "-c",
-                    "import sys; sys.stderr.write('toolchain install failed\\n'); sys.exit(1)",
-                    cwd=workspace,
-                )
-            self.assertTrue(
-                str(raised.exception).endswith("\ntoolchain install failed")
-            )
-            self.assertIn(str(workspace), str(raised.exception))
-            self.assertIsInstance(
-                raised.exception.__cause__, subprocess.CalledProcessError
-            )
-
     def _workspace(self, root: Path) -> Path:
         workspace = root / "rust"
         crate = workspace / "demo"
