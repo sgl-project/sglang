@@ -97,7 +97,10 @@ struct TopKPagedParams {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
   SGL_DEVICE PageTransform get_transform(uint32_t batch_id) const {
-    return {page_table + batch_id * page_table_stride, page_bits, raw_indices + batch_id * static_cast<int64_t>(topk)};
+    return {
+        page_table == nullptr ? nullptr : page_table + batch_id * page_table_stride,
+        page_bits,
+        raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk)};
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);

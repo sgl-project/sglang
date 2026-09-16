@@ -387,6 +387,17 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
     ref_raw = _reference(windows, lengths.cpu(), k)
     _assert_topk_close(windows, ref_raw, our_raw, len(rows), lengths.cpu(), k)
 
+    # The kernel may mask the at-most-three alignment columns immediately
+    # before a window. Everything else, including other rows' storage, must be
+    # left untouched.
+    changed = (scores != before).cpu()
+    for i, (start, length) in enumerate(rows):
+        allowed = torch.zeros(scores.shape[1], dtype=torch.bool)
+        if length > k:
+            allowed[start - start % 4 : start] = True
+        stray = (changed[i] & ~allowed).nonzero().flatten().tolist()
+        assert not stray, f"row {i} ({name}) wrote outside its masked head: {stray[:8]}"
+
 
 def _assert_topk_values(window, indices, k):
     indices = indices.cpu().long()
