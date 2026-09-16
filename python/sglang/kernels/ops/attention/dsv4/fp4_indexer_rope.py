@@ -18,13 +18,11 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+from .fp4_indexer import INDEX_K_SLOT_BYTES
 from .utils import make_name
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
-# Payload bytes plus one ue8m0 exponent per 32 elements, per compressed token.
-SLOT_BYTES = 68
 
 
 @cache_once
@@ -33,10 +31,10 @@ def _jit_index_k_module(
 ) -> Module:
     args = make_cpp_args(head_dim, rope_dim, page_size, ratio, is_arch_support_pdl())
     return load_jit(
-        make_name("fp4_rope"),
+        make_name("index_k_rope_pack"),
         *args,
-        cuda_files=["deepseek_v4/fp4_rope.cuh"],
-        cuda_wrappers=[("index_k", f"FlashIndexKKernel<{args}>::run_index_k")],
+        cuda_files=["deepseek_v4/fp4_indexer_rope.cuh"],
+        cuda_wrappers=[("index_k", f"IndexKKernel<{args}>::run_index_k")],
     )
 
 
@@ -44,11 +42,11 @@ def _jit_index_k_module(
 def _jit_index_q_module(head_dim: int, rope_dim: int) -> Module:
     args = make_cpp_args(head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(
-        make_name("fp4_rope"),
+        make_name("index_q_rope_pack"),
         *args,
-        cuda_files=["deepseek_v4/fp4_rope.cuh"],
+        cuda_files=["deepseek_v4/fp4_indexer_rope.cuh"],
         cuda_wrappers=[
-            ("index_q_weights", f"FlashIndexQKernel<{args}>::run_index_q_weights"),
+            ("index_q_weights", f"IndexQKernel<{args}>::run_index_q_weights"),
         ],
     )
 
@@ -88,7 +86,7 @@ def index_k_norm_rope_pack_store(
     """
     head_dim = input.shape[-1]
     _jit_index_k_module(
-        head_dim, freqs_cis.shape[-1], cache.shape[1] // SLOT_BYTES, ratio
+        head_dim, freqs_cis.shape[-1], cache.shape[1] // INDEX_K_SLOT_BYTES, ratio
     ).index_k(input, norm_weight, freqs_cis, positions, loc, cache, float(eps))
 
 

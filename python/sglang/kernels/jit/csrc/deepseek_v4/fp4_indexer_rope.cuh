@@ -61,8 +61,7 @@ constexpr uint32_t kFp4RopeWarpsPerCTA = 4;
 /// replaced by multiplication by 1/6, and the exponent is clamped.
 /// The two stages therefore require separate scales.
 SGL_DEVICE uint32_t index_pack_exponent(float amax) {
-  const auto bits = __float_as_uint(fmaxf(amax / 6.0f, 1.0e-4f));
-  const auto exponent = static_cast<int32_t>((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
+  const auto exponent = deepseek_v4::fp8::cast_to_ue8m0(fmaxf(amax / 6.0f, 1.0e-4f));
   // Neither bound is reachable for finite fp32 inputs: the 1e-4 floor keeps
   // the exponent above 1, and reaching 254 requires absmax > 6 * 2^126.
   return static_cast<uint32_t>(min(max(exponent, 1), 254));
@@ -160,8 +159,7 @@ SGL_DEVICE uint32_t index_scale_word(const uint32_t (&exponent)[2]) {
 /// so each lane carries one complex RoPE pair. Only RMSNorm spans the full
 /// row; the remaining reductions use the FP4 block layout.
 template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, typename PosT>
-__global__
-__launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_k_kernel(const IndexKParams params) {
+__global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void index_k_kernel(const IndexKParams params) {
   using namespace device;
   namespace fp4 = deepseek_v4::fp4;
 
@@ -239,8 +237,7 @@ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_k_
 /// Input is contiguous [num_tokens, heads, kHeadDim]; row r uses token r / heads
 /// and head r % heads. Queries use their own position, without a ratio mask.
 template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kWeights>
-__global__
-__launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_q_kernel(const IndexQParams params) {
+__global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void index_q_kernel(const IndexQParams params) {
   using namespace device;
 
   constexpr uint32_t kPayloadBytes = kHeadDim / 2;
@@ -288,14 +285,14 @@ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void flash_index_q_
   }
 }
 
-/// \brief Host side of `flash_index_k_kernel`.
+/// \brief Host side of `index_k_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kUsePDL>
-struct FlashIndexKKernel {
+struct IndexKKernel {
   static constexpr uint32_t kBlockSize = kFp4RopeWarpsPerCTA * device::kWarpThreads;
   static constexpr int64_t kSlotBytes = kHeadDim / 2 + kHeadDim / deepseek_v4::fp4::kBlockSize;
 
   template <typename PosT>
-  static constexpr auto kernel = flash_index_k_kernel<kUsePDL, kHeadDim, kRopeDim, kPageSize, kRatio, PosT>;
+  static constexpr auto kernel = index_k_kernel<kUsePDL, kHeadDim, kRopeDim, kPageSize, kRatio, PosT>;
 
   /// \param input `[num_tokens, kHeadDim]` bf16, `wk(latent)` before `k_norm`.
   /// \param norm_weight `[kHeadDim]` bf16, `k_norm.weight`.
@@ -348,13 +345,13 @@ struct FlashIndexKKernel {
   }
 };
 
-/// \brief Host side of `flash_index_q_kernel`.
+/// \brief Host side of `index_q_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
-struct FlashIndexQKernel {
+struct IndexQKernel {
   static constexpr uint32_t kBlockSize = kFp4RopeWarpsPerCTA * device::kWarpThreads;
 
   template <typename PosT, bool kWeights>
-  static constexpr auto kernel = flash_index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
+  static constexpr auto kernel = index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
 
   /// \param input `[num_tokens, heads, kHeadDim]` bf16, `wq_b(q_lora)`.
   /// \param freqs_cis `[max_pos, kRopeDim]` fp32, real/imag interleaved.

@@ -11,8 +11,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-FP4_MAX = 6.0
-FP4_AMAX_FLOOR = 6 * (2.0**-126)
+from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
 
 
 @triton.jit
