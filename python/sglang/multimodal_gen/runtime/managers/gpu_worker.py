@@ -47,15 +47,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    map_request_outputs,
     materialize_output_sample,
     post_process_sample,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    DefaultWorkload,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
-    resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     get_global_component_residency_manager,
@@ -80,6 +79,10 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
     GPUWorkerPostTrainingMixin,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
+from sglang.multimodal_gen.runtime.realtime.video import (
+    RAW_RGB_CONTENT_TYPE,
+    build_raw_rgb_frame_batches,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -90,17 +93,13 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    build_raw_rgb_frame_batches,
-)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
     DiffStage,
     init_diffusion_tracing,
     trace_slice,
 )
-from sglang.multimodal_gen.utils import kill_itself_when_parent_died
 from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
@@ -243,23 +242,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
-        # default workload resolved once for the per-request residency hint
-        self._cached_default_workload: DefaultWorkload | None = None
-        self._cached_default_workload_failed = False
-
-    def _default_workload_for_hint(self) -> DefaultWorkload | None:
-        if (
-            self._cached_default_workload is None
-            and not self._cached_default_workload_failed
-        ):
-            try:
-                self._cached_default_workload = resolve_default_workload(
-                    self.server_args
-                )
-            except Exception:
-                logger.debug("Default workload unresolvable", exc_info=True)
-                self._cached_default_workload_failed = True
-        return self._cached_default_workload
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -1196,9 +1178,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if not self.is_output_rank or output_batch.output is None:
             return
-        if len(output_batch.output) != len(reqs):
+        output_requests = map_request_outputs(reqs)
+        if len(output_batch.output) != len(output_requests):
             raise RuntimeError(
-                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+                f"Expected {len(output_requests)} grouped outputs, got {len(output_batch.output)}"
             )
 
         first_req = reqs[0]
@@ -1207,7 +1190,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
@@ -1551,23 +1534,10 @@ def _oom_exceptions():
 def run_scheduler_process(
     local_rank: int,
     rank: int,
-    master_port: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
 ) -> None:
-    """
-    The entry point for the worker process.
-    Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
-    Ranks > 0 act as slaves, waiting for tasks from the master.
-    """
+    """Run a rank's scheduler and report readiness to the launching process."""
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
@@ -1581,8 +1551,6 @@ def run_scheduler_process(
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     try:
@@ -1590,8 +1558,6 @@ def run_scheduler_process(
             server_args,
             gpu_id=rank,
             port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")

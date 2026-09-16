@@ -17,6 +17,7 @@ QWEN3_5_397B_A17B_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "ASCEND_USE_FIA": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "HCCL_BUFFSIZE": "0",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "6",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -124,8 +125,9 @@ class TestNPUQwen3_5_397B_A17B_3K5_1K5_50ms(TestNpuPerformanceTestCaseBase):
     tpot = 50
     output_token_throughput = 5415
     request_rate = float("inf")
-    temperature = 0.6
-    top_p = 0.95
+    # Disabled to work around DTS2026091033366; re-enable after the fix.
+    # temperature = 0.6
+    # top_p = 0.95
 
     def test_npu_qwen3_5_397b_a17b_3k5_1k5(self):
         """Run NPU performance test for Qwen3.5-397B-A17B in3k5 out1k5"""

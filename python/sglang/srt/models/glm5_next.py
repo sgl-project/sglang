@@ -94,6 +94,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -980,7 +981,8 @@ class Glm5NextModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # mHC carries its residual streams in hidden_states across PP stages.
+            residual = None if self.config.mhc else pp_proxy_tensors["residual"]
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1058,6 +1060,8 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            if self.config.mhc:
+                return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1077,6 +1081,13 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.language_model.": "model.",
+            "model.visual": "visual",
+        }
+    )
+
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": [
@@ -1200,6 +1211,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+            for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+                moe_prefix = f"model.layers.{layer_id}.mlp"
+                if quant_config.is_layer_excluded(
+                    f"{moe_prefix}.shared_experts"
+                ) and not quant_config.is_layer_excluded(f"{moe_prefix}.experts"):
+                    return (
+                        "ModelOpt FP4 keeps shared experts unquantized while routed "
+                        "experts are quantized."
+                    )
         if not _is_cuda:
             return "Shared experts fusion currently requires CUDA devices."
         if _device_sm is not None and _device_sm < 80:
