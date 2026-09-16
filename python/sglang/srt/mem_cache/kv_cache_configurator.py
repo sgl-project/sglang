@@ -1178,7 +1178,8 @@ class KVCacheConfigurator:
             # mamba-ish model (Mamba2/Nemotron, lightning, ...) run with the
             # flag set stays byte-identical to flag-off.
             enable_linear_replayssm_spec=(
-                get_exec().mamba.enable_linear_replayssm_spec
+                get_disagg().disaggregation_mode != "prefill"
+                and get_exec().mamba.enable_linear_replayssm_spec
                 and (
                     self.hybrid_gdn_config is not None
                     or kimi_linear_config(self.model_config) is not None
