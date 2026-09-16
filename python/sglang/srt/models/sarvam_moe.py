@@ -5,7 +5,7 @@
 
 import math
 from enum import IntEnum, auto
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,10 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -67,6 +71,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_spec,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -160,9 +165,14 @@ for backend in CONCAT_ROPE_BACKENDS:
 
 def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
     prefill_backend, decode_backend = attention_backends()
-    is_decode = forward_batch.forward_mode.is_decode_or_idle()
-    if is_decode:
+    if forward_batch.forward_mode.is_decode_or_idle():
         backend = decode_backend
+    elif forward_batch.forward_mode.is_target_verify():
+        backend = (
+            decode_backend
+            if get_spec().speculative_attention_mode == "decode"
+            else prefill_backend
+        )
     else:
         backend = prefill_backend
         if (
@@ -1077,9 +1087,15 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -1131,6 +1147,7 @@ class SarvamMLAModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.dspark_layers_to_capture: Optional[List[int]] = None
         self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
@@ -1182,10 +1199,33 @@ class SarvamMLAModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = AuxHiddenStatePacker(
+            len(self.dspark_layers_to_capture or ())
+        )
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                captured_last_layer_outputs=(
+                    aux_hidden_states
+                    if self.dspark_layers_to_capture is not None
+                    and i - 1 in self.dspark_layers_to_capture
+                    else None
+                ),
+            )
+
+        # prepare_attn materializes the completed residual stream from the
+        # previous decoder layer. The final layer has no successor, so capture
+        # its pre-norm output explicitly.
+        if (
+            self.dspark_layers_to_capture is not None
+            and self.end_layer - 1 in self.dspark_layers_to_capture
+        ):
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
             )
 
         if not self.pp_group.is_last_rank:
@@ -1199,6 +1239,8 @@ class SarvamMLAModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if self.dspark_layers_to_capture is not None:
+            return hidden_states, aux_hidden_states.finalize()
         return hidden_states
 
 
@@ -1223,6 +1265,7 @@ class SarvamMLAForCausalLM(nn.Module):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @staticmethod
     def _remap_config(config: PretrainedConfig) -> None:
@@ -1254,6 +1297,38 @@ class SarvamMLAForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        """Configure raw post-decoder layer outputs consumed by DSpark."""
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+
+        layer_ids = [int(layer_id) for layer_id in layer_ids]
+        if not layer_ids:
+            raise ValueError(
+                "DSPARK requires at least one target layer for aux hidden capture."
+            )
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError(
+                "DSPARK target layer_ids must be unique and strictly increasing."
+            )
+
+        num_layers = int(self.config.num_hidden_layers)
+        invalid = [layer_id for layer_id in layer_ids if not 0 <= layer_id < num_layers]
+        if invalid:
+            raise ValueError(
+                "DSPARK target layer_ids are outside the Sarvam decoder range: "
+                f"{invalid}; num_hidden_layers={num_layers}."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = layer_ids
+
     @torch.no_grad()
     def forward(
         self,
@@ -1267,8 +1342,15 @@ class SarvamMLAForCausalLM(nn.Module):
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         return hidden_states
 
@@ -1288,18 +1370,40 @@ class SarvamMLAForCausalLM(nn.Module):
             else:
                 forward_batch.hidden_states = input_embeds
             forward_batch.residual = None
+            if self.capture_aux_hidden_states:
+                forward_batch.dspark_aux_hidden_states = AuxHiddenStatePacker(
+                    len(self.model.dspark_layers_to_capture)
+                )
 
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
+                capture_previous_layer = (
+                    self.capture_aux_hidden_states
+                    and i - 1 in self.model.dspark_layers_to_capture
+                )
                 forward_batch.hidden_states, forward_batch.residual = layer(
                     positions,
                     forward_batch.hidden_states,
                     forward_batch,
                     forward_batch.residual,
+                    captured_last_layer_outputs=(
+                        forward_batch.dspark_aux_hidden_states
+                        if capture_previous_layer
+                        else None
+                    ),
                 )
 
         if end == self.model.config.num_hidden_layers:
+            if (
+                self.capture_aux_hidden_states
+                and end - 1 in self.model.dspark_layers_to_capture
+            ):
+                forward_batch.dspark_aux_hidden_states.append(
+                    forward_batch.hidden_states
+                    if forward_batch.residual is None
+                    else forward_batch.hidden_states + forward_batch.residual
+                )
             if forward_batch.residual is None:
                 hidden_states = self.model.norm(forward_batch.hidden_states)
             else:
@@ -1308,7 +1412,15 @@ class SarvamMLAForCausalLM(nn.Module):
                 )
             forward_batch.hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+                input_ids,
+                forward_batch.hidden_states,
+                self.lm_head,
+                forward_batch,
+                (
+                    forward_batch.dspark_aux_hidden_states.finalize()
+                    if self.capture_aux_hidden_states
+                    else None
+                ),
             )
         return None
 
