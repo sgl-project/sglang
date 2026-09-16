@@ -644,7 +644,9 @@ fn multimodal_sentinel_is_validated_after_expansion() {
     };
     g.input_ids = Some(vec![1, -103, 2]);
     g.mm = Some(Box::new(crate::message::request::MmData {
-        audio_data: Some(rmpv::Value::from("data:audio/wav;base64,xxxx")),
+        audio_data: vec![crate::message::multimodal::MmItem::Source(
+            "data:audio/wav;base64,xxxx".into(),
+        )],
         ..Default::default()
     }));
 
@@ -771,7 +773,9 @@ fn mm_generate_req(rid: &str) -> Request {
             rid: rid.to_string().into(),
             text: Some("<image> hi".into()),
             mm: Some(Box::new(crate::message::request::MmData {
-                image_data: Some(rmpv::Value::from("data:image/jpeg;base64,xxxx")),
+                image_data: vec![crate::message::multimodal::MmItem::Source(
+                    "data:image/jpeg;base64,xxxx".into(),
+                )],
                 ..Default::default()
             })),
             ..Default::default()
@@ -791,14 +795,16 @@ fn abort_cancels_parked_mm_request() {
     // The worker parks its result, as it always does before MmEncoded.
     intake.mm.results.park(
         "mm-gone".into(),
-        crate::multi_modality::result_store::MmEncodedEntry {
-            features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
-            grids: vec![],
-            hashes: vec![],
-            offsets: vec![],
-            mrope: vec![],
-            mrope_delta: 0,
-        },
+        crate::multi_modality::result_store::MmEncodedEntry::Qwen(
+            crate::multi_modality::result_store::QwenMmEncodedEntry {
+                features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
+                grids: vec![],
+                hashes: vec![],
+                offsets: vec![],
+                mrope: vec![],
+                mrope_delta: 0,
+            },
+        ),
     );
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
     assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
@@ -826,7 +832,7 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
     assert_eq!(sub.work.text.as_deref(), Some("<image> hi"));
     assert!(sub.work.input_ids.is_none(), "no client input_ids");
     assert_eq!(
-        sub.work.image_data.as_ref().and_then(|v| v.as_str()),
+        sub.work.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
     assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");

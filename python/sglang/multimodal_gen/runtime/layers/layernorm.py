@@ -17,6 +17,9 @@ from sglang.kernels.ops.diffusion import (
     fused_inplace_qknorm_rope,
     triton_one_pass_rms_norm,
 )
+from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+    expand_scale_shift_cpu_param,
+)
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -27,6 +30,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -74,6 +80,8 @@ if _is_xpu:
 
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
+
+_QK_NORM_ROPE_DICT: dict[tuple[int, bool], RotaryEmbedding] = {}
 
 
 # Copied and adapted from sglang
@@ -372,20 +380,6 @@ class LayerNorm(CustomOp):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-            # Lazy cache for ones vector (not a registered buffer to avoid FSDP/meta issues)
-            self._weight_fallback_cache = None
-
-    def _get_weight_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        wf = getattr(self, "_weight_fallback_cache", None)
-        if (
-            wf is None
-            or wf.device != x.device
-            or wf.dtype != x.dtype
-            or wf.numel() != self.hidden_size
-        ):
-            wf = torch.ones(self.hidden_size, device=x.device, dtype=x.dtype)
-            self._weight_fallback_cache = wf
-        return wf
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
@@ -741,6 +735,42 @@ class _ScaleResidualNormScaleShift(CustomOp):
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
+    def forward_cpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        if isinstance(gate, torch.Tensor):
+            gate_tensor = gate
+        elif gate == 1:
+            gate_tensor = None
+        else:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        if gate_tensor is not None:
+            gate_tensor = expand_scale_shift_cpu_param(gate_tensor, x)
+
+        return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
+            residual,
+            x,
+            gate_tensor,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
+
 
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
@@ -862,6 +892,28 @@ class _NormScaleShift(CustomOp):
 
         return (normalized * (1 + scale) + shift).to(x.dtype)
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
+            x,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
+
 
 class LayerNormScaleShift(_NormScaleShift):
     norm_type = "layer"
@@ -925,6 +977,7 @@ def apply_qk_norm_with_optional_rope(
     k_norm: "RMSNorm",
     head_dim: int,
     cos_sin_cache: Optional[torch.Tensor] = None,
+    freqs_complex: Optional[torch.Tensor] = None,
     *,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
@@ -950,6 +1003,7 @@ def apply_qk_norm_with_optional_rope(
         k_norm=k_norm,
         head_dim=head_dim,
         cos_sin_cache=cos_sin_cache,
+        freqs_complex=freqs_complex,
         is_neox=is_neox,
         positions=positions,
         position_offset=position_offset,
@@ -965,6 +1019,7 @@ def apply_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     *,
+    freqs_complex: Optional[torch.Tensor] = None,
     is_neox: bool = False,
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
@@ -980,10 +1035,6 @@ def apply_qk_norm_rope(
     ``cache_has_full_width`` describes ``[full cos, full sin]`` cache rows and
     requires the fused CUDA path; the ordinary cache stores half-width cos/sin.
     """
-
-    from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-        apply_flashinfer_rope_qk_inplace,
-    )
 
     if q.dim() != 4 or k.dim() != 4:
         raise ValueError(
@@ -1121,13 +1172,25 @@ def apply_qk_norm_rope(
         head_dim=head_dim,
         allow_inplace=allow_inplace,
     )
-    return apply_flashinfer_rope_qk_inplace(
-        q=q,
-        k=k,
-        cos_sin_cache=cos_sin_cache,
-        head_size=head_dim,
-        is_neox=is_neox,
+
+    rope_key = (head_dim, is_neox)
+    rotary_emb = _QK_NORM_ROPE_DICT.get(rope_key)
+    if rotary_emb is None:
+        rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=is_neox,
+        )
+        _QK_NORM_ROPE_DICT[rope_key] = rotary_emb
+    return rotary_emb(
+        query=q,
+        key=k,
         positions=positions,
+        complex_freqs=(
+            freqs_complex.unsqueeze(-2) if freqs_complex is not None else None
+        ),
+        cos_sin_cache=cos_sin_cache,
     )
 
 

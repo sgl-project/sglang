@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import enter_override, maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -193,6 +193,81 @@ class _MockTemplateManager:
         self.reasoning_config = None
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
+
+
+class TestChatTemplateCache(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", default_chat_template_kwargs=None),
+            role="tokenizer",
+        )
+        self.tokenizer_manager = _MockTokenizerManager()
+        self.chat = OpenAIServingChat(
+            self.tokenizer_manager,
+            _MockTemplateManager(),
+        )
+        self.tokenizer_manager.tokenizer.apply_chat_template.return_value = "rendered"
+        self.tokenizer_manager.tokenizer.encode.return_value = [11, 12]
+        self.tokenizer_manager.tokenizer.decode.return_value = "decoded"
+        self.tokenizer_manager.tokenizer.reset_mock()
+
+    def _render(self, **overrides):
+        kwargs = {
+            "messages": [{"role": "user", "content": "same text prefix"}],
+            "tools": None,
+            "template_kwargs": {"enable_thinking": False},
+            "encode_kwargs": {"add_special_tokens": False},
+            "use_cache": True,
+        }
+        kwargs.update(overrides)
+        return self.chat._render_and_encode_chat_template(**kwargs)
+
+    def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
+        first = self._render()
+        first[1].append(99)
+        second = self._render()
+
+        self.assertEqual(second, ("rendered", [11, 12], "decoded"))
+        self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer_manager.tokenizer.encode.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_called_once()
+
+    def test_cache_key_includes_template_and_encode_options(self):
+        self._render()
+        self._render(template_kwargs={"enable_thinking": True})
+        self._render(encode_kwargs={"add_special_tokens": True})
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            3,
+        )
+        self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 3)
+
+    def test_cache_key_tracks_tokenizer_chat_template_updates(self):
+        self.tokenizer_manager.tokenizer.chat_template = "template-v1"
+        self._render()
+        self.tokenizer_manager.tokenizer.chat_template = "template-v2"
+        self._render()
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+
+    def test_non_serializable_input_bypasses_cache(self):
+        messages = [{"role": "user", "content": object()}]
+        self._render(messages=messages)
+        self._render(messages=messages)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+        self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -386,9 +461,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.tm.tokenizer.apply_chat_template.reset_mock()
         self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
-        self.assertEqual(
-            rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
-        )
+        self.tm.tokenizer.apply_chat_template.assert_not_called()
 
         self.template_manager.jinja_template_may_reorder_tool_results = False
         self.tm.tokenizer.apply_chat_template.reset_mock()
@@ -1914,6 +1987,42 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
+
+    def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
+        """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
+        not by the detector's tool_index (0 for both)."""
+        self.chat.tool_call_parser = "deepseekv4"
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            parser_instance = ParserMock.return_value
+            calls = []
+            for city in ("San Francisco", "London"):
+                call_info = Mock()
+                call_info.name = "get_weather"
+                call_info.parameters = json.dumps({"location": city})
+                call_info.tool_index = 0
+                calls.append(call_info)
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", calls)
+
+            tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                text="<｜DSML｜tool_calls>...",
+                tools=tools,
+                finish_reason={"type": "stop", "matched": None},
+                history_tool_calls_cnt=0,
+            )
+
+        self.assertEqual([tc.index for tc in tool_calls], [0, 1])
+        self.assertEqual(
+            [tc.function.arguments for tc in tool_calls],
+            [
+                json.dumps({"location": "San Francisco"}),
+                json.dumps({"location": "London"}),
+            ],
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
 
     def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
         """A structural-tag parser owns the output format, so a missing tool

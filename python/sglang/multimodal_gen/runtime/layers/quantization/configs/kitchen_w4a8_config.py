@@ -11,12 +11,15 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+    is_comfy_int8_embedding,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8 import (
-    KitchenInt8EmbeddingMethod,
     KitchenW4A8LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
@@ -49,9 +52,7 @@ class KitchenW4A8Config(QuantizationConfig):
 
         for prefix, marker in layer_markers.items():
             marker_format = marker.get("format")
-            if marker_format == "int8_tensorwise" and marker.get(
-                "_is_tensorwise_scalar"
-            ):
+            if is_comfy_int8_embedding(marker):
                 continue
             if marker_format != "asym_w4a8_int8":
                 raise ValueError(
@@ -92,14 +93,14 @@ class KitchenW4A8Config(QuantizationConfig):
         if isinstance(layer, VocabParallelEmbedding):
             if marker is None:
                 return None
-            if marker.get("format") != "int8_tensorwise" or not marker.get(
-                "_is_tensorwise_scalar"
-            ):
+            if not is_comfy_int8_embedding(marker):
                 raise ValueError(
                     f"Unsupported quantized embedding marker for {prefix!r}: {marker}"
                 )
             self.selected.append(prefix)
-            return KitchenInt8EmbeddingMethod()
+            return ComfyInt8EmbeddingMethod(
+                tensorwise=bool(marker.get("_is_tensorwise_scalar"))
+            )
         if not isinstance(layer, LinearBase):
             return None
         if marker is None:
@@ -153,9 +154,4 @@ class KitchenW4A8Config(QuantizationConfig):
         return []
 
     def quantizes_embedding(self, prefix: str) -> bool:
-        marker = self.layer_markers.get(prefix)
-        return bool(
-            marker is not None
-            and marker.get("format") == "int8_tensorwise"
-            and marker.get("_is_tensorwise_scalar")
-        )
+        return is_comfy_int8_embedding(self.layer_markers.get(prefix))

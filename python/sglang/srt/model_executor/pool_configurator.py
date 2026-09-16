@@ -55,10 +55,12 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -69,6 +71,7 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    unified_memory_pool_bytes: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -310,6 +313,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
+            if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                # NPU sparse KV offload uses an index-only device pool.
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                    get_sparsity_driven_kv_offload_cell_size,
+                )
+
+                offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
+                    model_config=model_config,
+                    use_mla_backend=kvc.use_mla_backend,
+                    num_layers=num_layers,
+                    element_size=kv_size,
+                )
+                if offload_cell_size is not None:
+                    return offload_cell_size
+
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
@@ -406,7 +424,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
 
+        cell_size += self._compute_qsa_cell_size(
+            hf_config=model_config.hf_config, num_layers=num_layers
+        )
         return cell_size
+
+    @staticmethod
+    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.layers.attention.qsa.config import (
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+        )
+
+        if num_layers == 0:
+            return 0
+        qsa_profile = parse_qsa_profile(hf_config)
+        if qsa_profile is None:
+            return 0
+        return QSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            compress_ratio=qsa_profile.compress_ratio,
+            num_layers=num_layers,
+        )
 
     def _compute_dsa_indexer_cell_size(
         self,
@@ -422,6 +464,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            dtype = kvc.kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -482,6 +534,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = max(available_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -646,6 +699,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_cell_size
         )
 
+    def _unified_pool_bytes(self, full_tokens: int, swa_tokens: int) -> int:
+        return (
+            full_tokens * self._full_per_token * self._full_layers_num
+            + swa_tokens * self._swa_per_token * self._swa_layers_num
+        )
+
     def _max_unified_full_tokens(
         self,
         available_bytes: int,
@@ -655,7 +714,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         """Find the largest page-aligned full capacity whose allocations fit."""
         draft_bytes_per_token = self._draft_pool_bytes_per_token()
         target_full_bytes_per_token = self._full_per_token * self._full_layers_num
-        target_swa_bytes_per_token = self._swa_per_token * self._swa_layers_num
         assert target_full_bytes_per_token > 0
 
         def allocation_bytes(full_pages: int) -> int:
@@ -667,10 +725,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 // page_size
                 * page_size
             )
-            target_bytes = (
-                full_tokens * target_full_bytes_per_token
-                + swa_tokens * target_swa_bytes_per_token
-            )
+            target_bytes = self._unified_pool_bytes(full_tokens, swa_tokens)
             virtual_span = max(target_bytes // target_full_bytes_per_token - 1, 0)
             draft_tokens = ceil_align(virtual_span, page_size) + page_size
             return target_bytes + draft_tokens * draft_bytes_per_token
@@ -708,29 +763,34 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        self.validate_swa_pool_size(
-            swa_tokens, self._sliding_window_size, self._page_size
-        )
+        if not self._enable_unified_memory:
+            self.validate_swa_pool_size(
+                swa_tokens, self._sliding_window_size, self._page_size
+            )
 
         logger.info(
             f"Use sliding window memory pool. "
             f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )
 
+        return self._make_pool_config(full_tokens, swa_tokens)
+
+    def _make_pool_config(self, full_tokens: int, swa_tokens: int) -> MemoryPoolConfig:
         return MemoryPoolConfig(
             max_total_num_tokens=full_tokens,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            unified_memory_pool_bytes=(
+                self._unified_pool_bytes(full_tokens, swa_tokens)
+                if self._enable_unified_memory
+                else None
+            ),
         )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        if (
-            self._enable_unified_memory
-            and self._full_layers_num > 0
-            and self._draft_pool_bytes_per_token() > 0
-        ):
+        if self._enable_unified_memory and self._full_layers_num > 0:
             max_total_num_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size
             )
@@ -821,7 +881,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             * self._swa_per_token
             * (self._swa_layers_num + self._draft_swa_layers_num)
         )
-        if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
+        if self._enable_unified_memory:
             full_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
@@ -842,11 +902,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
                 f"Reduce --max-running-requests, lower SGLANG_SWA_EVICTION_INTERVAL, "
                 f"or increase --mem-fraction-static."
             )
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=swa_tokens,
-        )
+        return self._make_pool_config(full_tokens, swa_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
@@ -854,10 +910,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # Constrained max_total goes to the full pool; SWA stays at its cap.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         full_tokens = (max_total_num_tokens // page_size) * page_size
-        return MemoryPoolConfig(
-            max_total_num_tokens=full_tokens,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=min(swa_tokens, max_total_num_tokens),
+        return self._make_pool_config(
+            full_tokens, min(swa_tokens, max_total_num_tokens)
         )
 
 
@@ -934,15 +988,55 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
+        # Unified-KV uses a different physical layout than the non-unified V4 path:
+        #  * one row carries the full latent -- 1024 B bf16, or 640 B under
+        #    SGLANG_DSV4_UNIFIED_KV_FP8 (512 B fp8 nope + 128 B bf16 rope) -- not
+        #    that path's 584-byte fp8(nope) + bf16(rope) + scales cell.
+        #  * SWA is a fixed per-request ring (num_req_slots * ring_size),
+        #    independent of full_token, so it is a fixed *bias* rather than a
+        #    per-token term. Gate on the same switch the pool itself uses so the
+        #    sizing and the allocation never drift apart.
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
+        )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            dsv4_unified_row_bytes,
         )
 
         self._unified = is_unified_kv_triton()
+        self._unified_fp8 = is_unified_kv_fp8()
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # Row width across both pools: 1024 B bf16, 640 B fp8. Read from the pool
+        # module so sizing can't drift from the allocation.
+        self._unified_row_bytes = dsv4_unified_row_bytes(
+            self.qk_nope_head_dim, self.qk_rope_head_dim, self._unified_fp8
+        )
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
         self._spec_infl = 1.0
+
+        # The unified pool takes no dtype, so --kv-cache-dtype never reaches it.
+        # V4 defaults "auto" to fp8_e4m3 (overrides.py
+        # _deepseek_v4_kv_cache_dtype), so only a bfloat16 here tells us the user
+        # set it explicitly; warning on the fp8 side would fire on every run.
+        if self._unified_fp8 and self.kv_cache_dtype_str == "bfloat16":
+            logger.warning(
+                "--kv-cache-dtype=bfloat16 is ignored on the unified_kv path; "
+                "SGLANG_DSV4_UNIFIED_KV_FP8=1 stores the latent as fp8. Unset the "
+                "env switch to get a bf16 unified pool."
+            )
+
+        # get_contiguous_buf_infos ships one pointer per layer and prices a row as
+        # buf[0].nbytes, which under fp8 covers the nope pool only. Fail at startup
+        # rather than at the first transfer.
+        # TODO(danli103): drop this once the transfer ships the rope pool.
+        if self._unified_fp8 and self.disaggregation_mode != "null":
+            raise ValueError(
+                "SGLANG_DSV4_UNIFIED_KV_FP8=1 does not support PD disaggregation "
+                f"(disaggregation_mode={self.disaggregation_mode!r}). Unset the fp8 "
+                "switch or run without disaggregation."
+            )
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -1013,8 +1107,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_bytes_per_full_token(self) -> float:
         if self._unified:
-            # Unified_kv stores the whole latent in bf16.
-            kv_bytes = self.attn_head_dim * 2
+            # Unified_kv stores the whole latent: one bf16 pool, or an fp8 nope
+            # pool plus a bf16 rope pool. kv_bytes also prices the compressed
+            # c4/c128 rows below, which live in the same pool(s).
+            kv_bytes = self._unified_row_bytes
         else:
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
@@ -1147,14 +1243,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return min(estimated, full_token // 2)
 
     def _fixed_swa_bytes(self, max_running_requests: int) -> int:
+        """Unified_kv SWA is a fixed per-request ring, sized by concurrency
+        (num_req_slots) rather than by full_token. Return its byte footprint
+        across all full layers, inflated for the draft worker the same way as the
+        per-token coeff. Returns 0 on the non-unified path (where SWA is already
+        accounted per-token)."""
         if not self._unified:
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_bytes = (
             num_req_slots
             * self._swa_ring_size
-            * self.attn_head_dim
-            * 2  # bf16
+            * self._unified_row_bytes
             * self.num_layers_total
         )
         return int(ring_bytes * self._spec_infl)
@@ -1225,6 +1325,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: unified={self._unified}, "
+            f"unified_fp8={self._unified_fp8}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "

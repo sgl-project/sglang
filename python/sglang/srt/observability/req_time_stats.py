@@ -415,12 +415,18 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 convert_time_to_realtime_ns(ts),
             )
 
-    def set_finished_time(self, ts=None):
+    def set_finished_time(self, ts=None, span_attrs=None):
         ts = ts or time.perf_counter()
         self.finished_time = ts
 
         if self.trace_ctx.tracing_enable:
-            self.trace_ctx.trace_req_finish(convert_time_to_realtime_ns(ts))
+            # The latency attrs are derived from finished_time and the root span is
+            # closed below, so they must be merged in here rather than by the caller.
+            attrs = dict(span_attrs) if span_attrs else {}
+            attrs.update(self.convert_to_gen_ai_span_attrs())
+            self.trace_ctx.trace_req_finish(
+                convert_time_to_realtime_ns(ts), attrs=attrs
+            )
 
     def set_first_token_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -493,6 +499,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["request_received_ts"] = convert_time_to_realtime(
                 self.created_time
             )
+        if self.created_time > 0.0 and self.first_token_time > self.created_time:
+            meta_info["first_token_latency"] = self.get_first_token_latency()
         if self.api_server_dispatch_finish_time > 0.0:
             meta_info["api_server_dispatch_finish_ts"] = convert_time_to_realtime(
                 self.api_server_dispatch_finish_time
