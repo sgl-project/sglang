@@ -101,6 +101,20 @@ def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
+    SSM = auto()  # State Space Models (Mamba, Mamba2)
+
+
+# Pure Mamba-1 (selective-scan) archs; same mixer/state layout, differing only
+# in cosmetic details handled in their model files.
+PURE_MAMBA1_ARCHITECTURES = (
+    "FalconMambaForCausalLM",
+    "MambaForCausalLM",
+)
+
+# Pure state-space (SSM) causal-LMs: no attention, so no num_attention_heads /
+# head_dim in their HF config. Used for head-dim derivation and attention-arch
+# detection below.
+PURE_SSM_ARCHITECTURES = ("Mamba2ForCausalLM",) + PURE_MAMBA1_ARCHITECTURES
 
 
 class ModelImpl(str, Enum):
@@ -201,6 +215,15 @@ def is_qwen3_5(config) -> bool:
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
+    )
+
+
+def is_qwen3_5_mtp_draft(config) -> bool:
+    """The Qwen3.5 MoE MTP draft: _config_draft_model rewrites architectures[0] to
+    Qwen3_5ForCausalLMMTP before quantization is resolved."""
+    return (
+        _hf_arch(config) == "Qwen3_5ForCausalLMMTP"
+        and _hf_attr(config, "model_type") == "qwen3_5_moe"
     )
 
 
@@ -500,6 +523,15 @@ class ModelConfig:
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
+        # MiMo-V2 mxfp4 ckpts declare the routed-expert layout via store_dtype.
+        if (
+            not self.is_fp4_experts
+            and _hf_arch(self.hf_config) in MIMO_V2_MODEL_ARCHS
+            and str(quantization_config.get("store_dtype") or "").lower() == "mxfp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info("Detected MiMo-V2 mxfp4 routed-expert layout.")
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
         if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
@@ -892,6 +924,14 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "NemotronH_Omni_Reasoning_V3"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["NemotronHForCausalLMMTP"]
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
@@ -1017,14 +1057,23 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
+        # Pure SSM models have no attention heads; use head_dim == 0 so the
+        # KV-cell size is 0 rather than a division on a missing head count.
+        is_pure_ssm = any(
+            arch in self.hf_config.architectures for arch in PURE_SSM_ARCHITECTURES
+        )
+
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
         if self.head_dim is None:
-            self.head_dim = (
-                self.hf_text_config.hidden_size
-                // self.hf_text_config.num_attention_heads
-            )
-            setattr(self.hf_text_config, "head_dim", self.head_dim)
+            if is_pure_ssm:
+                self.head_dim = 0
+            else:
+                self.head_dim = (
+                    self.hf_text_config.hidden_size
+                    // self.hf_text_config.num_attention_heads
+                )
+                setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
         if self.v_head_dim is None or self.v_head_dim == 0:
@@ -1202,9 +1251,16 @@ class ModelConfig:
             elif "BaichuanForCausalLM" in self.hf_config.architectures:
                 self.use_alibi = self.hf_config.hidden_size != 4096
 
-            self.attention_arch = AttentionArch.MHA
+            # Pure Mamba SSMs have no attention (head_dim set to 0 above).
+            if is_pure_ssm:
+                self.attention_arch = AttentionArch.SSM
+            else:
+                self.attention_arch = AttentionArch.MHA
 
-        self.num_attention_heads = self.hf_text_config.num_attention_heads
+        # Mamba2 has no num_attention_heads.
+        self.num_attention_heads = getattr(
+            self.hf_text_config, "num_attention_heads", None
+        )
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
@@ -1278,7 +1334,8 @@ class ModelConfig:
         return self.num_attention_heads
 
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
-        total_num_attention_heads = self.num_attention_heads
+        # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
+        total_num_attention_heads = self.num_attention_heads or 0
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
@@ -1341,6 +1398,9 @@ class ModelConfig:
             if num_kv_heads is not None:
                 return num_kv_heads
 
+        # Mamba SSMs have no attention, so no KV heads.
+        if self.attention_arch == AttentionArch.SSM:
+            return 0
         # For non-grouped-query attention models, the number of KV heads is
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
@@ -1657,7 +1717,6 @@ class ModelConfig:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
-            "gptq",
             "fp8",
             "compressed_tensors",
             "compressed-tensors",
@@ -1773,9 +1832,16 @@ class ModelConfig:
                         f"Using CLI-specified quantization ({self.quantization}) which is "
                         f"compatible with HF config quant_method ({quant_method})."
                     )
-                elif self.is_draft_model:
+                elif self.is_draft_model and not (
+                    self.is_draft_quantization_explicit
+                    and self.quantization in REQUANTIZATION_METHODS
+                    and is_hip()
+                    and is_qwen3_5_mtp_draft(self.hf_config)
+                ):
                     # Allow auto-detection of quantization from checkpoint for draft model
-                    # only if the CLI quantization is not compatible
+                    # only if the CLI quantization is not compatible. An explicit
+                    # online-requantization request for the draft (e.g. quark_mxfp4
+                    # for an MTP stack the checkpoint left in bf16) is honored below.
                     logger.info(
                         f"Draft model quantization ({quant_method}) differs from "
                         f"main model quantization ({self.quantization}). "
@@ -2071,6 +2137,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",

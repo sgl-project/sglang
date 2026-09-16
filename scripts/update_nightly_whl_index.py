@@ -35,7 +35,7 @@ def update_wheel_index(
     Args:
         commit_hash: Short git commit hash (e.g., 'c5f1e86')
         nightly_version: Full nightly version string (e.g., '0.5.6.post1.dev7716+gc5f1e86')
-        cuda_version: CUDA version string (e.g., '129' or '130')
+        cuda_version: CUDA version string (e.g., '130')
         build_date: Build date in YYYY-MM-DD format (e.g., '2025-12-13')
     """
     dist_dir = pathlib.Path("dist")
@@ -176,7 +176,7 @@ def main():
         "--cuda-version",
         type=str,
         default="130",
-        help="CUDA version (e.g., '129' or '130'). Defaults to '130'.",
+        help="CUDA version (e.g., '130'). Defaults to '130'.",
     )
     parser.add_argument(
         "--build-date",
