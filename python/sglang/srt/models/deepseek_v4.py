@@ -3085,6 +3085,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         ):
             return mhc_post_split_h(x, residual, post, comb)
 
+        if (
+            _is_hip
+            and _is_gfx95_supported
+            and envs.SGLANG_OPT_HIP_MHC_POST_SPLIT_H.get()
+            and self.config.model_type == "deepseek_v41"
+            and 768 <= x.shape[0] <= 4096
+            and x.shape[1] == 5120
+            and residual.shape == (x.shape[0], 4, 5120)
+            and post.shape == (x.shape[0], 4)
+            and comb.shape == (x.shape[0], 4, 4)
+            and x.dtype == residual.dtype == torch.bfloat16
+            and post.dtype == comb.dtype == torch.float32
+            and all(t.is_contiguous() for t in (x, residual, post, comb))
+        ):
+            # Ordinary stores preserve locality for the following mHC reader.
+            return mhc_post_split_h(x, residual, post, comb, block_size=2048)
+
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             from flashinfer.mhc import mhc_post
 
