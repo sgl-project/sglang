@@ -213,6 +213,19 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
     return metadata
 
 
+def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
+    """Whether :func:`plan_topk_v2` writes a plan for these lengths. Small
+    batches and devices without clusters leave the plan buffer untouched."""
+    probe = torch.full(
+        (seq_lens.shape[0] + 1, _PLAN_METADATA_INTS_PER_BATCH),
+        -1,
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
+    return probe[0, 1].item() != -1
+
+
 def topk_transform_ragged_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
