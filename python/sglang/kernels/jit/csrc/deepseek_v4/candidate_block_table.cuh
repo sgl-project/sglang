@@ -26,7 +26,7 @@ namespace sglang {
 /// Counting sort over a per-row bitmap (one bit per block, 16 KiB for a 1M-token
 /// row): single-bit words are emitted by their owner, denser words go to a
 /// block-wide queue the warps drain one lane per bit.
-struct SortConfig {
+struct CandidateBlockTableConfig {
   static constexpr uint32_t kBlockSize = 1024;
   static constexpr uint32_t kOccupancy = 2;
   static constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
@@ -51,7 +51,7 @@ struct SortConfig {
   };
 };
 
-struct SortParams {
+struct CandidateBlockTableParams {
   const uint32_t* __restrict__ seq_len;    // [rows] tokens
   const int32_t* __restrict__ page_table;  // [rows, pages] index-pool pages
   int32_t* __restrict__ indices;           // [rows, topk] blocks, -1 padded in, ascending + kPad out
@@ -65,10 +65,10 @@ struct SortParams {
 
 /// One CTA per row.
 template <bool kUsePDL>
-__global__ __launch_bounds__(SortConfig::kBlockSize, SortConfig::kOccupancy)  //
-    void sort_128k_transform(const __grid_constant__ SortParams params) {
+__global__ __launch_bounds__(CandidateBlockTableConfig::kBlockSize, CandidateBlockTableConfig::kOccupancy)  //
+    void sort_128k_transform(const __grid_constant__ CandidateBlockTableParams params) {
   using namespace device;
-  using C = SortConfig;
+  using C = CandidateBlockTableConfig;
   __shared__ C::Smem smem;
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
@@ -163,7 +163,7 @@ __global__ __launch_bounds__(SortConfig::kBlockSize, SortConfig::kOccupancy)  //
 /// Host entry: `indices` is rewritten in place; `page_size` is the index pool's,
 /// a power of two >= 8, and the row's page table must cover its length.
 template <bool kPDL>
-struct SortIdxKernel {
+struct CandidateBlockTableKernel {
   static void transform(
       const tvm::ffi::TensorView indices,
       const tvm::ffi::TensorView seq_lens,
@@ -182,7 +182,7 @@ struct SortIdxKernel {
       const tvm::ffi::TensorView out_pages,
       const uint32_t page_size) {
     using namespace host;
-    using C = SortConfig;
+    using C = CandidateBlockTableConfig;
     auto B = SymbolicSize{"batch_size"};
     auto K = SymbolicSize{"topk_blocks"};
     auto Si = SymbolicSize{"indices_stride"};
@@ -198,7 +198,7 @@ struct SortIdxKernel {
         "page_size must be a power of two of at least 8");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= C::kMaxTopK, "topk_blocks must be in (0, kMaxTopK]");
-    const auto params = SortParams{
+    const auto params = CandidateBlockTableParams{
         .seq_len = static_cast<const uint32_t*>(seq_lens.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .indices = static_cast<int32_t*>(indices.data_ptr()),
