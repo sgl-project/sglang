@@ -26,7 +26,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -286,12 +297,17 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheRequestOutcome,
+    EvictParams,
+)
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3813,6 +3829,59 @@ class Scheduler(
 
         return res
 
+    def _ensure_mamba_admission_capacity(
+        self,
+        req: Req,
+        can_run_list: List[Req],
+    ) -> bool:
+        """Check real Mamba capacity before cache matching.
+
+        Prefix matching may allocate a live state, and request-pool allocation
+        may allocate the remaining main and ping-pong states. Gate both steps
+        on the exact outstanding demand so a temporary shortage keeps the
+        request queued instead of reaching an allocator assertion.
+        """
+        req_to_token_pool = self.req_to_token_pool
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return True
+
+        tree_cache = cast(BasePrefixCache, self.tree_cache)
+        session_kv = tree_cache.get_session_kv(req)
+        needed_slots = sum(
+            req_to_token_pool.mamba_admission_slots(candidate.kv)
+            for candidate in can_run_list
+        )
+        needed_slots += req_to_token_pool.mamba_admission_slots(session_kv or req.kv)
+        if needed_slots <= 0:
+            return True
+
+        mamba_allocator = req_to_token_pool.mamba_allocator
+        available_slots = mamba_allocator.schedulable_available_size()
+        active_slots_are_evictable = req_to_token_pool.mamba_ckpt_pool is None
+        full_cache_can_donate = hasattr(
+            self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost"
+        )
+        if (
+            available_slots < needed_slots
+            and (active_slots_are_evictable or full_cache_can_donate)
+            and tree_cache.supports_mamba()
+        ):
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=0, mamba_num=needed_slots - available_slots)
+            )
+            available_slots = mamba_allocator.schedulable_available_size()
+
+        if available_slots >= needed_slots:
+            return True
+
+        logger.debug(
+            "Mamba admission deferred for rid=%s: needed_slots=%d available_slots=%d",
+            req.rid,
+            needed_slots,
+            available_slots,
+        )
+        return False
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3959,7 +4028,9 @@ class Scheduler(
                 )
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        if mamba_allocator is not None:
+        if mamba_allocator is not None and not hasattr(
+            self.req_to_token_pool, "mamba_admission_slots"
+        ):
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
@@ -4007,6 +4078,9 @@ class Scheduler(
                     # Cache-mode host memory is a resident L2 tier. Buffer mode
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
+
+            if not self._ensure_mamba_admission_capacity(req, adder.can_run_list):
+                continue
 
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (
@@ -4057,7 +4131,9 @@ class Scheduler(
                         req.kv.mamba_pool_idx = None
                 break
 
-        if mamba_allocator is not None:
+        if mamba_allocator is not None and not hasattr(
+            self.req_to_token_pool, "mamba_admission_slots"
+        ):
             mamba_allocator.alloc_group_end()
 
         # Update waiting queue

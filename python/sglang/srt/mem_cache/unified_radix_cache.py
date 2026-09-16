@@ -3544,6 +3544,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_streaming_session(self) -> bool:
         return True
 
+    def get_session_kv(self, req: Req):
+        return self.session.get_session_kv(req)
+
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
