@@ -98,12 +98,62 @@ enum ProbedValue {
     /// the configured value is injected.
     #[default]
     Absent,
-    /// A JSON number, or a string the engine's pydantic lax mode reads as one.
+    /// A JSON number, a bool, or a string the engine's pydantic lax mode reads
+    /// as one — see [`parse_as_engine_number`].
     Number(f64),
-    /// Present but not numeric. Nobody's business but the engine's, which owns
-    /// the request schema and gives the better message — so the contract
-    /// neither compares it nor overwrites it.
+    /// Present, and NOT readable as a number by this probe. That is a
+    /// statement about the probe, not about the request: the engine's coercion
+    /// rules are laxer and undocumented, so a value landing here may still be
+    /// a number downstream. `reject` therefore refuses it rather than
+    /// forwarding it — see [`apply_sampling_overrides`].
     Unusable,
+}
+
+/// Longest numeric string the probe will normalize. A sampling value is a
+/// short literal, so the cap keeps a client-sized string off the
+/// underscore-stripping path below; an over-long one stays
+/// [`ProbedValue::Unusable`], which `reject` refuses rather than forwards.
+const MAX_SAMPLING_NUMERIC_LEN: usize = 64;
+
+/// Read a string the way the engine's pydantic lax mode reads it.
+///
+/// Pydantic parses the TRIMMED string first; failing that it strips
+/// underscores — refusing a leading one, a trailing one, or a doubled one —
+/// and parses WITHOUT trimming. So `"1_0"` is 10 and `" 1.0 "` is 1, but
+/// `" 1_0 "` is an error. That is not Python's own numeric-literal rule
+/// either: pydantic takes `1._5`, `1e_5` and `-_1`, each a `SyntaxError` in
+/// Python source.
+///
+/// WHY this is written out rather than approximated: a contract that forwards
+/// what it cannot parse is only as strong as this function's fidelity to a
+/// transitive dependency's undocumented coercion table, across a fleet whose
+/// engines need not even share a pydantic version. It is not, because
+/// [`apply_sampling_overrides`] refuses the residue — this function only
+/// decides how much of what the engine accepts is answered precisely instead
+/// of with a 400.
+fn parse_as_engine_number(s: &str) -> Option<f64> {
+    if let Ok(v) = s.trim().parse::<f64>() {
+        return Some(v);
+    }
+    if s.len() > MAX_SAMPLING_NUMERIC_LEN
+        || !s.contains('_')
+        || s.starts_with('_')
+        || s.ends_with('_')
+        || s.contains("__")
+    {
+        return None;
+    }
+    // Stripped into a fixed stack buffer: the value is client-controlled, and
+    // this type exists to keep client-sized allocations off the request path.
+    let mut buf = [0u8; MAX_SAMPLING_NUMERIC_LEN];
+    let mut len = 0;
+    for &b in s.as_bytes() {
+        if b != b'_' {
+            buf[len] = b;
+            len += 1;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).ok()?.parse().ok()
 }
 
 impl<'de> Deserialize<'de> for ProbedValue {
@@ -132,17 +182,18 @@ impl<'de> Deserialize<'de> for ProbedValue {
             /// number, so a `reject` contract must too or `"1.5"` slips past
             /// a pin of 1.
             fn visit_str<E>(self, v: &str) -> Result<ProbedValue, E> {
-                Ok(v.trim()
-                    .parse::<f64>()
-                    .map_or(ProbedValue::Unusable, ProbedValue::Number))
+                Ok(parse_as_engine_number(v).map_or(ProbedValue::Unusable, ProbedValue::Number))
             }
 
             fn visit_unit<E>(self) -> Result<ProbedValue, E> {
                 Ok(ProbedValue::Absent)
             }
 
-            fn visit_bool<E>(self, _: bool) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Unusable)
+            /// The engine reads a JSON bool as a number, so a pin of 0 must
+            /// see `false` as the 0 the engine will sample with rather than as
+            /// something it cannot judge.
+            fn visit_bool<E>(self, v: bool) -> Result<ProbedValue, E> {
+                Ok(ProbedValue::Number(if v { 1.0 } else { 0.0 }))
             }
 
             /// Drained, never collected — the allocation this type exists to
@@ -1378,9 +1429,16 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
 ///   * [`ConflictPolicy::Reject`] 400s a numeric value that differs from the
 ///     configured one (or falls outside the band) — never a silent rewrite,
 ///     which is the one behavior no client can detect;
-///   * a value that is not a number ([`ProbedValue::Unusable`]) is nobody's
-///     business but the engine's, which is authoritative for the request
-///     schema and produces the better message.
+///   * [`ConflictPolicy::Reject`] also 400s a value this probe cannot read as
+///     a number ([`ProbedValue::Unusable`]). `reject` is a promise that
+///     nothing but the configured value reaches the engine, and the engine's
+///     coercion rules are laxer than [`parse_as_engine_number`] and
+///     undocumented — a bool and an underscored numeric string were both once
+///     numbers to the engine and unreadable here. Forwarding the residue
+///     makes the contract only as strong as this probe's fidelity to a
+///     transitive Python dependency, so the residue is refused instead.
+///     Under `allow` it keeps flowing, because `allow` makes no promise to
+///     break.
 ///
 /// A rejection is counted per parameter before it is returned, because a
 /// contract rollout turns served traffic into 400s and the operator needs to
@@ -1411,10 +1469,21 @@ fn apply_sampling_overrides(
                 }
                 continue;
             }
-            ProbedValue::Unusable => continue,
-            // `allow` forwards a client value untouched, so the comparison
-            // below is `reject`-only.
-            ProbedValue::Number(_) if overrides.conflict == ConflictPolicy::Allow => continue,
+            // `allow` forwards a client value untouched, so everything below
+            // is `reject`-only.
+            _ if overrides.conflict == ConflictPolicy::Allow => continue,
+            // A value the router cannot read as a number is a value it cannot
+            // prove conforms. Under `reject` that is a refusal, not a pass.
+            ProbedValue::Unusable => {
+                return Err(reject(match spec {
+                    ParamSpec::Exact(want) => {
+                        format!("expected {want} (or omit the field), got a non-numeric value")
+                    }
+                    &ParamSpec::Range { lo, hi } => {
+                        format!("must be a number between {lo} and {hi}, got a non-numeric value")
+                    }
+                }));
+            }
             ProbedValue::Number(got) => got,
         };
         match spec {
@@ -1969,13 +2038,26 @@ mod tests {
             );
         }
 
-        // Non-numeric garbage is not ours to judge: forwarded untouched (and
-        // not injected over), the engine's schema validation owns the 400.
-        let p = probe_of(r#"{"model":"x","top_p":"hot","n":true}"#);
+        // A bool is a number to the engine, so it is judged like one: `n: true`
+        // IS the configured `n: 1` and passes.
+        let p = probe_of(r#"{"model":"x","n":true}"#);
         let inject = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap();
-        assert!(inject
-            .iter()
-            .all(|(f, _)| !matches!(f, SamplingField::TopP | SamplingField::N)));
+        assert!(!inject.iter().any(|(f, _)| *f == SamplingField::N));
+
+        // Garbage this probe cannot read as a number is refused under `reject`
+        // rather than forwarded: `reject` promises the engine sees nothing but
+        // the configured value, and the engine's coercion rules are laxer than
+        // ours, so "not a number here" does not mean "not a number there".
+        let p = probe_of(r#"{"model":"x","top_p":"hot"}"#);
+        let err = apply_sampling_overrides(&overrides, &p, &metrics())
+            .expect_err("an unreadable value must not slip past a pin");
+        assert!(matches!(err, ApiError::SamplingContract { .. }), "{err:?}");
+
+        // Under `allow` it keeps flowing — `allow` makes no promise to break —
+        // and is still never injected over.
+        let allow = overrides_of(ConflictPolicy::Allow, r#"{"top_p": 0.95}"#);
+        let inject = apply_sampling_overrides(&allow, &p, &metrics()).unwrap();
+        assert!(inject.is_empty(), "a client value is never overwritten");
 
         // Numeric strings coerce the way the engine's pydantic lax mode does:
         // "0.95" equals the configured value, "0.8" differs and 400s here.
@@ -2159,11 +2241,16 @@ mod tests {
                 ProbedValue::Unusable,
                 "a non-numeric value must collapse to Unusable"
             );
-            // ...and it stays the engine's business: neither compared nor
-            // injected over.
-            let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-            let inject = apply_sampling_overrides(&overrides, &probe, &metrics()).unwrap();
+            // ...and it is never injected over, in either mode: the client
+            // sent something, so there is no omission to fill.
+            let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
+            let inject = apply_sampling_overrides(&allow, &probe, &metrics()).unwrap();
             assert!(inject.is_empty(), "must not inject over a client value");
+            let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+            assert!(
+                apply_sampling_overrides(&reject, &probe, &metrics()).is_err(),
+                "reject must refuse a value it cannot read as a number"
+            );
         }
     }
 
@@ -2228,5 +2315,187 @@ mod tests {
             body.as_ptr(),
             "must be an Arc clone, not a copy"
         );
+    }
+
+    /// The two bypasses reported on the PR: the engine reads both of these as
+    /// numbers, so a `reject` contract that waved them through was pinning
+    /// nothing. `false` is 0 and `"0.5_0"` is 0.5 to pydantic — a pin of 1
+    /// must refuse both, and a pin of the value they coerce to must accept
+    /// them, since the engine will sample with exactly that.
+    #[test]
+    fn values_the_engine_reads_as_numbers_are_judged_not_waved_through() {
+        for (body_value, engine_sees) in [("false", 0.0), ("true", 1.0), (r#""0.5_0""#, 0.5)] {
+            let probe = probe_of(&format!(r#"{{"model":"x","temperature":{body_value}}}"#));
+            assert_eq!(
+                probe.sampling_field(SamplingField::Temperature),
+                ProbedValue::Number(engine_sees),
+                "{body_value} must be read as the number the engine will use"
+            );
+
+            let pinned_elsewhere = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 2}"#);
+            assert!(
+                apply_sampling_overrides(&pinned_elsewhere, &probe, &metrics()).is_err(),
+                "{body_value} differs from the pin and must be rejected"
+            );
+
+            let pinned_here = overrides_of(
+                ConflictPolicy::Reject,
+                &format!(r#"{{"temperature": {engine_sees}}}"#),
+            );
+            assert!(
+                apply_sampling_overrides(&pinned_here, &probe, &metrics()).is_ok(),
+                "{body_value} IS the pinned value to the engine, so it must pass"
+            );
+        }
+    }
+
+    /// `parse_as_engine_number` against the engine's actual answers.
+    ///
+    /// Every expectation here was produced by running the value through
+    /// pydantic 2.13.5 on sglang's own field declaration
+    /// (`temperature: Optional[float] = None`, no validator, no strict
+    /// config), not derived from a reading of the rules — deriving them is
+    /// what gets this wrong. Python's numeric-literal rule, the obvious
+    /// guess, disagrees with pydantic on `1._5`, `1_.5`, `1e_5`, `1_e5` and
+    /// `-_1`.
+    #[test]
+    fn numeric_strings_are_read_the_way_the_engine_reads_them() {
+        #[rustfmt::skip]
+        let cases: &[(&str, Option<f64>)] = &[
+            ("1_0", Some(10.0_f64)),
+            ("1_000.5", Some(1000.5_f64)),
+            ("0.5_0", Some(0.5_f64)),
+            ("1_0.5_0", Some(10.5_f64)),
+            ("0.5e1_0", Some(5000000000.0_f64)),
+            ("1_2_3", Some(123.0_f64)),
+            ("1_000_000", Some(1000000.0_f64)),
+            ("0_1", Some(1.0_f64)),
+            ("1_0.0_1", Some(10.01_f64)),
+            ("-1_0", Some(-10.0_f64)),
+            ("+1_0", Some(10.0_f64)),
+            ("1_0e1_0", Some(100000000000.0_f64)),
+            ("1._5", Some(1.5_f64)),
+            ("1_.5", Some(1.5_f64)),
+            ("1e_5", Some(100000.0_f64)),
+            ("1_e5", Some(100000.0_f64)),
+            ("-_1", Some(-1.0_f64)),
+            ("+_1", Some(1.0_f64)),
+            ("._5", Some(0.5_f64)),
+            ("-_.5", Some(-0.5_f64)),
+            ("1_._5", Some(1.5_f64)),
+            ("+_.5", Some(0.5_f64)),
+            ("1_.", Some(1.0_f64)),
+            ("_1", None),
+            ("1_", None),
+            ("1__0", None),
+            ("_", None),
+            ("__", None),
+            ("._", None),
+            ("-_", None),
+            ("_.5", None),
+            ("1e5_", None),
+            ("_1.5", None),
+            ("1.5_", None),
+            ("0_x10", None),
+            ("1_0e_1_0", Some(100000000000.0_f64)),
+            (" 1_0 ", None),
+            ("_ 1", None),
+            ("1 _0", None),
+            (" __1 ", None),
+            ("\t1_0\n", None),
+            ("0.5", Some(0.5_f64)),
+            ("  1.5  ", Some(1.5_f64)),
+            ("1e-1", Some(0.1_f64)),
+            ("+1.5", Some(1.5_f64)),
+            (".5", Some(0.5_f64)),
+            ("1.", Some(1.0_f64)),
+            ("-0", Some(-0.0_f64)),
+            ("1E5", Some(100000.0_f64)),
+            ("inf", Some(f64::INFINITY)),
+            ("-inf", Some(f64::NEG_INFINITY)),
+            ("Infinity", Some(f64::INFINITY)),
+            ("nan", Some(f64::NAN)),
+            ("NaN", Some(f64::NAN)),
+            ("0x10", None),
+            ("0b101", None),
+            ("0o17", None),
+            ("1,5", None),
+            ("1.5f", None),
+            ("", None),
+            (" ", None),
+            ("abc", None),
+            ("1e400", Some(f64::INFINITY)),
+        ];
+        for &(input, want) in cases {
+            let got = parse_as_engine_number(input);
+            match (got, want) {
+                (Some(g), Some(w)) if g.is_nan() && w.is_nan() => {}
+                _ => assert_eq!(got, want, "parse_as_engine_number({input:?})"),
+            }
+        }
+    }
+
+    /// A string long enough to be worth an allocation is not normalized —
+    /// the underscore path runs in a fixed stack buffer. Under `reject` the
+    /// over-long value is refused, which is the safe direction: the contract
+    /// never silently forwards what it declined to read.
+    #[test]
+    fn overlong_numeric_string_is_not_normalized_and_is_refused() {
+        let long = format!("1{}", "_0".repeat(MAX_SAMPLING_NUMERIC_LEN));
+        assert!(long.len() > MAX_SAMPLING_NUMERIC_LEN);
+        assert_eq!(parse_as_engine_number(&long), None);
+
+        let probe = probe_of(&format!(r#"{{"model":"x","temperature":"{long}"}}"#));
+        let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
+        assert!(apply_sampling_overrides(&overrides, &probe, &metrics()).is_err());
+    }
+
+    /// `allow` promises nothing, so it has nothing to fail open on: a value
+    /// the probe cannot read keeps flowing, and is still never injected over.
+    #[test]
+    fn allow_never_rejects_an_unreadable_value() {
+        let probe = probe_of(r#"{"model":"x","temperature":"abc","top_p":[1]}"#);
+        let overrides = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1, "top_p": 0.9}"#);
+        let inject = apply_sampling_overrides(&overrides, &probe, &metrics()).unwrap();
+        assert!(inject.is_empty(), "a client value is never overwritten");
+    }
+
+    /// A refused unreadable value is a contract violation like any other: same
+    /// error code, same per-parameter counter, and it names the parameter and
+    /// the expectation without echoing the client's value back.
+    #[test]
+    fn unreadable_value_rejection_is_counted_and_named() {
+        for (config, body, expected_detail) in [
+            (
+                r#"{"temperature": 1}"#,
+                r#"{"model":"x","temperature":"abc"}"#,
+                "expected 1 (or omit the field), got a non-numeric value",
+            ),
+            (
+                r#"{"temperature": {"min": 0.5, "max": 1.5}}"#,
+                r#"{"model":"x","temperature":{"a":1}}"#,
+                "must be a number between 0.5 and 1.5, got a non-numeric value",
+            ),
+        ] {
+            let overrides = overrides_of(ConflictPolicy::Reject, config);
+            let metrics = metrics();
+            let probe = probe_of(body);
+
+            let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+            match &err {
+                ApiError::SamplingContract { param, detail } => {
+                    assert_eq!(*param, "temperature");
+                    assert_eq!(detail, expected_detail);
+                }
+                other => panic!("expected SamplingContract, got {other:?}"),
+            }
+            assert!(
+                metrics.render().contains(
+                    r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 1"#
+                ),
+                "a refusal must be visible to an operator rolling the flag out:\n{}",
+                metrics.render()
+            );
+        }
     }
 }
