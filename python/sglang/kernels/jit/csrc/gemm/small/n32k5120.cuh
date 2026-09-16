@@ -1,14 +1,9 @@
 /// \file n32k5120.cuh
 /// \brief Small bf16 GEMM for N = 32, K = 5120: `out[m, n] = sum_k a[m, k] * b[n, k]`.
 ///
-/// One CTA owns an output column; threads share its 10 KB weight row and
-/// prefetch it before the PDL wait. Groups of at most 8 input rows map to
-/// blockIdx.y, with batch size read at run time.
-///
-/// The thread-to-K mapping and dot_product_vec reduction order match tiny_gemm's
-/// N-variant, giving bitwise parity where both apply (m <= 16) and row invariance
-/// across M. Accumulation is fp32 with one final bf16 rounding; cuBLAS uses
-/// a different reduction order.
+/// The thread-to-K mapping and reduction order are those of tiny_gemm's
+/// N-variant, so results are row-invariant across M and bitwise equal to
+/// tiny_gemm where both apply; cuBLAS uses a different reduction order.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

@@ -38,10 +38,7 @@ def _wo_a_reduce(P, Y, E: tl.constexpr):
 
 def wo_a_bf16_small_batch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Compute ``einsum('tgd,grd->tgr', x, weight)`` for the TP4 WO-A shape.
-
-    Eight K partitions expose more CTAs than the small-M batched GEMM.
-    Partial sums stay in FP32 until the final BF16, token-major store.
-    """
+    Partial sums stay in FP32 until the final BF16, token-major store."""
     m = x.shape[0]
     assert 2 <= m <= 8 and x.shape[1:] == (2, 4096)
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
