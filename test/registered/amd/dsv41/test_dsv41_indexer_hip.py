@@ -103,7 +103,7 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             pack_fp4_query_flydsl,
         )
-        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+        from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 
         q = fake_quant_fp4(
             torch.randn(rows, N_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
@@ -127,7 +127,7 @@ class TestFp4PagedLogitsKernels(CustomTestCase):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _expand_index_page_table,
         )
-        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+        from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(ratio)
         bs, n_full_pages = 4, 8

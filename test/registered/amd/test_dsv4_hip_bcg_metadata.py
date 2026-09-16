@@ -75,6 +75,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_unified_prefill_metadata_pads_to_capture_bucket(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.token_to_kv_pool = SimpleNamespace(unified_swa_window=128)
         core = self._make_core_metadata(0)
         core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
@@ -111,6 +114,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
@@ -159,6 +165,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_prefill_bcg_uses_bucket_sized_gpu_compressor_plans(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
         backend.token_to_kv_pool = object()
         core = self._make_core_metadata(0)
@@ -222,6 +231,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
     def test_capture_builds_graph_compatible_metadata_and_workspace(self):
         capture_metadata = DSV4Metadata(object(), indexer_metadata=None)
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend._build_forward_metadata = mock.Mock(return_value=capture_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()
@@ -348,6 +360,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         capture_metadata.refresh_for_breakable_cuda_graph_replay_ = mock.Mock()
 
         backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.low_ratios = ()
+        backend.has_c4 = True
+        backend.has_c128 = True
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
         backend._build_forward_metadata = mock.Mock(return_value=replay_metadata)
         backend.init_forward_metadata_in_graph = mock.Mock()

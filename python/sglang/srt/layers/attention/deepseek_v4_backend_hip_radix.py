@@ -16,6 +16,7 @@ from typing import (
 )
 
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
@@ -455,6 +456,21 @@ class DSV4AttnMetadata:
     )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
+        if not self.low_ratios:
+            assert self.page_size == other.page_size
+            assert self.index_topk == other.index_topk
+            assert self.low_ratios == other.low_ratios
+            for f in fields(self):
+                src, dst = getattr(other, f.name), getattr(self, f.name)
+                if torch.is_tensor(src) or torch.is_tensor(dst):
+                    assert src is not None and dst is not None, f.name
+                    dst.copy_(src)
+                elif f.name == "unified" and src is not None:
+                    assert dst is not None
+                    dst.refresh_for_breakable_cuda_graph_replay_(src)
+                else:
+                    setattr(self, f.name, src)
+            return
         """Rebind every field to ``other``'s (built for the live batch), except the SWA store
         target, which the captured segments read by address and is copied instead."""
         assert self.page_size == other.page_size
@@ -656,6 +672,34 @@ class DSV4Metadata:
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             other.core_attn_metadata
         )
+        if not self.core_attn_metadata.low_ratios:
+            maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
+            maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
+            maybe_copy_inplace(
+                self.c128_compress_metadata, src=other.c128_compress_metadata
+            )
+
+            if self.fp4_k_write_metadata is None and other.fp4_k_write_metadata is None:
+                pass
+            else:
+                assert (
+                    self.fp4_k_write_metadata is not None
+                    and other.fp4_k_write_metadata is not None
+                )
+                for captured, replay in zip(
+                    self.fp4_k_write_metadata,
+                    other.fp4_k_write_metadata,
+                    strict=True,
+                ):
+                    captured.copy_(replay)
+
+            if self.fp4_q_positions is None and other.fp4_q_positions is None:
+                pass
+            else:
+                assert self.fp4_q_positions is not None
+                assert other.fp4_q_positions is not None
+                self.fp4_q_positions.copy_(other.fp4_q_positions)
+            return
         for f in fields(self):
             name = f.name
             if (
@@ -1082,6 +1126,13 @@ class DeepseekV4HipRadixBackend(
                     use_prefill_cuda_graph=False,
                 )
 
+        low_ratio_indexer_metadata = (
+            self._init_low_ratio_indexer_metadata(
+                core_attn_metadata, is_prefill=not low_ratio_decode_rows
+            )
+            if need_compress
+            else {}
+        )
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
@@ -1872,6 +1923,7 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -1901,6 +1953,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_seq_lens = forward_batch.extend_seq_lens
@@ -1923,6 +1976,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             need_compress=not is_draft,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
             cp_metadata=forward_batch.attn_cp_metadata
             if is_cp_active(forward_batch)
             else None,
@@ -2150,6 +2204,17 @@ class DeepseekV4HipRadixBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
+        if not self.low_ratios:
+            self.forward_metadata = self._build_forward_metadata(
+                forward_batch,
+                max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+                use_prefill_cuda_graph=True,
+            )
+            self.init_forward_metadata_in_graph(forward_batch)
+            self._refresh_fp4_prefill_workspace(forward_batch)
+            assert isinstance(self.forward_metadata, DSV4Metadata)
+            return self.forward_metadata
+            return
         self._check_breakable_cuda_graph_support(forward_batch)
         metadata = self._prefill_metadata_for_batch(forward_batch)
         self.forward_metadata = metadata
@@ -2165,6 +2230,24 @@ class DeepseekV4HipRadixBackend(
         *,
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
+        if not self.low_ratios:
+            replay_batch = (
+                static_forward_batch if static_forward_batch is not None else forward_batch
+            )
+            replay_metadata = self._build_forward_metadata(
+                replay_batch,
+                max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+                use_prefill_cuda_graph=True,
+            )
+            self.forward_metadata = replay_metadata
+            self.init_forward_metadata_in_graph(replay_batch)
+
+            assert isinstance(capture_metadata, DSV4Metadata)
+            assert isinstance(replay_metadata, DSV4Metadata)
+            capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+            self.forward_metadata = capture_metadata
+            self._refresh_fp4_prefill_workspace(replay_batch)
+            return
         assert isinstance(capture_metadata, DSV4Metadata), type(capture_metadata)
         if static_forward_batch is None:
             static_forward_batch = forward_batch

@@ -4,9 +4,10 @@ import sys
 
 import pytest
 import torch
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 
-from sglang.kernels.ops.attention.dsv4.c2 import (
-    c2_decode_norm,
+from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+    c2_decode_norm_rope_store,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Compressor,
@@ -25,6 +26,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 EPS = 1e-6
+
+
+def _decode_pool_and_store(kv_input, kv_state, norm_weight, positions, req,
+                           raw_out_loc, eps, *, ring_size, out=None):
+    # The fused API returns the pre-RoPE latent checked by this pool/state oracle.
+    page_size = 128
+    slots = int(raw_out_loc.max().item()) // 2 + 1
+    cache = torch.zeros(((slots + page_size - 1) // page_size,
+                         KVLayout.V4.page_bytes(page_size)), device=kv_input.device, dtype=torch.uint8)
+    freqs = torch.zeros((int(positions.max().item()) + 1, 64),
+                        device=kv_input.device, dtype=torch.float32)
+    freqs[:, 0::2] = 1
+    return c2_decode_norm_rope_store(
+        kv_input, kv_state, norm_weight, positions, req, raw_out_loc, eps,
+        freqs, cache, page_size=page_size, ring_size=ring_size, out=out,
+    )
 # The 584-byte FlashMLA layout fixes head_dim at 512:
 # 448 fp8 nope values plus 64 bf16 RoPE values.
 HEAD_DIM = 512
@@ -152,7 +169,7 @@ def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], out=None, **kw):
     expected, odd = _torch_reference(
         kv_input, ref_state, norm, positions, req, raw_out_loc, ring_size
     )
-    got = c2_decode_norm(
+    got = _decode_pool_and_store(
         kv_input,
         got_state,
         norm.weight.data,
@@ -216,15 +233,15 @@ def test_pair_state_carried_across_two_steps():
 
     args = (norm.weight.data,)
     kw = {"ring_size": ring}
-    c2_decode_norm(first, got_state, *args, even, req, raw_out_loc, EPS, **kw)
-    got = c2_decode_norm(second, got_state, *args, odd, req, raw_out_loc, EPS, **kw)
+    _decode_pool_and_store(first, got_state, *args, even, req, raw_out_loc, EPS, **kw)
+    got = _decode_pool_and_store(second, got_state, *args, odd, req, raw_out_loc, EPS, **kw)
 
     assert mask.all(), "step two must be all-odd"
     _compare(got, expected, mask, "two-step")
     assert torch.equal(got_state, ref_state), "pair state diverged across steps"
     # A step-two row must actually depend on step one: pooling against the
     # original state instead would give a different answer.
-    stale = c2_decode_norm(
+    stale = _decode_pool_and_store(
         second, kv_state.clone(), *args, odd, req, raw_out_loc, EPS, **kw
     )
     assert not torch.equal(got, stale), "step two ignored what step one parked"
@@ -278,7 +295,7 @@ def test_saturated_and_tied_scores():
     expected, odd = _torch_reference(
         kv_input, ref_state, norm, positions, req, raw_out_loc, ring
     )
-    got = c2_decode_norm(
+    got = _decode_pool_and_store(
         kv_input,
         got_state,
         norm.weight.data,
