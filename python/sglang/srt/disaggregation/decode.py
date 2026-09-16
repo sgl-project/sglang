@@ -444,7 +444,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _uses_swa_reservation(self) -> bool:
         return self._uses_swa_tail_prealloc() or supports_swa_byte_budget(
-            self.scheduler.token_to_kv_pool_allocator
+            self.token_to_kv_pool_allocator
         )
 
     def _unified_swa_reservation_fits(
