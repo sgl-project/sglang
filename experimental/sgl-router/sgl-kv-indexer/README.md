@@ -1,18 +1,23 @@
-# SGL KV Indexer (in-memory build)
+# SGL KV Indexer
 
 `sgl-kv-indexer` is an experimental metadata service for SGLang KV-cache
 blocks. It records which worker and storage tier currently holds each
 content-addressed block, allowing a router to query likely cache hits without
 moving KV data itself.
 
-This build deliberately uses one process-local in-memory index. It has no
-external storage dependency, but it is soft-state: restarting the Indexer loses
-all placement metadata.
+Two storage backends implement the same placement semantics:
+
+- `memory` (default): one process-local index. No external dependency, but
+  soft-state: restarting the Indexer loses all placement metadata, and two
+  Indexer servers cannot share state.
+- `valkey`: the index lives in a Valkey (or Redis) keyspace. The server process
+  is stateless, so it can be restarted or run as several active-active
+  replicas over one keyspace. See [Valkey backend](#valkey-backend).
 
 ## Architecture
 
 ```text
-SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexer
+SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> indexer ──> memory | Valkey
 ```
 
 - SGLang publishes `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` events.
@@ -30,23 +35,29 @@ sharing between Indexer servers.
 
 ## Operational contract
 
-Run exactly one Indexer server for a deployment. Multiple bridge processes and
-workers may report to it, but active-active Indexer servers have independent
-state and must not be treated as replicas.
+With the `memory` backend, run exactly one Indexer server for a deployment.
+Multiple bridge processes and workers may report to it, but active-active
+in-memory servers have independent state and must not be treated as replicas.
 
-This build has no sequence gate, incarnation fencing, replay recovery, worker
-liveness TTL, or restart recovery:
+With the `valkey` backend, any number of Indexer servers may share one keyspace.
+Bridges and the Router may point at any of them; a server restart keeps the
+index. Each bridge still owns its worker's event stream: two bridges reporting
+the same worker id to different servers interleave their batches.
 
-- An Indexer restart starts with an empty index.
-- A worker death is not detected; its last placements remain until revoked or
-  until the Indexer restarts.
+Neither backend has a sequence gate, incarnation fencing, replay recovery, or
+worker liveness TTL:
+
+- An in-memory Indexer restart starts with an empty index. A Valkey-backed
+  restart does not.
+- A worker death is not detected; its last placements remain until revoked or,
+  for the `memory` backend, until the Indexer restarts.
 - Events published while a bridge is disconnected are not replayed.
 - A publisher sequence gap is logged and otherwise ignored.
 - Redelivered or reordered batches are applied again in arrival order.
 
 Individual report, revoke, and clear mutations are idempotent. A future
 Snapshot plus event-replay mechanism is required before production high
-availability can rebuild state safely after restart or event loss.
+availability can rebuild state safely after event loss.
 
 ## In-memory data model
 
@@ -89,7 +100,8 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 `KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
 queries executing concurrently and defaults to `32`. Requests above the limit
 are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
-There is no backend or storage configuration.
+`KV_INDEXER_BACKEND` selects `memory` (default) or `valkey`; see
+[Valkey backend](#valkey-backend) for the latter's variables.
 
 2. Start one bridge per worker event stream. This FULL+SWA example uses the
 worker URL registered with the Router:
@@ -146,6 +158,59 @@ For multiple workers, repeat steps 2–3 with unique worker IDs and ports.
 The bridge sends its `WorkerCacheSpec` with every batch. Omitting
 `KV_INDEXER_CACHE_COMPONENTS` clears any previously stored spec and uses legacy
 whole-block matching.
+
+## Valkey backend
+
+```bash
+KV_INDEXER_BACKEND=valkey \
+KV_INDEXER_VALKEY_URL=valkey://127.0.0.1:6379 \
+KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
+  cargo run --release --bin kv-indexer-server
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `KV_INDEXER_VALKEY_URL` | required | `valkey://host:port/db`, `valkeys://` (TLS), `valkey+unix:///path`, or the `redis` spellings. Comma-separated seed nodes in cluster mode. |
+| `KV_INDEXER_VALKEY_KEY_PREFIX` | `{sgl-kv-indexer}:` | Prepended to every key. Two deployments can share one Valkey by using different prefixes. |
+| `KV_INDEXER_VALKEY_CLUSTER` | `0` | `1` to connect to a Valkey Cluster. The prefix must then contain a `{hash tag}` so every key lands in one slot; the default does. |
+
+Start a second server with the same variables and a different
+`KV_INDEXER_LISTEN_ADDR` for an active-active pair. Point the bridges and the
+Router at either address; both answer from the same index.
+
+Semantics are those of the in-memory backend, field for field. Prefix answers
+come from the shared rule engine over the same placement inputs, and
+`tests/valkey_parity.rs` drives identical scenario streams (including a
+randomized one) into both backends and compares every response. Cycle
+detection needs no graph walk over the network: every block stores its chain
+root, and a batch can only attach a block whose parent was unknown, so a cycle
+through existing state means a planned parent's root is itself in the batch.
+
+Key layout, under the prefix:
+
+| Key | Type | Contents |
+| --- | --- | --- |
+| `b:<hash>` | hash | `p` parent (`R` root, `<hash>`, or absent), `r` chain root, `t` token count, `w:<worker>:<tier>` component mask per placement |
+| `c:<hash>` | set | child hashes |
+| `w:<worker>` | hash | `addr` router-facing address, `spec` encoded `WorkerCacheSpec` |
+| `h:<worker>:<tier>` | set | reverse holdings, drives `CLEAR_ALL_AT_TIER` |
+| `hc` | hash | cumulative hit count per block |
+
+A placement costs one hash field, so a worker holding a hundred thousand blocks
+is a few megabytes; the index is small enough that a single slot is a capacity
+fit, and cluster mode buys failover rather than sharding.
+
+Consistency: a batch is validated against a read snapshot before any write, so
+a rejected batch leaves the keyspace untouched. An accepted batch is pipelined
+in action order but is not one transaction; a concurrent query may observe a
+partially applied batch. For REPORT that only under-reports a prefix, the safe
+direction. For REVOKE the stale placement is visible for one extra round trip.
+Two bridges reporting the same block write disjoint fields and never clobber
+each other. Blocks left with no placement and no children are deleted by a
+server-side check-and-delete so a concurrent re-report is not lost.
+
+The parity tests spawn `valkey-server` from `PATH` on a unix socket, or use
+`KV_INDEXER_TEST_VALKEY_URL` when set, and skip cleanly when neither exists.
 
 ## API
 
