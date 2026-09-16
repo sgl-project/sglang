@@ -137,6 +137,15 @@ impl AppContext {
         }
     }
 
+    /// Readiness conditions 3 and 4, via
+    /// [`BootstrapTracker::admit_ready`](crate::state::kv_events::BootstrapTracker::admit_ready).
+    /// Always true when this router holds no KV index.
+    pub fn kv_bootstrap_admit_ready(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().admit_ready())
+    }
+
     /// Report bootstrap as finished, unless the pod has already begun draining.
     /// The `DRAINING` state is a one-way door (see [`Self::mark_not_ready`]),
     /// and a compare-exchange is what enforces it: a plain store would let any
