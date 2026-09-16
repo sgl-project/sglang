@@ -6,9 +6,9 @@ native HTTP `POST /generate`, including JSON and SSE responses.
 
 ## Run
 
-Copy the platform configuration and set a fixed Qwen3 model snapshot for the
-reasoning cases (an MLX-compatible snapshot on Mac). Both examples define all
-startup profiles used by the suite. By default, the runner prepares one
+Use the committed configuration for your platform directly. Both select a public
+Qwen3 model at a fixed revision and define every startup profile used by the suite;
+no model path edits or local configuration copy are needed. The runner prepares one
 Python 3.12.8 environment and the Rust HTTP extension for both implementations.
 It tests a detached snapshot of the calling checkout's exact `HEAD`; commit source
 changes first. Python and Rust use the same source, dependencies, model, hardware
@@ -17,12 +17,34 @@ options, and request bytes.
 From the `rust/` workspace:
 
 ```sh
-# CUDA: use run.json. On Apple Silicon, copy run-mlx.json instead.
-cp sglang-parity/examples/run.json /path/to/run.json
-# Edit the model path and review the profile settings.
-cargo run --locked -p sglang-parity -- --config /path/to/run.json --describe
-cargo run --locked -p sglang-parity -- --config /path/to/run.json
+# Apple Silicon / MLX
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/mlx.json
+
+# Linux x86_64 / NVIDIA CUDA
+cargo run --locked -p sglang-parity -- --config sglang-parity/configs/cuda.json
 ```
+
+Append `--describe` to inspect the resolved plan without downloading models,
+installing environments or starting services. First execution requires network
+access for dependencies and model downloads; later runs reuse verified environment
+and Hugging Face caches. No authentication is required for the selected models.
+
+| Configuration | Model | Pinned model revision |
+| --- | --- | --- |
+| [`configs/mlx.json`](configs/mlx.json) | [mlx-community/Qwen3-0.6B-4bit](https://huggingface.co/mlx-community/Qwen3-0.6B-4bit/tree/73e3e38d981303bc594367cd910ea6eb48349da8) | `73e3e38d981303bc594367cd910ea6eb48349da8` |
+| [`configs/cuda.json`](configs/cuda.json) | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca) | `c1899de289a04d12100db370d81485cdf75e47ca` |
+
+The two platforms use different model formats; parity compares Python and Rust
+on the same platform, not MLX against CUDA. Both configs bound context length to
+2048, the token pool to 4096 and concurrent requests to four. CUDA requires the
+host prerequisites below; two-device DP cases remain uncovered on a single GPU.
+Real NVIDIA acceptance of the CUDA configuration is still pending.
+
+The defaults contain no personal paths or forced offline settings. Model caching
+uses the standard Hugging Face cache and honors `HF_HOME` / `HF_HUB_CACHE`.
+For custom settings, copy the relevant config and pass its path with `--config`.
+When changing models, update the `--revision` in every overridden argument list
+and review model-specific cases such as the Qwen3 reasoning checks.
 
 The command runs the complete [`native_generate` suite](suites/native_generate/suite.json),
 including metadata checks and both streaming modes. No `--suite-file` is needed.
@@ -134,8 +156,8 @@ the report as uncovered, with their reason and exit code 2.
 
 All scenarios and their metadata assertions live in
 [`suites/native_generate/suite.json`](suites/native_generate/suite.json).
-Use [`examples/run-mlx.json`](examples/run-mlx.json) on Mac or
-[`examples/run.json`](examples/run.json) on CUDA. Both include every required
+Use [`configs/mlx.json`](configs/mlx.json) on Mac or
+[`configs/cuda.json`](configs/cuda.json) on CUDA. Both include every required
 profile, including cumulative and incremental settings.
 
 | Scenario | Required evidence | Availability |
@@ -153,7 +175,7 @@ profile, including cumulative and incremental settings.
 | Retraction | At least one member of a four-request batch has a positive retraction count | CUDA; forced test retraction, fresh process per attempt |
 
 Every scenario includes JSON and SSE and explicitly binds both output modes.
-The MLX example retains CUDA-only cases as unavailable coverage, so a full
+The MLX configuration retains CUDA-only cases as unavailable coverage, so a full
 invocation on Mac intentionally exits 2. This does not replace CUDA
 acceptance. To run a deliberately narrower suite, edit the explicit bindings and
 cases; do not relabel unavailable checks as passing.
@@ -311,9 +333,10 @@ input digest and require a lock update. Ordinary source changes do not. Commit
 updated locks alongside dependency changes. Generated files contain no local
 paths, timestamps, or source commit, so regeneration is reviewable.
 
-Model files and GPU drivers are outside the Python lock. For reproducible model
-acceptance, use a local snapshot downloaded at a fixed model revision and record
-that revision with the run configuration. Resolving dependencies successfully is
+Model files and GPU drivers are outside the Python lock. The committed run configs
+pin model revisions through `--revision`, which is retained in the effective plan.
+Custom runs should likewise use a pinned revision or a local snapshot with recorded
+provenance. Resolving dependencies successfully is
 not evidence of successful device execution or Python/Rust parity.
 
 ## Review the test contract

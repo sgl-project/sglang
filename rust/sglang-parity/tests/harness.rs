@@ -666,9 +666,8 @@ fn describe_rejects_unsafe_or_ambiguous_configuration_without_processes() {
 fn cli_describe_uses_the_same_default_and_external_spec_without_starting_python() {
     let mut fixture = Fixture::new();
     fixture.config.server.python = Some(fixture.directory.path().join("missing-python"));
-    let example: RunConfig =
-        serde_json::from_str(include_str!("../examples/run-mlx.json")).unwrap();
-    fixture.config.profiles = example.profiles;
+    let defaults: RunConfig = serde_json::from_str(include_str!("../configs/mlx.json")).unwrap();
+    fixture.config.profiles = defaults.profiles;
     let directory = &fixture.directory;
     let config_path = directory.path().join("run.json");
     fs::write(&config_path, serde_json::to_vec(&fixture.config).unwrap()).unwrap();

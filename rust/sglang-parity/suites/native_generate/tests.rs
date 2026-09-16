@@ -965,10 +965,25 @@ fn profiles_bind_explicitly_and_compile_the_actual_streaming_mode() {
 #[test]
 fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_services() {
     for config in [
-        include_str!("../../examples/run-mlx.json"),
-        include_str!("../../examples/run.json"),
+        include_str!("../../configs/mlx.json"),
+        include_str!("../../configs/cuda.json"),
     ] {
         let config: RunConfig = serde_json::from_str(config).unwrap();
+        let model_parts = config.server.model.split('/').collect::<Vec<_>>();
+        assert_eq!(model_parts.len(), 2, "defaults must use a Hub repository");
+        assert!(model_parts.iter().all(|part| !part.is_empty()));
+        assert!(config.server.python.is_none());
+        assert!(config.server.working_dir.is_none());
+        assert!(config.server.env.is_empty());
+        assert!(config.output_dir.is_relative());
+        let revision = config
+            .server
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--revision")
+            .expect("default model revision must be pinned");
+        assert_eq!(revision[1].len(), 40);
+        assert!(revision[1].bytes().all(|b| b.is_ascii_hexdigit()));
         let plan = load_plan(DEFAULT_SPEC, &config).unwrap();
         assert_eq!(plan.profiles.len(), 12);
         assert_eq!(
@@ -979,6 +994,16 @@ fn default_spec_resolves_all_profiles_for_both_platforms_without_starting_servic
             48
         );
         for entry in &plan.profiles {
+            // Profile argv replaces the base list; every override must keep the pin.
+            assert_eq!(entry.profile.server.model, config.server.model);
+            assert!(
+                entry
+                    .profile
+                    .server
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == revision)
+            );
             assert_eq!(
                 entry.policy.incremental,
                 entry.profile.server.incremental_output()
