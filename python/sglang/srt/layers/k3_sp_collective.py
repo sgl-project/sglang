@@ -49,9 +49,6 @@ class _State:
 _STATE: Optional[_State] = None
 _INITIALIZED = False
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
-_RS_FALLBACK_LOGGED = False
-_RS_DISPATCH_LOGGED = False
-_AG_DISPATCH_LOGGED = False
 _O_PROJ_OUTPUT_ROWS: ContextVar[Optional[int]] = ContextVar(
     "k3_sp_o_proj_output_rows", default=None
 )
@@ -278,25 +275,8 @@ def reduce_scatter_res(
     tensor: torch.Tensor, residual: Optional[torch.Tensor]
 ) -> Optional[torch.Tensor]:
     """Return a fused local shard, or None when the NCCL fallback should run."""
-    global _RS_DISPATCH_LOGGED, _RS_FALLBACK_LOGGED
     state = _init_state()
-    if state is None:
-        return None
-    if not _eligible(state, tensor, residual):
-        if not _RS_FALLBACK_LOGGED:
-            _RS_FALLBACK_LOGGED = True
-            logger.warning(
-                "K3 SP reduce-scatter ineligible: tensor(shape=%s, dtype=%s, "
-                "contiguous=%s), residual(shape=%s, dtype=%s, contiguous=%s), "
-                "world_size=%s",
-                tuple(tensor.shape),
-                tensor.dtype,
-                tensor.is_contiguous(),
-                None if residual is None else tuple(residual.shape),
-                None if residual is None else residual.dtype,
-                None if residual is None else residual.is_contiguous(),
-                state.group.world_size,
-            )
+    if state is None or not _eligible(state, tensor, residual):
         return None
     from sglang.kernels.ops.kimi_k3 import sp_collective
 
@@ -308,40 +288,11 @@ def reduce_scatter_res(
         tensor.device,
     )
     if dispatch is None:
-        if not _RS_FALLBACK_LOGGED:
-            _RS_FALLBACK_LOGGED = True
-            logger.warning(
-                "K3 SP reduce-scatter has no custom dispatch for "
-                "world_size=%s, hidden_size=%s, num_tokens=%s, device=%s",
-                state.group.world_size,
-                tensor.shape[1],
-                tensor.shape[0],
-                tensor.device,
-            )
         return None
     if dispatch.strategy == "push":
         local_bytes = tensor.numel() * tensor.element_size() // state.group.world_size
         if local_bytes > state.comm.max_push_size:
-            if not _RS_FALLBACK_LOGGED:
-                _RS_FALLBACK_LOGGED = True
-                logger.warning(
-                    "K3 SP reduce-scatter push requires %s bytes per rank, but "
-                    "the communicator workspace has %s; using NCCL.",
-                    local_bytes,
-                    state.comm.max_push_size,
-                )
             return None
-    if not _RS_DISPATCH_LOGGED:
-        _RS_DISPATCH_LOGGED = True
-        logger.info(
-            "K3 SP reduce-scatter dispatch: strategy=%s, world_size=%s, "
-            "num_tokens=%s, num_blocks=%s, block_size=%s",
-            dispatch.strategy,
-            state.group.world_size,
-            tensor.shape[0],
-            dispatch.tuning.num_blocks,
-            dispatch.tuning.block_size,
-        )
     output = torch.empty(
         (tensor.shape[0] // state.group.world_size, tensor.shape[1]),
         dtype=tensor.dtype,
@@ -436,7 +387,6 @@ def reduce_scatter_attn_res(
 
 def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
     """Return the reassembled full batch, or None for the NCCL fallback."""
-    global _AG_DISPATCH_LOGGED
     state = _init_state()
     if state is None:
         return None
@@ -465,17 +415,6 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         and tensor.numel() * tensor.element_size() > state.comm.max_push_size
     ):
         return None
-    if not _AG_DISPATCH_LOGGED:
-        _AG_DISPATCH_LOGGED = True
-        logger.info(
-            "K3 SP all-gather dispatch: strategy=%s, world_size=%s, "
-            "num_tokens=%s, num_blocks=%s, block_size=%s",
-            dispatch.strategy,
-            state.group.world_size,
-            global_tokens,
-            dispatch.tuning.num_blocks,
-            dispatch.tuning.block_size,
-        )
     output_shape = (global_tokens, tensor.shape[1])
     if dispatch.strategy == "push":
         output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
