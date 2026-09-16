@@ -945,8 +945,8 @@ class TestLowRatioContextParallel(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
             store_fp4_index_k_cache_split,
         )
-        from sglang.srt.environ import envs
         from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
+        from sglang.srt.environ import envs
         from sglang.srt.layers.cp import base as cp_base
         from sglang.srt.layers.cp.interleave import (
             InterleaveContextParallelMetadata,

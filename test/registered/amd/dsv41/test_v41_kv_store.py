@@ -7,10 +7,10 @@ follow the decode kernel's own reference quantizer.
 
 import unittest
 
+import kv_quant_reference as tq
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-import kv_quant_reference as tq
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -330,8 +330,8 @@ class TestV41KVStore(CustomTestCase):
         holds the quantized rope_tail of the pre-RoPE latent the kernel publishes
         (bitwise; the fp8 layout after the model's fp4 fake quantization), and the
         latent is the torch RMSNorm to within an fp32-reduction-order bf16 ulp."""
-        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import c1_decode_norm_rope_store
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c1_decode_norm_rope_store,
             c2_decode_norm_rope_store,
         )
 
