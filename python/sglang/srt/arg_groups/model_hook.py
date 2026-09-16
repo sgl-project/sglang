@@ -352,8 +352,13 @@ def handle_model_specific_adjustments(server_args: Any):
                         "_handle_model_specific_adjustments",
                         enable_aiter_allreduce_fusion=True,
                     )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        disable_aiter_allreduce_fusion_in_prefill=True,
+                    )
                     logger.info(
-                        "Enable Aiter AllReduce Fusion for GlmMoeDsaForCausalLM"
+                        "Enable Aiter AllReduce Fusion on decode phase for GlmMoeDsaForCausalLM"
                     )
 
             # The fp4-checkpoint draft spec-MoE resolution moved to the

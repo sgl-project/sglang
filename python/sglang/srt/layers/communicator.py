@@ -205,7 +205,18 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
-def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
+def aiter_all_reduce_fusion_enabled_for(forward_mode: ForwardMode) -> bool:
+    comm = get_exec().comm
+    if not comm.enable_aiter_allreduce_fusion:
+        return False
+    if forward_mode.is_extend_or_draft_extend_or_mixed():
+        return not comm.disable_aiter_allreduce_fusion_in_prefill
+    return not comm.disable_aiter_allreduce_fusion_in_decode
+
+
+def apply_aiter_all_reduce_fusion(
+    input_tensor: torch.Tensor, forward_batch: ForwardBatch
+):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
@@ -216,7 +227,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and get_exec().comm.enable_aiter_allreduce_fusion
+        and aiter_all_reduce_fusion_enabled_for(forward_batch.forward_mode)
     )
 
 
@@ -694,7 +705,7 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
+                    apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
@@ -1287,7 +1298,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_aiter_all_reduce_fusion(hidden_states)
+                apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(

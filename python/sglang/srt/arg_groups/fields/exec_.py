@@ -627,6 +627,28 @@ class ExecComm(msgspec.Struct):
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
     ] = False
+    disable_aiter_allreduce_fusion_in_prefill: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for prefill batches "
+                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+    disable_aiter_allreduce_fusion_in_decode: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
+                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
 
 
 class ExecMoe(msgspec.Struct):
