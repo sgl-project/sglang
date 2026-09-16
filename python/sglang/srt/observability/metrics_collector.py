@@ -1811,8 +1811,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_finished_outcome(self, labels, outcome, prompt_tokens, cached_tokens):
         outcome_labels = {**labels, "outcome": outcome}
-        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(prompt_tokens)
-        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(cached_tokens)
+        self.finished_prompt_tokens_by_outcome.labels(**outcome_labels).inc(
+            prompt_tokens
+        )
+        self.finished_cached_tokens_by_outcome.labels(**outcome_labels).inc(
+            cached_tokens
+        )
         self.finished_requests_by_outcome.labels(**outcome_labels).inc()
 
     def observe_one_finished_request(

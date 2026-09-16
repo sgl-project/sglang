@@ -3,10 +3,15 @@
 import ast
 import math
 from pathlib import Path
-from types import MethodType, SimpleNamespace as NS
+from types import MethodType
+from types import SimpleNamespace as NS
 
 import pytest
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 SRT = ROOT / "python/sglang/srt"

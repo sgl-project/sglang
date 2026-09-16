@@ -3009,9 +3009,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and reason.get("type") in ("stop", "length")
             ):
                 decode_throughput = meta_info.get("decode_throughput")
-                if (
-                    decode_throughput is not None
-                    and 0 < decode_throughput < float("inf")
+                if decode_throughput is not None and 0 < decode_throughput < float(
+                    "inf"
                 ):
                     self.metrics_collector.observe_request_tpot(
                         labels,
@@ -3044,7 +3043,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 outcome = "other"
             self.metrics_collector.observe_finished_outcome(
-                labels, outcome, recv_obj.prompt_tokens[i],
+                labels,
+                outcome,
+                recv_obj.prompt_tokens[i],
                 recv_obj.cached_tokens[i],
             )
             self.metrics_collector.observe_one_finished_request(
