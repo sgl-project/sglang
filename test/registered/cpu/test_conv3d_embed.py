@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu-intel")
 
 conv3d_embed_weight_pack = torch.ops.sgl_kernel.conv3d_embed_weight_pack
 conv3d_embed = torch.ops.sgl_kernel.conv3d_embed_cpu
