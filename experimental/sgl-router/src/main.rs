@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     let tokenizers =
         Arc::new(TokenizerRegistry::load_from_config(&config).context("load tokenizers")?);
 
-    // Create a gRPC client only when routing uses an external KV indexer.
+    // (Optional) Create a gRPC client only when routing uses an external KV indexer.
     let external_kv_indexer_client = create_external_kv_indexer_client(&config)?;
 
     // Monitor engine-reported KV-cache events and load statistics for routing.
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
         .context("build policy registry")?,
     );
 
-    // Track this router's in-flight proxied requests and clean up stale entries.
+    // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
