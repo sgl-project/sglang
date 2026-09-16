@@ -6,9 +6,16 @@ Covers python/sglang/kernels/ops/quantization/mxfp4_group_quant.py:
   - silu_mul_quant_mxfp4 (fused SiLU-mul + quant, with/without swiglu clamp)
 """
 
+import sys
 import unittest
+from pathlib import Path
 
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PYTHON_DIR = REPO_ROOT / "python"
+if str(PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_DIR))
 
 from sglang.kernels.ops.quantization.mxfp4_group_quant import (
     quant_mxfp4_group32,

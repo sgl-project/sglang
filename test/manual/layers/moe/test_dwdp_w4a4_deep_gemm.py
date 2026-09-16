@@ -1,6 +1,6 @@
-"""W4A4 (SGLANG_USE_DWDP_W4A4) DeepGEMM MoE path branch tests.
+"""W4A4 (SGLANG_USE_DEEPGEMM_W4A4) DeepGEMM MoE path branch tests.
 
-Covers the SGLANG_USE_DWDP_W4A4 additions in
+Covers the SGLANG_USE_DEEPGEMM_W4A4 additions in
 python/sglang/srt/layers/moe/moe_runner/deep_gemm.py:
   - pre_permute_standard_to_deep_gemm: packed e2m1 scatter branch
   - DeepGemmRunnerCore._run_contiguous_gemm: (1, 32) recipe selection, the
@@ -11,11 +11,18 @@ GEMMs / scatter / quant helpers are mocked; only the branch logic is real.
 
 import contextlib
 import os
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+PYTHON_DIR = REPO_ROOT / "python"
+if str(PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(PYTHON_DIR))
 
 import sglang.kernels.ops.moe.ep_moe_kernels as ep_kernels
 import sglang.kernels.ops.quantization.mxfp4_group_quant as mxfp4_group_quant
@@ -28,15 +35,15 @@ from sglang.test.test_utils import CustomTestCase
 @contextlib.contextmanager
 def _dwdp_w4a4(enabled):
     if enabled:
-        with patch.dict(os.environ, {"SGLANG_USE_DWDP_W4A4": "1"}):
+        with patch.dict(os.environ, {"SGLANG_USE_DEEPGEMM_W4A4": "1"}):
             yield
     else:
-        saved = os.environ.pop("SGLANG_USE_DWDP_W4A4", None)
+        saved = os.environ.pop("SGLANG_USE_DEEPGEMM_W4A4", None)
         try:
             yield
         finally:
             if saved is not None:
-                os.environ["SGLANG_USE_DWDP_W4A4"] = saved
+                os.environ["SGLANG_USE_DEEPGEMM_W4A4"] = saved
 
 
 class TestPrePermuteW4A4(CustomTestCase):
@@ -336,7 +343,7 @@ class TestRunnerCoreW4A4(CustomTestCase):
         self.assertEqual(silu_calls, [10.5])
 
     def test_w4a4_env_set_but_fp8_experts_uses_default_branch(self):
-        # SGLANG_USE_DWDP_W4A4=1 alone must not switch fp8 weights onto the
+        # SGLANG_USE_DEEPGEMM_W4A4=1 alone must not switch fp8 weights onto the
         # packed-e2m1 path; only is_fp4_experts gates that.
         core = self._make_core()
         quant_info = self._make_quant_info(is_fp4_experts=False)
