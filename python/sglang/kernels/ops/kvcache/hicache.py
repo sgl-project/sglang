@@ -474,6 +474,29 @@ def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> M
     )
 
 
+def can_use_page_unified_write_back_jit_kernel(
+    *,
+    group_bytes: int,
+    is_mla: bool = False,
+) -> bool:
+    """Probe the module the page-unified write-back actually launches.
+
+    Its own build, not the page_first staged one: same header, a different
+    template instantiation under a different `cache_once` key, so a page_first
+    probe says nothing about whether this one compiles.
+    """
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified write-back")
+        return False
+    try:
+        _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT write-back kernel: {e}")
+        return False
+
+
 @debug_kernel_api
 def transfer_hicache_all_layer_staged_lf_page_unified(
     k_ptr_src: torch.Tensor,

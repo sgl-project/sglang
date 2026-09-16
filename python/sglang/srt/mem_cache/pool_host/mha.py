@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
+    can_use_page_unified_write_back_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
@@ -261,11 +262,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         geometry = self.page_unified_layout
         self.can_use_write_back_jit = (
             _is_cuda or _is_hip
-        ) and can_use_write_back_jit_kernel(element_size=geometry.group_bytes)
+        ) and can_use_page_unified_write_back_jit_kernel(
+            group_bytes=geometry.group_bytes
+        )
         if not self.can_use_write_back_jit:
             raise ValueError(
-                f"the 'page_unified' host layout requires the staged "
-                f"write-back JIT kernel, which could not be built for a "
+                "the 'page_unified' host layout requires the staged "
+                "write-back JIT kernel, which could not be built for a "
                 f"{geometry.group_bytes}-byte head-group row."
             )
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
