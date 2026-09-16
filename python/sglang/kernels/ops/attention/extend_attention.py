@@ -1121,8 +1121,28 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    # Causality bounds which KV this query block can reach: every query in the block
+    # sits at extend position < (cur_block_m + 1) * BLOCK_M, so keys from
+    # prefix_len + (cur_block_m + 1) * BLOCK_M onward are masked for all of them. Those
+    # tiles contribute exp(-inf) = 0 to the running softmax and leave the accumulator
+    # and denominator untouched, so skipping them is bitwise identical rather than an
+    # approximation.
+    #
+    # Without the bound this kernel walks the whole extend x extend square while the
+    # two-stage path walks its lower triangle, which is 1.8x the work on a 4k-token
+    # chunk with no prefix -- the shape a long prompt actually presents.
+    #
+    # The bound reads only this sequence's own prefix length and block index, so it
+    # cannot make a row's result depend on its batch mates. A custom mask keeps the full
+    # range, since nothing here knows that mask is causal.
+    kv_end = cur_seq_kv_len
+    if IS_CAUSAL and not USE_CUSTOM_MASK:
+        kv_end = tl.minimum(
+            cur_seq_kv_len, cur_seq_prefix_len + (cur_block_m + 1) * BLOCK_M
+        )
+
+    # Unified loop: process all KV tokens (prefix + extend) this block can see
+    for start_n in range(0, kv_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
