@@ -516,9 +516,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            result = self._forward_prefill(batch, on_publish)
+        else:
+            result = self._forward_decode(batch, on_publish, grammar_barrier)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        read_done = torch.get_device_module(self.device).Event()
+        read_done.record()
+        self.model_runner.shared_read_done_event = read_done
+        return result
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -891,6 +896,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
         )
 
     def _commit_target_mamba_states_after_verify(
