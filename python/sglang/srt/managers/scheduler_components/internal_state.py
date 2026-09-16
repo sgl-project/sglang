@@ -115,6 +115,8 @@ class SchedulerInternalStateController:
         state["pending_ep_size"] = ElasticEPStateManager.get_pending_ep_size()
         state["scale_phase"] = ElasticEPStateManager.get_scale_phase()
         state["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
+        state["elastic_ep_runtime_health"] = ElasticEPStateManager.get_runtime_health()
+        state["elastic_ep_runtime_error"] = ElasticEPStateManager.get_runtime_error()
 
     def _add_speculative(self, state: Dict[str, Any]) -> None:
         scheduler = self.scheduler
