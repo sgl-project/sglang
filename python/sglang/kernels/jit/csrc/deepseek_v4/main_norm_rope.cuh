@@ -336,10 +336,8 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const auto row = Paged::row(params.kvcache, out_loc);
 
   if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
-    // V4.1 layouts: every dim is quantized, with one scale per 32 (fp8) or 16 (fp4)
-    // values. The reference quantizes the bf16 tensor kv_norm produces and rotates
-    // the tail in bf16, so round the normed values to the storage dtype, rotate,
-    // round again, then quantize the whole row.
+    // V4.1 layouts: every dim is quantized, one scale per 32 (fp8) or 16 (fp4) values. The
+    // reference rotates in bf16, so round the normed values, rotate, round again, then quantize.
     using Packed = packed_t<DType>;
     PDLTriggerSecondary<kUsePDL>();
 

@@ -79,13 +79,8 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
   PDLTriggerSecondary<kUsePDL>();
 }
 
-/// V4.1 store: one 256-thread block per token, thread `tx` owns elements (2tx, 2tx + 1) of the
-/// 512-wide row. With kRope the last warp first rotates its (real, imag) pairs -- the RoPE
-/// tail -- and rounds them back to the input dtype, as `rope_tail` does, so that the caller can
-/// hand in the un-rotated, un-quantized latent and the e2m1 / e4m3 rounding happens exactly once.
-/// Elements per thread of the V4.1 store, `512 / vec` threads per token: 4 for the fp8 rows
-/// (8-byte loads, half the threads), 2 for the fp4 rows, whose per-element IEEE divisions
-/// are better spread over more threads (measured on B200, bs 1..512).
+/// Elements per thread of the V4.1 store (`512 / vec` threads per token): 4 for fp8 rows, 2 for
+/// fp4, whose per-element IEEE divisions spread better over more threads (measured on B200, bs 1..512).
 constexpr uint32_t v41_store_vec_size(deepseek_v4::KVLayout layout) {
   return layout == deepseek_v4::KVLayout::V41 ? 4 : 2;
 }
@@ -125,8 +120,7 @@ __global__ void fused_store_flashmla_cache_v41(const __grid_constant__ FusedStor
   }
   if constexpr (kRope) {
     if (tid >= kNopeLanes) {
-      // (real, imag) pairs of the tail, rotated and rounded back to the input dtype as
-      // `rope_tail` does, so that the caller can also pass pre-rotated rows.
+      // (real, imag) pairs of the tail, rotated and rounded back to the input dtype as `rope_tail` does.
       AlignedVector<float, kVecSize> freq;
       freq.load(freqs_cis + bid * 64, tid - kNopeLanes);
 #pragma unroll

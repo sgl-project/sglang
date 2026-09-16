@@ -387,9 +387,8 @@ constexpr int64_t kFp8TwoPoolRowBytes = 512;
 // ----------------------------------------------------------------------------
 // FlashMLA variant: kHeadDim = 512, 1 token per *block* (256 threads).
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
-// Cache layout (kLayout): V4 = 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2)
-// rope + 8 scale; V41 / V41_FP4 = the V4.1 fp8 (528 B) / fp4 (288 B) formats in
-// which every dim is quantized, one scale per 32 / 16 values.
+// Cache layout (kLayout): V4 = 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale;
+// V41 / V41_FP4 = the fully quantized fp8 (528 B) / fp4 (288 B) rows, one scale per 32 / 16 values.
 // ----------------------------------------------------------------------------
 template <
     typename DType,
@@ -490,9 +489,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   const auto row = Paged::row(params.kvcache, out_loc);
 
   if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
-    // V4.1 layouts: the whole row is quantized. Match the unfused path, which
-    // quantizes the bf16 tensor the norm produces and rotates the tail in bf16:
-    // round the normed values, rotate, round again, then quantize the row.
+    // V4.1 layouts: the whole row is quantized. Match the unfused path, which quantizes the bf16
+    // the norm produces: round the normed values, rotate in bf16, round again, quantize the row.
     using Packed = packed_t<DType>;
     PDLTriggerSecondary<kUsePDL>();
 
@@ -510,8 +508,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     return;
   }
 
-  // V4 rows come from the paged helper. The bf16 cache is dense [num_slots, head_dim]
-  // rows and the fp8 two-pool cache is kRowBytes rows, both addressed by out_loc.
+  // The bf16 cache is dense [num_slots, head_dim] rows and the fp8 two-pool cache kRowBytes rows,
+  // both addressed by out_loc directly rather than through the paged helper.
   const int64_t page = out_loc >> kPageBits;
   const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
