@@ -885,12 +885,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             // self.lmcache_connector.chunk_size
             * self.lmcache_connector.chunk_size
         )
-        if resident_len == 0:
+        store_start = self.lmcache_connector.get_store_start(req.rid, len(key))
+        if resident_len <= store_start:
             logger.debug(
-                "LMCache store skipped for %s: radix prefix has no complete "
-                "LMCache chunk (%d/%d tokens)",
+                "LMCache store skipped for %s: no new resident chunk "
+                "after token %d (%d/%d tokens)",
                 req.rid,
-                len(matched.device_indices),
+                store_start,
+                resident_len,
                 len(key),
             )
             return
@@ -905,6 +907,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             key = key[:resident_len]
             # Re-match so the lock and Mamba state use the shortened boundary.
             matched = super().match_prefix(MatchPrefixParams(key=key))
+        store_indices = matched.device_indices[store_start : len(key)]
+        if len(store_indices) != len(key) - store_start:
+            logger.debug(
+                "LMCache store skipped for %s: store indices length: %d, "
+                "store start: %d, key length: %d",
+                req.rid,
+                len(store_indices),
+                store_start,
+                len(key),
+            )
+            return
         lock_params = self.inc_lock_ref(matched.last_device_node).to_dec_params()
         mamba_value = (
             self.tree_core.get_component_device_value(
@@ -934,8 +947,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 req.rid,
                 key.raw_token_ids()[: len(key)],
                 self.lmcache_connector.device_indices_by_group(
-                    matched.device_indices[: len(key)], mamba_value=mamba_value
+                    store_indices,
+                    mamba_value=mamba_value,
                 ),
+                device_indices_start=store_start,
                 cache_salt=self.lmcache_connector.build_cache_salt(
                     req.cache_salt, req.extra_key
                 ),

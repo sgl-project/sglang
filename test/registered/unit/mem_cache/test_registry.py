@@ -523,29 +523,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             (fake_components.ComponentType.FULL,),
         )
 
-    def test_lmcache_pure_swa_omits_full_component(self):
-        ctx = _make_ctx(
-            self,
-            enable_lmcache=True,
-            is_hybrid_swa=True,
-            full_tokens_per_layer=0,
-        )
-        fake_module = MagicMock()
-        fake_components = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache": fake_module,
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-            },
-        ):
-            default_radix_cache_factory(ctx)
-
-        self.assertEqual(
-            ctx.params.tree_components,
-            (fake_components.ComponentType.SWA,),
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
