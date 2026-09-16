@@ -1,14 +1,8 @@
-"""Record SGLang's content processing for a minimal array-only VLM template.
+"""Regenerate the array-only template regression using SGLang's content processor.
 
-Run from experimental/sgl-router with the repository's Python dependencies:
-    PYTHONPATH=../../python python tests/scripts/generate_array_content_fixture.py
-
-This fixture records a known string-content mismatch, not general VLM parity.
-The template deliberately has no string-content branch, like array-only VLM
-templates. The tiny byte-level tokenizer keeps the Rust regression offline.
+Run: PYTHONPATH=../../python python tests/scripts/generate_array_content_fixture.py
 """
 
-import copy
 import json
 from pathlib import Path
 
@@ -38,35 +32,17 @@ def main():
     content_format = detect_jinja_template_content_format(TEMPLATE)
     assert content_format == "openai"
     cases = []
-    for shape, content in [
-        ("string", "hello"),
-        ("text_array", [{"type": "text", "text": "hello"}]),
-    ]:
-        messages = [{"role": "user", "content": content}]
-        processed = [
-            process_content_for_template_format(
-                copy.deepcopy(message), content_format, [], [], [], []
-            )
-            for message in messages
-        ]
-        prompt = tokenizer.apply_chat_template(
-            processed, tokenize=False, add_generation_prompt=True, tools=None
+    for content in ["hello", [{"type": "text", "text": "hello"}]]:
+        message = process_content_for_template_format(
+            {"role": "user", "content": content}, content_format, [], [], [], []
         )
-        cases.append(
-            {
-                "shape": shape,
-                "request": {"messages": messages},
-                "engine_prompt": prompt,
-                "engine_token_ids": tokenizer.encode(prompt, add_special_tokens=False),
-            }
+        ids = tokenizer.apply_chat_template(
+            [message], return_dict=False, add_generation_prompt=True
         )
-    fixture = {
-        "chat_template": TEMPLATE,
-        "engine_content_format": content_format,
-        "cases": cases,
-    }
+        cases.append(json.dumps({"content": content, "engine_token_ids": ids}))
+    cases_json = ",\n".join(cases)
     (ROOT / "array_content_rendering.json").write_text(
-        json.dumps(fixture, indent=2) + "\n"
+        f'{{"chat_template": {json.dumps(TEMPLATE)}, "cases": [\n{cases_json}\n]}}\n'
     )
 
 
