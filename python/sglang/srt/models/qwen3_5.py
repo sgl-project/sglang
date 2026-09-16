@@ -88,6 +88,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import qwen3_5_dense_fp8
 from sglang.srt.models.qwen2_moe import (
     Qwen2MoeMLP,
     Qwen2MoeSparseMoeBlock,
@@ -1629,6 +1630,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        qwen3_5_dense_fp8.register(quant_config)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 

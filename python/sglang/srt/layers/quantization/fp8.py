@@ -47,6 +47,7 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.quantization import fp8_silu_quant_fusion
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -1116,6 +1117,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
             )
+
+        if _use_aiter and fp8_silu_quant_fusion.owns_input(self, x):
+            return fp8_silu_quant_fusion.apply_linear(self, layer, x, bias)
 
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
