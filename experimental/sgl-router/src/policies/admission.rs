@@ -1346,6 +1346,42 @@ mod tests {
     }
 
     #[test]
+    fn queue_gate_saturation_survives_a_capacity_exhausted_re_admission() {
+        // The audit tuple the decision label is read from, in the one case
+        // that used to lose the saturation signal: the fleet is queueing, the
+        // ungated tier re-admits the owners, and they then fail hard
+        // admission, so there is no winner. `fleet_all_queued` must still be
+        // set on the way out, because the label is keyed on the fleet being
+        // saturated and not on where the request finally landed.
+        let owner = worker("owner");
+        let shallow_owner = worker("shallow_owner");
+        let proposal = queue_gate_proposal(
+            vec![candidate(&owner, 10, 9), candidate(&shallow_owner, 60, 4)],
+            Some(4),
+        );
+        // Queueing AND out of KV: used == capacity on both.
+        let loads = snapshot(&[
+            (&owner, 1, 9, 10_000, 10_000),
+            (&shallow_owner, 1, 5, 10_000, 10_000),
+        ]);
+        let fleet = vec![Arc::clone(&owner), Arc::clone(&shallow_owner)];
+
+        let resolution = resolve_cache_candidates(&proposal, 100_000, &loads, &fleet);
+
+        assert!(
+            resolution.decision.is_none(),
+            "a capacity-exhausted fleet cannot produce a winner"
+        );
+        assert!(resolution.fleet_all_queued);
+        assert!(resolution.queue_gate_fell_back);
+        assert_eq!(resolution.queue_gate_rejected_candidates, 2);
+        assert_eq!(
+            resolution.admission_evaluated_candidates, 2,
+            "re-admission is what makes a zero-evaluated saturated audit unreachable"
+        );
+    }
+
+    #[test]
     fn queue_gate_fleet_saturation_needs_a_fresh_sample_everywhere() {
         // A worker with no fresh sample has an unknown queue, not a proven
         // full one, so the fleet is not saturated and the gate keeps diverting.

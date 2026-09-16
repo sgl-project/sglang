@@ -54,7 +54,11 @@
 //!   shallower one survived, an owner still won, so the request books here
 //!   and contributes nothing to `sgl_router_diverted_overlap_blocks`.
 //! - `cache_miss` — no usable prefix owner (tree miss, or every owner
-//!   rejected by hard capacity admission).
+//!   rejected by hard capacity admission). A tree miss books here even on a
+//!   saturated fleet: with no prefix owner the gate never fired, so there was
+//!   no affinity to keep or trade. `all_queued` is the saturation signal for
+//!   traffic the gate ACTED on, not a fleet-wide saturation gauge — read
+//!   engine queue depth for that.
 //! - `cache_worker_queued` — the queue gate (`--worker-queue-limit`) removed
 //!   every owner while an unqueued destination still existed, so the request
 //!   was diverted off its prefix. The matched-prefix depth it gave up is in
@@ -62,9 +66,12 @@
 //!   all selections: a diverted curve skewing high means the gate is trading
 //!   large cached prefixes for short waits.
 //! - `all_queued` — the queue gate removed every owner AND every worker in
-//!   the prefill fleet is queueing, so no diversion could dodge a wait and
-//!   the request kept its prefix. This is the fleet-saturation signal, keyed
-//!   on saturation rather than on where the request landed. It deliberately
+//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
+//!   is the saturation signal for traffic the gate acted on, keyed on
+//!   saturation rather than on where the request landed: usually the request
+//!   kept its prefix, but when the re-admitted owners are also out of KV
+//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
+//!   saturation in the one state where it matters most. It deliberately
 //!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
 //!   must not absorb it, or a fully saturated fleet reads as a healthy one.
 //!
@@ -1122,7 +1129,7 @@ impl MetricsRegistry {
 
         // cache_aware_decisions_total
         out.push_str(
-            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions: cache_hit = prefix owner won; cache_miss = no usable owner; cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing, so the prefix was kept (fleet-saturation signal, not a cache hit).\n",
+            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit).\n",
         );
         out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
         let guard = self.cache_aware_decisions_total.lock();
