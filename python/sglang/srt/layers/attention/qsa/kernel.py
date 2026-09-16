@@ -271,7 +271,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with platform kernels or the Torch fallback."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -282,6 +282,17 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.kernels.qwen3_8_flash_next.expansion import (
+            can_run_block_expansion,
+            expand_blocks,
+        )
+
+        args = (
+            block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+        )
+        if can_run_block_expansion(*args):
+            return expand_blocks(*args)
     if not _is_npu and block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
