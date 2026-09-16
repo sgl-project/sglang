@@ -333,7 +333,6 @@ class TestFusedInplaceQKNorm:
     def test_fused_inplace_qknorm(
         self, batch_size: int, tp_size: int, dtype: torch.dtype
     ):
-        """Muse-Glimmer QKNorm must not write outside its in-place Q/K views."""
         head_dim = 128
         num_q_heads = 32 // tp_size
         num_kv_heads = max(1, 2 // tp_size)
