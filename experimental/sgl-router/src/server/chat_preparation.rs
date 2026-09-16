@@ -32,12 +32,12 @@ impl ChatRequest {
     pub(crate) fn prepare(
         ctx: &AppContext,
         model: ModelId,
-        probe: RequestProbe,
+        fields: RoutingFields,
         body: Bytes,
         policy_needs_tokens: bool,
     ) -> Result<Self, ApiError> {
         let sampling =
-            apply_sampling_overrides(&ctx.config.model.sampling_overrides, &probe, &ctx.metrics)?;
+            apply_sampling_overrides(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
         let want_tokens = should_tokenize_request(
             ctx.tokenizers.has_chat_formatter(&model.0),
             policy_needs_tokens,
@@ -56,8 +56,8 @@ impl ChatRequest {
             .unwrap_or_else(|| estimate_prefill_tokens(&body));
         Ok(Self {
             model,
-            streaming: probe.stream.unwrap_or(false),
-            max_output_tokens: probe.requested_max_output_tokens(),
+            streaming: fields.stream.unwrap_or(false),
+            max_output_tokens: fields.requested_max_output_tokens(),
             body,
             tokens,
             prefill_load,
@@ -92,17 +92,17 @@ impl ChatRequest {
 
 /// Reads routing and sampling fields without retaining unrelated client data.
 #[derive(Debug, Default)]
-pub(crate) struct RequestProbe {
+pub(crate) struct RoutingFields {
     stream: Option<bool>,
     pub(crate) model: Option<String>,
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
-    sampling: [ProbedValue; SamplingField::ALL.len()],
+    sampling: [SamplingValue; SamplingField::ALL.len()],
 }
 
 /// Null is absent; unrepresentable values are rejected only under a sampling contract.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-enum ProbedValue {
+enum SamplingValue {
     #[default]
     Absent,
     Number(f64),
@@ -141,54 +141,57 @@ fn parse_as_engine_number(s: &str) -> Option<f64> {
     std::str::from_utf8(&buf[..len]).ok()?.parse().ok()
 }
 
-impl<'de> Deserialize<'de> for ProbedValue {
+impl<'de> Deserialize<'de> for SamplingValue {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct ValueVisitor;
         impl<'de> serde::de::Visitor<'de> for ValueVisitor {
-            type Value = ProbedValue;
+            type Value = SamplingValue;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a sampling parameter value")
             }
 
-            fn visit_i64<E>(self, v: i64) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Number(v as f64))
+            fn visit_i64<E>(self, v: i64) -> Result<SamplingValue, E> {
+                Ok(SamplingValue::Number(v as f64))
             }
 
-            fn visit_u64<E>(self, v: u64) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Number(v as f64))
+            fn visit_u64<E>(self, v: u64) -> Result<SamplingValue, E> {
+                Ok(SamplingValue::Number(v as f64))
             }
 
-            fn visit_f64<E>(self, v: f64) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Number(v))
+            fn visit_f64<E>(self, v: f64) -> Result<SamplingValue, E> {
+                Ok(SamplingValue::Number(v))
             }
 
-            fn visit_str<E>(self, v: &str) -> Result<ProbedValue, E> {
-                Ok(parse_as_engine_number(v).map_or(ProbedValue::Unusable, ProbedValue::Number))
+            fn visit_str<E>(self, v: &str) -> Result<SamplingValue, E> {
+                Ok(
+                    parse_as_engine_number(v)
+                        .map_or(SamplingValue::Unusable, SamplingValue::Number),
+                )
             }
 
-            fn visit_unit<E>(self) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Absent)
+            fn visit_unit<E>(self) -> Result<SamplingValue, E> {
+                Ok(SamplingValue::Absent)
             }
 
-            fn visit_bool<E>(self, v: bool) -> Result<ProbedValue, E> {
-                Ok(ProbedValue::Number(if v { 1.0 } else { 0.0 }))
+            fn visit_bool<E>(self, v: bool) -> Result<SamplingValue, E> {
+                Ok(SamplingValue::Number(if v { 1.0 } else { 0.0 }))
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
-            ) -> Result<ProbedValue, A::Error> {
+            ) -> Result<SamplingValue, A::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(ProbedValue::Unusable)
+                Ok(SamplingValue::Unusable)
             }
 
             fn visit_map<M: serde::de::MapAccess<'de>>(
                 self,
                 mut map: M,
-            ) -> Result<ProbedValue, M::Error> {
+            ) -> Result<SamplingValue, M::Error> {
                 while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(ProbedValue::Unusable)
+                Ok(SamplingValue::Unusable)
             }
         }
         d.deserialize_any(ValueVisitor)
@@ -223,31 +226,31 @@ impl RoutingKey {
     }
 }
 
-enum ProbeKey {
+enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
     Other,
 }
 
-impl<'de> Deserialize<'de> for ProbeKey {
+impl<'de> Deserialize<'de> for RequestKey {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct KeyVisitor;
         impl serde::de::Visitor<'_> for KeyVisitor {
-            type Value = ProbeKey;
+            type Value = RequestKey;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a request field name")
             }
 
-            fn visit_str<E>(self, v: &str) -> Result<ProbeKey, E> {
+            fn visit_str<E>(self, v: &str) -> Result<RequestKey, E> {
                 Ok(match v {
-                    "stream" => ProbeKey::Routing(RoutingKey::Stream),
-                    "model" => ProbeKey::Routing(RoutingKey::Model),
-                    "max_tokens" => ProbeKey::Routing(RoutingKey::MaxTokens),
-                    "max_completion_tokens" => ProbeKey::Routing(RoutingKey::MaxCompletionTokens),
+                    "stream" => RequestKey::Routing(RoutingKey::Stream),
+                    "model" => RequestKey::Routing(RoutingKey::Model),
+                    "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
+                    "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     other => match SamplingField::from_wire_name(other) {
-                        Some(field) => ProbeKey::Sampling(field),
-                        None => ProbeKey::Other,
+                        Some(field) => RequestKey::Sampling(field),
+                        None => RequestKey::Other,
                     },
                 })
             }
@@ -256,23 +259,26 @@ impl<'de> Deserialize<'de> for ProbeKey {
     }
 }
 
-struct ProbeVisitor {
+struct RoutingFieldsVisitor {
     read_sampling: bool,
 }
 
-impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
-    type Value = RequestProbe;
+impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
+    type Value = RoutingFields;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str("a JSON object")
     }
 
-    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<RequestProbe, M::Error> {
-        let mut probe = RequestProbe::default();
+    fn visit_map<M: serde::de::MapAccess<'de>>(
+        self,
+        mut map: M,
+    ) -> Result<RoutingFields, M::Error> {
+        let mut fields = RoutingFields::default();
         let mut seen = 0u8;
-        while let Some(key) = map.next_key::<ProbeKey>()? {
+        while let Some(key) = map.next_key::<RequestKey>()? {
             match key {
-                ProbeKey::Routing(r) => {
+                RequestKey::Routing(r) => {
                     if seen & r.bit() != 0 {
                         return Err(serde::de::Error::custom(format_args!(
                             "duplicate field `{}`",
@@ -282,58 +288,58 @@ impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
                     // Routing duplicates are ambiguous; sampling duplicates below use the last value.
                     seen |= r.bit();
                     match r {
-                        RoutingKey::Stream => probe.stream = map.next_value()?,
-                        RoutingKey::Model => probe.model = map.next_value()?,
-                        RoutingKey::MaxTokens => probe.max_tokens = map.next_value()?,
+                        RoutingKey::Stream => fields.stream = map.next_value()?,
+                        RoutingKey::Model => fields.model = map.next_value()?,
+                        RoutingKey::MaxTokens => fields.max_tokens = map.next_value()?,
                         RoutingKey::MaxCompletionTokens => {
-                            probe.max_completion_tokens = map.next_value()?
+                            fields.max_completion_tokens = map.next_value()?
                         }
                     }
                 }
-                ProbeKey::Sampling(field) => {
-                    probe.sampling[field.index()] = if self.read_sampling {
+                RequestKey::Sampling(field) => {
+                    fields.sampling[field.index()] = if self.read_sampling {
                         map.next_value()?
                     } else {
                         map.next_value::<IgnoredAny>()?;
-                        ProbedValue::Unusable
+                        SamplingValue::Unusable
                     };
                 }
-                ProbeKey::Other => {
+                RequestKey::Other => {
                     map.next_value::<IgnoredAny>()?;
                 }
             }
         }
-        Ok(probe)
+        Ok(fields)
     }
 }
 
-impl<'de> Deserialize<'de> for RequestProbe {
+impl<'de> Deserialize<'de> for RoutingFields {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_map(ProbeVisitor {
+        d.deserialize_map(RoutingFieldsVisitor {
             read_sampling: true,
         })
     }
 }
 
 /// Preserve valid JSON with sampling numbers outside f64 range (for example, 1e400).
-fn probe_without_sampling_values(body: &[u8]) -> Result<RequestProbe, serde_json::Error> {
+fn parse_without_sampling_values(body: &[u8]) -> Result<RoutingFields, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(body);
-    let probe = serde::Deserializer::deserialize_map(
+    let fields = serde::Deserializer::deserialize_map(
         &mut de,
-        ProbeVisitor {
+        RoutingFieldsVisitor {
             read_sampling: false,
         },
     )?;
     de.end()?;
-    Ok(probe)
+    Ok(fields)
 }
 
-impl RequestProbe {
+impl RoutingFields {
     fn requested_max_output_tokens(&self) -> Option<u64> {
         self.max_completion_tokens.or(self.max_tokens)
     }
 
-    fn sampling_field(&self, field: SamplingField) -> ProbedValue {
+    fn sampling_field(&self, field: SamplingField) -> SamplingValue {
         self.sampling[field.index()]
     }
 }
@@ -499,15 +505,15 @@ fn request_has_non_text_content(value: &Value) -> bool {
 
 fn apply_sampling_overrides(
     overrides: &SamplingOverrides,
-    probe: &RequestProbe,
+    fields: &RoutingFields,
     metrics: &MetricsRegistry,
 ) -> Result<Vec<(SamplingField, Number)>, ApiError> {
     let mut inject = Vec::with_capacity(overrides.params.len());
     // Count every violated parameter, but report only the first to the client.
     let mut first_violation: Option<ApiError> = None;
     for (&field, spec) in &overrides.params {
-        let got = probe.sampling_field(field);
-        if got == ProbedValue::Absent {
+        let got = fields.sampling_field(field);
+        if got == SamplingValue::Absent {
             if let ParamSpec::Exact(value) = spec {
                 inject.push((field, value.clone()));
             }
@@ -528,34 +534,34 @@ fn apply_sampling_overrides(
     }
 }
 
-fn sampling_violation(spec: &ParamSpec, got: ProbedValue) -> Option<String> {
+fn sampling_violation(spec: &ParamSpec, got: SamplingValue) -> Option<String> {
     match (spec, got) {
-        (ParamSpec::Exact(want), ProbedValue::Unusable) => Some(format!(
+        (ParamSpec::Exact(want), SamplingValue::Unusable) => Some(format!(
             "expected {want} (or omit the field), got a non-numeric value"
         )),
-        (ParamSpec::Range { lo, hi }, ProbedValue::Unusable) => Some(format!(
+        (ParamSpec::Range { lo, hi }, SamplingValue::Unusable) => Some(format!(
             "must be a number between {lo} and {hi}, got a non-numeric value"
         )),
-        (ParamSpec::Exact(want), ProbedValue::Number(got)) if Some(got) != want.as_f64() => {
+        (ParamSpec::Exact(want), SamplingValue::Number(got)) if Some(got) != want.as_f64() => {
             Some(format!("got {got}, expected {want} (or omit the field)"))
         }
-        (&ParamSpec::Range { lo, hi }, ProbedValue::Number(got)) if !(lo..=hi).contains(&got) => {
+        (&ParamSpec::Range { lo, hi }, SamplingValue::Number(got)) if !(lo..=hi).contains(&got) => {
             Some(format!("must be between {lo} and {hi}, got {got}"))
         }
         _ => None,
     }
 }
 
-pub(crate) fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
-    let err = match serde_json::from_slice::<RequestProbe>(body) {
-        Ok(probe) => return Ok(probe),
+pub(crate) fn parse_routing_fields(body: &Bytes) -> Result<RoutingFields, ApiError> {
+    let err = match serde_json::from_slice::<RoutingFields>(body) {
+        Ok(fields) => return Ok(fields),
         Err(e) => e,
     };
-    if let Ok(probe) = probe_without_sampling_values(body) {
-        return Ok(probe);
+    if let Ok(fields) = parse_without_sampling_values(body) {
+        return Ok(fields);
     }
     // Keep deserialization details out of the client-visible error.
-    tracing::debug!(error = %err, "chat-completions request-probe deserialize failed");
+    tracing::debug!(error = %err, "chat-completions routing-fields deserialize failed");
     Err(invalid_request())
 }
 
@@ -733,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_reads_routing_fields_and_nested_messages() {
+    fn routing_fields_parse_with_nested_messages() {
         for stream in [true, false] {
             for messages in [
                 json!([]),
@@ -741,29 +747,29 @@ mod tests {
             ] {
                 let body =
                     json!({"model":"tiny", "stream":stream, "messages":messages}).to_string();
-                let probe = probe_of(&body);
-                assert_eq!(probe.stream, Some(stream));
-                assert_eq!(probe.model.as_deref(), Some("tiny"));
-                assert_eq!(probe.requested_max_output_tokens(), None);
+                let fields = fields_of(&body);
+                assert_eq!(fields.stream, Some(stream));
+                assert_eq!(fields.model.as_deref(), Some("tiny"));
+                assert_eq!(fields.requested_max_output_tokens(), None);
             }
         }
-        let probe = probe_of(r#"{"model":"tiny","messages":[]}"#);
-        assert_eq!(probe.stream, None);
-        assert_eq!(probe.model.as_deref(), Some("tiny"));
+        let fields = fields_of(r#"{"model":"tiny","messages":[]}"#);
+        assert_eq!(fields.stream, None);
+        assert_eq!(fields.model.as_deref(), Some("tiny"));
     }
 
     #[test]
-    fn probe_prefers_modern_output_budget() {
+    fn routing_fields_prefer_modern_output_budget() {
         for body in [
             r#"{"model":"tiny","messages":[],"max_completion_tokens":256}"#,
             r#"{"model":"tiny","max_tokens":128,"max_completion_tokens":256}"#,
         ] {
-            assert_eq!(probe_of(body).requested_max_output_tokens(), Some(256));
+            assert_eq!(fields_of(body).requested_max_output_tokens(), Some(256));
         }
     }
 
     #[test]
-    fn probe_rejects_invalid_requests_without_exposing_parser_details() {
+    fn routing_fields_reject_invalid_requests_without_exposing_parser_details() {
         for body in [
             "null",
             "[]",
@@ -773,7 +779,7 @@ mod tests {
             r#"{"stream":"not-a-bool"}"#,
             r#"{"stream":true,"stream":false}"#,
         ] {
-            let error = parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap_err();
+            let error = parse_routing_fields(&Bytes::copy_from_slice(body.as_bytes())).unwrap_err();
             assert!(
                 matches!(error, ApiError::BadRequest(ref message)
                 if message == "invalid request: body must be a JSON object"),
@@ -782,8 +788,8 @@ mod tests {
         }
     }
 
-    fn probe_of(body: &str) -> RequestProbe {
-        parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
+    fn fields_of(body: &str) -> RoutingFields {
+        parse_routing_fields(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
     }
 
     fn overrides_of(conflict: ConflictPolicy, json: &str) -> SamplingOverrides {
@@ -807,7 +813,7 @@ mod tests {
     #[test]
     fn unconfigured_sampling_overrides_inject_nothing() {
         let overrides = SamplingOverrides::default();
-        let p = probe_of(r#"{"model":"x","temperature":0.7,"n":4}"#);
+        let p = fields_of(r#"{"model":"x","temperature":0.7,"n":4}"#);
         assert_eq!(
             apply_sampling_overrides(&overrides, &p, &metrics()).unwrap(),
             vec![]
@@ -826,7 +832,7 @@ mod tests {
     fn reject_mode_injects_missing_exact_values_but_not_ranges() {
         let inject = apply_sampling_overrides(
             &reject_overrides(),
-            &probe_of(r#"{"model":"x","messages":[]}"#),
+            &fields_of(r#"{"model":"x","messages":[]}"#),
             &metrics(),
         )
         .unwrap();
@@ -868,7 +874,7 @@ mod tests {
             ("n", "2", false),
         ] {
             let body = format!(r#"{{"model":"x","{field}":{value}}}"#);
-            let result = apply_sampling_overrides(&overrides, &probe_of(&body), &metrics());
+            let result = apply_sampling_overrides(&overrides, &fields_of(&body), &metrics());
             if accepted {
                 let inject = result.unwrap_or_else(|error| panic!("{body}: {error:?}"));
                 assert!(
@@ -887,10 +893,10 @@ mod tests {
     #[test]
     fn exact_temperature_rejects_conflicts_and_injects_when_absent() {
         let exact = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1.0}"#);
-        let p = probe_of(r#"{"model":"x","temperature":0.6}"#);
+        let p = fields_of(r#"{"model":"x","temperature":0.6}"#);
         assert!(apply_sampling_overrides(&exact, &p, &metrics()).is_err());
         assert_eq!(
-            apply_sampling_overrides(&exact, &probe_of(r#"{"model":"x"}"#), &metrics()).unwrap(),
+            apply_sampling_overrides(&exact, &fields_of(r#"{"model":"x"}"#), &metrics()).unwrap(),
             vec![(SamplingField::Temperature, Number::from_f64(1.0).unwrap())]
         );
     }
@@ -911,7 +917,8 @@ mod tests {
             ),
             (r#"{"temperature":"abc","top_p":[1],"n":1}"#, vec![]),
         ] {
-            let inject = apply_sampling_overrides(&overrides, &probe_of(body), &metrics()).unwrap();
+            let inject =
+                apply_sampling_overrides(&overrides, &fields_of(body), &metrics()).unwrap();
             assert_eq!(
                 inject
                     .iter()
@@ -931,8 +938,12 @@ mod tests {
             ConflictPolicy::Reject,
             r#"{"top_p":0.95,"top_k":1000,"frequency_penalty":0.0,"presence_penalty":0.0,"n":1}"#,
         );
-        let inject =
-            apply_sampling_overrides(&overrides, &parse_probe(&body).unwrap(), &metrics()).unwrap();
+        let inject = apply_sampling_overrides(
+            &overrides,
+            &parse_routing_fields(&body).unwrap(),
+            &metrics(),
+        )
+        .unwrap();
         let out = build_outgoing_body(&body, None, Some(&[1, 2, 3]), None, &inject).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&out).unwrap(),
@@ -948,10 +959,10 @@ mod tests {
     fn duplicate_sampling_key_takes_the_last_value_like_the_engine() {
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
 
-        let p = probe_of(r#"{"model":"x","temperature":0.5,"temperature":1}"#);
+        let p = fields_of(r#"{"model":"x","temperature":0.5,"temperature":1}"#);
         assert!(apply_sampling_overrides(&overrides, &p, &metrics()).is_ok());
 
-        let p = probe_of(r#"{"model":"x","temperature":1,"temperature":0.5}"#);
+        let p = fields_of(r#"{"model":"x","temperature":1,"temperature":0.5}"#);
         let err = apply_sampling_overrides(&overrides, &p, &metrics()).unwrap_err();
         assert!(
             format!("{err}").contains("got 0.5"),
@@ -970,7 +981,7 @@ mod tests {
         ] {
             let b = Bytes::copy_from_slice(body.as_bytes());
             assert!(
-                parse_probe(&b).is_err(),
+                parse_routing_fields(&b).is_err(),
                 "{body} must be rejected as ambiguous"
             );
         }
@@ -983,46 +994,46 @@ mod tests {
         let big_object = format!("{{{}\"k\":1}}", "\"j\":[[[1]]],".repeat(10_000));
         for value in [&big_array, &big_string, &big_object] {
             let body = format!(r#"{{"model":"x","temperature":{value}}}"#);
-            let probe = probe_of(&body);
+            let fields = fields_of(&body);
             assert_eq!(
-                probe.sampling_field(SamplingField::Temperature),
-                ProbedValue::Unusable,
+                fields.sampling_field(SamplingField::Temperature),
+                SamplingValue::Unusable,
                 "a non-numeric value must collapse to Unusable"
             );
             let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
-            let inject = apply_sampling_overrides(&allow, &probe, &metrics()).unwrap();
+            let inject = apply_sampling_overrides(&allow, &fields, &metrics()).unwrap();
             assert!(inject.is_empty(), "must not inject over a client value");
             let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
             assert!(
-                apply_sampling_overrides(&reject, &probe, &metrics()).is_err(),
+                apply_sampling_overrides(&reject, &fields, &metrics()).is_err(),
                 "reject must refuse a value it cannot read as a number"
             );
         }
     }
 
     #[test]
-    fn probed_sampling_values_normalize_to_numbers() {
-        let p = probe_of(r#"{"model":"x","temperature":" 0.7 ","top_k":40,"min_p":0.05}"#);
+    fn sampling_values_normalize_to_numbers() {
+        let p = fields_of(r#"{"model":"x","temperature":" 0.7 ","top_k":40,"min_p":0.05}"#);
         assert_eq!(
             p.sampling_field(SamplingField::Temperature),
-            ProbedValue::Number(0.7)
+            SamplingValue::Number(0.7)
         );
         assert_eq!(
             p.sampling_field(SamplingField::TopK),
-            ProbedValue::Number(40.0)
+            SamplingValue::Number(40.0)
         );
         assert_eq!(
             p.sampling_field(SamplingField::MinP),
-            ProbedValue::Number(0.05)
+            SamplingValue::Number(0.05)
         );
-        assert_eq!(p.sampling_field(SamplingField::N), ProbedValue::Absent);
+        assert_eq!(p.sampling_field(SamplingField::N), SamplingValue::Absent);
     }
 
     #[test]
     fn contract_rejection_has_its_own_error_code_and_counter() {
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"top_p": 0.95}"#);
         let metrics = metrics();
-        let p = probe_of(r#"{"model":"x","top_p":0.5}"#);
+        let p = fields_of(r#"{"model":"x","top_p":0.5}"#);
 
         let err = apply_sampling_overrides(&overrides, &p, &metrics).unwrap_err();
         let ApiError::SamplingContract { param, .. } = &err else {
@@ -1062,7 +1073,7 @@ mod tests {
             ),
         ] {
             let body = Bytes::copy_from_slice(raw.as_bytes());
-            let inject = apply_sampling_overrides(&config, &probe_of(raw), &metrics()).unwrap();
+            let inject = apply_sampling_overrides(&config, &fields_of(raw), &metrics()).unwrap();
             assert_eq!(inject.len(), 2);
             for value in [None, Some(serde_json::from_slice(&body).unwrap())] {
                 let out = build_outgoing_body(&body, value, None, None, &inject).unwrap();
@@ -1077,16 +1088,16 @@ mod tests {
     #[test]
     fn values_the_engine_reads_as_numbers_are_judged_not_waved_through() {
         for (body_value, engine_sees) in [("false", 0.0), ("true", 1.0), (r#""0.5_0""#, 0.5)] {
-            let probe = probe_of(&format!(r#"{{"model":"x","temperature":{body_value}}}"#));
+            let fields = fields_of(&format!(r#"{{"model":"x","temperature":{body_value}}}"#));
             assert_eq!(
-                probe.sampling_field(SamplingField::Temperature),
-                ProbedValue::Number(engine_sees),
+                fields.sampling_field(SamplingField::Temperature),
+                SamplingValue::Number(engine_sees),
                 "{body_value} must be read as the number the engine will use"
             );
 
             let pinned_elsewhere = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 2}"#);
             assert!(
-                apply_sampling_overrides(&pinned_elsewhere, &probe, &metrics()).is_err(),
+                apply_sampling_overrides(&pinned_elsewhere, &fields, &metrics()).is_err(),
                 "{body_value} differs from the pin and must be rejected"
             );
 
@@ -1095,7 +1106,7 @@ mod tests {
                 &format!(r#"{{"temperature": {engine_sees}}}"#),
             );
             assert!(
-                apply_sampling_overrides(&pinned_here, &probe, &metrics()).is_ok(),
+                apply_sampling_overrides(&pinned_here, &fields, &metrics()).is_ok(),
                 "{body_value} IS the pinned value to the engine, so it must pass"
             );
         }
@@ -1185,9 +1196,9 @@ mod tests {
         assert!(long.len() > MAX_SAMPLING_NUMERIC_LEN);
         assert_eq!(parse_as_engine_number(&long), None);
 
-        let probe = probe_of(&format!(r#"{{"model":"x","temperature":"{long}"}}"#));
+        let fields = fields_of(&format!(r#"{{"model":"x","temperature":"{long}"}}"#));
         let overrides = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&overrides, &probe, &metrics()).is_err());
+        assert!(apply_sampling_overrides(&overrides, &fields, &metrics()).is_err());
     }
 
     #[test]
@@ -1206,9 +1217,9 @@ mod tests {
         ] {
             let overrides = overrides_of(ConflictPolicy::Reject, config);
             let metrics = metrics();
-            let probe = probe_of(body);
+            let fields = fields_of(body);
 
-            let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+            let err = apply_sampling_overrides(&overrides, &fields, &metrics).unwrap_err();
             match &err {
                 ApiError::SamplingContract { param, detail } => {
                     assert_eq!(*param, "temperature");
@@ -1221,30 +1232,30 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_number_literal_does_not_fail_the_probe() {
+    fn out_of_range_number_literal_does_not_fail_parsing() {
         for body in [
             r#"{"model":"x","temperature":1e400}"#,
             r#"{"model":"x","temperature":-1e309}"#,
             r#"{"model":"x","top_k":1E1000,"stream":true}"#,
         ] {
-            let probe = parse_probe(&Bytes::copy_from_slice(body.as_bytes()))
+            let fields = parse_routing_fields(&Bytes::copy_from_slice(body.as_bytes()))
                 .unwrap_or_else(|e| panic!("{body} must still parse: {e:?}"));
-            assert_eq!(probe.model.as_deref(), Some("x"), "{body}");
+            assert_eq!(fields.model.as_deref(), Some("x"), "{body}");
         }
-        let probe = probe_of(r#"{"model":"x","temperature":1e400,"stream":true}"#);
-        assert_eq!(probe.stream, Some(true));
+        let fields = fields_of(r#"{"model":"x","temperature":1e400,"stream":true}"#);
+        assert_eq!(fields.stream, Some(true));
 
-        let probe = probe_of(r#"{"model":"x","temperature":1e400}"#);
+        let fields = fields_of(r#"{"model":"x","temperature":1e400}"#);
         assert_eq!(
-            probe.sampling_field(SamplingField::Temperature),
-            ProbedValue::Unusable
+            fields.sampling_field(SamplingField::Temperature),
+            SamplingValue::Unusable
         );
         let allow = overrides_of(ConflictPolicy::Allow, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&allow, &probe, &metrics())
+        assert!(apply_sampling_overrides(&allow, &fields, &metrics())
             .unwrap()
             .is_empty());
         let reject = overrides_of(ConflictPolicy::Reject, r#"{"temperature": 1}"#);
-        assert!(apply_sampling_overrides(&reject, &probe, &metrics()).is_err());
+        assert!(apply_sampling_overrides(&reject, &fields, &metrics()).is_err());
 
         for bad in [
             r#"{"model":"x","stream":true,"stream":false}"#,
@@ -1253,7 +1264,7 @@ mod tests {
             "{oops",
         ] {
             assert!(
-                parse_probe(&Bytes::copy_from_slice(bad.as_bytes())).is_err(),
+                parse_routing_fields(&Bytes::copy_from_slice(bad.as_bytes())).is_err(),
                 "{bad} must still be rejected"
             );
         }
@@ -1266,9 +1277,9 @@ mod tests {
             r#"{"temperature": 1, "top_p": 0.95, "n": 1}"#,
         );
         let metrics = metrics();
-        let probe = probe_of(r#"{"model":"x","temperature":0.7,"top_p":0.8,"n":2}"#);
+        let fields = fields_of(r#"{"model":"x","temperature":0.7,"top_p":0.8,"n":2}"#);
 
-        let err = apply_sampling_overrides(&overrides, &probe, &metrics).unwrap_err();
+        let err = apply_sampling_overrides(&overrides, &fields, &metrics).unwrap_err();
         let ApiError::SamplingContract { param, .. } = &err else {
             panic!("expected SamplingContract, got {err:?}");
         };

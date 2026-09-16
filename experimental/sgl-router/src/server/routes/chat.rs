@@ -11,7 +11,7 @@ use crate::policies::selection::{
 use crate::policies::{ExternalPrefixSignal, Policy};
 use crate::server::app_context::AppContext;
 use crate::server::chat_forward::{forward, SelectedWorkers};
-use crate::server::chat_request::{parse_probe, ChatRequest};
+use crate::server::chat_preparation::{parse_routing_fields, ChatRequest};
 use crate::server::error::ApiError;
 use crate::server::metrics::PolicySelectionFailureReason;
 use crate::workers::Worker;
@@ -36,9 +36,9 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let mut probe = parse_probe(&body)?;
+    let mut fields = parse_routing_fields(&body)?;
     let model = ModelId(
-        probe
+        fields
             .model
             .take()
             .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
@@ -55,7 +55,7 @@ pub async fn chat_completions(
         .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
     // Validate sampling parameters and render/tokenize only when needed.
-    let request = ChatRequest::prepare(&ctx, model, probe, body, policy.needs_request_tokens())?;
+    let request = ChatRequest::prepare(&ctx, model, fields, body, policy.needs_request_tokens())?;
 
     // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
     let workers = select_workers(
