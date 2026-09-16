@@ -115,7 +115,9 @@ def test_npu_graph_zero_records_skip_update_and_replay(legacy):
                 1, [3], attr_name="actual_seq_lengths_kv", attr_type=torch.empty(0)
             )
         else:
-            result = backend.replay_with_input_update(1, None, cpu_update_input=[{}, {}])
+            result = backend.replay_with_input_update(
+                1, None, cpu_update_input=[{}, {}]
+            )
         assert result is output
         torch.testing.assert_close(result, torch.full_like(output, value * 2))
     assert graph.replay.call_count == 2
@@ -123,7 +125,9 @@ def test_npu_graph_zero_records_skip_update_and_replay(legacy):
     backend._device_module.set_device.assert_not_called()
 
 
-@pytest.mark.parametrize("missing", ["auto_dispatch_capture", "mode", "records", "none"])
+@pytest.mark.parametrize(
+    "missing", ["auto_dispatch_capture", "mode", "records", "none"]
+)
 def test_npu_graph_missing_capture_state_fails_before_replay(missing):
     graph = SimpleNamespace(update=Mock(), replay=Mock())
     backend = _make_backend(graph)

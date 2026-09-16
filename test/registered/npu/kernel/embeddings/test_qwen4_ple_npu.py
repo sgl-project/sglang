@@ -99,7 +99,9 @@ def test_ple_short_conv_npu(monkeypatch, execution, dtype, kernel_size, dilation
     if execution == "npu_graph" and mode == "prefill":
         pytest.skip("Prefill retains native convolution outside graph capture")
     # Isolate convolution from the optional CUDA fused state-movement kernel.
-    monkeypatch.setattr(qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False)
+    monkeypatch.setattr(
+        qwen4_ple, "can_fuse_qwen4_short_conv_state", lambda *args: False
+    )
     device = "cpu" if execution == "cpu" else "npu"
     case = _make_case(device, dtype, mode, kernel_size, dilation)
     reference = _make_case("cpu", dtype, mode, kernel_size, dilation, reference=True)

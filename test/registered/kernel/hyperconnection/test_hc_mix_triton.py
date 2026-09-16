@@ -99,9 +99,7 @@ def test_grouped_norm_cuda_jit_dispatch(
     monkeypatch.setattr(hyperconnection, "_is_npu", npu_platform)
     monkeypatch.setattr(qwen4_exp, "_is_npu", npu_platform)
     # Exercise the actual forwards without needing a CUDA device or compiler.
-    monkeypatch.setattr(
-        torch.Tensor, "is_cuda", property(lambda self: tensor_is_cuda)
-    )
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: tensor_is_cuda))
     monkeypatch.setattr(norm_kernel, "grouped_gemma_rmsnorm", fake_cuda_kernel)
     actual = norm(x)
     if not npu_platform and tensor_is_cuda:
@@ -142,7 +140,9 @@ def test_npu_grouped_norm_fallback_matches_reference(monkeypatch, ple_norm):
     actual = norm(x)
     grouped = x.cpu().float().reshape(3, 2, 512)
     normalized = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + 1e-6)
-    expected = (normalized.reshape(3, 1024) * (1 + norm.weight.detach().cpu().float())).to(x.dtype)
+    expected = (
+        normalized.reshape(3, 1024) * (1 + norm.weight.detach().cpu().float())
+    ).to(x.dtype)
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-2, atol=1e-2)
 
 

@@ -289,7 +289,11 @@ def expand_qsa_block_indices(
         )
 
         args = (
-            block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            token_topk,
         )
         if can_run_block_expansion(*args):
             return expand_blocks(*args)

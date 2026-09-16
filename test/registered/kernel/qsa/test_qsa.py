@@ -462,24 +462,30 @@ def test_qsa_speculative_row_bound_for_draft_extend():
         spec_info=EagleDraftExtendInput(),
     )
     assert not hasattr(batch.spec_info, "draft_token_num")
-    assert QwenSparseAttnBackend._speculative_max_row_length(
-        batch, torch.tensor([9, 10, 11, 12, 17, 18, 19, 20], dtype=torch.int32)
-    ) == 20
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(
+            batch, torch.tensor([9, 10, 11, 12, 17, 18, 19, 20], dtype=torch.int32)
+        )
+        == 20
+    )
 
 
 def test_qsa_speculative_row_bound_without_spec_info():
     batch = SimpleNamespace(seq_lens_cpu=torch.tensor([0]), spec_info=None)
-    assert QwenSparseAttnBackend._speculative_max_row_length(
-        batch, torch.tensor([0])
-    ) == 1
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(batch, torch.tensor([0])) == 1
+    )
 
 
 @pytest.mark.parametrize("cpu_lengths", [None, torch.empty(0, dtype=torch.int32)])
 def test_qsa_speculative_row_bound_without_cpu_lengths(cpu_lengths):
     batch = SimpleNamespace(seq_lens_cpu=cpu_lengths, spec_info=SimpleNamespace())
-    assert QwenSparseAttnBackend._speculative_max_row_length(
-        batch, torch.tensor([12, 20], dtype=torch.int32)
-    ) == 20
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(
+            batch, torch.tensor([12, 20], dtype=torch.int32)
+        )
+        == 20
+    )
 
 
 def test_qsa_cuda_graph_pads_dynamic_draft_extend_rows():
@@ -1402,9 +1408,7 @@ def test_qsa_npu_logical_to_physical_mapping(is_graph):
         token_to_batch_idx=torch.tensor([1, 0, 1]),
         row_req_pool_indices=torch.tensor([1, 0]),
         token_slot_table=(
-            torch.zeros(2, 1, dtype=torch.int64)
-            if is_graph
-            else req_to_token[[1, 0]]
+            torch.zeros(2, 1, dtype=torch.int64) if is_graph else req_to_token[[1, 0]]
         ),
     )
     logical = torch.tensor([[2, -1, 3], [0, 1, 2], [1, 0, -1]])
@@ -1426,7 +1430,9 @@ def test_qsa_npu_graph_mapping_requires_live_metadata(missing):
     )
     fields[missing] = None
     metadata = qsa_backend_module.QwenSparseAttnMetadata(**fields)
-    with pytest.raises(RuntimeError, match="requires the live request-to-token mapping"):
+    with pytest.raises(
+        RuntimeError, match="requires the live request-to-token mapping"
+    ):
         QwenSparseAttnBackend._logical_to_physical(torch.tensor([[0]]), metadata)
 
 
@@ -1495,9 +1501,7 @@ def test_qsa_npu_fallback_graph_replay():
         torch.npu.synchronize()
         torch.testing.assert_close(actual, expected)
         # All keys are identical, so attention is the mean of visible values.
-        expected_mean = torch.tensor(
-            expected_means, device=device, dtype=q.dtype
-        )
+        expected_mean = torch.tensor(expected_means, device=device, dtype=q.dtype)
         torch.testing.assert_close(actual[:, 0, 0], expected_mean)
 
 
@@ -1514,7 +1518,10 @@ def test_qsa_npu_block_expansion_uses_exact_float_sort_keys(monkeypatch, is_npu)
     monkeypatch.setattr(torch, "argsort", record_argsort)
     result = torch_expand_qsa_block_indices(
         torch.tensor([[-1, 0]], dtype=torch.int32),
-        torch.tensor([5]), torch.tensor([6]), 4, 8,
+        torch.tensor([5]),
+        torch.tensor([6]),
+        4,
+        8,
     )
     assert dtypes == [torch.float32 if is_npu else torch.int64]
     assert result.tolist() == [[0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]]

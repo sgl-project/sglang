@@ -38,14 +38,16 @@ def _block_prefix(
         boundary = full_blocks
         beyond_int32 = False
     count = tl.where(
-        (block < boundary) | beyond_int32, RATIO,
+        (block < boundary) | beyond_int32,
+        RATIO,
         tl.where(block == boundary, remainder, 0),
     )
     count = tl.minimum(count, TOPK - cols * RATIO)
     count = tl.where((cols < BLOCKS) & (block >= 0), count, 0).to(tl.int32)
     inclusive = tl.cumsum(count, 0)
     tl.store(
-        prefix + row * (BLOCKS + 1) + cols, inclusive - count,
+        prefix + row * (BLOCKS + 1) + cols,
+        inclusive - count,
         mask=cols < BLOCKS,
     )
     tl.store(prefix + row * (BLOCKS + 1) + BLOCKS, tl.sum(count, 0))
@@ -86,12 +88,14 @@ def _expand_blocks(
     after = tl.load(prefix + row * (BLOCKS + 1) + block_col + 1)
     preceding = before + tl.minimum(cols % RATIO, after - before)
     preceding = tl.where(
-        cols < TOPK, preceding,
+        cols < TOPK,
+        preceding,
         block_total + tl.minimum(cols - TOPK, tail_count),
     )
     block = tl.load(
         blocks + row * ROW_STRIDE + (cols // RATIO) * COL_STRIDE,
-        mask=cols < TOPK, other=-1,
+        mask=cols < TOPK,
+        other=-1,
     ).to(tl.int32)
     expanded_valid = (cols < TOPK) & (cols % RATIO < after - before)
     tail_offset = cols - TOPK
@@ -99,7 +103,8 @@ def _expand_blocks(
     tail_valid = tail_valid & (tail_offset < tail_extent)
     # Validity is decided before narrowing indices to the int32 output dtype.
     token = tl.where(
-        expanded_valid, block * RATIO + cols % RATIO,
+        expanded_valid,
+        block * RATIO + cols % RATIO,
         tl.where(tail_valid, tail_start.to(tl.int32) + tail_offset, -1),
     )
     valid = expanded_valid | (tail_valid & (tail_start >= 0))

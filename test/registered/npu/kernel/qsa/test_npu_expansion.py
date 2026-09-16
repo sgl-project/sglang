@@ -18,8 +18,7 @@ pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "rows,ratio,topk",
-    [(0, 4, 17), (1, 1, 1), (8, 3, 17), (32, 4, 2048),
-     (128, 8, 4097), (4, 8, 8185)],
+    [(0, 4, 17), (1, 1, 1), (8, 3, 17), (32, 4, 2048), (128, 8, 4097), (4, 8, 8185)],
 )
 def test_exact_expansion(rows, ratio, topk, dtype):
     torch.manual_seed(73)
@@ -99,8 +98,10 @@ def test_mixed_integer_types_and_broadcast(ratio):
     lengths = torch.tensor([0, 17, 2**31 - 1, 2**35], device="npu")
     args = blocks, positions, lengths, ratio, 5 * ratio - (ratio > 1)
     torch.testing.assert_close(
-        expand_blocks(*args), kernel.torch_expand_qsa_block_indices(*args),
-        atol=0, rtol=0,
+        expand_blocks(*args),
+        kernel.torch_expand_qsa_block_indices(*args),
+        atol=0,
+        rtol=0,
     )
 
 
@@ -117,5 +118,7 @@ def test_unsupported_width_keeps_reference():
         expand_blocks(*args)
     torch.testing.assert_close(
         kernel.expand_qsa_block_indices(*args),
-        kernel.torch_expand_qsa_block_indices(*args), atol=0, rtol=0,
+        kernel.torch_expand_qsa_block_indices(*args),
+        atol=0,
+        rtol=0,
     )
