@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.attention_hook import (
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     disable_tc_piecewise_cudagraph_if_incompatible,
+    finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
@@ -111,6 +112,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_radix_eviction_policy_explicitness_is_preserved(self):
+        omitted = prepare_server_args(["--model-path", "dummy"])
+        separated = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
+        )
+        joined = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nradix-eviction-policy: lru\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        configured = prepare_server_args(["--config", config_path])
+
+        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
+        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
+        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
+        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -667,14 +687,18 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
-    def test_cuda_vmm_rejects_rust_server(self):
+    def test_cuda_vmm_allows_rust_server(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with (
+            patch.dict(os.environ, {}, clear=False),
             envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"),
         ):
             handle_multimodal_feature_transport(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
+        )
 
     @override_platform(is_cuda=True)
     def test_cuda_vmm_rejects_pipeline_parallelism(self):
@@ -2091,6 +2115,35 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
+    @staticmethod
+    def _make_args(max_context_size, model_context_len=4096, page_size=64):
+        args = ServerArgs(
+            model_path="dummy",
+            page_size=page_size,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(
+                    backend=Backend.BREAKABLE,
+                    max_context_size=max_context_size,
+                )
+            ),
+        )
+        args._model_config = SimpleNamespace(context_len=model_context_len)
+        return args
+
+    def test_rejects_invalid_values_during_resolution(self):
+        cases = (
+            (0, "positive integer"),
+            (-1, "positive integer"),
+            (4097, "model context length"),
+        )
+        for max_context_size, expected_error in cases:
+            with self.subTest(max_context_size=max_context_size):
+                args = self._make_args(max_context_size)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    finalize_cuda_graph_prefill_max_context(args)
+
+
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
     def test_pp_prefill_graph_is_opt_in(self):
         cases = (
@@ -2134,11 +2187,22 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
-                with patch(
-                    "sglang.srt.arg_groups.memory_hook.use_mla_backend",
-                    return_value=False,
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                        return_value=False,
+                    ),
+                    patch(
+                        # `handle_gpu_memory_settings` computes `gpu_mem` itself
+                        # now (`get_device_memory_capacity(cfg.device)`),
+                        # imported at module scope into `memory_hook` -- patch
+                        # the name where it is looked up, not its origin
+                        # module.
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=None,
+                    ),
                 ):
-                    handle_gpu_memory_settings(args, gpu_mem=None)
+                    handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
@@ -2503,15 +2567,14 @@ class TestDeepEPv2Args(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "instance connector"):
             handle_a2a_moe(args)
 
-    def test_deterministic_inference_rejected(self):
+    def test_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             enable_deterministic_inference=True,
         )
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
-    def test_rl_on_policy_deterministic_inference_rejected(self):
+    def test_rl_on_policy_deterministic_inference_accepted(self):
         args = self._args(
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
@@ -2524,8 +2587,7 @@ class TestDeepEPv2Args(CustomTestCase):
             ),
         ):
             handle_deterministic_inference(args)
-        with self.assertRaisesRegex(ValueError, "deterministic sorting"):
-            handle_a2a_moe(args)
+        handle_a2a_moe(args)
 
     def test_deterministic_inference_does_not_affect_legacy_deepep(self):
         args = self._args(
@@ -3405,6 +3467,46 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                     resolution_result(server_args, "enable_tp_lm_head_all_to_all")
                 )
                 self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
+class TestDcpCommBackendDefault(CustomTestCase):
+    def _resolved(self, **fields):
+        args = ServerArgs(model_path="dummy", tp_size=8, **fields)
+        parallel_hook.handle_decode_context_parallelism(args)
+        return resolution_result(args, "dcp_comm_backend")
+
+    def test_no_dcp_is_ag_rs(self):
+        self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_where_supported(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_a2a_on_cuda_without_mnnvl(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "a2a")
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_ag_rs_off_cuda(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_value_wins(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(
+                self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
+            )
 
 
 if __name__ == "__main__":

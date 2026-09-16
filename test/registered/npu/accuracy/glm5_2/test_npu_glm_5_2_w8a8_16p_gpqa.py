@@ -83,6 +83,8 @@ GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--speculative-draft-model-quantization",
+    "unquant",
 ]
 
 GLM_5_2_W8A8_16P_TWO_NODE_MODEL_CONFIG = {
@@ -103,9 +105,11 @@ class TestNPUGLM_5_2_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     # generation_config = {"max_tokens": 131072, "temperature": 1.0}
     eval_batch_size = 32
     generation_config = {
-        "max_tokens": 65536,
+        "max_tokens": 131072,
+        "top_p": 0.95,
         "temperature": 1.0,
-        "timeout": 1200,
+        "timeout": 7200,
+        "retries": 2,
         "stream": True,
     }
 

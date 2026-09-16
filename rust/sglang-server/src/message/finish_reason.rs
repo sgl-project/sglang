@@ -66,8 +66,8 @@ pub enum FinishReason {
     /// This arm is why the outer enum is untagged: a finish reason added Python-side
     /// must not fail the header decode, which rejects the whole frame — every
     /// request in the batch, not just the one that carried it.
-    // Keep the native frame compact even when HTTP/rendering dependencies turn
-    // on serde_json's large `preserve_order` map representation.
+    // Keep the scheduler response compact even when HTTP/rendering dependencies
+    // turn on serde_json's large `preserve_order` map representation.
     Unknown(Box<serde_json::Map<String, serde_json::Value>>),
 }
 

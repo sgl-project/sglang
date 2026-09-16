@@ -554,7 +554,11 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
         tree_cache.is_chunk_cache.return_value = False
-        tree_cache.token_to_kv_pool_allocator.available_size.return_value = 30
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        allocator = object.__new__(TokenToKVPoolAllocator)
+        allocator.available_size = lambda: 30
+        tree_cache.token_to_kv_pool_allocator = allocator
 
         evict_from_tree_cache(tree_cache, num_tokens=100)
 

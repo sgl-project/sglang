@@ -158,6 +158,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_attn_allocator.available_size(),
         )
 
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        return (
+            (full_capacity, self.full_available_size()),
+            (swa_capacity, self.swa_available_size()),
+        )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        full_shortfall = max(0, num_tokens - self.full_available_size())
+        swa_shortfall = max(0, num_tokens - self.swa_available_size())
+        if full_shortfall or swa_shortfall:
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+            )
+
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
 
@@ -202,6 +227,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Sliding-window token ids as the PD transfer engine addresses them.
+
+        The sibling of `translate_kv_indices_for_transfer` for the SWA state
+        component. On a static pool the sliding-window buffers are indexed by
+        the same ids the kernels use, so the read-path translate IS the answer.
+        A virtual-id pool must override: the transfer addresses raw bytes and
+        needs PHYSICAL ids, not kernel-facing ones.
+        """
+        return self.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
         assert self.page_size == 1
@@ -673,6 +711,16 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def available_size(self):
         return self.swa_attn_allocator.available_size()
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+
+        return SWAPrefillBudget(
+            self,
+            tree_cache,
+            num_mixed_decode_tokens=num_mixed_decode_tokens,
+            all_swa=True,
+        )
 
     def full_available_size(self):
         return self.swa_attn_allocator.available_size()
