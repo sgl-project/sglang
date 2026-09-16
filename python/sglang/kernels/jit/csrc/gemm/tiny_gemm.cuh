@@ -6,7 +6,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/gemm/utils.cuh>
+#include <sgl_kernel/gemm/dot_product.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
