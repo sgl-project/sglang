@@ -186,6 +186,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._replicated_pp_draft = (
             get_spec().speculative_dspark_pp_replicated_draft and ps.pp_size > 1
         )
+        self._pp_draft_dp_enabled = (
+            self._replicated_pp_draft and get_parallel().enable_dp_attention
+        )
         self._replicated_pp_decode = (
             self._replicated_pp_draft and disaggregation_mode == "decode"
         )
@@ -1062,11 +1065,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
-                if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
-                self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
-                )
+                idle_layout = self._idle_verify_ragged_layout(batch)
+                if self._replicated_pp_decode:
+                    self._verify_executor.run_idle_participation(
+                        batch=batch, idle_layout=idle_layout
+                    )
+                    if self._draft_is_moe:
+                        self._proposer.run_idle_participation(
+                            self._pp_draft_sync_batch(batch, local_bs=0)
+                        )
+                else:
+                    if self._draft_is_moe:
+                        self._proposer.run_idle_participation(batch)
+                    self._verify_executor.run_idle_participation(
+                        batch=batch, idle_layout=idle_layout
+                    )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.seq_lens.record_stream(
@@ -1367,11 +1380,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             if draft_owner(req.rid, self.ps.pp_size) == self.ps.pp_rank
         ]
         payload = {"identities": [identities[i].to_wire() for i in rows]}
+        draft_batch = self._pp_draft_sync_batch(next_batch, local_bs=len(rows))
         if rows:
             from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
             index = torch.tensor(rows, dtype=torch.int64, device=self.device)
-            owned = copy.copy(next_batch)
+            owned = draft_batch
             owned.forward_mode = ForwardMode.DECODE
             owned.reqs = [batch.reqs[i] for i in rows]
             owned.req_pool_indices = batch.req_pool_indices[index]
@@ -1414,7 +1428,26 @@ class DSparkWorkerV2(BaseSpecWorker):
             payload["draft_tokens"] = proposal.draft_block.draft_tokens.clone()
             if confidence is not None:
                 payload["confidence"] = confidence.clone()
+        elif self._pp_draft_dp_enabled:
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                self._proposer.run_idle_participation(draft_batch)
         return payload
+
+    def _pp_draft_sync_batch(
+        self, batch: ScheduleBatch, *, local_bs: int
+    ) -> ScheduleBatch:
+        if not self._pp_draft_dp_enabled:
+            return batch
+        # Request ownership must stay stable when P/D route to different DP lanes.
+        # Gather the filtered counts so every TP-MoE rank uses matching metadata.
+        local_count = torch.tensor([local_bs], dtype=torch.int64, device=self.device)
+        global_counts = (
+            get_parallel().tp_group.all_gather(local_count, dim=0).to("cpu").tolist()
+        )
+        draft_batch = copy.copy(batch)
+        draft_batch.global_num_tokens = global_counts
+        draft_batch.global_num_tokens_for_logprob = global_counts
+        return draft_batch
 
     def install_pp_draft(self, batch: ScheduleBatch, owner: int, payload: dict) -> None:
         expected = [

@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -108,6 +109,103 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertTrue(torch.equal(kwargs["projected_context"], projected[:2]))
         self.assertTrue(torch.equal(kwargs["cache_loc"], torch.tensor([10, 11])))
         self.assertTrue(torch.equal(kwargs["positions"], torch.tensor([0, 1])))
+
+    @patch(
+        "sglang.srt.speculative.dspark_components.dspark_worker_v2.alloc_verify_window"
+    )
+    def test_empty_owner_partition_runs_idle_draft_with_gathered_counts(
+        self, alloc_verify_window
+    ):
+        alloc_verify_window.return_value = SimpleNamespace()
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
+        worker._pp_draft_dp_enabled = True
+        worker.verify_num_draft_tokens = 5
+        worker._block_pos_offsets = torch.empty(0)
+        worker.model_runner = Mock()
+        worker._proposer = Mock()
+        worker._draft_context = Mock(return_value=nullcontext())
+        worker._observers = Mock()
+        worker._observers.segment.return_value = nullcontext()
+        reqs = []
+        suffix = 0
+        while len(reqs) < 2:
+            rid = f"owner-1-{suffix}"
+            if draft_owner(rid, 2) == 1:
+                reqs.append(
+                    SimpleNamespace(
+                        rid=rid,
+                        bootstrap_room=1,
+                        retraction_count=0,
+                        spec_verify_ct=2,
+                    )
+                )
+            suffix += 1
+        batch = SimpleNamespace(
+            reqs=reqs,
+            seq_lens=torch.tensor([7, 9]),
+            global_num_tokens=[3, 2, 5, 2],
+            global_num_tokens_for_logprob=[3, 2, 5, 2],
+        )
+        draft_input = SimpleNamespace(new_seq_lens=torch.tensor([8, 10]))
+        tp_group = Mock()
+        tp_group.all_gather.return_value = torch.tensor([0, 2, 1, 0])
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+            return_value=SimpleNamespace(tp_group=tp_group),
+        ):
+            payload = worker.prepare_pp_draft(batch, draft_input)
+
+        self.assertEqual(payload, {"identities": []})
+        idle_batch = worker._proposer.run_idle_participation.call_args.args[0]
+        self.assertEqual(idle_batch.global_num_tokens, [0, 2, 1, 0])
+        self.assertEqual(idle_batch.global_num_tokens_for_logprob, [0, 2, 1, 0])
+        local_count = tp_group.all_gather.call_args.args[0]
+        self.assertEqual(local_count.tolist(), [0])
+
+    @patch(
+        "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
+        return_value=SimpleNamespace(
+            enable_dp_attention=True,
+            tp_group=SimpleNamespace(
+                all_gather=lambda tensor, dim: torch.tensor([0, 2, 1, 0])
+            ),
+        ),
+    )
+    def test_replicated_idle_lane_matches_verify_then_draft_order(self, _):
+        calls = []
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
+        worker._pp_draft_dp_enabled = True
+        worker._replicated_pp_decode = True
+        worker._draft_is_moe = True
+        worker._observers = Mock()
+        worker._verify_executor = Mock()
+        worker._verify_executor.run_idle_participation.side_effect = (
+            lambda **kwargs: calls.append(("verify", kwargs["batch"]))
+        )
+        worker._proposer = Mock()
+        worker._proposer.run_idle_participation.side_effect = (
+            lambda batch: calls.append(("draft", batch))
+        )
+        worker._idle_verify_ragged_layout = Mock(return_value=None)
+        expected = object()
+        worker._decode_idle_result = Mock(return_value=expected)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            global_num_tokens=[3, 2, 5, 2],
+            global_num_tokens_for_logprob=[3, 2, 5, 2],
+        )
+
+        result = worker._forward_decode(batch, on_publish=None)
+
+        self.assertIs(result, expected)
+        self.assertEqual([name for name, _ in calls], ["verify", "draft"])
+        self.assertIs(calls[0][1], batch)
+        self.assertEqual(calls[1][1].global_num_tokens, [0, 2, 1, 0])
 
     def test_full_projection_fast_path_requires_final_pp_owner(self):
         with patch.dict(

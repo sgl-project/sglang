@@ -609,10 +609,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
             logger.warning("Mixed chunked prefill is disabled for PP DSpark.")
         if cfg.enable_dp_attention:
-            raise ValueError(
-                "--speculative-dspark-pp-replicated-draft does not support "
-                "--enable-dp-attention."
-            )
+            if cfg.dp_size != cfg.tp_size:
+                raise ValueError(
+                    "PP DSpark with dp attention requires --dp-size == --tp-size "
+                    "so each attention DP lane has attn_tp=1."
+                )
+            if cfg.moe_a2a_backend != "none":
+                raise ValueError(
+                    "PP DSpark with dp attention currently requires "
+                    "--moe-a2a-backend none (built-in TP MoE)."
+                )
         if (
             cfg.disaggregation_mode == "prefill"
             and not cfg.disable_cuda_graph

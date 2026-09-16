@@ -163,6 +163,27 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(args)
 
+    def test_dp4_tp4_builtin_moe_is_admitted(self):
+        args = self._replicated_args("decode")
+        args.enable_dp_attention = True
+        args.enable_dp_lm_head = True
+        args.dp_size = 4
+        args.tp_size = 4
+        args.moe_a2a_backend = "none"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.dp_size = 2
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "dp-size == --tp-size"):
+                _handle_dspark(args)
+
+        args.dp_size = 4
+        args.moe_a2a_backend = "megamoe"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "built-in TP MoE"):
+                _handle_dspark(args)
+
     def test_prefill_requires_only_prefill_graph_disabled(self):
         args = self._replicated_args("prefill")
         args.disable_cuda_graph = False
