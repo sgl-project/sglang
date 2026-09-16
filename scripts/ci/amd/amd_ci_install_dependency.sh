@@ -142,16 +142,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
-  # The image's default Rust toolchain can differ from rust/rust-toolchain.toml.
-  # Runtime extension builds run inside rust/, so install and check that pinned
-  # toolchain before launching schedulers that need the Rust TreeCore.
-  docker exec -w /sglang-checkout/rust ci_sglang bash -c '
-    set -euo pipefail
-    bash /sglang-checkout/scripts/ci/utils/install_rustup.sh
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-    cargo --version --verbose
-    rustc --version --verbose
-  '
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
   docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true

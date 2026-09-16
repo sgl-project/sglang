@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    is_in_ci,
     popen_launch_pd_server,
     try_cached_model,
 )
@@ -62,14 +61,6 @@ class NixlTransferEngineBase(PDDisaggregationServerBase):
                 "--build-arg ENABLE_NIXL=0 "
                 f"({e})."
             )
-
-        # MI35x CI exposes RDMA sysfs entries whose netdevs are outside the
-        # container network namespace. Restricting UCX to those HCAs removes
-        # the TCP active-message transport and fails backend initialization.
-        # Allow UCX to select available transports for this functional test.
-        if is_in_ci() and "UCX_NET_DEVICES" not in os.environ:
-            os.environ["UCX_NET_DEVICES"] = "all"
-            cls.addClassCleanup(os.environ.pop, "UCX_NET_DEVICES", None)
 
         super().setUpClass()
 
