@@ -1102,6 +1102,23 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestDcpAttentionCompatibility(CustomTestCase):
+    @override_platform(is_cuda=True, is_hip=False, is_sm90=True, is_sm100=False)
+    def test_qwen3_rejects_dcp_with_fa3(self):
+        from sglang.srt.configs.model_config import AttentionArch
+
+        args = ServerArgs(
+            model_path="dummy", tp_size=2, dcp_size=2, attention_backend="fa3"
+        )
+        args._model_config = MagicMock()
+        args._model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
+        args._model_config.hf_config.dual_chunk_attention_config = None
+        args._model_config.attention_arch = AttentionArch.MHA
+
+        with self.assertRaisesRegex(ValueError, "Qwen3ForCausalLM.*K/V projections"):
+            handle_attention_backend_compatibility(args)
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()
