@@ -2276,13 +2276,16 @@ class Scheduler(
             self.rust_server = None
             return
 
-        rust_server = RustServer.launch(self)
+        rust_server = self.get_rust_server_class().launch(self)
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
+    def get_rust_server_class(self) -> type[RustServer]:
+        return RustServer
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
@@ -2523,23 +2526,28 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget:
-        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
-        req.sampling_params.max_new_tokens = max(
+        # Keep this bound consistent with PrefillAdder's admission budget.
+        max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
-                - paged_input_len
-                - self.page_size
-                - 1,
             ),
         )
+        max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
+            input_len,
+            max_new_tokens,
+            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            sliding_window_size=self.sliding_window_size,
+            chunk_size=self.chunked_prefill_size,
+        )
+        if max_new_tokens is None:
+            req.set_finish_with_abort(
+                f"Request prompt exceeds the KV memory budget: input_len={input_len}."
+            )
+            max_new_tokens = 0
+
+        req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:

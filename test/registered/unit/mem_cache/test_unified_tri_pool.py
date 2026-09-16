@@ -20,7 +20,7 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -174,6 +174,33 @@ class TestUnifiedTriPool(unittest.TestCase):
         # KV pool got the allocators.
         self.assertIs(kvcache._full_allocator, fa)
         self.assertIs(kvcache._swa_allocator, sa)
+
+    def test_pd_preallocation_binds_only_swa_tail_pages(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        before = allocator.available_size()
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([12], dtype=torch.int64)
+        # With an empty prefix, ordinary allocation supplies the same virtual
+        # pages without launching the GPU extend kernel. All page binding and
+        # capacity accounting still run through the real sub-allocators.
+        full = allocator.full_attn_allocator
+        with patch.object(
+            full, "alloc_extend", side_effect=lambda *a, **kw: full.alloc(12)
+        ):
+            virtual = allocator.alloc_extend_swa_tail(
+                prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
+            )
+        self.assertIsNotNone(virtual)
+        self.assertEqual(len(virtual), 12)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 12)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 8)
+        swa_pages = allocator.swa_v2p_page_table[virtual[::4] // 4]
+        self.assertLessEqual(swa_pages[0].item(), 0)
+        self.assertTrue(torch.all(swa_pages[1:] > 0).item())
+        allocator.free(virtual)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.available_size(), before)
 
     def test_empty_float_is_transparent_to_the_ends(self):
         _, allocator, _, _ = self._build()
@@ -961,11 +988,19 @@ class TestTriFactorySizing(unittest.TestCase):
         return kw
 
     def test_budget_sizing_and_boot_signature(self):
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
         budget = 1 << 20
         bundle = init_unified_mamba_swa_pools(
             **self._factory_kwargs(unified_total_bytes=budget)
         )
         pool = bundle.unified_memory_pool
+        allocator = bundle.token_to_kv_pool_allocator
+        self.assertIsInstance(allocator, UnifiedSWAAllocatorBase)
+        self.assertNotIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
         # Buffer = budget + the state pool's bytes (budget captured AFTER the
         # state carve-out), never the token-count re-sum.
         state_bytes = 4 * pool.spec("mamba").entry_bytes()

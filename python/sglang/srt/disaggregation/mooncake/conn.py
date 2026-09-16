@@ -1501,6 +1501,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            dst_item_lens,
                         )
                         or rc
                     )
@@ -1707,6 +1708,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_state_item_lens: Optional[list[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1721,6 +1723,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
             length = src_state_item_lens[i]
+            if dst_state_item_lens and length != dst_state_item_lens[j]:
+                raise RuntimeError(
+                    "Prefill/Decode Mamba slot size mismatch "
+                    f"(src={length}, dst={dst_state_item_lens[j]}). "
+                    "Configure matching persistent state layouts on both peers."
+                )
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
@@ -1776,6 +1784,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+                dst_state_item_lens,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
