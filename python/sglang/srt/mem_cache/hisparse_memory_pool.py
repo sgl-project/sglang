@@ -11,7 +11,8 @@ from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
-# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
+# sgl_kernel.kvcacheio ships in the CUDA/ROCm sgl-kernel builds and in the
+# out-of-tree sgl-kernel-xpu wheel; HiSparse is wired up for CUDA/ROCm only.
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
@@ -20,8 +21,8 @@ else:
 
     def transfer_kv_all_layer_mla(*args, **kwargs):
         raise RuntimeError(
-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
-            "It is not available on this backend."
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio and is only "
+            "wired up for CUDA/ROCm. It is not available on this backend."
         )
 
 
