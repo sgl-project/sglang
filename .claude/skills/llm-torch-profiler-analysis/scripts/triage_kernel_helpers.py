@@ -541,7 +541,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
-            "NSA replay metadata copies are already fused into one-kernel" " families."
+            "NSA replay metadata copies are already fused into one-kernel families."
         ),
         min_share=0.02,
         likely_share=0.2,
@@ -787,7 +787,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("softmax", "sampling"),
         ),
         rationale_hint=(
-            "Decode-time sampling already has fused temperature and softmax" " kernels."
+            "Decode-time sampling already has fused temperature and softmax kernels."
         ),
         min_share=0.05,
         likely_share=0.5,
@@ -1218,8 +1218,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="vLLM fused residual add + RMSNorm",
         candidate_path=(
-            "vllm/_custom_ops.py"
-            "<br>vllm/compilation/passes/fusion/rms_quant_fusion.py"
+            "vllm/_custom_ops.py<br>vllm/compilation/passes/fusion/rms_quant_fusion.py"
         ),
         active_keywords=(
             "fused_add_rms_norm",
@@ -1236,8 +1235,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="vLLM fused activation-and-mul",
         candidate_path=(
-            "vllm/_custom_ops.py"
-            "<br>vllm/compilation/passes/fusion/act_quant_fusion.py"
+            "vllm/_custom_ops.py<br>vllm/compilation/passes/fusion/act_quant_fusion.py"
         ),
         active_keywords=(
             "silu_and_mul",

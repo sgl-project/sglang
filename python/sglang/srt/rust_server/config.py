@@ -1,16 +1,18 @@
-"""Configuration handoff and CPU placement for the embedded Rust server."""
+"""Configuration and CPU placement for the embedded Rust server."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from types import ModuleType
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_mm,
     get_model,
     get_observability,
     get_serving,
@@ -24,8 +26,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_server_args(scheduler: Scheduler) -> ServerArgs:
-    """The typed launch handoff for the scheduler's embedded Rust server:
+def _build_server_args(
+    scheduler: Scheduler, *, extension: Optional[ModuleType] = None
+) -> ServerArgs:
+    """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
     ``model_config``, and launch-time facts — as the Rust extension's own
     ``ServerArgs`` class. Its constructor takes every field as a required
@@ -34,7 +38,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     running on a silently-defaulted knob."""
     from sglang.srt.rust_extensions import load_rust_extension
 
-    ext = load_rust_extension("sglang.srt.rust_extensions._server")
+    ext = extension or load_rust_extension("sglang.srt.rust_extensions._server")
 
     sa = resolving_view(scheduler.server_args)
     mc = scheduler.model_config
@@ -46,7 +50,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
-        tokenizer_path=get_serving().tokenizer_path,
+        tokenizer_path=scheduler.rust_server_tokenizer_path(),
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -61,12 +65,14 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
+        skip_server_warmup=get_serving().skip_server_warmup,
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
             context_len=mc.context_len,
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
+            model_type=getattr(mc.hf_config, "model_type", None),
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -76,13 +82,12 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
                 **mc.get_default_sampling_params()
             ),
         ),
-        # `preferred_sampling_params` is deliberately absent: `launch`
-        # refuses to start when it is set, so the Rust server never needs it.
         preferred_sampling_params=(
             json.dumps(get_serving().preferred_sampling_params)
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
@@ -98,6 +103,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
 
 def _partition_cores(
     mm_workers: int = 0,
+    server_core_budget: Optional[Callable[[int, int], int]] = None,
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
@@ -136,7 +142,11 @@ def _partition_cores(
     # once bounded. The budget covers the CPU-hot threads (MM workers, plus
     # the I/O-shaped tokenizer/ingress/egress/api ones that are rarely all hot
     # at once) and leaves the rest of the node to the scheduler ranks.
-    pool_budget = max(8, mm_workers + 4)
+    pool_budget = (
+        server_core_budget(len(allowed), mm_workers)
+        if server_core_budget is not None
+        else max(8, mm_workers + 4)
+    )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
         "rust server cores=%s, scheduler launch cores=%s",

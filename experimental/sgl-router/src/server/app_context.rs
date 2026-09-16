@@ -4,9 +4,13 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
-use crate::policies::kv_events::BlockSizeOracle;
+use crate::policies::buckets::BucketSelector;
+use crate::policies::engine_load::EngineLoadTable;
+use crate::policies::kv_events::{BlockSizeOracle, KvIndexMetrics};
+use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -19,19 +23,28 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
-    /// Per-worker active-load bookkeeping. Shared between the proxy
-    /// (which mints guards on the request hot path), the cache-aware
-    /// policy (which reads per-worker load when scoring candidates), and
-    /// the stale-request janitor (which sweeps expired entries).
+    /// Converts static Bucket configuration into request candidate domains.
+    pub bucket_selector: Arc<BucketSelector>,
+    /// Per-worker active-load bookkeeping shared by the proxy, policies,
+    /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
-    /// cache-aware-zmq policy (overlap_blocks), active-load registry
-    /// (active_load gauge + stale_requests_total), and PD resolver
-    /// (decode_affinity_total).
+    /// active-load registry, policy-specific counters, and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
-    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
+    pub engine_load: Arc<EngineLoadTable>,
+    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Read-only handles `/metrics` pulls the KV storage-tier series from on
+    /// scrape. `None` when this router maintains no local tree (external
+    /// Indexer), where those series would all be a structural zero — see
+    /// [`crate::policies::kv_events::KvEventIndex::metrics_source`].
+    pub kv_metrics: Option<KvIndexMetrics>,
+    /// Open HTTP exchanges, on every route. What axum's graceful shutdown
+    /// waits on — `active_load` sees only the proxied subset.
+    pub inflight_http: Arc<InflightHttp>,
     ready: AtomicBool,
 }
 
@@ -71,21 +84,25 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
-        // Same rationale for the cache-aware-zmq policy's
-        // `sgl_router_overlap_blocks`: the metrics registry is built here,
-        // after the policy registry, so inject it now. No-op for policies
-        // that don't emit metrics.
+        // The metrics registry is built after the policy registry, so attach
+        // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
+        let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         Self {
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            bucket_selector,
             active_load,
             metrics,
             prefix_index: None,
+            radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
+            engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -107,15 +124,22 @@ impl AppContext {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
+                    ..Default::default()
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
                     tokenizer_path: "stub".into(),
                     policy: crate::config::PolicyKind::RoundRobin,
+                    decode_policy: Default::default(),
+                    bucket_config: None,
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
+                    affinity: None,
+                    fused: None,
+                    eligibility: None,
+                    sampling_overrides: Default::default(),
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
@@ -129,10 +153,15 @@ impl AppContext {
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
+            bucket_selector: Arc::new(BucketSelector::new(None)),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
+            radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
+            kv_metrics: None,
+            engine_load: EngineLoadTable::new(),
+            inflight_http: InflightHttp::new(),
             ready: AtomicBool::new(false),
         }
     }

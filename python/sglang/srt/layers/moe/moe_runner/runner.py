@@ -80,9 +80,11 @@ class MoeRunner:
             raise ValueError(
                 "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
                 f"but this MoE layer's quantization method selected the "
-                f"'{runner_backend.value}' runner. deepep_v2 dispatches FP8 "
-                "activations plus scales, which only deep_gemm consumes; use an "
-                "FP8 blockwise-quantized checkpoint, or --moe-a2a-backend deepep."
+                f"'{runner_backend.value}' runner. deepep_v2 dispatches into "
+                "the deep_gemm grouped-GEMM layout (FP8 activations plus "
+                "scales, or BF16 activations for unquantized experts); use an "
+                "FP8 blockwise-quantized or BF16 checkpoint, or "
+                "--moe-a2a-backend deepep."
             )
 
         self.fused_func = None
@@ -130,6 +132,13 @@ class MoeRunner:
             from sglang.srt.layers.moe.moe_runner import (  # noqa: F401
                 flashinfer_cutlass,
             )
+        elif runner_backend.is_flashinfer_megamoe():
+            if lora_enabled:
+                raise NotImplementedError(
+                    "FlashInfer MegaMOE does not support LoRA because it requires a fused path."
+                )
+            self.runner_core = None  # FlashInfer MegaMOE only supports fused path
+            import sglang.srt.layers.moe.flashinfer_megamoe  # noqa: F401
         elif runner_backend.is_cutlass():
             self.runner_core = None  # CUTLASS uses the direct cutlass_moe_fp4 path
         elif runner_backend.is_hpc_ops():

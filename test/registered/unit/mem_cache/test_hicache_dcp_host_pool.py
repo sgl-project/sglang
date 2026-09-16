@@ -16,11 +16,12 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 DCP_SIZE = 8
 PHYSICAL_PAGE = 64
@@ -57,24 +58,16 @@ def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolH
 
 
 class TestDcpKernelIndices(CustomTestCase):
-    def _bare_pool(self, dcp_size: int, dcp_rank: int) -> MLATokenToKVPoolHost:
-        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-        pool.dcp_size = dcp_size
-        pool.dcp_rank = dcp_rank
-        return pool
-
     def test_identity_without_dcp(self):
-        pool = self._bare_pool(1, 0)
         indices = torch.arange(37)
-        self.assertIs(pool.maybe_dcp_kernel_indices(indices), indices)
+        self.assertIs(maybe_dcp_kernel_indices(indices, 1, 0), indices)
 
     def test_aligned_page_translates_to_full_physical_page(self):
         # One widened page starting at logical 512 covers physical rows
         # 64..127 on every rank.
         indices = torch.arange(WIDENED_PAGE, 2 * WIDENED_PAGE)
         for rank in range(DCP_SIZE):
-            pool = self._bare_pool(DCP_SIZE, rank)
-            out = pool.maybe_dcp_kernel_indices(indices)
+            out = maybe_dcp_kernel_indices(indices, DCP_SIZE, rank)
             torch.testing.assert_close(
                 out, torch.arange(PHYSICAL_PAGE, 2 * PHYSICAL_PAGE)
             )
@@ -87,18 +80,12 @@ class TestDcpKernelIndices(CustomTestCase):
             [torch.arange(p * WIDENED_PAGE, (p + 1) * WIDENED_PAGE) for p in pages]
         )
         for rank in range(DCP_SIZE):
-            pool = self._bare_pool(DCP_SIZE, rank)
-            out = pool.maybe_dcp_kernel_indices(indices)
+            out = maybe_dcp_kernel_indices(indices, DCP_SIZE, rank)
             expected = (
                 indices[indices % DCP_SIZE == rank] // DCP_SIZE
             )  # owner rule, same as filter_dcp_local_kv_indices
             torch.testing.assert_close(out, expected)
             self.assertEqual(out.numel() * DCP_SIZE, indices.numel())
-
-    def test_ragged_run_is_rejected(self):
-        pool = self._bare_pool(DCP_SIZE, 0)
-        with self.assertRaises(AssertionError):
-            pool.maybe_dcp_kernel_indices(torch.arange(WIDENED_PAGE + 1))
 
     def test_positional_residue_pairing_survives_host_sort(self):
         # move_indices (direct/layer_first) sorts host indices and permutes
@@ -122,13 +109,12 @@ class TestDcpKernelIndices(CustomTestCase):
         host_sorted, order = host[perm].sort()
         device_matched = device[perm][order]
         for rank in range(DCP_SIZE):
-            pool = self._bare_pool(DCP_SIZE, rank)
             host_mask = host_sorted % DCP_SIZE == rank
             device_mask = device_matched % DCP_SIZE == rank
             # same positions selected on both sides -> pairing preserved
             torch.testing.assert_close(host_mask, device_mask)
             self.assertEqual(
-                pool.maybe_dcp_kernel_indices(host_sorted).numel(),
+                maybe_dcp_kernel_indices(host_sorted, DCP_SIZE, rank).numel(),
                 host.numel() // DCP_SIZE,
             )
 

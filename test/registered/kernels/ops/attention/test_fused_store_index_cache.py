@@ -392,9 +392,9 @@ def test_roundtrip_reconstruction(num_tokens: int):
     per_row_energy = reconstructed.abs().sum(dim=-1)
     orig_energy = original.abs().sum(dim=-1)
     mask = orig_energy > 0.1
-    assert (
-        per_row_energy[mask] > 0.01
-    ).all(), "Some tokens have zero reconstruction — kernel may not be writing output"
+    assert (per_row_energy[mask] > 0.01).all(), (
+        "Some tokens have zero reconstruction — kernel may not be writing output"
+    )
 
 
 # TEST 4: Boundary conditions

@@ -72,8 +72,7 @@ class MiniCPM3MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -94,7 +93,6 @@ def input_to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 class MiniCPM3AttentionMLA(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

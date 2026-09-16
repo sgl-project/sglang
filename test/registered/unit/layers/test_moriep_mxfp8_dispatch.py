@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HIDDEN = 7168  # DeepSeek-V4
 
