@@ -2570,6 +2570,29 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params["todos"][0]["content"], "Buy groceries")
         self.assertEqual(params["todos"][1]["status"], "completed")
 
+    def test_object_parameter_with_unescaped_inner_quote(self):
+        """
+        Test object parameter recovery when the model leaves a quote unescaped inside a string.
+
+        Scenario: Hebrew abbreviations write gershayim as an ASCII double quote (סה"כ, ש"ח);
+        the model writes it verbatim inside a JSON string in an object-typed parameter.
+        Purpose: A quote between two word characters can never be a JSON delimiter, so the
+        detector escapes it and still returns an object instead of degrading to a string.
+        """
+        text = """<tool_call>
+<function=TodoWrite>
+<parameter=todos>
+[{"content": "סה"כ 332.00 ש"ח", "status": "pending"}]
+</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["todos"], list)
+        self.assertEqual(params["todos"][0]["content"], 'סה"כ 332.00 ש"ח')
+        self.assertEqual(params["todos"][0]["status"], "pending")
+
     def test_anyof_array_parameter_conversion(self):
         """
         Test array parameter conversion for nullable anyOf schemas.
