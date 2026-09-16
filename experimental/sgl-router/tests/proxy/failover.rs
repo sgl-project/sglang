@@ -29,6 +29,7 @@ async fn failover_when_one_worker_dies() {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: Default::default(),
         model: ModelConfig {
@@ -46,6 +47,7 @@ async fn failover_when_one_worker_dies() {
             affinity: None,
             fused: None,
             eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
