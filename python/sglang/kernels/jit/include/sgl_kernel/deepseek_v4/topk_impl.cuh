@@ -7,11 +7,11 @@
 /// Design notes:
 ///  - top-k (`topk`) is a *runtime* value (<= kMaxTopK = 2048), never a
 ///    compile-time constant.
-///  - the output is the page-table transform of the selected raw indices
-///    (`TopKProblem::emit` then `transform_output`).
+///  - the dispatcher optionally transforms selected raw indices through a page
+///    table after the device implementation writes them.
 ///  - each block reads its own `seq_len` (per-batch ragged lengths) -- the host
 ///    launches one universal kernel and dispatches per block.
-///  - the cluster size is fixed at 8 (dynamic persistent clusters are hard).
+///  - the dispatcher selects cluster size 8 or 16 from the probed occupancy.
 ///
 /// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
 /// exact radix tie-break.
@@ -23,6 +23,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdint>
 #include <limits>
@@ -83,15 +84,6 @@ constexpr float padding_value() {
 constexpr float infinity_value() {
   return std::numeric_limits<float>::infinity();
 }
-
-// template <uint32_t kBits>
-// SGL_DEVICE uint32_t extract_coarse_bin(float x) {
-//   static_assert(0 < kBits && kBits < 15);
-//   const auto hx = cast<fp16_t>(x);
-//   const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
-//   const uint16_t key = (bits & 0x8000) ? ~bits : bits | 0x8000;
-//   return key >> (16 - kBits);
-// }
 
 template <uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin(float x) {
