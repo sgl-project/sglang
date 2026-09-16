@@ -30,8 +30,8 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16_gemv import wo_a_bf16_gemv
-from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
+    wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
@@ -3160,7 +3160,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # tile only. Large prefill keeps its one-CTA-per-row norm and
                 # lets the projection quantize the full activation layout.
                 if quantize and x.shape[0] <= 8:
-                    from sglang.kernels.ops.layernorm.mxfp8_epilogue import (
+                    from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
                     )
 

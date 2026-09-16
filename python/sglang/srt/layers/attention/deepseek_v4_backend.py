@@ -233,7 +233,7 @@ def _maybe_precompute_flashmla_sched_meta(
     each 32-byte entry to global memory. At the 152 partitions of a BS=1 step
     that is 28 us, and a decode graph replays it on the critical path. Filling
     the buffers here instead means FlashMLA finds them already populated and
-    skips its kernel; `decoding_sched_meta` produces the same schedule, bit for
+    skips its kernel; `flashmla_sched_meta` produces the same schedule, bit for
     bit, in about 9 us.
 
     Only fires where FlashMLA would have computed -- when the scheduler holds no
@@ -245,16 +245,16 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if not _fast_flashmla_sched_shape(q):
         return
-    from sglang.kernels.ops.attention.dsv4.decoding_sched_meta import (
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
-        decoding_sched_meta,
+        flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
-    decoding_sched_meta(
+    flashmla_sched_meta(
         meta,
         num_splits,
         topk_length=topk_length,

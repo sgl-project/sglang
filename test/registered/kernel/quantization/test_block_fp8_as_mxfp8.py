@@ -106,7 +106,7 @@ class TestFp8LinearMethod(_OptInCase):
     MS = [1, 17, 300]
 
     def test_apply_on_fused_quantized_input_matches_bf16(self):
-        from sglang.kernels.ops.attention.dsv4.wo_a_bf16_small_batch import (
+        from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
             _quantize_partial,
             _wo_a_reduce,
         )
