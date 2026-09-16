@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
+from sglang.srt.utils.common import human_readable_int
 
 
 class ExecFeatures(msgspec.Struct):
@@ -492,6 +493,20 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_bs_prefill: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
+    ] = None
+    cuda_graph_prefill_max_context: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum context length supported by DeepSeek-V4 breakable/full "
+                "prefill CUDA graphs. Context-shaped attention metadata and "
+                "indexer logits are allocated at this fixed size instead of "
+                "the model maximum. Larger live contexts fall back to eager."
+                f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+            aliases=["--context-bucket"],
+        ),
     ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
