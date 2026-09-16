@@ -85,6 +85,17 @@ struct PDRequestContext<'a> {
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
 
+fn native_messages_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        axum::Json(json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        })),
+    )
+        .into_response()
+}
+
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
@@ -536,6 +547,17 @@ impl PDRouter {
     ) -> Response {
         let status = res.status();
 
+        if context.route == "/v1/messages" {
+            let headers = header_utils::preserve_response_headers(res.headers());
+            return match res.bytes().await {
+                Ok(body) => {
+                    let mut response = (status, body).into_response();
+                    response.headers_mut().extend(headers);
+                    response
+                }
+                Err(_) => native_messages_error("Failed to read decode response"),
+            };
+        }
         if context.is_stream {
             // Handle streaming error response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -758,6 +780,25 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            if context.route == "/v1/messages" {
+                let mut response = match prefill_result {
+                    Ok(res) => {
+                        let status = res.status();
+                        let headers = header_utils::preserve_response_headers(res.headers());
+                        match res.bytes().await {
+                            Ok(body) => {
+                                let mut response = (status, body).into_response();
+                                response.headers_mut().extend(headers);
+                                response
+                            }
+                            Err(_) => native_messages_error("Failed to read prefill response"),
+                        }
+                    }
+                    Err(_) => native_messages_error("Prefill connection failed"),
+                };
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
             let mut response = match self
                 .process_prefill_response(prefill_result, prefill.url(), false)
                 .await
@@ -1626,6 +1667,69 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_messages::NativeMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        use crate::protocols::common::GenerationRequest;
+        let context = PDRequestContext {
+            route: "/v1/messages",
+            batch_size: None,
+            is_stream: body.is_stream(),
+            return_logprob: false,
+            request_text: self
+                .policies_need_request_text()
+                .then(|| body.extract_text_for_routing()),
+            model_id,
+            headers: headers.cloned(),
+        };
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_messages::NativeMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let workers = if self.enable_igw {
+            model_id
+                .map(|model| self.worker_registry.get_by_model(model))
+                .unwrap_or_default()
+                .iter()
+                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        };
+        let Some(worker) = workers.iter().find(|worker| worker.is_available()) else {
+            return native_messages_error("No prefill worker available for token counting");
+        };
+        let url = Self::worker_endpoint_url(worker.as_ref(), "/v1/messages/count_tokens");
+        match self
+            .build_post_with_headers(&self.client, &url, &body.0, headers, false)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let headers = header_utils::preserve_response_headers(response.headers());
+                match response.bytes().await {
+                    Ok(body) => {
+                        let mut response = (status, body).into_response();
+                        response.headers_mut().extend(headers);
+                        response
+                    }
+                    Err(_) => native_messages_error("Failed to read token-count response"),
+                }
+            }
+            Err(_) => native_messages_error("Token-count connection failed"),
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -1838,6 +1942,215 @@ mod tests {
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
         );
+    }
+
+    async fn messages_test_pair(
+        prefill_app: axum::Router,
+        decode_app: axum::Router,
+    ) -> (PDRouter, Vec<tokio::task::JoinHandle<()>>) {
+        let router = create_test_pd_router();
+        let mut tasks = Vec::new();
+        for (app, role) in [
+            (
+                prefill_app,
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            ),
+            (decode_app, WorkerType::Decode),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            router
+                .worker_registry
+                .register(Arc::from(create_test_worker(url, role, true)));
+        }
+        (router, tasks)
+    }
+
+    #[tokio::test]
+    async fn native_messages_preserves_payload_and_decodes_response() {
+        use std::sync::Mutex;
+        let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let mut apps = Vec::new();
+        for role in ["prefill", "decode"] {
+            let captured = captured.clone();
+            apps.push(axum::Router::new().route("/v1/messages", axum::routing::post(
+                move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push((headers, body));
+                        axum::Json(json!({
+                            "type":"message", "id":role, "content":[{"type":"text","text":"answer"}],
+                            "stop_reason":"end_turn", "usage":{"input_tokens":123,"output_tokens":7}
+                        }))
+                    }
+                }
+            )));
+        }
+        let (router, tasks) = messages_test_pair(apps.remove(0), apps.remove(0)).await;
+        let original = json!({
+            "model":"test", "max_tokens":16, "top_p":0.95, "stream":false,
+            "system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}},
+                {"type":"tool_result","tool_use_id":"call_1","content":"result"},
+                {"type":"text","text":"hello"}
+            ]}],
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "tools":[{"name":"tool","input_schema":{"type":"object","properties":{}}}],
+            "future_extension":{"number":0.9500000001}
+        });
+        let body = crate::routers::native_messages::NativeMessagesRequest(original.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        let response = router
+            .route_messages(Some(&headers), &body, Some("test"))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["id"], "decode");
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].1["bootstrap_room"],
+            captured[1].1["bootstrap_room"]
+        );
+        for (headers, forwarded) in captured.iter() {
+            assert_eq!(headers["anthropic-version"], "2023-06-01");
+            let mut forwarded = forwarded.clone();
+            for key in ["bootstrap_host", "bootstrap_port", "bootstrap_room"] {
+                assert!(forwarded.as_object_mut().unwrap().remove(key).is_some());
+            }
+            assert_eq!(forwarded, original);
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_stream_preserves_engine_events() {
+        use futures_util::StreamExt;
+        let prefill = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                axum::Json(json!({"type":"message","content":[]}))
+            }),
+        );
+        let expected = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let decode = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                ([(CONTENT_TYPE, "text/event-stream")], expected)
+            }),
+        );
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+            "model":"test","max_tokens":16,"messages":[],"stream":true
+        }));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            router.route_messages(None, &body, None),
+        )
+        .await
+        .expect("native Messages response should be returned");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk, expected.as_bytes());
+        drop(stream);
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_preserves_engine_validation_errors() {
+        for failing_role in ["prefill", "decode"] {
+            for stream in [false, true] {
+                let error = json!({"type":"error","error":{"type":"invalid_request_error","message":"bad media"}});
+                let mut apps = Vec::new();
+                for role in ["prefill", "decode"] {
+                    let error = error.clone();
+                    apps.push(axum::Router::new().route(
+                        "/v1/messages",
+                        axum::routing::post(move || {
+                            let error = error.clone();
+                            async move {
+                                if role == failing_role {
+                                    (StatusCode::BAD_REQUEST, axum::Json(error))
+                                } else {
+                                    // Force the native 400 to arrive before stream commitment.
+                                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                                    (StatusCode::OK, axum::Json(json!({"type":"message"})))
+                                }
+                            }
+                        }),
+                    ));
+                }
+                let (router, tasks) = messages_test_pair(apps.remove(0), apps.remove(0)).await;
+                let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+                    "model":"test","max_tokens":16,"messages":[],"stream":stream
+                }));
+                let response = router.route_messages(None, &body, None).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let actual: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(actual, error);
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_messages_count_tokens_does_not_dispatch_decode_or_inject_bootstrap() {
+        let prefill = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                assert!(body.get("bootstrap_room").is_none());
+                assert!(body["messages"][0]["content"][0]["source"]["data"].is_string());
+                axum::Json(json!({"input_tokens":42}))
+            }),
+        );
+        let decode = axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let (router, tasks) = messages_test_pair(prefill, decode).await;
+        let body = crate::routers::native_messages::NativeMessagesRequest(json!({
+            "model":"test","messages":[{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"fixture"}}
+            ]}]
+        }));
+        let response = router.route_messages_count_tokens(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let actual: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(actual, json!({"input_tokens":42}));
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

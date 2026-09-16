@@ -594,6 +594,60 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_messages::NativeMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(response) => return *response,
+            }
+        } else {
+            None
+        };
+        let model = effective_model_id.as_deref().or(model_id);
+        if let Some(router) = self.select_router_for_request(headers, model) {
+            router.route_messages(headers, body, model).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to handle messages request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::native_messages::NativeMessagesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(model_id) {
+                Ok(id) => Some(id),
+                Err(response) => return *response,
+            }
+        } else {
+            None
+        };
+        let model = effective_model_id.as_deref().or(model_id);
+        if let Some(router) = self.select_router_for_request(headers, model) {
+            router
+                .route_messages_count_tokens(headers, body, model)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to count messages tokens",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,

@@ -28,6 +28,7 @@ pub mod header_utils;
 pub mod http;
 pub mod mcp_utils;
 pub mod mesh;
+pub mod native_messages;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
@@ -108,6 +109,34 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Completion endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Forward the engine's native Anthropic Messages protocol unchanged.
+    async fn route_messages(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &native_messages::NativeMessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Native Messages endpoint not implemented",
+        )
+            .into_response()
+    }
+
+    /// Count native Messages tokens without creating a generation or reserving KV.
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &native_messages::NativeMessagesRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Native Messages token counting not implemented",
         )
             .into_response()
     }
