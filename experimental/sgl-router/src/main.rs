@@ -9,7 +9,7 @@ use sgl_router::{
     discovery::spawn_discovery,
     policies::{
         active_load::{spawn_janitor, ActiveLoadRegistry, JanitorHandle, SystemTimeClock},
-        factory::build_registry,
+        factory::build_registry as build_policy_registry,
         kv_events::{BlockSizeOracle, KvEventIndex},
         prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
@@ -35,49 +35,76 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
     install_bootstrap_subscriber();
-    let cfg = cli
+    let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
-    init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
+    init_tracing(
+        &config.observability.log_level,
+        config.observability.log_format,
+    )?;
+
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
-    log_startup(&cfg);
+    log_startup(&config);
 
+    // Load tokenizers and create the shared catalog of workers available for routing.
     let tokenizers =
-        Arc::new(TokenizerRegistry::load_from_config(&cfg).context("load tokenizers")?);
-    let registry = Arc::new(WorkerRegistry::default());
-    let prefix_index = build_prefix_index(&cfg)?;
-    let kv_index = start_kv_events(prefix_index.is_some());
-    let policies = Arc::new(
-        build_registry(&cfg, kv_index.tree(), kv_index.block_size_oracle())
-            .context("build policy registry")?,
+        Arc::new(TokenizerRegistry::load_from_config(&config).context("load tokenizers")?);
+    let worker_registry = Arc::new(WorkerRegistry::default());
+
+    // Set up cache lookup and monitor workers for KV-cache and engine-load updates.
+    let external_prefix_index = build_external_prefix_index(&config)?;
+    let kv_event_index = start_kv_event_monitor(external_prefix_index.is_some());
+
+    // Build the policies that choose which workers receive each request.
+    let routing_policies = Arc::new(
+        build_policy_registry(
+            &config,
+            kv_event_index.tree(),
+            kv_event_index.block_size_oracle(),
+        )
+        .context("build policy registry")?,
     );
-    let (active_load, janitor_handle) = start_load_monitor(&cfg);
-    let (discovery_handle, manager_handle) =
-        start_worker_discovery(&cfg, &registry, &kv_index, &active_load).await?;
-    let ctx = build_app_context(
-        &cfg,
+
+    // Track active requests and periodically remove stale load records.
+    let (active_load, load_janitor) = start_load_monitor(&config);
+
+    // Discover workers and let the manager register, update, and remove them.
+    let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
+        &config,
+        &worker_registry,
+        &kv_event_index,
+        &active_load,
+    )
+    .await?;
+
+    // Share routing dependencies with HTTP handlers and mark startup complete.
+    let app_context = build_app_context(
+        &config,
         tokenizers,
-        registry,
-        policies,
+        worker_registry,
+        routing_policies,
         active_load,
-        &kv_index,
-        prefix_index,
+        &kv_event_index,
+        external_prefix_index,
     )?;
-    ctx.mark_ready();
+    app_context.mark_ready();
 
-    let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
-    let listener = TcpListener::bind(&bind)
+    // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
+    let listen_addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = TcpListener::bind(&listen_addr)
         .await
-        .with_context(|| format!("bind {bind}"))?;
-    tracing::info!("listening on {bind}");
-    let (server_result, inflight_drain_secs) = serve(listener, ctx, sigterm, sigint).await;
+        .with_context(|| format!("bind {listen_addr}"))?;
+    tracing::info!("listening on {listen_addr}");
+    let (server_result, inflight_drain_secs) = serve(listener, app_context, sigterm, sigint).await;
 
+    // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
-    manager_handle.abort();
-    janitor_handle.shutdown().await;
+    worker_manager_handle.abort();
+    load_janitor.shutdown().await;
     log_shutdown(&server_result, inflight_drain_secs);
     server_result
 }
@@ -124,10 +151,10 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
     Ok((sigterm, sigint))
 }
 
-fn log_startup(cfg: &Config) {
+fn log_startup(config: &Config) {
     if let Some(advisory) = sgl_router::config::shutdown_drain_advisory(
-        cfg.server.shutdown_drain_secs,
-        cfg.server.termination_grace_secs,
+        config.server.shutdown_drain_secs,
+        config.server.termination_grace_secs,
     ) {
         tracing::warn!(
             shutdown_drain_secs = advisory.shutdown_drain_secs,
@@ -141,21 +168,21 @@ fn log_startup(cfg: &Config) {
     }
 
     tracing::info!(
-        configured_decode_policy = ?cfg.model.decode_policy,
+        configured_decode_policy = ?config.model.decode_policy,
         "sgl-router {} starting on {}:{}",
         env!("CARGO_PKG_VERSION"),
-        cfg.server.host,
-        cfg.server.port
+        config.server.host,
+        config.server.port
     );
 }
 
-fn build_prefix_index(cfg: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
-    let endpoint = cfg
+fn build_external_prefix_index(config: &Config) -> Result<Option<Arc<dyn PrefixIndex>>> {
+    let endpoint = config
         .model
         .cache_aware
         .as_ref()
         .filter(|cache| {
-            cfg.model.policy == PolicyKind::CacheAware
+            config.model.policy == PolicyKind::CacheAware
                 && cache.prefix_provider == CachePrefixProvider::Indexer
         })
         .and_then(|cache| cache.kv_indexer_endpoint.as_ref());
@@ -176,7 +203,7 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     }
 }
 
-fn start_kv_events(use_external_indexer: bool) -> Arc<KvEventIndex> {
+fn start_kv_event_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -189,8 +216,8 @@ fn start_kv_events(use_external_indexer: bool) -> Arc<KvEventIndex> {
     }
 }
 
-fn start_load_monitor(cfg: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) {
-    let timeout_secs = cfg.active_load.stale_request_timeout_secs;
+fn start_load_monitor(config: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) {
+    let timeout_secs = config.active_load.stale_request_timeout_secs;
     let active_load =
         ActiveLoadRegistry::new(Arc::new(SystemTimeClock), Duration::from_secs(timeout_secs));
     // Reap stale requests at one tenth of their timeout, bounded to 1–60 seconds.
@@ -199,73 +226,77 @@ fn start_load_monitor(cfg: &Config) -> (Arc<ActiveLoadRegistry>, JanitorHandle) 
     (active_load, handle)
 }
 
-async fn start_worker_discovery(
-    cfg: &Config,
-    registry: &Arc<WorkerRegistry>,
-    kv_index: &Arc<KvEventIndex>,
+async fn start_worker_discovery_and_manager(
+    config: &Config,
+    worker_registry: &Arc<WorkerRegistry>,
+    kv_event_index: &Arc<KvEventIndex>,
     active_load: &Arc<ActiveLoadRegistry>,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let (event_rx, discovery_handle) = spawn_discovery(cfg).await.context("spawn discovery")?;
-    let manager_handle = tokio::spawn(manager::run_with_config(
-        event_rx,
-        Arc::clone(registry),
-        Some(Arc::new(cfg.clone())),
-        Some(Arc::clone(kv_index)),
+    let (worker_events, discovery_handle) =
+        spawn_discovery(config).await.context("spawn discovery")?;
+    let worker_manager_handle = tokio::spawn(manager::run_with_config(
+        worker_events,
+        Arc::clone(worker_registry),
+        Some(Arc::new(config.clone())),
+        Some(Arc::clone(kv_event_index)),
         Some(Arc::clone(active_load)),
     ));
-    Ok((discovery_handle, manager_handle))
+    Ok((discovery_handle, worker_manager_handle))
 }
 
 fn build_app_context(
-    cfg: &Config,
+    config: &Config,
     tokenizers: Arc<TokenizerRegistry>,
-    registry: Arc<WorkerRegistry>,
-    policies: Arc<PolicyRegistry>,
+    worker_registry: Arc<WorkerRegistry>,
+    routing_policies: Arc<PolicyRegistry>,
     active_load: Arc<ActiveLoadRegistry>,
-    kv_index: &KvEventIndex,
-    prefix_index: Option<Arc<dyn PrefixIndex>>,
+    kv_event_index: &KvEventIndex,
+    external_prefix_index: Option<Arc<dyn PrefixIndex>>,
 ) -> Result<Arc<AppContext>> {
-    let block_size_oracle = kv_index.block_size_oracle();
+    let block_size_oracle = kv_event_index.block_size_oracle();
     let proxy = Arc::new(
-        Proxy::new(Duration::from_secs(cfg.proxy.request_timeout_secs))
+        Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
             .context("build proxy client")?,
     );
 
-    let mut app_ctx = AppContext::with_active_load(
-        cfg.clone(),
+    let mut app_context = AppContext::with_active_load(
+        config.clone(),
         tokenizers,
         proxy,
-        registry,
-        policies,
+        worker_registry,
+        routing_policies,
         active_load,
     );
-    app_ctx.prefix_index = prefix_index;
-    app_ctx.radix_tree_prefix_provider = (cfg.model.policy == PolicyKind::CacheAware
-        && cfg
+    app_context.prefix_index = external_prefix_index;
+    app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
+        && config
             .model
             .cache_aware
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(kv_index.tree(), Arc::clone(&block_size_oracle)));
-    app_ctx.block_size_oracle = block_size_oracle;
-    app_ctx.engine_load = kv_index.engine_load();
-    app_ctx.kv_metrics = kv_index.metrics_source();
-    Ok(Arc::new(app_ctx))
+    .then(|| RadixTreePrefixProvider::new(kv_event_index.tree(), Arc::clone(&block_size_oracle)));
+    app_context.block_size_oracle = block_size_oracle;
+    app_context.engine_load = kv_event_index.engine_load();
+    app_context.kv_metrics = kv_event_index.metrics_source();
+    Ok(Arc::new(app_context))
 }
 
 async fn serve(
     listener: TcpListener,
-    ctx: Arc<AppContext>,
+    app_context: Arc<AppContext>,
     sigterm: Signal,
     sigint: Signal,
 ) -> (Result<()>, Option<u64>) {
-    let app = build_router(Arc::clone(&ctx));
-    let drain = ctx.config.server.shutdown_drain();
+    let app = build_router(Arc::clone(&app_context));
+    let drain = app_context.config.server.shutdown_drain();
     let (drain_tx, drain_rx) = watch::channel(None);
-    let heartbeat = tokio::spawn(report_drain_progress(Arc::clone(&ctx), drain_rx.clone()));
+    let heartbeat = tokio::spawn(report_drain_progress(
+        Arc::clone(&app_context),
+        drain_rx.clone(),
+    ));
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal(sigterm, sigint, ctx, drain).await;
+            shutdown_signal(sigterm, sigint, app_context, drain).await;
             let _ = drain_tx.send(Some(Instant::now()));
         })
         .await
@@ -276,7 +307,7 @@ async fn serve(
 }
 
 async fn report_drain_progress(
-    ctx: Arc<AppContext>,
+    app_context: Arc<AppContext>,
     mut drain_rx: watch::Receiver<Option<Instant>>,
 ) {
     // Start reporting only after the readiness pause, when axum begins draining requests.
@@ -295,8 +326,8 @@ async fn report_drain_progress(
         ($level:ident, $elapsed:expr) => {
             tracing::$level!(
                 elapsed_secs = $elapsed,
-                inflight_http = ctx.inflight_http.count(),
-                inflight_proxied = ctx.active_load.inflight_count(),
+                inflight_http = app_context.inflight_http.count(),
+                inflight_proxied = app_context.active_load.inflight_count(),
                 "still draining in-flight requests; this phase is unbounded and ends at \
                  SIGKILL when terminationGracePeriodSeconds expires",
             )
@@ -337,7 +368,7 @@ fn log_shutdown(result: &Result<()>, inflight_drain_secs: Option<u64>) {
 async fn shutdown_signal(
     mut sigterm: Signal,
     mut sigint: Signal,
-    ctx: Arc<AppContext>,
+    app_context: Arc<AppContext>,
     drain: Duration,
 ) {
     let sigterm_first = tokio::select! {
@@ -371,7 +402,7 @@ async fn shutdown_signal(
         let expedite = async move {
             let _ = expedite_rx.await;
         };
-        drain_for_termination(&ctx, drain, expedite).await;
+        drain_for_termination(&app_context, drain, expedite).await;
     }
 }
 
