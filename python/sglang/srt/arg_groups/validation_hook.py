@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -19,6 +20,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.speculative.pp_support import supports_qwen35_pp_mtp_prefill
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
@@ -78,10 +80,29 @@ def check_server_args(server_args: Any):
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
         else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert cfg.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
             )
+            if cfg.speculative_algorithm is not None:
+                assert (
+                    cfg.speculative_algorithm.upper() == "EAGLE"
+                    and not cfg.enable_multi_layer_eagle
+                ), (
+                    "Pipeline parallelism currently only supports EAGLE "
+                    "(non-multi-layer) speculative decoding"
+                )
+                assert cfg.disaggregation_mode == "prefill", (
+                    "CUDA PP + speculative decoding (MTP) is only supported "
+                    "on prefill nodes (disaggregation-mode=prefill)"
+                )
+                model_architecture = model_config_of(
+                    server_args
+                ).hf_config.architectures[0]
+                assert supports_qwen35_pp_mtp_prefill(model_architecture), (
+                    "CUDA PP + speculative decoding is currently only supported "
+                    "for Qwen3.5; got "
+                    f"architecture={model_architecture}"
+                )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "
