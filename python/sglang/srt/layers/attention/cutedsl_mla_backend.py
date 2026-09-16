@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 class CuteDslMLABackend(TRTLLMMLABackend):
     """flashinfer cute-dsl MLA decode backend with decode context parallelism."""
 
+    # SGLang uses this class for decode only. Its prefill side is trtllm_mla,
+    # whose variable-Q call may auto-dispatch to FlashInfer CuTeDSL.
+    owns_varlen_absorbed_extend = False
+
     def __init__(
         self,
         model_runner: ModelRunner,

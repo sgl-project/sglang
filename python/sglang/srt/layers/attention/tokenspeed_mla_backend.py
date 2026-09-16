@@ -110,6 +110,9 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
+    # Tokenspeed overrides decode only and does not own the extend path.
+    owns_varlen_absorbed_extend = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
