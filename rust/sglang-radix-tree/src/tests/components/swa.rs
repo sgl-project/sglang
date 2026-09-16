@@ -3598,6 +3598,7 @@ fn backup_storage_transfers_carry_trailing_page_keys() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3628,6 +3629,7 @@ fn backup_storage_is_none_without_host_value_or_hashes() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
     };
@@ -3649,7 +3651,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
             .build_hicache_transfers(
                 &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
                 /* token_ids = */ None, /* prefetch_tokens = */ 0,
-                /* last_hash = */ None,
+                /* staging_tokens = */ 0, /* last_hash = */ None,
             )
             .unwrap();
         assert!(transfers.is_none());
@@ -3665,6 +3667,7 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3687,6 +3690,7 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3718,6 +3722,7 @@ fn backup_host_build_returns_none_for_a_tombstone() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3768,6 +3773,7 @@ fn load_back_build_collects_host_only_nodes_within_the_window() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3808,6 +3814,7 @@ fn load_back_build_stops_at_the_window_boundary() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()
@@ -3841,6 +3848,7 @@ fn load_back_build_returns_none_when_the_window_is_on_device() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap();
@@ -3860,6 +3868,7 @@ fn load_back_build_rejects_a_bare_window_node() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id })
@@ -3883,6 +3892,7 @@ fn fallible_load_back_boundaries_reject_a_bare_window_node() {
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         ),
         Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
@@ -4115,21 +4125,26 @@ fn commit_hicache_transfers_routes_to_the_component() {
 }
 
 #[test]
-fn prefetch_build_wraps_the_host_buffer_with_placeholder_keys() {
+fn prefetch_build_sizes_the_placeholder_keys_from_the_staging_tokens() {
     let tc = swa_core(/* window = */ 4, /* page_size = */ 1);
-    let transfers = swa_component(4)
-        .build_hicache_transfers(
-            &tc,
-            tc.arena.root(),
-            CacheTransferPhase::Prefetch,
-            /* mamba_pool_idx = */ None,
-            /* host_indices = */ Some(Tensor::from_slice(&[30i64, 31])),
-            /* token_ids = */ None,
-            /* prefetch_tokens = */ 0,
-            /* last_hash = */ None,
-        )
-        .unwrap()
-        .unwrap();
+    let build = |staging_tokens: usize| {
+        swa_component(4)
+            .build_hicache_transfers(
+                &tc,
+                tc.arena.root(),
+                CacheTransferPhase::Prefetch,
+                /* mamba_pool_idx = */ None,
+                /* host_indices = */ None,
+                /* token_ids = */ None,
+                /* prefetch_tokens = */ 0,
+                staging_tokens,
+                /* last_hash = */ None,
+            )
+            .unwrap()
+    };
+    // Staging is allocated once the hit is known: the build carries only the
+    // planned page count, never a host buffer.
+    let transfers = build(2).unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(
         transfers[0].keys,
@@ -4139,13 +4154,8 @@ fn prefetch_build_wraps_the_host_buffer_with_placeholder_keys() {
         ])
     );
     assert_eq!(transfers[0].hit_policy, PoolHitPolicy::TrailingPages);
-    assert!(
-        transfers[0]
-            .host_indices
-            .as_ref()
-            .unwrap()
-            .equal(&Tensor::from_slice(&[30i64, 31]))
-    );
+    assert!(transfers[0].host_indices.is_none());
+    assert!(build(0).is_none());
 }
 
 #[test]
@@ -5195,6 +5205,7 @@ fn backup_transfers(
             /* host_indices = */ None,
             /* token_ids = */ None,
             /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
             /* last_hash = */ None,
         )
         .unwrap()

@@ -1944,11 +1944,23 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "below_threshold",
             "host_capacity",
             "device_capacity",
+            "device_covered",
             "storage_transfer",
             "shrunk",
             "dropped",
         ):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
+                **self.labels, reason=reason
+            )
+
+        self.storage_prefetch_deferred_tokens_total = Counter(
+            name="sglang:storage_prefetch_deferred_tokens_total",
+            documentation="Storage-prefetch token-attempts deferred for later "
+            "reuse, by transient capacity reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        for reason in ("host_capacity", "device_capacity"):
+            self.storage_prefetch_deferred_tokens_total.labels(
                 **self.labels, reason=reason
             )
 
@@ -2038,6 +2050,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         if num_tokens > 0:
             self.storage_prefetch_unfulfilled_tokens_total.labels(
+                **self.labels, reason=reason
+            ).inc(num_tokens)
+
+    def log_storage_prefetch_deferred_tokens(
+        self, num_tokens: int, reason: str
+    ) -> None:
+        if num_tokens > 0:
+            self.storage_prefetch_deferred_tokens_total.labels(
                 **self.labels, reason=reason
             ).inc(num_tokens)
 
