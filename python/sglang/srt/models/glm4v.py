@@ -668,7 +668,7 @@ class Glm4vForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 
         if not (

@@ -792,6 +792,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                if self.draft_runner.model_config.model_is_mrope:
+                    forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
                     0,
