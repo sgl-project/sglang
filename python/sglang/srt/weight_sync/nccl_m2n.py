@@ -719,9 +719,7 @@ class NcclM2NReceiver:
         # FusedMoE's regular weight loader swaps W1/W3 before applying the
         # quantization method's gate/up ordering when FlashInfer TRT-LLM is in
         # use. M2N bypasses that loader, so reproduce both transformations here.
-        trtllm_swaps_w13 = bool(
-            getattr(module, "use_flashinfer_trtllm_moe", False)
-        )
+        trtllm_swaps_w13 = bool(getattr(module, "use_flashinfer_trtllm_moe", False))
         up_first = method_up_first ^ trtllm_swaps_w13
         return (intermediate, 0) if up_first else (0, intermediate)
 

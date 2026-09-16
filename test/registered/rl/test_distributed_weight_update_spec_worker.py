@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -343,8 +344,9 @@ def test_session_restart_keeps_original_selector_and_preparation(
 
 
 def test_model_runner_retains_fp8_graph_storage_across_failure_and_reconnect():
-    import sglang.srt.model_executor.model_runner as mr
     import torch
+
+    import sglang.srt.model_executor.model_runner as mr
 
     model = torch.nn.Module()
     model.weight = torch.nn.Parameter(
