@@ -5,10 +5,17 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 ## Usage
 
 Rust is the default tree core. The centralized tree-core registry falls back to
-Python for session-aware caching, C128 or other unsupported/custom components,
-non-Linux platforms, PyTorch versions outside 2.11 through 2.13, devices other
-than CPU or CUDA, and installations containing neither the Rust extension nor
-its sources. This policy also applies when Rust is explicitly selected.
+Python in these cases:
+
+- Session-aware caching.
+- C128 or other unsupported components.
+- Custom component overrides.
+- Non-Linux platforms.
+- PyTorch versions outside 2.11 through 2.13.
+- Devices other than CPU or CUDA.
+- Installations containing neither the Rust extension nor its sources.
+
+This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
 
 Select a backend explicitly with:
