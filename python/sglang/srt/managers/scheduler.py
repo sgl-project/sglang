@@ -1933,6 +1933,8 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
+                if use_mlx():
+                    self._cleanup_mlx_state_if_fully_idle()
                 self.on_idle()
 
             # Update last_batch
