@@ -15,10 +15,9 @@ from __future__ import annotations
 
 """Fused Triton kernel: reconstruct NGRAM verify metadata from a tree mask.
 
-Device-native replacement for the pure-torch fallback
-``_reconstruct_indices_from_tree_mask_torch`` (used where the compiled
+Device-native fallback used where the compiled
 ``sgl_kernel.speculative.reconstruct_indices_from_tree_mask`` op is unavailable,
-e.g. Intel XPU). It reproduces that op's contract exactly, mutating
+e.g. Intel XPU. It reproduces that op's contract exactly, mutating
 ``positions`` / ``retrieve_*`` in place.
 
 Semantics (per batch ``b``, per node ``tid``; ``n = draft_token_num``):

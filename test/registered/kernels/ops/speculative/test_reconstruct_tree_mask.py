@@ -1,10 +1,12 @@
-"""Correctness guard for the fused XPU tree-mask reconstruction kernel.
+"""Test the Triton implementation of ``reconstruct_indices_from_tree_mask``.
 
-``reconstruct_indices_from_tree_mask_triton`` is the device-native replacement
-for the compiled ``sgl_kernel.speculative.reconstruct_indices_from_tree_mask``
-op on platforms that ship no such op (Intel XPU). It reconstructs NGRAM verify
+``reconstruct_indices_from_tree_mask_triton`` is the device-native fallback for
+the compiled ``sgl_kernel.speculative.reconstruct_indices_from_tree_mask`` op on
+platforms that ship no such op (e.g. Intel XPU). It reconstructs NGRAM verify
 metadata (``positions`` / ``retrieve_index`` / ``retrieve_next_token`` /
-``retrieve_next_sibling``) from a per-batch ``n x n`` tree mask.
+``retrieve_next_sibling``) from a per-batch ``n x n`` tree mask. This test runs
+on every available GPU-like backend (CUDA, XPU) so a Triton codegen regression
+on one backend doesn't slip through on the strength of the other's coverage.
 
 This test pins the kernel to the op's documented contract two ways:
 
@@ -17,7 +19,7 @@ This test pins the kernel to the op's documented contract two ways:
    randomly generated *valid* trees, across power-of-two and non-power-of-two
    ``n`` (exercises the ``BLOCK_N`` padding mask) and multiple batch sizes.
 
-Failure modes guarded (no other test covers these on XPU):
+Failure modes guarded (no other test covers these):
   - root nodes (``parent < 0``) must NOT link as siblings to one another;
   - ``n`` not a power of two must mask out the padded ``BLOCK_N`` tail;
   - the two reduction axes (parent/depth over columns, child/sibling over rows)
@@ -29,9 +31,10 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 try:
@@ -40,10 +43,17 @@ try:
     )
 
     _HAS_KERNEL = True
-except Exception:  # pragma: no cover - import guarded; only meaningful on XPU
+except Exception:  # pragma: no cover - import guarded for hardware-less CI shards
     _HAS_KERNEL = False
 
-_HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
+_AVAILABLE_DEVICES = [
+    device
+    for device, available in (
+        ("cuda", torch.cuda.is_available()),
+        ("xpu", hasattr(torch, "xpu") and torch.xpu.is_available()),
+    )
+    if available
+]
 
 
 def _make_valid_tree_mask(bs: int, n: int, seed: int) -> np.ndarray:
@@ -92,18 +102,16 @@ def _reference(mask: np.ndarray, seq_lens: np.ndarray, bs: int, n: int):
     return positions, retrieve_index, next_token, next_sibling
 
 
-@unittest.skipUnless(_HAS_XPU, "XPU device required")
 @unittest.skipUnless(_HAS_KERNEL, "reconstruct_tree Triton kernel import required")
-class TestReconstructTreeMaskXPU(CustomTestCase):
-    device = "xpu"
-
-    def _run_kernel(self, mask_bool_cpu, seq_lens_cpu, bs, n):
-        tree_mask = mask_bool_cpu.reshape(-1).contiguous().to(self.device)
-        seq_lens = seq_lens_cpu.to(self.device)
-        positions = torch.empty(bs * n, dtype=torch.int64, device=self.device)
-        retrieve_index = torch.full((bs, n), -1, dtype=torch.int64, device=self.device)
-        next_token = torch.full((bs, n), -1, dtype=torch.int64, device=self.device)
-        next_sibling = torch.full((bs, n), -1, dtype=torch.int64, device=self.device)
+@unittest.skipUnless(_AVAILABLE_DEVICES, "CUDA or XPU device required")
+class TestReconstructTreeMask(CustomTestCase):
+    def _run_kernel(self, device, mask_bool_cpu, seq_lens_cpu, bs, n):
+        tree_mask = mask_bool_cpu.reshape(-1).contiguous().to(device)
+        seq_lens = seq_lens_cpu.to(device)
+        positions = torch.empty(bs * n, dtype=torch.int64, device=device)
+        retrieve_index = torch.full((bs, n), -1, dtype=torch.int64, device=device)
+        next_token = torch.full((bs, n), -1, dtype=torch.int64, device=device)
+        next_sibling = torch.full((bs, n), -1, dtype=torch.int64, device=device)
         reconstruct_indices_from_tree_mask_triton(
             tree_mask,
             seq_lens,
@@ -114,7 +122,10 @@ class TestReconstructTreeMaskXPU(CustomTestCase):
             bs,
             n,
         )
-        torch.xpu.synchronize()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        else:
+            torch.xpu.synchronize()
         return (
             positions.cpu().numpy(),
             retrieve_index.reshape(-1).cpu().numpy(),
@@ -131,37 +142,45 @@ class TestReconstructTreeMaskXPU(CustomTestCase):
             dtype=torch.bool,
         )
         seq_lens = torch.tensor([12], dtype=torch.int64)
-        positions, retrieve_index, next_token, next_sibling = self._run_kernel(
-            tree_mask.reshape(bs, n, n), seq_lens, bs, n
-        )
-        self.assertEqual(positions.tolist(), [12, 13, 13, 14])
-        self.assertEqual(retrieve_index.tolist(), [0, 1, 2, 3])
-        self.assertEqual(next_token.tolist(), [1, -1, 3, -1])
-        self.assertEqual(next_sibling.tolist(), [-1, 2, -1, -1])
+        for device in _AVAILABLE_DEVICES:
+            with self.subTest(device=device):
+                positions, retrieve_index, next_token, next_sibling = self._run_kernel(
+                    device, tree_mask.reshape(bs, n, n), seq_lens, bs, n
+                )
+                self.assertEqual(positions.tolist(), [12, 13, 13, 14])
+                self.assertEqual(retrieve_index.tolist(), [0, 1, 2, 3])
+                self.assertEqual(next_token.tolist(), [1, -1, 3, -1])
+                self.assertEqual(next_sibling.tolist(), [-1, 2, -1, -1])
 
     def test_matches_reference_over_random_trees(self):
         # Power-of-two and non-power-of-two n (BLOCK_N tail masking) x batch sizes.
-        for n in (1, 2, 3, 7, 8, 16, 17, 32, 63, 64):
-            for bs in (1, 3, 16, 64):
-                for seed in range(3):
-                    mask = _make_valid_tree_mask(bs, n, seed * 1000 + bs * 100 + n)
-                    seq_lens = torch.from_numpy(
-                        np.random.default_rng(seed).integers(1, 200, size=bs)
-                    ).to(torch.int64)
-                    got = self._run_kernel(torch.from_numpy(mask), seq_lens, bs, n)
-                    ref = _reference(mask, seq_lens.numpy(), bs, n)
-                    names = (
-                        "positions",
-                        "retrieve_index",
-                        "retrieve_next_token",
-                        "retrieve_next_sibling",
-                    )
-                    for name, g, r in zip(names, got, ref):
-                        np.testing.assert_array_equal(
-                            g,
-                            r,
-                            err_msg=f"{name} mismatch at bs={bs} n={n} seed={seed}",
+        for device in _AVAILABLE_DEVICES:
+            for n in (1, 2, 3, 7, 8, 16, 17, 32, 63, 64):
+                for bs in (1, 3, 16, 64):
+                    for seed in range(3):
+                        mask = _make_valid_tree_mask(bs, n, seed * 1000 + bs * 100 + n)
+                        seq_lens = torch.from_numpy(
+                            np.random.default_rng(seed).integers(1, 200, size=bs)
+                        ).to(torch.int64)
+                        got = self._run_kernel(
+                            device, torch.from_numpy(mask), seq_lens, bs, n
                         )
+                        ref = _reference(mask, seq_lens.numpy(), bs, n)
+                        names = (
+                            "positions",
+                            "retrieve_index",
+                            "retrieve_next_token",
+                            "retrieve_next_sibling",
+                        )
+                        for name, g, r in zip(names, got, ref):
+                            np.testing.assert_array_equal(
+                                g,
+                                r,
+                                err_msg=(
+                                    f"{name} mismatch at device={device} "
+                                    f"bs={bs} n={n} seed={seed}"
+                                ),
+                            )
 
 
 if __name__ == "__main__":

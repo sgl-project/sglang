@@ -112,9 +112,9 @@ def reconstruct_indices_from_tree_mask(
         )
         return
 
-    assert (
-        _reconstruct_indices_kernel is not None
-    ), "sgl_kernel.speculative.reconstruct_indices_from_tree_mask is unavailable"
+    assert _reconstruct_indices_kernel is not None, (
+        "sgl_kernel.speculative.reconstruct_indices_from_tree_mask is unavailable"
+    )
     _reconstruct_indices_kernel(
         tree_mask,
         verified_seq_len,
