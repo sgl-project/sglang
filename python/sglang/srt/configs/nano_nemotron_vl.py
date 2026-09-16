@@ -76,8 +76,6 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         if vision_config is None:
             vision_config = kwargs.pop("raw_vision_config", None)
 
-        super().__init__(**kwargs)
-
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
         if llm_config is not None:
             self.llm_config = NemotronHConfig(**llm_config)
@@ -87,6 +85,8 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             assert vision_config is None
             self.llm_config = NemotronHConfig()
             self.raw_vision_config = {}
+
+        super().__init__(**kwargs)
 
         # Audio (Parakeet) config: stored as a PretrainedConfig sub-object
         if sound_config is not None and isinstance(sound_config, dict):
@@ -145,6 +145,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self.video_maintain_aspect_ratio = self.raw_vision_config.get(
             "video_maintain_aspect_ratio", True
         )
+
+    def get_text_config(self, decoder=False):
+        return self.llm_config
 
     def create_radio_config(self):
         config = self.raw_vision_config
