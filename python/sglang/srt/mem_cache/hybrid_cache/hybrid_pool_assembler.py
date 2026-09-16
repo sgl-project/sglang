@@ -851,8 +851,9 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
+    use_dsa = isinstance(kv_pool, DSATokenToKVPool)
     mtp_draft_device_pools = tuple(
         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
         for pool in params.mtp_draft_device_pools
@@ -867,6 +868,7 @@ def build_hybrid_mamba_stack(
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
+        override_kv_cache_dim=kv_pool.kv_cache_dim if use_dsa else None,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
     if mtp_draft_device_pools:
@@ -905,6 +907,26 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if use_dsa:
+        # DSA full-attention layers need both latent KV and index keys restored.
+        # Use the same dense full-attention mapping, including packed MTP layers;
+        # linear-attention layers have no indexer state.
+        indexer_host_pool = DSAIndexerPoolHost(
+            kv_pool,
+            kv_host_pool,
+            get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=indexer_host_pool,
+                device_pool=kv_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
+                packed_draft_device_pools=mtp_draft_device_pools,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1496,6 +1518,14 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        sidecars = []
+        if PoolName.INDEXER in host_pool_group.entry_map:
+            sidecars.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1503,9 +1533,10 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=sidecars,
             register_req_to_token_counter=True,
             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
-            pools_desc="KV + MAMBA",
+            pools_desc="KV + MAMBA" + (" + INDEXER" if sidecars else ""),
         )
 
 
