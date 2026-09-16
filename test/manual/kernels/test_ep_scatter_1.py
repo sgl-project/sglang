@@ -22,9 +22,6 @@ import triton
 
 from sglang.kernels.ops.moe.ep_moe_kernels import _fwd_kernel_ep_scatter_1
 from sglang.test.test_utils import CustomTestCase
-from sglang.test_internal.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=60, num_gpus=1)
 
 BLOCK_E = 128  # must match the launcher's BLOCK_E
 
