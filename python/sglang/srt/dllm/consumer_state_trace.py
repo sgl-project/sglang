@@ -40,9 +40,13 @@ def compact_tp_gather_bytes(*, rows: int, tp_size: int, packed: bool) -> int:
         return 0
     if packed:
         return rows * tp_size * 3 * torch.tensor([], dtype=torch.float32).element_size()
-    return rows * tp_size * (
-        2 * torch.tensor([], dtype=torch.float32).element_size()
-        + torch.tensor([], dtype=torch.int64).element_size()
+    return (
+        rows
+        * tp_size
+        * (
+            2 * torch.tensor([], dtype=torch.float32).element_size()
+            + torch.tensor([], dtype=torch.int64).element_size()
+        )
     )
 
 
