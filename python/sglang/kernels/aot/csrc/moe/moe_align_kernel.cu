@@ -212,13 +212,14 @@ __global__ void moe_align_block_size_kernel(
   if (tid < scan_size) scan_buf[tid] = pre + offset;
   __syncthreads();
 
-  // Write prefix[0..num_experts - 1] and cumsum
+  // Write prefix[0..num_experts - 1]
   if (tid < num_experts) prefix[tid] = scan_buf[tid];
 #endif
 
   if (tid <= num_experts) {
     cumsum[tid] = prefix[tid];
   }
+  __syncthreads();
   // fill expert_ids
   const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
