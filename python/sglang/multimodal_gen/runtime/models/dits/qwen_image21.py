@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -27,6 +26,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.layernorm import RMSNorm
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
