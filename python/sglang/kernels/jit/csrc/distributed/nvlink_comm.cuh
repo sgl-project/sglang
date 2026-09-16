@@ -22,10 +22,8 @@ namespace sglang {
 using device::distributed::PushWorkSpace;
 using device::distributed::Semaphore;
 
-// Runtime uint32 division as one 32x32->64 multiply and a shift (the round-up
-// magic number, exact for dividends below 2^31; a vector index is far smaller).
-// Self-contained so the header builds with the CCCL bundled in every CUDA 13
-// toolkit: cuda::fast_mod_div only arrived in a later CCCL.
+// Runtime uint32 division as a multiply-high and a shift (round-up magic,
+// exact below 2^31); cuda::fast_mod_div needs a newer CCCL than CUDA 13 bundles.
 struct fast_mod_div_u32_t {
   uint32_t divisor;
   uint32_t magic;
@@ -124,11 +122,9 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   using Lamport = distributed::LamportTrait<T, kVecSize, /*kAtom=*/4>;
   constexpr uint32_t kGroup = get_poll_group<kHasResidual>(kWorldSize);
 
-  // Round-robin warps to blocks rather than giving each block a contiguous run.
-  // The poll domain is this rank's shard for the reduce-scatter, `world_size`
-  // times smaller than what the push loop walks, so a block-major index parks
-  // all of it on the first `num_poll_vecs / blockDim` CTAs and idles the rest
-  // of the SMs; with the grid pinned to the SM count that is most of them.
+  // Round-robin warps to blocks: the poll domain is this rank's shard, so a
+  // block-major index would park all of it on the first few CTAs and idle the
+  // rest of the SMs.
   const auto warp_in_block = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
@@ -143,11 +139,9 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   if constexpr (kWorldSize < 8 && (kPrim & Primitive::AG)) {
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      // Same address arithmetic as the multicast branch below, so the two agree
-      // on where a sender's shard lands. `dst_offset` is a slot stride for the
-      // all-reduce but a packed token prefix for the gather, whose consumer
-      // reads the plane linearly; `slot_ptr(i, rank)` would put the gather's
-      // senders `slot_bytes` apart and the poll loop would never see them.
+      // `dst_offset` is a slot stride for the all-reduce but a packed token
+      // prefix for the gather, whose consumer reads the plane linearly; this
+      // must stay the same address arithmetic as the multicast branch below.
       push_ptrs[i] = static_cast<uint8_t*>(epoch.slot_ptr(/*dst=*/i)) + params.dst_offset;
     }
   }
@@ -179,8 +173,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
       // Both by a compile-time constant, so this is a mask and a shift.
       const auto dst_rank = token_id % kWorldSize;
       const auto dst_token_id = token_id / kWorldSize;
-      // The walk is round-robin so neighbouring work lands on different peers
-      // and every link stays busy instead congestion on 1 rank
+      // Round-robin over peers so every link stays busy instead of one congesting
       const auto avg_tokens = params.tokens_avg;
       const auto rem_tokens = params.tokens_rem;
       const auto rank_prefix = dst_rank * avg_tokens + std::min(dst_rank, rem_tokens);
@@ -194,9 +187,7 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
   }
 
   // Poll addresses are linear in the source rank -- one base, `slot_bytes`
-  // apart -- so a base plus a vector-index bias replaces a kWorldSize-wide
-  // pointer table: 2 registers instead of 2 per peer. (The push side cannot do
-  // this; `workspaces[i]` genuinely varies per peer.)
+  // apart -- so a base plus a vector-index bias replaces a per-peer pointer table.
   const auto poll_base = epoch.slot_ptr(params.rank);
   const auto slot_vecs = params.ws.slot_bytes / sizeof(vec_t);
   vec_t pos_zero_vec;
@@ -310,9 +301,8 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   using vec_t = device::AlignedVector<packed_t<T>, kVecSize / 2>;
   constexpr uint32_t kNumWarpVecs = kPullUnroll * kWarpThreads;
 
-  // Round-robin chunks to blocks rather than giving each block a contiguous
-  // run: the global warp index runs block-fastest, so neighbouring chunks are
-  // driven by different CTAs.
+  // Round-robin chunks to blocks: the global warp index runs block-fastest, so
+  // neighbouring chunks are driven by different CTAs.
   const auto warp_in_block = threadIdx.x / kWarpThreads;
   const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
   const auto lane_id = threadIdx.x % kWarpThreads;
@@ -437,12 +427,8 @@ struct NVLinkComm {
   /// \brief Base pointer of the residual, shifted onto this rank's slice when
   /// the caller hands over the whole tensor.
   ///
-  /// The kernels fold the residual in over their own working domain, which is
-  /// this rank's shard everywhere except the push all-reduce, where every rank
-  /// reduces the whole tensor. So a caller holding a shard-shaped residual
-  /// passes it straight through, and one holding the full tensor passes that
-  /// and gets sliced here -- which keeps ragged splits working, since the slice
-  /// comes from `get_routing` rather than a uniform stride.
+  /// A shard-shaped residual passes straight through; a full tensor is sliced
+  /// via `get_routing`, not a uniform stride, so ragged splits keep working.
   static const void* get_residual_ptr(
       const tvm::ffi::Optional<TensorView>& residual,
       uint32_t domain_tokens,

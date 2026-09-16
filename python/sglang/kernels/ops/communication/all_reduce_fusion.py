@@ -14,17 +14,8 @@ materializes; ``idx == -1`` slots (EP: non-local expert) contribute nothing.
 Small-batch only: the whole ``[T, hidden]`` bf16 row view must fit one push
 slot (checked C++-side; :func:`fits_push_slot` lets callers pre-check).
 
-The un-normed result is what DeepSeek-V4.1 consumes (its consumer is the mHC
-post-split, not an RMSNorm), so ``norm_weight=None`` is the primary
-configuration; ``norm_weight`` + ``norm_eps`` give the K3-style fused norm.
-
-Geometry: one thread-block cluster per token row plus a bumper cluster that
-keeps the plane's phase counters uniform; ``cluster_size`` blocks share a
-row (``hidden / cluster_size`` dims each). :func:`default_cluster_size` holds
-the tuned default per hidden size and can be overridden per call.
-
 Needs :func:`register_comm` once per process (the CustomAllReduceV2
-``Communicator``); the ops key on ``world_size`` alone, like the K3 ones.
+``Communicator``); the ops key on ``world_size`` alone.
 """
 
 from __future__ import annotations
@@ -56,12 +47,8 @@ _COMM_MAP: dict[int, Communicator] = {}
 
 def register_comm(comm: Communicator) -> None:
     """Register the CustomAllReduceV2 communicator whose push plane the fused
-    kernel stages through.
-
-    ``world_size`` is the whole key (the custom op takes nothing else), so at
-    most one communicator per size may be registered in a process; a second
-    group of the same size would silently inherit the first one's peer
-    pointers and the symptom would be a hang, hence the assert.
+    kernel stages through. ``world_size`` is the whole key, so at most one
+    communicator per size may be registered in a process.
     """
     prev = _COMM_MAP.get(comm.world_size)
     assert prev is None or prev is comm, (
@@ -208,17 +195,12 @@ def moe_finalize_all_reduce(
     :param shared_output: optional ``[T, hidden_dim]`` bf16 added before the reduce.
     :param norm_weight: optional ``[hidden_dim]`` bf16 RMSNorm weight; with
                         ``norm_eps`` it turns on the fused norm epilogue.
-    :param prefetch_metadata: let the kernel read the plane's phase counter and
-                              the routing metadata before its PDL wait. Under
-                              PDL the kernel may start as soon as the preceding
-                              kernel *triggers*, and nothing earlier in the
-                              stream is guaranteed complete until the wait: so
-                              this is only valid when the preceding kernel is
-                              not an all-reduce on the same plane AND the
-                              producers of ``expanded_idx_to_permuted_idx`` /
-                              ``expert_weights`` are known complete (a chain of
-                              early-triggering kernels such as the TRT-LLM MoE
-                              GEMMs is not). Defaults to False (wait first).
+    :param prefetch_metadata: read the plane's phase counter and the routing
+                              metadata before the PDL wait; valid only when the
+                              preceding kernel is not an all-reduce on the same
+                              plane and the producers of
+                              ``expanded_idx_to_permuted_idx`` /
+                              ``expert_weights`` are complete. Defaults to False.
     :returns: a new ``[T, hidden_dim]`` bf16 tensor (not in place).
     """
     num_tokens = expert_weights.shape[0]

@@ -21,11 +21,8 @@ SUPPORTED_OPS: Final = ["all_reduce", "all_gather", "reduce_scatter"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
-    """Multicast alias of a symmetric-memory tensor. Collective on first call.
-
-    torch caches the handle per allocation, so this stays cheap on repeat; a
-    cache of our own keyed by address would go stale the moment an allocation is
-    freed and the address reused.
+    """Multicast alias of a symmetric-memory tensor. Collective on first call;
+    torch caches the handle per allocation, so repeats stay cheap.
     """
     from torch._C._distributed_c10d import _SymmetricMemory
 
@@ -62,10 +59,8 @@ def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
     )
 
 
-# `residual` on any of these is folded into the reduction rather than costing a
-# separate pass. It may be shaped like this rank's shard or like the whole
-# tensor; in the latter case this rank's slice is taken, so a ragged split needs
-# no view on the caller's side.
+# `residual` on any of these is folded into the reduction; it may be shaped like
+# this rank's shard or like the whole tensor, of which this rank's slice is taken.
 def all_reduce_push(
     comm: Communicator,
     input: torch.Tensor,
