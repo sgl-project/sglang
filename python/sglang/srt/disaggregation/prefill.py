@@ -877,9 +877,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # still self.chunked_req, or its final chunk (extend_range
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                still_chunking = (
+                    self.chunked_req is req
+                    or req in self.chunked_reqs
+                    or (
+                        req.extend_range is not None
+                        and req.extend_range.end >= len(req.origin_input_ids)
+                    )
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -914,7 +918,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
-                if self.enable_overlap and not req.pending_bootstrap:
+                if (
+                    self.enable_overlap
+                    and not req.pending_bootstrap
+                    and not self.server_args.disaggregation_defer_partial_kv_transfer
+                ):
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
@@ -1188,17 +1196,29 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
-        if (req := self.chunked_req) is not None:
+        previous_chunked_reqs = []
+        if self.chunked_req is not None:
+            previous_chunked_reqs.append(self.chunked_req)
+        if last_batch is not None and last_batch.chunked_reqs:
+            previous_chunked_reqs.extend(last_batch.chunked_reqs)
+
+        for req in previous_chunked_reqs:
             chunked_req_to_exclude.add(req)
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
-                    self.chunked_req = None
+                    if self.chunked_req is req:
+                        self.chunked_req = None
+                    if req in self.chunked_reqs:
+                        self.chunked_reqs.remove(req)
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
-                    self.chunked_req = None
+                    if self.chunked_req is req:
+                        self.chunked_req = None
+                    if req in self.chunked_reqs:
+                        self.chunked_reqs.remove(req)
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
@@ -1208,17 +1228,19 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif not self.server_args.disaggregation_defer_partial_kv_transfer:
                 self.send_kv_chunk(req)
 
-            if self.chunked_req is not None:
-                running_batch.batch_is_full = False
+        if self.chunked_req is not None or self.chunked_reqs:
+            running_batch.batch_is_full = False
 
         if last_batch and last_batch.forward_mode.is_extend():
             if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.chunked_reqs:
+                chunked_req_to_exclude.update(last_batch.chunked_reqs)
 
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))

@@ -196,6 +196,26 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 (False, True),
             )
 
+    @patch("sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStore")
+    def test_decode_mooncake_storage_contributor_uses_cache_group_width(self, store):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_rank = 0
+        manager.attn_tp_size = 1
+        manager.attn_cp_rank = 2
+        manager.attn_cp_size = 4
+        manager.pp_rank = 0
+        manager.pp_size = 1
+        manager.is_mla_backend = True
+        manager.server_args = SimpleNamespace(model_path="model")
+
+        manager._init_storage_contributor()
+
+        config = store.call_args.kwargs["storage_config"]
+        self.assertEqual((config.tp_rank, config.tp_size), (0, 1))
+        self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (2, 4))
+        self.assertTrue(config.is_mla_model)
+        self.assertIs(manager.storage_contributor, store.return_value)
+
 
 class TestQwen4StateWire(unittest.TestCase):
     def test_qsa_pending_payload_uses_nested_request_pool_row(self):

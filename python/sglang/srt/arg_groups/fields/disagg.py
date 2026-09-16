@@ -70,6 +70,10 @@ class Disagg(msgspec.Struct):
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
         ),
     ] = "mooncake"
+    disaggregation_defer_partial_kv_transfer: A[
+        bool,
+        "Defer KV transfer for intermediate chunked-prefill batches and send the accumulated KV with the final prefill chunk.",
+    ] = False
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998

@@ -1312,6 +1312,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self.chunked_reqs = []
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -2369,7 +2370,9 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_chunked_req=lambda: self.chunked_req,
+            get_chunked_req=lambda: (
+                self.chunked_reqs if self.chunked_reqs else self.chunked_req
+            ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2435,7 +2438,9 @@ class Scheduler(
                 self.metrics_reporter.recent_cache_hit_rate
             ),
             get_stats=lambda: self.metrics_reporter.stats,
-            get_chunked_req=lambda: self.chunked_req,
+            get_chunked_req=lambda: (
+                self.chunked_reqs if self.chunked_reqs else self.chunked_req
+            ),
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),
@@ -3481,7 +3486,7 @@ class Scheduler(
         req = self._pending_chunked_abort_req
         if req is None:
             return
-        if self.chunked_req is not req:
+        if self.chunked_req is not req and req not in self.chunked_reqs:
             # Already past chunked prefill; the running-batch abort path handles
             # it. Drop the marker once the request is actually gone.
             if req.finished() or not req.kv.holds_kv:
@@ -3506,7 +3511,10 @@ class Scheduler(
         self._release_aborted_request(req)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        self.chunked_req = None
+        if self.chunked_req is req:
+            self.chunked_req = None
+        if req in self.chunked_reqs:
+            self.chunked_reqs.remove(req)
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -3605,6 +3613,12 @@ class Scheduler(
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
+        if self.chunked_reqs:
+            for req in self.chunked_reqs:
+                chunked_req_to_exclude.add(req)
+                if req.extend_range.end > len(req.prefix_indices):
+                    self.stash_chunked_request(req)
+
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
@@ -3627,6 +3641,8 @@ class Scheduler(
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.chunked_reqs:
+                chunked_req_to_exclude.update(last_batch.chunked_reqs)
 
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
@@ -3778,8 +3794,10 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+            (running_batch.batch_is_full or len(self.waiting_queue) == 0)
+            and self.chunked_req is None
+            and not self.chunked_reqs
+        ):
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -3787,6 +3805,7 @@ class Scheduler(
         if (
             self.min_free_slots_delayer is not None
             and self.chunked_req is None
+            and not self.chunked_reqs
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
@@ -3804,6 +3823,7 @@ class Scheduler(
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
+            and not self.chunked_reqs
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -3855,7 +3875,24 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            chunk_tokens_per_request=get_schedule().prefill_chunk_size_per_request,
         )
+
+        scheduled_chunked_reqs = []
+        if self.chunked_reqs:
+            unfinished_chunked_reqs = []
+            remaining_chunked_reqs = []
+            for index, req in enumerate(self.chunked_reqs):
+                if adder.budget_state() != AddReqResult.CONTINUE:
+                    remaining_chunked_reqs.extend(self.chunked_reqs[index:])
+                    break
+                req.init_next_round_input()
+                next_req = adder.add_chunked_req(req)
+                if next_req is not None:
+                    unfinished_chunked_reqs.append(next_req)
+                    if req in adder.can_run_list:
+                        scheduled_chunked_reqs.append(next_req)
+            self.chunked_reqs = unfinished_chunked_reqs + remaining_chunked_reqs
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -3925,6 +3962,10 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if self.tree_cache.is_external_lookup_pending(req.rid):
+                # The external backend is probing this request off-thread.
+                # Keep scanning so ready requests can still fill the batch.
+                continue
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -3937,7 +3978,9 @@ class Scheduler(
                 continue
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(
+                    self.chunked_req is not None or bool(self.chunked_reqs)
+                ),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -3996,6 +4039,14 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
+        if adder.new_chunked_reqs:
+            self.chunked_reqs.extend(adder.new_chunked_reqs)
+
+        for req in scheduled_chunked_reqs:
+            req.inflight_middle_chunks += 1
+        for req in adder.new_chunked_reqs:
+            req.inflight_middle_chunks += 1
+
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
@@ -4011,11 +4062,12 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            chunked_reqs=scheduled_chunked_reqs + adder.new_chunked_reqs,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
-        )
+            self.chunked_req is None and not new_batch.chunked_reqs
+        ) or len(can_run_list) != 1
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -4039,6 +4091,10 @@ class Scheduler(
                     self.chunked_req.extend_range.length
                     if self.chunked_req is not None
                     else 0
+                )
+                + sum(
+                    req.extend_range.length
+                    for req in scheduled_chunked_reqs + adder.new_chunked_reqs
                 ),
             ),
         )
@@ -4823,6 +4879,7 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
+            and not self.chunked_reqs
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -5203,6 +5260,7 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.chunked_reqs,
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5226,6 +5284,10 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+        for chunked_req in self.chunked_reqs:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+                break
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5418,6 +5480,12 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            retract_reqs.extend(
+                req
+                for req in self.chunked_reqs
+                if not req.finished() and req not in retract_reqs
+            )
 
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -5454,6 +5522,7 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
+            self.chunked_reqs = []
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

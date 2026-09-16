@@ -1105,6 +1105,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(delayer.calls, [True])
         self.assertIn(req, adder.can_run_list)
 
+    def test_per_request_chunk_cap_fills_batch_with_multiple_long_requests(self):
+        adder = self._create_delayer_adder(
+            available_tokens=100_000,
+            delayer=None,
+            rem_chunk_tokens=8,
+            chunk_tokens_per_request=4,
+        )
+        reqs = [self._create_delayer_req(20) for _ in range(2)]
+
+        results = [
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+            for req in reqs
+        ]
+
+        self.assertEqual(results, [AddReqResult.CONTINUE, AddReqResult.OTHER])
+        self.assertEqual([req.extend_range.length for req in reqs], [4, 4])
+        self.assertEqual(adder.can_run_list, reqs)
+        self.assertEqual(adder.new_chunked_reqs, reqs)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
     def test_chunked_req_negotiates_prefillable_and_proceeds(self):
         """A rank resuming a chunked prefill runs it this pass regardless of
         the verdict, so add_chunked_req must report prefillable=True (else a

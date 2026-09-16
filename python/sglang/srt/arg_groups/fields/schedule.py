@@ -60,6 +60,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
+    prefill_chunk_size_per_request: A[
+        Optional[int],
+        "The maximum number of prefill tokens contributed by one request to a batch. Unlike chunked-prefill-size, this is a per-request cap and is not divided by DP size.",
+    ] = None
     prefill_decode_interval: A[
         Optional[int],
         Arg(

@@ -69,6 +69,10 @@ class BackupKV(msgspec.Struct, frozen=True):
     actions carry a single eviction victim."""
 
     node_ids: list[NodeId]
+    # Absolute, page-aligned end of the inserted prefix key. None for
+    # eviction-driven backups without a request replay boundary.
+    replay_boundary: int | None = None
+    include_prompt_boundary: bool = True
 
 
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):

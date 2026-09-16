@@ -370,6 +370,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def is_external_lookup_pending(self, req_id: str) -> bool:
+        return self.linker is not None and self.linker.has_pending_lookup(req_id)
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
@@ -959,6 +962,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        if self.linker is not None:
+            self.linker.release_request(req.rid)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -1277,7 +1282,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
-                self.linker.offload_nodes(action.node_ids)
+                self.linker.offload_nodes(
+                    action.node_ids,
+                    replay_boundary=action.replay_boundary,
+                    include_prompt_boundary=action.include_prompt_boundary,
+                )
             else:
                 self._execute_and_commit_kv_backup(action)
         else:
@@ -3280,8 +3289,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            self.linker.maybe_log_debug_stats()
             finish_counts = torch.tensor(
                 [
+                    self.linker.cache_linker.num_completed_lookups(),
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
                 ],
@@ -3289,7 +3300,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            lookup_count, load_count, offload_count = map(int, finish_counts.tolist())
+            self.linker.drain_lookups(lookup_count)
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:

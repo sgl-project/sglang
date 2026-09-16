@@ -57,6 +57,14 @@ class SchedulerLoadInquirer:
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
 
+    def _get_chunked_reqs(self):
+        chunked = self.get_chunked_req()
+        if chunked is None:
+            return ()
+        if isinstance(chunked, list):
+            return chunked
+        return (chunked,)
+
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
 
@@ -72,9 +80,12 @@ class SchedulerLoadInquirer:
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        chunked_reqs = SchedulerLoadInquirer._get_chunked_reqs(self)
+        num_pending_tokens += sum(
+            req.seqlen - len(req.prefix_indices) for req in chunked_reqs
+        )
+        if chunked_reqs:
+            num_pending_tokens -= chunk_deduct
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -89,9 +100,8 @@ class SchedulerLoadInquirer:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
-        cr = self.get_chunked_req()
-        if cr is not None:
-            num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+        for req in SchedulerLoadInquirer._get_chunked_reqs(self):
+            num_tokens += max(0, req.seqlen - len(req.prefix_indices))
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:

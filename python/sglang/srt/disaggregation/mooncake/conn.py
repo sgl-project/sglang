@@ -219,6 +219,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        self.storage_contributor = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_MOONCAKE_STORE_CONTRIBUTOR.get()
+        ):
+            self._init_storage_contributor()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
@@ -297,6 +303,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _init_storage_contributor(self) -> None:
+        """Contribute decode-host memory without enabling external-cache I/O."""
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        storage_config = HiCacheStorageConfig(
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
+            is_mla_model=bool(self.is_mla_backend),
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name=self.server_args.model_path,
+        )
+        self.storage_contributor = MooncakeStore(
+            storage_config=storage_config,
+            mem_pool=None,
+        )
+        logger.info(
+            "Decode rank registered as a Mooncake storage contributor: "
+            "attn_tp_rank=%d/%d, attn_cp_rank=%d/%d, pp_rank=%d/%d",
+            self.attn_tp_rank,
+            self.attn_tp_size,
+            self.attn_cp_rank,
+            self.attn_cp_size,
+            self.pp_rank,
+            self.pp_size,
+        )
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
