@@ -151,6 +151,23 @@ def _randn_with_seed(shape, *, device, dtype, seed: int) -> torch.Tensor:
     return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
 
+def _randn_with_generators(
+    shape, *, device, dtype, generators: list[torch.Generator]
+) -> torch.Tensor:
+    batch_size = shape[0]
+    if len(generators) != batch_size:
+        raise ValueError(
+            f"Generator length {len(generators)} is not consistent with batch size {batch_size}."
+        )
+    return torch.cat(
+        [
+            torch.randn((1, *shape[1:]), generator=generator, device=device, dtype=dtype)
+            for generator in generators
+        ],
+        dim=0,
+    )
+
+
 def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
     """
     Compute patch coordinates (x, y)
@@ -1854,6 +1871,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        generators=None,
     ):
         assert cfg_norm in ["none", "global", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2124,12 +2142,21 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        image_prediction = noise_scale * _randn_with_seed(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=device,
-            dtype=dtype,
-            seed=seed,
-        )
+
+        if generators is None:
+            image_prediction = noise_scale * _randn_with_seed(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                seed=seed,
+            )
+        else:
+            image_prediction = noise_scale * _randn_with_generators(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                generators=generators,
+            )
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_img_condition = {"full_attention": None}
@@ -2293,6 +2320,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        generators=None,
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
@@ -2457,12 +2485,21 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        image_prediction = noise_scale * _randn_with_seed(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=device,
-            dtype=dtype,
-            seed=seed,
-        )
+
+        if generators is None:
+            image_prediction = noise_scale * _randn_with_seed(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                seed=seed,
+            )
+        else:
+            image_prediction = noise_scale * _randn_with_generators(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                generators=generators,
+            )
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_uncondition = {"full_attention": None}

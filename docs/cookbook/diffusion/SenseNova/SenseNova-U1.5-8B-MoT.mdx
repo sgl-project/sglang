@@ -78,6 +78,29 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Generate Multiple Outputs per Prompt
+SenseNova-U1 multi-output generation: Requests with n > 1 use native batched generation. The prompt prefix is processed once and reused across outputs, while each output keeps an independent random generator/seed. This avoids repeated prefix computation compared with sequential per-output execution.
+
+```API example:
+
+import requests
+
+response = requests.post(
+    "http://localhost:30000/v1/images/generations",
+    json={
+        "model": "SenseNova/SenseNova-U1-8B-MoT",
+        "prompt": "A red fox standing in a snowy forest",
+        "n": 4,
+        "seed": 42,
+        "size": "1024x1024",
+    },
+)
+
+response.raise_for_status()
+```
+For a base seed of 42 and n=4, SGLang preserves deterministic per-output RNG streams corresponding to seeds 42, 43, 44, and 45.
+
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark
