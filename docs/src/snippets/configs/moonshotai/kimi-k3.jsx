@@ -198,7 +198,7 @@ export const config = {
           disableReason: (s) => (s.hw === "a3" ? "Only Modelslim (W4A8) is supported on this recipe." : ""),
         },
         {
-          // A3 only (NPU W4A8 checkpoint); hidden on the GPU recipes.
+          // A3 Series only (NPU W4A8 checkpoint); hidden on the GPU recipes.
           id: "modelslim",
           label: "Modelslim (W4A8)",
           subtitle: "ModelScope NPU checkpoint",
@@ -513,7 +513,7 @@ export const config = {
             ]; },
           },
           {
-            // A3 only: 64 ranks (4 nodes × 8 cards × 2 dies); hidden on the GPU recipes.
+            // A3 Series only: 64 ranks (4 nodes × 8 cards × 2 dies); hidden on the GPU recipes.
             value: 64,
             hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"] },
           },
@@ -719,7 +719,7 @@ export const config = {
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
         // Only DSPARK is selectable today, so only its form is emitted.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        // The A3 recipe pins the shipped block size (7).
+        // The A3 Series recipe pins the shipped block size (7).
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         control: "slider",
         stripPrefixes: [
@@ -743,7 +743,7 @@ export const config = {
         // Spec-only, so gate the row on DSPARK; every DSPARK recipe (except the PD
         // prefill role) turns it on in the base, so this row derives to On and
         // exists mainly as the opt-out.
-        // Needs the Triton linear-attn decode backend (the K3 default); the A3
+        // Needs the Triton linear-attn decode backend (the K3 default); the A3 Series
         // script never sets it.
         id: "replaySsm", title: "ReplaySSM (spec)",
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
@@ -766,7 +766,7 @@ export const config = {
         // without --speculative-dspark-sps-table-path (every step still
         // verifies full width); fails fast with ReplaySSM or DCP > 1.
         id: "raggedVerify", title: "Ragged Verify Mode (spec)",
-        // The A3 recipe pins static.
+        // The A3 Series recipe pins static.
         showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripEnv: ["SGLANG_RAGGED_VERIFY_MODE"],
         options: [
