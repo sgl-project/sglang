@@ -16,15 +16,15 @@ META_INTS = 8
 
 
 @cache_once
-def _jit_decoding_sched_meta_module() -> Module:
+def _jit_flashmla_sched_meta_module() -> Module:
     return load_jit(
-        make_name("decoding_sched_meta"),
-        cuda_files=["deepseek_v4/decoding_sched_meta.cuh"],
-        cuda_wrappers=[("decoding_sched_meta", "decoding_sched_meta")],
+        make_name("flashmla_sched_meta"),
+        cuda_files=["deepseek_v4/flashmla_sched_meta.cuh"],
+        cuda_wrappers=[("flashmla_sched_meta", "flashmla_sched_meta")],
     )
 
 
-def decoding_sched_meta(
+def flashmla_sched_meta(
     tile_scheduler_metadata: torch.Tensor,
     num_splits: torch.Tensor,
     *,
@@ -56,7 +56,7 @@ def decoding_sched_meta(
         topk: the sparse top-k, or -1 for a dense model.
         extra_topk: the extra cache's top-k, 0 when there is none.
     """
-    _jit_decoding_sched_meta_module().decoding_sched_meta(
+    _jit_flashmla_sched_meta_module().flashmla_sched_meta(
         tile_scheduler_metadata,
         num_splits,
         topk_length,
