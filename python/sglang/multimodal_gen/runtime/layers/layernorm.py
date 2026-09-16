@@ -17,6 +17,9 @@ from sglang.kernels.ops.diffusion import (
     fused_inplace_qknorm_rope,
     triton_one_pass_rms_norm,
 )
+from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+    expand_scale_shift_cpu_param,
+)
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
@@ -402,20 +405,6 @@ class LayerNorm(CustomOp):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-            # Lazy cache for ones vector (not a registered buffer to avoid FSDP/meta issues)
-            self._weight_fallback_cache = None
-
-    def _get_weight_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        wf = getattr(self, "_weight_fallback_cache", None)
-        if (
-            wf is None
-            or wf.device != x.device
-            or wf.dtype != x.dtype
-            or wf.numel() != self.hidden_size
-        ):
-            wf = torch.ones(self.hidden_size, device=x.device, dtype=x.dtype)
-            self._weight_fallback_cache = wf
-        return wf
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
@@ -771,6 +760,42 @@ class _ScaleResidualNormScaleShift(CustomOp):
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
+    def forward_cpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        if isinstance(gate, torch.Tensor):
+            gate_tensor = gate
+        elif gate == 1:
+            gate_tensor = None
+        else:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        if gate_tensor is not None:
+            gate_tensor = expand_scale_shift_cpu_param(gate_tensor, x)
+
+        return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift_cpu(
+            residual,
+            x,
+            gate_tensor,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
+
 
 class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
@@ -891,6 +916,28 @@ class _NormScaleShift(CustomOp):
             return modulated.to(x.dtype)
 
         return (normalized * (1 + scale) + shift).to(x.dtype)
+
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+
+        scale = expand_scale_shift_cpu_param(scale, x)
+        shift = expand_scale_shift_cpu_param(shift, x)
+
+        return torch.ops.sgl_kernel.fused_norm_scale_shift_cpu(
+            x,
+            _ensure_contiguous(weight),
+            _ensure_contiguous(bias),
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
 
 
 class LayerNormScaleShift(_NormScaleShift):
