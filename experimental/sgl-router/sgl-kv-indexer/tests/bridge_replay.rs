@@ -10,6 +10,9 @@
 #[path = "common/net.rs"]
 mod test_net;
 #[allow(dead_code)]
+#[path = "common/valkey.rs"]
+mod test_valkey;
+#[allow(dead_code)]
 #[path = "common/zmq.rs"]
 mod test_zmq;
 
@@ -23,6 +26,7 @@ use sgl_kv_indexer::{
     DEFAULT_STREAM_MAXLEN,
 };
 use test_net::free_addr;
+use test_valkey::{fresh_prefix, ValkeyServer};
 use test_zmq::{batch, removed, stored, FakePublisher};
 
 const TOPIC: &str = "kv-events";
@@ -189,4 +193,54 @@ async fn a_sequence_reset_clears_the_worker_before_new_events() {
     publisher.publish(0, batch(vec![stored(&[7], None)])).await;
     wait_for(&backend, &[1, 2, 3, 7], &[7], "after restart").await;
     bridge.stop().await;
+}
+
+/// A restarted bridge must resume from its checkpoint and ask the worker only
+/// for what it missed; without the checkpoint it would replay the whole buffer
+/// and briefly re-report blocks that later events removed.
+#[tokio::test]
+async fn restarted_bridge_resumes_from_its_valkey_checkpoint() {
+    let Some(server) = ValkeyServer::start() else {
+        eprintln!("skipping: no valkey-server on PATH and KV_INDEXER_TEST_VALKEY_URL unset");
+        return;
+    };
+    let (backend, indexer) = start_indexer().await;
+    let mut publisher = FakePublisher::bind(TOPIC).await;
+    let mut cfg = config(&publisher, &indexer, true);
+    cfg.valkey = Some(server.config(&fresh_prefix()));
+    cfg.heartbeat_ttl = None;
+
+    let first = start_bridge(cfg.clone()).await;
+    publisher
+        .publish(0, batch(vec![stored(&[1, 2], None)]))
+        .await;
+    publisher
+        .publish(1, batch(vec![stored(&[3], Some(2))]))
+        .await;
+    wait_for(&backend, &[1, 2, 3], &[1, 2, 3], "live before restart").await;
+    first.stop().await;
+
+    // Missed while the bridge was down.
+    publisher.buffer_only(2, batch(vec![stored(&[4], Some(3))]));
+    let second = start_bridge(cfg).await;
+    wait_for(
+        &backend,
+        &[1, 2, 3, 4],
+        &[1, 2, 3, 4],
+        "replay after restart",
+    )
+    .await;
+    second.stop().await;
+
+    let requests = publisher.replay_requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.first(),
+        Some(&0),
+        "a fresh bridge starts from the beginning"
+    );
+    assert_eq!(
+        requests.last(),
+        Some(&2),
+        "the restarted bridge resumed after its checkpoint"
+    );
 }

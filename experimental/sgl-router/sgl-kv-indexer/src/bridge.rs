@@ -24,7 +24,7 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage
 
 use crate::liveness::{Heartbeat, DEFAULT_HEARTBEAT_TTL};
 use crate::stream::{StreamSink, DEFAULT_STREAM_MAXLEN};
-use crate::valkey_backend::{ValkeyConfig, DEFAULT_KEY_PREFIX};
+use crate::valkey_backend::{connect_conn, Conn, ValkeyConfig, DEFAULT_KEY_PREFIX};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
@@ -417,8 +417,33 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
         replay = config.replay_endpoint.is_some(),
         "starting SGLang KV event bridge"
     );
-    // Survives reconnects so a replay request can resume where we stopped.
-    let mut last_seq: Option<u64> = None;
+    // Survives reconnects so a replay request can resume where we stopped, and
+    // restarts too when Valkey holds the checkpoint.
+    let checkpoint = match &config.valkey {
+        Some(valkey) => match Checkpoint::connect(valkey, &config.worker_id).await {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(status) => {
+                warn!(%status, "sequence checkpoint unavailable; a restart replays the whole worker buffer");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut last_seq: Option<u64> = match &checkpoint {
+        Some(checkpoint) => match checkpoint.load().await {
+            Ok(seq) => {
+                if let Some(seq) = seq {
+                    info!(seq, "resuming from the checkpointed sequence");
+                }
+                seq
+            }
+            Err(status) => {
+                warn!(%status, "could not read the sequence checkpoint");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Supervisor loop: (re)connect to both the indexer and the ZMQ publisher,
     // run until a connection-level error, then back off and retry. Decode-level
@@ -430,7 +455,15 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
         match connect(&config).await {
             Ok((forwarder, subscriber)) => {
                 delay = RECONNECT_MIN_DELAY;
-                match run_session(&config, forwarder, subscriber, &mut last_seq).await {
+                match run_session(
+                    &config,
+                    forwarder,
+                    subscriber,
+                    &mut last_seq,
+                    checkpoint.as_ref(),
+                )
+                .await
+                {
                     Ok(()) => {
                         info!("bridge shut down cleanly");
                         return Ok(());
@@ -515,9 +548,13 @@ async fn run_session(
     mut forwarder: Forwarder,
     mut subscriber: SubSocket,
     last_seq: &mut Option<u64>,
+    checkpoint: Option<&Checkpoint>,
 ) -> Result<(), BridgeError> {
     // Whatever the worker still buffers since we last saw it, before live events.
     replay(config, &mut forwarder, last_seq, None).await?;
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.store(*last_seq).await;
+    }
 
     loop {
         let message = tokio::select! {
@@ -558,6 +595,44 @@ async fn run_session(
 
         forward_raw_batch(config, &mut forwarder, seq, &payload).await?;
         *last_seq = Some(seq);
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.store(Some(seq)).await;
+        }
+    }
+}
+
+/// The last sequence this worker's bridge forwarded, kept in Valkey so a
+/// restarted bridge replays only what it missed instead of the whole buffer.
+struct Checkpoint {
+    conn: Conn,
+    key: String,
+}
+
+impl Checkpoint {
+    async fn connect(valkey: &ValkeyConfig, worker_id: &str) -> Result<Self, Status> {
+        Ok(Self {
+            conn: connect_conn(valkey).await?,
+            key: format!("{}seq:{worker_id}", valkey.key_prefix),
+        })
+    }
+
+    async fn load(&self) -> Result<Option<u64>, Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("GET").arg(&self.key);
+        let values: Vec<Option<u64>> = self.conn.clone().run(&pipe).await?;
+        Ok(values.into_iter().next().flatten())
+    }
+
+    /// Best effort: a failed checkpoint costs a longer replay next time, not data.
+    async fn store(&self, seq: Option<u64>) {
+        let mut pipe = redis::pipe();
+        match seq {
+            Some(seq) => pipe.cmd("SET").arg(&self.key).arg(seq).ignore(),
+            None => pipe.cmd("DEL").arg(&self.key).ignore(),
+        };
+        if let Err(status) = self.conn.clone().exec(&pipe).await {
+            warn!(%status, "sequence checkpoint write failed");
+        }
     }
 }
 
