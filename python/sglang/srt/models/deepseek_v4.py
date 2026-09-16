@@ -2723,7 +2723,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4439,7 +4440,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP or MoE A2A"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4646,16 +4647,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -4664,7 +4668,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -4674,6 +4678,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
