@@ -9,6 +9,35 @@ def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
+def dequantize_sparse_nope_cache(
+    quant_k_cache: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read 528-byte FP8 KV with four FP32 scales, preserving sparse masks.
+
+    Materialize the smaller of the physical pool and the selected-token table.
+    The gathered form may duplicate shared tokens, but bounds BF16 workspace by
+    ``min(physical_tokens, indices.numel()) * 1024`` bytes without a host sync
+    or data-dependent unique operation. Returned indices address this workspace.
+    """
+    if (
+        quant_k_cache.ndim != 3
+        or quant_k_cache.shape[1:] != (1, 528)
+        or quant_k_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("expected [physical tokens, 1, 528] group-scaled FP8 NoPE KV")
+    if indices.numel() >= quant_k_cache.shape[0]:
+        return dequantize_k_cache(quant_k_cache), indices
+    valid = (indices >= 0) & (indices < quant_k_cache.shape[0])
+    # The existing paged reader requires in-bounds physical indices. Invalid
+    # entries gather an in-bounds row but retain -1 in the new table. The
+    # attention consumer must still mask invalid entries before reading KV.
+    safe_indices = torch.where(valid, indices, 0).flatten()
+    kv = dequantize_k_cache_paged(quant_k_cache, safe_indices)
+    remapped = torch.arange(indices.numel(), device=indices.device, dtype=indices.dtype)
+    remapped = torch.where(valid, remapped.view_as(indices), -1)
+    return kv, remapped
+
+
 def _dequantize_k_cache_ref(
     quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
     dv: int = 512,
@@ -63,7 +92,7 @@ def _dequantize_k_cache_fast_wrapped(
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
     assert dv == 512
-    assert dim_quant == 656
+    assert dim_quant in (528, 656), "expected NoPE or 64-RoPE group-scaled FP8 KV"
     assert tile_size == 128
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
@@ -80,9 +109,9 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
+    dim_rope = (dim_quant - dim_nope - (dim_nope // group_size) * 4) // 2
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant in (528, 656)
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -91,7 +120,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     )
 
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    assert num_blocks_per_token in (4, 5)
 
     assert dim_nope % group_size == 0
 
@@ -181,8 +210,8 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656, (
-        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant in (528, 656), (
+        f"expected NoPE or 64-RoPE group-scaled FP8 KV, got width {dim_quant}"
     )
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
@@ -191,7 +220,7 @@ def dequantize_k_cache_paged(
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
+    dim_rope = (dim_quant - dim_nope - (dim_nope // group_size) * 4) // 2
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
@@ -200,9 +229,9 @@ def dequantize_k_cache_paged(
         device=quant_k_cache.device,
     )
 
-    # cdiv(512 + 64, 128) = 5
+    # Four NoPE blocks, plus one RoPE block for the 656-byte layout.
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    assert num_blocks_per_token in (4, 5)
 
     assert dim_nope % group_size == 0
 
