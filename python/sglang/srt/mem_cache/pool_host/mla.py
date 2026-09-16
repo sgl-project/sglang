@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -28,6 +29,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
@@ -132,10 +134,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.data_ptrs = make_kernel_ptr_table(
+            self.data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -214,7 +216,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         for registering host memory with the disaggregation transfer engine."""
         if self._is_dummy:
             return [], [], []
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = [tensor.data_ptr() for tensor in self.data_refs]
         if self.layout == "page_first_kv_split":
             # data_refs are per-layer views of the k_buffer (page-major), so
             # take the per-layer slab size instead of kv_buffer[i] (a page slab).
@@ -652,8 +654,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "load on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -850,8 +856,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         assert not getattr(self, "_is_dummy", False), (
             "backup on a dummy (non-src MLA) host pool"
         )
-        host_indices = self.maybe_dcp_kernel_indices(host_indices)
-        device_indices = self.maybe_dcp_kernel_indices(device_indices)
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
         if self._is_device_layer_sharded(device_pool):
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(

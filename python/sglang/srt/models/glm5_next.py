@@ -981,7 +981,8 @@ class Glm5NextModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # mHC carries its residual streams in hidden_states across PP stages.
+            residual = None if self.config.mhc else pp_proxy_tensors["residual"]
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1059,6 +1060,8 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            if self.config.mhc:
+                return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
