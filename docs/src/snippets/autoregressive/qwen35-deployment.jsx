@@ -517,8 +517,8 @@ export const Qwen35Deployment = () => {
           cmd += ' \\\n  --enable-hierarchical-cache';
           cmd += ' \\\n  --hicache-ratio 1.5';
           cmd += ' \\\n  --hicache-write-policy write_through';
-          cmd += ' \\\n  --hicache-io-backend direct';
-          cmd += ' \\\n  --hicache-mem-layout page_first_direct';
+          cmd += ' \\\n  --hicache-io-backend kernel';
+          cmd += ' \\\n  --hicache-mem-layout page_first';
         } else {
           cmd += ' \\\n  --disable-radix-cache';
         }
