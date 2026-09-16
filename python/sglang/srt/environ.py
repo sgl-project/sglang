@@ -662,6 +662,9 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Minimum local radix-node hit count before a direct external linker stores
+    # the node.  Values above one avoid admitting one-shot prompt tails.
+    SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD = EnvInt(1)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # Deprecated: the unified radix tree is the default tree cache now, so the

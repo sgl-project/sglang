@@ -550,6 +550,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def is_external_lookup_pending(self, req_id: str) -> bool:
+        """Whether admission must wait for an asynchronous external lookup."""
+        return False
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 
