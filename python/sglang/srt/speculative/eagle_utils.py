@@ -90,6 +90,15 @@ def _eagle_prefill_tail_tokens(
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
+    next_prompt_tokens = batch.chunked_req_next_prompt_tokens
+    if next_prompt_tokens is not None:
+        if any(token is not None for token in next_prompt_tokens):
+            tail_tokens = tail_tokens.clone()
+        for i, next_prompt_token in enumerate(next_prompt_tokens):
+            if next_prompt_token is not None:
+                tail_tokens[i : i + 1].fill_(next_prompt_token)
+        return tail_tokens
+
     next_prompt_token = batch.chunked_req_next_prompt_token
     if next_prompt_token is not None:
         for i, r in enumerate(batch.reqs):

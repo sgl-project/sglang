@@ -271,7 +271,9 @@ class SchedulerInvariantChecker:
         counted: set[int] = set()
         reqs = [req for batch in batches for req in batch.reqs]
         chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
+        if isinstance(chunked_req, list):
+            reqs.extend(chunked_req)
+        elif chunked_req is not None:
             reqs.append(chunked_req)
         for req in reqs:
             if id(req) in counted:

@@ -574,6 +574,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        chunk_tokens_per_request: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -583,6 +584,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.chunk_tokens_per_request = chunk_tokens_per_request
         self.dllm_config = dllm_config
         self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
 
@@ -598,6 +600,7 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        self.new_chunked_reqs = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
@@ -698,6 +701,12 @@ class PrefillAdder:
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
+    def _record_new_chunked_req(self, req: Req) -> None:
+        if self.chunk_tokens_per_request is None:
+            self.new_chunked_req = req
+        else:
+            self.new_chunked_reqs.append(req)
+
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
             min(
@@ -733,13 +742,16 @@ class PrefillAdder:
         total_tokens: int,
         swa_host_hit_length: int,
     ) -> tuple[bool, Optional[int]]:
+        chunk_limit = self.rem_chunk_tokens
+        if chunk_limit is not None and self.chunk_tokens_per_request is not None:
+            chunk_limit = min(chunk_limit, self.chunk_tokens_per_request)
         return self.memory_budget.check_prefill(
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             swa_host_hit_length=swa_host_hit_length,
-            chunk_limit=self.rem_chunk_tokens,
+            chunk_limit=chunk_limit,
         )
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
@@ -956,6 +968,8 @@ class PrefillAdder:
             )
             if _rem_tokens is None:
                 return req
+            if self.chunk_tokens_per_request is not None:
+                _rem_tokens = min(_rem_tokens, self.chunk_tokens_per_request)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1141,7 +1155,7 @@ class PrefillAdder:
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self._record_new_chunked_req(req)
             self._update_prefill_budget(
                 0,
                 trunc_len,
@@ -1354,7 +1368,7 @@ class PrefillAdder:
         self._req_inc_lock_ref(req)
         self.can_run_list.append(req)
         if admission.is_chunked:
-            self.new_chunked_req = req
+            self._record_new_chunked_req(req)
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
