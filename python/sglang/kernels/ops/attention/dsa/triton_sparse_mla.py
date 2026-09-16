@@ -214,10 +214,10 @@ def _is_gfx950_sparse_mla_fp8(
     kv_dim: int,
     device: torch.device | int | None = None,
 ) -> bool:
-    """Gate for the tuning below: gfx950 with an FP8 KV cache in the DSA shape."""
+    """Gate for gfx950 FP8 prefill tuning in the TP4/TP8 DSA shapes."""
     return (
         kv_dtype != torch.bfloat16
-        and H == 16
+        and H in (8, 16)
         and d_v == 512
         and d_tail == 64
         and kv_dim == 576

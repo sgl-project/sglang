@@ -95,6 +95,18 @@ def test_gfx950_launch_config():
     assert not _page_offsets_fit_i32(max_pages + 1, 576)
 
 
+def test_gfx950_fp8_gate_supports_tp8_prefill(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsa.triton_sparse_mla._is_gfx950_device",
+        lambda _device: True,
+    )
+    for heads in (8, 16):
+        assert _is_gfx950_sparse_mla_fp8(
+            torch.float8_e4m3fn, heads, 512, 64, 576
+        )
+    assert not _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, 4, 512, 64, 576)
+
+
 def test_splitk_workspaces_are_graph_and_stream_safe():
     workspace = []
     device = torch.device("cuda")
