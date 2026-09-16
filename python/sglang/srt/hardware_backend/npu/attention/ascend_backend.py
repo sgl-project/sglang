@@ -371,6 +371,10 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fias_v2_bsnd = (
+            get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
+            and model_runner.spec_algorithm.is_dspark()
+        )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
