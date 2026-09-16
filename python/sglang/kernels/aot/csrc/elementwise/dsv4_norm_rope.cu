@@ -134,14 +134,7 @@ inline static bool is_e4m3fn_gpu() {
   }
   return cached_result == 1;
 }
-
-inline static float get_fp8_max() {
-  static const float fp8_max = is_e4m3fn_gpu() ? 448.0f : 224.0f;
-  return fp8_max;
-}
 #endif
-
-static constexpr float kFP8Max = 448.0f;  // CUDA default, overridden at runtime for ROCm
 
 #ifndef USE_ROCM
 template <int FP8_MAX = 448>
