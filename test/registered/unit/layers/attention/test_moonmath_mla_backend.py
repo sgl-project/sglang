@@ -116,13 +116,11 @@ def _make_backend(kv_cache_dtype=None, use_mla=True):
     runner.kv_cache_dtype = kv_cache_dtype
     runner.num_head = 16
     runner.device = "cpu"
-    runner.token_to_kv_pool.size = 8192
-    runner.model_config.context_len = 131072
 
-    with patch.object(
-        AiterAttnBackend, "__init__", _fake_aiter_init
-    ), _mocked_mla_module() as mock_mla:
-        mock_mla.mla_decode_a16w8_plan_parts_capped.return_value = 1
+    with (
+        patch.object(AiterAttnBackend, "__init__", _fake_aiter_init),
+        _mocked_mla_module(),
+    ):
         backend = MoonmathMLABackend(runner)
 
     backend.forward_metadata = MagicMock()
@@ -142,13 +140,13 @@ class TestMoonmathMLAEligibility(unittest.TestCase):
         q = torch.zeros(1, dtype=torch.bfloat16)
         self.assertTrue(backend._decode_eligible(q, layer, fb))
 
-    def test_reject_h128(self):
-        """H=128 (DSV3) should fall back to aiter."""
+    def test_head_count_bound(self):
+        """The kernel takes H up to 128 (DSV3 at TP1); past it falls back to aiter."""
         backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
-        layer = _make_layer(q_head_num=128)
         fb = _make_fb(batch_size=4, forward_mode="decode")
         q = torch.zeros(1, dtype=torch.bfloat16)
-        self.assertFalse(backend._decode_eligible(q, layer, fb))
+        self.assertTrue(backend._decode_eligible(q, _make_layer(q_head_num=128), fb))
+        self.assertFalse(backend._decode_eligible(q, _make_layer(q_head_num=144), fb))
 
     def test_reject_bf16_kv(self):
         """The A16W8 kernels read an fp8 pool; a bf16 KV cache falls back."""
@@ -191,9 +189,20 @@ class TestMoonmathMLAEligibility(unittest.TestCase):
         q = torch.zeros(1, dtype=torch.bfloat16)
         self.assertFalse(backend._decode_eligible(q, layer, fb))
 
+    def test_reject_batch_past_kernel_row_slices(self):
+        """The kernel launches B * ceil(q_len * H / 96) row slices, at most 304.
+
+        A larger batch must fall back to aiter instead of raising in the kernel.
+        """
+        backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
+        layer = _make_layer(q_head_num=16)
+        q = torch.zeros(1, dtype=torch.bfloat16)
+        self.assertTrue(backend._decode_eligible(q, layer, _make_fb(batch_size=304)))
+        self.assertFalse(backend._decode_eligible(q, layer, _make_fb(batch_size=305)))
+
 
 class TestMoonmathMLAVerifyGate(unittest.TestCase):
-    """The multi-query window serves q_len 4..8 only; everything else falls back."""
+    """Any draft window within the kernel's row-slice budget; past it falls back."""
 
     def _fb(self, q_len):
         spec = MagicMock()
@@ -204,15 +213,35 @@ class TestMoonmathMLAVerifyGate(unittest.TestCase):
         backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
         layer = _make_layer(q_head_num=12)  # Kimi-K3 at TP8
         q = torch.zeros(1, dtype=torch.bfloat16)
-        for q_len in (4, 5, 6, 7, 8):
+        for q_len in (2, 3, 4, 8, 16):
             self.assertTrue(backend._verify_eligible(q, layer, self._fb(q_len)))
 
-    def test_window_bounds_rejected(self):
+    def test_window_past_row_slices_rejected(self):
+        """4 * ceil(q_len * 12 / 96) row slices: 304 at q_len 608, 308 at 609."""
         backend = _make_backend(kv_cache_dtype=torch.float8_e4m3fnuz)
         layer = _make_layer(q_head_num=12)
         q = torch.zeros(1, dtype=torch.bfloat16)
-        for q_len in (1, 3, 9, 16):
-            self.assertFalse(backend._verify_eligible(q, layer, self._fb(q_len)))
+        self.assertTrue(backend._verify_eligible(q, layer, self._fb(608)))
+        self.assertFalse(backend._verify_eligible(q, layer, self._fb(609)))
+
+    def test_rejects_package_without_unified_op(self):
+        """An older moonmath_amd has a same-named op with another signature."""
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        from sglang.srt.layers.attention.moonmath_mla_backend import (
+            MoonmathMLABackend,
+        )
+
+        runner = MagicMock()
+        runner.kv_cache_dtype = torch.float8_e4m3fnuz
+        old_mla = MagicMock(spec=["mla_decode_a16w8", "mla_decode_a16w8_paged_dev"])
+        pkg = types.ModuleType("moonmath_amd")
+        pkg.mla = old_mla
+        with (
+            patch.object(AiterAttnBackend, "__init__", _fake_aiter_init),
+            patch.dict(sys.modules, {"moonmath_amd": pkg, "moonmath_amd.mla": old_mla}),
+        ):
+            with self.assertRaises(ImportError):
+                MoonmathMLABackend(runner)
 
     def test_decode_gate_rejects_verify(self):
         """The two arms are disjoint: verify never reaches forward_decode."""
@@ -244,15 +273,16 @@ class TestMoonmathMLAKernelCorrectness(unittest.TestCase):
         KV_LAT = 512
         ROPE = 64
         KV_DIM = KV_LAT + ROPE
-        H = 16
         SCALE = 1.0 / math.sqrt(KV_DIM)
 
-        for B, S in [(1, 128), (2, 256)]:
-            with self.subTest(B=B, S=S):
-                torch.manual_seed(42 + B * 1000 + S)
+        # (B, S, q_len, H): plain decode, then Kimi-K3's TP8 verify window.
+        for B, S, q_len, H in [(1, 128, 1, 16), (2, 256, 1, 16), (2, 256, 4, 12)]:
+            with self.subTest(B=B, S=S, q_len=q_len, H=H):
+                torch.manual_seed(42 + B * 1000 + S + q_len)
+                T = B * q_len
 
-                q_lat = torch.randn(B, H, KV_LAT, dtype=torch.bfloat16, device=DEV)
-                q_pe = torch.randn(B, H, ROPE, dtype=torch.bfloat16, device=DEV)
+                q_lat = torch.randn(T, H, KV_LAT, dtype=torch.bfloat16, device=DEV)
+                q_pe = torch.randn(T, H, ROPE, dtype=torch.bfloat16, device=DEV)
 
                 num_slots = S * B + 1
                 kv_pool = torch.zeros(num_slots, 1, KV_DIM, dtype=FP8, device=DEV)
@@ -275,33 +305,33 @@ class TestMoonmathMLAKernelCorrectness(unittest.TestCase):
                     c_refs.append(kv_pool[slots.long(), 0, :KV_LAT].float())
                     k_refs.append(kv_pool[slots.long(), 0, KV_LAT:].float())
 
-                out = torch.empty(B, H, KV_LAT, dtype=torch.bfloat16, device=DEV)
-                parts = mla.mla_decode_a16w8_plan_parts_capped(B, H, S, KV_LAT)
-                mla.mla_decode_a16w8_paged_dev(
+                out = torch.empty(T, H, KV_LAT, dtype=torch.bfloat16, device=DEV)
+                mla.mla_decode_a16w8(
                     q_lat,
                     q_pe,
                     kv_pool,
                     out,
                     seq_lens,
-                    None,
                     kv_indices,
                     kv_indptr,
-                    parts,
                     SCALE,
-                    1.0,
                     1.0,
                 )
                 torch.cuda.synchronize()
 
-                ref = torch.empty(B, H, KV_LAT, dtype=torch.float32, device=DEV)
+                # Draft position t attends KV [0, S - (q_len - 1 - t)).
+                ref = torch.empty(T, H, KV_LAT, dtype=torch.float32, device=DEV)
                 for b in range(B):
-                    c, k = c_refs[b], k_refs[b]
-                    ql, qp = q_lat[b].float(), q_pe[b].float()
-                    scores = (ql @ c.t() + qp @ k.t()) * SCALE
-                    ref[b] = torch.softmax(scores, dim=-1) @ c
+                    for t in range(q_len):
+                        n = S - (q_len - 1 - t)
+                        c, k = c_refs[b][:n], k_refs[b][:n]
+                        row = b * q_len + t
+                        ql, qp = q_lat[row].float(), q_pe[row].float()
+                        scores = (ql @ c.t() + qp @ k.t()) * SCALE
+                        ref[row] = torch.softmax(scores, dim=-1) @ c
 
                 relerr = (out.float() - ref).abs().max().item() / ref.abs().max().item()
-                self.assertLess(relerr, 1e-2, f"B={B} S={S}: relerr={relerr:.3e}")
+                self.assertLess(relerr, 1e-2, f"relerr={relerr:.3e}")
 
 
 if __name__ == "__main__":

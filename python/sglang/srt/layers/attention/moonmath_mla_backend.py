@@ -1,26 +1,26 @@
 """Moonmath MLA attention backend for CDNA3 (gfx942).
 
 Subclasses AiterAttnBackend and takes over absorbed MLA with the
-moonmath_amd A16W8 kernels (bf16 Q / fp8 KV), which read sglang's existing
+moonmath_amd A16W8 kernel (bf16 Q / fp8 KV), which reads sglang's existing
 fused-576 MLATokenToKVPool key buffer directly (page_size=1, device-driven,
-cuda-graph safe). Two shapes, both H <= 16:
+cuda-graph safe). One op, `mla_decode_a16w8`, serves both shapes for H <= 128:
 
-    decode        q_len 1     -> mla_decode_a16w8_paged_dev
-    TARGET_VERIFY q_len 4..8  -> mla_decode_a16w8_multiq_paged_dev
+    decode        q_len 1   -> mla_decode_a16w8
+    TARGET_VERIFY q_len > 1 -> mla_decode_a16w8
 
 Everything else -- prefill, bf16 KV, unsupported geometry -- falls back to
 AiterAttnBackend.
 
-The multi-query arm is what makes speculative decoding work here at all: aiter's
+The verify arm is what makes speculative decoding work here at all: aiter's
 asm MLA has no kernel past qseqlen 4, so a larger draft window aborts the
 process during cuda-graph capture. Q stays bf16 in both arms, so there is no
 query scale to calibrate and the verify logits are not perturbed.
 
 aiter's MLA kernels also require num_head in {4, 8} or a multiple of 16 in
-[16, 128], which excludes Kimi-K3's 12 heads at TP8. The moonmath kernels take H
-as a runtime parameter and mask the trailing rows of the 16-row MFMA tile, so
-H=12 runs natively; the inherited fallback paths keep aiter's limit, so Q is
-zero-padded to 16 heads for them (`_mla_decode_fwd_with_head_pad`).
+[16, 128], which excludes Kimi-K3's 12 heads at TP8. The moonmath kernel takes H
+as a runtime parameter, so H=12 runs natively; the inherited fallback paths keep
+aiter's limit, so Q is zero-padded to 16 heads for them
+(`_mla_decode_fwd_with_head_pad`).
 """
 
 from __future__ import annotations
@@ -44,17 +44,15 @@ logger = logging.getLogger(__name__)
 KV_LORA_RANK = 512
 KV_CACHE_DIM = 576  # 512 latent + 64 rope
 
-# Both A16W8 kernels serve one 16-head TP shard (H is a runtime parameter that
-# masks the trailing rows of the single 16-row MFMA query tile).
-_MAX_HEADS = 16
+# H is a runtime parameter of the kernel, up to 128.
+_MAX_HEADS = 128
 # Narrowest head count aiter's asm MLA has a kernel for: its qh16 kernels bake
 # gqa=16 into the ISA, so a 12-head call has nothing to dispatch to.
 _AITER_MLA_MIN_HEADS = 16
-# Draft window the multi-query kernel is compiled for. Position t of the window
-# attends KV [0, S - q_len + t]. q_len 1 is a different CTA shape and is the
-# single-query decode kernel's job.
-_MULTIQ_MIN_QLEN = 4
-_MULTIQ_MAX_QLEN = 8
+# The kernel launches B * ceil(q_len * H / 96) query row slices and accepts at
+# most 304 of them; a larger batch falls back to aiter.
+_KERNEL_SLICE_ROWS = 96
+_KERNEL_MAX_ROW_SLICES = 304
 
 _MAX_BATCH = 8192  # size of the staged int32 seq_lens buffer
 
@@ -70,25 +68,20 @@ class MoonmathMLABackend(AiterAttnBackend):
         super().__init__(model_runner)
         import moonmath_amd.mla as mla  # fail fast if not installed
 
+        # The unified op reuses the old q_len-1 kernel's name; only the package
+        # that ships it also exports the DCP merge.
+        if not hasattr(mla, "mla_dcp_lse_merge_ranks"):
+            raise ImportError(
+                "moonmath_mla needs moonmath_amd with the unified mla_decode_a16w8 op"
+            )
         self._mla = mla
         # The kernels take the fused-576 pool as fp8 e4m3fnuz at a per-tensor
         # descale; a bf16 KV cache has no A16W8 arm and falls back to aiter.
         self._enabled = (
             bool(self.use_mla) and self.kv_cache_dtype == torch.float8_e4m3fnuz
         )
-        self._multiq = (
-            self._enabled
-            and envs.SGLANG_MOONMATH_MLA_MULTIQ_VERIFY.get()
-            and hasattr(mla, "mla_decode_a16w8_multiq_paged_dev")
-        )
+        self._multiq = self._enabled and envs.SGLANG_MOONMATH_MLA_MULTIQ_VERIFY.get()
 
-        # `parts` must not vary inside a captured graph, so the kv-split is
-        # frozen per (arm, bs, H, q_len) at first call / capture and reused.
-        self._parts: dict[tuple, int] = {}
-        self._max_ctx = model_runner.model_config.context_len
-        # sum(seq_lens) can never exceed the pool, so slots // bs bounds the mean
-        # sequence length at that batch. See _plan_seq_len.
-        self._kv_pool_slots = int(self.token_to_kv_pool.size)
         # int32 staging for device seq_lens (sglang carries int64 in eager mode).
         self._seq_lens_i32 = torch.zeros(
             _MAX_BATCH, dtype=torch.int32, device=model_runner.device
@@ -141,25 +134,6 @@ class MoonmathMLABackend(AiterAttnBackend):
         super().init_forward_metadata_out_graph(forward_batch, in_capture)
         self._stage_seq_lens_i32(forward_batch)
 
-    # ── kv-split planning ────────────────────────────────────────────────────
-    def _plan_seq_len(self, bs: int) -> int:
-        """Sequence length the frozen kv-split is planned from.
-
-        `parts` must be constant inside a captured graph, but the optimal split
-        tracks the live sequence length, and planning from the context window
-        over-splits badly at batch. All requests' KV shares one pool, so
-        `slots // bs` is the mean length at that batch -- a better input, and a
-        safe one: every `parts >= 1` is numerically correct.
-        """
-        return max(1, min(self._max_ctx, self._kv_pool_slots // max(bs, 1)))
-
-    def _cached_parts(self, key: tuple, plan) -> int:
-        parts = self._parts.get(key)
-        if parts is None:
-            parts = plan()
-            self._parts[key] = parts
-        return parts
-
     # ── shared eligibility ───────────────────────────────────────────────────
     def _shape_eligible(self, q, layer: RadixAttention, fb: ForwardBatch) -> bool:
         """Absorbed-MLA geometry the A16W8 kernels are compiled for."""
@@ -177,12 +151,19 @@ class MoonmathMLABackend(AiterAttnBackend):
             and self.forward_metadata.kv_indptr is not None
         )
 
-    def _kv_indices_int32(self):
+    @staticmethod
+    def _within_kernel_domain(bs: int, q_len: int, num_heads: int) -> bool:
+        """Whether one launch fits the kernel's query row-slice budget."""
+        row_slices = -(-(q_len * num_heads) // _KERNEL_SLICE_ROWS)
+        return bs * row_slices <= _KERNEL_MAX_ROW_SLICES
+
+    def _kv_indices_int32(self, bs: int):
         # Both are int32 already, so `.to` returns the argument. It must STAY
         # free: a real cast allocates a fresh tensor per layer, and a captured
-        # graph holds the address it saw at capture time.
+        # graph holds the address it saw at capture time. The kernel takes B
+        # from kv_indptr's length, so hand it exactly bs + 1 entries (a view).
         meta = self.forward_metadata
-        return meta.kv_indices.to(torch.int32), meta.kv_indptr.to(torch.int32)
+        return meta.kv_indices.to(torch.int32), meta.kv_indptr[: bs + 1].to(torch.int32)
 
     def _split_q(self, q, *shape):
         """`q` as the contiguous (latent, rope) pair the kernel ABI takes."""
@@ -195,6 +176,7 @@ class MoonmathMLABackend(AiterAttnBackend):
             fb.forward_mode.is_decode()
             and fb.spec_info is None
             and self._shape_eligible(q, layer, fb)
+            and self._within_kernel_domain(fb.batch_size, 1, layer.tp_q_head_num)
         )
 
     def forward_decode(
@@ -216,29 +198,21 @@ class MoonmathMLABackend(AiterAttnBackend):
         if save_kv_cache and k is not None:
             self.token_to_kv_pool.set_kv_buffer(layer, fb.out_cache_loc, k, v)
 
-        parts = self._cached_parts(
-            ("decode", B, H),
-            lambda: self._mla.mla_decode_a16w8_plan_parts_capped(
-                B, H, self._plan_seq_len(B), KV_LORA_RANK
-            ),
-        )
         if not self._logged_decode:
             self._logged_decode = True
-            logger.info("moonmath_mla: decode bs=%d H=%d parts=%d", B, H, parts)
+            logger.info("moonmath_mla: decode bs=%d H=%d", B, H)
 
         q_lat, q_pe = self._split_q(q, B, H)
         out = torch.empty(B, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device)
-        kv_indices, kv_indptr = self._kv_indices_int32()
-        self._mla.mla_decode_a16w8_paged_dev(
+        kv_indices, kv_indptr = self._kv_indices_int32(B)
+        self._mla.mla_decode_a16w8(
             q_lat,
             q_pe,
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             out,
             self._seq_lens_i32[:B],
-            None,
             kv_indices,
             kv_indptr,
-            parts,
             layer.scaling,
             1.0 if layer.k_scale is None else float(layer.k_scale),
         )
@@ -252,8 +226,10 @@ class MoonmathMLABackend(AiterAttnBackend):
             self._multiq
             and fb.forward_mode.is_target_verify()
             and fb.spec_info is not None
-            and _MULTIQ_MIN_QLEN <= fb.spec_info.num_tokens_per_req <= _MULTIQ_MAX_QLEN
             and self._shape_eligible(q, layer, fb)
+            and self._within_kernel_domain(
+                fb.batch_size, fb.spec_info.num_tokens_per_req, layer.tp_q_head_num
+            )
         )
 
     def _forward_verify(self, q, k, v, layer, fb, save_kv_cache):
@@ -271,37 +247,28 @@ class MoonmathMLABackend(AiterAttnBackend):
         if save_kv_cache and k is not None:
             self.token_to_kv_pool.set_kv_buffer(layer, fb.out_cache_loc, k, v)
 
-        parts = self._cached_parts(
-            ("verify", B, H, q_len),
-            lambda: self._mla.mla_decode_a16w8_multiq_plan_parts_q(
-                B, self._plan_seq_len(B), q_len, H
-            ),
-        )
         if not self._logged_verify:
             self._logged_verify = True
             logger.info(
-                "moonmath_mla: multi-query verify bs=%d q_len=%d H=%d parts=%d",
+                "moonmath_mla: multi-query verify bs=%d q_len=%d H=%d",
                 B,
                 q_len,
                 H,
-                parts,
             )
 
-        q_lat, q_pe = self._split_q(q, B, q_len, H)
+        q_lat, q_pe = self._split_q(q, B * q_len, H)
         out = torch.empty(
-            B, q_len, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device
+            B * q_len, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device
         )
-        kv_indices, kv_indptr = self._kv_indices_int32()
-        self._mla.mla_decode_a16w8_multiq_paged_dev(
+        kv_indices, kv_indptr = self._kv_indices_int32(B)
+        self._mla.mla_decode_a16w8(
             q_lat,
             q_pe,
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             out,
             self._seq_lens_i32[:B],
-            None,
             kv_indices,
             kv_indptr,
-            parts,
             layer.scaling,
             1.0 if layer.k_scale is None else float(layer.k_scale),
         )
