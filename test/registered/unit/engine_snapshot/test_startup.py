@@ -60,13 +60,14 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
         fields.update(overrides)
         return SimpleNamespace(**fields)
 
+    @staticmethod
+    def canary(token_id=42, logprob=-0.5):
+        return SnapshotCanary(startup.CANARY_PROMPT, token_id, logprob)
+
     def write_manifest(self, token_id=42):
         publish_manifest(
             self.artifact_path,
-            artifact_manifest(
-                self.artifact_path,
-                canary=SnapshotCanary(startup.CANARY_PROMPT, token_id),
-            ),
+            artifact_manifest(self.artifact_path, canary=self.canary(token_id)),
         )
 
     def barrier_scheduler(self):
@@ -116,7 +117,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
     # ------------------------------------------------------------------ #
     # barriers
     # ------------------------------------------------------------------ #
-    def test_scheduler_barrier_parks_before_reloading(self):
+    def test_scheduler_barrier_rehearses_then_parks_released(self):
         scheduler = self.barrier_scheduler()
         self.write_manifest()
         observed = {}
@@ -125,39 +126,61 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
             observed["scheduler_json"] = json.loads(
                 (self.control / control.SCHEDULER).read_text()
             )
-            observed["canary"] = json.loads((self.control / control.CANARY).read_text())
             observed["resumed"] = (self.control / control.RESUMED).exists()
-            scheduler.weight_updater.resume_memory_occupation.assert_not_called()
+            observed["calls"] = (
+                scheduler.weight_updater.release_memory_occupation.call_count,
+                scheduler.weight_updater.resume_memory_occupation.call_count,
+                scheduler.weight_updater.update_weights_from_disk.call_count,
+            )
 
         with (
             patch.object(startup.control, "wait_for", side_effect=note_park),
-            patch.object(startup, "_run_canary_forward", return_value=42),
+            patch.object(startup, "_run_canary", return_value=self.canary()),
         ):
             startup.scheduler_barrier(scheduler, str(self.artifact_path))
 
         self.assertEqual(observed["scheduler_json"]["gpu_uuid"], "GPU-1")
         self.assertEqual(
-            observed["canary"], {"prompt": startup.CANARY_PROMPT, "token_id": 42}
+            observed["scheduler_json"]["canary"],
+            {"prompt": startup.CANARY_PROMPT, "token_id": 42, "logprob": -0.5},
         )
+        # The rehearsal already released, reloaded and re-verified, so the park
+        # happens released with one more release than resume behind it.
+        self.assertEqual(observed["calls"], (2, 1, 1))
         self.assertFalse(observed["resumed"])
-        self.assertTrue((self.control / control.RESUMED).exists())
+        self.assertEqual(
+            json.loads((self.control / control.RESUMED).read_text()),
+            {"token_id": 42, "logprob": -0.5},
+        )
         request = scheduler.weight_updater.update_weights_from_disk.call_args.args[0]
         self.assertEqual((request.model_path, request.load_format), ("/model", "auto"))
 
     def test_scheduler_barrier_reports_failures(self):
+        canary = self.canary()
         cases = (
-            ("abort", False, [42], SnapshotRuntimeFailure, "aborted"),
-            ("reload", True, [42], SnapshotRuntimeFailure, "bad weights"),
-            ("canary", True, [42, 7], SnapshotRuntimeFailure, "canary mismatch"),
-            ("missing manifest", False, [42], SnapshotCompatibilityError, "manifest"),
+            ("abort", False, (canary, canary), SnapshotRuntimeFailure, "aborted"),
+            ("reload", True, (canary, canary), SnapshotRuntimeFailure, "bad weights"),
+            (
+                "canary",
+                True,
+                (canary, self.canary(token_id=7)),
+                SnapshotRuntimeFailure,
+                "canary mismatch",
+            ),
+            (
+                "missing manifest",
+                False,
+                (canary, canary),
+                SnapshotCompatibilityError,
+                "manifest",
+            ),
         )
-        for name, with_manifest, canary, error, expected in cases:
+        for name, with_manifest, runs, error, expected in cases:
             with self.subTest(case=name):
                 for marker in (
                     control.RESUMED,
                     control.ERROR,
                     control.ABORT,
-                    control.CANARY,
                     control.SCHEDULER,
                     control.READY,
                     control.RELEASE,
@@ -177,7 +200,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
                     scheduler.weight_updater.update_weights_from_disk.return_value = (
                         SimpleNamespace(success=False, message="bad weights")
                     )
-                with patch.object(startup, "_run_canary_forward", side_effect=canary):
+                with patch.object(startup, "_run_canary", side_effect=list(runs)):
                     with self.assertRaisesRegex(error, expected):
                         startup.scheduler_barrier(scheduler, str(self.artifact_path))
 
@@ -189,7 +212,7 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
         scheduler = Mock()
         scheduler.device_module.device_count.return_value = 2
         with (
-            patch.object(startup, "_run_canary_forward") as forward,
+            patch.object(startup, "_run_canary") as forward,
             self.assertRaisesRegex(SnapshotUsageError, "one visible"),
         ):
             startup.scheduler_barrier(scheduler, str(self.artifact_path))
@@ -199,7 +222,9 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
     def test_server_barrier_publishes_and_applies_overrides(self):
         write_json_atomic(
             self.control / control.SCHEDULER,
-            msgspec.to_builtins(control.SchedulerInfo(gpu_uuid="GPU-1")),
+            msgspec.to_builtins(
+                control.SchedulerInfo(gpu_uuid="GPU-1", canary=self.canary())
+            ),
         )
         args = SimpleNamespace(model_path="/model", host="127.0.0.1", port=30184)
 
@@ -233,8 +258,9 @@ class TestSnapshotStartup(SnapshotArtifacts, CustomTestCase):
 
 
 # The canary's forward pass (PrefillAdder admission, KV release, a real GPU
-# step) is exercised end to end by `sglang snapshot create`, which fails if the
-# canary cannot run; the mismatch path is covered above.
+# step) is exercised end to end by `sglang snapshot create`, which also fails
+# when the rehearsal cannot reproduce the canary; the mismatch path is covered
+# above.
 
 
 if __name__ == "__main__":
