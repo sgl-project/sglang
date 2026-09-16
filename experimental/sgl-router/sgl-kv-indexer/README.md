@@ -173,6 +173,8 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 | `KV_INDEXER_VALKEY_URL` | required | `valkey://host:port/db`, `valkeys://` (TLS), `valkey+unix:///path`, or the `redis` spellings. Comma-separated seed nodes in cluster mode. |
 | `KV_INDEXER_VALKEY_KEY_PREFIX` | `{sgl-kv-indexer}:` | Prepended to every key. Two deployments can share one Valkey by using different prefixes. |
 | `KV_INDEXER_VALKEY_CLUSTER` | `0` | `1` to connect to a Valkey Cluster. The prefix must then contain a `{hash tag}` so every key lands in one slot; the default does. |
+| `KV_INDEXER_VALKEY_REQUEST_TIMEOUT_MS` | `1000` | Per-command response deadline. A stalled Valkey surfaces as gRPC `UNAVAILABLE`, which the Router treats as "index unreachable". |
+| `KV_INDEXER_VALKEY_CONNECT_TIMEOUT_MS` | `5000` | Deadline for the initial connection and for reconnects. |
 
 Start a second server with the same variables and a different
 `KV_INDEXER_LISTEN_ADDR` for an active-active pair. Point the bridges and the
@@ -207,7 +209,13 @@ partially applied batch. For REPORT that only under-reports a prefix, the safe
 direction. For REVOKE the stale placement is visible for one extra round trip.
 Two bridges reporting the same block write disjoint fields and never clobber
 each other. Blocks left with no placement and no children are deleted by a
-server-side check-and-delete so a concurrent re-report is not lost.
+server-side script (loaded once, run by `EVALSHA`, every key it touches
+declared) so a concurrent re-report is not lost; the walk up the chain
+continues one declared level at a time.
+
+TLS (`valkeys://`) uses rustls with webpki roots, the same stack as the
+router's HTTP client. Transport failures map to `UNAVAILABLE`, everything else
+to `INTERNAL`.
 
 The parity tests spawn `valkey-server` from `PATH` on a unix socket, or use
 `KV_INDEXER_TEST_VALKEY_URL` when set, and skip cleanly when neither exists.

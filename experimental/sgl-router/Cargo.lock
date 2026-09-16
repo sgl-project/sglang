@@ -2893,11 +2893,16 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rand 0.10.2",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
+ "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
+ "webpki-roots 1.0.9",
  "xxhash-rust",
 ]
 
@@ -3421,6 +3426,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
