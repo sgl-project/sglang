@@ -1,9 +1,8 @@
 //! Tonic adapter for the canonical `sglang.runtime.v1` API.
 //!
-//! This module only translates protobuf requests and responses. The shared
-//! [`FrontendHandle`] owns preprocessing, admission, runtime communication, and
-//! request cancellation; listener construction and server lifecycle are added
-//! by the next stack layer.
+//! This module translates protobuf requests and responses and mounts that thin
+//! adapter on Tonic. The shared [`FrontendHandle`] owns preprocessing,
+//! admission, runtime communication, and request cancellation.
 //!
 //! The thin Tonic-service structure, streamed response approach, and test
 //! strategy build on Rain Jiang's multi-protocol prototype in
@@ -23,11 +22,13 @@ use crate::message::config::{PreferredSamplingParams, ServerArgs};
 
 mod convert;
 mod response;
+mod server;
+
+pub(crate) use server::serve;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -43,18 +44,12 @@ struct AdapterConfig {
 }
 
 /// Tonic-facing implementation backed by the transport-neutral Rust frontend.
-///
-/// The listener follow-up constructs this service. The temporary dead-code
-/// allowance keeps this adapter-only stack layer warning-clean on its own.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct GrpcService {
     frontend: FrontendHandle,
     config: AdapterConfig,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl GrpcService {
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn new(frontend: FrontendHandle, server_args: &ServerArgs) -> Self {
         Self {
             frontend,

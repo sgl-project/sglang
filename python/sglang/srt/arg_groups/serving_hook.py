@@ -368,6 +368,11 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
+                "Rust-server mode does not run the Python sidecar lifecycle."
+            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(

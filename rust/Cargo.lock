@@ -3814,6 +3814,7 @@ dependencies = [
  "socket2 0.6.5",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "tracing",
