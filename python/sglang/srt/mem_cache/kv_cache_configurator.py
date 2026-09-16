@@ -2456,6 +2456,16 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
+        stage_spec_per_req = (
+            int(
+                config.mamba2_cache_params.spec_intermediate_bytes_per_req(
+                    get_spec().speculative_num_draft_tokens
+                )
+                * pp_layer_scale
+            )
+            if has_spec_dec and not replayssm_active
+            else 0
+        )
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -2473,11 +2483,7 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
-                )
+                intermediate_size = stage_spec_per_req * (capped_reqs + 1)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             get_memory().disable_radix_cache
@@ -2492,10 +2498,8 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
-                intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                intermediate_size = stage_spec_per_req * (
+                    get_schedule().max_mamba_cache_size + 1
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2505,7 +2509,7 @@ class KVCacheConfigurator:
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
-            #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
+            #   (K + 1) * per_req + (K / ratio + 1) * spec_per_req = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * get_schedule().mamba_full_memory_ratio
@@ -2515,13 +2519,12 @@ class KVCacheConfigurator:
 
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
-                D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D))
-                        // (per_req * (1 + D / ratio))
+                        (mamba_budget_bytes - per_req - stage_spec_per_req)
+                        // (per_req + stage_spec_per_req / ratio)
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -2530,7 +2533,7 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = stage_spec_per_req * (capped_reqs + 1)
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + replayssm_ring_per_slot
