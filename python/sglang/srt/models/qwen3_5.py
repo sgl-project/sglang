@@ -68,7 +68,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.mx_dense import MX_DENSE_FORMATS, enable_mx_dense
+from sglang.srt.models import qwen3_5_dense_mx
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -149,78 +149,6 @@ _gdn_decode_fused_proj_conv = (
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
-
-# An MX Qwen3.5 checkpoint quantizes only its routed experts, so every
-# attention, GDN and shared-expert projection arrives BF16. These four are the
-# widest of them: they carry most of that BF16 work and measure ~1.9x on aiter's
-# MXFP6 GEMM once a forward pass is wide enough to amortize quantizing the
-# activation. The remaining shapes lose or barely break even, so they are not
-# offered here at all.
-#
-# Which of the four to convert is a per-projection choice because they are not
-# equally tolerant. Measured on gsm8k with MXFP4, against a 0.936 BF16 base:
-# in_proj_qkvz -0.3, out_proj -1.3, o_proj -1.8, qkv_proj -3.0, and all four
-# together -8.5 with the invalid-output rate going 0.5% -> 8.9%. qkv_proj is the
-# outlier because its doubled Q block is half attention output gate, so the
-# error lands on a gate rather than on a plain projection -- note the GDN `z`
-# gate inside in_proj_qkvz is, empirically, almost free. MXFP6's ~4% error
-# (against MXFP4's ~16%) is what makes converting all four viable.
-_QWEN3_5_DENSE_MX_PROJECTIONS = ("in_proj_qkvz", "out_proj", "qkv_proj", "o_proj")
-_qwen3_5_dense_mx = _is_hip and envs.SGLANG_QWEN3_5_DENSE_MX.get()
-_QWEN3_5_DENSE_MX_MIN_TOKENS = envs.SGLANG_QWEN3_5_DENSE_MX_MIN_TOKENS.get()
-
-
-def _qwen3_5_dense_mx_format() -> str:
-    """Which microscaling format to install; validated here so a typo fails loudly."""
-    fmt = envs.SGLANG_QWEN3_5_DENSE_MX_FORMAT.get().strip().lower()
-    if fmt not in MX_DENSE_FORMATS:
-        raise ValueError(
-            f"SGLANG_QWEN3_5_DENSE_MX_FORMAT={fmt!r} is not a known format; "
-            f"pick from {list(MX_DENSE_FORMATS)}"
-        )
-    return fmt
-
-
-def _qwen3_5_dense_mx_selection() -> frozenset:
-    """Projections to convert: everything unless the env var narrows it."""
-    raw = envs.SGLANG_QWEN3_5_DENSE_MX_PROJECTIONS.get().strip()
-    if not raw or raw == "all":
-        return frozenset(_QWEN3_5_DENSE_MX_PROJECTIONS)
-    chosen = frozenset(part.strip() for part in raw.split(",") if part.strip())
-    unknown = chosen - frozenset(_QWEN3_5_DENSE_MX_PROJECTIONS)
-    if unknown:
-        raise ValueError(
-            f"SGLANG_QWEN3_5_DENSE_MX_PROJECTIONS names unknown projections "
-            f"{sorted(unknown)}; pick from {list(_QWEN3_5_DENSE_MX_PROJECTIONS)}"
-        )
-    return chosen
-
-
-_QWEN3_5_DENSE_MX_SELECTED = (
-    _qwen3_5_dense_mx_selection() if _qwen3_5_dense_mx else frozenset()
-)
-_QWEN3_5_DENSE_MX_FMT = _qwen3_5_dense_mx_format() if _qwen3_5_dense_mx else ""
-
-
-_dense_mx_converted = set()
-
-
-def _enable_dense_mx(*named_projections) -> None:
-    """Put each selected ``(name, layer)`` on the dense MX path."""
-    for name, layer in named_projections:
-        if name not in _QWEN3_5_DENSE_MX_SELECTED:
-            continue
-        if enable_mx_dense(layer, _QWEN3_5_DENSE_MX_MIN_TOKENS, _QWEN3_5_DENSE_MX_FMT):
-            # Report the names once they are known to have taken, so the log
-            # names what actually converted rather than what was asked for.
-            if name not in _dense_mx_converted:
-                _dense_mx_converted.add(name)
-                logger.info(
-                    "Dense %s projections converted so far: %s",
-                    _QWEN3_5_DENSE_MX_FMT.upper(),
-                    ", ".join(sorted(_dense_mx_converted)),
-                )
-
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -556,12 +484,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
-        )
-
-        # in_proj_ba is not offered: at 64 output columns it is never
-        # compute-bound, so MXFP4 would only add the activation quantization.
-        _enable_dense_mx(
-            ("in_proj_qkvz", self.in_proj_qkvz), ("out_proj", self.out_proj)
         )
 
     @staticmethod
@@ -1257,8 +1179,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        _enable_dense_mx(("qkv_proj", self.qkv_proj), ("o_proj", self.o_proj))
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -1710,6 +1630,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        # Must precede layer construction: quark consults the policy from
+        # get_quant_method as each linear is built.
+        qwen3_5_dense_mx.register(quant_config)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 

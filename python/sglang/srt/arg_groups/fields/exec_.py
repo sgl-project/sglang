@@ -308,6 +308,17 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_dense_mx: A[
+        bool,
+        "Quantize the wide bf16 projections an MX checkpoint leaves unquantized (Qwen3.5's attention and GDN projections) to an online microscaling format on gfx950. Prefill only: below the model's token threshold those layers keep running bf16, so decode is unchanged.",
+    ] = False
+    dense_mx_format: A[
+        str,
+        Arg(
+            help="Microscaling format for --enable-dense-mx. 'mxfp6' (default) measures ~4% relative error on Qwen3.5's wide projections and is accuracy-neutral on gsm8k; 'mxfp4' is faster but cost 8.5 gsm8k points there, so it is for measurement rather than serving. CDNA4 runs both at the same matrix-core rate.",
+            choices=["mxfp6", "mxfp4"],
+        ),
+    ] = "mxfp6"
 
 
 class ExecMamba(msgspec.Struct):

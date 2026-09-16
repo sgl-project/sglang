@@ -15,9 +15,11 @@ if _RUNNABLE:
         from sglang.kernels.ops.gemm import mxfp6_dense_aiter_hip as _mxfp6
         from sglang.srt.layers.quantization.mx_dense import (
             MxDenseLinearMethod,
-            enable_mx_dense,
+            mx_dense_supported,
         )
+        from sglang.srt.layers.quantization.quark import dense_mx
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.models import qwen3_5_dense_mx
 
         _RUNNABLE = _mxfp4.supported() and _mxfp6.supported()
     except Exception:
@@ -65,8 +67,7 @@ class TestQwen35DenseMx(CustomTestCase):
         torch.manual_seed(0)
         weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") / (k**0.5)
         layer = _Layer(weight)
-        self.assertTrue(enable_mx_dense(layer, min_tokens, fmt))
-        self.assertIsInstance(layer.quant_method, MxDenseLinearMethod)
+        layer.quant_method = MxDenseLinearMethod(fmt, min_tokens)
         layer.load()
         return layer
 
@@ -145,7 +146,7 @@ class TestQwen35DenseMx(CustomTestCase):
             with self.subTest(fmt=fmt):
                 weight = torch.randn(40, 4096, dtype=torch.bfloat16, device="cuda")
                 layer = _Layer(weight)
-                self.assertTrue(enable_mx_dense(layer, 1, fmt))
+                layer.quant_method = MxDenseLinearMethod(fmt, 1)
                 layer.load()
                 x = torch.randn(2048, 4096, dtype=torch.bfloat16, device="cuda")
                 torch.testing.assert_close(
@@ -154,14 +155,6 @@ class TestQwen35DenseMx(CustomTestCase):
                     rtol=0,
                     atol=0,
                 )
-
-    def test_declines_an_already_quantized_layer(self):
-        for fmt in FORMATS:
-            with self.subTest(fmt=fmt):
-                weight = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
-                layer = _Layer(weight)
-                layer.quant_method = object()
-                self.assertFalse(enable_mx_dense(layer, 1, fmt))
 
     def test_non_2d_input_falls_back(self):
         _, n, k = SHAPES[1]
@@ -177,9 +170,119 @@ class TestQwen35DenseMx(CustomTestCase):
                 )
 
     def test_unknown_format_is_rejected(self):
-        weight = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
         with self.assertRaises(ValueError):
-            enable_mx_dense(_Layer(weight), 1, "mxfp3")
+            mx_dense_supported("mxfp3")
+
+
+class _FakeQuantConfig:
+    """Stands in for QuarkConfig, which is all dense_mx.register() needs."""
+
+
+@unittest.skipUnless(_RUNNABLE, "requires HIP gfx950 with aiter")
+class TestQwen35DenseMxPolicy(CustomTestCase):
+    """The Qwen3.5 policy decides by module-name substring, so collisions matter.
+
+    `o_proj` must not match `out_proj` or `in_proj_qkvz`, and the layers whose
+    measurements said "leave it alone" must stay bf16 -- in particular
+    `shared_expert.down_proj`, which is claimed by the separate dense-FP8 path,
+    and the 64-column `in_proj_ba`.
+    """
+
+    CONVERT = (
+        "model.layers.0.linear_attn.in_proj_qkvz",
+        "model.layers.0.linear_attn.out_proj",
+        "model.layers.3.self_attn.qkv_proj",
+        "model.layers.3.self_attn.o_proj",
+    )
+    LEAVE_BF16 = (
+        "model.layers.0.linear_attn.in_proj_ba",
+        "model.layers.0.linear_attn.in_proj_b",
+        "model.layers.0.linear_attn.in_proj_a",
+        "model.layers.0.linear_attn.conv1d",
+        "model.layers.1.mlp.gate",
+        "model.layers.1.mlp.shared_expert.down_proj",
+        "model.layers.1.mlp.shared_expert.gate_up_proj",
+        "model.layers.1.mlp.shared_expert_gate",
+        "model.layers.1.mlp.experts.0.down_proj",
+        "lm_head",
+        "model.embed_tokens",
+    )
+
+    def _policy_config(self):
+        cfg = _FakeQuantConfig()
+        dense_mx.register(
+            cfg,
+            include=qwen3_5_dense_mx._INCLUDE,
+            exclude=qwen3_5_dense_mx._EXCLUDE,
+            min_output_size=qwen3_5_dense_mx._MIN_OUTPUT_SIZE,
+            min_tokens=qwen3_5_dense_mx._MIN_TOKENS,
+        )
+        return cfg
+
+    def _wide_layer(self):
+        layer = torch.nn.Module()
+        layer.output_size_per_partition = 4096
+        return layer
+
+    def _routed(self, cfg, prefix, layer):
+        """linear_method_for with the server flag forced on."""
+        real = dense_mx._flag_enabled
+        dense_mx._flag_enabled = lambda: True
+        try:
+            return dense_mx.linear_method_for(cfg, prefix, layer)
+        finally:
+            dense_mx._flag_enabled = real
+
+    def test_converts_the_four_measured_projections(self):
+        cfg = self._policy_config()
+        for prefix in self.CONVERT:
+            with self.subTest(prefix):
+                method = self._routed(cfg, prefix, self._wide_layer())
+                self.assertIsInstance(method, MxDenseLinearMethod)
+                self.assertEqual(method.min_tokens, qwen3_5_dense_mx._MIN_TOKENS)
+
+    def test_reports_which_projections_converted(self):
+        """A server log must name them, so an inert arm cannot read as a null result."""
+        dense_mx._converted.clear()
+        cfg = self._policy_config()
+        for prefix in self.CONVERT:
+            self._routed(cfg, prefix, self._wide_layer())
+        self.assertEqual(
+            dense_mx._converted, set(qwen3_5_dense_mx._INCLUDE), dense_mx._converted
+        )
+        # A declined layer must not appear.
+        self._routed(cfg, "model.layers.1.mlp.gate", self._wide_layer())
+        self.assertNotIn("mlp.gate", dense_mx._converted)
+
+    def test_leaves_everything_else_bf16(self):
+        cfg = self._policy_config()
+        for prefix in self.LEAVE_BF16:
+            with self.subTest(prefix):
+                self.assertIsNone(self._routed(cfg, prefix, self._wide_layer()))
+
+    def test_narrow_layer_is_declined_even_if_the_name_matches(self):
+        cfg = self._policy_config()
+        narrow = torch.nn.Module()
+        narrow.output_size_per_partition = 64
+        self.assertIsNone(
+            self._routed(cfg, "model.layers.0.self_attn.o_proj", narrow)
+        )
+
+    def test_flag_off_leaves_every_layer_bf16(self):
+        cfg = self._policy_config()
+        for prefix in self.CONVERT:
+            with self.subTest(prefix):
+                # No forced flag: an uninitialized runtime context reads as off.
+                self.assertIsNone(
+                    dense_mx.linear_method_for(cfg, prefix, self._wide_layer())
+                )
+
+    def test_unregistered_config_leaves_every_layer_bf16(self):
+        for prefix in self.CONVERT:
+            with self.subTest(prefix):
+                self.assertIsNone(
+                    self._routed(_FakeQuantConfig(), prefix, self._wide_layer())
+                )
 
 
 if __name__ == "__main__":

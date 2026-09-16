@@ -26,10 +26,11 @@ win above roughly a thousand tokens: below that the GEMM is not compute-bound,
 the extra activation quantization dominates, and decode -- where a precision
 loss would compound across every step -- keeps running exactly as before.
 
-This is a *model-driven* method: nothing selects it from a checkpoint's quant
-config. A model asks for it per projection via :func:`enable_mx_dense`, which is
-what keeps the policy (which projections, which format, and above which token
-count) in the model that was measured rather than in a global switch.
+Nothing here decides *which* layers to convert. A model registers its own policy
+(which projections, minimum width, token threshold) and quark routes matching
+excluded layers to this method from ``get_quant_method`` -- see
+``layers.quantization.quark.dense_mx`` and ``models.qwen3_5_dense_mx``. That keeps
+the tuned names with the model that was measured and out of this file.
 """
 
 from __future__ import annotations
@@ -66,6 +67,11 @@ def _adapter(fmt: str):
     return mod
 
 
+def mx_dense_supported(fmt: str) -> bool:
+    """Whether this device has the kernels for ``fmt``; raises on an unknown name."""
+    return _adapter(fmt).supported()
+
+
 class MxDenseLinearMethod(UnquantizedLinearMethod):
     """BF16 linear that switches to a microscaling format once tokens make it pay.
 
@@ -84,6 +90,15 @@ class MxDenseLinearMethod(UnquantizedLinearMethod):
         self._packed: Optional[torch.Tensor] = None
         self._scale: Optional[torch.Tensor] = None
         self._out_features: Optional[int] = None
+        global _announced
+        if not _announced:
+            _announced = True
+            logger.info(
+                "Dense %s is enabled for forward passes of at least %d tokens; "
+                "the BF16 weights stay live for everything below that.",
+                fmt.upper(),
+                min_tokens,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
@@ -116,33 +131,3 @@ class MxDenseLinearMethod(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         out = self._mx.run(x, self._packed, self._scale, self._out_features)
         return out if bias is None else out.add_(bias)
-
-
-def enable_mx_dense(
-    layer: torch.nn.Module,
-    min_tokens: int,
-    fmt: str = MX_DENSE_DEFAULT_FORMAT,
-) -> bool:
-    """Put ``layer`` on the MX path above ``min_tokens`` tokens; report if it took.
-
-    Must run before weights are loaded, so the replacement method is the one the
-    loader calls ``process_weights_after_loading`` on. Only an unquantized layer
-    can be converted -- anything else already has a quantized kernel that this
-    would be undoing.
-    """
-    if not _adapter(fmt).supported():
-        return False
-    method = getattr(layer, "quant_method", None)
-    if type(method) is not UnquantizedLinearMethod:
-        return False
-    layer.quant_method = MxDenseLinearMethod(fmt, min_tokens)
-    global _announced
-    if not _announced:
-        _announced = True
-        logger.info(
-            "Dense %s is enabled for forward passes of at least %d tokens; "
-            "the BF16 weights stay live for everything below that.",
-            fmt.upper(),
-            min_tokens,
-        )
-    return True

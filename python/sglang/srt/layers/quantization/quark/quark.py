@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.quark import dense_mx
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
     QuarkMoEScheme,
@@ -391,6 +392,9 @@ class QuarkConfig(QuantizationConfig):
                 # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
                 if self.excluded_fp8_config is not None:
                     return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
+                dense_mx_method = dense_mx.linear_method_for(self, prefix, layer)
+                if dense_mx_method is not None:
+                    return dense_mx_method
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
