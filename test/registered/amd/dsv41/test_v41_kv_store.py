@@ -79,7 +79,9 @@ def reference_pages(layout, page_size, num_pages, locs, values, page_bytes):
     return REFERENCE[layout](full, page_bytes=page_bytes)
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "V4.1 HIP KV stores require gfx950")
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported(), "V4.1 HIP KV stores require gfx950"
+)
 class TestV41KVStore(CustomTestCase):
     def assert_tokens_equal(self, cache, ref, layout, page_size, locs):
         got_data, got_scale = token_rows(cache, layout, page_size, locs)
