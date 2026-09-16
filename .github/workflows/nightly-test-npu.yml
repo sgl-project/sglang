@@ -330,15 +330,15 @@ jobs:
 #      device_type_for_deps: 'a5'
 #      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-4-npu-a5-test:
-    name: nightly-acc-4-npu-a5-test
+  nightly-acc-8-npu-a5-test:
+    name: nightly-acc-8-npu-a5-test
     if: ${{ !cancelled() }}
     needs: [ set-image-config ]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-amd64-a5-4
+      runner: linux-amd64-a5-8
       test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a5-test
+      test_suite: nightly-acc-8-npu-a5-test
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a5 }}
