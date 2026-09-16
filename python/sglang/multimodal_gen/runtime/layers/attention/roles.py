@@ -3,8 +3,10 @@
 
 A "role" distinguishes the type of attention a layer performs (self-attention
 vs cross-attention) so a different backend can be selected per role. The value
-strings double as the role token used in ``component_attention_backends`` config
-keys, e.g. ``transformer.cross``.
+strings double as the role token accepted in ``--component-attention-backends``
+keys, e.g. ``transformer.cross``; ``ServerArgs`` splits those entries out of
+``component_attention_backends`` into ``component_attention_backend_roles`` so a
+component lookup by name never sees a role-qualified key.
 """
 
 import enum
@@ -16,7 +18,7 @@ class AttentionRole(str, enum.Enum):
 
 
 # Separator between the component name and the role token in a
-# ``component_attention_backends`` config key (e.g. ``transformer.cross``).
+# ``--component-attention-backends`` key (e.g. ``transformer.cross``).
 ROLE_KEY_SEPARATOR = "."
 
 
