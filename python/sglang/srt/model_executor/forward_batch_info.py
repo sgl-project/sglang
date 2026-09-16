@@ -503,6 +503,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
+    mamba_track_seqlens_cpu: Optional[List[int]] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -908,6 +910,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_prefill_track_mask_cpu=(
+                list(batch.mamba_prefill_track_mask_cpu)
+                if batch.mamba_prefill_track_mask_cpu is not None
+                else None
+            ),
+            mamba_track_seqlens_cpu=(
+                list(batch.mamba_track_seqlens_cpu)
+                if batch.mamba_track_seqlens_cpu is not None
+                else None
+            ),
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -1031,8 +1043,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens = torch.tensor(
                     extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
                 ).to(device, non_blocking=True)
-                ret.extend_prefix_lens_cpu = extend_prefix_lens
-                ret.extend_seq_lens_cpu = extend_seq_lens
+                ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
+                ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
                 # gpu_only: device tensors handed in directly; leave *_cpu unset.
                 assert isinstance(extend_seq_lens, torch.Tensor)
@@ -1684,6 +1696,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.mamba_track_indices is not None:
             self.mamba_track_indices = self._pad_tensor_to_size(
                 self.mamba_track_indices, bs
+            )
+        if self.mamba_prefill_track_mask_cpu is not None:
+            self.mamba_prefill_track_mask_cpu = self.mamba_prefill_track_mask_cpu + [
+                False
+            ] * (bs - len(self.mamba_prefill_track_mask_cpu))
+        if self.mamba_track_seqlens_cpu is not None:
+            self.mamba_track_seqlens_cpu = self.mamba_track_seqlens_cpu + [0] * (
+                bs - len(self.mamba_track_seqlens_cpu)
             )
         if self.mamba_track_mask is not None:
             self.mamba_track_mask = self._pad_tensor_to_size(self.mamba_track_mask, bs)
