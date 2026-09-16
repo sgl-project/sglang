@@ -383,7 +383,9 @@ pub struct ModelConfig {
 /// External KV Indexer client settings.
 #[derive(Debug, Clone)]
 pub struct KvIndexerEndpointConfig {
-    pub url: String,
+    /// Interchangeable indexer endpoints in preference order; they must share
+    /// state, since a query may be answered by any of them.
+    pub urls: Vec<String>,
     pub query_timeout_ms: u64,
     pub query_max_inflight: usize,
 }

@@ -51,6 +51,9 @@ What each deployment shape gives you:
   Valkey-backed restart keeps the index.
 - With `KV_INDEXER_SINK=grpc`, batches sent while the indexer is down are lost.
   With the stream sink they wait in the stream.
+- A Router given one endpoint has no index to query while that endpoint
+  restarts, whatever the backend holds. Give it every endpoint of a shared-state
+  fleet, or put a stable address in front.
 - Events published while a bridge is disconnected are recovered from the
   worker's replay buffer when `SGLANG_KV_REPLAY_ENDPOINT` is set; a sequence
   gap on the live stream triggers the same bounded replay. Without it, they
@@ -182,7 +185,22 @@ KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
 
 Start a second server with the same variables and a different
 `KV_INDEXER_LISTEN_ADDR` for an active-active pair. Point the bridges and the
-Router at either address; both answer from the same index.
+Router at either address; both answer from the same index. Give the Router the
+whole list and it fails over between them:
+
+```bash
+sgl-router ... --cache-prefix-provider indexer \
+  --kv-indexer-endpoint "http://10.0.0.1:50051 http://10.0.0.2:50051"
+```
+
+The Router queries the preferred endpoint and moves to the next only while that
+one cannot answer (unreachable, shedding load, or out of time); the endpoint
+that answered becomes preferred, so an outage costs one failover rather than a
+probe of a dead address on every query. A rejection is not a failover, since
+every server would reject the same request. The query deadline covers the whole
+query including failovers, so a longer list cannot make a slow query slower.
+Endpoints must share indexer state: with the `memory` backend each server has
+its own index and the answer would depend on which one replied.
 
 Semantics are those of the in-memory backend, field for field. Prefix answers
 come from the shared rule engine over the same placement inputs, and

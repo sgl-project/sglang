@@ -569,7 +569,7 @@ async fn start_recording_deadlines(
     }
 
     let index = GrpcPrefixIndex::new(PrefixIndexConfig {
-        endpoint,
+        endpoints: vec![endpoint],
         query_deadline,
         max_inflight: sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT,
     })
