@@ -183,24 +183,21 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
         normal, calls = self._feed([text])
 
-        self.assertEqual(calls, [])
-        self.assertIn(DSML, normal)
+        self.assertEqual((normal, calls), ("", []))
 
     def test_closed_invoke_rejects_malformed_direct_json(self):
         text = _wrapped(_invoke("get_weather", '{"city": }'))
 
         normal, calls = self._feed([text])
 
-        self.assertEqual(calls, [])
-        self.assertIn(DSML, normal)
+        self.assertEqual((normal, calls), ("", []))
 
     def test_closed_invoke_rejects_nonstandard_json_constant(self):
         text = _wrapped(_invoke("get_weather", '{"city": NaN}'))
 
         normal, calls = self._feed([text])
 
-        self.assertEqual(calls, [])
-        self.assertIn(DSML, normal)
+        self.assertEqual((normal, calls), ("", []))
 
     def test_nonstandard_xml_constant_falls_back_to_string(self):
         text = _wrapped(_invoke("get_weather", _param("city", "false", "NaN")))
@@ -233,7 +230,64 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "get_weather")
         self.assertEqual(calls[0].parameters, '{"city": "SF"}')
-        self.assertIn(DSML, normal)
+        self.assertEqual(normal, "")
+
+    def test_malformed_first_invoke_keeps_prose_and_later_call(self):
+        """A malformed invoke is discarded on its own: the prose ahead of the
+        block survives, the next well-formed invoke still becomes call 0, and
+        no DSML reaches the client."""
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("get_weather", f'<{DSML}parameter name="city">SF')
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual(normal, "Checking.")
+        self.assertEqual(
+            [(call.tool_index, call.name, call.parameters) for call in calls],
+            [(0, "get_weather", '{"city": "NY"}')],
+        )
+
+    def test_malformed_invoke_fails_closed_at_every_chunk_width(self):
+        """Whatever the delta boundaries, a malformed invoke yields the prose,
+        no call, and no DSML, including the trailing tool_calls close."""
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("get_weather", f'<{DSML}parameter name="city" string="true">SF')
+        )
+
+        for width in range(1, len(text) + 1):
+            with self.subTest(width=width):
+                parser = FunctionCallParser(self.tools, "deepseekv4")
+                normal, calls = "", []
+                for index in range(0, len(text), width):
+                    chunk_normal, chunk_calls = parser.parse_stream_chunk(
+                        text[index : index + width]
+                    )
+                    normal += chunk_normal
+                    calls.extend(chunk_calls)
+                end_normal, end_calls = parser.parse_stream_end()
+                normal += end_normal
+                calls.extend(end_calls)
+
+                self.assertEqual(normal, "Checking.")
+                self.assertEqual(calls, [])
+
+    def test_non_streaming_drops_only_the_malformed_invoke(self):
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("get_weather", '{"city": }')
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "Checking.")
+        self.assertEqual(
+            [(call.name, call.parameters) for call in result.calls],
+            [("get_weather", '{"city": "NY"}')],
+        )
 
     def test_stream_end_drops_incomplete_invoke(self):
         parser = FunctionCallParser(self.tools, "deepseekv4")
@@ -263,9 +317,9 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
         self.assertEqual(len(result.calls), 2)
 
-    def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must not empty the turn, and the dropped
-        buffer must not come back on the next delta."""
+    def test_unexpected_parse_error_fails_closed(self):
+        """An unexpected parse error keeps the prose, drops the DSML and the
+        call, and the dropped buffer must not come back on the next delta."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -273,15 +327,15 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
             "_parse_parameters_from_xml",
             side_effect=RuntimeError("boom"),
         ):
-            first = detector.parse_streaming_increment(_weather_call(), self.tools)
+            first = detector.parse_streaming_increment(
+                "Checking.\n\n" + _weather_call(), self.tools
+            )
             self.assertEqual(detector._buffer, "")
             second = detector.parse_streaming_increment(" tail", self.tools)
 
-        self.assertIn("get_weather", first.normal_text)
-        self.assertNotIn("get_weather", second.normal_text)
-        # No half-formed call: the failure can land between a tool's name and its
-        # arguments, so an argument-less named call must not reach the client.
+        self.assertEqual(first.normal_text, "Checking.")
         self.assertEqual(first.calls, [])
+        self.assertEqual(second.normal_text, " tail")
 
 
 if __name__ == "__main__":
