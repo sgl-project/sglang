@@ -84,6 +84,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,

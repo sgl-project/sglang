@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
+from sglang.srt.utils.common import human_readable_int
 
 
 class ExecFeatures(msgspec.Struct):
@@ -95,6 +96,13 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -194,6 +202,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -223,6 +232,7 @@ class ExecKernel(msgspec.Struct):
                 "flashinfer_sparse_mla",
                 "fa3",
                 "tilelang",
+                "triton",
                 "aiter",
                 "trtllm",
             ],
@@ -484,6 +494,20 @@ class ExecGraph(msgspec.Struct):
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
     ] = None
+    cuda_graph_prefill_max_context: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Maximum context length supported by DeepSeek-V4 breakable/full "
+                "prefill CUDA graphs. Context-shaped attention metadata and "
+                "indexer logits are allocated at this fixed size instead of "
+                "the model maximum. Larger live contexts fall back to eager."
+                f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+            aliases=["--context-bucket"],
+        ),
+    ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",
@@ -636,6 +660,7 @@ class ExecMoe(msgspec.Struct):
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -651,6 +676,7 @@ class ExecMoe(msgspec.Struct):
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
             ],
             resolvable=True,
         ),
@@ -695,6 +721,10 @@ class ExecMoe(msgspec.Struct):
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+    ] = None
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
@@ -861,6 +891,30 @@ class ExecOffload(msgspec.Struct):
             "--no-ple-offload-embedding to disable.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
+        ),
+    ] = None
+
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="Host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse "
+            "file under --ple-offload-dir and lets the gather kernel read it "
+            "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
+            "where pinned host memory comes out of the same pool as the model "
+            "weights. Requires a device that reports "
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        Arg(
+            help="Directory for the file-backed PLE table when "
+            "--ple-offload-backend is 'file'. Defaults to "
+            "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
+            "The file is sparse and reused across restarts; put it on fast "
+            "local storage (NVMe).",
         ),
     ] = None
 

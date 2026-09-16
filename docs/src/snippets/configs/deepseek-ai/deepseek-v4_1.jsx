@@ -1,8 +1,16 @@
 // Single `export const config` literal — no spreads/calls/IIFE (Mintlify re-evals at hydration).
 //
 // Cells marked `verified` are transcribed from recorded runs on that hardware with
-// real weights. DP-Attention, DeepEP and MegaMoE are absent by design: they have
-// never been enabled on this model. EP is set equal to TP on every shape here.
+// real weights.
+//
+// Every DSpark cell caps --cuda-graph-max-bs-decode: the derived batch list does
+// not fit while capturing the DSpark decode graphs, on any NVIDIA platform. The
+// MI350X cell already carried the equivalent --cuda-graph-max-bs. H200 is the
+// tightest board at 140 GiB and needs the cap on both cells plus a lower memory
+// fraction; the three other High-Throughput cells start without either.
+//
+// DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
+// enabled on this model. EP is set equal to TP on every shape here.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
@@ -114,6 +122,19 @@ export const config = {
       },
     },
 
+    // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI350X: both
+    // ROCm cells run `--disable-radix-cache`, which the server rejects alongside
+    // `--enable-hierarchical-cache`.
+    hicache: {
+      excludesHw: ["mi350x"],
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
+      ],
+    },
+
     flagSelects: [
       {
         id: "dsparkBlockSize",
@@ -169,6 +190,8 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -196,20 +219,24 @@ export const config = {
       ],
     },
 
-    // ---------- H200: 8x H200, TP8 + EP8. No MXFP8 dense path on Hopper;
-    // verification round open. ----------
+    // ---------- H200: 8x H200, TP8 + EP8. No MXFP8 dense path on Hopper. The
+    // tightest board here at 140 GiB, so both cells also need the memory
+    // fraction pulled back; the cap alone still leaves the graphs short. ------
     {
       match: { hw: "h200", strategy: "low-latency" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
+        "--mem-fraction-static 0.8",
         "--attention-backend dsv4",
         "--moe-runner-backend flashinfer_mxfp4",
         "--enable-decoder-swa-bounded-replay",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -219,15 +246,18 @@ export const config = {
     {
       match: { hw: "h200", strategy: "high-throughput" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--ep-size 8",
+        "--mem-fraction-static 0.8",
         "--attention-backend dsv4",
         "--moe-runner-backend flashinfer_mxfp4",
         "--max-running-requests 256",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -235,12 +265,12 @@ export const config = {
       ],
     },
 
-    // ---------- B200 / B300: verification round open. Mirrors the GB300 recipe
-    // because the kernels dispatch by architecture family. ----------
+    // ---------- B200: 4x B200, TP4 + EP4. Mirrors the GB300 recipe — the
+    // kernels dispatch by architecture family. ----------
     {
       match: { hw: "b200", strategy: "low-latency" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -249,6 +279,8 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -258,7 +290,7 @@ export const config = {
     {
       match: { hw: "b200", strategy: "high-throughput" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -271,10 +303,13 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+
+    // ---------- B300: 4x B300, TP4 + EP4. Same recipe as GB300 — the kernels
+    // dispatch by architecture family. ----------
     {
       match: { hw: "b300", strategy: "low-latency" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -283,6 +318,8 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -292,7 +329,7 @@ export const config = {
     {
       match: { hw: "b300", strategy: "high-throughput" },
       nnodes: 1,
-      verificationStatus: "in-progress",
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
