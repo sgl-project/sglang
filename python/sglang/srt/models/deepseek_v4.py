@@ -4360,6 +4360,30 @@ class DeepseekV4Model(nn.Module):
                 ),
             )
 
+        self.engram_prefetch_stream = None
+        if (
+            (_is_cuda or _is_hip)
+            and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
+            and self.pp_group.world_size == 1
+            and not is_dp_attention_enabled()
+            and config.vision_n_layers == 0
+            and config.hc_pre_from_prev_sublayer
+            and self.start_layer <= 14 < self.end_layer
+            and self.layers[14].engram is not None
+            and self.layers[14].engram.embed._shared
+            # These backends use per-call scratch rather than a shared GEMM workspace.
+            and getattr(
+                self.layers[14].engram.wkv.quant_method, "mxfp8_dense_backend", None
+            )
+            in (
+                Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
+                Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
+                Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+            )
+        ):
+            self.engram_prefetch_stream = torch.cuda.Stream()
+            logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
+
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -4480,6 +4504,22 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+        prefetched_engram_kv = None
+        if (
+            self.engram_prefetch_stream is not None
+            and forward_batch.forward_mode.is_decode()
+            and hash_ids.shape[0] == 1
+        ):
+            # Overlap layer 14's shared-host lookup and WKV projection with the
+            # earlier layers; the main stream joins right before the gate.
+            prefetch_stream = self.engram_prefetch_stream
+            prefetch_stream.wait_stream(torch.cuda.current_stream())
+            engram = self.layers[14].engram
+            with torch.cuda.stream(prefetch_stream):
+                prefetched_engram_kv = engram.project(
+                    hash_ids[:, engram.layer_hash_index]
+                )
+            hash_ids.record_stream(prefetch_stream)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4526,13 +4566,22 @@ class DeepseekV4Model(nn.Module):
                     if _is_hip
                     else None
                 )
-                hidden_states = engram(
-                    hidden_states,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    cp_all_tokens=cp_extend,
-                    image_select=image_select,
-                )
+                if i == 14 and prefetched_engram_kv is not None:
+                    main_stream = torch.cuda.current_stream()
+                    main_stream.wait_stream(self.engram_prefetch_stream)
+                    prefetched_engram_kv.record_stream(main_stream)
+                    hidden_states = engram.apply_gate(
+                        hidden_states, prefetched_engram_kv, image_select=image_select
+                    )
+                    prefetched_engram_kv = None
+                else:
+                    hidden_states = engram(
+                        hidden_states,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                        image_select=image_select,
+                    )
                 if image_select is None and (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
