@@ -1,8 +1,7 @@
 """Fused RoPE and two-stage fp4 packing for low-ratio index keys and queries.
 
-Keys include RMSNorm and a 68-byte cache store, using the group's first position.
-Queries use each token's own position, without RMSNorm or a cache store.
-The decode backend uses index_q_rope_pack_weights to also produce FP32 head weights.
+Keys add RMSNorm and a 68-byte cache store and use the group's first position;
+queries have neither and use each token's own position.
 """
 
 from __future__ import annotations
@@ -74,8 +73,7 @@ def index_k_norm_rope_pack_store(
     :param positions: ``[num_tokens]`` int32 or int64, the token position. The
                       group position is masked out of it in-kernel.
     :param loc: ``[num_tokens]`` int64, the index-K slot. ``0`` is the reserved
-                dummy: those rows publish nothing, which covers both padded
-                graph rows and, at ratio > 1, rows completing no group.
+                dummy; those rows publish nothing.
     :param cache: the layer's index-K buffer, ``[npages, page_size * 68]`` uint8.
     :param ratio: the layer's compress ratio. A power of two.
 

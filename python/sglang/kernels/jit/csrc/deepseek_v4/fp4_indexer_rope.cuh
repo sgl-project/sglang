@@ -19,8 +19,8 @@ namespace sglang {
 
 /// \brief RMSNorm, RoPE, two FP4 stages and a 68-byte index-K cache store.
 ///
-/// `input` is `wk(latent)`, before `k_norm`. A ratio-r group's latent uses
-/// its first position, `positions & ~(r - 1)`, for power-of-two ratios.
+/// A ratio-r group's latent uses its first position, `positions & ~(r - 1)`,
+/// for power-of-two ratios.
 struct IndexKParams {
   const bf16_t* __restrict__ input;        // [num_tokens, kHeadDim] bf16, pre-norm
   const bf16_t* __restrict__ norm_weight;  // [kHeadDim] bf16
@@ -35,7 +35,7 @@ struct IndexKParams {
 /// \brief RoPE and two-stage FP4 packing for index-Q, after `wq_b`.
 ///
 /// Each (token, head) row uses its token's own position, without RMSNorm
-/// or a ratio mask. Payload and scales are contiguous outputs, not a paged cache.
+/// or a ratio mask.
 struct IndexQParams {
   const bf16_t* __restrict__ input;     // [num_tokens, heads, kHeadDim] bf16
   const float* __restrict__ freqs_cis;  // [max_pos, kRopeDim] fp32, real/imag interleaved
@@ -43,7 +43,7 @@ struct IndexQParams {
   int8_t* __restrict__ payload;         // [num_tokens * heads, kHeadDim / 2] int8
   int32_t* __restrict__ scale;          // [num_tokens * heads] int32, four ue8m0 bytes
   // Optional head-weight epilogue (kWeights): the raw `weights_proj` output for
-  // the same (token, head) rows, and where `float(bf16(w * weight_scale))` goes.
+  // the same (token, head) rows.
   const bf16_t* __restrict__ head_weights;  // [num_tokens * heads] bf16, or nullptr
   float* __restrict__ weights_out;          // [num_tokens * heads] fp32, or nullptr
   float weight_scale;
@@ -51,8 +51,8 @@ struct IndexQParams {
   uint32_t heads;
 };
 
-/// Warps per CTA; one warp owns one row. Chosen from B200 decode measurements,
-/// where occupancy has little effect; multiple warps avoid starving larger batches.
+/// One warp owns one row. Chosen from B200 decode measurements, where occupancy
+/// has little effect; multiple warps avoid starving larger batches.
 constexpr uint32_t kFp4RopeWarpsPerCTA = 4;
 
 /// \brief Indexer packer scale: `_ceil_ue8m0_exp(max(amax / 6, 1e-4))`.
@@ -131,8 +131,7 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     const auto amax = warp::reduce_max<kHalfLanes>(fmaxf(fabsf(data[half * 2]), fabsf(data[half * 2 + 1])));
     out.exponent[half] = index_pack_exponent(amax);
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
-    // power of two so both are exact, except at exponent 254, which needs a
-    // block absmax above `6 * 2^126` and so cannot come from a finite float.
+    // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
     const auto code = __nv_cvt_float2_to_fp4x2(
         fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
@@ -184,7 +183,6 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
 
   // Both come from the step's metadata rather than the predecessor, so
   // prefetching them ahead of the PDL gate overlaps with the `wk` GEMM's tail.
-  // A row that publishes nothing is dropped at the store, not here.
   const auto slot_id = params.loc[row];
   const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row]);
   PDLWaitPrimary<kUsePDL>();
@@ -235,7 +233,7 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
 /// \brief One warp per (token, head); grid = ceil(num_rows / kFp4RopeWarpsPerCTA).
 ///
 /// Input is contiguous [num_tokens, heads, kHeadDim]; row r uses token r / heads
-/// and head r % heads. Queries use their own position, without a ratio mask.
+/// and head r % heads.
 template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kWeights>
 __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void index_q_kernel(const IndexQParams params) {
   using namespace device;
@@ -276,8 +274,7 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   if (lane == 0) params.scale[row] = static_cast<int32_t>(scale_word);
 
   if constexpr (kWeights) {
-    // Match head_weights(x).float(): multiply by the fp32-rounded scale,
-    // round to nearest-even bf16, then widen to fp32.
+    // Match `head_weights(x).float()`: the bf16 round-trip is part of the reference.
     if (lane == 0) {
       const auto w = cast<float>(params.head_weights[row]) * params.weight_scale;
       params.weights_out[row] = cast<float>(cast<bf16_t>(w));

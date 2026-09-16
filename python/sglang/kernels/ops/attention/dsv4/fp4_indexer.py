@@ -45,8 +45,7 @@ def _fp4_e2m1_code(x):
 
 @triton.jit
 def _fp4_e2m1_code_rne(x):
-    """Round-to-nearest-even e2m1 code, matching the reference rounding: at an
-    exact half-way value the even grid index wins."""
+    """Round-to-nearest-even e2m1 code, matching the reference rounding."""
     ax = tl.minimum(tl.abs(x), 6.0)
     idx = (ax >= 0.25).to(tl.uint8)
     idx += (ax >= 0.75).to(tl.uint8)
@@ -162,7 +161,7 @@ def quantize_fp4_indexer_tensor(
     x: torch.Tensor, rne: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-32 ue8m0 fp4 quantize. rne=True uses round-to-nearest-even (the dsv41
-    reference rounding); the default keeps the c4 threshold behavior."""
+    reference rounding); the default keeps ``_fp4_e2m1_code``'s thresholds."""
     assert x.shape[-1] == 128
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
@@ -250,8 +249,7 @@ def _index_k_rope_pack_kernel(
     step = tl.where(magnitude < 2.0, 0.5, tl.where(magnitude < 4.0, 1.0, 2.0))
     sign = tl.where(scaled > 0, 1.0, tl.where(scaled < 0, -1.0, 0.0))
     rounded = libdevice.rint(magnitude / step) * step * sign
-    # Preserve the BF16 intermediate before recomputing the indexer scale,
-    # including its 1e-4 lower bound.
+    # Preserve the BF16 intermediate before recomputing the indexer scale.
     dequantized = (rounded * fake_scale[:, None]).to(tl.bfloat16).to(tl.float32)
     pack_amax = tl.max(tl.abs(dequantized), 1)
     pack_exponent = _ceil_ue8m0_exp(tl.maximum(pack_amax / 6.0, 1.0e-4))

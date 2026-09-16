@@ -1,8 +1,4 @@
-"""Fused RoPE tail and fp4 fake-quant for the DeepSeek-V4.1 low-ratio path.
-
-Preserves the bf16 round-trip after RoPE and before quantization, and the
-round-half-to-even behavior of torch.round.
-"""
+"""Fused RoPE tail and fp4 fake-quant for the DeepSeek-V4.1 low-ratio path."""
 
 from __future__ import annotations
 
@@ -47,8 +43,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     im = tl.load(
         x_ptr + x_stride_r * r + head_len + 2 * j + 1, mask=in_tail, other=0.0
     ).to(tl.float32)
-    # freqs is a real/imag-interleaved view with stride 2 between complex pairs;
-    # index 2*j / 2*j+1 to preserve that layout.
+    # freqs is a real/imag-interleaved view: stride 2 between complex pairs.
     fr = tl.load(f_ptr + t * f_stride_t + 2 * j, mask=in_tail, other=1.0)
     fi = tl.load(f_ptr + t * f_stride_t + 2 * j + 1, mask=in_tail, other=0.0)
     if INVERSE:
