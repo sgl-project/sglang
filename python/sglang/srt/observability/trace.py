@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,6 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
 
 
 def get_global_trace_level() -> int:
-    from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
     if resources.trace_level is None:
@@ -84,7 +84,6 @@ def get_global_trace_level() -> int:
 
 
 def set_global_trace_level(level: int):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().trace_level = level
 

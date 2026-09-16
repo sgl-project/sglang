@@ -51,7 +51,9 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
     RoutingMethodType,
+    get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
@@ -83,7 +85,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
-    print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -158,18 +159,24 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig,
+    quant_method: FusedMoEMethodBase,
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
         # StandardDispatcher is created but never invoked.
+        # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
+        # dispatcher stays a pure noop passthrough.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -191,6 +198,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             return_recv_hook=True,
         )
     elif a2a_backend.is_deepep_v2():
+        output_dtype = get_deepep_v2_dispatcher_output_dtype(
+            _deepep_v2_experts_are_fp8(quant_method)
+        )
         return DeepEPv2Dispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -198,6 +208,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+            use_fp8_dispatch=output_dtype is DispatcherOutputDtype.FP8,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -206,6 +217,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+            moe_runner_config=moe_runner_config,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -236,9 +248,17 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _deepep_v2_experts_are_fp8(quant_method) -> bool:
+    # All other supported quantization methods are blockwise FP8.
+    return not isinstance(quant_method, UnquantizedFusedMoEMethod)
+
+
 def _validate_deepep_v2_quant_method(quant_method) -> None:
-    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    """Validate the expert formats the DeepEP v2 adapter can feed."""
     if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    if isinstance(quant_method, UnquantizedFusedMoEMethod):
         return
 
     config = (
@@ -258,9 +278,10 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
-            f"experts with dynamic activation scaling, but this layer {reason}. "
-            "Use a compatible checkpoint or --moe-a2a-backend deepep."
+            "--moe-a2a-backend deepep_v2 requires either 128x128 blockwise FP8 "
+            "experts with dynamic activation scaling or unquantized BF16 "
+            f"experts, but this layer {reason}. Use a compatible checkpoint or "
+            "--moe-a2a-backend deepep."
         )
 
 
@@ -282,7 +303,10 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Data type for the parameters.
         reduce_results: Whether to apply all_reduce on the output of the layer
         quant_config: Quantization configuration.
+        quant_method: Explicit quant method, overriding selection from quant_config.
         inplace: suggestion to compute inplace (modify input activation).
+        enable_qwen35_fp8_deferred_finalize: Whether this concrete Qwen3.5
+            layer may expose FlashInfer's block-FP8 deferred MoE output.
     """
 
     # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
@@ -321,6 +345,8 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        enable_qwen35_fp8_deferred_finalize: bool = False,
+        quant_method: Optional[FusedMoEMethodBase] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -354,10 +380,10 @@ class FusedMoE(torch.nn.Module):
 
         self._num_global_routed = num_experts - num_shared_slots
         if get_exec().moe.ep_join_mode == "scale":
-            storage_ep_size = get_parallel().config.elastic_ep_initial_size
+            storage_ep_size = get_parallel().elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                get_parallel().config.ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
@@ -395,6 +421,11 @@ class FusedMoE(torch.nn.Module):
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
+        # Keep the pre-round value: the mxfp4 SM90 CUTLASS post-load processor
+        # needs to know which trailing K columns are padding, because the
+        # loader never writes them and their scale entries keep the buffer's
+        # _UE8M0_ONE fill.
+        self.hidden_size_unpadded = hidden_size
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
@@ -426,17 +457,19 @@ class FusedMoE(torch.nn.Module):
             gate_up_interleaved=gate_up_interleaved,
         )
 
-        self.quant_method: Optional[FusedMoEMethodBase] = None
+        self.quant_method = quant_method
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
-            if quant_config is not None:
+            if self.quant_method is not None:
+                gpu_method = self.quant_method
+            elif quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
-            if quant_config is not None:
+            if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
@@ -446,15 +479,22 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
+        nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
+            self.quant_method, ModelOptNvFp4FusedMoEMethod
+        )
+        qwen35_fp8_deferred = (
+            enable_qwen35_fp8_deferred_finalize
+            and isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.block_quant
+        )
         self.supports_deferred_finalize = (
-            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-            and get_moe_runner_backend().is_flashinfer_trtllm()
-            and isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            and (nvfp4_deferred or qwen35_fp8_deferred)
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
-            logging.getLogger(__name__).info(
+            logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
                 f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
@@ -477,7 +517,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.dispatcher = create_moe_dispatcher(
+            self.moe_runner_config, quant_method=self.quant_method
+        )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -496,10 +538,6 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
-            if self.moe_runner_config.inplace:
-                print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
-                )
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
@@ -514,8 +552,7 @@ class FusedMoE(torch.nn.Module):
 
         self._dwdp_bound = False
 
-        if self.quant_method is not None and hasattr(self.quant_method, "runner"):
-            self.runner = self.quant_method.runner
+        self.runner = self.quant_method.runner
 
     @property
     def num_global_routed_experts(self) -> int:
@@ -1674,7 +1711,7 @@ class FusedMoE(torch.nn.Module):
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        if hasattr(self, "runner"):
+        if self.runner is not None:
             self.runner.set_overlap_args(down_gemm_overlap_args, meta_overlap_args)
         else:
             # TODO: remove this branch after MoE refactor
@@ -1682,7 +1719,7 @@ class FusedMoE(torch.nn.Module):
             self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        if hasattr(self, "runner"):
+        if self.runner is not None:
             self.runner.clear_overlap_args()
         else:
             # TODO: remove this branch after MoE refactor

@@ -131,7 +131,6 @@ class MiniLoadBalancer:
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
@@ -141,7 +140,6 @@ class MiniLoadBalancer:
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
             if "return_logprob" in modified_request:
-
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
 

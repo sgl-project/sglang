@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """SubBlock block-sparse attention backend.
 
-Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
-FlashAttention kernel on SM90 or FlashInfer's kernel on SM100. A log-sum-exp
-over query/key sub-block pairs selects the blocks (see ``backends/subblock_sparse/``).
+Routes a SubBlock plan to SGLang's CuTe-DSL block-sparse FlashAttention kernel
+on SM90 or FlashInfer's architecture-specific kernels on SM100 and SM120. A
+log-sum-exp over query/key sub-block pairs selects the blocks (see
+``backends/subblock_sparse/``).
 Everything is training-free: the router runs before attention and produces
 the ``q2k_block_index`` the selected kernel consumes.
 
@@ -18,15 +19,19 @@ individual keys of the defaults below::
     --attention-backend-config '{"sparsity": 0.85}'
 
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
-10.0 (B200 / GB200), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
-block-sparse FlashAttention kernel; B200 uses FlashInfer's ``sm_100a`` blk64
-kernel. Inside the DiT, any call the kernels cannot serve -- cross/refiner
-attention, short sequences, non-bf16 -- runs dense instead. On any other GPU
-the resolver refuses the backend at startup rather than falling back.
+10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
+block-sparse FlashAttention kernel by default; ``compute_mode="sage_fp8"``
+selects its native SageAttention2 INT8-QK/FP8-PV kernel. The mode name is stable
+across architectures, so future SM100/SM120 implementations can use their own
+Sage FP8 arithmetic without changing server configuration. B200 and SM120
+devices currently use FlashInfer's architecture-specific blk64 BF16 kernels.
+Inside the DiT, unsupported calls run dense instead; unsupported GPU
+architectures are rejected.
 
 ``--attention-backend`` reaches every component, and the text encoder admits
-only fa / torch_sdpa / sage_attn_3, so pair it with
-``--component-attention-backends text_encoder=fa``; see the README.
+only fa / torch_sdpa / sage_attn_3. Pair it with
+``--component-attention-backends text_encoder=fa`` on SM90/SM100, or
+``text_encoder=torch_sdpa`` on SM120; see the README.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
     SubBlockRouter,
     load_bsa_attn_blk64_fwd,
+    load_bsa_attn_sm120_blk64_fwd,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -55,9 +61,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# The kernel is fixed at 64-token blocks and 128-wide heads.
+# Query blocks and heads are fixed; Hopper Sage FP8 widens K blocks to 128.
 SUBBLOCK_SPARSE_BLOCK_SIZE = 64
 SUBBLOCK_SPARSE_HEAD_DIM = 128
+SAGE_FP8_SM90_KEY_BLOCK_SIZE = 128
 
 # Defaults for the schedule; override through --attention-backend-config.
 # Sparsity is the speed lever, and it saturates: on MiniMax-H3 t2va at 37.7k
@@ -94,6 +101,9 @@ DEFAULT_N_Q = 4
 # Below this many keys the router costs more than the blocks it saves, and the
 # top-k budget collapses to a handful of blocks.
 DEFAULT_MIN_SEQ_LEN = 4096
+# Keep the established BF16 kernel as the default. ``sage_fp8`` is explicit
+# until its model-level quality/performance envelope has been validated.
+DEFAULT_COMPUTE_MODE = "bf16"
 
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
 # anything else is not and stays dense.
@@ -175,6 +185,31 @@ def _sm90_sparse_attention(
     return out
 
 
+def _sm90_sage_fp8_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a 64x128 plan with the native SM90 Sage INT8-QK/FP8-PV kernel."""
+    from sglang.kernels.ops.attention.subblock_sage_fp8_sm90 import (
+        subblock_sage_fp8_sm90_attention,
+    )
+
+    return subblock_sage_fp8_sm90_attention(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        softmax_scale,
+        block_counts,
+    )
+
+
 def _sm100_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -198,16 +233,59 @@ def _sm100_sparse_attention(
     return out[0] if isinstance(out, tuple) else out
 
 
+def _sm120_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    block_counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a SubBlock routing plan through FlashInfer's SM120 kernel."""
+    logger.info_once("SubBlock sparse attention kernel active: FlashInfer SM120 blk64")
+    out = load_bsa_attn_sm120_blk64_fwd()(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=block_counts,
+        softmax_scale=softmax_scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
 @functools.lru_cache(maxsize=None)
-def _get_subblock_sparse_attention_runner(device: torch.device):
-    """Resolve the architecture-specific kernel once per CUDA device."""
+def _get_subblock_sparse_attention_runner(
+    device: torch.device, compute_mode: str = DEFAULT_COMPUTE_MODE
+):
+    """Resolve the architecture/mode-specific kernel once per CUDA device."""
     capability = torch.cuda.get_device_capability(device)
+    if compute_mode not in ("bf16", "sage_fp8"):
+        raise ValueError(f"unknown SubBlock compute mode {compute_mode!r}")
     if capability == (9, 0):
-        return _sm90_sparse_attention
+        if compute_mode == "bf16":
+            return _sm90_sparse_attention
+        if compute_mode == "sage_fp8":
+            return _sm90_sage_fp8_sparse_attention
     if capability == (10, 0):
+        if compute_mode != "bf16":
+            raise RuntimeError(
+                f"SubBlock compute_mode={compute_mode!r} currently targets SM90; "
+                "the SM100 FlashInfer Sage adapter is not wired in SGLang yet."
+            )
         return _sm100_sparse_attention
+    if capability == (12, 0):
+        if compute_mode != "bf16":
+            raise RuntimeError(
+                f"SubBlock compute_mode={compute_mode!r} currently targets SM90; "
+                "the SM120 FlashInfer Sage adapter is not wired in SGLang yet."
+            )
+        return _sm120_sparse_attention
     raise RuntimeError(
-        "SubBlock sparse attention supports compute capability 9.0 or 10.0; "
+        "SubBlock sparse attention supports compute capability 9.0, 10.0, or 12.0; "
         f"this tensor is on a {capability[0]}.{capability[1]} device."
     )
 
@@ -220,14 +298,16 @@ def _run_subblock_sparse_attention(
     topk: int,
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
+    compute_mode: str = DEFAULT_COMPUTE_MODE,
 ) -> torch.Tensor:
-    """Dispatch a prepared 64x64 routing plan to Hopper or Blackwell.
+    """Dispatch a prepared routing plan to Hopper or Blackwell.
 
     SM90 requires every active index prefix to be sorted in ascending order;
-    SM100 accepts the router's original order. Heterogeneous callers must sort
-    compact sparse prefixes before expanding them to full-width dense rows.
+    SM100 and SM120 accept the router's original order. Heterogeneous callers
+    must sort compact sparse prefixes before expanding them to full-width dense
+    rows.
     """
-    runner = _get_subblock_sparse_attention_runner(q.device)
+    runner = _get_subblock_sparse_attention_runner(q.device, compute_mode)
     return runner(
         q,
         k,
@@ -290,12 +370,17 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     n_k: int
     n_q: int
     min_seq_len: int
+    compute_mode: str
 
     @classmethod
     def from_server_args(cls) -> SubBlockSparseSchedule:
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         config = get_global_server_args().attention_backend_config or {}
+        compute_mode = str(config.get("compute_mode", DEFAULT_COMPUTE_MODE))
+        # Hopper's native kernel consumes 128-token K blocks. Eight sub-blocks
+        # preserve the default router's 16-token key pooling cells.
+        default_n_k = 8 if compute_mode == "sage_fp8" else DEFAULT_N_K
         schedule = SubBlockSparseSchedule(
             sparsity=float(config.get("sparsity", DEFAULT_SPARSITY)),
             skip_first_steps=int(
@@ -304,9 +389,10 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             skip_first_layers=int(
                 config.get("skip_first_layers", DEFAULT_SKIP_FIRST_LAYERS)
             ),
-            n_k=int(config.get("n_k", DEFAULT_N_K)),
+            n_k=int(config.get("n_k", default_n_k)),
             n_q=int(config.get("n_q", DEFAULT_N_Q)),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
+            compute_mode=compute_mode,
         )
         if not 0.0 <= schedule.sparsity < 1.0:
             raise ValueError(
@@ -317,6 +403,11 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
                 raise ValueError(f"subblock {name} must be 1, 2, 4 or 8, got {value}")
         if schedule.skip_first_steps < 0 or schedule.skip_first_layers < 0:
             raise ValueError("subblock skip_first_* must be non-negative")
+        if schedule.compute_mode not in ("bf16", "sage_fp8"):
+            raise ValueError(
+                "subblock compute_mode must be 'bf16' or 'sage_fp8', got "
+                f"{schedule.compute_mode!r}"
+            )
         return schedule
 
 
@@ -358,7 +449,18 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             and self.schedule.sparsity > 0.0
         )
         self.router = (
-            SubBlockRouter(n_k=self.schedule.n_k, n_q=self.schedule.n_q)
+            SubBlockRouter(
+                n_k=self.schedule.n_k,
+                n_q=self.schedule.n_q,
+                block_size_k=(
+                    SAGE_FP8_SM90_KEY_BLOCK_SIZE
+                    if self.schedule.compute_mode == "sage_fp8"
+                    else SUBBLOCK_SPARSE_BLOCK_SIZE
+                ),
+                budget_granularity=(
+                    1 if self.schedule.compute_mode == "sage_fp8" else 8
+                ),
+            )
             if self.layer_enabled
             else None
         )
@@ -366,7 +468,8 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         if self.layer_enabled:
             logger.info_once(
                 f"SubBlock sparse attention: sparsity={self.schedule.sparsity:.3f} "
-                f"n_k={self.schedule.n_k} n_q={self.schedule.n_q}, dense for the first "
+                f"n_k={self.schedule.n_k} n_q={self.schedule.n_q} "
+                f"compute_mode={self.schedule.compute_mode}, dense for the first "
                 f"{self.schedule.skip_first_steps} denoise steps and the first "
                 f"{self.schedule.skip_first_layers} DiT layers"
             )
@@ -445,7 +548,9 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
                 "query blocks are dense"
             )
         block_counts = None
-        runner = _get_subblock_sparse_attention_runner(q.device)
+        runner = _get_subblock_sparse_attention_runner(
+            q.device, self.schedule.compute_mode
+        )
         block_index = (
             plan.index.sort(dim=-1).values
             if runner is _sm90_sparse_attention
@@ -492,6 +597,7 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             kernel_topk,
             self.softmax_scale,
             block_counts,
+            self.schedule.compute_mode,
         )
 
     def forward(

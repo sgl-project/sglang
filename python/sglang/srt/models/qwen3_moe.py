@@ -19,6 +19,7 @@
 
 import logging
 import math
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -34,7 +35,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -58,11 +58,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -77,6 +72,7 @@ from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -85,12 +81,19 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
+
+
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm_rope() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_rope_cpu")
+
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -267,9 +270,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant, mirroring vllm-ascend. Only the
-        # offline ModelSlim path (which carries a per-layer quant_model_description)
-        # may quantise the gate — if the checkpoint stored it as MXFP8 it is loaded
+        # Router gate: description-driven quant. Only the offline ModelSlim path
+        # (which carries a per-layer quant_model_description) may quantise the
+        # gate — if the checkpoint stored it as MXFP8 it is loaded
         # and dequantised correctly instead of cast to bf16 without its block scale.
         # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
         gate_quant_config = (
@@ -324,9 +327,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
@@ -530,6 +536,12 @@ class Qwen3MoeAttention(nn.Module):
                 _yarn_factor != 1.0,
             )
         )
+        self.use_fused_qk_norm_rope_cpu = (
+            _is_cpu
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.rotary_dim % 2 == 0
+            and _has_cpu_fused_qk_norm_rope()
+        )
         self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
@@ -597,31 +609,53 @@ class Qwen3MoeAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        use_fused = (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16) or (
+            self.use_fused_qk_norm_rope_cpu
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+        )
         if use_fused:
-            theta = self.rope_theta
-            positions = (
-                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
-            )
-            factor, low, high, attention_factor = compute_yarn_parameters(self.config)
-            fused_qk_norm_rope(
-                qkv,
-                self.num_heads,
-                self.num_kv_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                theta,
-                self.rotary_emb.is_neox_style,
-                positions,
-                factor,
-                low,
-                high,
-                attention_factor,
-            )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if _is_cuda:
+                theta = self.rope_theta
+                positions = (
+                    positions.view(-1)
+                    .to(dtype=torch.int32, device=qkv.device)
+                    .contiguous()
+                )
+                factor, low, high, attention_factor = compute_yarn_parameters(
+                    self.config
+                )
+                fused_qk_norm_rope(
+                    qkv,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    theta,
+                    self.rotary_emb.is_neox_style,
+                    positions,
+                    factor,
+                    low,
+                    high,
+                    attention_factor,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            elif _is_cpu:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                self.rotary_emb._match_cos_sin_cache_dtype(q)
+                torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.q_norm.variance_epsilon,
+                    self.rotary_emb.is_neox_style,
+                    positions.view(-1),
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.rotary_dim,
+                )
             self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
@@ -961,7 +995,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -975,7 +1009,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
@@ -995,15 +1028,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled() and not is_cp_v2_active(forward_batch):
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.attn_cp_rank,
-                    self.attn_cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
 
         hidden_states = self.model(
             input_ids,

@@ -58,7 +58,9 @@ class EPLBManager:
         assert (
             get_exec().moe.eplb_rebalance_num_iterations
             >= get_exec().moe.expert_distribution_recorder_buffer_size
-        ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        ), (
+            "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        )
 
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
@@ -157,7 +159,7 @@ class EPLBManager:
                 model=self._get_model(),
                 new_expert_location_metadata=expert_location_metadata,
                 update_layer_ids=chunk_layer_ids,
-                nnodes=get_parallel().config.nnodes,
+                nnodes=get_parallel().nnodes,
                 tp_rank=(
                     self._elastic_global_rank()
                     if is_post_scale_rebalance
@@ -221,7 +223,7 @@ class EPLBManager:
         )
 
     def _elastic_global_rank(self) -> int:
-        return self._ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        return self._ps.tp_rank + get_parallel().ep_join_rank_offset
 
     def _check_rebalance_needed(self, average_utilization_rate_over_window):
         if average_utilization_rate_over_window is None:

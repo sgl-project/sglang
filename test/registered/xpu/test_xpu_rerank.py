@@ -21,27 +21,9 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-
-def _xpu_total_gib() -> float:
-    if not torch.xpu.is_available():
-        return 0.0
-    return torch.xpu.get_device_properties(0).total_memory / (1024**3)
-
-
-def _xpu_free_cache() -> None:
-    gc.collect()
-    if torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        torch.xpu.synchronize()
-
-
-# fp32+Triton fits on B60 (22GiB) but hangs on B580 (~12GiB).
-_LARGE_XPU_VRAM_GIB = 20.0
-_HAS_LARGE_XPU = _xpu_total_gib() >= _LARGE_XPU_VRAM_GIB
-
-register_xpu_ci(est_time=180, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=180, suite="nightly-xpu-1-gpu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
 TP_SIZE = 1
@@ -175,10 +157,6 @@ class TestXPUDecoderRerank(CustomTestCase):
             self._assert_close_scores(prompts)
 
 
-# Ported from test/manual/prefill_only/test_cross_encoder_models.py.
-# fp32+triton fits on B60 (22GiB) but OOMs on B580 (~12GiB); bf16+intel_xpu on
-# this encoder model does not match HF (tracked separately), so on <20GiB XPU
-# the class is skipped rather than shipping a knowingly-wrong config.
 CROSS_ENCODER_MODEL_PATH = "BAAI/bge-reranker-v2-m3"
 CROSS_ENCODER_TP_SIZE = 1
 CROSS_ENCODER_SCORE_TOLERANCE = 1e-2
@@ -187,11 +165,6 @@ CROSS_ENCODER_ATTENTION_BACKEND = "triton"
 CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
 
 
-@unittest.skipUnless(
-    _HAS_LARGE_XPU,
-    "bge-reranker-v2-m3 fp32+triton OOMs on <20GiB XPU (B580); "
-    "bf16+intel_xpu on this encoder produces wrong scores.",
-)
 class TestXPUCrossEncoderRerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -214,8 +187,8 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
         ) as hf_runner:
             hf_scores = hf_runner.forward(prompts).scores
 
-        # HFRunner leaks a ZMQ context on shutdown; free VRAM before SRT starts.
-        _xpu_free_cache()
+        gc.collect()
+        empty_gpu_cache()
 
         with SRTRunner(
             model_path,

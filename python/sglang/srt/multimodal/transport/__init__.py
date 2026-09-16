@@ -14,7 +14,7 @@ def determine_tensor_transport_mode() -> TensorTransportMode:
     inject the address only into scheduler actors for a multi-node deployment,
     and external launchers may use an environment-based rendezvous instead.
     """
-    if get_parallel().config.nnodes > 1:
+    if get_parallel().nnodes > 1:
         # CUDA IPC and POSIX shared memory are local to one node.
         return "default"
     return "cuda_ipc"

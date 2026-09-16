@@ -49,8 +49,7 @@ class ContextParallelStrategyKind(IntEnum):
         if value == "interleave":
             return cls.INTERLEAVE
         raise ValueError(
-            f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            f"Unknown cp_strategy={value!r}; expected one of {{'zigzag', 'interleave'}}"
         )
 
     @property
@@ -181,9 +180,9 @@ class ContextParallelStrategy(ABC):
         positions: Any,
         input_embeds: Optional[Any] = None,
     ) -> Optional[Any]:
-        """Shard model inputs before model.forward in CP-v2 paths."""
+        """Shard model inputs before model.forward in CP paths."""
         if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
+            forward_batch.cp_input_ids = self.shard_hidden_states(
                 input_ids, forward_batch
             )
         forward_batch.positions = self.shard_position_ids(positions, forward_batch)
@@ -282,15 +281,19 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
+        # The reads are what raise, so they sit inside the guard.
         try:
-            parallel = get_parallel().config
-        except ValueError:
+            parallel = get_parallel()
+            enable_prefill_cp = parallel.enable_prefill_cp
+            cp_size = parallel.attn_cp_size
+            cp_strategy = parallel.cp_strategy
+        except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if parallel.enable_prefill_cp:
+        if enable_prefill_cp:
             init_cp_strategy(
                 enable_prefill_cp=True,
-                cp_size=parallel.attn_cp_size,
-                cp_strategy=parallel.cp_strategy,
+                cp_size=cp_size,
+                cp_strategy=cp_strategy,
             )
     return _STRATEGY
 
