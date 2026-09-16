@@ -9,7 +9,7 @@ import numpy as np
 
 import sglang as sgl
 from sglang.srt.utils import is_hip
-from sglang.utils import download_and_cache_file, read_jsonl
+from sglang.utils import load_hellaswag_val
 
 _is_hip = is_hip()
 
@@ -516,9 +516,7 @@ def test_hellaswag_select():
         return ret
 
     # Read data
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    lines = load_hellaswag_val()
 
     # Construct prompts
     num_questions = 200

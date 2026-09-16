@@ -430,6 +430,26 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+def load_hellaswag_val() -> list[dict]:
+    """Read the HellaSwag validation split in its original file order.
+
+    ``rowanz/hellaswag``, which used to serve ``data/hellaswag_val.jsonl`` over
+    raw.githubusercontent.com, was disabled by a DMCA claim on 2026-09-14 and
+    now answers 451, so the data comes from its HuggingFace mirror. The mirror
+    keeps the row order the jsonl had -- callers slice off leading rows for
+    few-shot prompts and accuracy thresholds are calibrated against those exact
+    rows -- but types ``label`` as a string, and callers use it both to index
+    ``endings`` and to compare against predicted indices, so it is coerced back
+    to int here.
+    """
+    from datasets import load_dataset
+
+    return [
+        {**example, "label": int(example["label"])}
+        for example in load_dataset("Rowan/hellaswag", split="validation")
+    ]
+
+
 def is_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
