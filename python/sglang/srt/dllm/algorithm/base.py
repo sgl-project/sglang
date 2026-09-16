@@ -47,12 +47,13 @@ class DllmAlgorithm:
     def step(
         self,
         forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
         states: List[Any],
     ) -> List[bool]:
         """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+        place. ``logits_output`` may carry either dense logits or a compact state.
+        Returns, per block, whether it was already complete *on entry* -- i.e.
+        this forward persisted its final KV cache and it can be emitted.
         """
         raise NotImplementedError
 
@@ -90,7 +91,7 @@ class DllmAlgorithm:
         if _is_npu:
             forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
-            done = self.step(forward_batch, out.logits_output.full_logits, states)
+            done = self.step(forward_batch, out.logits_output, states)
             if all(done):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -122,7 +123,7 @@ class DllmAlgorithm:
                 states.append(carried)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        done = self.step(forward_batch, out.logits_output.full_logits, states)
+        done = self.step(forward_batch, out.logits_output, states)
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
         next_token_ids_list = forward_batch.input_ids.view(

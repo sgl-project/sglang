@@ -32,17 +32,12 @@ from sglang.srt.dllm.consumer_state_trace import (
     emit_compact_vocab_state_trace,
     emit_full_vocab_trace,
 )
-from sglang.srt.dllm.tp_local_vocab_kernel import (
-    can_use_local_vocab_state_triton,
-    local_vocab_state_from_logits_triton,
-)
 from sglang.srt.dllm.tp_local_vocab_state import (
     VocabState,
     can_pack_vocab_ids_as_float32,
+    can_use_local_vocab_state_triton,
+    gather_vocab_state_across_tp,
     local_vocab_state_from_logits,
-    merge_gathered_packed_vocab_state,
-    merge_vocab_states,
-    pack_vocab_state_for_tp_gather,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -207,75 +202,11 @@ def _should_pack_dllm_vocab_state_for_gather(max_vocab_id_inclusive: int) -> boo
     )
 
 
-def _global_max_vocab_id_for_dllm_tp_state(
-    lm_head: VocabParallelEmbedding,
-    fallback_vocab_size: int,
-) -> int:
-    vocab_size = getattr(lm_head, "org_vocab_size", fallback_vocab_size)
-    return int(vocab_size) - 1
-
-
 def _tp_rank_for_trace() -> int:
     try:
         return int(getattr(get_tp_group(), "rank_in_group", 0))
     except Exception:
         return 0
-
-
-def _merge_dllm_vocab_state_across_tp(
-    *,
-    local_state: VocabState,
-    tp_group,
-    tp_size: int,
-    global_max_vocab_id_inclusive: int,
-) -> VocabState:
-    num_rows = local_state.max_values.shape[0]
-
-    if _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id_inclusive):
-        local_packed = pack_vocab_state_for_tp_gather(local_state)
-        gathered_packed = torch.empty(
-            (tp_size * num_rows, 3),
-            device=local_packed.device,
-            dtype=local_packed.dtype,
-        )
-        tp_group.all_gather_into_tensor(gathered_packed, local_packed)
-        return merge_gathered_packed_vocab_state(
-            gathered_packed.view(tp_size, num_rows, 3)
-        )
-
-    gathered_max = torch.empty(
-        (tp_size * num_rows,),
-        device=local_state.max_values.device,
-        dtype=local_state.max_values.dtype,
-    )
-    gathered_arg = torch.empty(
-        (tp_size * num_rows,),
-        device=local_state.argmax_ids.device,
-        dtype=local_state.argmax_ids.dtype,
-    )
-    gathered_lse = torch.empty(
-        (tp_size * num_rows,),
-        device=local_state.logsumexp.device,
-        dtype=local_state.logsumexp.dtype,
-    )
-    tp_group.all_gather_into_tensor(gathered_max, local_state.max_values.contiguous())
-    tp_group.all_gather_into_tensor(gathered_arg, local_state.argmax_ids.contiguous())
-    tp_group.all_gather_into_tensor(gathered_lse, local_state.logsumexp.contiguous())
-
-    gathered_max = gathered_max.view(tp_size, num_rows)
-    gathered_arg = gathered_arg.view(tp_size, num_rows)
-    gathered_lse = gathered_lse.view(tp_size, num_rows)
-    return merge_vocab_states(
-        [
-            VocabState(
-                max_values=gathered_max[rank],
-                argmax_ids=gathered_arg[rank],
-                logsumexp=gathered_lse[rank],
-                max_probs=torch.exp(gathered_max[rank] - gathered_lse[rank]),
-            )
-            for rank in range(tp_size)
-        ]
-    )
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -336,7 +267,7 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
-    dllm_vocab_state: Optional[Any] = None
+    dllm_vocab_state: Optional[VocabState] = None
 
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
@@ -1214,16 +1145,17 @@ class LogitsProcessor(nn.Module):
     def _should_use_dllm_tp_local_vocab(self, lm_head: VocabParallelEmbedding) -> bool:
         if not envs.SGLANG_DLLM_TP_LOCAL_VOCAB.get():
             return False
-        server_args = get_global_server_args()
-        if getattr(server_args, "dllm_algorithm", None) != "LowConfidence":
+        if get_exec().dllm.dllm_algorithm != "LowConfidence":
             return False
-        if _is_npu:
+        if _is_npu or _is_cpu:
             return False
         if self.use_attn_tp_group or self.do_tensor_parallel_all_gather_dp_attn:
             return False
         if not hasattr(lm_head, "weight"):
             return False
         if not hasattr(lm_head, "shard_indices"):
+            return False
+        if int(getattr(lm_head, "tp_size", 1)) != int(get_parallel().tp_size):
             return False
         return int(getattr(lm_head, "num_added_embeddings", 0)) == 0
 
@@ -1269,6 +1201,10 @@ class LogitsProcessor(nn.Module):
             )
 
         if local_logits.is_cuda and can_use_local_vocab_state_triton(valid_vocab_size):
+            from sglang.srt.dllm.tp_local_vocab_kernel import (
+                local_vocab_state_from_logits_triton,
+            )
+
             local_state = local_vocab_state_from_logits_triton(
                 local_logits=local_logits,
                 vocab_start=vocab_start,
@@ -1282,9 +1218,8 @@ class LogitsProcessor(nn.Module):
             )
 
         tp_size = int(get_parallel().tp_size)
-        global_max_vocab_id = _global_max_vocab_id_for_dllm_tp_state(
-            lm_head,
-            self.vocab_size,
+        global_max_vocab_id = (
+            int(getattr(lm_head, "org_vocab_size", self.vocab_size)) - 1
         )
         packed_gather = _should_pack_dllm_vocab_state_for_gather(global_max_vocab_id)
         if tp_size == 1:
@@ -1301,11 +1236,11 @@ class LogitsProcessor(nn.Module):
             )
             return local_state
 
-        merged_state = _merge_dllm_vocab_state_across_tp(
+        merged_state = gather_vocab_state_across_tp(
             local_state=local_state,
             tp_group=get_tp_group(),
             tp_size=tp_size,
-            global_max_vocab_id_inclusive=global_max_vocab_id,
+            packed=packed_gather,
         )
         emit_compact_vocab_state_trace(
             component="sglang.logits_processor._get_dllm_vocab_state",

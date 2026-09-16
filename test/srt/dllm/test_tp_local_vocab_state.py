@@ -5,20 +5,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.tp_local_vocab_state import (
     FLOAT32_EXACT_INT_LIMIT,
+    LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB,
+    VocabState,
     argmax_max_prob_from_logits_output,
     can_pack_vocab_ids_as_float32,
+    can_use_local_vocab_state_triton,
+    gather_vocab_state_across_tp,
     local_vocab_state_from_logits,
-    low_confidence_transfer_mask,
     merge_gathered_packed_vocab_state,
     merge_vocab_states,
     pack_vocab_state_for_tp_gather,
-    VocabState,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-    _slice_prefill_logits_output,
+    PrefillCudaGraphRunner,
 )
 
 ENDPOINT_BASELINE_URL_ENV = "SGLANG_DLLM_BASELINE_URL"
@@ -26,7 +30,9 @@ ENDPOINT_TP_LOCAL_URL_ENV = "SGLANG_DLLM_TP_LOCAL_VOCAB_URL"
 ENDPOINT_TP_LOCAL_TRACE_ENV = "SGLANG_DLLM_TP_LOCAL_VOCAB_TRACE_JSONL"
 
 
-def _dense_argmax_and_max_prob(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _dense_argmax_and_max_prob(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     logits = logits.float()
     max_values, argmax_ids = torch.max(logits, dim=-1)
     max_probs = torch.exp(max_values - torch.logsumexp(logits, dim=-1))
@@ -36,18 +42,8 @@ def _dense_argmax_and_max_prob(logits: torch.Tensor) -> tuple[torch.Tensor, torc
 def test_low_confidence_tp_state_matches_dense_logits():
     torch.manual_seed(0)
     logits = torch.randn(9, 23, dtype=torch.float32)
-    input_ids = torch.tensor([99, 99, 3, 99, 4, 99, 99, 7, 99], dtype=torch.long)
-    mask_id = 99
-    threshold = 0.19
 
     dense_argmax_ids, dense_max_probs = _dense_argmax_and_max_prob(logits)
-    dense_transfer = low_confidence_transfer_mask(
-        input_ids=input_ids,
-        argmax_ids=dense_argmax_ids,
-        max_probs=dense_max_probs,
-        mask_id=mask_id,
-        threshold=threshold,
-    )
 
     shard_sizes = [5, 11, 7]
     states = []
@@ -63,18 +59,12 @@ def test_low_confidence_tp_state_matches_dense_logits():
         vocab_start += shard_size
 
     merged = merge_vocab_states(states)
-    merged_transfer = low_confidence_transfer_mask(
-        input_ids=input_ids,
-        argmax_ids=merged.argmax_ids,
-        max_probs=merged.max_probs,
-        mask_id=mask_id,
-        threshold=threshold,
-    )
 
     torch.testing.assert_close(merged.max_probs, dense_max_probs)
-    torch.testing.assert_close(merged.logsumexp, torch.logsumexp(logits.float(), dim=-1))
+    torch.testing.assert_close(
+        merged.logsumexp, torch.logsumexp(logits.float(), dim=-1)
+    )
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
-    assert torch.equal(merged_transfer, dense_transfer)
 
 
 def test_local_vocab_state_ignores_padded_vocab_entries():
@@ -113,56 +103,6 @@ def test_local_vocab_state_ignores_padded_vocab_entries():
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
 
-def test_joint_threshold_penalty_matches_dense_logits():
-    logits = torch.tensor(
-        [
-            [0.2, 1.0, 0.1, -0.1, 0.0, 0.3, -0.4, 0.6],
-            [0.5, 0.2, 1.4, 0.8, 0.1, 1.7, 0.4, -0.2],
-            [1.3, 0.1, -0.5, 1.6, 0.2, 0.0, 1.5, 0.4],
-            [0.0, 0.7, 0.2, -0.3, 1.9, 0.8, 0.1, 1.8],
-        ],
-        dtype=torch.float32,
-    )
-    penalty_token_ids = torch.tensor([-1, 5, 3, 6], dtype=torch.long)
-    penalty_lambda = 0.75
-
-    dense_penalized = logits.clone()
-    row_ids = torch.arange(logits.shape[0])
-    penalized_rows = penalty_token_ids >= 0
-    dense_penalized[row_ids[penalized_rows], penalty_token_ids[penalized_rows]] -= (
-        penalty_lambda
-    )
-    dense_argmax_ids, dense_max_probs = _dense_argmax_and_max_prob(dense_penalized)
-
-    first_state = local_vocab_state_from_logits(
-        local_logits=logits[:, :3],
-        vocab_start=0,
-        penalized_token_ids=penalty_token_ids,
-        penalty_lambda=penalty_lambda,
-    )
-    second_state = local_vocab_state_from_logits(
-        local_logits=logits[:, 3:6],
-        vocab_start=3,
-        penalized_token_ids=penalty_token_ids,
-        penalty_lambda=penalty_lambda,
-    )
-    third_state = local_vocab_state_from_logits(
-        local_logits=logits[:, 6:],
-        vocab_start=6,
-        penalized_token_ids=penalty_token_ids,
-        penalty_lambda=penalty_lambda,
-    )
-
-    merged = merge_vocab_states([first_state, second_state, third_state])
-
-    torch.testing.assert_close(merged.max_probs, dense_max_probs)
-    torch.testing.assert_close(
-        merged.logsumexp,
-        torch.logsumexp(dense_penalized.float(), dim=-1),
-    )
-    assert torch.equal(merged.argmax_ids, dense_argmax_ids)
-
-
 @pytest.mark.parametrize(
     ("seed", "rows", "vocab_size", "shard_sizes"),
     [
@@ -171,7 +111,7 @@ def test_joint_threshold_penalty_matches_dense_logits():
         (20260622, 13, 67, [17, 3, 19, 28]),
     ],
 )
-def test_random_low_confidence_tp_state_matches_dense_with_padding_and_penalty(
+def test_random_low_confidence_tp_state_matches_dense_with_padding(
     seed: int,
     rows: int,
     vocab_size: int,
@@ -179,22 +119,7 @@ def test_random_low_confidence_tp_state_matches_dense_with_padding_and_penalty(
 ):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     logits = torch.randn(rows, vocab_size, generator=generator, dtype=torch.float32)
-    penalty_token_ids = torch.randint(
-        low=0,
-        high=vocab_size + 1,
-        size=(rows,),
-        generator=generator,
-        dtype=torch.long,
-    ) - 1
-    penalty_lambda = 0.625
-
-    penalized = logits.clone()
-    row_ids = torch.arange(rows)
-    penalized_rows = penalty_token_ids >= 0
-    penalized[row_ids[penalized_rows], penalty_token_ids[penalized_rows]] -= (
-        penalty_lambda
-    )
-    dense_argmax_ids, dense_max_probs = _dense_argmax_and_max_prob(penalized)
+    dense_argmax_ids, dense_max_probs = _dense_argmax_and_max_prob(logits)
 
     states = []
     vocab_start = 0
@@ -212,8 +137,6 @@ def test_random_low_confidence_tp_state_matches_dense_with_padding_and_penalty(
                 local_logits=padded_logits,
                 vocab_start=vocab_start,
                 valid_vocab_size=shard_size,
-                penalized_token_ids=penalty_token_ids,
-                penalty_lambda=penalty_lambda,
             )
         )
         vocab_start += shard_size
@@ -223,7 +146,7 @@ def test_random_low_confidence_tp_state_matches_dense_with_padding_and_penalty(
     torch.testing.assert_close(merged.max_probs, dense_max_probs)
     torch.testing.assert_close(
         merged.logsumexp,
-        torch.logsumexp(penalized.float(), dim=-1),
+        torch.logsumexp(logits.float(), dim=-1),
     )
     assert torch.equal(merged.argmax_ids, dense_argmax_ids)
 
@@ -255,36 +178,6 @@ def test_triton_local_vocab_state_matches_reference_cuda():
     assert torch.equal(actual.argmax_ids, expected.argmax_ids)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_triton_local_vocab_state_applies_penalty_cuda():
-    from sglang.srt.dllm.tp_local_vocab_kernel import (
-        local_vocab_state_from_logits_triton,
-    )
-
-    torch.manual_seed(2)
-    logits = torch.randn(5, 29, device="cuda", dtype=torch.float32)
-    penalty_token_ids = torch.tensor([11, -1, 17, 30, 27], device="cuda")
-    penalty_lambda = 0.5
-
-    actual = local_vocab_state_from_logits_triton(
-        local_logits=logits,
-        vocab_start=9,
-        penalized_token_ids=penalty_token_ids,
-        penalty_lambda=penalty_lambda,
-    )
-    expected = local_vocab_state_from_logits(
-        local_logits=logits,
-        vocab_start=9,
-        penalized_token_ids=penalty_token_ids,
-        penalty_lambda=penalty_lambda,
-    )
-
-    torch.testing.assert_close(actual.max_values, expected.max_values)
-    torch.testing.assert_close(actual.max_probs, expected.max_probs)
-    torch.testing.assert_close(actual.logsumexp, expected.logsumexp)
-    assert torch.equal(actual.argmax_ids, expected.argmax_ids)
-
-
 def test_argmax_max_prob_uses_compact_state_without_full_logits():
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0]),
@@ -308,6 +201,53 @@ def test_argmax_max_prob_uses_compact_state_without_full_logits():
     torch.testing.assert_close(max_probs, torch.tensor([0.6, 0.7]))
 
 
+def test_low_confidence_step_accepts_compact_or_full_logits():
+    logits = torch.tensor(
+        [
+            [0.0, 3.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [0.0, 1.0, 4.0],
+            [3.0, 0.0, 1.0],
+        ]
+    )
+    config = DllmConfig(
+        algorithm="LowConfidence",
+        algorithm_config={"threshold": 0.5},
+        block_size=2,
+        mask_id=99,
+        max_running_requests=2,
+    )
+    algorithm = LowConfidence(config)
+    dense_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=torch.tensor([99, 7, 99, 99]),
+    )
+    compact_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=dense_batch.input_ids.clone(),
+    )
+
+    dense_done = algorithm.step(
+        dense_batch,
+        LogitsProcessorOutput(next_token_logits=None, full_logits=logits),
+        [None, None],
+    )
+    compact_done = algorithm.step(
+        compact_batch,
+        LogitsProcessorOutput(
+            next_token_logits=None,
+            dllm_vocab_state=local_vocab_state_from_logits(
+                local_logits=logits,
+                vocab_start=0,
+            ),
+        ),
+        [None, None],
+    )
+
+    assert dense_done == compact_done
+    assert torch.equal(dense_batch.input_ids, compact_batch.input_ids)
+
+
 def test_prefill_cuda_graph_slices_dllm_vocab_state_without_next_logits():
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0]),
@@ -324,11 +264,17 @@ def test_prefill_cuda_graph_slices_dllm_vocab_state_without_next_logits():
         dllm_vocab_state=state,
     )
 
-    sliced = _slice_prefill_logits_output(
+    runner = SimpleNamespace(
+        raw_num_tokens=2,
+        raw_bs=2,
+        _is_full_backend=False,
+        model_runner=SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False)
+        ),
+    )
+    sliced = PrefillCudaGraphRunner._trim_logits_output(
+        runner,
         output,
-        2,
-        is_dllm=True,
-        is_speculative=False,
     )
 
     assert sliced.next_token_logits is None
@@ -521,16 +467,10 @@ def test_pack_vocab_state_requires_float32_state_values():
 def test_packed_gather_gate_uses_vocab_upper_bound_and_env():
     import sglang.srt.layers.logits_processor as logits_processor
     from sglang.srt.environ import envs
-    from sglang.srt.dllm.tp_local_vocab_kernel import (
-        LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB,
-        can_use_local_vocab_state_triton,
-    )
 
     assert can_pack_vocab_ids_as_float32(151669)
     assert not can_pack_vocab_ids_as_float32(FLOAT32_EXACT_INT_LIMIT + 1)
-    assert can_use_local_vocab_state_triton(
-        LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB
-    )
+    assert can_use_local_vocab_state_triton(LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB)
     assert not can_use_local_vocab_state_triton(
         LOCAL_VOCAB_STATE_TRITON_MAX_BLOCK_VOCAB + 1
     )
@@ -546,9 +486,6 @@ def test_packed_gather_gate_uses_vocab_upper_bound_and_env():
 
 
 def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
-    from sglang.srt.environ import envs
-    from sglang.srt.layers.logits_processor import _merge_dllm_vocab_state_across_tp
-
     states = [
         VocabState(
             max_values=torch.tensor([2.0, 5.0], dtype=torch.float32),
@@ -582,8 +519,7 @@ def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
             )
             if input_tensor.dim() == 2:
                 packed_states = [
-                    pack_vocab_state_for_tp_gather(state)
-                    for state in self.all_states
+                    pack_vocab_state_for_tp_gather(state) for state in self.all_states
                 ]
                 output.copy_(torch.cat(packed_states, dim=0))
                 return
@@ -597,25 +533,24 @@ def test_dllm_vocab_state_tp_merge_uses_rank_uniform_packed_or_legacy_path():
             output.copy_(torch.cat(values))
             self.float_call_index += 1
 
-    with envs.SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER.override(True):
-        packed_group = FakeTPGroup(states)
-        packed = _merge_dllm_vocab_state_across_tp(
-            local_state=states[0],
-            tp_group=packed_group,
-            tp_size=len(states),
-            global_max_vocab_id_inclusive=151669,
-        )
-        assert len(packed_group.calls) == 1
-        assert packed_group.calls[0][0] == (len(states) * 2, 3)
+    packed_group = FakeTPGroup(states)
+    packed = gather_vocab_state_across_tp(
+        local_state=states[0],
+        tp_group=packed_group,
+        tp_size=len(states),
+        packed=True,
+    )
+    assert len(packed_group.calls) == 1
+    assert packed_group.calls[0][0] == (len(states) * 2, 3)
 
-        legacy_group = FakeTPGroup(states)
-        legacy = _merge_dllm_vocab_state_across_tp(
-            local_state=states[0],
-            tp_group=legacy_group,
-            tp_size=len(states),
-            global_max_vocab_id_inclusive=FLOAT32_EXACT_INT_LIMIT + 1,
-        )
-        assert len(legacy_group.calls) == 3
+    legacy_group = FakeTPGroup(states)
+    legacy = gather_vocab_state_across_tp(
+        local_state=states[0],
+        tp_group=legacy_group,
+        tp_size=len(states),
+        packed=False,
+    )
+    assert len(legacy_group.calls) == 3
 
     torch.testing.assert_close(packed.max_probs, legacy.max_probs)
     assert torch.equal(packed.max_values, legacy.max_values)
@@ -636,8 +571,14 @@ def test_logits_processor_tp_local_vocab_gate(monkeypatch):
 
     monkeypatch.setattr(
         logits_processor,
-        "get_global_server_args",
-        lambda: SimpleNamespace(dllm_algorithm="LowConfidence"),
+        "get_exec",
+        lambda: SimpleNamespace(dllm=SimpleNamespace(dllm_algorithm="LowConfidence")),
+    )
+    monkeypatch.setattr(logits_processor, "_is_cpu", False)
+    monkeypatch.setattr(
+        logits_processor,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=2),
     )
 
     with envs.SGLANG_DLLM_TP_LOCAL_VOCAB.override(False):
@@ -651,15 +592,19 @@ def test_logits_processor_tp_local_vocab_gate(monkeypatch):
 
         monkeypatch.setattr(
             logits_processor,
-            "get_global_server_args",
-            lambda: SimpleNamespace(dllm_algorithm="JointThreshold"),
+            "get_exec",
+            lambda: SimpleNamespace(
+                dllm=SimpleNamespace(dllm_algorithm="JointThreshold")
+            ),
         )
         assert should_use(processor, lm_head) is False
 
         monkeypatch.setattr(
             logits_processor,
-            "get_global_server_args",
-            lambda: SimpleNamespace(dllm_algorithm="LowConfidence"),
+            "get_exec",
+            lambda: SimpleNamespace(
+                dllm=SimpleNamespace(dllm_algorithm="LowConfidence")
+            ),
         )
         assert (
             should_use(
@@ -685,16 +630,19 @@ def test_logits_processor_tp_local_vocab_gate(monkeypatch):
 
         global_added_lm_head = SimpleNamespace(
             weight=torch.empty(1),
+            tp_size=2,
             num_added_embeddings=2,
             shard_indices=SimpleNamespace(num_added_elements=0),
         )
         clean_lm_head = SimpleNamespace(
             weight=torch.empty(1),
+            tp_size=2,
             num_added_embeddings=0,
             shard_indices=SimpleNamespace(num_added_elements=0),
         )
         lora_wrapped_lm_head = SimpleNamespace(
             weight=torch.empty(1),
+            tp_size=2,
             num_added_embeddings=0,
             base_layer=SimpleNamespace(
                 shard_indices=SimpleNamespace(
@@ -707,6 +655,18 @@ def test_logits_processor_tp_local_vocab_gate(monkeypatch):
         assert should_use(processor, global_added_lm_head) is False
         assert should_use(processor, clean_lm_head) is True
         assert should_use(processor, lora_wrapped_lm_head) is False
+        assert (
+            should_use(
+                processor,
+                SimpleNamespace(
+                    weight=torch.empty(1),
+                    tp_size=1,
+                    num_added_embeddings=0,
+                    shard_indices=SimpleNamespace(num_added_elements=0),
+                ),
+            )
+            is False
+        )
 
 
 def test_dllm_vocab_state_logit_scale_matches_full_logits_dtype_order(monkeypatch):
@@ -953,10 +913,6 @@ def test_baseline_and_tp_local_vocab_endpoints_match_when_configured():
 
 
 def test_cuda_graph_replay_slice_preserves_compact_vocab_state():
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-        _slice_dllm_vocab_state,
-    )
-
     state = VocabState(
         max_values=torch.tensor([1.0, 2.0, 3.0, 4.0]),
         argmax_ids=torch.tensor([10, 11, 12, 13]),
@@ -964,7 +920,7 @@ def test_cuda_graph_replay_slice_preserves_compact_vocab_state():
         max_probs=torch.tensor([0.6, 0.7, 0.8, 0.9]),
     )
 
-    sliced = _slice_dllm_vocab_state(state, 2)
+    sliced = state.slice_rows(2)
 
     assert sliced is not None
     torch.testing.assert_close(sliced.max_values, torch.tensor([1.0, 2.0]))
