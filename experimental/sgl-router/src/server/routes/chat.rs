@@ -289,6 +289,18 @@ pub async fn chat_completions(
         .as_ref()
         .map(|config| config.session_affinity_mode)
         .unwrap_or(SessionAffinityMode::Bucket);
+    // The queue gate (`--worker-queue-limit`) applies to the cache-aware
+    // candidate resolution and, beneath it, to primary/backup admission and
+    // the min-load range fallback. It does NOT reach the
+    // `CapacityFallbackPowerOfTwo` last resort: by the time that fires no
+    // worker in the domain is capacity-admitted, so there is no unqueued
+    // destination left to prefer.
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.worker_queue_limit);
     // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
     let worker = select_prefill_worker(&PrefillSelectionInputs {
         policy: policy.as_ref(),
@@ -307,6 +319,7 @@ pub async fn chat_completions(
         ttft_slo_ms,
         tps_slo,
         session_affinity_mode,
+        worker_queue_limit,
     })
     .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
@@ -526,6 +539,7 @@ pub async fn chat_completions(
         let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
 
         let prefill_url = worker.url.clone();
+        let prefill_protocol = worker.protocol();
         let prefill_breaker = Arc::clone(&worker.breaker);
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
@@ -542,6 +556,7 @@ pub async fn chat_completions(
             match prefill_proxy
                 .forward_json_to(
                     &prefill_url,
+                    prefill_protocol,
                     &prefill_breaker,
                     "/v1/chat/completions",
                     &prefill_headers,
@@ -575,6 +590,7 @@ pub async fn chat_completions(
                 Box::new((decode_guard, decode_active_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -592,6 +608,7 @@ pub async fn chat_completions(
             let _decode_hold = (decode_guard, decode_active_guard);
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
+                decode_worker.protocol(),
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -611,6 +628,7 @@ pub async fn chat_completions(
             Box::new((guard, active_guard, make_duration_guard()));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
@@ -640,6 +658,7 @@ pub async fn chat_completions(
         let _holds: (LoadGuard, _) = (guard, active_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
+            worker.protocol(),
             &worker.breaker,
             "/v1/chat/completions",
             &headers,
