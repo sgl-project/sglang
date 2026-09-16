@@ -40,6 +40,8 @@ class SparseBlockTable(CandidateMetadata):
     # [rows] int32: length of each row of the sparse logits: the published blocks
     # laid out block by block, the newest possibly partial (`candidate_row_lens`)
     valid_lens: torch.Tensor
+    # recorded on the side stream once the fields above are complete
+    ready: torch.cuda.Event
 
 
 def amax_topk_blocks(
@@ -70,6 +72,7 @@ def amax_topk_blocks(
 
 
 _ROW_IDS: dict = {}
+_ROW_IDS_RETIRED: list = []  # captured graphs keep reading the buffers they saw
 
 
 def _row_ids(rows: int, device: torch.device) -> torch.Tensor:
@@ -77,6 +80,12 @@ def _row_ids(rows: int, device: torch.device) -> torch.Tensor:
     every-row-its-own-request case costs no launch."""
     buf = _ROW_IDS.get(device)
     if buf is None or buf.numel() < rows:
+        assert not torch.cuda.is_current_stream_capturing(), (
+            f"row-id buffer grows to {rows} rows inside a CUDA graph capture; "
+            "warm up with the largest row count first"
+        )
+        if buf is not None:
+            _ROW_IDS_RETIRED.append(buf)
         size = max(8192, -(-rows // 8192) * 8192)
         buf = _ROW_IDS[device] = torch.arange(size, dtype=torch.int32, device=device)
     return buf[:rows]
@@ -161,7 +170,6 @@ class DeepGemmCandidateIndexer:
         self.topk_blocks = topk_blocks
         self.block_size = block_size
         self.alt_stream = torch.cuda.Stream()
-        self.need_wait = False
 
     def publish_decode(
         self,
@@ -184,10 +192,10 @@ class DeepGemmCandidateIndexer:
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
-        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        main_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(main_stream)
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
-        self.need_wait = True
         # TODO(candidate): one kernel for both selections below (dense logits read once)
         topk_transform_paged_v2(
             logits,
@@ -217,11 +225,17 @@ class DeepGemmCandidateIndexer:
                 inputs.q_fp4.dtype,
                 inputs.request_ids,
             )
+            # select_decode reads these on the main stream
+            for t in (blocks, schedule, phys_blocks, row_valid_lens):
+                t.record_stream(main_stream)
+            ready = torch.cuda.Event()
+            ready.record(self.alt_stream)
             return SparseBlockTable(
                 blocks=blocks,
                 schedule=schedule,
                 phys_blocks=phys_blocks,
                 valid_lens=row_valid_lens,
+                ready=ready,
             )
 
     def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
@@ -248,9 +262,7 @@ class DeepGemmCandidateIndexer:
         given)."""
         assert raw_indices is None
         table = candidate_metadata
-        if self.need_wait:
-            self.need_wait = False
-            torch.cuda.current_stream().wait_stream(self.alt_stream)
+        torch.cuda.current_stream().wait_event(table.ready)
         logits = self.scores(table, inputs)
         # decode carries no raw_indices; the kernel writes slots only
         topk_transform_sparse(logits, table.valid_lens, table, page_indices)
