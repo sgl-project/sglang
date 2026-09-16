@@ -221,6 +221,12 @@ def get_nccl_ep_graph_resources():
     return get_resources().buffers.get("nccl_ep_graph_resources")
 
 
+def is_nccl_ep_graph_capture():
+    """Include Graph-specific warmup, but exclude serving eager fallbacks."""
+    owner = get_nccl_ep_graph_resources()
+    return owner is not None and owner.capturing
+
+
 def nccl_ep_eager_session():
     owner = get_nccl_ep_graph_resources()
     return owner.submission_session("eager") if owner is not None else nullcontext()
@@ -243,3 +249,6 @@ def destroy_nccl_ep_resources():
 
         torch.cuda.synchronize()
         NcclEpBuffer.destroy()
+    from .nccl_ep_stream import destroy_nccl_ep_streams
+
+    destroy_nccl_ep_streams()

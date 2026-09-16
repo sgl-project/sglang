@@ -17,8 +17,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.test.test_utils import CustomTestCase
 
-class TestNcclEpStageStateMachine(unittest.TestCase):
+
+class TestNcclEpStageStateMachine(CustomTestCase):
     """Test the _Stage enum and _update_stage guard."""
 
     def test_stage_enum_has_four_states(self):
@@ -79,7 +81,7 @@ class TestNcclEpStageStateMachine(unittest.TestCase):
             dispatcher.combine_a(MagicMock())
 
 
-class TestNcclEpDispatchHooks(unittest.TestCase):
+class TestNcclEpDispatchHooks(CustomTestCase):
     """Test the DeepEPPDispatchHooks mechanism for SBO."""
 
     def test_dispatch_hooks_initialized(self):
@@ -153,7 +155,7 @@ class TestNcclEpDispatchHooks(unittest.TestCase):
         self.assertEqual(call_order, ["dispatch_a", "hook", "dispatch_b"])
 
 
-class TestMaxNumSmsResolution(unittest.TestCase):
+class TestMaxNumSmsResolution(CustomTestCase):
     """Test NcclEpBuffer._resolve_max_num_sms."""
 
     def test_default_value(self):
@@ -194,7 +196,7 @@ class TestMaxNumSmsResolution(unittest.TestCase):
             self.assertEqual(result, 5)
 
 
-class TestSBOAssertAcceptsNcclEp(unittest.TestCase):
+class TestSBOAssertAcceptsNcclEp(CustomTestCase):
     """Test that the SBO assert in deepseek_v2.py accepts NcclEpDispatcher."""
 
     def test_nccl_ep_dispatcher_is_accepted(self):
@@ -213,7 +215,7 @@ class TestSBOAssertAcceptsNcclEp(unittest.TestCase):
         )
 
 
-class TestForwardNormalSkipArConsistency(unittest.TestCase):
+class TestForwardNormalSkipArConsistency(CustomTestCase):
     """Test skip_ar behavior for nccl_ep backend."""
 
     def test_skip_ar_false_for_nccl_ep(self):
@@ -241,7 +243,7 @@ class TestForwardNormalSkipArConsistency(unittest.TestCase):
         self.assertFalse(result)
 
 
-class TestNcclEpFuseAllreduceBehavior(unittest.TestCase):
+class TestNcclEpFuseAllreduceBehavior(CustomTestCase):
     """Test NCCL EP backend causes fuse_mlp_allreduce=False."""
 
     def test_aiter_fusion_requires_a2a_none(self):
@@ -251,7 +253,7 @@ class TestNcclEpFuseAllreduceBehavior(unittest.TestCase):
         self.assertTrue(MoeA2ABackend.NONE.is_none())
 
 
-class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
+class TestNcclEpDispatcherEpGroupType(CustomTestCase):
     """Test that create_moe_dispatcher passes get_tp_group() as ep_group."""
 
     def test_create_moe_dispatcher_passes_tp_group_as_ep_group(self):
@@ -288,7 +290,7 @@ class TestNcclEpDispatcherEpGroupType(unittest.TestCase):
                     self.assertIs(call_kwargs.kwargs["ep_group"], tp_group_mock)
 
 
-class TestNcclRuntimeVersionParsing(unittest.TestCase):
+class TestNcclRuntimeVersionParsing(CustomTestCase):
     """Test the selected nccl4py core VersionInfo API and conservative fallback."""
 
     def test_returns_none_when_no_nccl4py(self):
@@ -334,7 +336,7 @@ class TestNcclRuntimeVersionParsing(unittest.TestCase):
                 self.assertEqual(result, (2, 28, 9))
 
 
-class TestNcclEpCapabilityCheck(unittest.TestCase):
+class TestNcclEpCapabilityCheck(CustomTestCase):
     """Test is_nccl_ep_available() and nccl_ep_unavailable_reason()."""
 
     def test_unavailable_reason_returns_str_or_none(self):
@@ -354,7 +356,7 @@ class TestNcclEpCapabilityCheck(unittest.TestCase):
         self.assertIsInstance(result, bool)
 
 
-class TestNcclEpHiddenAllowlist(unittest.TestCase):
+class TestNcclEpHiddenAllowlist(CustomTestCase):
     """Test that NcclEpDispatcher enforces the hidden size allowlist."""
 
     def test_allowed_hidden_sizes(self):
@@ -375,7 +377,7 @@ class TestNcclEpHiddenAllowlist(unittest.TestCase):
             self.assertNotIn(h, _NCCL_EP_LL_SUPPORTED_HIDDEN)
 
 
-class TestNcclEpTopkGuard(unittest.TestCase):
+class TestNcclEpTopkGuard(CustomTestCase):
     """Test that NcclEpDispatcher enforces topk <= 9 guard."""
 
     def test_topk_guard_constant(self):

@@ -122,12 +122,12 @@ def test_pp_dynamic_chunk_growth_is_rejected(model_path, supported_gpu):
         server_args(model_path, pp_size=2, enable_dynamic_chunking=True)
 
 
-@pytest.mark.parametrize(
-    "overlap", ["enable_single_batch_overlap", "enable_two_batch_overlap"]
-)
-def test_non_triton_overlap_is_rejected(model_path, supported_gpu, overlap):
+@pytest.mark.parametrize("runner", ["triton", "deep_gemm"])
+def test_tbo_is_rejected(model_path, supported_gpu, runner):
     with pytest.raises(ValueError, match="NCCL EP.*overlap"):
-        server_args(model_path, moe_runner_backend="deep_gemm", **{overlap: True})
+        server_args(
+            model_path, moe_runner_backend=runner, enable_two_batch_overlap=True
+        )
 
 
 def test_triton_unavailable_fallback_uses_standard_dispatch(model_path, monkeypatch):
@@ -228,6 +228,14 @@ def test_fp16_eager_input_is_rejected_before_handle_creation():
         with pytest.raises(ValueError, match="NCCL EP.*bfloat16"):
             forward_layer(dispatcher, x, ids, weights, rank=0)
         assert env.events.count("handle_create") == 0
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_eplb_is_rejected_before_native_setup(model_path, supported_gpu, graph):
+    with pytest.raises(ValueError, match="(?i)eplb"):
+        server_args(
+            model_path, tp_size=2, enable_eplb=True, enable_nccl_ep_cuda_graph=graph
+        )
 
 
 if __name__ == "__main__":

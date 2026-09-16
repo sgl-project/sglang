@@ -7,12 +7,17 @@ import torch
 import torch.nn.functional as F
 
 
-def configure_compute(*, graph_enabled=False):
+def configure_compute(*, graph_enabled=False, dispatch_algorithm=None):
     from sglang.srt.arg_groups.arg_utils import NS
     from sglang.srt.runtime_context import get_context
 
     @dataclass
     class ComputeConfig:
+        device: Annotated[str, NS("device")] = "cuda"
+        moe_dense_tp_size: Annotated[int, NS("parallel")] = 1
+        ep_dispatch_algorithm: Annotated[str | None, NS("exec.moe")] = (
+            dispatch_algorithm
+        )
         enable_fused_moe_sum_all_reduce: Annotated[bool, NS("exec.moe")] = False
         enable_nccl_ep_cuda_graph: Annotated[bool, NS("exec.moe")] = graph_enabled
         rl_on_policy_target: Annotated[str | None, NS("exec.deterministic")] = None

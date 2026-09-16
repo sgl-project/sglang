@@ -4031,7 +4031,6 @@ class ServerArgs:
             name.replace("_", "-")
             for name in (
                 "enable_two_batch_overlap",
-                "enable_single_batch_overlap",
                 "enable_pdmux",
                 "enable_eplb",
                 "elastic_ep_backend",
@@ -6347,6 +6346,36 @@ class ServerArgs:
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _a2a_fusion_adjustments)
 
+        view = resolved_view(self)
+        nccl_ep_overlap = (
+            view.moe_a2a_backend == "nccl_ep" and self.enable_single_batch_overlap
+        )
+        if nccl_ep_overlap:
+            if (
+                self.device != "cuda"
+                or view.moe_runner_backend != "triton"
+                or self.enable_two_batch_overlap
+                or self.nnodes != 1
+                or self.enable_pdmux
+                or self.enable_torch_compile
+                or self.enable_memory_saver
+                or self.speculative_algorithm is not None
+                or self.enable_eplb
+            ):
+                raise ValueError(
+                    "NCCL EP overlap requires single-node CUDA NCCL EP Triton "
+                    "SBO without TBO, PDMux, compile, memory saver, speculation or EPLB"
+                )
+            model = self.get_model_config()
+            quant = getattr(model.hf_config, "quantization_config", {}) or {}
+            if (
+                model.hf_config.architectures[0]
+                not in ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
+                or (view.quantization or quant.get("quant_method")) != "fp8"
+                or quant.get("weight_block_size") != [128, 128]
+            ):
+                raise ValueError("NCCL EP overlap requires DeepSeek V2/V3 FP8")
+
         if (
             self.enable_nccl_ep_cuda_graph
             and resolved_view(self).moe_a2a_backend != "nccl_ep"
@@ -6366,6 +6395,8 @@ class ServerArgs:
             if reason is not None:
                 if self.enable_nccl_ep_cuda_graph:
                     raise ValueError(f"NCCL EP CUDA Graph is unavailable: {reason}")
+                if nccl_ep_overlap:
+                    raise ValueError(f"NCCL EP overlap is unavailable: {reason}")
                 # Triton consumes standard dispatch output outside NCCL EP;
                 # there is no DeepEP -> Triton format adapter.
                 fallback = (
@@ -6468,14 +6499,15 @@ class ServerArgs:
                 )
 
         if a2a_backend == "nccl_ep":
-            if self.enable_single_batch_overlap or self.enable_two_batch_overlap:
-                raise ValueError("NCCL EP LL does not support single/two batch overlap")
+            if self.enable_two_batch_overlap:
+                raise ValueError("NCCL EP LL does not support two batch overlap")
+            if self.enable_eplb:
+                raise ValueError("NCCL EP LL does not support EPLB")
             self._handle_nccl_ep_token_budget()
             if resolved_view(self).moe_runner_backend == "triton":
                 unsupported = [
                     name
                     for name in (
-                        "enable_eplb",
                         "enforce_shared_experts_fusion",
                         "enable_lora",
                     )
