@@ -29,7 +29,7 @@ def _jit_topk_v1_module():
 
 @cache_once
 def _jit_topk_v2_module():
-    from sglang.kernels.ops.misc import get_max_active_clusters
+    from sglang.kernels.jit.utils.occupancy import get_max_active_clusters
 
     args = make_cpp_args(is_arch_support_pdl())
     # Leave these undefined if the probe fails: topk_v2.cuh carries per-arch
@@ -98,102 +98,6 @@ def topk_transform_bf16_small(
     )
 
 
-@cache_once
-def _jit_amax_copy_module():
-    args = make_cpp_args(is_arch_support_pdl())
-    return load_jit(
-        make_name("amax_copy"),
-        *args,
-        cuda_files=["deepseek_v4/amax_copy.cuh"],
-        cuda_wrappers=[("amax8_varlen", f"AmaxCopyKernel<{args}>::amax8_varlen")],
-    )
-
-
-def amax8_varlen(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    topk: int = 0,
-    *,
-    max_seqlen: int = 0,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Level-one keys of the two-level indexer: ``out[b, i]`` is the max of
-    ``scores[b, 8 i : 8 i + 8]`` for ``i < ceil(seq_lens[b] / 8)``, the last of
-    them ``+inf`` (the newest block is always selected), nothing written past
-    that count. Rows with at most ``topk`` blocks are skipped (every block is
-    selected anyway); ``topk=0`` never skips. ``out`` is allocated as
-    ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
-    the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
-    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
-    of 8). Returns ``out``.
-    """
-    if out is None:
-        num_tokens, max_len = scores.shape
-        if max_seqlen == 0:
-            max_seqlen = max_len
-        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
-    _jit_amax_copy_module().amax8_varlen(scores, seq_lens, out, topk)
-    return out
-
-
-@cache_once
-def _jit_sort_idx_module():
-    args = make_cpp_args(is_arch_support_pdl())
-    return load_jit(
-        make_name("sort_idx"),
-        *args,
-        cuda_files=["deepseek_v4/sort_idx.cuh"],
-        cuda_wrappers=[
-            ("transform", f"SortIdxKernel<{args}>::transform"),
-            ("transform_pages", f"SortIdxKernel<{args}>::transform_pages"),
-        ],
-    )
-
-
-def sort_candidate_blocks(
-    blocks: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    *,
-    out_pages: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """The block table of the two-level indexer from a row's selected blocks,
-    in place: ``blocks`` ``[rows, k]`` int32 block ids in any order, ``-1``
-    padded, become the same ids ascending with ``INT32_MAX`` past ``min(k,
-    ceil(seq_lens[b] / 8))``; the matching pool slots / 8 (``page_table[b, id //
-    bpp] * bpp + id % bpp``, ``bpp = page_size // 8``, same padding) go to
-    ``out_pages``. A row with at most ``k`` blocks gets the identity table
-    regardless of its input. Returns ``out_pages``.
-    """
-    if out_pages is None:
-        out_pages = torch.empty_like(blocks)
-    _jit_sort_idx_module().transform(blocks, seq_lens, page_table, out_pages, page_size)
-    return out_pages
-
-
-def transform_candidate_blocks(
-    blocks: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    *,
-    out_pages: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """The page transform of ``sort_candidate_blocks`` alone, for a block top-k
-    that already emits ascending ids: ``out_pages[b, t]`` is the pool slot / 8 of
-    ``blocks[b, t]`` for ``t < min(k, ceil(seq_lens[b] / 8))`` (which must be
-    valid block ids), ``INT32_MAX`` past that; ``blocks`` is not modified.
-    Returns ``out_pages``.
-    """
-    if out_pages is None:
-        out_pages = torch.empty_like(blocks)
-    _jit_sort_idx_module().transform_pages(
-        blocks, seq_lens, page_table, out_pages, page_size
-    )
-    return out_pages
-
-
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -236,6 +140,19 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
+
+
+def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
+    """Whether :func:`plan_topk_v2` writes a plan for these lengths. Small
+    batches and devices without clusters leave the plan buffer untouched."""
+    probe = torch.full(
+        (seq_lens.shape[0] + 1, _PLAN_METADATA_INTS_PER_BATCH),
+        -1,
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
+    return probe[0, 1].item() != -1
 
 
 def topk_transform_ragged_v2(
