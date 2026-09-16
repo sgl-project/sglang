@@ -23,7 +23,7 @@ Ensure sufficient disk space before proceeding. The Docker image requires at lea
 First, launch the SGLang environment using the provided container image:
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```shell Command
 export IMAGE=quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -46,7 +46,7 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```shell Command
 export IMAGE=quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -214,8 +214,8 @@ For more details, refer to the [EvalScope documentation](https://evalscope.readt
 
 ### SGLang Server Startup Failure
 
-1. Verify device mapping: A2 uses `davinci[0-7]`, A3 uses `davinci[0-15]`
-2. Confirm image tag matches device type: A2 uses `...-910b`, A3 uses `...-a3`
+1. Verify device mapping: A2 Series uses `davinci[0-7]`, A3 Series uses `davinci[0-15]`
+2. Confirm image tag matches device type: A2 Series uses `...-910b`, A3 Series uses `...-a3`
 3. Check NPU status with `npu-smi info`
 4. First run requires model download; set `HF_ENDPOINT=https://hf-mirror.com` if network access is restricted
 

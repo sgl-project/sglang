@@ -27,8 +27,8 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     """One server covering both worker pools: multi-tokenizer and
     multi-detokenizer (the flags are orthogonal)."""
 
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod

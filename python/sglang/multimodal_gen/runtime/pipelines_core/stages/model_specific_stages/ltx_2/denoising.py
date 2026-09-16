@@ -12,11 +12,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_world_size,
 )
-from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
-    dispatch_branches,
-)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_gather,
     cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -38,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -101,6 +100,48 @@ class LTX2GuidancePassSpec:
     disable_v2a_cross_attn: bool = False
 
 
+def _prepare_ltx2_rope_coords_for_bcg(
+    *,
+    enabled: bool,
+    current_model,
+    latent_model_input: torch.Tensor,
+    audio_latent_model_input: torch.Tensor,
+    video_coords: torch.Tensor | None,
+    audio_coords: torch.Tensor | None,
+    num_frames: int,
+    height: int,
+    width: int,
+    audio_num_frames: int,
+    fps: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build missing LTX-2 RoPE coordinates before CUDA graph capture.
+
+    The legacy LTX-2.3 one-stage path normally builds these tensors inside the
+    model forward. That performs an unpinned host-to-device copy, which CUDA
+    graph capture rejects. Preparing the same coordinates before entering the
+    graph preserves the eager values and makes both legacy and two-stage LTX
+    forwards capturable.
+    """
+    if not enabled:
+        return video_coords, audio_coords
+    if video_coords is None:
+        video_coords = current_model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=fps,
+        )
+    if audio_coords is None:
+        audio_coords = current_model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=audio_num_frames,
+            device=audio_latent_model_input.device,
+        )
+    return video_coords, audio_coords
+
+
 class LTX2DenoisingStage(DenoisingStage):
     """
     LTX-2 specific denoising stage that handles joint video and audio generation.
@@ -136,6 +177,8 @@ class LTX2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.sampler_name = sampler_name
+        # set per request by _prepare_denoising_loop before the cache-dit hook
+        self._disable_cache_dit_for_request = False
 
     def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
         return self.prepare_extra_func_kwargs(
@@ -209,144 +252,6 @@ class LTX2DenoisingStage(DenoisingStage):
             cfg_model_parallel_all_reduce(audio_partial),
         )
 
-    def _run_legacy_one_stage_multi_branch_cfg_parallel(
-        self,
-        *,
-        base_model_kwargs: dict[str, object],
-        ctx: "LTX2DenoisingContext",
-        step: "DenoisingStepState",
-        encoder_hidden_states: torch.Tensor,
-        audio_encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor | None,
-        negative_encoder_hidden_states: torch.Tensor,
-        negative_audio_encoder_hidden_states: torch.Tensor,
-        negative_encoder_attention_mask: torch.Tensor | None,
-        need_perturbed: bool,
-        need_modality: bool,
-        stage1_guider_params: dict[str, object],
-    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """Multi-branch CFG parallel for the legacy LTX-2.3 one-stage path.
-
-        Distributes up to 4 forward passes (cond, neg, perturbed, modality)
-        across CFG ranks via round-robin.  Each rank runs only its assigned
-        passes, then an all-gather collects every output so all ranks can
-        compute the guidance combination locally.
-        """
-        cfg_rank = get_classifier_free_guidance_rank()
-        cfg_world_size = get_classifier_free_guidance_world_size()
-
-        # Build kwargs for every pass in canonical order.
-        all_passes: list[tuple[str, dict[str, object]]] = [
-            (
-                "cond",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=encoder_hidden_states,
-                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                ),
-            ),
-            (
-                "neg",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=negative_encoder_hidden_states,
-                    audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                    encoder_attention_mask=negative_encoder_attention_mask,
-                ),
-            ),
-        ]
-        if need_perturbed:
-            all_passes.append(
-                (
-                    "perturbed",
-                    self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        skip_video_self_attn_blocks=tuple(
-                            stage1_guider_params["video_stg_blocks"]
-                        ),
-                        skip_audio_self_attn_blocks=tuple(
-                            stage1_guider_params["audio_stg_blocks"]
-                        ),
-                    ),
-                )
-            )
-        if need_modality:
-            all_passes.append(
-                (
-                    "modality",
-                    self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                        disable_a2v_cross_attn=True,
-                        disable_v2a_cross_attn=True,
-                    ),
-                )
-            )
-
-        pass_names = [name for name, _ in all_passes]
-        n_passes = len(pass_names)
-        assignments = dispatch_branches(n_passes, cfg_world_size)
-        my_indices = assignments[cfg_rank]
-        max_local = max(len(a) for a in assignments)
-
-        local_videos: list[torch.Tensor] = []
-        local_audios: list[torch.Tensor] = []
-
-        indices_to_run = my_indices if my_indices else [0]
-        with set_forward_context(
-            current_timestep=step.step_index, attn_metadata=step.attn_metadata
-        ):
-            for idx in indices_to_run:
-                _, kwargs = all_passes[idx]
-                v, a = step.current_model(**kwargs)
-                local_videos.append(v.float())
-                local_audios.append(a.float())
-
-        if not my_indices:
-            # This rank has no real branch, but it still needs tensor shapes for all-gather.
-            # The dummy branch above provides the shapes; zeros keep this rank from contributing.
-            local_videos = [torch.zeros_like(local_videos[0])]
-            local_audios = [torch.zeros_like(local_audios[0])]
-
-        # Pad to max_local for unbalanced cases (n_passes not divisible by n_ranks).
-        while len(local_videos) < max_local:
-            local_videos.append(torch.zeros_like(local_videos[0]))
-            local_audios.append(torch.zeros_like(local_audios[0]))
-
-        # Stack -> [max_local, B, ...], flatten to [max_local*B, ...] for all-gather.
-        local_v = torch.stack(local_videos, dim=0)
-        local_a = torch.stack(local_audios, dim=0)
-        B = local_v.shape[1]
-        local_v_flat = local_v.reshape(max_local * B, *local_v.shape[2:])
-        local_a_flat = local_a.reshape(max_local * B, *local_a.shape[2:])
-
-        # All-gather along batch dim -> [cfg_world_size * max_local * B, ...].
-        all_v_flat = cfg_model_parallel_all_gather(local_v_flat, dim=0)
-        all_a_flat = cfg_model_parallel_all_gather(local_a_flat, dim=0)
-
-        # Reshape to [cfg_world_size, max_local, B, ...].
-        all_v = all_v_flat.reshape(cfg_world_size, max_local, B, *all_v_flat.shape[1:])
-        all_a = all_a_flat.reshape(cfg_world_size, max_local, B, *all_a_flat.shape[1:])
-
-        # Branch i was run by rank (i % cfg_world_size) at slot (i // cfg_world_size).
-        return {
-            name: (
-                all_v[i % cfg_world_size, i // cfg_world_size],
-                all_a[i % cfg_world_size, i // cfg_world_size],
-            )
-            for i, name in enumerate(pass_names)
-        }
-
     @staticmethod
     def _get_video_latent_num_frames_for_model(
         batch: Req, server_args: ServerArgs, latents: torch.Tensor
@@ -402,14 +307,12 @@ class LTX2DenoisingStage(DenoisingStage):
             )
         return latents[:, :orig_s, :].contiguous()
 
-    def _maybe_enable_cache_dit(self, num_inference_steps: int, batch: Req) -> None:
-        """Disable cache-dit for TI2V-style requests to avoid stale activations.
-
-        NOTE: base denoising stage calls this hook with (num_inference_steps, batch).
-        """
-        if getattr(self, "_disable_cache_dit_for_request", False):
-            return
-        return super()._maybe_enable_cache_dit(num_inference_steps, batch)
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """TI2V requests must not cache stale activations; reporting "not
+        requested" lets the base stage unmount hooks a prior request left."""
+        if self._disable_cache_dit_for_request:
+            return False
+        return super()._cache_dit_requested_for_batch(batch)
 
     def _get_ltx2_stage1_guider_params(
         self, batch: Req, server_args: ServerArgs, stage: str
@@ -521,7 +424,11 @@ class LTX2DenoisingStage(DenoisingStage):
         noise = torch.randn(
             reference_tensor.shape,
             generator=generator,
-            dtype=torch.float64,
+            dtype=(
+                torch.float32
+                if not current_platform.is_float64_supported()
+                else torch.float64
+            ),
             device=reference_tensor.device,
         )
         noise = (noise - noise.mean()) / noise.std()
@@ -1169,28 +1076,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
-            if server_args.enable_breakable_cuda_graph:
-                # The in-model RoPE coordinate construction builds host
-                # tensors (torch.tensor(list, device=cuda)), which is an
-                # unpinned H2D copy and therefore illegal inside CUDA graph
-                # capture. Build the coords outside the captured region with
-                # the exact same rope helpers (start_frame=0 == the sp<=1
-                # in-model path), so values are bit-identical.
-                if video_coords is None:
-                    video_coords = step.current_model.rope.prepare_video_coords(
-                        batch_size=int(latent_model_input.shape[0]),
-                        num_frames=ctx.latent_num_frames_for_model,
-                        height=ctx.latent_height,
-                        width=ctx.latent_width,
-                        device=latent_model_input.device,
-                        fps=batch.fps,
-                    )
-                if audio_coords is None:
-                    audio_coords = step.current_model.audio_rope.prepare_audio_coords(
-                        batch_size=int(audio_latent_model_input.shape[0]),
-                        num_frames=audio_num_frames_latent,
-                        device=audio_latent_model_input.device,
-                    )
+        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+            enabled=server_args.enable_breakable_cuda_graph,
+            current_model=step.current_model,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            num_frames=ctx.latent_num_frames_for_model,
+            height=ctx.latent_height,
+            width=ctx.latent_width,
+            audio_num_frames=audio_num_frames_latent,
+            fps=batch.fps,
+        )
 
         batch_size = int(latent_model_input.shape[0])
         use_raw_sigma_timestep = ctx.use_ltx23_hq_timestep_semantics
@@ -2686,8 +2584,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list negative prompt embeddings for LTX-2 CFG."""
-        return (
-            lambda x: (not batch.do_classifier_free_guidance)
+        return lambda x: (
+            (not batch.do_classifier_free_guidance)
             or V.is_tensor(x)
             or V.list_not_empty(x)
         )

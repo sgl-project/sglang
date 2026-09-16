@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -68,12 +69,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
         cls.bootstrap_port = f"{int(base_port) + 500}"
+        # Pin distinct nccl (torch.distributed rendezvous) ports below the
+        # ephemeral range; otherwise both sides derive them from get_free_port()
+        # and can race onto the same port, failing at init_process_group with
+        # EADDRINUSE.
+        cls.prefill_nccl_port = f"{int(base_port) + 300}"
+        cls.decode_nccl_port = f"{int(base_port) + 400}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.base_url = cls.lb_url
         print(
-            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} "
+            f"{cls.bootstrap_port=} {cls.prefill_nccl_port=} {cls.decode_nccl_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
         if cls.capture_per_side_logs:
@@ -85,11 +93,13 @@ class PDDisaggregationServerBase(CustomTestCase):
 
         # config transfer backend and rdma devices
         cls._mc_gid_index_set = False
+        cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
+            cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -104,6 +114,13 @@ class PDDisaggregationServerBase(CustomTestCase):
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)
 
+    @classmethod
+    def rdma_devices_for(cls, gpu_indices) -> list:
+        """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
+        if not is_in_ci():
+            return cls.rdma_devices
+        return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
+
     # Subclasses can set these to customize server args
     extra_prefill_args = []
     extra_decode_args = []
@@ -116,10 +133,14 @@ class PDDisaggregationServerBase(CustomTestCase):
             "prefill",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.prefill_tp_size)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -141,12 +162,16 @@ class PDDisaggregationServerBase(CustomTestCase):
             "decode",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
             "--tp",
             str(cls.decode_tp_size),
             "--base-gpu-id",
             str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.decode_base_gpu_id, cls.decode_base_gpu_id + cls.decode_tp_size)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -214,10 +239,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+        if getattr(cls, "_ucx_net_devices_set", False):
+            os.environ.pop("UCX_NET_DEVICES", None)
+        # The LB holds no device state, and popen_with_error_check only stays
+        # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
+        if cls.process_lb:
+            try:
+                kill_process_tree(cls.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"Error killing process {cls.process_lb.pid}: {e}")
+        for process in [cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
@@ -315,93 +349,56 @@ def _get_available_ib_devices():
     return devices if devices else None
 
 
-def get_rdma_devices_args():
+def get_rdma_devices_args(gpu_indices=None) -> str:
+    """RDMA devices for a server pinned to `gpu_indices`, as absolute node ids.
+
+    Ids relative to a group base would map a decode server pinned with
+    `--base-gpu-id 4` onto the first NICs, across the socket boundary.
+    """
+
     def _parse_list_env(var_name: str):
         val = os.getenv(var_name)
-        if not val:
-            return None
-        items = [x.strip() for x in val.split(",") if x.strip()]
+        items = [x.strip() for x in (val or "").split(",") if x.strip()]
         return items or None
 
-    def _pick_default_pair(rdma_all_devices):
-        return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
-
-    # Priority: env var > auto-detect > hardcoded fallback
     rdma_all_devices = (
         _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
         or _get_available_ib_devices()
         or [f"mlx5_roce{i}" for i in range(8)]
     )
-    logger.warning("Resolved rdma_all_devices=%s", rdma_all_devices)
-
     n_rdma = len(rdma_all_devices)
 
-    # 1. Get visible GPU indices
-    cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
-    if not cuda_visible_devices:
-        warnings.warn("CUDA_VISIBLE_DEVICES is not set. Using default RDMA devices.")
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
+    if gpu_indices is None:
+        gpu_indices = _parse_list_env("CUDA_VISIBLE_DEVICES") or []
     try:
-        # Convert to list of integers (handling possible spaces and empty strings)
-        gpu_indices = [
-            int(idx.strip()) for idx in cuda_visible_devices.split(",") if idx.strip()
-        ]
-        if not gpu_indices or len(gpu_indices) > 4:
-            return ",".join(_pick_default_pair(rdma_all_devices))
+        gpu_indices = sorted({int(g) for g in gpu_indices})
     except ValueError:
-        warnings.warn(f"Invalid CUDA_VISIBLE_DEVICES format: {cuda_visible_devices}")
-        return ",".join(_pick_default_pair(rdma_all_devices))
+        warnings.warn(f"Invalid GPU indices: {gpu_indices}")
+        gpu_indices = []
+    if not gpu_indices:
+        return ",".join([rdma_all_devices[0], rdma_all_devices[n_rdma // 2]])
 
-    # 2. Calculate base RDMA index group (each group of 4 GPUs uses consecutive devices)
-    base_rdma_group = (min(gpu_indices) // 4) * 4
-    for gpu_idx in gpu_indices:
-        if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
-            warnings.warn(
-                f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group+3}"
-            )
-
-    # 3. Generate RDMA device names
-    # Detect total GPUs on the node (not just visible ones)
     try:
         import torch
 
         total_gpus = torch.cuda.device_count()
     except Exception:
-        total_gpus = 8  # Fallback to common 8-GPU setup
+        total_gpus = 0
+    total_gpus = total_gpus or max(8, gpu_indices[-1] + 1)
 
-    # Handle edge cases
-    if total_gpus == 0:
-        total_gpus = 8
-    if n_rdma > total_gpus:
-        logger.warning(
-            "More RDMA devices (%d) than GPUs (%d), using first and middle device",
-            n_rdma,
-            total_gpus,
-        )
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
-    # Calculate how many GPUs share each RDMA device
     gpus_per_rdma = max(1, total_gpus // n_rdma)
+    devices = [
+        rdma_all_devices[min(gpu // gpus_per_rdma, n_rdma - 1)] for gpu in gpu_indices
+    ]
+    resolved = ",".join(dict.fromkeys(devices))
     logger.warning(
-        "GPU-to-RDMA mapping: total_gpus=%d, n_rdma=%d, gpus_per_rdma=%d",
+        "RDMA for gpus=%s: total_gpus=%d n_rdma=%d -> %s",
+        gpu_indices,
         total_gpus,
         n_rdma,
-        gpus_per_rdma,
+        resolved,
     )
-
-    rdma_devices = []
-    base_gpu = min(gpu_indices)
-    for gpu_idx in gpu_indices:
-        nic_index = min((gpu_idx - base_gpu) // gpus_per_rdma, n_rdma - 1)
-        rdma_devices.append(rdma_all_devices[nic_index])
-
-    if not rdma_devices:
-        return ",".join(_pick_default_pair(rdma_all_devices))
-
-    # Deduplicate while preserving order
-    return ",".join(dict.fromkeys(rdma_devices))
+    return resolved
 
 
 _IB_SYSFS = "/sys/class/infiniband"
@@ -481,4 +478,21 @@ def _maybe_set_roce_gid_index(ib_devices) -> bool:
         return False
     os.environ["MC_GID_INDEX"] = str(gid_index)
     logger.warning("RoCE fabric detected; set MC_GID_INDEX=%d for mooncake", gid_index)
+    return True
+
+
+def _maybe_set_ucx_net_devices(ib_devices) -> bool:
+    if not ib_devices or os.environ.get("UCX_NET_DEVICES"):
+        return False
+    if ib_devices.lstrip().startswith("{"):
+        # Per-GPU JSON mapping; UCX_NET_DEVICES cannot express it.
+        return False
+    devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
+    if not devices:
+        return False
+    net_devices = ",".join(f"{d}:1" for d in devices)
+    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
+    # device on the host, and that full-device init can stall inside the driver.
+    os.environ["UCX_NET_DEVICES"] = net_devices
+    logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

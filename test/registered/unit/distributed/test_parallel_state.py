@@ -37,16 +37,138 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("inplace_allreduce", [False, True])
+@pytest.mark.parametrize("alias_output", [False, True])
+def test_deterministic_reduce_scatter_preserves_input_and_selects_rank_shard(
+    monkeypatch, rank, inplace_allreduce, alias_output
+):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.rank_in_group = rank
+    coordinator.world_size = 4
+    # Flattened input is a valid reduce-scatter layout too.
+    input_ = torch.arange(24, dtype=torch.float32)
+    original = input_.clone()
+    output = input_.view(4, 2, 3)[rank] if alias_output else torch.empty((2, 3))
+    reduced = original + 100
+
+    def all_reduce(tensor):
+        assert tensor.data_ptr() != input_.data_ptr()
+        torch.testing.assert_close(tensor, original)
+        if inplace_allreduce:
+            tensor.copy_(reduced)
+            return tensor
+        return reduced
+
+    coordinator.all_reduce = Mock(side_effect=all_reduce)
+    coordinator._reduce_scatter_tensor = Mock(side_effect=AssertionError)
+    coordinator.reduce_scatter_tensor(output, input_)
+    torch.testing.assert_close(output, reduced.view(4, 2, 3)[rank])
+    if alias_output:
+        original.view(4, 2, 3)[rank].copy_(output)
+    torch.testing.assert_close(input_, original)
+    coordinator.all_reduce.assert_called_once()
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("sizes", [None, [1, 3, 2, 0]])
+def test_deterministic_reduce_scatterv_selects_rank_shard(monkeypatch, rank, sizes):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1")
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.rank_in_group = rank
+    coordinator.world_size = 4
+    rows = 8 if sizes is None else sum(sizes)
+    input_ = torch.arange(rows * 3, dtype=torch.float32).view(rows, 3)
+    original = input_.clone()
+    reduced = original + 100
+
+    def all_reduce(tensor):
+        assert tensor.data_ptr() != input_.data_ptr()
+        torch.testing.assert_close(tensor, original)
+        return reduced
+
+    coordinator.all_reduce = Mock(side_effect=all_reduce)
+    # pynccl must not be touched on the deterministic path.
+    coordinator.pynccl_comm = None
+    output = coordinator.reduce_scatterv(input_, sizes=sizes)
+
+    offset = (rows // 4) * rank if sizes is None else sum(sizes[:rank])
+    chunk = rows // 4 if sizes is None else sizes[rank]
+    torch.testing.assert_close(output, reduced.narrow(0, offset, chunk))
+    torch.testing.assert_close(input_, original)
+    coordinator.all_reduce.assert_called_once()
+
+
+def test_nondeterministic_reduce_scatter_keeps_native_path(monkeypatch):
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "0")
+    monkeypatch.setattr(parallel_state, "_is_cpu", True)
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator._reduce_scatter_tensor = Mock()
+    coordinator.all_reduce = Mock(side_effect=AssertionError)
+    input_ = torch.arange(8, dtype=torch.float32)
+    output = torch.empty(2)
+    coordinator.reduce_scatter_tensor(output, input_)
+    coordinator._reduce_scatter_tensor.assert_called_once_with(output, input_)
+
+
+def test_custom_allreduce_precedes_symmetric_memory_pynccl():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.unique_name = "test"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.qr_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator._fi_workspace_hint = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
+    coordinator.debug_check_symmetric_mempool = Mock()
+    input_ = Mock(is_cpu=False)
+    custom_output = object()
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(
+            parallel_state, "outplace_all_reduce", return_value=custom_output
+        ) as outplace_all_reduce,
+    ):
+        output = coordinator.all_reduce(input_)
+
+    assert output is custom_output
+    outplace_all_reduce.assert_called_once_with(
+        input_,
+        group_name="test",
+        outplace_all_reduce_method="ca",
+    )
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
 def test_parallel_group_construction_tp8_attn_cp2():
@@ -83,7 +205,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -104,7 +225,6 @@ def test_parallel_group_construction_tp8_attn_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -134,18 +254,18 @@ def test_parallel_group_construction_tp8_attn_cp2():
 
             # Verify ATTN_CP groups
             attn_cp_groups = created_groups.get("attn_cp", [])
-            assert (
-                len(attn_cp_groups) == 4
-            ), f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            assert len(attn_cp_groups) == 4, (
+                f"Expected 4 ATTN_CP groups, got {len(attn_cp_groups)}"
+            )
             expected_attn_cp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                attn_cp_groups == expected_attn_cp
-            ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            assert attn_cp_groups == expected_attn_cp, (
+                f"Wrong ATTN_CP groups: {attn_cp_groups}"
+            )
 
             print("TP=8, Attn CP=2 group construction verified")
 
@@ -183,7 +303,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.get_backend", return_value="nccl"),
     ):
-
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
 
@@ -204,7 +323,6 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             ),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
-
             # Mock world group
             mock_world = Mock()
             mock_world.device_group = Mock()
@@ -235,31 +353,31 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
 
             # Verify MOE_EP groups
             moe_ep_groups = created_groups.get("moe_ep", [])
-            assert (
-                len(moe_ep_groups) == 2
-            ), f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            assert len(moe_ep_groups) == 2, (
+                f"Expected 2 MOE_EP groups, got {len(moe_ep_groups)}"
+            )
             expected_moe_ep = [
                 [0, 1, 2, 3],
                 [4, 5, 6, 7],
             ]
-            assert (
-                moe_ep_groups == expected_moe_ep
-            ), f"Wrong MOE_EP groups: {moe_ep_groups}"
+            assert moe_ep_groups == expected_moe_ep, (
+                f"Wrong MOE_EP groups: {moe_ep_groups}"
+            )
 
             # Verify MOE_DP groups
             moe_dp_groups = created_groups.get("moe_dp", [])
-            assert (
-                len(moe_dp_groups) == 4
-            ), f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            assert len(moe_dp_groups) == 4, (
+                f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            )
             expected_moe_dp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
-            assert (
-                moe_dp_groups == expected_moe_dp
-            ), f"Wrong MOE_DP groups: {moe_dp_groups}"
+            assert moe_dp_groups == expected_moe_dp, (
+                f"Wrong MOE_DP groups: {moe_dp_groups}"
+            )
 
             print("TP=8, MoE EP=4, MoE CP=2 group construction verified")
 

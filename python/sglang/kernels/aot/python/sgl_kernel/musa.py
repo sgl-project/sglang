@@ -86,9 +86,9 @@ def musa_fused_gemv(
     out_shape = x.shape[:-1] + (
         qweight.shape[0] if not use_swigelu else qweight.shape[0] // 2,
     )
-    assert not (
-        use_swigelu and use_rms_norm
-    ), "gemv only fused one activation (swigelu or rms_norm)!"
+    assert not (use_swigelu and use_rms_norm), (
+        "gemv only fused one activation (swigelu or rms_norm)!"
+    )
 
     if use_rms_norm:
         if gamma is None:
@@ -113,9 +113,9 @@ def musa_fused_gemv(
         return output
     # w4a16 gemv
     elif qweight_scales is not None:
-        assert (
-            x.dtype == torch.bfloat16 or x.dtype == torch.float16
-        ), "W4A16 gemv only support bfloat16 or float16!"
+        assert x.dtype == torch.bfloat16 or x.dtype == torch.float16, (
+            "W4A16 gemv only support bfloat16 or float16!"
+        )
         use_int4_w4a16 = True
         out_shape = x.shape[:-1] + (
             qweight.shape[0] if not use_swigelu else qweight.shape[0] // 2,

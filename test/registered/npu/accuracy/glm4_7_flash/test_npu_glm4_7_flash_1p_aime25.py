@@ -7,10 +7,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import GLM_4_7_FLASH_MODE
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="",
+    est_time=6500,
+    suite="full-acc-2-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 ENVS = {
@@ -41,7 +40,7 @@ OTHER_ARGS = [
     "--trust-remote-code",
     "--mem-fraction-static",
     0.75,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,
@@ -58,7 +57,6 @@ OTHER_ARGS = [
 
 
 class TestNPUGLM_4_7_FLASH_1P_AIME25(TestNpuAccuracyTestCaseBase):
-
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

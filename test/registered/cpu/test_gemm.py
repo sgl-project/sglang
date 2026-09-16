@@ -1,9 +1,12 @@
 import unittest
 
 # TODO: use interface in cpu.py
+import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
-from utils import (
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
     convert_weight,
     native_w8a8_per_token_matmul,
@@ -13,11 +16,9 @@ from utils import (
     unpack_and_dequant_awq,
     unpack_and_dequant_gptq,
 )
-
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=9, suite="stage-a-test-cpu-intel")
 
 torch.manual_seed(1234)
 
@@ -32,7 +33,6 @@ class Mod(nn.Module):
 
 
 class TestGemm(CustomTestCase):
-
     @parametrize(
         M=[1, 101],
         N=[16, 32 * 13],
@@ -181,6 +181,41 @@ class TestGemm(CustomTestCase):
             data.dtype,
             prepack,
         )
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 11, 97],
+        N=[128, 224],
+        K=[512, 576],
+        scale_as_vector=[False, True],
+        has_bias=[False, True],
+        prepack=[False, True],
+    )
+    def test_fp8_per_tensor_gemm(self, M, N, K, scale_as_vector, has_bias, prepack):
+        data = torch.randn(M, K, dtype=torch.bfloat16) / 10
+        weight = torch.randn(N, K).to(torch.float8_e4m3fn)
+        scale = torch.tensor(0.01, dtype=torch.float32)
+        scales = scale.reshape(1) if scale_as_vector else scale
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        ref = torch.matmul(data.float(), weight.float().T) * scale
+        if bias is not None:
+            ref = ref + bias
+        ref = ref.bfloat16()
+
+        kernel_weight = (
+            torch.ops.sgl_kernel.convert_weight_packed(weight) if prepack else weight
+        )
+        out = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            data,
+            kernel_weight,
+            scales,
+            bias,
+            data.dtype,
+            prepack,
+        )
+
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 

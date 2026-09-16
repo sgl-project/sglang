@@ -16,9 +16,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_cpu_ids_by_node, is_cuda
+from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,17 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
                 executable, debug_str = _create_numactl_executable(
                     numactl_args=numactl_args
                 )
-                debug_str += (
-                    f", logical_gpu_id={gpu_id}, "
-                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-                )
+                if _is_xpu:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK', '')}"
+                    )
+                else:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                    )
                 with _mp_set_executable(executable=executable, debug_str=debug_str):
                     yield
                     return
@@ -93,9 +100,9 @@ def _mp_set_executable(executable: str, debug_str: str):
     try:
         yield
     finally:
-        assert (
-            os.fsdecode(multiprocessing.spawn.get_executable()) == executable
-        ), f"{multiprocessing.spawn.get_executable()=}"
+        assert os.fsdecode(multiprocessing.spawn.get_executable()) == executable, (
+            f"{multiprocessing.spawn.get_executable()=}"
+        )
         multiprocessing.spawn.set_executable(old_executable)
         logger.debug(f"mp.set_executable revert to {old_executable}")
 
@@ -129,6 +136,8 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     """
     if server_args.numa_node is not None:
         return server_args.numa_node[gpu_id]
+    if not envs.SGLANG_AUTO_NUMA_BIND.get():
+        return None
     if _is_numa_available():
         queried_numa_node = _query_numa_node_for_gpu(gpu_id)
         if len(queried_numa_node) == 0:
@@ -354,7 +363,7 @@ def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
     """
-    if not _is_cuda:
+    if not (_is_cuda or _is_xpu):
         return False
 
     # Check if this is a numa system.
@@ -381,10 +390,13 @@ def _query_numa_node_for_gpu(device_id: int):
     Get the NUMA node affinity list for a GPU device.
 
     Args:
-        device_id: CUDA logical device index (post-CUDA_VISIBLE_DEVICES).
+        device_id: Logical device index (post-CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK).
     Returns:
         List of NUMA node IDs that have affinity with the device.
     """
+    if _is_xpu:
+        return _query_numa_node_for_xpu(device_id)
+
     try:
         import pynvml
     except ModuleNotFoundError:
@@ -431,39 +443,197 @@ def _query_numa_node_for_gpu(device_id: int):
 
 def init_threads_binding(
     *,
-    tp_rank: int,
-    tp_size: int,
+    numa_index: int,
+    world_size: int,
 ):
     omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
     cpu_ids_by_node = get_cpu_ids_by_node()
     n_numa_node = len(cpu_ids_by_node)
     if omp_cpuids == "all":
-        assert tp_size <= n_numa_node, (
+        assert world_size <= n_numa_node, (
             f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-            f"tp_size {tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-            f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+            f"If you need more ranks than the number of numa nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
             f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
             f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
             f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-            f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-            f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
         )
-        if tp_size < n_numa_node:
+        if world_size < n_numa_node:
             logger.warning(
-                f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {tp_size}, so only {tp_size} numa nodes are used."
+                f"Detected the current machine has {n_numa_node} numa nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa nodes are used."
             )
-        local_omp_cpuid = cpu_ids_by_node[tp_rank]
+        assert 0 <= numa_index < n_numa_node, (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
+            f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
+        )
+        local_omp_cpuid = cpu_ids_by_node[numa_index]
     else:
         threads_bind_list = omp_cpuids.split("|")
-        assert tp_size == len(threads_bind_list), (
-            f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({tp_size}). "
-            f"Please double check your settings."
+        # Bound-check numa_index against the bind list rather than asserting
+        # world_size == len(...): in router mode each worker is an independent
+        # dp_size=1 server, so world_size is locally 1 and can't equal a
+        # multi-group bind string. numa_index (== the global gpu_id) is the
+        # correct frame here, so this per-rank bound both prevents IndexError
+        # and catches an under-sized bind list, without needing the global
+        # rank count.
+        assert 0 <= numa_index < len(threads_bind_list), (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for the {len(threads_bind_list)} SGLANG_CPU_OMP_THREADS_BIND entries. "
+            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size (across all DP workers)."
         )
-        local_omp_cpuid = threads_bind_list[tp_rank]
-        if tp_size > n_numa_node:
+        local_omp_cpuid = threads_bind_list[numa_index]
+        if world_size > n_numa_node:
             logger.warning(
-                f"TP size ({tp_size})is larger than numa node number ({n_numa_node}), "
+                f"The total number of ranks ({world_size}) is larger than numa node number ({n_numa_node}), "
                 f"in this case the available memory amount of each rank cannot be determined in prior. "
                 f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
             )
+    logger.info(
+        f"init_threads_binding: numa_index={numa_index}, world_size={world_size}, "
+        f"local_omp_cpuid={local_omp_cpuid}"
+    )
     return local_omp_cpuid
+
+
+def _list_xpu_pci_addresses():
+    """Intel GPU PCI addresses in Level Zero's physical device order."""
+    # sysfs, not the XPU runtime: this also runs in the launcher parent, where a
+    # torch XPU init pins ~170MB of device memory for the life of the server.
+    addresses = []
+    # Walk /dev/dri, which is what Level Zero opens and what a container narrows
+    # to the devices it was given; the sysfs PCI tree always shows every host GPU.
+    for node in glob.glob("/dev/dri/renderD*"):
+        if not os.access(node, os.R_OK | os.W_OK):
+            continue
+        device_link = os.path.join("/sys/class/drm", os.path.basename(node), "device")
+        try:
+            with open(os.path.join(device_link, "vendor")) as f:
+                vendor = f.read().strip()
+        except OSError:
+            continue
+        if vendor == "0x8086":
+            addresses.append(os.path.basename(os.path.realpath(device_link)))
+
+    # Level Zero sorts by PCI domain/bus/device/function, but places integrated
+    # GPUs last unless ZE_ENABLE_PCI_ID_DEVICE_ORDER is set
+    # (intel/compute-runtime, ExecutionEnvironment::comparePciIdBusNumber).
+    pci_id_order = os.environ.get("ZE_ENABLE_PCI_ID_DEVICE_ORDER", "").strip() not in (
+        "",
+        "0",
+    )
+    return sorted(
+        addresses,
+        key=lambda address: _xpu_pci_sort_key(
+            address, integrated_last=not pci_id_order
+        ),
+    )
+
+
+def _is_integrated_xpu(pci_address: str) -> bool:
+    # An Intel integrated GPU is always at domain 0000, bus 00.
+    domain, bus, _ = pci_address.split(":")
+    return int(domain, 16) == 0 and int(bus, 16) == 0
+
+
+def _xpu_pci_sort_key(pci_address: str, *, integrated_last: bool):
+    domain, bus, device_function = pci_address.split(":")
+    device, function = device_function.split(".")
+    return (
+        integrated_last and _is_integrated_xpu(pci_address),
+        int(domain, 16),
+        int(bus, 16),
+        int(device, 16),
+        int(function),
+    )
+
+
+def _xpu_visible_device_indices(num_devices: int):
+    """Physical XPU indices ZE_AFFINITY_MASK exposes, in logical index order."""
+    affinity_mask = os.environ.get("ZE_AFFINITY_MASK", "").strip()
+    if not affinity_mask or affinity_mask == "default":
+        return list(range(num_devices))
+
+    # ZE_AFFINITY_MASK filters instead of permuting like CUDA_VISIBLE_DEVICES
+    # (intel/compute-runtime, ExecutionEnvironment::parseAffinityMask).
+    indices = set()
+    for entry in affinity_mask.split(","):
+        try:
+            index = int(entry.strip().split(".")[0])
+        except ValueError:
+            continue
+        if 0 <= index < num_devices:
+            indices.add(index)
+    return sorted(indices)
+
+
+def _xpu_visible_pci_addresses(addresses: list, *, device_count: int):
+    """The candidate device list whose length matches what the runtime reports."""
+    # Level Zero can leave an integrated GPU out of its device list altogether,
+    # and it orders them last anyway, so retry without them before giving up.
+    for candidate in (addresses, [a for a in addresses if not _is_integrated_xpu(a)]):
+        visible = [candidate[i] for i in _xpu_visible_device_indices(len(candidate))]
+        if len(visible) == device_count:
+            return visible
+    return None
+
+
+def _xpu_pci_address(device_id: int) -> Optional[str]:
+    """Logical XPU device index -> its PCI address, or None if unresolvable.
+
+    The ZE_AFFINITY_MASK-aware counterpart of _get_nvml_device_index.
+    """
+    addresses = _list_xpu_pci_addresses()
+    if not addresses:
+        logger.warning(
+            "No Intel GPU render nodes found under /dev/dri, skipping NUMA node "
+            "configuration for XPU"
+        )
+        return None
+
+    # device_count() is the runtime's own count and needs no XPU init.
+    device_count = torch.xpu.device_count()
+    visible = _xpu_visible_pci_addresses(addresses, device_count=device_count)
+    if visible is None:
+        logger.warning(
+            f"Found {len(addresses)} Intel GPU(s) via /dev/dri but torch reports "
+            f"{device_count} XPU device(s) with ZE_AFFINITY_MASK="
+            f"{os.environ.get('ZE_AFFINITY_MASK', '')!r}, skipping NUMA node "
+            "configuration for XPU"
+        )
+        return None
+
+    if not 0 <= device_id < len(visible):
+        logger.warning(
+            f"XPU device {device_id} is out of range of the {len(visible)} "
+            "Intel GPU(s) found in sysfs, skipping NUMA node configuration for XPU"
+        )
+        return None
+    return visible[device_id]
+
+
+def _read_pci_numa_node(pci_address: str):
+    numa_path = f"/sys/bus/pci/devices/{pci_address}/numa_node"
+    try:
+        with open(numa_path) as f:
+            node = int(f.read().strip())
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Could not read {numa_path}: {e}, skipping NUMA node configuration for XPU"
+        )
+        return []
+
+    # The kernel reports -1 when the device has no NUMA affinity.
+    if node < 0:
+        return []
+    return [node]
+
+
+def _query_numa_node_for_xpu(device_id: int):
+    """NUMA node affinity list for an Intel XPU device, via sysfs."""
+    pci_address = _xpu_pci_address(device_id)
+    if pci_address is None:
+        return []
+    return _read_pci_numa_node(pci_address)

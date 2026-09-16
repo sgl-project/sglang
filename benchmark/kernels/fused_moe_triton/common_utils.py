@@ -82,9 +82,18 @@ def get_model_config(
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
+    ]:
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+    elif architecture in [
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -94,7 +103,9 @@ def get_model_config(
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekOCRForCausalLM",
         "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
         "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
@@ -107,6 +118,7 @@ def get_model_config(
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
@@ -136,6 +148,7 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -194,6 +207,9 @@ def get_model_config(
 
     # text_config may not carry torch_dtype; fall back to bf16.
     torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    # Only the DeepSeek family replaces leading MoE layers with dense ones.
+    dense_layers = getattr(config, "first_k_dense_replace", 0)
 
     return {
         "num_experts": E,
@@ -203,6 +219,8 @@ def get_model_config(
         "dtype": torch_dtype,
         "block_shape": block_shape,
         "architecture": architecture,
+        "num_layers": num_layers,
+        "dense_layers": dense_layers,
     }
 
 

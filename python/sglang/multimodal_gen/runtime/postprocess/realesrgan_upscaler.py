@@ -34,7 +34,10 @@ _DEFAULT_REALESRGAN_FILENAMES_BY_SCALE = {
     4: "RealESRGAN_x4.pth",
     8: "RealESRGAN_x8.pth",
 }
-_LOW_MEMORY_TILED_UPSCALE_FREE_BYTES = 2 * 1024**3
+# RRDBNet full-frame 1024x1024 inference can request several GiB of cuDNN
+# workspace beyond its output tensor. Keep enough headroom to avoid using an
+# allocator OOM as the normal tiled-dispatch mechanism.
+_FULL_FRAME_UPSCALE_MIN_FREE_BYTES = 12 * 1024**3
 _REALESRGAN_TILE_SIZE = 256
 _REALESRGAN_TILE_PAD = 32
 
@@ -343,7 +346,7 @@ class UpscalerModel:
         free_bytes, _ = torch.cuda.mem_get_info(self.device)
         output_bytes = h * w * self.scale * self.scale * 3 * 4
         required_free_bytes = max(
-            _LOW_MEMORY_TILED_UPSCALE_FREE_BYTES,
+            _FULL_FRAME_UPSCALE_MIN_FREE_BYTES,
             output_bytes * 4,
         )
         return free_bytes < required_free_bytes

@@ -20,9 +20,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -96,8 +95,9 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture"),
             ):
                 profiler, result = MetalCaptureProfiler.start_mlx(trace_path)
 
@@ -131,9 +131,10 @@ class TestMetalCaptureProfilerMLX(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "test.gputrace"
-            with patch.object(mx.metal, "start_capture"), patch.object(
-                mx.metal, "stop_capture"
-            ) as mock_stop:
+            with (
+                patch.object(mx.metal, "start_capture"),
+                patch.object(mx.metal, "stop_capture") as mock_stop,
+            ):
                 profiler, _ = MetalCaptureProfiler.start_mlx(trace_path)
                 profiler.stop()
                 mock_stop.assert_called_once()
@@ -185,7 +186,21 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestSchedulerProfilerManagerMPS(unittest.TestCase):
-    """SchedulerProfilerManager._start_profile handles Metal capture failures."""
+    """SchedulerProfilerManager._start_profile handles Metal capture failures.
+
+    apply_metal_profiler_patches() dispatches on use_mlx(), which reads
+    SGLANG_USE_MLX and is cached for the process (tensor_bridge.use_mlx).
+    This class exists to exercise the MPS strategy, so it pins use_mlx at
+    its point of use in profiler.py rather than the ambient environment;
+    an env-only pin would not reliably override an already-cached value.
+    """
+
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.hardware_backend.mlx.profiler.use_mlx", return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _make_manager(self, output_dir):
         from sglang.srt.managers.scheduler_components.profiler_manager import (
@@ -247,9 +262,12 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
             capture_ctx = MagicMock()
-            with mock_patch.object(
-                torch.mps.profiler, "metal_capture", return_value=capture_ctx
-            ), mock_patch("torch.distributed.barrier"):
+            with (
+                mock_patch.object(
+                    torch.mps.profiler, "metal_capture", return_value=capture_ctx
+                ),
+                mock_patch("torch.distributed.barrier"),
+            ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success, result.message)
                 self.assertTrue(mgr.profile_in_progress)

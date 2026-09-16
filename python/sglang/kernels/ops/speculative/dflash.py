@@ -244,3 +244,73 @@ def _prepare_dflash_draft_block_unchecked(
         BLOCK_SIZE=block,
         num_warps=num_warps,
     )
+
+
+@triton.jit
+def _selector_walk_kernel(
+    scores_ptr,
+    candidate_ptr,
+    uniforms_ptr,
+    temperatures_ptr,
+    greedy_ptr,
+    tokens_ptr,
+    q_ptr,
+    slots: tl.constexpr,
+    top_k: tl.constexpr,
+):
+    """One program per request: a slot's K scores stay in registers and the walk is a
+    loop, so the slot-to-slot dependency costs nothing instead of one kernel each."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, top_k)
+    temperature = tl.load(temperatures_ptr + row)
+    greedy = tl.load(greedy_ptr + row) != 0
+    previous = 0
+    for slot in range(slots):
+        base = (row * slots + slot) * top_k
+        scores = tl.load(scores_ptr + (base + previous) * top_k + offsets).to(
+            tl.float32
+        )
+        if greedy:
+            best = tl.max(scores, axis=0)
+            index = tl.min(tl.where(scores == best, offsets, top_k), axis=0)
+            probabilities = tl.where(offsets == index, 1.0, 0.0)
+        else:
+            scaled = scores / temperature
+            exponentials = tl.exp(scaled - tl.max(scaled, axis=0))
+            probabilities = exponentials / tl.sum(exponentials, axis=0)
+            uniform = tl.load(uniforms_ptr + row * slots + slot)
+            index = tl.sum(
+                tl.where(uniform >= tl.cumsum(probabilities, axis=0), 1, 0), axis=0
+            )
+            index = tl.minimum(index, top_k - 1)
+        tl.store(q_ptr + base + offsets, probabilities)
+        tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
+        previous = index
+
+
+def selector_walk_triton(
+    *,
+    candidate_ids,
+    scores,
+    uniforms,
+    temperatures,
+    greedy_mask,
+):
+    batch, slots, top_k = candidate_ids.shape
+    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+    q_rows = torch.empty(
+        (batch, slots, top_k), dtype=torch.float32, device=scores.device
+    )
+    _selector_walk_kernel[(batch,)](
+        scores.contiguous(),
+        candidate_ids.contiguous(),
+        uniforms.contiguous(),
+        temperatures.contiguous(),
+        greedy_mask.contiguous(),
+        tokens,
+        q_rows,
+        slots=slots,
+        top_k=top_k,
+        num_warps=1,
+    )
+    return tokens, q_rows

@@ -30,12 +30,17 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     _lse_pack_dim,
     correct_attn_out,
     dcp_lse_combine_triton,
+    dcp_pack_a2a_send,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_fi_a2a_supported
+
+_is_hip = is_hip()
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -85,7 +90,6 @@ def cp_lse_ag_out_rs_mha(
     cp_group: GroupCoordinator,
     return_lse: bool = False,
 ):
-    """Merge DCP partial attention outputs using natural-log LSE (PR #25090)."""
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
@@ -95,7 +99,8 @@ def cp_lse_ag_out_rs_mha(
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
-    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_attn_out.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    out.mul_(scale)
     out = cp_group.all_reduce(out)
 
     cp_num_heads = global_lse.shape[1] // cp_group.world_size
@@ -274,19 +279,21 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # On hip, skip the all-gather when there is no cached prefix to avoid crash
+    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
@@ -400,7 +407,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
             decode_cp_a2a_init_workspace,
         )
         from flashinfer.comm.mapping import Mapping
-        from flashinfer.comm.mnnvl import MnnvlConfig, is_mnnvl_fabric_supported
+        from flashinfer.comm.mnnvl import MnnvlConfig
     except ImportError as e:
         raise ImportError(
             "--dcp-comm-backend fi_a2a requires FlashInfer with the DCP "
@@ -415,15 +422,25 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         TorchDistributedCommBackend,
     )
 
-    if not is_mnnvl_fabric_supported(torch.cuda.current_device()):
-        raise RuntimeError(
-            "--dcp-comm-backend fi_a2a requires MNNVL fabric memory (e.g. "
-            "GB200 NVL72); is_mnnvl_fabric_supported() returned False. Use "
-            "--dcp-comm-backend a2a or ag_rs on clusters without MNNVL."
-        )
-
     cp_size = cp_group.world_size
     cp_rank = cp_group.rank_in_group
+    parallel = get_parallel()
+
+    if not is_fi_a2a_supported(
+        dcp_size=cp_size,
+        tp_size=parallel.tp_size,
+        pp_size=parallel.pp_size,
+        nnodes=parallel.nnodes,
+    ):
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a needs a Blackwell system whose DCP group "
+            "shares one MNNVL domain: either MNNVL fabric memory (GB200/GB300) "
+            f"or a DCP group inside one node (got dcp_size={cp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"nnodes={parallel.nnodes}). Use --dcp-comm-backend a2a or ag_rs "
+            "otherwise."
+        )
+
     mapping = Mapping(
         world_size=cp_size,
         rank=cp_rank,
@@ -476,34 +493,10 @@ def dcp_a2a_lse_reduce(
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
-    # Reshape [B, H, D] -> [N, B, H/N, D] — split heads across ranks
-    reshaped_out = cp_attn_out.view(B, N, H_per_rank, D).permute(1, 0, 2, 3)
-    reshaped_lse = cp_attn_lse.view(B, N, H_per_rank).permute(1, 0, 2)
-
     if cuda_graph_buffers is not None:
-        # CUDA graph path with pre-allocated fused buffers.
         send_combined = cuda_graph_buffers["send_combined"]
         recv_combined = cuda_graph_buffers["recv_combined"]
-        send_lse_stg = cuda_graph_buffers["send_lse"]
-        recv_lse_stg = cuda_graph_buffers["recv_lse"]
-
-        send_combined[:, :B, :, :D].copy_(reshaped_out)
-        send_lse_stg[:, :B, :].copy_(reshaped_lse)
-        send_combined[:, :, :, D:].copy_(
-            send_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd)
-        )
-
-        cp_group.all_to_all_single(
-            recv_combined.reshape(-1).view(torch.uint8),
-            send_combined.reshape(-1).view(torch.uint8),
-        )
-        recv_output = recv_combined[:, :B, :, :D]
-        recv_lse_stg.view(out_dtype).view(N, -1, H_per_rank, lpd).copy_(
-            recv_combined[:, :, :, D:]
-        )
-        recv_lse = recv_lse_stg[:, :B, :]
     else:
-        send_lse_contig = reshaped_lse.contiguous()  # [N, B, H_per_rank] fp32
         send_combined = torch.empty(
             N,
             B,
@@ -514,30 +507,23 @@ def dcp_a2a_lse_reduce(
         )
         recv_combined = torch.empty_like(send_combined)
 
-        send_combined[:, :, :, :D].copy_(reshaped_out)
-        send_combined[:, :, :, D:].copy_(
-            send_lse_contig.view(out_dtype).view(N, B, H_per_rank, lpd)
-        )
+    send_words = send_combined.view(torch.float32)
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        send_combined[:, :, :, :D],
+        send_words[:, :, :, D // lpd],
+    )
 
-        # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
-        # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
-        cp_group.all_to_all_single(
-            recv_combined.reshape(-1).view(torch.uint8),
-            send_combined.reshape(-1).view(torch.uint8),
-        )
+    # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
+    # which pynccl's dtype enum can't send; byte a2a is exact for equal chunks.
+    cp_group.all_to_all_single(
+        recv_combined.reshape(-1).view(torch.uint8),
+        send_combined.reshape(-1).view(torch.uint8),
+    )
 
-        recv_output = recv_combined[:, :, :, :D]
-        recv_lse_stg = torch.empty(
-            N,
-            B,
-            H_per_rank,
-            dtype=torch.float32,
-            device=cp_attn_out.device,
-        )
-        recv_lse_stg.view(out_dtype).view(N, B, H_per_rank, lpd).copy_(
-            recv_combined[:, :, :, D:]
-        )
-        recv_lse = recv_lse_stg
+    recv_output = recv_combined[:, :B, :, :D]
+    recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
@@ -569,16 +555,21 @@ def _dcp_fi_a2a_lse_reduce(
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
-    # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
-    # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].
-    partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
-    # softmax_stats: fp32 [B, H_per_rank, N, S=2] (FI requires S>=2 & even);
-    # carry the LSE in lane 0, lane 1 is ignored by the combine.
-    lse_view = cp_attn_lse.view(B, N, H_per_rank).permute(0, 2, 1)  # [B,H_pr,N]
-    softmax_stats = torch.zeros(
+    # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
+    # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
+    # field as opaque bytes and we only ever read slot 0 back off the wire.
+    partial_o = torch.empty(
+        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    softmax_stats = torch.empty(
         B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
     )
-    softmax_stats[..., 0] = lse_view
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        softmax_stats[..., 0].permute(2, 0, 1),
+    )
 
     o_out, stats_out = decode_cp_a2a_alltoall(
         partial_o,
@@ -588,9 +579,8 @@ def _dcp_fi_a2a_lse_reduce(
         N,
     )
 
-    # o_out[b,hpr,src] = rank src's partial for local head hpr -> combine layout.
-    recv_output = o_out.permute(2, 0, 1, 3).contiguous()  # [N, B, H_per_rank, D]
-    recv_lse = stats_out[..., 0].permute(2, 0, 1).contiguous()  # [N, B, H_per_rank]
+    recv_output = o_out.permute(2, 0, 1, 3)
+    recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e

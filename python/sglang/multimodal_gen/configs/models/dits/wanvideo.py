@@ -4,13 +4,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 
 @dataclass
 class WanVideoArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
-
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
@@ -103,9 +100,7 @@ class WanVideoArchConfig(DiTArchConfig):
     local_attn_size: int = (
         -1
     )  # Window size for temporal local attention (-1 indicates global attention)
-    sink_size: int = (
-        0  # Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
-    )
+    sink_size: int = 0  # Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
     num_frames_per_block: int = 3
     sliding_window_num_frames: int = 21
     attention_type: str = "original"

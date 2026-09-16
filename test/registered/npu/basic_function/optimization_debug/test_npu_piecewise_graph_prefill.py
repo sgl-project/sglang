@@ -27,7 +27,7 @@ class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
         0.8,
         "--attention-backend",
         "ascend",
-        "--cuda-graph-bs",
+        "--cuda-graph-bs-decode",
         128,
         "--cuda-graph-backend-prefill=tc_piecewise",
         "--cuda-graph-bs-prefill",

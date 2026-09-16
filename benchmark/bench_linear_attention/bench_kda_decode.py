@@ -4,6 +4,7 @@ Benchmark & Correctness: KDA Packed Decode vs Baseline Decode.
 Compares:
   - Baseline: split(mixed_qkv) -> view -> fused_sigmoid_gating_delta_rule_update(is_kda=True)
   - Packed:   fused_recurrent_kda_packed_decode (single fused kernel)
+  - Helion:   helion_fused_recurrent_kda_packed_decode
 
 Differences from the GDN packed decode benchmark:
   - KDA gate ``a`` is per-K with shape ``[B, HV * K]`` (instead of ``[B, HV]``).
@@ -27,6 +28,9 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 )
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.kernels.ops.attention.helion.kda_decode import (
+    helion_fused_recurrent_kda_packed_decode,
 )
 
 
@@ -131,6 +135,27 @@ def run_packed(inp):
     return out.transpose(0, 1), ssm_states
 
 
+def run_helion(inp):
+    """Helion path: same packed decode contract and output layout."""
+    B, HV, V = inp["B"], inp["HV"], inp["V"]
+    ssm_states = inp["ssm_states"].clone()
+    out = inp["mixed_qkv"].new_empty(B, 1, HV, V)
+
+    helion_fused_recurrent_kda_packed_decode(
+        mixed_qkv=inp["mixed_qkv"],
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=inp["K"] ** -0.5,
+        initial_state=ssm_states,
+        out=out,
+        ssm_state_indices=inp["cache_indices"],
+        use_qk_l2norm_in_kernel=True,
+    )
+    return out.transpose(0, 1), ssm_states
+
+
 def check_correctness(B, H, HV, K, V, pool_size, device, dtype, seed=42):
     """Run correctness check for a single config. Returns True if PASS."""
     tag = f"B={B:>4} H={H:>2} HV={HV:>2} K={K:>3} V={V:>3} pool={pool_size:>4}"
@@ -139,6 +164,7 @@ def check_correctness(B, H, HV, K, V, pool_size, device, dtype, seed=42):
 
     o_baseline, state_baseline = run_baseline(inp)
     o_packed, state_packed = run_packed(inp)
+    o_helion, state_helion = run_helion(inp)
 
     atol = 2e-2 if dtype != torch.float32 else 1e-4
     rtol = 1e-2 if dtype != torch.float32 else 1e-4
@@ -157,6 +183,19 @@ def check_correctness(B, H, HV, K, V, pool_size, device, dtype, seed=42):
         atol, rtol * state_baseline[indices].float().abs().max().item()
     )
 
+    helion_out_diff = (o_helion.float() - o_packed.float()).abs().max().item()
+    helion_state_diff = (
+        (state_helion[indices].float() - state_packed[indices].float())
+        .abs()
+        .max()
+        .item()
+    )
+    helion_ok = helion_out_diff <= max(
+        atol, rtol * o_packed.float().abs().max().item()
+    ) and helion_state_diff <= max(
+        atol, rtol * state_packed[indices].float().abs().max().item()
+    )
+
     passed = output_ok and state_ok
     if passed:
         print(
@@ -166,7 +205,12 @@ def check_correctness(B, H, HV, K, V, pool_size, device, dtype, seed=42):
         print(
             f"  [FAIL] {tag}  out max_diff={out_diff:.6f}, state max_diff={st_diff:.6f}"
         )
-    return passed
+    print(
+        f"  [{'PASS' if helion_ok else 'FAIL'}] Helion vs packed {tag}  "
+        f"(out max_diff={helion_out_diff:.2e}, "
+        f"state max_diff={helion_state_diff:.2e})"
+    )
+    return passed and helion_ok
 
 
 def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
@@ -213,6 +257,20 @@ def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
             use_qk_l2norm_in_kernel=True,
         )
 
+    def fn_helion():
+        helion_fused_recurrent_kda_packed_decode(
+            mixed_qkv=inp["mixed_qkv"],
+            a=inp["a"],
+            b=inp["b"],
+            A_log=inp["A_log"],
+            dt_bias=inp["dt_bias"],
+            scale=K**-0.5,
+            initial_state=inp["ssm_states"],
+            out=out_buf,
+            ssm_state_indices=inp["cache_indices"],
+            use_qk_l2norm_in_kernel=True,
+        )
+
     # Intentionally wall-clock CUDA-event timing, not the shared do_bench /
     # do_bench_cudagraph util: ~2/3 of the packed win is eager CPU dispatch
     # (split + 3x unflatten + extra launch), which graph capture / L2-flush
@@ -222,6 +280,7 @@ def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
     for _ in range(warmup):
         fn_baseline()
         fn_packed()
+        fn_helion()
     torch.cuda.synchronize()
 
     def _time(fn):
@@ -236,7 +295,7 @@ def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
 
     ms_baseline = _time(fn_baseline)
     ms_packed = _time(fn_packed)
-
+    ms_helion = _time(fn_helion)
     speedup = ms_baseline / ms_packed if ms_packed > 0 else float("inf")
     saved_us = (ms_baseline - ms_packed) * 1000
 
@@ -245,7 +304,9 @@ def bench_shape(B, H, HV, K, V, pool_size, device, dtype):
         f"{ms_baseline * 1000:>10.1f} | "
         f"{ms_packed * 1000:>10.1f} | "
         f"{speedup:>7.2f}x | "
-        f"{saved_us:>+9.1f}"
+        f"{saved_us:>+9.1f} | "
+        f"{ms_helion * 1000:>10.1f} | "
+        f"{ms_packed / ms_helion:>10.2f}x"
     )
 
 
@@ -289,8 +350,10 @@ def run_correctness(device, dtype):
     )
     o_baseline, _ = run_baseline(inp)
     o_packed, _ = run_packed(inp)
+    o_helion, _ = run_helion(inp)
     try:
         torch.testing.assert_close(o_packed, o_baseline, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(o_helion, o_packed, atol=2e-2, rtol=1e-2)
         print("  [PASS] PAD_SLOT_ID=-1 handling")
     except AssertionError as e:
         print(f"  [FAIL] PAD_SLOT_ID=-1 handling: {e}")
@@ -323,9 +386,11 @@ def run_benchmark(device, dtype, args):
         f"{'base (us)':>10} | "
         f"{'packed (us)':>10} | "
         f"{'speedup':>8} | "
-        f"{'saved (us)':>10}"
+        f"{'saved (us)':>10} | "
+        f"{'Helion (us)':>10} | "
+        f"{'packed/H':>11}"
     )
-    print("  " + "-" * 80)
+    print("  " + "-" * 116)
 
     for B, H, HV in bench_configs:
         # Packed kernel requires HV % H == 0 (GVA / grouped query layout).

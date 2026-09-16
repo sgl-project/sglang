@@ -1,6 +1,7 @@
 import logging
 from typing import Any, List
 
+from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     DEFAULT_TENANT_ID,
     MooncakeBaseStore,
@@ -9,7 +10,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
 logger = logging.getLogger(__name__)
 
 
-class MooncakeEmbeddingStore(MooncakeBaseStore):
+class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
     def __init__(
         self,
         storage_config: Any = None,

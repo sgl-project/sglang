@@ -44,7 +44,7 @@ def _run_accuracy_eval(
     eval_name: str,
     score_threshold: float,
     num_examples: Optional[int],
-    num_threads: int,
+    num_threads: Optional[int],
     accept_length_thres: Optional[float] = None,
     summary_label: Optional[str] = None,
     **eval_overrides,
@@ -60,13 +60,14 @@ def _run_accuracy_eval(
     ``None``, so the common case stays identical to ``run_eval``'s defaults.
     Returns the metrics dict.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
+    model = eval_overrides.pop("model", getattr(test_case, "model", None))
     kwargs = dict(
         base_url=test_case.base_url,
-        model=getattr(test_case, "model", None),
+        model=model,
         eval_name=eval_name,
         num_examples=num_examples,
         num_threads=num_threads,
@@ -110,21 +111,18 @@ def _run_sgl_eval(
     asserts the score meets ``score_threshold``, and checks the speculative accept
     length. ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking":
     True}`` so the server separates reasoning from the final answer. Skips the test
-    if sgl-eval (git-only) is not installed. Returns the RunResult.
+    if sgl-eval is not installed. Returns the RunResult.
     """
-    assert (
-        score_threshold == score_threshold
-    ), f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    assert score_threshold == score_threshold, (
+        f"{type(test_case).__name__} must set the {eval_name} score threshold"
+    )
 
     try:
         from sgl_eval.registry import get as get_eval_spec
         from sgl_eval.sampler import ChatCompletionSampler
         from sgl_eval.types import GenConfig
     except ImportError:
-        test_case.skipTest(
-            "sgl-eval not installed; pip install "
-            "'sgl-eval @ git+https://github.com/sgl-project/sgl-eval'"
-        )
+        test_case.skipTest("sgl-eval not installed; pip install 'sglang[test]'")
 
     base_url = test_case.base_url.rstrip("/")
     if not base_url.endswith("/v1"):
@@ -191,7 +189,12 @@ class GSM8KMixin:
     gsm8k_num_shots: int = 5  # run_eval backend only
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
+    gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
     gsm8k_n_repeats: int = 1  # sgl_eval backend
+    # None keeps run_eval's greedy default; set both to route the run through
+    # the sampling path.
+    gsm8k_temperature: Optional[float] = None
+    gsm8k_top_p: Optional[float] = None
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -212,6 +215,7 @@ class GSM8KMixin:
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
+                max_tokens=self.gsm8k_max_tokens,
                 accept_length_thres=self.gsm8k_accept_length_thres,
             )
         else:
@@ -225,15 +229,17 @@ class GSM8KMixin:
                 api="completion",
                 max_tokens=512,
                 num_shots=self.gsm8k_num_shots,
+                temperature=self.gsm8k_temperature,
+                top_p=self.gsm8k_top_p,
             )
 
 
 class MMLUMixin:
     """Mixin for MMLU evaluation.
 
-    Backend is selectable via ``mmlu_backend`` (default ``"run_eval"``; or
-    ``"sgl_eval"``: sgl-eval multichoice grader, skipped if sgl-eval is not
-    installed).
+    Both ``mmlu_backend`` values score through sgl-eval -- ``"sgl_eval"`` calls it
+    in-process, ``"run_eval"`` reaches the same CLI via ``run_eval``. The switch
+    picks the call mechanism, not the grader.
 
     Required attributes on the test class:
         base_url: str
@@ -270,6 +276,41 @@ class MMLUMixin:
                 num_threads=self.mmlu_num_threads,
                 accept_length_thres=self.mmlu_accept_length_thres,
             )
+
+
+class MMMUProMixin:
+    """Mixin for the standard 10-option MMMU-Pro evaluation via sgl-eval.
+
+    The model preset supplies the endpoint model and all generation settings.
+    Leaving those values to sgl-eval is important for reasoning models whose
+    recommended token budget and sampling settings differ from run_eval defaults.
+
+    Required attributes on the test class:
+        base_url: str
+        mmmu_pro_score_threshold: float
+        mmmu_pro_load_preset_from_model_id: str
+    """
+
+    mmmu_pro_score_threshold: float = _THRESHOLD_NOT_SET
+    mmmu_pro_accept_length_thres: Optional[float] = None
+    mmmu_pro_num_examples: Optional[int] = 300
+    mmmu_pro_num_threads: Optional[int] = None
+    mmmu_pro_load_preset_from_model_id: Optional[str] = None
+
+    def test_mmmu_pro(self):
+        assert self.mmmu_pro_load_preset_from_model_id, (
+            f"{type(self).__name__} must set mmmu_pro_load_preset_from_model_id"
+        )
+        _run_accuracy_eval(
+            self,
+            eval_name="mmmu_pro",
+            score_threshold=self.mmmu_pro_score_threshold,
+            num_examples=self.mmmu_pro_num_examples,
+            num_threads=self.mmmu_pro_num_threads,
+            accept_length_thres=self.mmmu_pro_accept_length_thres,
+            model=None,
+            load_preset_from_model_id=self.mmmu_pro_load_preset_from_model_id,
+        )
 
 
 class GPQAMixin:

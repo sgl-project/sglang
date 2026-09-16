@@ -23,7 +23,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+)
 
 try:
     from nixl_ep import Buffer
@@ -31,6 +34,13 @@ try:
     use_nixl = True
 except ImportError:
     use_nixl = False
+
+try:
+    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
+except ImportError:
+    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
+
+assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +55,6 @@ class NixlEPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("nixl_ep_state")
@@ -288,7 +296,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(NIXL_EP_TOPK_INDICES_DTYPE)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts

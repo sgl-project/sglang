@@ -1,13 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::SessionAffinityMode;
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::selection::{
+    select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
+};
+use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens};
+use crate::proxy::sse::StreamEnd;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    classify_stream_end, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -19,8 +26,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Observability header carrying the decode-pool URL selected via host
-/// affinity for a PD-disaggregated request. The router fans the
+/// Observability header carrying the final decode-pool URL for a
+/// PD-disaggregated request. The router fans the
 /// bootstrap-injected request body to BOTH the prefill and the decode
 /// worker concurrently; this header lets the prefill log the chosen
 /// peer, and is mirrored onto the response so sidecars / tests can
@@ -28,6 +35,10 @@ use std::sync::Arc;
 /// prefix matches `x-sgl-router-error-code` so router-emitted metadata
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
+/// Optional caller requirement consumed only when a static P Bucket config is enabled.
+const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
+/// Optional caller TPS requirement consumed only when a static D Bucket config is enabled.
+const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -39,14 +50,9 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
-/// long context — a ~1 M-token context tokenized as JSON fits under this —
-/// while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
-/// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
-/// layer; axum's `Bytes` extractor enforces it and returns 413
-/// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+/// Maximum buffered chat-completions body (32MiB). Sized for base64 multimodal inputs;
+/// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
+pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -66,6 +72,17 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Explicit output budget used by Decode Bucket routing.
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+impl RequestProbe {
+    fn requested_max_output_tokens(&self) -> Option<u64> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -89,6 +106,24 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
+fn policy_selection_failed(
+    ctx: &AppContext,
+    model: &str,
+    reason: PolicySelectionFailureReason,
+) -> ApiError {
+    ctx.metrics
+        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    tracing::warn!(
+        policy = %ctx.config.model.policy,
+        reason = reason.as_str(),
+        model,
+        "prefill policy selection failed"
+    );
+    ApiError::PolicySelectionFailed {
+        model: model.to_owned(),
+    }
+}
+
 /// POST /v1/chat/completions — parse model from body, select a healthy
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
@@ -101,6 +136,7 @@ pub async fn chat_completions(
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
+    let requested_max_output_tokens = probe.requested_max_output_tokens();
     let model_str = probe
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
@@ -145,12 +181,18 @@ pub async fn chat_completions(
     //     chat encoder (`/v1/completions` / `text`), which the first gate
     //     alone wouldn't trigger.
     //
-    // When neither holds, `parse_probe`'s minimal probe is enough, so we keep
+    //   * Bucket routing also needs the prompt token count.
+    //
+    // When none holds, `parse_probe`'s minimal probe is enough, so we keep
     // avoiding the full `serde_json::Value` allocation over a (up to 1 MiB)
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
-    let want_tokens = ctx.tokenizers.has_chat_encoder(&model_str) || policy.needs_request_tokens();
+    let want_tokens = should_tokenize_request(
+        ctx.tokenizers.has_chat_encoder(&model_str),
+        policy.needs_request_tokens(),
+        ctx.bucket_selector.is_enabled(),
+    );
     let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
             ApiError::BadRequest("invalid request: body must be a JSON object".into())
@@ -167,6 +209,56 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let external_prefix = match (
+        ctx.prefix_index.as_ref(),
+        request_tokens.as_ref(),
+        ctx.block_size_oracle.get(),
+    ) {
+        (Some(index), Some(tokens), Some(block_size)) => {
+            let hashes = if ctx.block_size_oracle.is_bigram() {
+                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+            } else {
+                compute_block_hashes(&tokens.ids, block_size as usize)
+            };
+            let query_blocks = hashes.len();
+            let outcome = if hashes.is_empty() {
+                sgl_kv_indexer::PrefixOutcome::Empty
+            } else {
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+            };
+            Some(ExternalPrefixSignal {
+                outcome,
+                query_blocks,
+            })
+        }
+        _ => ctx
+            .radix_tree_prefix_provider
+            .as_ref()
+            .zip(request_tokens.as_ref())
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+    };
+
+    // Prefer exact ingress tokens; otherwise use the conservative estimate.
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let needs_load_snapshot = policy.needs_load_snapshot()
+        || workers
+            .iter()
+            .any(|worker| worker.mode() == WorkerMode::Prefill);
+    let load_snapshot =
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+    let needs_dispatch_timestamps = policy.needs_dispatch_timestamps();
+    let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+        (
+            parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
+            parse_optional_positive_f64_header(&headers, &X_SGL_TPS_SLO, "TPS SLO")?,
+        )
+    } else {
+        (None, None)
+    };
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -180,46 +272,91 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    // `select_prefill_worker` reduces this to `Bucket` when Bucket
+    // partitioning is off.
+    let session_affinity_mode = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .map(|config| config.session_affinity_mode)
+        .unwrap_or(SessionAffinityMode::Bucket);
+    // The queue gate (`--worker-queue-limit`) applies to the cache-aware
+    // candidate resolution and, beneath it, to primary/backup admission and
+    // the min-load range fallback. It does NOT reach the
+    // `CapacityFallbackPowerOfTwo` last resort: by the time that fires no
+    // worker in the domain is capacity-admitted, so there is no unqueued
+    // destination left to prefer.
+    let worker_queue_limit = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| config.worker_queue_limit);
+    // Each Bucket retry rebuilds the proposal and reruns Admission/Guard.
+    let worker = select_prefill_worker(&PrefillSelectionInputs {
+        policy: policy.as_ref(),
+        policy_kind: ctx.config.model.policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        metrics: ctx.metrics.as_ref(),
+        model_id: &model_id,
+        body: Some(&body),
+        routing_key,
+        session_id,
+        request_input_tokens,
+        request_tokens: request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        external_prefix: external_prefix.as_ref(),
+        load_snapshot: load_snapshot.as_ref(),
+        workers: &workers,
+        ttft_slo_ms,
+        tps_slo,
+        session_affinity_mode,
+        worker_queue_limit,
+    })
+    .map_err(|reason| policy_selection_failed(&ctx, &model_str, reason))?;
 
-    // PD-mode decoder affinity. When the selected prefill worker is
-    // part of a PD-disagg deployment, also resolve the matching decode
-    // peer (same host where possible, falling back to min-load via
-    // `select_decode_with_affinity`). Both workers receive the SAME
-    // request body — augmented with the three flat `bootstrap_*`
-    // fields below — so the SGLang engine can match incoming KV
-    // transfers via `bootstrap_room`.
+    // Decode selection starts after Final P.
     //
     // Plain-mode workers skip the decode resolution entirely (no
     // decode peer to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
+        let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
         Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
+            select_decode_peer(&DecodeSelectionInputs {
+                decode_policy_kind: ctx.config.model.decode_policy,
+                bucket_selector: ctx.bucket_selector.as_ref(),
+                model_id: &model_id,
+                prefill_url: &worker.url,
+                decode_workers: &decode_workers,
+                request_input_tokens,
+                requested_max_output_tokens,
+                ttft_slo_ms,
+                tps_slo,
+                load_snapshot: load_snapshot.as_ref(),
+            })
+            .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            })?,
         )
     } else {
         None
@@ -256,19 +393,12 @@ pub async fn chat_completions(
     // ends, the client disconnects, or the handler returns an error. In
     // PD mode the pair moves into the spawned prefill task so prefill
     // load is tracked for the full duration of the KV transfer; in plain
-    // mode the pair stays in this handler. Decode-load contribution is
-    // 0 here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler — current decode selection is
-    // host-affinity only.
-    let guard = worker.load_guard();
-    // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    // mode the pair stays in this handler. Decode load is tracked on Final D.
+    let guard = if needs_dispatch_timestamps {
+        worker.timestamped_load_guard()
+    } else {
+        worker.load_guard()
+    };
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -312,6 +442,16 @@ pub async fn chat_completions(
         metrics: Arc::clone(&ctx.metrics),
         model: metrics_model.clone(),
         start,
+    };
+
+    // Classifies a 2xx stream after its headers are committed. Takes the
+    // streaming worker's URL (Final D in PD mode).
+    let make_stream_end_hook = |worker_url: String| -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
+        let metrics = Arc::clone(&ctx.metrics);
+        let model = metrics_model.clone();
+        Box::new(move |end| {
+            metrics.record_stream_outcome(&worker_url, &model, classify_stream_end(end));
+        })
     };
 
     // Forward the router-computed tokens to the engine as `input_ids` so it
@@ -438,12 +578,14 @@ pub async fn chat_completions(
 
         // Synchronously await the decode worker. Its response is what
         // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // per-worker `active_requests` reflects load on Final D.
         let decode_guard = decode_worker.load_guard();
+        let decode_active_guard =
+            ctx.active_load
+                .register(decode_worker.id.clone(), decode_worker.url.clone(), 0, 1);
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
-                Box::new((decode_guard, make_duration_guard()));
+                Box::new((decode_guard, decode_active_guard, make_duration_guard()));
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -452,6 +594,7 @@ pub async fn chat_completions(
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
+                Some(make_stream_end_hook(decode_worker.url.clone())),
             );
             tokio::select! {
                 biased;
@@ -459,7 +602,7 @@ pub async fn chat_completions(
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
         } else {
-            let _decode_hold = decode_guard;
+            let _decode_hold = (decode_guard, decode_active_guard);
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
@@ -487,6 +630,7 @@ pub async fn chat_completions(
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
+            Some(make_stream_end_hook(worker.url.clone())),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -592,7 +736,7 @@ pub async fn chat_completions(
     );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
-    // external tests / sidecars can observe PD decode affinity without
+    // external tests / sidecars can observe the final PD Decode selection without
     // sniffing the proxy hop. The request-side header was set above for
     // the prefill worker; copying it here makes the affinity observable
     // end-to-end. Plain-mode requests skip this (no decode peer was
@@ -620,17 +764,101 @@ pub async fn chat_completions(
     }
 }
 
+fn resolve_prefix_query(
+    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+    model: &str,
+) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+    use sgl_kv_indexer::PrefixIndexError;
+    match result {
+        Ok(outcome) => Ok(outcome),
+        // The prefix hit only improves worker choice, so an indexer that is
+        // shedding, slow, or down costs cache affinity — not availability.
+        Err(
+            error @ (PrefixIndexError::Overloaded
+            | PrefixIndexError::Timeout
+            | PrefixIndexError::Unreachable),
+        ) => {
+            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A prompt too long to fit one gRPC message is still a prompt a worker
+        // can serve, so it costs cache affinity like the cases above. Logged
+        // separately because the remedy is operational — raise the indexer's
+        // message limit — rather than waiting for the indexer to recover.
+        Err(error @ PrefixIndexError::QueryTooLarge) => {
+            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A rejection means the router and the indexer disagree on the request
+        // contract; degrading would hide that from every request.
+        Err(error) => {
+            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
+            Err(ApiError::PolicySelectionFailed {
+                model: model.to_string(),
+            })
+        }
+    }
+}
+
+fn parse_optional_positive_u64_header(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    label: &str,
+) -> Result<Option<u64>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a positive integer"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_positive_f64_header(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    label: &str,
+) -> Result<Option<f64>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive number")))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a finite positive number"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn should_tokenize_request(
+    has_chat_encoder: bool,
+    policy_needs_request_tokens: bool,
+    bucket_enabled: bool,
+) -> bool {
+    has_chat_encoder || policy_needs_request_tokens || bucket_enabled
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
 /// to zero would hide the request from the cache-aware policy's
 /// load-imbalance fast-path.
 ///
-/// This is a coarse approximation: we count the body length in bytes
-/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
-/// to thread the tokenizer's actual token count through (the
-/// cache-aware-zmq policy already tokenizes the prompt for tree
-/// matching — that count could be reused here).
+/// Exact ingress tokens are preferred when available.
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
@@ -707,7 +935,7 @@ fn build_outgoing_body(
         _ => {
             return Err(ApiError::BadRequest(
                 "invalid request: body must be a JSON object".to_string(),
-            ))
+            ));
         }
     };
     if let Some(ids) = input_ids {
@@ -910,6 +1138,44 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unavailable indexer must never fail a request that min-load routing
+    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
+    /// the query's message limit loses cache affinity, not availability.
+    #[test]
+    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
+        for error in [
+            sgl_kv_indexer::PrefixIndexError::Overloaded,
+            sgl_kv_indexer::PrefixIndexError::Timeout,
+            sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
+        ] {
+            assert_eq!(
+                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
+                sgl_kv_indexer::PrefixOutcome::Empty,
+                "{error} should degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_indexer_query_still_fails_selection() {
+        assert!(matches!(
+            resolve_prefix_query(
+                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
+                    sgl_kv_indexer::RpcCode::InvalidArgument
+                )),
+                "tiny"
+            ),
+            Err(ApiError::PolicySelectionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
+        assert!(should_tokenize_request(false, false, true));
+        assert!(!should_tokenize_request(false, false, false));
+    }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
@@ -1177,6 +1443,26 @@ mod tests {
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.stream, None);
         assert_eq!(p.model.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn parse_probe_accepts_modern_openai_completion_budget() {
+        let body =
+            Bytes::from_static(br#"{"model":"tiny","messages":[],"max_completion_tokens":256}"#);
+        assert_eq!(
+            parse_probe(&body).unwrap().requested_max_output_tokens(),
+            Some(256)
+        );
+    }
+
+    #[test]
+    fn modern_completion_budget_takes_precedence_when_both_fields_are_present() {
+        let body =
+            Bytes::from_static(br#"{"model":"tiny","max_tokens":128,"max_completion_tokens":256}"#);
+        assert_eq!(
+            parse_probe(&body).unwrap().requested_max_output_tokens(),
+            Some(256)
+        );
     }
 
     #[test]

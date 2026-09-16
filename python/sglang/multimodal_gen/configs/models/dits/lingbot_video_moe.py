@@ -4,14 +4,8 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
-def is_blocks(name: str, module) -> bool:
-    return "blocks" in name and str.isdigit(name.split(".")[-1])
-
-
 @dataclass
 class LingBotVideoMoEArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
-
     param_names_mapping: dict = field(default_factory=dict)
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)

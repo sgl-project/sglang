@@ -70,7 +70,8 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   // NVIDIA: two multi-arch CUDA builds (dev-inkling-dspark for CUDA 13,
-  // dev-cu12-inkling-dspark for CUDA 12) — pick by your CUDA version, not by GPU.
+  // dev-cu12-inkling-dspark for CUDA 12, a final build since that lane is
+  // retired) — pick by your CUDA version, not by GPU.
   // Panel defaults to cu13. AMD: dev-rocm720-mi35x-inkling-dspark (sglang-rocm repo).
   // DGX Spark uses a dedicated arm64 CUDA 13 image with NCCL 2.30.7.
   // All tiers ship from the same images, DSpark included (except DGX Spark).
@@ -751,7 +752,7 @@ export const config = {
         "--tool-call-parser inkling",
         "--skip-server-warmup",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark",
         "--speculative-draft-model-quantization unquant",
         "--chunked-prefill-size 8192",
         "--cuda-graph-max-bs-prefill 8192",
@@ -786,7 +787,7 @@ export const config = {
         "--tool-call-parser inkling",
         "--skip-server-warmup",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark",
         "--speculative-draft-model-quantization unquant",
         "--chunked-prefill-size 8192",
         "--cuda-graph-max-bs-prefill 8192",
@@ -821,7 +822,7 @@ export const config = {
         "--tool-call-parser inkling",
         "--skip-server-warmup",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark",
         "--speculative-draft-model-quantization unquant",
         "--chunked-prefill-size 8192",
         "--cuda-graph-max-bs-prefill 8192",
@@ -856,7 +857,7 @@ export const config = {
         "--tool-call-parser inkling",
         "--skip-server-warmup",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark-Preview",
+        "--speculative-draft-model-path RadixArk/Inkling-Small-DSpark",
         "--speculative-draft-model-quantization unquant",
         "--chunked-prefill-size 8192",
         "--cuda-graph-max-bs-prefill 8192",

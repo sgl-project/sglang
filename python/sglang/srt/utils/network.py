@@ -88,7 +88,7 @@ def wait_port_available(
                 logger.info(
                     f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
                 )
-        time.sleep(0.1)
+        time.sleep(1)
 
     if raise_exception:
         raise ValueError(
