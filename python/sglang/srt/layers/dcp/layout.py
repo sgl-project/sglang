@@ -84,6 +84,61 @@ def filter_dcp_local_chunk_kv_indices(
     return torch.cat(parts)
 
 
+def remap_dcp_sparse_indices(
+    topk_indices: torch.Tensor, dcp_size: int, dcp_rank: int
+) -> torch.Tensor:
+    """Map global sparse token indices to one rank's compact DCP KV layout.
+
+    Keep indices owned by this rank, convert them to local KV positions, and
+    stably move them before ``-1`` padding while preserving their score order.
+    """
+    if dcp_size == 1:
+        return topk_indices
+
+    # Global token p belongs to rank p % dcp_size and maps to local position
+    # p // dcp_size.
+    topk_indices_fp32 = topk_indices.to(torch.float32)
+    local_owner_mask = (topk_indices_fp32 >= 0) & (
+        torch.remainder(topk_indices_fp32, dcp_size) == dcp_rank
+    )
+    remapped_indices = torch.where(
+        local_owner_mask,
+        torch.floor(topk_indices_fp32 / dcp_size),
+        torch.full_like(topk_indices_fp32, -1.0),
+    ).to(topk_indices.dtype)
+
+    # Move valid entries before padding without changing their top-k order.
+    topk_count = topk_indices.shape[-1]
+    original_order = torch.arange(
+        topk_count, dtype=torch.float32, device=topk_indices.device
+    ).expand_as(topk_indices_fp32)
+    pack_keys = original_order + (~local_owner_mask).to(torch.float32) * topk_count
+    pack_order = torch.argsort(pack_keys, dim=-1).to(torch.int64)
+    return torch.gather(remapped_indices, dim=-1, index=pack_order)
+
+
+def get_dcp_chain_spec_lens(
+    total_kv_lens: torch.Tensor,
+    tokens_per_req: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Return request-major local KV frontiers for a speculative chain."""
+    if tokens_per_req < 1:
+        raise ValueError(f"tokens_per_req must be >= 1, got {tokens_per_req}")
+    total_kv_lens = total_kv_lens.int()
+    steps = torch.arange(
+        1, tokens_per_req + 1, dtype=total_kv_lens.dtype, device=total_kv_lens.device
+    )
+    global_query_lens = total_kv_lens.unsqueeze(1) - tokens_per_req + steps
+    global_query_lens = torch.where(
+        total_kv_lens.unsqueeze(1) >= tokens_per_req,
+        global_query_lens,
+        torch.zeros_like(global_query_lens),
+    )
+    return get_dcp_lens(global_query_lens.reshape(-1), dcp_size, dcp_rank).int()
+
+
 def update_local_kv_lens_for_dcp(kv_len_arr):
     """In-place per-rank KV length: the start=0 case of get_dcp_lens.
 
