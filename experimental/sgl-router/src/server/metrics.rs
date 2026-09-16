@@ -23,6 +23,7 @@
 //! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
+//! | `sgl_router_stream_outcome_total` | Counter | `worker_url`, `model_id`, `outcome` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
@@ -38,7 +39,42 @@
 //! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
 //! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
+//! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
+//!
+//! `sgl_router_cache_aware_decisions_total` records exactly one decision per
+//! cache-aware prefill selection that resolves a worker, so the labels sum to
+//! the cache-aware request rate less the selections that ended in a 503 (see
+//! `sgl_router_policy_selection_failures_total` for those) and ratios between
+//! them are meaningful:
+//!
+//! - `cache_hit` — a prefix owner won the selection. Note this includes a
+//!   PARTIAL gate diversion: when the gate removed the deepest owner but a
+//!   shallower one survived, an owner still won, so the request books here
+//!   and contributes nothing to `sgl_router_diverted_overlap_blocks`.
+//! - `cache_miss` — no usable prefix owner (tree miss, or every owner
+//!   rejected by hard capacity admission). A tree miss books here even on a
+//!   saturated fleet: with no prefix owner the gate never fired, so there was
+//!   no affinity to keep or trade. `all_queued` is the saturation signal for
+//!   traffic the gate ACTED on, not a fleet-wide saturation gauge — read
+//!   engine queue depth for that.
+//! - `cache_worker_queued` — the queue gate (`--worker-queue-limit`) removed
+//!   every owner while an unqueued destination still existed, so the request
+//!   was diverted off its prefix. The matched-prefix depth it gave up is in
+//!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
+//!   all selections: a diverted curve skewing high means the gate is trading
+//!   large cached prefixes for short waits.
+//! - `all_queued` — the queue gate removed every owner AND every worker in
+//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
+//!   is the saturation signal for traffic the gate acted on, keyed on
+//!   saturation rather than on where the request landed: usually the request
+//!   kept its prefix, but when the re-admitted owners are also out of KV
+//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
+//!   saturation in the one state where it matters most. It deliberately
+//!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
+//!   must not absorb it, or a fully saturated fleet reads as a healthy one.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -49,6 +85,7 @@
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
 use crate::config::PolicyKind;
+use crate::proxy::sse::StreamEnd;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -85,6 +122,14 @@ const TTFT_BUCKETS: &[f64] = &[
     400.0,
 ];
 
+/// Histogram bucket upper bounds (blocks) for
+/// `sgl_router_diverted_overlap_blocks`. Powers of two up to 8192 blocks;
+/// block size is engine-configured (commonly 16–64 tokens), so the ladder
+/// spans ~16 tokens to ~512K tokens of forfeited prefix.
+const OVERLAP_BLOCK_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
+
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +145,39 @@ impl RequestOutcome {
             Self::Success => "success",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Final outcome of a 2xx SSE stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// Stream ended without errors.
+    Ok,
+    /// The engine sent a `data: {"error"...}` SSE event.
+    StreamErrorEvent,
+    /// The upstream byte stream failed.
+    UpstreamError,
+    /// The client disconnected before the stream finished.
+    ClientDisconnect,
+}
+
+pub(crate) fn classify_stream_end(end: StreamEnd) -> StreamOutcome {
+    match (end.transport_ok, end.saw_error_event, end.client_disconnect) {
+        (false, _, _) => StreamOutcome::UpstreamError,
+        (_, true, _) => StreamOutcome::StreamErrorEvent,
+        (_, _, true) => StreamOutcome::ClientDisconnect,
+        _ => StreamOutcome::Ok,
+    }
+}
+
+impl StreamOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::StreamErrorEvent => "stream_error_event",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientDisconnect => "client_disconnect",
         }
     }
 }
@@ -188,6 +266,27 @@ pub(crate) enum PolicySelectionFailureReason {
     ProposalEmpty,
 }
 
+/// Final cache-aware routing decision, one per prefill selection. See the
+/// module doc for how the labels read against each other.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheAwareDecision {
+    CacheHit,
+    CacheMiss,
+    CacheWorkerQueued,
+    AllQueued,
+}
+
+impl CacheAwareDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::CacheWorkerQueued => "cache_worker_queued",
+            Self::AllQueued => "all_queued",
+        }
+    }
+}
+
 impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -233,6 +332,7 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -244,7 +344,10 @@ pub struct MetricsRegistry {
     cache_pressure_guard_compared_total: AtomicU64,
     cache_pressure_guard_override_total: AtomicU64,
     cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
+    diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -269,6 +372,14 @@ struct EdgeResponseKey {
     route: String,
     method: String,
     status_code: u16,
+}
+
+/// Labels for `sgl_router_stream_outcome_total`.
+#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Clone)]
+struct StreamOutcomeKey {
+    worker_url: String,
+    model_id: String,
+    outcome: &'static str,
 }
 
 /// Per-worker state sampled from the [`crate::workers::WorkerRegistry`] at
@@ -298,6 +409,12 @@ struct ActiveLoadKey {
 struct PolicyDecisionKey {
     policy: String,
     reason: String,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct CacheAwareDecisionKey {
+    model_id: String,
+    decision: &'static str,
 }
 
 #[derive(Debug)]
@@ -427,6 +544,22 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
+    }
+
+    /// Record the final outcome of a 2xx stream.
+    pub fn record_stream_outcome(&self, worker_url: &str, model_id: &str, outcome: StreamOutcome) {
+        let key = StreamOutcomeKey {
+            worker_url: worker_url.to_owned(),
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+        };
+        let counter = self
+            .stream_outcome_total
+            .lock()
+            .entry(key)
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bump the edge counter `responses_total{route,method,status_code}`. Called
@@ -561,6 +694,38 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the final cache-aware routing decision for one prefill
+    /// selection — exactly one call per cache-aware request, so the labels
+    /// sum to the cache-aware request rate.
+    pub fn record_cache_aware_decision(&self, model_id: &str, decision: CacheAwareDecision) {
+        let key = CacheAwareDecisionKey {
+            model_id: model_id.to_owned(),
+            decision: decision.as_str(),
+        };
+        let mut guard = self.cache_aware_decisions_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe the matched-prefix depth (blocks) a queue-gate diversion gave
+    /// up, for `sgl_router_diverted_overlap_blocks`. Recorded ONLY when the
+    /// gate emptied the candidate set (`cache_worker_queued`), so the
+    /// histogram measures sacrifice rather than traffic. A PARTIAL diversion
+    /// — the gate removed the deepest owner but a shallower one still won —
+    /// is therefore not represented here even though some locality was given
+    /// up; it books as `cache_hit`.
+    pub fn observe_diverted_overlap_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.diverted_overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCK_BUCKETS));
+        hist.observe(blocks as f64);
+    }
+
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
     ///
     /// Recorded ONLY when the tokenization offload SHOULD have fired but the
@@ -576,6 +741,24 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sampling_contract_rejections_total{param}`.
+    ///
+    /// Recorded when the fleet-wide sampling contract refuses a request under
+    /// `--sampling-param-conflict reject`. This is the rollout gauge for the
+    /// flag: it answers "how much client traffic is the contract turning away,
+    /// and on which parameter" — which is otherwise unanswerable, because the
+    /// rejection reaches the client as a 400 like any other. `param` is a
+    /// wire name from a fixed enum, so the label set is bounded.
+    pub fn record_sampling_contract_rejection(&self, param: &'static str) {
+        let mut guard = self.sampling_contract_rejections_total.lock();
+        let counter = guard
+            .entry(param)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -681,6 +864,26 @@ impl MetricsRegistry {
             let hist = guard.get(model_id).unwrap();
             let label_body = format!("model_id=\"{}\"", escape_label(model_id));
             render_histogram(&mut out, "sgl_router_ttft_seconds", &label_body, hist);
+        }
+        drop(guard);
+
+        // Final outcomes observed after a 2xx stream's headers are committed.
+        out.push_str("# HELP sgl_router_stream_outcome_total Final outcome of a 2xx stream.\n");
+        out.push_str("# TYPE sgl_router_stream_outcome_total counter\n");
+        let guard = self.stream_outcome_total.lock();
+        let mut entries: Vec<(&StreamOutcomeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort();
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_stream_outcome_total{{worker_url=\"{}\",model_id=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                escape_label(&key.model_id),
+                key.outcome,
+                value,
+            ));
         }
         drop(guard);
 
@@ -944,6 +1147,47 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // cache_aware_decisions_total
+        out.push_str(
+            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit).\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
+        let guard = self.cache_aware_decisions_total.lock();
+        let mut entries: Vec<(&CacheAwareDecisionKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.decision).cmp(&(&b.0.model_id, b.0.decision)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_aware_decisions_total{{model_id=\"{}\",decision=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.decision,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // diverted_overlap_blocks histogram
+        out.push_str(
+            "# HELP sgl_router_diverted_overlap_blocks Matched-prefix depth (blocks) given up by queue-gate diversions (decision=cache_worker_queued). Read against the overlap of all selections: a curve skewing high means the gate is trading large cached prefixes for short waits.\n",
+        );
+        out.push_str("# TYPE sgl_router_diverted_overlap_blocks histogram\n");
+        let guard = self.diverted_overlap_blocks.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_diverted_overlap_blocks",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -959,6 +1203,26 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // sampling_contract_rejections_total
+        out.push_str(
+            "# HELP sgl_router_sampling_contract_rejections_total Requests refused by the fleet-wide sampling contract (--override-sampling-params under --sampling-param-conflict reject), by parameter.\n",
+        );
+        out.push_str("# TYPE sgl_router_sampling_contract_rejections_total counter\n");
+        let guard = self.sampling_contract_rejections_total.lock();
+        let mut entries: Vec<(&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        for (param, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sampling_contract_rejections_total{{param=\"{}\"}} {}\n",
+                escape_label(param),
                 value,
             ));
         }
@@ -994,7 +1258,7 @@ fn render_histogram(out: &mut String, name: &str, label_body: &str, hist: &Histo
 /// https://prometheus.io/docs/instrumenting/exposition_formats/.
 /// We only escape `\`, `"`, and newline — the three characters the
 /// reference parser rejects unescaped.
-fn escape_label(s: &str) -> String {
+pub(crate) fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1010,6 +1274,13 @@ fn escape_label(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_metric_line(output: &str, expected: &str) {
+        assert!(
+            output.lines().any(|line| line == expected),
+            "missing metric line `{expected}`; got:\n{output}"
+        );
+    }
 
     #[test]
     fn empty_registry_renders_only_help_lines() {
@@ -1149,6 +1420,59 @@ mod tests {
                 "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
             );
         }
+    }
+
+    #[test]
+    fn stream_outcome_precedence() {
+        use StreamOutcome::*;
+
+        for (transport_ok, saw_error_event, client_disconnect, expected) in [
+            (false, false, false, UpstreamError),
+            (false, false, true, UpstreamError),
+            (false, true, false, UpstreamError),
+            (false, true, true, UpstreamError),
+            (true, false, false, Ok),
+            (true, false, true, ClientDisconnect),
+            (true, true, false, StreamErrorEvent),
+            (true, true, true, StreamErrorEvent),
+        ] {
+            let end = StreamEnd {
+                transport_ok,
+                saw_error_event,
+                client_disconnect,
+            };
+            assert_eq!(classify_stream_end(end), expected, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn record_stream_outcome_emits_labelled_counter_lines() {
+        let reg = MetricsRegistry::new();
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::Ok);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::StreamErrorEvent);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::UpstreamError);
+        reg.record_stream_outcome("http://w:30000", "tiny", StreamOutcome::ClientDisconnect);
+        let out = reg.render();
+        for expected in [
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="ok"} 2"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="stream_error_event"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="upstream_error"} 1"#,
+            r#"sgl_router_stream_outcome_total{worker_url="http://w:30000",model_id="tiny",outcome="client_disconnect"} 1"#,
+        ] {
+            assert_metric_line(&out, expected);
+        }
+    }
+
+    #[test]
+    fn stream_outcome_absent_until_recorded() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_stream_outcome_total counter"));
+        assert!(
+            !out.contains("sgl_router_stream_outcome_total{"),
+            "no series until an outcome is recorded; got:\n{out}",
+        );
     }
 
     #[test]
@@ -1372,6 +1696,41 @@ mod tests {
     }
 
     #[test]
+    fn cache_aware_decisions_and_diverted_overlap_render() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheHit);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheWorkerQueued);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheWorkerQueued);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::AllQueued);
+        reg.observe_diverted_overlap_blocks("tiny", 40);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_hit"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_worker_queued"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="all_queued"} 1"#
+        ));
+        // The saturation label must not be absorbed by a `cache_hit.*`
+        // hit-rate query.
+        assert!(!out.contains(r#"decision="cache_hit_all_queued""#));
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_count{model_id="tiny"} 1"#),
+            "expected one diverted observation; got:\n{out}"
+        );
+        // 40 blocks lands in the le=64 bucket, not le=32.
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_bucket{model_id="tiny",le="64"} 1"#)
+        );
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_bucket{model_id="tiny",le="32"} 0"#)
+        );
+    }
+
+    #[test]
     fn ingress_tokenize_error_counter_increments_per_model() {
         let reg = MetricsRegistry::new();
         reg.record_ingress_tokenize_error("tiny");
@@ -1418,6 +1777,31 @@ mod tests {
         assert!(
             out.contains(r#"model_id="back\\slash""#),
             "render did not escape backslash; got:\n{out}",
+        );
+    }
+    /// The contract's rollout gauge: absent until a request is actually
+    /// refused, then keyed by the parameter that refused it.
+    #[test]
+    fn sampling_contract_rejections_are_keyed_by_param() {
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_sampling_contract_rejections_total counter"));
+        assert!(
+            !out.contains("sgl_router_sampling_contract_rejections_total{"),
+            "must emit no series before the first rejection"
+        );
+
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("temperature");
+        reg.record_sampling_contract_rejection("top_p");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="temperature"} 2"#),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_sampling_contract_rejections_total{param="top_p"} 1"#),
+            "got:\n{out}"
         );
     }
 }
