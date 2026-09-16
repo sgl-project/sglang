@@ -26,6 +26,7 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    is_draft_worker: bool = False
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -34,6 +35,20 @@ class RemoteInstanceWeightTransporter:
     @property
     def model(self) -> torch.nn.Module:
         return self.get_model()
+
+    @property
+    def publishes_weights(self) -> bool:
+        """Whether this runner exports its own weights to the bootstrap server.
+
+        A seed only ever exports its target model, so a draft runner must stay
+        off the publish side: the bootstrap server keys entries by tp_rank alone
+        (no per-model dimension) and the draft initializes after the target, so
+        it would overwrite the target's session id and weight layout and hand
+        the client the draft model's memory regions. Receiving is a separate
+        gate -- a draft loading under --speculative-draft-load-format still gets
+        its own engine from maybe_init_remote_instance_transfer_engine.
+        """
+        return remote_instance_transfer_engine_enabled() and not self.is_draft_worker
 
     def init_engine(self):
         try:
@@ -57,7 +72,7 @@ class RemoteInstanceWeightTransporter:
 
     def maybe_register_and_publish_weight_info(self) -> None:
         if (
-            remote_instance_transfer_engine_enabled()
+            self.publishes_weights
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
