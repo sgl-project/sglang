@@ -1256,7 +1256,9 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.kv.cache_protected_len = len(req.prefix_indices)
+                # PP linker slots remain request-owned until post-prefill insert.
+                if req.external_cache_hit_length is None:
+                    req.kv.cache_protected_len = len(req.prefix_indices)
 
             # Successful materialization has no remaining admission gates.
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
