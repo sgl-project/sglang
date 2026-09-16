@@ -73,13 +73,13 @@ def _call(kv, b, s_q, topk, topk_length, *, extra=None, meta=None):
 def _ours(
     like_meta, like_splits, topk_length, topk, *, extra_topk_length=None, extra_topk=0
 ):
-    from sglang.kernels.ops.attention.dsv4.decoding_sched_meta import (
-        decoding_sched_meta,
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        flashmla_sched_meta,
     )
 
     meta = torch.empty_like(like_meta)
     splits = torch.empty_like(like_splits)
-    decoding_sched_meta(
+    flashmla_sched_meta(
         meta,
         splits,
         topk_length=topk_length,
