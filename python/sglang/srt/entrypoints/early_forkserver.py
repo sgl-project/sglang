@@ -418,7 +418,7 @@ def _install_import_time_cuda_shim() -> None:
         if torch.cuda.is_initialized():
             return _TORCH_CUDA_ORIG["get_device_properties"](device)
         idx = device if isinstance(device, int) else 0
-        return _NvmlDeviceProperties(idx, _TORCH_CUDA_ORIG["get_device_properties"])
+        return _NvmlDeviceProperties(idx)
 
     def current_device():
         if torch.cuda.is_initialized():
@@ -432,13 +432,19 @@ def _install_import_time_cuda_shim() -> None:
 
 class _NvmlDeviceProperties:
     """torch.cuda.get_device_properties() answered from NVML during the preload.
-    An attribute NVML cannot supply falls back to the real query, which
-    initializes CUDA in this process."""
+    An attribute NVML cannot supply raises: the real query would initialize
+    CUDA in the forkserver and every worker forked afterwards would fail."""
 
-    def __init__(self, index: int, real_query):
+    NVML_ATTRIBUTES = (
+        "major",
+        "minor",
+        "name",
+        "total_memory",
+        "multi_processor_count",
+    )
+
+    def __init__(self, index: int):
         major, minor, name, total_memory, cores = _nvml_device(index)
-        self._index = index
-        self._real_query = real_query
         self.major = major
         self.minor = minor
         self.name = name
@@ -450,7 +456,15 @@ class _NvmlDeviceProperties:
             self.multi_processor_count = cores // per_sm
 
     def __getattr__(self, attr):
-        return getattr(self._real_query(self._index), attr)
+        if attr.startswith("__"):
+            raise AttributeError(attr)  # hasattr / copy / pickle protocol probes
+        raise AttributeError(
+            f"torch.cuda.get_device_properties().{attr} was read while the forkserver "
+            f"preloads the worker modules; only {', '.join(self.NVML_ATTRIBUTES)} are "
+            "available from NVML there, and the real query would initialize CUDA and "
+            "break fork(). Move the read out of import time, or answer it from NVML in "
+            "sglang.srt.entrypoints.early_forkserver._NvmlDeviceProperties."
+        )
 
 
 def _restore_torch_cuda() -> None:

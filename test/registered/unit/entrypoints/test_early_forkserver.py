@@ -148,6 +148,37 @@ class TestSwitches(CustomTestCase):
             set_method.assert_not_called()
 
 
+class TestNvmlDeviceProperties(CustomTestCase):
+    """The preload-time stand-in for torch.cuda.get_device_properties() must
+    never reach the real query: that initializes CUDA in the forkserver and
+    every worker forked afterwards fails. Unknown attributes raise instead."""
+
+    def _props(self):
+        with mock.patch.object(
+            early_forkserver,
+            "_nvml_device",
+            return_value=(9, 0, "H100", 80 << 30, 132 * 128),
+        ):
+            return early_forkserver._NvmlDeviceProperties(0)
+
+    def test_nvml_attributes(self):
+        props = self._props()
+        self.assertEqual((props.major, props.minor, props.name), (9, 0, "H100"))
+        self.assertEqual(props.total_memory, 80 << 30)
+        self.assertEqual(props.multi_processor_count, 132)
+
+    def test_unknown_attribute_raises_with_the_name(self):
+        with self.assertRaises(AttributeError) as ctx:
+            self._props().L2_cache_size
+        self.assertIn("L2_cache_size", str(ctx.exception))
+        self.assertIn("NVML", str(ctx.exception))
+
+    def test_protocol_probes_do_not_raise_the_message(self):
+        props = self._props()
+        self.assertFalse(hasattr(props, "__deepcopy__"))
+        self.assertFalse(hasattr(props, "regs_per_multiprocessor"))
+
+
 @unittest.skipUnless(os.path.exists("/proc/self/comm"), "needs Linux /proc")
 class TestForkedWorkerTitle(CustomTestCase):
     def test_setproctitle_works_after_env_rewrite(self):
