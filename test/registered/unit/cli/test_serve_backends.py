@@ -7,10 +7,6 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.cli.utils import (
-    _is_diffusion_model_from_hub_metadata,
-    get_is_diffusion_model,
-)
 from sglang.cli.serve import serve
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
@@ -19,6 +15,10 @@ from sglang.cli.serve_backends import (
     ServeBackendDetection,
     ServeBackendRegistry,
     ServeRequest,
+)
+from sglang.cli.utils import (
+    _is_diffusion_model_from_hub_metadata,
+    get_is_diffusion_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
