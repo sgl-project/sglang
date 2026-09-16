@@ -458,7 +458,7 @@ def _apply_wo_a_bf16_matmul(
     fuse_mxfp8_quant: bool = False,
     is_prefill: bool = False,
     fp8_grid: bool = False,
-) -> torch.Tensor | Mxfp8SwizzledInput | Mxfp8Activation:
+) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
 
     Single-token decode uses a GEMV for the validated TP4 shape. Blackwell
@@ -693,7 +693,10 @@ def _apply_gguf_grouped_wo_a(
 
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation,
+        Mxfp8Activation,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
         LateLayerTail,
