@@ -441,8 +441,21 @@ def hc_boundary(
     with ``pre_prev`` (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
     coefficients); the coefficients' reduce + sinkhorn is still pending (see ``HcCoefficients``)."""
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        _HC_BOUNDARY_BF16X3_MIN_M,
         hc_boundary_fused_deferred,
     )
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    weight_parts = None
+    if (
+        residual.shape[0] >= _HC_BOUNDARY_BF16X3_MIN_M
+        and envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.get()
+        and not is_batch_invariant_mode_enabled()
+    ):
+        if hc_fn is layer.hc_attn_fn:
+            weight_parts = getattr(layer, "_hc_attn_bf16_parts", None)
+        elif hc_fn is layer.hc_ffn_fn:
+            weight_parts = getattr(layer, "_hc_ffn_bf16_parts", None)
 
     new_residual, y, coefficients = hc_boundary_fused_deferred(
         x,
@@ -457,6 +470,7 @@ def hc_boundary(
         layer.hc_sinkhorn_iters,
         layer.rms_norm_eps,
         layer.hc_eps,
+        weight_parts=weight_parts,
     )
     if not envs.SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM.get():
         coefficients.materialize()
