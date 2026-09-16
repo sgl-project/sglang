@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import msgspec
 from torch import nn
 
+from sglang.srt.speculative.pp_support import supports_qwen35_pp_mtp_prefill
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -160,6 +161,7 @@ def resolve_layer_indices(
 
     if not is_npu():
         _assert_pp_mtp_compat(
+            model_architecture=model_config.hf_config.architectures[0],
             model_has_mtp_layers=model_has_mtp_layers,
             spec_algorithm=spec_algorithm,
             num_effective_layers=num_effective_layers,
@@ -214,13 +216,15 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
 
 def _assert_pp_mtp_compat(
     *,
+    model_architecture: str,
     model_has_mtp_layers: bool,
     spec_algorithm: SpeculativeAlgorithm,
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
     assert (
-        (not model_has_mtp_layers)
+        supports_qwen35_pp_mtp_prefill(model_architecture)
+        or (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
         or (
             (not spec_algorithm.is_none())

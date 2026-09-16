@@ -4,8 +4,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    _assert_pp_mtp_compat,
     compute_attention_and_moe_layers,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -44,6 +46,27 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
 
         self.assertEqual(attention_layers, [None, None, local_attention])
         self.assertEqual(mha_companion_layers, [None, None, None])
+
+
+class TestPipelineParallelMtpCompatibility(unittest.TestCase):
+    def test_qwen35_allows_stage_local_target_layers(self):
+        _assert_pp_mtp_compat(
+            model_architecture="Qwen3_5MoeForCausalLM",
+            model_has_mtp_layers=True,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            num_effective_layers=15,
+            model_num_layers=60,
+        )
+
+    def test_other_models_keep_existing_guard(self):
+        with self.assertRaisesRegex(AssertionError, "PP is not compatible with MTP"):
+            _assert_pp_mtp_compat(
+                model_architecture="LlamaForCausalLM",
+                model_has_mtp_layers=True,
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                num_effective_layers=15,
+                model_num_layers=60,
+            )
 
 
 if __name__ == "__main__":
