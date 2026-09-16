@@ -117,6 +117,8 @@ class AITerImpl(AttentionImpl):
     Implementation of attention using AITemplate.
     """
 
+    has_native_varlen_kernel: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -225,6 +227,8 @@ class AITerImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
         if USE_AITER_GFX942:
@@ -237,14 +241,20 @@ class AITerImpl(AttentionImpl):
             attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        if cu_seqlens_k is None:
+            cu_seqlens_k = cu_seqlens
+        else:
+            cu_seqlens_k = cu_seqlens_k.to(
+                device=query.device, dtype=torch.int32
+            ).contiguous()
         output = attention_func(
             q=query.contiguous(),
             k=key.contiguous(),
             v=value.contiguous(),
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_k=max_seqlen if max_seqlen_k is None else max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )

@@ -39,6 +39,8 @@ def _fake_output_all_to_all(x, **_):
 class _CaptureAttn:
     """Stand-in attn backend that records the q/k/v it receives."""
 
+    has_native_varlen_kernel = False
+
     def __init__(self):
         self.q = self.k = self.v = None
 
@@ -118,6 +120,7 @@ class TestUSPAttentionMaskedReplicatedGuard(unittest.TestCase):
         obj.skip_sequence_parallel = False
         obj.sp_attention_mode = "ulysses"
         obj.sp_attention_mode_is_auto = False
+        obj.causal = False
         q = torch.randn(1, 6, 2, 4)
         mask = torch.ones(1, 6, dtype=torch.bool)
         with (
@@ -174,7 +177,8 @@ class TestUSPAttentionMaskedReplicatedPrefix(unittest.TestCase):
         obj.skip_sequence_parallel = False
         obj.sp_attention_mode = "ulysses"
         obj.sp_attention_mode_is_auto = True
-        obj.backend = None  # not FA -> the masked branch takes SDPA
+        obj.backend = None
+        obj.causal = False
         obj.softmax_scale = self._D**-0.5
         obj.allow_cudnn_sdp = False
         obj.enable_packed_qkv_input_a2a = False
@@ -273,6 +277,7 @@ class TestUSPAttentionMaskedReplicatedPrefix(unittest.TestCase):
         obj.skip_sequence_parallel = False
         obj.sp_attention_mode = "ulysses"
         obj.sp_attention_mode_is_auto = True
+        obj.causal = False
         q = torch.randn(1, 6, 2, 4)
         with (
             patch(

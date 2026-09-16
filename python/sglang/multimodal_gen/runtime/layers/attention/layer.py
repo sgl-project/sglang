@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
     build_inv_indices,
     fused_pack_qkv,
@@ -34,9 +33,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends import (
-    flash_attn as _fa_backend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionImpl,
@@ -78,9 +74,9 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
-# Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
+# Set ``SGLANG_VARLEN_FA=0`` to disable the packed varlen fast path in
 # USPAttention masked branch and fall back to SDPA.
-_VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
+_PACKED_VARLEN_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
 
 def _resolve_sp_attention_mode(
@@ -934,6 +930,12 @@ class USPAttention(nn.Module):
             raise NotImplementedError(
                 "Skip Softmax does not support USPAttention masks."
             )
+        if self.causal and (attn_mask is not None or attn_mask_meta is not None):
+            # Every masked branch below attends non-causally, while the impl
+            # applies its own self.causal; the two would disagree silently.
+            raise NotImplementedError(
+                "USPAttention's masked path does not support causal attention."
+            )
         effective_skip_sp = (
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
@@ -1079,14 +1081,14 @@ class USPAttention(nn.Module):
 
             sp_world_size = get_sequence_parallel_world_size()
             if effective_skip_sp or sp_world_size == 1:
-                # Varlen FA fast path: SDPA with a non-None mask falls back
+                # Packed varlen fast path: SDPA with a non-None mask falls back
                 # to cutlassF. Meta-gated to opt in callers that drop masked
                 # query rows downstream (zero-filled on output, differs from
                 # SDPA semantics). Without meta, fall through to SDPA.
                 if (
-                    _VARLEN_FA_ENABLED
+                    _PACKED_VARLEN_ENABLED
                     and attn_mask_meta is not None
-                    and self.backend == AttentionBackendEnum.FA
+                    and self.attn_impl.has_native_varlen_kernel
                     and attn_mask.dim() == 2
                     and attn_mask.dtype
                     in (torch.bool, torch.uint8, torch.int32, torch.int64)
@@ -1140,38 +1142,30 @@ class USPAttention(nn.Module):
                                     q, k, v, indices
                                 )
                         if bs == 1 or all_valid:
-                            # Empty cu_seqlens selects FA3's faster static
+                            # A dense call lets FA3 pick its faster static
                             # persistent scheduler. A single packed sequence is
                             # dense even when its BCG bucket contains padding.
+                            # attn_metadata stays None: the impl backfills
+                            # max_seqlen_* onto it, and the packed length here
+                            # would leak to every later layer.
                             dense_seq = indices.shape[0] if bs == 1 else seq
-                            out_dense = flash_attn_varlen_func(
-                                q=q_unpad.reshape(bs, dense_seq, *q_unpad.shape[-2:]),
-                                k=k_unpad.reshape(bs, dense_seq, *k_unpad.shape[-2:]),
-                                v=v_unpad.reshape(bs, dense_seq, *v_unpad.shape[-2:]),
-                                cu_seqlens_q=None,
-                                cu_seqlens_k=None,
-                                max_seqlen_q=dense_seq,
-                                max_seqlen_k=dense_seq,
-                                softmax_scale=self.softmax_scale,
-                                causal=False,
-                                ver=_fa_backend.fa_ver,
+                            out_dense = self.attn_impl.forward(
+                                q_unpad.reshape(bs, dense_seq, *q_unpad.shape[-2:]),
+                                k_unpad.reshape(bs, dense_seq, *k_unpad.shape[-2:]),
+                                v_unpad.reshape(bs, dense_seq, *v_unpad.shape[-2:]),
+                                None,
                             )
                             if all_valid:
                                 return out_dense
                             return fused_scatter_to_padded(
                                 out_dense.flatten(0, 1), inv_indices, bs, seq
                             )
-                        out_unpad = flash_attn_varlen_func(
-                            q=q_unpad,
-                            k=k_unpad,
-                            v=v_unpad,
-                            cu_seqlens_q=cu_seqlens,
-                            cu_seqlens_k=cu_seqlens,
-                            max_seqlen_q=max_seqlen,
-                            max_seqlen_k=max_seqlen,
-                            softmax_scale=self.softmax_scale,
-                            causal=False,
-                            ver=_fa_backend.fa_ver,
+                        out_unpad = self.attn_impl.forward_varlen(
+                            q_unpad,
+                            k_unpad,
+                            v_unpad,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=max_seqlen,
                         )
                         return fused_scatter_to_padded(out_unpad, inv_indices, bs, seq)
 
@@ -1201,6 +1195,8 @@ class USPAttention(nn.Module):
                     ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
+                # Gates ring rotation, not packed varlen: _forward_ring_tail_pad
+                # needs the kernel's softmax LSE via forward_ring_kv_chunk.
                 if (
                     meta_only_pad
                     and q.shape[0] == 1
@@ -1225,8 +1221,8 @@ class USPAttention(nn.Module):
                     q, k, v = _usp_input_all_to_all_qkv(q, k, v)
 
             if (
-                _VARLEN_FA_ENABLED
-                and self.backend == AttentionBackendEnum.FA
+                _PACKED_VARLEN_ENABLED
+                and self.attn_impl.has_native_varlen_kernel
                 and meta_pad_start is not None
                 and meta_pad_end is not None
                 and meta_pad_end > meta_pad_start
@@ -1237,23 +1233,19 @@ class USPAttention(nn.Module):
                 assert 0 <= meta_pad_start < meta_pad_end <= seq
                 cu_tail = attn_mask_meta.get("cu_seqlens_tail")
                 if cu_tail is not None and meta_pad_end == seq:
-                    # Zero-copy tail path: run varlen FA straight over the
-                    # padded layout, each row split into [valid | pad] segments
-                    # (contiguous reshapes only, no repacking).
+                    # Tail path: run varlen straight over the padded layout,
+                    # each row split into [valid | pad] segments (contiguous
+                    # reshapes only, no repacking on the caller side; AITER's
+                    # forward_varlen still copies to enforce contiguity).
                     assert cu_tail.numel() == 2 * bs + 1, (
                         "cu_seqlens_tail does not match the batch size"
                     )
-                    out = flash_attn_varlen_func(
-                        q=q.reshape(bs * seq, *q.shape[2:]),
-                        k=k.reshape(bs * seq, *k.shape[2:]),
-                        v=v.reshape(bs * seq, *v.shape[2:]),
-                        cu_seqlens_q=cu_tail,
-                        cu_seqlens_k=cu_tail,
-                        max_seqlen_q=attn_mask_meta["max_seqlen_tail"],
-                        max_seqlen_k=attn_mask_meta["max_seqlen_tail"],
-                        softmax_scale=self.softmax_scale,
-                        causal=False,
-                        ver=_fa_backend.fa_ver,
+                    out = self.attn_impl.forward_varlen(
+                        q.reshape(bs * seq, *q.shape[2:]),
+                        k.reshape(bs * seq, *k.shape[2:]),
+                        v.reshape(bs * seq, *v.shape[2:]),
+                        cu_seqlens=cu_tail,
+                        max_seqlen=attn_mask_meta["max_seqlen_tail"],
                     ).reshape(bs, seq, *q.shape[2:])
                     # Match the packed paths: masked query rows read as zeros.
                     out[:, meta_pad_start:].zero_()
@@ -1271,17 +1263,12 @@ class USPAttention(nn.Module):
                     dtype=torch.int32,
                     device=q.device,
                 )
-                out_dense = flash_attn_varlen_func(
-                    q=q_dense.reshape(bs * valid_seq, *q.shape[2:]),
-                    k=k_dense.reshape(bs * valid_seq, *k.shape[2:]),
-                    v=v_dense.reshape(bs * valid_seq, *v.shape[2:]),
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=valid_seq,
-                    max_seqlen_k=valid_seq,
-                    softmax_scale=self.softmax_scale,
-                    causal=False,
-                    ver=_fa_backend.fa_ver,
+                out_dense = self.attn_impl.forward_varlen(
+                    q_dense.reshape(bs * valid_seq, *q.shape[2:]),
+                    k_dense.reshape(bs * valid_seq, *k.shape[2:]),
+                    v_dense.reshape(bs * valid_seq, *v.shape[2:]),
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=valid_seq,
                 ).reshape(bs, valid_seq, *q.shape[2:])
                 gap_out = out_dense.new_zeros(
                     bs,
@@ -1317,8 +1304,8 @@ class USPAttention(nn.Module):
                     attn_mask.contiguous(), dim=1
                 )
             if (
-                _VARLEN_FA_ENABLED
-                and self.backend == AttentionBackendEnum.FA
+                _PACKED_VARLEN_ENABLED
+                and self.attn_impl.has_native_varlen_kernel
                 and gathered_mask.dtype
                 in (torch.bool, torch.uint8, torch.int32, torch.int64)
                 and q.device.type == "cuda"
@@ -1335,17 +1322,12 @@ class USPAttention(nn.Module):
                 )
                 if indices.shape[0] > 0:
                     q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
-                    out_unpad = flash_attn_varlen_func(
-                        q=q_unpad,
-                        k=k_unpad,
-                        v=v_unpad,
-                        cu_seqlens_q=gathered_mask_meta["cu_seqlens"],
-                        cu_seqlens_k=gathered_mask_meta["cu_seqlens"],
-                        max_seqlen_q=gathered_mask_meta["max_seqlen"],
-                        max_seqlen_k=gathered_mask_meta["max_seqlen"],
-                        softmax_scale=self.softmax_scale,
-                        causal=False,
-                        ver=_fa_backend.fa_ver,
+                    out_unpad = self.attn_impl.forward_varlen(
+                        q_unpad,
+                        k_unpad,
+                        v_unpad,
+                        cu_seqlens=gathered_mask_meta["cu_seqlens"],
+                        max_seqlen=gathered_mask_meta["max_seqlen"],
                     )
                     out = fused_scatter_to_padded(out_unpad, inv_indices, bs, seq)
                     if sp_size > 1:
@@ -1578,8 +1560,8 @@ class USPAttention(nn.Module):
             key_mask = cached["key_mask"]
 
         if (
-            _VARLEN_FA_ENABLED
-            and self.backend == AttentionBackendEnum.FA
+            _PACKED_VARLEN_ENABLED
+            and self.attn_impl.has_native_varlen_kernel
             and q.device.type == "cuda"
             and q.dtype in (torch.float16, torch.bfloat16)
         ):
@@ -1611,17 +1593,14 @@ class USPAttention(nn.Module):
             q_unpad = q.reshape(-1, *q.shape[2:]).index_select(0, query_meta["indices"])
             k_unpad = k.reshape(-1, *k.shape[2:]).index_select(0, key_meta["indices"])
             v_unpad = v.reshape(-1, *v.shape[2:]).index_select(0, key_meta["indices"])
-            out_unpad = flash_attn_varlen_func(
-                q=q_unpad,
-                k=k_unpad,
-                v=v_unpad,
-                cu_seqlens_q=query_meta["cu_seqlens"],
+            out_unpad = self.attn_impl.forward_varlen(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens=query_meta["cu_seqlens"],
+                max_seqlen=query_meta["max_seqlen"],
                 cu_seqlens_k=key_meta["cu_seqlens"],
-                max_seqlen_q=query_meta["max_seqlen"],
                 max_seqlen_k=key_meta["max_seqlen"],
-                softmax_scale=self.softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
             )
             return fused_scatter_to_padded(
                 out_unpad,
@@ -1825,14 +1804,14 @@ class USPAttention(nn.Module):
     ) -> torch.Tensor:
         """Rank-local attention with a [B, S] key mask over full-sequence
         q/k/v (heads may already be sharded). Mirrors the single-rank masked
-        path: varlen FA with precomputed meta when the caller opted into
+        path: packed varlen with precomputed meta when the caller opted into
         dropped-query-row semantics (masked rows zero-filled on output), SDPA
         with an additive mask otherwise.
         """
         if (
-            _VARLEN_FA_ENABLED
+            _PACKED_VARLEN_ENABLED
             and attn_mask_meta is not None
-            and self.backend == AttentionBackendEnum.FA
+            and self.attn_impl.has_native_varlen_kernel
             and attn_mask.dtype in (torch.bool, torch.uint8, torch.int32, torch.int64)
             and q.device.type == "cuda"
             and attn_mask.device == q.device
@@ -1844,17 +1823,12 @@ class USPAttention(nn.Module):
             indices = meta["indices"]
             if indices.shape[0] > 0:
                 q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
-                out_unpad = flash_attn_varlen_func(
-                    q=q_unpad,
-                    k=k_unpad,
-                    v=v_unpad,
-                    cu_seqlens_q=meta["cu_seqlens"],
-                    cu_seqlens_k=meta["cu_seqlens"],
-                    max_seqlen_q=meta["max_seqlen"],
-                    max_seqlen_k=meta["max_seqlen"],
-                    softmax_scale=self.softmax_scale,
-                    causal=False,
-                    ver=_fa_backend.fa_ver,
+                out_unpad = self.attn_impl.forward_varlen(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens=meta["cu_seqlens"],
+                    max_seqlen=meta["max_seqlen"],
                 )
                 return fused_scatter_to_padded(out_unpad, meta["inv_indices"], bs, seq)
 

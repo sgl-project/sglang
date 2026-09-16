@@ -20,6 +20,8 @@ _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 
 
 class _SdpaAttention:
+    has_native_varlen_kernel = False
+
     def __init__(self, scale: float):
         self.scale = scale
 
