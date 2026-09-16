@@ -7,12 +7,15 @@ import torch
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
+    resolve_dspark_max_verify_len,
+    uniform_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -552,6 +555,55 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+
+class TestResolveDSparkMaxVerifyLen(CustomTestCase):
+    def test_unset_resolves_to_uncapped(self):
+        envs.SGLANG_DSPARK_MAX_VERIFY_LEN.clear()
+        self.assertEqual(resolve_dspark_max_verify_len(gamma=7), 0)
+
+    def test_non_positive_resolves_to_uncapped(self):
+        with envs.SGLANG_DSPARK_MAX_VERIFY_LEN.override(-1):
+            self.assertEqual(resolve_dspark_max_verify_len(gamma=7), 0)
+
+    def test_in_range_passes_through(self):
+        with envs.SGLANG_DSPARK_MAX_VERIFY_LEN.override(3):
+            self.assertEqual(resolve_dspark_max_verify_len(gamma=7), 3)
+
+    def test_clamps_to_gamma_plus_one(self):
+        with envs.SGLANG_DSPARK_MAX_VERIFY_LEN.override(99):
+            self.assertEqual(resolve_dspark_max_verify_len(gamma=7), 8)
+
+
+class TestUniformRaggedLayoutMaxVerifyLen(CustomTestCase):
+    def test_capped_lens_shrink_the_uniform_tier(self):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
+        layout = uniform_ragged_layout(
+            bs=2,
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=3,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            model_runner=model_runner,
+        )
+        self.assertEqual(layout.verify_lens_cpu, [3, 3])
+        self.assertEqual(layout.graph_num_tokens, 8)
+
+    def test_floor_override_keeps_full_window_tier(self):
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+        model_runner = _fake_model_runner([8, 16, 1024], max_bs=128)
+        layout = uniform_ragged_layout(
+            bs=2,
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=3,
+            ragged_verify_mode=RaggedVerifyMode.COMPACT,
+            model_runner=model_runner,
+            floor_num_draft_tokens=8,
+        )
+        self.assertEqual(layout.verify_lens_cpu, [3, 3])
+        self.assertEqual(layout.graph_num_tokens, 16)
 
 
 if __name__ == "__main__":

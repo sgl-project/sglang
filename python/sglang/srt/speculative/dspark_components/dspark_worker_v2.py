@@ -562,7 +562,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tier_num_reqs=global_bs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
             device=self.device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            verify_num_draft_tokens=self._verify_planner.uniform_verify_num_draft_tokens,
             model_runner=self.model_runner,
         )
 
