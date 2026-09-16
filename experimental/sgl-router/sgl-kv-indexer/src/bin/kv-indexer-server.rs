@@ -22,6 +22,8 @@ const BACKEND_ENV: &str = "KV_INDEXER_BACKEND";
 const VALKEY_URL_ENV: &str = "KV_INDEXER_VALKEY_URL";
 const VALKEY_KEY_PREFIX_ENV: &str = "KV_INDEXER_VALKEY_KEY_PREFIX";
 const VALKEY_CLUSTER_ENV: &str = "KV_INDEXER_VALKEY_CLUSTER";
+const VALKEY_REQUEST_TIMEOUT_ENV: &str = "KV_INDEXER_VALKEY_REQUEST_TIMEOUT_MS";
+const VALKEY_CONNECT_TIMEOUT_ENV: &str = "KV_INDEXER_VALKEY_CONNECT_TIMEOUT_MS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BackendChoice {
@@ -115,15 +117,34 @@ fn backend_choice_from_env() -> io::Result<BackendChoice> {
                     ))
                 }
             };
-            Ok(BackendChoice::Valkey(
-                ValkeyConfig::new(url)
-                    .with_key_prefix(key_prefix)
-                    .with_cluster(cluster),
-            ))
+            let mut config = ValkeyConfig::new(url)
+                .with_key_prefix(key_prefix)
+                .with_cluster(cluster);
+            if let Some(ms) = env_millis(VALKEY_REQUEST_TIMEOUT_ENV)? {
+                config = config.with_request_timeout(ms);
+            }
+            if let Some(ms) = env_millis(VALKEY_CONNECT_TIMEOUT_ENV)? {
+                config = config.with_connect_timeout(ms);
+            }
+            Ok(BackendChoice::Valkey(config))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{BACKEND_ENV} must be \"memory\" or \"valkey\", got {other:?}"),
+        )),
+    }
+}
+
+/// A positive millisecond count, or `None` when the variable is unset.
+fn env_millis(name: &str) -> io::Result<Option<std::time::Duration>> {
+    let Some(raw) = env_string(name)? else {
+        return Ok(None);
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => Ok(Some(std::time::Duration::from_millis(ms))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a positive integer of milliseconds, got {raw:?}"),
         )),
     }
 }
