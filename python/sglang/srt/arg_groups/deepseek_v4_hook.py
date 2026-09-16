@@ -317,18 +317,29 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # PD permits asymmetric attention parallelism: prefill may shard the
+        # prompt with CP while decode uses DP attention.  What is unsupported
+        # is combining real CP and real DP on the same server, or enabling CP
+        # on the decode server.  ``enable_dp_attention`` alone is not enough to
+        # identify real DP because DeepSeek-V4 prefill CP enables that flag as
+        # a degenerate DP=1 implementation detail.
+        uses_cp = getattr(cfg, "enable_prefill_cp", False) or cfg.attn_cp_size > 1
+        uses_real_dp = cfg.dp_size > 1
+        invalid_cp_topology = uses_cp and (
+            cfg.disaggregation_mode != "prefill" or uses_real_dp
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
+            or invalid_cp_topology
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "decode CP=1, and no server-local CP+DP combination. Prefill "
+                "may use CP with DP=1 and decode may use DP attention. Both "
+                "servers must enable DSpark with the same block size and "
+                "target/draft KV layout."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -359,9 +370,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
+            # DeepSeek-V4 prefill CP sets enable_dp_attention as an internal
+            # DP=1 detail. Its bounded replay has a dedicated compact CP tail
+            # layout, so only real multi-rank attention DP is incompatible.
+            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:
