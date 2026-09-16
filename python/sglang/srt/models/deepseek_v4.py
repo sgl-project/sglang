@@ -1311,13 +1311,13 @@ class MQALayer(MqaAttentionBase):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if (
-                _is_cuda
+                (_is_cuda or _is_hip)
                 and q_out is not None
                 and (
                     0 < q.shape[0] <= 8
                     or (
                         self.is_dsv41
-                        and get_platform().is_blackwell
+                        and (get_platform().is_blackwell or _is_gfx95_supported)
                         and self.n_local_heads == 16
                         and 4096 <= q.shape[0] <= 65536
                     )
