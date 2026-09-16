@@ -405,6 +405,14 @@ pub struct CacheAwareConfig {
     /// Only consulted when a peer selector is configured; see
     /// [`K8sDiscoveryConfig::peer_selector`].
     pub bootstrap_timeout_ms: u64,
+    /// Upper bound on a single peer-snapshot fetch. The per-fetch timeout is
+    /// derived as a quarter of `bootstrap_timeout_ms` (raised toward a 5s floor
+    /// for short budgets) so several peers can be tried within one deadline;
+    /// this caps that derivation.
+    ///
+    /// Raise it when the fleet's tree is large enough that one transfer +
+    /// decode of the snapshot body no longer fits under the derived value.
+    pub bootstrap_fetch_timeout_cap_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -413,6 +421,7 @@ impl Default for CacheAwareConfig {
             prefix_provider: CachePrefixProvider::default(),
             kv_indexer_endpoint: None,
             bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+            bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
         }
     }
 }
@@ -420,6 +429,22 @@ impl Default for CacheAwareConfig {
 /// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
 /// enough to sit inside a normal readinessProbe budget.
 pub const DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 5_000;
+
+/// 120s: comfortably past one gzipped transfer + decode of a snapshot body on
+/// a warm fleet — measured at 40 MB gzipped / 208 MB inflated / 17s on a
+/// 61-engine Kimi-K3 fleet at half its usual tree size. A hung peer is not this
+/// value's problem: separate connect and read timeouts bound "not answering"
+/// and "stopped sending", leaving this to bound only a transfer that is
+/// progressing. Must agree with
+/// [`crate::policies::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`];
+/// a test pins the two.
+pub const DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 120_000;
+
+/// Floor for `--kv-bootstrap-fetch-timeout-cap-ms`. Below the internal fetch
+/// floor the cap would cut every fetch short of a body transfer. Mirrors
+/// `SNAPSHOT_FETCH_TIMEOUT_FLOOR` in `policies::kv_events::index`; keep them in
+/// agreement if it moves.
+pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 5_000;
 
 /// Ceiling on `--kv-bootstrap-timeout-ms`.
 ///

@@ -75,6 +75,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
+# Inflates a gzipped peer snapshot on the bootstrap fetch path. Deliberately
+# used directly instead of reqwest's `gzip` feature: that feature is crate-wide,
+# so enabling it would make every client in the process advertise gzip and
+# auto-decode — including the proxy client carrying SSE.
+flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"
@@ -94,9 +99,6 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 
 [dev-dependencies]
 dirs = "5"
-# Inflates the gzip the snapshot route's CompressionLayer produces, so the
-# route test asserts on the real encoding rather than on the layer's presence.
-flate2 = "1"
 http-body-util = "0.1"
 # HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
 # `http1` as well as `http2`: tests/proxy/pd_protocol_binding.rs drives both
