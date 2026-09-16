@@ -20,14 +20,9 @@ from sglang.test.test_utils import CustomTestCase
 class TestFlashinferDispatcher(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.moe_runner_backend = "flashinfer_cutlass"
-        server_args.moe_a2a_backend = "flashinfer"
-        cls.server_args = server_args
-        set_global_server_args_for_scheduler(server_args)
-        publish(server_args, role="scheduler")
-        initialize_moe_config()
-
+        # Dist-init first: world_size (and so the tp/ep width ServerArgs must
+        # carry) is only known after it, and init_distributed_environment
+        # itself reads no published config.
         init_distributed_environment(
             world_size=-1,  # Auto-detect from environment
             rank=-1,  # Auto-detect from environment
@@ -38,6 +33,17 @@ class TestFlashinferDispatcher(CustomTestCase):
         rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
         torch.cuda.set_device(device)
+
+        server_args = ServerArgs(
+            model_path="dummy", tp_size=world_size, ep_size=world_size
+        )
+        server_args.moe_runner_backend = "flashinfer_cutlass"
+        server_args.moe_a2a_backend = "flashinfer"
+        cls.server_args = server_args
+        set_global_server_args_for_scheduler(server_args)
+        publish(server_args, role="scheduler")
+        initialize_moe_config()
+
         initialize_model_parallel(
             tensor_model_parallel_size=world_size, expert_model_parallel_size=world_size
         )
