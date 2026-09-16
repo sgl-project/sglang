@@ -81,6 +81,11 @@ def forward_extend_vectorized_5d(
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
     """
+    # Draft-extend metadata may own new offsets after an earlier long prefill.
+    qo_indptr = backend.forward_metadata.qo_indptr
+    if qo_indptr is None:
+        qo_indptr = backend.qo_indptr[:bs0]
+
     # Path 1: fresh-prompt shortcut.
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
@@ -92,13 +97,13 @@ def forward_extend_vectorized_5d(
         kv_indices_lin = torch.arange(
             total_tokens, dtype=torch.int32, device=k_lin.device
         )
-        kv_indptr_lin = backend.qo_indptr[:bs0]
+        kv_indptr_lin = qo_indptr
         max_q = int(backend.forward_metadata.max_q_len)
         o = mha_batch_prefill_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k_lin,
             v_lin,
-            backend.qo_indptr[:bs0],
+            qo_indptr,
             kv_indptr_lin,
             kv_indices_lin,
             max_q,
@@ -185,7 +190,7 @@ def forward_extend_vectorized_5d(
         q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
         k_lin,
         v_lin,
-        backend.qo_indptr[:bs0],
+        qo_indptr,
         kv_indptr_lin,
         kv_indices_lin,
         max_q,
