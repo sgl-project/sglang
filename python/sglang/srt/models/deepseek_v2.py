@@ -1933,6 +1933,15 @@ class DeepseekV2AttentionMLA(
         self.w_vc = None
         self.w_scale = 1.0
 
+        # GLM can retain its checkpoint BF16 absorb weights for large token
+        # batches while keeping a separately quantized FP8 copy for small
+        # decode and speculative-verification matrices. The copy is populated
+        # only when the explicit hybrid-absorb environment switch is enabled.
+        self.w_kc_decode = None
+        self.w_vc_decode = None
+        self.w_scale_decode = None
+        self.use_glm_bf16_prefill_fp8_decode = False
+
         # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
@@ -1979,6 +1988,8 @@ class DeepseekV2AttentionMLA(
         tensor_attrs = [
             (self, "w_kc", 0),
             (self, "w_vc", 0),
+            (self, "w_kc_decode", 0),
+            (self, "w_vc_decode", 0),
             (self, "w_scale_k", 0),
             (self, "w_scale_v", 0),
         ]

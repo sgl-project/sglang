@@ -319,6 +319,10 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # Retain GLM's BF16 absorbed-MLA weights for batches of at least 512 tokens
+    # and add a separately quantized FP8 copy for smaller batches. Disabled by
+    # default because it increases model memory and changes kernel dispatch.
+    SGLANG_GLM_BF16_PREFILL_FP8_DECODE = EnvBool(False)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
