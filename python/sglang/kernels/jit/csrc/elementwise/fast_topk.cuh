@@ -39,7 +39,7 @@ SGL_DEVICE auto convert_to_uint32(float x) -> uint32_t {
 
 // When length <= kTopK, write the indices directly.
 template <int kTopK>
-SGL_DEVICE void naive_topk(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
+SGL_DEVICE void naive_topk(int32_t* __restrict__ indice, int32_t length) {
   const auto tid = threadIdx.x;
   for (int i = tid; i < kTopK; i += kThreadsPerBlock) {
     indice[i] = (i < length) ? i : -1;
@@ -217,12 +217,12 @@ __global__ __launch_bounds__(fast_topk_detail::kThreadsPerBlock) void fast_topk_
   device::PDLWaitPrimary<kUsePDL>();
 
   const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto row_start = params.row_starts == nullptr ? 0 : params.row_starts[bid];
+  const auto row_start = params.row_starts[bid];
   const auto length = params.lengths[bid];
   const auto indice = params.indices + bid * kTopK;
   const auto score = params.input + bid * params.input_stride;
   if (length <= kTopK) {
-    naive_topk<kTopK>(score, indice, length);
+    naive_topk<kTopK>(indice, length);
   } else {
     radix_select_topk<kTopK>(score, indice, row_start, length);
   }
