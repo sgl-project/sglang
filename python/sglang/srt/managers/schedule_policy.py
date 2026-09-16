@@ -1336,19 +1336,6 @@ class PrefillAdder:
             self.dllm_config is not None and self.dllm_config.needs_full_prefill
         )
 
-        if is_dream_full_prefill:
-            assert truncation_align_size is None, (
-                "truncation_align_size is not supported for dllm prefill"
-            )
-            # Dream must execute the complete prompt-and-generation canvas in a
-            # single prefill. It may exceed the configured compute budget, like
-            # the first regular non-chunked prefill, but must fit the allocator.
-            if extend_len > self._get_dllm_remain_tokens():
-                return AddReqResult.NO_TOKEN
-            if (verdict := self._check_prefill_tile_budget(input_tokens)) is not None:
-                return verdict
-            return _PrefillAdmission(prefix_len, extend_len, 0, False)
-
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
@@ -1361,6 +1348,19 @@ class PrefillAdder:
         )
         if not can_admit:
             return AddReqResult.NO_TOKEN
+
+        if is_dream_full_prefill:
+            assert truncation_align_size is None, (
+                "truncation_align_size is not supported for dllm prefill"
+            )
+            # Dream must execute the complete prompt-and-generation canvas in a
+            # single prefill. It may exceed the configured compute budget, like
+            # the first regular non-chunked prefill, but must fit the allocator.
+            if extend_len > self._get_dllm_remain_tokens():
+                return AddReqResult.NO_TOKEN
+            if (verdict := self._check_prefill_tile_budget(input_tokens)) is not None:
+                return verdict
+            return _PrefillAdmission(prefix_len, extend_len, 0, False)
 
         # Without chunking, allow the first request even above the input cap.
         if (
