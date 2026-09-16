@@ -18,7 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
 from sglang.srt.utils.common import ceil_div
 
 
@@ -115,7 +115,9 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu() or is_musa():
+    # NPU prefill CP stays supported (the DSV4 backend consumes the V2
+    # strategy metadata); HIP/MUSA remain on the deprecated path.
+    if is_hip() or is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model

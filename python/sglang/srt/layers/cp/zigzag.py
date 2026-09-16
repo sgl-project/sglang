@@ -334,6 +334,25 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             [chunks[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index], dim=0
         )
 
+    def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
+        meta = forward_batch.attn_cp_metadata
+        device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
+        if device is None and meta.cu_seqlens_q_prev_tensor is not None:
+            device = meta.cu_seqlens_q_prev_tensor.device
+        if device is None:
+            device = torch.device("cpu")
+
+        offsets = [0] + list(accumulate(meta.split_list))
+        pieces = []
+        for chunk_idx in meta.zigzag_index:
+            start = offsets[chunk_idx]
+            end = offsets[chunk_idx + 1]
+            if end > start:
+                pieces.append(torch.arange(start, end, device=device, dtype=torch.long))
+        if not pieces:
+            return torch.empty(0, device=device, dtype=torch.long)
+        return torch.cat(pieces, dim=0)
+
     def get_supported_attention_backend(self):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,

@@ -46,15 +46,22 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
     Layer split is a prefill-CP-only optimization for DSA (DeepSeek Sparse
-    Attention) MLA models (e.g. GLM-5.2). Draft workers keep the full cache.
+    Attention) models: the MLA DSA family (e.g. GLM-5.2) and DeepSeek V4,
+    whose attention arch is MHA but whose pools are still DSA-style per-layer
+    caches. Draft workers keep the full cache.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
+    hf_config = model_runner.model_config.hf_config
     return (
         not model_runner.is_draft_worker
         and get_parallel().enable_dsa_cache_layer_split
-        and model_runner.use_mla_backend
-        and is_deepseek_dsa(model_runner.model_config.hf_config)
+        and (
+            # V4 is AttentionArch.MHA, so the MLA backend term only gates the
+            # MLA DSA family.
+            (model_runner.use_mla_backend and is_deepseek_dsa(hf_config))
+            or is_deepseek_v4(hf_config)
+        )
     )
 
 
@@ -107,15 +114,21 @@ def get_layer_shard_range(
 
 
 def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) -> int:
-    """CP rank that owns ``local_layer_idx`` under the contiguous split."""
-    for rank in range(shard_size):
-        start, end = get_layer_shard_range(rank, shard_size, total_layers)
-        if start <= local_layer_idx < end:
-            return rank
-    raise ValueError(
-        f"Invalid local_layer_idx={local_layer_idx} for "
-        f"shard_size={shard_size}, total_layers={total_layers}"
-    )
+    """CP rank that owns ``local_layer_idx`` under the contiguous split.
+
+    Closed form of :func:`get_layer_shard_range`: the first ``total_layers %
+    shard_size`` ranks own ``base + 1`` layers, the rest own ``base``.
+    """
+    if not 0 <= local_layer_idx < total_layers:
+        raise ValueError(
+            f"Invalid local_layer_idx={local_layer_idx} for "
+            f"shard_size={shard_size}, total_layers={total_layers}"
+        )
+    base, rem = divmod(total_layers, shard_size)
+    head = rem * (base + 1)
+    if local_layer_idx < head:
+        return local_layer_idx // (base + 1)
+    return rem + (local_layer_idx - head) // base
 
 
 def is_cp_active(forward_batch) -> bool:
@@ -199,6 +212,16 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
     return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
+
+
+def cp_gather_full_sequence_states(sharded_states, forward_batch):
+    """Gather CP-sharded states into the full logical sequence order."""
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert sharded_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.gather_hidden_states(sharded_states, forward_batch)
 
 
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
