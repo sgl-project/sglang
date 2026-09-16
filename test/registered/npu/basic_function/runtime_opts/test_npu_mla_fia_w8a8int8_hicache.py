@@ -41,7 +41,6 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "ascend",
             "--tp-size",
             2,
-            "--disable-radix-cache",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             1.2,

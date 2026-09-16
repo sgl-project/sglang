@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
     popen_with_error_check,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class DisaggregationHiCacheBase(PDDisaggregationServerBase):
@@ -162,11 +162,6 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
 class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
     """Decode startup parameters"""
 
-    ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
-    base_gpu_id = (
-        ascend_devices.split(",")[2] if len(ascend_devices.split(",")) >= 3 else "2"
-    )
-
     @classmethod
     def start_decode(cls):
         decode_args = [
@@ -182,7 +177,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             "--mem-fraction-static",
             "0.9",
             "--base-gpu-id",
-            cls.base_gpu_id,
+            2,
             "--disaggregation-decode-enable-offload-kvcache",
             "--hicache-io-backend",
             "kernel_ascend",
