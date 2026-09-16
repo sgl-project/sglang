@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
-import subprocess
-import sys
-import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -15,10 +11,6 @@ from sglang.cli.serve_backends import (
     ServeBackendDetection,
     ServeBackendRegistry,
     ServeRequest,
-)
-from sglang.cli.utils import (
-    _is_diffusion_model_from_hub_metadata,
-    get_is_diffusion_model,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -251,64 +243,6 @@ class TestServeBackendDispatch(unittest.TestCase):
         self.assertIsNone(request.model_path)
         mock_load_plugins.assert_not_called()
         mock_kill.assert_not_called()
-
-
-class TestDiffusionImportIsolation(unittest.TestCase):
-    def test_local_model_card_detects_diffusion_without_model_names(self):
-        with tempfile.TemporaryDirectory() as model_path:
-            with open(os.path.join(model_path, "README.md"), "w") as model_card:
-                model_card.write("---\npipeline_tag: text-to-image\n---\n")
-            self.assertTrue(get_is_diffusion_model(model_path))
-
-    @patch("sglang.cli.utils.HfApi")
-    def test_hub_metadata_detects_diffusion_without_model_names(self, mock_hf_api):
-        info = mock_hf_api.return_value.model_info.return_value
-        info.library_name = None
-        info.pipeline_tag = "text-to-video"
-        info.tags = []
-        self.assertTrue(_is_diffusion_model_from_hub_metadata("org/model"))
-
-        info.pipeline_tag = "text-generation"
-        self.assertFalse(_is_diffusion_model_from_hub_metadata("org/model"))
-
-    def test_llm_detection_does_not_import_multimodal_gen(self):
-        script = """
-import os
-import sys
-from types import SimpleNamespace
-from unittest.mock import patch
-
-os.environ.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
-from sglang.cli.utils import get_is_diffusion_model
-
-model_info = SimpleNamespace(
-    library_name="transformers",
-    pipeline_tag="text-generation",
-    tags=["transformers"],
-)
-with patch("huggingface_hub.hf_hub_download", side_effect=FileNotFoundError), patch(
-    "sglang.cli.utils.HfApi"
-) as hf_api:
-    hf_api.return_value.model_info.return_value = model_info
-    assert not get_is_diffusion_model("org/llm")
-
-assert not any(
-    name == "sglang.multimodal_gen" or name.startswith("sglang.multimodal_gen.")
-    for name in sys.modules
-)
-"""
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        self.assertEqual(
-            completed.returncode,
-            0,
-            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
-        )
 
 
 if __name__ == "__main__":

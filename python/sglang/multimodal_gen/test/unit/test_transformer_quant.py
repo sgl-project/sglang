@@ -165,7 +165,6 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
-    @unittest.skipIf(torch.version.hip is not None, "CUTLASS FP8 requires CUDA")
     def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
         method = ModelOptFp8LinearMethod(
             ModelOptFp8Config(is_checkpoint_fp8_serialized=True)

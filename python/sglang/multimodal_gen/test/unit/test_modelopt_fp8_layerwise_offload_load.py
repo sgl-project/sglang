@@ -75,10 +75,7 @@ def _make_serialized_fp8_checkpoint() -> tuple[dict[str, torch.Tensor], torch.Te
     return state_dict, weight_ref
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and torch.version.hip is None,
-    "requires CUDA for scaled_fp8_quant",
-)
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA for scaled_fp8_quant")
 class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
     def test_serialized_checkpoint_loads_with_component_starting_on_cpu(self):
         if not model_parallel_is_initialized():
