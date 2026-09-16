@@ -352,4 +352,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
+        if key[0] == "full_assistant_ebnf":
+            return ret
         return self._make_grammar_object(ret, reasoning)
