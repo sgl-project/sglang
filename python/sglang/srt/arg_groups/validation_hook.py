@@ -159,6 +159,14 @@ def check_server_args(server_args: Any):
     check_lora_server_args(server_args)
 
     # Check speculative decoding
+    if cfg.speculative_draft_scheduling_policy == "bubble":
+        assert (
+            cfg.speculative_algorithm or ""
+        ).upper() == "DSPARK" and cfg.speculative_dspark_pp_replicated_draft, (
+            "--speculative-draft-scheduling-policy=bubble requires DSPARK "
+            "with --speculative-dspark-pp-replicated-draft"
+        )
+
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 

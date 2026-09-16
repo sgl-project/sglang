@@ -16,6 +16,8 @@ _contract = runpy.run_path(
 )
 draft_owner = _contract["draft_owner"]
 Identity = _contract["PPDSparkIdentity"]
+DraftWork = _contract["PPDSparkDraftWork"]
+DraftReadyQueue = _contract["DraftReadyQueue"]
 validate_identities = _contract["validate_identities"]
 validate_pd_contract = _contract["validate_pd_contract"]
 pack_proposal = _contract["pack_proposal"]
@@ -112,3 +114,25 @@ def test_context_selection_covers_each_token_exactly_once():
     assert owned_token_rows([], [], 0, 2) == ([], [])
     with pytest.raises(ValueError, match="token counts"):
         owned_token_rows(["r"], [], 0, 2)
+
+
+def test_draft_ready_queue_is_fifo_and_rejects_stale_or_duplicate_work():
+    first_identity = (Identity("a", (1, 0), 2),)
+    second_identity = (Identity("b", (1, 0), 2),)
+    first = DraftWork(first_identity, batch=object(), draft_input=object())
+    second = DraftWork(second_identity, batch=object(), draft_input=object())
+    queue = DraftReadyQueue()
+
+    queue.push(first)
+    queue.push(second)
+    with pytest.raises(RuntimeError, match="Duplicate"):
+        queue.push(first)
+    with pytest.raises(RuntimeError, match="Stale or mismatched"):
+        queue.pop(second_identity)
+
+    assert len(queue) == 2
+    assert queue.pop(first_identity) is first
+    assert queue.pop(second_identity) is second
+    assert len(queue) == 0
+    with pytest.raises(RuntimeError, match="empty"):
+        queue.pop(first_identity)

@@ -563,6 +563,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     replicated_pp_draft = cfg.speculative_dspark_pp_replicated_draft
+    if cfg.speculative_draft_scheduling_policy == "bubble" and not replicated_pp_draft:
+        raise ValueError(
+            "--speculative-draft-scheduling-policy=bubble requires "
+            "--speculative-dspark-pp-replicated-draft."
+        )
     if replicated_pp_draft:
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyMode,

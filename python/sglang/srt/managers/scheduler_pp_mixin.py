@@ -32,6 +32,9 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.speculative.dspark_components.dspark_pp import (
+    DraftReadyQueue,
+    PPDSparkDraftWork,
+    PPDSparkIdentity,
     pack_proposal,
     unpack_proposal,
 )
@@ -596,6 +599,7 @@ class SchedulerPPMixin:
             and self.ps.pp_size > 1
             and not self.spec_algorithm.is_none()
         )
+        self._pp_dspark_draft_ready_queue = DraftReadyQueue()
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -833,6 +837,10 @@ class SchedulerPPMixin:
             tensor_dict["dspark_new_seq_lens"] = result.new_seq_lens
             tensor_dict["dspark_bonus_tokens"] = result.next_draft_input.bonus_tokens
             if result.accept_lens is not None:
+                if result.pp_dspark_next_proposal is None:
+                    raise RuntimeError(
+                        "Replicated PP DSpark output is missing the next proposal."
+                    )
                 tensor_dict.update(pack_proposal(1, result.pp_dspark_next_proposal))
                 tensor_dict["dspark_accept_lens"] = result.accept_lens
                 tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
@@ -1110,7 +1118,7 @@ class SchedulerPPMixin:
                         pp_outputs.tensors.update(
                             pack_proposal(
                                 0,
-                                self.model_worker.prepare_pp_draft(
+                                self._pp_schedule_dspark_draft(
                                     fwd_batch, next_draft_input
                                 ),
                             )
@@ -1225,6 +1233,24 @@ class SchedulerPPMixin:
         if metadata is not None and metadata.fwd_batch is not None:
             return metadata.fwd_batch
         return self.mbs[mb_id]
+
+    def _pp_schedule_dspark_draft(self: Scheduler, batch: ScheduleBatch, draft_input):
+        if get_spec().speculative_draft_scheduling_policy == "tail":
+            return self.model_worker.prepare_pp_draft(batch, draft_input)
+
+        identities = tuple(
+            PPDSparkIdentity.from_req(req).next_round() for req in batch.reqs
+        )
+        self._pp_dspark_draft_ready_queue.push(
+            PPDSparkDraftWork(
+                identities=identities,
+                batch=replace(batch, reqs=batch.reqs[:]),
+                draft_input=draft_input,
+            )
+        )
+        work = self._pp_dspark_draft_ready_queue.pop(identities)
+        with torch.profiler.record_function("pp_dspark_draft_bubble"):
+            return self.model_worker.prepare_pp_draft(work.batch, work.draft_input)
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -1685,6 +1711,14 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                if (
+                    result.pp_dspark_projected_context is not None
+                    and result.accept_lens is not None
+                    and result.pp_dspark_next_proposal is None
+                ):
+                    result.pp_dspark_next_proposal = self._pp_schedule_dspark_draft(
+                        cur_batch, result.next_draft_input
+                    )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=(

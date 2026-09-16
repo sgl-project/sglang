@@ -1324,7 +1324,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 projected_context=pp_projected_context,
                 commit_lens=accept.commit_lens,
             )
-            pp_next_proposal = self.prepare_pp_draft(batch, next_draft_input)
+            if get_spec().speculative_draft_scheduling_policy == "tail":
+                pp_next_proposal = self.prepare_pp_draft(batch, next_draft_input)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),

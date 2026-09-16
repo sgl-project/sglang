@@ -117,6 +117,13 @@ class Spec(msgspec.Struct):
         "DP attention, or context parallelism. Decode CUDA graphs are supported; "
         "prefill CUDA graphs must be disabled.",
     ] = False
+    speculative_draft_scheduling_policy: A[
+        Literal["tail", "bubble"],
+        "Draft scheduling policy for replicated PP DSPARK. 'tail' drafts inline "
+        "after verify and preserves the default behavior. 'bubble' queues owner-local "
+        "draft work and dispatches it only after the stage's target forward has been "
+        "submitted.",
+    ] = "tail"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from typing import Any
 from zlib import crc32
 
 
@@ -39,6 +41,47 @@ class PPDSparkCandidate:
     draft_block_ids: object
     draft_tokens: object
     confidence: object = None
+
+
+@dataclass(frozen=True)
+class PPDSparkDraftWork:
+    identities: tuple[PPDSparkIdentity, ...]
+    batch: Any
+    draft_input: Any
+
+
+class DraftReadyQueue:
+    def __init__(self) -> None:
+        self._queue: deque[PPDSparkDraftWork] = deque()
+        self._pending: set[tuple[tuple[str, tuple[int, int], int], ...]] = set()
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def push(self, work: PPDSparkDraftWork) -> None:
+        key = self._key(work.identities)
+        if key in self._pending:
+            raise RuntimeError(f"Duplicate PP DSpark draft work: identities={key}")
+        self._queue.append(work)
+        self._pending.add(key)
+
+    def pop(self, expected: tuple[PPDSparkIdentity, ...]) -> PPDSparkDraftWork:
+        if not self._queue:
+            raise RuntimeError("PP DSpark draft ready queue is empty")
+        work = self._queue[0]
+        validate_identities(
+            expected, [identity.to_wire() for identity in work.identities]
+        )
+        self._queue.popleft()
+        key = self._key(work.identities)
+        self._pending.remove(key)
+        return work
+
+    @staticmethod
+    def _key(
+        identities: tuple[PPDSparkIdentity, ...],
+    ) -> tuple[tuple[str, tuple[int, int], int], ...]:
+        return tuple(identity.to_wire() for identity in identities)
 
 
 def validate_identities(expected, received) -> None:

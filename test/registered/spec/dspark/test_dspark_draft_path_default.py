@@ -143,6 +143,18 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
                 args = self._replicated_args(mode)
                 _handle_dspark(args)
                 self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
+                self.assertEqual(args.speculative_draft_scheduling_policy, "tail")
+
+    def test_bubble_policy_requires_replicated_pp_draft(self):
+        args = self._replicated_args("decode")
+        args.speculative_draft_scheduling_policy = "bubble"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+        args.speculative_dspark_pp_replicated_draft = False
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "replicated-draft"):
+                _handle_dspark(args)
 
     def test_decode_cuda_graph_is_admitted(self):
         args = self._replicated_args("decode")
