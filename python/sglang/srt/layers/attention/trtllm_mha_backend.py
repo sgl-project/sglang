@@ -28,9 +28,11 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -104,7 +106,7 @@ class TRTLLMMHAMetadata:
     encoder_row_map: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -137,9 +139,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        super().__init__()
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "trtllm_mha"
         )
@@ -460,6 +465,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
         v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
         return q_scale * k_scale * layer.scaling, v_scale
+
+    def _kv_write_scales(self, layer: RadixAttention):
+        if self.kv_cache_quant_method.needs_global_scale():
+            return None, None
+        return layer.k_scale, layer.v_scale
 
     def init_cuda_graph_state(
         self,
