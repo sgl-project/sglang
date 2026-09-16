@@ -125,7 +125,10 @@ class AdaptiveController:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        num_steps: int | None = None,
     ) -> None:
         """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
@@ -133,6 +136,9 @@ class AdaptiveController:
         )
         if new_step is not None:
             self._activate(new_step)
+
+    def run_profiling(self, tree_cache, *, max_running_requests: int) -> None:
+        """Startup profiling hook; policies without profiling leave it a no-op."""
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

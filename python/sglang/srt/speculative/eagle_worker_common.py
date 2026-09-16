@@ -662,6 +662,7 @@ def run_eagle_verify(
         next_token_ids=predict,
         can_run_cuda_graph=can_run_cuda_graph,
         speculative_num_draft_tokens=num_draft_tokens,
+        speculative_num_steps=verify_input.spec_steps,
         next_draft_input=next_draft_input,
         accept_lens=accept_lens,
         new_seq_lens=new_seq_lens,
