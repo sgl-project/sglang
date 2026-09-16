@@ -599,19 +599,9 @@ fn assistant_message(message: &Value, path: &str) -> Result<(), Violation> {
             }
         }
     }
-    if !message["content"].is_string()
-        && !["reasoning_content", "refusal"]
-            .iter()
-            .any(|key| message[*key].as_str().is_some_and(|s| !s.is_empty()))
-        && message["tool_calls"]
-            .as_array()
-            .is_none_or(|calls| calls.is_empty())
-    {
-        return Err(invalid(
-            path,
-            "missing assistant content, reasoning, refusal or tool calls",
-        ));
-    }
+    // A stop can terminate before any visible text. Nullable/absent content
+    // is valid even without another payload; scenario assertions check whether
+    // a particular request actually produced the expected output.
     Ok(())
 }
 

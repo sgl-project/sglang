@@ -123,12 +123,29 @@ fn plans_bind_only_selected_profiles_and_validate_equivalence_pairs() {
         assert!(profile.suite.response_policy.is_some());
     }
     let config = config();
-    for mutation in ["profile", "body", "endpoint", "rules"] {
+    for mutation in [
+        "profile",
+        "body",
+        "endpoint",
+        "rules",
+        "expectations",
+        "warmup",
+        "tool_expectation",
+    ] {
         let mut spec: Value = serde_json::from_str(DEFAULT_SPEC).unwrap();
         match mutation {
             "profile" => spec["cases"][0]["profiles"] = json!(["missing"]),
             "body" => spec["cases"][0]["body"]["temperature"] = json!(1),
             "endpoint" => spec["cases"][0]["path"] = json!("/v1/responses"),
+            "expectations" => {
+                spec["cases"][0]["expectations"] = json!([
+                {"check":"content","empty":false}, {"check":"content","empty":true}])
+            }
+            "warmup" => spec["cases"][0]["before_each"] = json!([{"prompt":"hello","stream":true}]),
+            "tool_expectation" => {
+                spec["cases"][0]["expectations"] = json!([
+                {"check":"tool_calls","enabled":false,"arguments":{}}])
+            }
             _ => spec["streaming"]["delta"]["content"] = json!("constant"),
         }
         assert!(load_plan(&spec.to_string(), &config).is_err(), "{mutation}");
@@ -643,6 +660,20 @@ fn scenario_assertions_distinguish_inactive_and_populated_values() {
             assert_eq!(result.violations.is_empty(), passes, "{spec}: {response}");
         }
     }
+    let mut cold = unary(true);
+    cold["usage"]["prompt_tokens_details"] = json!({"cached_tokens":0});
+    assert!(
+        Expectation::CachedTokens { positive: false }
+            .evaluate(&cold, &c)
+            .violations
+            .is_empty()
+    );
+    assert!(
+        !Expectation::CachedTokens { positive: true }
+            .evaluate(&cold, &c)
+            .violations
+            .is_empty()
+    );
     // A missing positive field never counts as exercising the populated state.
     for check in ["reasoning_tokens", "cached_tokens"] {
         let expectation: Expectation =
@@ -848,4 +879,39 @@ fn coverage_cases_resolve_assertions_and_warmups_for_every_stream_mode() {
             }
         }
     }
+}
+
+#[test]
+fn empty_chat_outputs_are_valid_but_keep_null_empty_and_missing_distinct() {
+    let (c, p) = case("chat_empty_stop_json");
+    let mut values = Vec::new();
+    for content in [None, Some(Value::Null), Some(json!(""))] {
+        let mut value = unary(true);
+        value["choices"][0]["finish_reason"] = json!("stop");
+        value["choices"][0]["matched_stop"] = json!("Paris");
+        let message = value["choices"][0]["message"].as_object_mut().unwrap();
+        if let Some(content) = content {
+            message.insert("content".into(), content);
+        } else {
+            message.remove("content");
+        }
+        let result = p
+            .prepare(
+                &c,
+                &HttpObservation {
+                    json: Some(value.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.value, value);
+        assert!(result.assertions.iter().all(|a| a.violations.is_empty()));
+        values.push(result);
+    }
+    assert_ne!(values[0].value, values[1].value);
+    assert_ne!(values[1].value, values[2].value);
+    assert_eq!(
+        values[0].equivalence.as_ref().unwrap().value,
+        values[2].equivalence.as_ref().unwrap().value
+    );
 }

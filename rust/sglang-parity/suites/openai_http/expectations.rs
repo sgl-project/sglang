@@ -119,6 +119,7 @@ impl Expectation {
                             })
                     } else {
                         absent_or_null(details)
+                            || details.and_then(|v| v["cached_tokens"].as_u64()) == Some(0)
                     },
                 );
             }
@@ -235,7 +236,8 @@ impl Expectation {
                                         "text".into()
                                     }
                                 ),
-                                value.as_str().is_some_and(|s| s.is_empty() == *empty),
+                                value.as_str().is_some_and(|s| s.is_empty() == *empty)
+                                    || (*empty && is_chat(&case.path) && value.is_null()),
                             );
                         }
                         Self::ToolCalls { enabled, arguments } => {
