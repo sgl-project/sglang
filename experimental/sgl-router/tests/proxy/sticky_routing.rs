@@ -8,7 +8,7 @@
 
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -36,20 +36,27 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::Sticky,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: Some(StickyConfig {
                 header_name: header_name.to_string(),
-                fallback_policy: PolicyKind::RoundRobin,
+                fallback_policy: StickyFallbackKind::RoundRobin,
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            affinity: None,
+            fused: None,
+            eligibility: None,
+            sampling_overrides: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

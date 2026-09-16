@@ -148,8 +148,8 @@ def _discovered_rust_extensions():
             cargo_manifest_args=["--locked"],
         )
         # Preserve Cargo metadata until the selected extension is actually
-        # built. Alternate platform pyprojects filter mem-cache out before
-        # this point and therefore do not need torch as a build dependency.
+        # built. Alternate platform pyprojects filter the Rust TreeCore extension
+        # out before this point and therefore do not need torch as a build dependency.
         extension._sglang_metadata = sglang_meta
         extension._sglang_manifest_path = package["manifest_path"]
         extensions.append(extension)

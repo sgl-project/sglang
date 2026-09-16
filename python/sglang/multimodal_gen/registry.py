@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
+    FastH3PipelineConfig,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -83,6 +84,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
+    VDNH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -100,6 +104,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+    SenseNovaU1PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -162,7 +169,11 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3SamplingParams,
+    MiniMaxH3SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import VDNH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -177,6 +188,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -195,6 +209,11 @@ from sglang.multimodal_gen.configs.sample.wan import (
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
+)
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    SENSENOVA_U1_MODEL_IDS,
+    is_sensenova_u1_adapter_only_model,
+    is_sensenova_u1_model,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -334,6 +353,8 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
+    "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -453,17 +474,24 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
     _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
+    if is_sensenova_u1_model(model_path):
+        return True
+
     if model_path in _MODEL_HF_PATH_TO_NAME:
         return True
 
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
         if registered_model_name in model_short_name:
             return True
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -497,6 +525,13 @@ def _get_config_info(
             "falling back to automatic detection."
         )
 
+    # SenseNova Hub IDs require an exact match, while local checkpoints are
+    # identified from their config metadata rather than their directory name.
+    if is_sensenova_u1_model(model_path):
+        for registered_hf_id in all_model_hf_paths:
+            if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_id = _MODEL_HF_PATH_TO_NAME[model_path]
@@ -506,6 +541,8 @@ def _get_config_info(
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
         if registered_model_name in model_short_name:
@@ -524,6 +561,8 @@ def _get_config_info(
     # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
+        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+            continue
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
@@ -656,6 +695,16 @@ def get_model_info(
     elif isinstance(backend, str):
         backend = Backend.from_string(backend)
 
+    if is_sensenova_u1_adapter_only_model(model_path):
+        logger.error(
+            "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
+            "model weights or config. SenseNova-U1 adapters are not supported "
+            "yet; use the base checkpoint 'sensenova/SenseNova-U1.5-8B-MoT' "
+            "directly.",
+            model_path,
+        )
+        return None
+
     # Handle explicit diffusers backend
     if backend == Backend.DIFFUSERS:
         logger.info(
@@ -779,9 +828,11 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower()
-            and "ltx-2.3" not in path.lower()
-            and "ltx-2.5" not in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
         ],
     )
     register_configs(
@@ -968,8 +1019,42 @@ def _register_configs():
             "MiniMax/MiniMax-H3",
         ],
         model_detectors=[
-            lambda model_id: "minimaxh3"
-            in model_id.lower().replace("-", "").replace("_", "")
+            lambda model_id: (
+                "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "vdn" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=[
+            "sensenova/SenseNova-U1.5-8B-MoT",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3SamplingParams,
+        pipeline_config_cls=FastH3PipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=VDNH3SamplingParams,
+        pipeline_config_cls=VDNH3PipelineConfig,
+        hf_model_paths=[
+            "OpenVDN/vdn-minimax-h3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "vdn" in model_id.lower()
+                and "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+            )
         ],
     )
     # FLUX
@@ -1175,7 +1260,7 @@ def _register_configs():
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
         ],
     )
 
@@ -1187,9 +1272,7 @@ def _register_configs():
             "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         ],
         model_detectors=[
-            lambda hf_id: (
-                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
-            )
+            lambda hf_id: "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
         ],
     )
 
@@ -1277,8 +1360,10 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
-            and "image-edit" not in hf_id.lower(),
+            lambda hf_id: (
+                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+                and "image-edit" not in hf_id.lower()
+            ),
         ],
     )
 
@@ -1338,9 +1423,11 @@ def _register_configs():
             "meituan-longcat/LongCat-Image-Edit-Turbo",
         ],
         model_detectors=[
-            lambda hf_id: "longcat" in hf_id.lower()
-            and "edit" in hf_id.lower()
-            and "turbo" in hf_id.lower(),
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" in hf_id.lower()
+            ),
         ],
     )
 
@@ -1352,9 +1439,11 @@ def _register_configs():
             "meituan-longcat/LongCat-Image-Edit",
         ],
         model_detectors=[
-            lambda hf_id: "longcat" in hf_id.lower()
-            and "edit" in hf_id.lower()
-            and "turbo" not in hf_id.lower(),
+            lambda hf_id: (
+                "longcat" in hf_id.lower()
+                and "edit" in hf_id.lower()
+                and "turbo" not in hf_id.lower()
+            ),
         ],
     )
 
@@ -1368,6 +1457,9 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
+    if is_sensenova_u1_model(model_path):
+        return "SenseNovaU1Pipeline"
+
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():

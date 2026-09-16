@@ -377,6 +377,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
+        # None on a static pool, whose collapsed page is already physical.
+        v2p = self.kv_index_translator.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (
                 block_kv_indices.shape[0],
@@ -389,12 +391,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             req_pool_indices,
             local_seq_lens,
             block_kv_indices,
+            v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
+            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
             PAGES_PER_BLOCK=pages_per_block,
+            HAS_V2P=v2p is not None,
         )
 
     def _create_block_kv_indices(
@@ -761,21 +766,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
-            out_cache_loc = forward_batch.out_cache_loc
-            n = out_cache_loc.shape[0]
-            dst = self.cuda_graph_out_cache_loc_kernel[:n]
-            dst.copy_(out_cache_loc)
-            # Replay-prep receives the RAW (unpadded) out_cache_loc
-            # (build_replay_fb_view), but the captured write kernel consumes the
-            # full captured tier of this buffer. Zero the tail so pad rows write
-            # to the sink (row 0) instead of stale kernel-facing locs left by
-            # earlier larger replays — a stale tail scatters pad-row garbage into
-            # live KV pages. Mirrors the runner's PaddingPolicy.ZERO on its own
-            # out_cache_loc slot.
-            self.cuda_graph_out_cache_loc_kernel[n:].zero_()
-            self._decode_kernel_loc = dst
+            # The captured kernel consumes the whole buffer, so the tail a
+            # shorter replay leaves must go to slot 0 rather than live pages.
+            self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
+                out=self.cuda_graph_out_cache_loc_kernel,
+                forward_batch=forward_batch,
+                width=self.cuda_graph_out_cache_loc_kernel.numel(),
+            )
         else:
             self._decode_kernel_loc = None
+
+    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """The loc an unfused KV scatter must write at: the capture-stable
+        buffer under a captured unified-pool decode, since the translate
+        rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
+        the batch's own loc everywhere else.
+        """
+        if self._decode_kernel_loc is not None:
+            return self._decode_kernel_loc
+        return forward_batch.out_cache_loc
 
     def _resolve_fused_write_loc(
         self, forward_batch: ForwardBatch
@@ -1198,6 +1207,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
+        # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
+        # is also its only skip. A DCP-resolved loc never reaches here -- see
+        # the `_fused_set_kv_concat_q_fp8` gate.
+        assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
+            "fused fp8 KV write reached with a DCP-resolved loc"
+        )
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1205,8 +1220,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cache_k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
-            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
-            # (identity when attn_dcp_size == 1).
             dcp_world_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
         )
@@ -1290,9 +1303,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Save KV cache if requested (the fused fp8 path already wrote it)
         query = fused_fp8_query
         if query is None and save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             if self._decode_kernel_loc is not None:
                 if merge_query and self._fused_set_kv_concat_q:
                     # Fused: KV scatter + [q_nope | q_rope] concat in one
@@ -1470,14 +1483,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -1492,11 +1520,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        if save_kv_cache and fused_fp8_query is None:
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             if self._decode_kernel_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
                     layer, self._decode_kernel_loc, k, k_rope
@@ -1507,8 +1535,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
 
         # TODO refactor to avoid code duplication
-        # Prepare query tensor inline
-        if merge_query:
+        # Prepare query tensor inline (already built when the fused fp8 path
+        # ran)
+        if fused_fp8_query is not None:
+            q = fused_fp8_query
+        elif merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(

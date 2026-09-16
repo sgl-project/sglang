@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
+    has_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
@@ -57,9 +58,7 @@ from sglang.multimodal_gen.runtime.realtime.session import (
 from sglang.multimodal_gen.runtime.realtime.states import (
     RealtimeCausalDecodeState,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-)
+from sglang.multimodal_gen.runtime.realtime.video import RAW_RGB_CONTENT_TYPE
 
 
 class _Req(SimpleNamespace):
@@ -976,6 +975,7 @@ def test_realtime_input_validation_reuses_generator_across_chunks():
 def test_realtime_registry_resolves_lingbot_adapter():
     server_args = SimpleNamespace(pipeline_config=LingBotWorldCausalDMDConfig())
 
+    assert has_realtime_model_adapter(server_args)
     adapter = get_realtime_model_adapter(server_args)
 
     assert isinstance(adapter, lingbot_realtime.LingBotWorldRealtimeAdapter)

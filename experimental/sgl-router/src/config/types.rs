@@ -1,3 +1,5 @@
+use crate::config::sampling::SamplingOverrides;
+use serde::Deserialize;
 use std::num::NonZeroU32;
 
 /// In-memory router configuration, built from CLI flags by
@@ -70,7 +72,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `power_of_two` / `load_based` / `fused_score` / `score_policy` /
+/// `session_aware` / `cache_aware` / `sticky`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -83,11 +86,18 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
-    /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
-    /// Requires the model to have a tokenizer loaded; cache_aware tuning
-    /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq")]
-    CacheAwareZmq,
+    /// Weighted sum of `--fuse` terms.
+    #[value(name = "fused_score")]
+    FusedScore,
+    /// Composes compatible scoring terms into a single routing policy.
+    #[value(name = "score_policy")]
+    ScorePolicy,
+    /// Selects a worker from session affinity.
+    #[value(name = "session_aware")]
+    SessionAware,
+    /// Selects cache-affine prefill candidates from the configured prefix provider.
+    #[value(name = "cache_aware")]
+    CacheAware,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
     /// stateful sessions land on the same backend. Tuning — header name,
@@ -97,10 +107,206 @@ pub enum PolicyKind {
     Sticky,
 }
 
+/// Policy used to select decode workers for PD requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DecodePolicyKind {
+    #[default]
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "legacy_host_affinity")]
+    LegacyHostAffinity,
+}
+
+/// Role served by a static bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketStage {
+    Prefill,
+    Decode,
+}
+
+/// SLO matching rules for a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloBucketPolicy {
+    #[default]
+    Disabled,
+    BestEffort,
+    SloFirst,
+}
+
+/// Static bucket configuration loaded at Router startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub buckets: Vec<BucketSpec>,
+    #[serde(default)]
+    pub ttft_slo_policy: SloBucketPolicy,
+    #[serde(default)]
+    pub tps_slo_policy: SloBucketPolicy,
+}
+
+/// Runtime capacity assigned to one role. Lower ranks have higher priority.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    pub id: String,
+    pub stage: BucketStage,
+    pub rank: u32,
+    pub worker_ids: Vec<String>,
+    #[serde(default)]
+    pub min_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub min_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub ttft_p95_at_capacity_ms: Option<u64>,
+    #[serde(default)]
+    pub tps_p05_at_capacity: Option<f64>,
+    #[serde(default)]
+    pub max_pending_prefill_tokens: Option<u64>,
+}
+
+impl std::fmt::Display for PolicyKind {
+    /// The CLI spelling for this policy kind.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("PolicyKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// A hard admission constraint accepted by `--filter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum FilterKind {
+    /// Router-local in-flight capacity limit.
+    #[value(name = "overloaded")]
+    Overloaded,
+    /// Requires a minimum share of cached prompt blocks.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+}
+
+impl std::fmt::Display for FilterKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("FilterKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// A soft scoring term accepted by `--fuse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScoreTermKind {
+    /// Independent uniform-random preference.
+    #[value(name = "random")]
+    Random,
+    /// Prefers the least router-local active load.
+    #[value(name = "load_based")]
+    LoadBased,
+    /// Prefers the largest local prefix-cache overlap.
+    #[value(name = "prefix_cache")]
+    PrefixCache,
+}
+
+impl std::fmt::Display for ScoreTermKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("ScoreTermKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
+/// Policy choices that can initialize or handle a keyless sticky request.
+/// These policies have no request-scoped cache or sticky-state dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StickyFallbackKind {
+    #[value(name = "round_robin")]
+    RoundRobin,
+    #[value(name = "random")]
+    Random,
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "load_based")]
+    LoadBased,
+}
+
+impl std::fmt::Display for StickyFallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = <Self as clap::ValueEnum>::to_possible_value(self)
+            .expect("StickyFallbackKind skips no variants");
+        f.write_str(v.get_name())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
+    /// before the HTTP server stops accepting. The default covers both
+    /// deregistration paths: endpoint removal reaching kube-proxy after the
+    /// pod's `deletionTimestamp` is stamped, and a probe-driven load balancer,
+    /// which cannot act until `failureThreshold * periodSeconds` of `/readyz`
+    /// failures have accumulated.
+    ///
+    /// Note that it equals the k8s default `terminationGracePeriodSeconds`, so
+    /// a pod that has not raised its grace period is left with nothing for the
+    /// in-flight drain that follows the pause, and
+    /// [`shutdown_drain_advisory`](crate::config::shutdown_drain_advisory)
+    /// warns at every startup. That is the intended reading rather than a
+    /// misconfigured default: a router whose completions stream for minutes
+    /// cannot terminate cleanly inside 30 s at all, and the grace period is the
+    /// thing to raise. 0 disables the pause.
+    pub shutdown_drain_secs: u64,
+    /// The pod's actual `terminationGracePeriodSeconds`, when the operator
+    /// declares it. The router cannot read its own pod spec, so without this
+    /// the startup advisory can only compare the drain against the k8s
+    /// default — and warns, wrongly, about a deployment that raised the grace
+    /// period on purpose. `None` means "assume the default".
+    pub termination_grace_secs: Option<u64>,
+}
+
+impl ServerConfig {
+    /// [`Self::shutdown_drain_secs`] as a `Duration`. Keeps the seconds-to-
+    /// `Duration` conversion in the library, where a test can pin it, rather
+    /// than in `main.rs` where a `from_secs`/`from_millis` slip would silently
+    /// shorten every drain by a factor of 1000.
+    pub fn shutdown_drain(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_drain_secs)
+    }
+}
+
+pub fn default_host() -> String {
+    "127.0.0.1".into()
+}
+
+pub fn default_port() -> u16 {
+    30000
+}
+
+pub fn default_shutdown_drain_secs() -> u64 {
+    30
+}
+
+/// Exists so test fixtures can spell out only the fields they care about
+/// (`tests/` is a separate crate, so a `#[cfg(test)]` constructor cannot reach
+/// the integration fixtures). Keep `Cli::into_config` exhaustive so adding a
+/// field still forces a decision on the production path.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            termination_grace_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,16 +351,33 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
+    /// Selection policy for the decode pool.
+    pub decode_policy: DecodePolicyKind,
+    /// Optional static bucket configuration. `None` uses the global domain.
+    pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Tuning for cache-aware routing. Ignored unless
-    /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
-    /// policy construction time.
+    /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Session and cache-affinity tuning.
+    pub affinity: Option<AffinityConfig>,
+    /// Terms the score-composition policy sums. `Some` exactly when
+    /// `policy = "fused_score"` or `policy = "score_policy"` (built by
+    /// [`crate::config::cli::Cli::into_config`]), defaulting to
+    /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
+    pub fused: Option<Vec<FusedTerm>>,
+    /// Hard constraints applied before policy selection.
+    pub eligibility: Option<EligibilityConfig>,
+    /// Sampling parameters fixed fleet-wide for this model, and what happens
+    /// to a request that sends a different value: a 400 before admission, or
+    /// the client value forwarded untouched. Either way the configured value
+    /// is injected when the request omits the field — see
+    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
+    pub sampling_overrides: SamplingOverrides,
 }
 
 /// External KV Indexer client settings.
@@ -165,47 +388,71 @@ pub struct KvIndexerEndpointConfig {
     pub query_max_inflight: usize,
 }
 
-/// Per-model cache-aware tuning.
-#[derive(Debug, Clone)]
-pub struct CacheAwareConfig {
-    /// Lower bound on `matched_blocks / total_blocks` for the tree match
-    /// to win the selection. Below this, the policy falls back to
-    /// min-load. Default 0.5 — a half-cached prompt is still a strong
-    /// signal but not so weak that random hash collisions could trigger
-    /// affinity to an arbitrary worker.
-    pub cache_threshold: f32,
-    /// Absolute load spread (`max - min`) above which the cache check is
-    /// skipped in favour of min-load. Default 32 — picked to dominate
-    /// over typical batch-of-8 effect.
-    pub balance_abs_threshold: usize,
-    /// Multiplicative load spread (`max > min * balance_rel_threshold`)
-    /// that the absolute check is gated on. Default 1.1 — 10 % relative
-    /// difference triggers re-balancing.
-    pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration. When configured, it
-    /// replaces the local ZMQ radix tree as the cache signal.
-    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+/// Eligibility filter configuration.
+#[derive(Debug, Clone, Default)]
+pub struct EligibilityConfig {
+    /// Filters in priority order.
+    pub filters: Vec<FilterKind>,
+    /// `overloaded`: in-flight count at which a worker stops being eligible.
+    pub max_in_flight: Option<usize>,
+    /// `prefix_cache` minimum cached prompt share.
+    pub min_prefix_share: Option<f32>,
 }
 
-impl Default for CacheAwareConfig {
-    fn default() -> Self {
-        Self {
-            cache_threshold: default_cache_threshold(),
-            balance_abs_threshold: default_balance_abs(),
-            balance_rel_threshold: default_balance_rel(),
-            kv_indexer_endpoint: None,
-        }
+/// Default `--policy fused_score` terms.
+pub const DEFAULT_FUSE: [ScoreTermKind; 2] = [ScoreTermKind::PrefixCache, ScoreTermKind::LoadBased];
+
+/// One `--fuse` policy and optional weight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusedTerm {
+    pub kind: ScoreTermKind,
+    /// Weight override; `None` keeps the term's own `Criterion::weight()`.
+    pub weight: Option<f32>,
+}
+
+impl std::str::FromStr for FusedTerm {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (name, weight) = match s.split_once('=') {
+            Some((n, w)) => (n, Some(parse_fuse_weight(n, w)?)),
+            None => (s, None),
+        };
+        let kind = <ScoreTermKind as clap::ValueEnum>::from_str(name, false)
+            .map_err(|_| format!("--fuse: `{name}` is not a score term"))?;
+        Ok(FusedTerm { kind, weight })
     }
 }
 
-fn default_cache_threshold() -> f32 {
-    0.5
+/// Parses a finite, non-negative term weight.
+fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
+    let w: f32 = raw
+        .parse()
+        .map_err(|_| format!("--fuse: `{name}` weight `{raw}` is not a number"))?;
+    if !w.is_finite() || w < 0.0 {
+        return Err(format!(
+            "--fuse: `{name}` weight `{raw}` must be finite and >= 0"
+        ));
+    }
+    Ok(w)
 }
-fn default_balance_abs() -> usize {
-    32
+
+/// Cache-Aware prefix-match source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CachePrefixProvider {
+    #[default]
+    #[value(name = "radix_tree")]
+    RadixTree,
+    #[value(name = "indexer")]
+    Indexer,
 }
-fn default_balance_rel() -> f32 {
-    1.1
+
+/// Per-model Cache-Aware configuration.
+#[derive(Debug, Clone, Default)]
+pub struct CacheAwareConfig {
+    /// Prefix-match source for native Cache-Aware.
+    pub prefix_provider: CachePrefixProvider,
+    /// External Indexer configuration when `prefix_provider = indexer`.
+    pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
@@ -213,10 +460,136 @@ fn default_balance_rel() -> f32 {
 /// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
+/// Default request header for session-aware routing.
+pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
+
+/// Default external-indexer request limits.
+pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
+
+/// Controls whether admission may select a session-affinity backup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AffinityMode {
+    /// Keep the primary after it passes admission.
+    #[value(name = "strict")]
+    Strict,
+    /// Allow the admitted backup to relieve pressure.
+    #[default]
+    #[value(name = "soft")]
+    Soft,
+}
+
+/// Controls the session-affinity lookup and fallback behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SessionAffinityMode {
+    /// Search only within the target bucket.
+    #[default]
+    #[value(name = "bucket")]
+    Bucket,
+    /// Rebind to a target-bucket fallback when the global primary is unavailable.
+    #[value(name = "global-rebind")]
+    GlobalRebind,
+    /// Keep a valid global assignment when a bucket fallback is used.
+    #[value(name = "global-preserve")]
+    GlobalPreserve,
+}
+
+/// Shared session-aware and cache-aware settings.
+#[derive(Debug, Clone)]
+pub struct AffinityConfig {
+    pub session_id_header: String,
+    pub session_idle_secs: u64,
+    pub session_eviction_interval_secs: u64,
+    pub stable_pair: bool,
+    pub mode: AffinityMode,
+    pub session_affinity_mode: SessionAffinityMode,
+    pub pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
+    pub cache_affinity_min_matched_tokens: Option<u64>,
+    pub cache_affinity_min_match_ratio: Option<f64>,
+    pub cache_candidate_min_workers: usize,
+    pub cache_candidate_ratio: f64,
+    pub cache_candidate_max_workers: usize,
+    pub cache_switch_margin_tokens: u64,
+    /// Queue gate (`--worker-queue-limit`): a worker whose engine reports at
+    /// least this many *waiting* requests cannot win a selection on cache
+    /// affinity — the request goes to another worker holding the same
+    /// prefix, or failing that to the least-loaded worker that is not
+    /// queueing. `None` disables the gate.
+    ///
+    /// Gating on the queue rather than on total depth is what makes this
+    /// targeted: `num_waiting_reqs` IS the question the request cares about
+    /// — will I sit behind other work before my prefill starts — whereas
+    /// depth only proxies it, and proxies it badly (an engine can queue at
+    /// 7-8 running on long-prompt traffic, far below its running cap, so a
+    /// depth threshold either fires on healthy busy workers or misses the
+    /// workers actually making requests wait).
+    ///
+    /// The gate reads the engine-published load sample and fails OPEN on a
+    /// worker with no fresh sample: the router-side in-flight counter cannot
+    /// separate a running request from a waiting one, so there is no honest
+    /// substitute to compare the limit against.
+    ///
+    /// Note the firing point scales with `dp_size`: the sample sums `waiting`
+    /// across a worker's DP ranks while a request lands on one of them, so
+    /// scale the limit with `--dp-size` on DP-attention deployments.
+    ///
+    /// The companion `saturation_queue_floor` cancels the gate's diversions
+    /// when they have no payoff (nothing in the fleet reads below the
+    /// floor).
+    pub worker_queue_limit: Option<u64>,
+    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
+    /// diversions that have no payoff. When no cache candidate survives
+    /// both `worker_queue_limit` and hard admission, at least one was over
+    /// the limit, AND no worker in the routable fleet has a fresh queue
+    /// reading strictly below this floor, the diverted request would wait
+    /// wherever it lands — so it pins to the least-pressured prefix owner
+    /// instead of cold-prefilling on a non-owner (which evicts other
+    /// prefixes and manufactures the next round of misses). `None` — the
+    /// default — preserves the pure gate behavior.
+    ///
+    /// Polarity note: a worker with no fresh sample does NOT count as idle
+    /// — the opposite of the gate's fail-open, and deliberately so. The
+    /// gate keeps affinity because that is the safe default action; the
+    /// pin asks whether a *provably better* destination exists, and an
+    /// unknown queue is not proof. Both polarities leave the request with
+    /// its prefix owner when the signal is missing.
+    ///
+    /// The CLI enforces `floor <= worker_queue_limit` and requires the
+    /// gate; like the limit, scale the floor with `dp_size`.
+    pub saturation_queue_floor: Option<u64>,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            session_id_header: DEFAULT_SESSION_ID_HEADER.to_string(),
+            session_idle_secs: default_sticky_idle_secs(),
+            session_eviction_interval_secs: default_sticky_eviction_interval_secs(),
+            stable_pair: false,
+            mode: AffinityMode::Soft,
+            session_affinity_mode: SessionAffinityMode::Bucket,
+            pressure_guard: true,
+            pressure_abs_threshold_tokens: 1_024,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.5,
+            // Indexer prefix scans are truncated, so use an absolute token floor.
+            cache_affinity_min_matched_tokens: Some(1_024),
+            cache_affinity_min_match_ratio: None,
+            cache_candidate_min_workers: 8,
+            cache_candidate_ratio: 0.05,
+            cache_candidate_max_workers: 32,
+            cache_switch_margin_tokens: 1_024,
+            worker_queue_limit: None,
+            saturation_queue_floor: None,
+        }
+    }
+}
+
 /// Per-model sticky-session tuning. Built from the `--routing-key-header`
 /// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
-/// also validates that `header_name` parses as an HTTP header name and
-/// that `fallback_policy` is one of the dependency-free policies.
+/// also validates that `header_name` parses as an HTTP header name.
 #[derive(Debug, Clone)]
 pub struct StickyConfig {
     /// Request header carrying the routing key. Validated to parse as a
@@ -225,10 +598,8 @@ pub struct StickyConfig {
     /// Policy used to pick a worker when a request has no routing key, and
     /// to pick the initial worker when a new key is first seen. One of
     /// `round_robin` / `random` / `power_of_two` / `load_based` — the
-    /// dependency-free policies the factory can build standalone (no
-    /// `HashTree` / tokenizer / ZMQ feed). `cache_aware_zmq` and `sticky`
-    /// are rejected at config-build time.
-    pub fallback_policy: PolicyKind,
+    /// dependency-free policies the factory can build standalone.
+    pub fallback_policy: StickyFallbackKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.
     pub idle_secs: u64,
@@ -247,7 +618,7 @@ impl Default for StickyConfig {
     fn default() -> Self {
         Self {
             header_name: DEFAULT_STICKY_HEADER.to_string(),
-            fallback_policy: PolicyKind::RoundRobin,
+            fallback_policy: StickyFallbackKind::RoundRobin,
             idle_secs: default_sticky_idle_secs(),
             eviction_interval_secs: default_sticky_eviction_interval_secs(),
         }
@@ -345,9 +716,13 @@ pub enum K8sDiscoveryMode {
 /// invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set")]
+    #[error(
+        "discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set"
+    )]
     NoSelector,
-    #[error("discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both")]
+    #[error(
+        "discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both"
+    )]
     MixedModes,
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,
