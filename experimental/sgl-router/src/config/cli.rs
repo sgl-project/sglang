@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
+use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy, SamplingOverrides};
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
@@ -59,6 +60,33 @@ pub struct Cli {
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
     pub bucket_config: Option<String>,
+
+    // ---- fleet-wide sampling contract (opt-in) ----
+    /// Sampling parameters fixed fleet-wide, as one JSON object keyed by the
+    /// request-body field names — e.g. `{"temperature": 1, "top_p": 0.95}`.
+    /// Keys: temperature, top_p, top_k, min_p, repetition_penalty,
+    /// frequency_penalty, presence_penalty, n. Each value is a number, or an
+    /// inclusive band `{"min": LO, "max": HI}`.
+    ///
+    /// A configured value is injected whenever the request omits that field;
+    /// `--sampling-param-conflict` decides what a request that sends one gets.
+    /// Unknown or repeated keys, out-of-domain values and a band under `allow`
+    /// all fail the launch, naming the offending key. Full contract — domains,
+    /// `null` handling, cost — in the router README.
+    #[arg(long, value_name = "JSON")]
+    pub override_sampling_params: Option<String>,
+    /// What a request that sends a value differing from
+    /// `--override-sampling-params` gets: `reject` (the default) 400s it
+    /// before admission, quoting the configured value; `allow` forwards the
+    /// client's value untouched. Only accepted alongside
+    /// `--override-sampling-params`.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        requires = "override_sampling_params"
+    )]
+    pub sampling_param_conflict: Option<ConflictPolicy>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -135,6 +163,16 @@ pub struct Cli {
     /// Maximum uncached-work difference that pressure may override.
     #[arg(long)]
     pub cache_switch_margin_tokens: Option<u64>,
+    /// Queue gate for cache affinity: a worker whose engine reports at least
+    /// this many waiting (queued) requests cannot win a selection on cache
+    /// affinity. The request goes to another worker holding the same prefix,
+    /// or failing that to the least-loaded worker that is not queueing; when
+    /// every worker is queueing the least-loaded worker overall keeps the
+    /// fleet routable. Unset disables the gate. Requires
+    /// `--policy cache_aware`; scale with the engine's `--dp-size` because
+    /// the published queue sums across a worker's DP ranks.
+    #[arg(long)]
+    pub worker_queue_limit: Option<u64>,
 
     // ---- score composition ----
     /// Policies to sum, spelled exactly as `--policy` spells them and each
@@ -321,7 +359,13 @@ impl Cli {
             || self.cache_candidate_min_workers.is_some()
             || self.cache_candidate_ratio.is_some()
             || self.cache_candidate_max_workers.is_some()
-            || self.cache_switch_margin_tokens.is_some();
+            || self.cache_switch_margin_tokens.is_some()
+            || self.worker_queue_limit.is_some();
+        // Value checks before the policy check: a value that is wrong under
+        // every policy should say so, rather than pointing at --policy.
+        if self.worker_queue_limit == Some(0) {
+            return Err(anyhow!("--worker-queue-limit must be at least 1"));
+        }
         if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
             return Err(anyhow!(
                 "cache candidate tuning flags require --policy cache_aware"
@@ -545,6 +589,7 @@ impl Cli {
                 cache_switch_margin_tokens: self
                     .cache_switch_margin_tokens
                     .unwrap_or(d.cache_switch_margin_tokens),
+                worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
             })
         } else {
             None
@@ -577,6 +622,13 @@ impl Cli {
             None
         };
 
+        let sampling_overrides = match &self.override_sampling_params {
+            None => SamplingOverrides::default(),
+            Some(raw) => {
+                parse_sampling_overrides(raw, self.sampling_param_conflict.unwrap_or_default())?
+            }
+        };
+
         let config = Config {
             server: ServerConfig {
                 host: self.host,
@@ -600,6 +652,7 @@ impl Cli {
                 affinity,
                 fused,
                 eligibility,
+                sampling_overrides,
             },
             discovery,
             proxy: ProxyConfig {
@@ -1782,6 +1835,58 @@ mod tests {
     }
 
     #[test]
+    fn worker_queue_limit_requires_cache_aware_and_a_positive_value() {
+        let config = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 4",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .worker_queue_limit,
+            Some(4)
+        );
+
+        // Unset, the gate is disabled.
+        let defaults =
+            cfg_of("--policy cache_aware --kv-indexer-endpoint http://indexer:50051").unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .worker_queue_limit,
+            None
+        );
+
+        let err = cfg_of("--policy power_of_two --worker-queue-limit 4")
+            .expect_err("the gate only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
+
+        let err = cfg_of(
+            "--policy cache_aware --kv-indexer-endpoint http://indexer:50051 \
+             --worker-queue-limit 0",
+        )
+        .expect_err("a zero limit would reject every queue reading")
+        .to_string();
+        assert!(err.contains("--worker-queue-limit"), "got: {err}");
+
+        // A zero limit is wrong under every policy, so the value error must
+        // win over the policy error rather than being masked by it.
+        let err = cfg_of("--policy power_of_two --worker-queue-limit 0")
+            .expect_err("a zero limit is rejected regardless of policy")
+            .to_string();
+        assert!(err.contains("--worker-queue-limit"), "got: {err}");
+    }
+
+    #[test]
     fn cache_candidate_cli_rejects_invalid_bounds() {
         for (args, expected) in [
             (
@@ -1884,5 +1989,65 @@ mod tests {
             buckets.tps_slo_policy,
             crate::config::SloBucketPolicy::BestEffort
         );
+    }
+
+    /// The flag reaches `ModelConfig`, and is opt-in: unset leaves the model
+    /// with an empty sampling contract, so no request is ever checked.
+    #[test]
+    fn override_sampling_params_reaches_the_model_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": 1, "top_p": 0.95}"#,
+        ]))
+        .unwrap();
+        assert_eq!(c.model.sampling_overrides.params.len(), 2);
+        // `reject` is the default mode: declaring a contract is the usual
+        // reason to declare one.
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Reject);
+
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(c.model.sampling_overrides.params.is_empty());
+    }
+
+    #[test]
+    fn sampling_param_conflict_selects_the_mode() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temperature": 1}"#,
+            "--sampling-param-conflict",
+            "allow",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.sampling_overrides.conflict, ConflictPolicy::Allow);
+
+        // The mode alone governs nothing, so clap rejects it (`requires`).
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--sampling-param-conflict",
+            "reject",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--override-sampling-params"), "got: {err}");
+    }
+
+    /// A malformed contract fails the launch with the parser's own message,
+    /// rather than starting a router that 400s every request at the engine.
+    #[test]
+    fn malformed_override_sampling_params_fails_the_launch() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--override-sampling-params",
+            r#"{"temp": 1}"#,
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown parameter"), "got: {err}");
     }
 }
