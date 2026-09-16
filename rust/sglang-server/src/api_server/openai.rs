@@ -66,13 +66,14 @@ impl IntoResponse for OpenAiResponse {
             )
                 .into_response(),
             Self::Stream(stream) => {
-                Sse::new(stream.map(|data| Ok::<_, Infallible>(Event::default().data(data))))
+                Sse::new(stream.map(|item| Ok::<_, Infallible>(Event::default().data(item.data))))
                     .into_response()
             }
             Self::Error {
                 code,
                 message,
                 stream,
+                ..
             } => openai_error(code, message, stream),
         }
     }

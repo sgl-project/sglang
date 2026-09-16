@@ -30,8 +30,8 @@ use crate::tokenizer_manager::tokenizer;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
-/// Existing OpenAI JSON error-code semantics, also used by HTTP's native
-/// adapter. gRPC converts these codes into canonical statuses at its boundary.
+/// Existing OpenAI JSON error-code semantics used by the HTTP adapter.
+/// Other adapters consume [`FrontendErrorKind`] instead.
 pub(crate) fn frontend_error_status(error: &FrontendError) -> StatusCode {
     if let FrontendError::RuntimeRejected {
         legacy_http_status, ..
@@ -78,12 +78,42 @@ impl OpenAiState {
 pub(crate) enum OpenAiResponse {
     /// Serialized once by the operation, then moved into either transport.
     Json(Vec<u8>),
-    Stream(futures::stream::BoxStream<'static, String>),
+    Stream(futures::stream::BoxStream<'static, OpenAiStreamItem>),
     Error {
         code: StatusCode,
         message: String,
         stream: bool,
+        /// Preserve transport-neutral runtime semantics for non-HTTP adapters.
+        /// Request-validation errors originate in this OpenAI layer and leave
+        /// this unset so adapters retain their existing status-code mapping.
+        kind: Option<FrontendErrorKind>,
     },
+}
+
+/// One serialized OpenAI stream frame plus optional runtime error semantics.
+///
+/// The serialized JSON / `[DONE]` framing remains unchanged. The side metadata
+/// only prevents gRPC from having to reconstruct a runtime error category from
+/// the legacy HTTP code embedded in an error payload.
+pub(crate) struct OpenAiStreamItem {
+    pub(crate) data: String,
+    pub(crate) error_kind: Option<FrontendErrorKind>,
+}
+
+impl OpenAiStreamItem {
+    pub(super) fn data(data: String) -> Self {
+        Self {
+            data,
+            error_kind: None,
+        }
+    }
+
+    pub(super) fn error(data: String, kind: FrontendErrorKind) -> Self {
+        Self {
+            data,
+            error_kind: Some(kind),
+        }
+    }
 }
 
 type Response = OpenAiResponse;
@@ -171,13 +201,27 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
         code,
         message: message.into(),
         stream,
+        kind: None,
     }
 }
 
-/// Drain one submitted request to its terminal output, fold frames, and map
-/// semantic failures / truncation to `(status, message)` for the OpenAI error
-/// shape. The call owns cancellation and disarms itself.
-async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (StatusCode, String)> {
+pub(super) fn frontend_openai_error(
+    code: StatusCode,
+    message: impl Into<String>,
+    stream: bool,
+    kind: FrontendErrorKind,
+) -> Response {
+    Response::Error {
+        code,
+        message: message.into(),
+        stream,
+        kind: Some(kind),
+    }
+}
+
+/// Drain one submitted request to its terminal output and fold its frames. The
+/// call owns cancellation and disarms itself.
+async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, FrontendError> {
     let mut accumulator = FrontendOutput::default();
     let output = loop {
         match call.recv().await {
@@ -186,16 +230,8 @@ async fn collect_output(mut call: FrontendCall) -> Result<FrontendOutput, (Statu
                 accumulator.append_delta(&output);
                 break accumulator;
             }
-            Some(FrontendEvent::Failed(error)) => {
-                let status = frontend_error_status(&error);
-                return Err((status, error.to_string()));
-            }
-            None => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "response truncated before completion".into(),
-                ));
-            }
+            Some(FrontendEvent::Failed(error)) => return Err(error),
+            None => return Err(FrontendError::ResponseTruncated),
         }
     };
     Ok(output)
@@ -211,16 +247,15 @@ async fn submit_generation(
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
         // error shape, since this is the OpenAI frontend.
-        Err(FrontendError::Unavailable) => Err(openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
-            stream,
-        )),
-        Err(error) => Err(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            error.to_string(),
-            stream,
-        )),
+        Err(error) => {
+            let code = if matches!(error, FrontendError::Unavailable) {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            let kind = error.kind();
+            Err(frontend_openai_error(code, error.to_string(), stream, kind))
+        }
     }
 }
 

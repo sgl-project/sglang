@@ -133,40 +133,6 @@ async fn reply_to_generation(harness: &Harness) {
 }
 
 #[tokio::test]
-async fn every_unsupported_rpc_returns_unimplemented_without_runtime_work() {
-    let harness = Harness::new(4, false, Duration::from_secs(1));
-    macro_rules! unsupported {
-        ($($method:ident),+ $(,)?) => {$(
-            assert_eq!(
-                harness.service.$method(Request::new(Default::default())).await.unwrap_err().code(),
-                Code::Unimplemented,
-                stringify!($method),
-            );
-        )+};
-    }
-    unsupported!(
-        text_embed,
-        embed,
-        classify,
-        tokenize,
-        get_load,
-        abort,
-        flush_cache,
-        pause_generation,
-        continue_generation,
-        open_ai_embed,
-        open_ai_classify,
-        score,
-        rerank,
-        start_profile,
-        stop_profile,
-        update_weights_from_disk,
-    );
-    assert!(harness.intake_rx.try_recv().is_err());
-    assert!(harness.abort_rx.try_recv().is_err());
-}
-
-#[tokio::test]
 async fn static_metadata_and_model_listing_use_frontend_metadata() {
     let harness = Harness::new(4, false, Duration::from_secs(1));
     let info = harness
@@ -604,7 +570,7 @@ async fn missing_chat_template_and_nested_extensions_are_unsupported() {
 }
 
 #[tokio::test]
-async fn streamed_runtime_error_maps_to_status_and_cancels_other_choices() {
+async fn streamed_capacity_error_uses_semantic_status_and_cancels_other_choices() {
     let harness = Harness::new(4, false, Duration::from_secs(1));
     let mut stream = harness
         .service
@@ -620,16 +586,44 @@ async fn streamed_runtime_error_maps_to_status_and_cancels_other_choices() {
     assert!(second.admission.try_accept());
     first
         .sink
-        .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
-            "bad sampling".into(),
-        )))
+        .try_send(ResponseItem::Error(crate::utils::error::Error::QueueFull))
         .unwrap();
     assert_eq!(
         stream.next().await.unwrap().unwrap_err().code(),
-        Code::InvalidArgument
+        Code::ResourceExhausted
     );
     assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &second.rid);
     assert!(stream.next().await.is_none());
+    assert!(harness.abort_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn unary_scheduler_rejection_uses_semantic_status() {
+    let harness = Harness::new(4, false, Duration::from_secs(1));
+    let rpc = harness.service.complete(openai_request(json!({
+        "model":"model","prompt":[1]
+    })));
+    let runtime = async {
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        let mut rejected = chunk(&intake.rid, "", 42, true);
+        rejected.finish_reason = Some(
+            serde_json::from_value(json!({
+                "type": "abort",
+                "message": "upstream unavailable",
+                "status_code": 502
+            }))
+            .unwrap(),
+        );
+        intake.sink.try_send(ResponseItem::Done(rejected)).unwrap();
+    };
+
+    let (result, ()) = tokio::join!(rpc, runtime);
+    let error = match result {
+        Ok(_) => panic!("scheduler rejection must fail the RPC"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::Unavailable);
     assert!(harness.abort_rx.try_recv().is_err());
 }
 

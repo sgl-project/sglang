@@ -1,7 +1,7 @@
 //! runtime.v1's JSON-carrying RPCs reuse the same OpenAI operations as HTTP.
 //! Only protobuf framing and gRPC support/error policy belong here.
 
-use super::{GrpcService, ResponseStream, convert::ConvertError};
+use super::{GrpcService, ResponseStream, convert::ConvertError, response};
 use crate::openai::{self, OpenAiResponse};
 use futures::StreamExt;
 use serde_json::Value;
@@ -56,8 +56,16 @@ impl GrpcService {
             .map_err(|_| Status::deadline_exceeded("OpenAI operation timed out"))??;
         let timeout = self.config.response_timeout;
         let stream: ResponseStream<_> = match response {
-            OpenAiResponse::Error { code, message, .. } => {
-                return Err(status(code.as_u16(), message));
+            OpenAiResponse::Error {
+                code,
+                message,
+                kind,
+                ..
+            } => {
+                return Err(match kind {
+                    Some(kind) => response::status_from_kind(kind, message),
+                    None => status(code.as_u16(), message),
+                });
             }
             OpenAiResponse::Json(bytes) => Box::pin(futures::stream::once(async move {
                 Ok(proto::OpenAiStreamChunk {
@@ -68,10 +76,11 @@ impl GrpcService {
             OpenAiResponse::Stream(mut source) => Box::pin(async_stream::stream! {
                 let terminal = loop {
                     match tokio::time::timeout(timeout, source.next()).await {
-                        Ok(Some(data)) if data == "[DONE]" => {
+                        Ok(Some(item)) if item.data == "[DONE]" => {
                             break Ok(proto::OpenAiStreamChunk { json_chunk: Vec::new(), finished: true });
                         }
-                        Ok(Some(data)) => {
+                        Ok(Some(item)) => {
+                            let data = item.data;
                             let value: Value = match serde_json::from_str(&data) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -81,8 +90,12 @@ impl GrpcService {
                             if let Some(error) = value.get("error") {
                                 let code = error.get("code").and_then(Value::as_u64)
                                     .and_then(|v| u16::try_from(v).ok()).unwrap_or(500);
-                                break Err(status(code, error.get("message").and_then(Value::as_str)
-                                    .unwrap_or("OpenAI generation failed").to_owned()));
+                                let message = error.get("message").and_then(Value::as_str)
+                                    .unwrap_or("OpenAI generation failed").to_owned();
+                                break Err(match item.error_kind {
+                                    Some(kind) => response::status_from_kind(kind, message),
+                                    None => status(code, message),
+                                });
                             }
                             yield Ok(proto::OpenAiStreamChunk { json_chunk: data.into_bytes(), finished: false });
                         }

@@ -24,8 +24,9 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    ChatFormatter, ChatTemplateKwargs, OpenAiState, collect_output, contains_media, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    ChatFormatter, ChatTemplateKwargs, OpenAiState, OpenAiStreamItem, collect_output,
+    contains_media, error_payload, frontend_openai_error, indexed_decode_stream, openai_error,
+    submit_generation, unix_seconds_u32,
 };
 use crate::frontend::{FrontendCall, FrontendEvent, FrontendRequest};
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -433,8 +434,9 @@ pub(super) async fn unary_chat(
     for (index, call) in submitted {
         let output = match collect_output(call).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, message, false);
+            Err(error) => {
+                let status = super::frontend_error_status(&error);
+                return frontend_openai_error(status, error.to_string(), false, error.kind());
             }
         };
 
@@ -511,8 +513,13 @@ pub(super) fn chat_event_stream(
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
-) -> impl futures::Stream<Item = String> {
+) -> impl futures::Stream<Item = OpenAiStreamItem> {
     let count = submitted.len();
+    // The tool-call jail consumes `Annotated` values and passes error-only
+    // annotations through unchanged. Carry the frontend category beside that
+    // existing stream so HTTP can retain its legacy JSON code while gRPC uses
+    // the transport-neutral category. This channel is touched only on errors.
+    let (error_kind_tx, error_kind_rx) = std::sync::mpsc::channel();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
@@ -560,6 +567,7 @@ pub(super) fn chat_event_stream(
             let output = match event {
                 FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
                 FrontendEvent::Failed(error) => {
+                    let _ = error_kind_tx.send(error.kind());
                     yield Annotated {
                         data: None,
                         id: None,
@@ -731,12 +739,15 @@ pub(super) fn chat_event_stream(
                         }
                     }
                 }
-                yield serialize_chat_stream_response(response.clone());
+                yield OpenAiStreamItem::data(serialize_chat_stream_response(response.clone()));
             } else if let Some(error) = item.error {
-                yield error;
+                yield match error_kind_rx.try_recv() {
+                    Ok(kind) => OpenAiStreamItem::error(error, kind),
+                    Err(_) => OpenAiStreamItem::data(error),
+                };
             }
         }
-        yield "[DONE]".to_string();
+        yield OpenAiStreamItem::data("[DONE]".to_string());
     }
 }
 
@@ -813,7 +824,7 @@ mod tests {
         merge_template_stops, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
@@ -1084,7 +1095,7 @@ mod tests {
             None,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
         let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
@@ -1130,7 +1141,7 @@ mod tests {
             None,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         assert_eq!(frames.len(), 5);
         let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
@@ -1145,5 +1156,42 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_preserves_error_kind_through_tool_jail() {
+        let (choice, tx) = chat_submitted(0, "r0");
+        tx.send(ResponseItem::Error(crate::utils::error::Error::QueueFull))
+            .await
+            .unwrap();
+
+        let stream = chat_event_stream(
+            vec![choice],
+            "chatcmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            Some("llama3_json".into()),
+            None,
+            false,
+            None,
+            None,
+            false,
+            true,
+            None,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<_> = stream.collect().await;
+        let error = frames
+            .iter()
+            .find(|item| item.error_kind.is_some())
+            .expect("runtime error frame");
+        assert_eq!(
+            error.error_kind,
+            Some(crate::frontend::FrontendErrorKind::ResourceExhausted)
+        );
+        let payload: serde_json::Value = serde_json::from_str(&error.data).unwrap();
+        assert_eq!(payload["error"]["code"], 503);
     }
 }

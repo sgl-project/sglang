@@ -12,8 +12,9 @@ use http::StatusCode;
 
 use super::frontend_error_status;
 use super::{
-    MAX_OPENAI_CHOICES, OpenAiState, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    MAX_OPENAI_CHOICES, OpenAiState, OpenAiStreamItem, collect_output, error_payload,
+    frontend_openai_error, indexed_decode_stream, openai_error, submit_generation,
+    unix_seconds_u32,
 };
 use crate::frontend::{
     FrontendCall, FrontendError, FrontendEvent, FrontendOutput, FrontendRequest,
@@ -214,25 +215,31 @@ async fn decode_prompt_echo(state: &OpenAiState, token_ids: TokenIds) -> Result<
         Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
-        Err(FrontendError::Unavailable) => Err(openai_error(
+        Err(error @ FrontendError::Unavailable) => Err(frontend_openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable",
             false,
+            error.kind(),
         )),
-        Err(FrontendError::InvalidArgument(message)) => {
-            Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
-        }
-        Err(FrontendError::InvalidResponse(message)) => Err(openai_error(
+        Err(FrontendError::InvalidArgument(message)) => Err(frontend_openai_error(
+            StatusCode::BAD_REQUEST,
+            &message,
+            false,
+            crate::frontend::FrontendErrorKind::InvalidArgument,
+        )),
+        Err(FrontendError::InvalidResponse(message)) => Err(frontend_openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             message,
             false,
+            crate::frontend::FrontendErrorKind::Internal,
         )),
         Err(error) => {
             let status = frontend_error_status(&error);
-            Err(openai_error(
+            Err(frontend_openai_error(
                 status,
                 format!("failed to decode prompt for echo: {error}"),
                 false,
+                error.kind(),
             ))
         }
     }
@@ -331,8 +338,9 @@ pub(super) async fn unary_completion(
     for choice in submitted {
         let output = match collect_output(choice.call).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, &message, false);
+            Err(error) => {
+                let status = frontend_error_status(&error);
+                return frontend_openai_error(status, error.to_string(), false, error.kind());
             }
         };
 
@@ -476,7 +484,7 @@ pub(super) fn completion_event_stream(
     want_logprobs: bool,
     include_usage: bool,
     continuous_usage: bool,
-) -> impl futures::Stream<Item = String> {
+) -> impl futures::Stream<Item = OpenAiStreamItem> {
     async_stream::stream! {
         let count = submitted.len();
         let mut prompt_indexes = Vec::with_capacity(count);
@@ -498,7 +506,10 @@ pub(super) fn completion_event_stream(
             let output = match event {
                 FrontendEvent::Delta(output) | FrontendEvent::Finished(output) => output,
                 FrontendEvent::Failed(error) => {
-                    yield error_payload(frontend_error_status(&error), error.to_string()).to_string();
+                    yield OpenAiStreamItem::error(
+                        error_payload(frontend_error_status(&error), error.to_string()).to_string(),
+                        error.kind(),
+                    );
                     continue;
                 }
             };
@@ -536,7 +547,7 @@ pub(super) fn completion_event_stream(
                 object: "text_completion".into(),
                 usage: chunk_usage,
             };
-            yield completion_response_value(chunk, &[extension]).to_string();
+            yield OpenAiStreamItem::data(completion_response_value(chunk, &[extension]).to_string());
         }
 
         if include_usage {
@@ -559,9 +570,9 @@ pub(super) fn completion_event_stream(
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                 )),
             };
-            yield completion_response_value(final_chunk, &[]).to_string();
+            yield OpenAiStreamItem::data(completion_response_value(final_chunk, &[]).to_string());
         }
-        yield "[DONE]".to_string();
+        yield OpenAiStreamItem::data("[DONE]".to_string());
     }
 }
 
@@ -799,7 +810,7 @@ mod tests {
             false,
         );
         futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
+        let frames: Vec<String> = stream.map(|item| item.data).collect().await;
         assert_eq!(frames.len(), 4);
         let first: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
         let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();

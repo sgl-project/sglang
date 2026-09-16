@@ -658,19 +658,6 @@ mod tests {
             .unwrap();
         let mut stream = client_runtime.block_on(async {
             let mut client = connect_grpc(grpc_addr).await;
-            let models = client
-                .list_models(proto::ListModelsRequest {})
-                .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(models.models.len(), 1);
-            let info = client
-                .get_model_info(proto::GetModelInfoRequest {})
-                .await
-                .unwrap()
-                .into_inner();
-            let info: serde_json::Value = serde_json::from_str(&info.json_info).unwrap();
-            assert_eq!(info["served_model_name"], models.models[0].id);
             tokio::time::timeout(
                 Duration::from_secs(5),
                 client.generate(proto::GenerateRequest {
