@@ -234,6 +234,42 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+_varlen_fp8_gather_logged = False
+
+
+def _gather_varlen_kv(
+    cache: torch.Tensor,
+    tok_idx: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    out_dtype: torch.dtype,
+    descale: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Gather paged KV rows into the contiguous buffer varlen prefill needs.
+
+    fp8 is dequantized here rather than passed through: the triton varlen path
+    rejects a mix of fp8 and non-fp8 inputs, so passing it would force q to fp8
+    too. index_select has no fp8 kernel, hence the uint8 round-trip.
+    """
+    flat = cache.view(-1, num_heads * head_dim)
+    if flat.dtype == fp8_dtype:
+        global _varlen_fp8_gather_logged
+        if not _varlen_fp8_gather_logged:
+            _varlen_fp8_gather_logged = True
+            logger.info("aiter varlen prefill: dequantizing fp8 KV cache on gather")
+        gathered = (
+            flat.view(torch.uint8)
+            .index_select(0, tok_idx)
+            .view(fp8_dtype)
+            .to(out_dtype)
+        )
+        if descale is not None:
+            gathered = gathered * descale.to(out_dtype)
+    else:
+        gathered = flat.index_select(0, tok_idx)
+    return gathered.view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -393,6 +429,11 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
+
+        # Route extend through flash_attn_varlen_func instead of CK-tile
+        # mha_batch_prefill_func, which has no gfx12 kernels. Opt-in, so
+        # gfx942/gfx950 keep batch_prefill unless asked otherwise.
+        self.use_aiter_varlen_prefill = get_bool_env_var("SGLANG_AITER_VARLEN_PREFILL")
 
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
@@ -3580,6 +3621,107 @@ class AiterAttnBackend(AttentionBackend):
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            # mha_batch_prefill_func has no gfx12 kernels, so go through
+            # flash_attn_varlen_func (aiter's Triton MHA under ENABLE_CK=0). It
+            # accepts block_table but silently discards it, so paged KV must be
+            # gathered into a contiguous buffer first. Chunked prefill makes
+            # prefixed batches unavoidable at concurrency.
+            if (
+                self.use_aiter_varlen_prefill
+                and not self.kv_cache_is_vectorized_5d
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and self.logits_soft_cap == 0.0
+                and k is not None
+                and v is not None
+            ):
+                varlen_ok = True
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    bs = forward_batch.batch_size
+                    kc, vc = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                    kv_indptr = self.forward_metadata.kv_indptr[: bs + 1]
+                    kv_slots = self.forward_metadata.kv_indices
+                    seq_lens = forward_batch.seq_lens[:bs].to(torch.long)
+                    # kv_indptr strides in TOKENS and kv_indices holds one pool
+                    # slot per token, so no page arithmetic applies: scaling by
+                    # page_size reads stale slots for the newest tokens
+                    # (GSM8K 0.961 -> 0.410). Clamp to the tokens this batch
+                    # actually has, since metadata can disagree with seq_lens.
+                    toks_per_seq = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(
+                        torch.long
+                    )
+                    seq_lens = torch.minimum(seq_lens, toks_per_seq)
+                    total_k = int(seq_lens.sum().item())
+                    cu_k = torch.zeros(bs + 1, dtype=torch.long, device=q.device)
+                    torch.cumsum(seq_lens, 0, out=cu_k[1:])
+                    seq_ids = torch.repeat_interleave(
+                        torch.arange(bs, device=q.device), seq_lens
+                    )
+                    pos_in_seq = torch.arange(total_k, device=q.device) - cu_k[seq_ids]
+                    slot = kv_indptr[seq_ids].to(torch.long) + pos_in_seq
+                    varlen_ok = (
+                        self.forward_metadata.max_kv_len is not None
+                        and int(slot.max().item()) < kv_slots.numel()
+                    )
+                    if varlen_ok:
+                        tok_idx = kv_slots[slot].to(torch.long)
+                        varlen_ok = int(tok_idx.max().item()) < kc.shape[0]
+                    if varlen_ok:
+                        k_in = _gather_varlen_kv(
+                            kc,
+                            tok_idx,
+                            layer.tp_k_head_num,
+                            layer.qk_head_dim,
+                            q.dtype,
+                            (
+                                layer.k_scale
+                                if layer.k_scale is not None
+                                else self.k_scale
+                            ),
+                        )
+                        v_in = _gather_varlen_kv(
+                            vc,
+                            tok_idx,
+                            layer.tp_v_head_num,
+                            layer.v_head_dim,
+                            q.dtype,
+                            (
+                                layer.v_scale
+                                if layer.v_scale is not None
+                                else self.v_scale
+                            ),
+                        )
+                        cu_seqlens_k = cu_k.to(torch.int32)
+                        max_kv_len = int(self.forward_metadata.max_kv_len)
+                else:
+                    # No prefix: kv is the k/v just computed, so no gather.
+                    k_in = k.contiguous().view(
+                        -1, layer.tp_k_head_num, layer.qk_head_dim
+                    )
+                    v_in = v.contiguous().view(
+                        -1, layer.tp_v_head_num, layer.v_head_dim
+                    )
+                    cu_seqlens_k = self.qo_indptr[:bs0]
+                    max_kv_len = self.forward_metadata.max_q_len
+
+                if varlen_ok:
+                    o = flash_attn_varlen_func(
+                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k_in,
+                        v_in,
+                        self.qo_indptr[:bs0],
+                        cu_seqlens_k,
+                        self.forward_metadata.max_q_len,
+                        max_kv_len,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        window_size=window_size,
+                        sink_ptr=sinks,
+                    )
+                    if o.dtype != self.input_dtype:
+                        o = o.to(self.input_dtype)
+                    return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
                     self,
@@ -3629,6 +3771,24 @@ class AiterAttnBackend(AttentionBackend):
             if attn_out is not None and q.dtype != fp8_dtype:
                 extra_kwargs["out"] = attn_out.view(
                     -1, layer.tp_q_head_num, layer.head_dim
+                )
+
+            if self.use_aiter_varlen_prefill and not getattr(
+                self, "_varlen_fallthrough_logged", False
+            ):
+                self._varlen_fallthrough_logged = True
+                logger.warning(
+                    "[varlen-prefill] fell through to batch_prefill: "
+                    "5d=%s mode=%s(is_extend=%s) prefix_cpu=%s soft_cap=%s "
+                    "k=%s v=%s q_shape=%s",
+                    self.kv_cache_is_vectorized_5d,
+                    forward_batch.forward_mode,
+                    forward_batch.forward_mode.is_extend(),
+                    forward_batch.extend_prefix_lens_cpu,
+                    self.logits_soft_cap,
+                    k is not None,
+                    v is not None,
+                    tuple(q.shape),
                 )
 
             o = mha_batch_prefill_func(
