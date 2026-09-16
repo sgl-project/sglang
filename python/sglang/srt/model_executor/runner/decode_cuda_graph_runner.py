@@ -111,6 +111,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.nccl_ep_admission import (
+        NcclEpGraphDecision,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -1022,7 +1025,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def recapture_if_needed(self, forward_batch: ForwardBatch):
+    def required_capture_hidden_mode(self, forward_batch: ForwardBatch):
 
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
@@ -1043,15 +1046,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Determine the highest capture_hidden_mode required
         # (If we have FULL, we can emulate LAST or NULL)
         # (If we have LAST, we can emulate NULL)
-        required_capture_hidden_mode = max(
+        return max(
             capture_hidden_mode_required_by_forward_batch,
             capture_hidden_mode_required_by_spec_info,
             capture_hidden_mode_required_for_returning_hidden_states,
         )
 
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
-            self.capture_hidden_mode = required_capture_hidden_mode
+    def recapture_if_needed(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        nccl_ep_admission: Optional[NcclEpGraphDecision] = None,
+    ):
+        if nccl_ep_admission is None:
+            target = self.required_capture_hidden_mode(forward_batch)
+            recapture = self.capture_hidden_mode != target
+        else:
+            if not nccl_ep_admission.can_run:
+                raise RuntimeError(
+                    "NCCL EP Graph replay was not admitted on every rank"
+                )
+            target = CaptureHiddenMode(nccl_ep_admission.capture_hidden_mode)
+            recapture = nccl_ep_admission.recapture
+        if recapture:
+            self.capture_hidden_mode = target
             self.backend.cleanup()
             self.capture()
 
@@ -1059,6 +1077,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        nccl_ep_admission: Optional[NcclEpGraphDecision] = None,
     ):
         # External planning callers must not overwrite EP Graph input buffers
         # before the backend has ordered the preceding replay and its consumers.
@@ -1108,7 +1128,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
 
         buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
+        self.recapture_if_needed(forward_batch, nccl_ep_admission=nccl_ep_admission)
 
         raw_bs = forward_batch.batch_size
 
@@ -1216,6 +1236,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        nccl_ep_admission: Optional[NcclEpGraphDecision] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         timer_ctx = (
             self.model_runner.device_timer.wrap(
@@ -1240,7 +1262,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         with timer_ctx, self.backend.replay_session():
-            self.load_batch(forward_batch, pp_proxy_tensors)
+            self.load_batch(
+                forward_batch, pp_proxy_tensors, nccl_ep_admission=nccl_ep_admission
+            )
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
