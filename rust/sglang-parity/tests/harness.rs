@@ -1224,9 +1224,19 @@ async fn semantic_equivalence_has_separate_verdicts_and_evidence() {
             observation: &HttpObservation,
         ) -> Result<PreparedResponse, Vec<Violation>> {
             let mut prepared = EchoPolicy.prepare(case, observation)?;
+            let score = if case.name == "different" {
+                -0.5
+            } else if case.name == "stream"
+                || prepared.value["trace"].as_str().unwrap().ends_with(":2")
+            {
+                -0.24555964767932892
+            } else {
+                -0.24555965
+            };
+            prepared.value["score"] = json!(score);
             if case.name != "missing" {
                 prepared.equivalence = Some(EquivalenceValue {
-                    value: json!({"meaning": if case.name == "different" { "different" } else { "same" }}),
+                    value: json!({"meaning":"same", "score":score}),
                     origins: prepared.origins.clone(),
                 });
             }
@@ -1245,11 +1255,24 @@ async fn semantic_equivalence_has_separate_verdicts_and_evidence() {
         value["equivalence_group"] = json!("semantics");
         cases.push(value);
     }
-    let report = run(&fixture.config, &suite(cases), &Policy).await.unwrap();
+    let mut suite = suite(cases);
+    suite.comparison.per_result_numeric_rules = serde_json::from_value(json!([
+        {"path":"/score","precision":"float32","reason":"Compare at source precision."}
+    ]))
+    .unwrap();
+    let report = run(&fixture.config, &suite, &Policy).await.unwrap();
     assert_eq!(report.cases[0].parity.status, Status::Fail);
     assert_eq!(report.equivalence[0].check.status, Status::Pass);
     assert_eq!(report.equivalence[1].check.status, Status::Fail);
+    assert_eq!(report.equivalence[1].check.differences[0].path, "/score");
     assert_eq!(report.equivalence[2].check.status, Status::Skipped);
+    assert!(
+        report
+            .cases
+            .iter()
+            .flat_map(|c| c.implementations.values())
+            .all(|side| side.repeatability.status == Status::Pass)
+    );
     assert!(
         report
             .runtime_errors
@@ -1259,7 +1282,16 @@ async fn semantic_equivalence_has_separate_verdicts_and_evidence() {
     let attempt = &report.cases[1].implementations["python"].attempts[0];
     assert_eq!(
         read_json(&attempt.equivalence.as_ref().unwrap().file),
-        json!({"meaning":"same"})
+        json!({"meaning":"same","score":-0.24555964767932892})
+    );
+    let json_attempt = &report.cases[0].implementations["python"].attempts[0];
+    assert_eq!(
+        read_json(json_attempt.final_json.as_ref().unwrap())["score"],
+        -0.24555965
+    );
+    assert_eq!(
+        read_json(&json_attempt.equivalence.as_ref().unwrap().file)["score"],
+        -0.24555965
     );
     let reloaded: sglang_parity::Report =
         serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
@@ -1268,6 +1300,8 @@ async fn semantic_equivalence_has_separate_verdicts_and_evidence() {
     let html = fs::read_to_string(report.directory.join("report.html")).unwrap();
     assert!(html.contains("Semantic equivalence value"));
     assert!(html.contains("equivalence.json"));
+    assert!(html.contains("Value exception applied: Compare at source precision."));
     let detail = view.terminal(Some("different"), false).unwrap();
     assert!(detail.contains("semantic equivalence:"));
+    assert!(detail.contains("value exception: Compare at source precision."));
 }

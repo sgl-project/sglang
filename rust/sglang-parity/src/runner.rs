@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::artifacts::Artifacts;
-use crate::compare::{Difference, Violation, compare_json, prepare_comparison};
+use crate::compare::{
+    Difference, Violation, compare_json, prepare_comparison, prepare_numeric_comparison,
+};
 use crate::environment::{self, EnvironmentPlan, PreparedEnvironment};
 use crate::http::{self, CaptureMode, HttpCase, HttpObservation, Isolation};
 use crate::plan::{ExecutionPlan, ProfilePlan, ResolvedProfile};
@@ -896,7 +898,14 @@ impl<P: ResponsePolicy> Capture<'_, P> {
                             file,
                             origins: projection.origins,
                         });
-                        attempt.equivalence_value = Some(projection.value);
+                        match prepare_numeric_comparison(
+                            &projection.value,
+                            crate::compare::ComparisonScope::Root,
+                            self.rules,
+                        ) {
+                            Ok(value) => attempt.equivalence_value = Some(value),
+                            Err(errors) => attempt.violations.extend(errors),
+                        }
                     }
                     attempt.assertions = prepared.assertions;
                     if !case.assertions.is_empty() {

@@ -421,6 +421,74 @@ fn both_platform_configs_and_model_aliases_resolve_without_side_effects() {
 }
 
 #[test]
+fn logprob_precision_rules_cover_both_apis_and_preserve_original_evidence() {
+    use sglang_parity::compare::{prepare_comparison, prepare_numeric_comparison};
+    let rules = &plan().profiles[0].suite.comparison;
+    for chat in [false, true] {
+        let prefix = if chat { "chat" } else { "completion" };
+        let (json_case, policy) = case(&format!("{prefix}_logprobs_json"));
+        let (stream_case, _) = case(&format!("{prefix}_logprobs_stream"));
+        let probabilities = |number| {
+            if chat {
+                let entry = json!({"token":"Hi","logprob":number,"token_id":16777217,
+                    "top_logprobs":[{"token":"Hi","logprob":number}]});
+                json!({"content":[entry.clone()],"refusal":[entry]})
+            } else {
+                json!({"tokens":["Hi"],"token_logprobs":[number],
+                    "top_logprobs":[{"a/~":number}],"text_offset":[0]})
+            }
+        };
+        let mut json = unary(chat);
+        json["choices"][0]["logprobs"] = probabilities(-0.24555964767932892);
+        let original = policy
+            .prepare(
+                &json_case,
+                &HttpObservation {
+                    json: Some(json.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(original.value, json);
+        let mut event = json.clone();
+        event["usage"] = Value::Null;
+        event["choices"][0]["logprobs"] = probabilities(-0.24555965);
+        if chat {
+            event["object"] = json!("chat.completion.chunk");
+            let choice = event["choices"][0].as_object_mut().unwrap();
+            let message = choice.remove("message").unwrap();
+            choice.insert("delta".into(), message);
+        }
+        let streamed = policy
+            .prepare(&stream_case, &capture(vec![event, usage_event(chat)]))
+            .unwrap();
+        assert_eq!(
+            streamed.value["choices"][0]["logprobs"],
+            probabilities(-0.24555965)
+        );
+        let left = prepare_comparison(&original.value, ComparisonScope::Root, rules).unwrap();
+        let right = prepare_comparison(&streamed.value, ComparisonScope::Root, rules).unwrap();
+        assert_eq!(
+            left["choices"][0]["logprobs"],
+            right["choices"][0]["logprobs"]
+        );
+        if chat {
+            assert_eq!(
+                right["choices"][0]["logprobs"]["content"][0]["token_id"],
+                16777217
+            );
+        }
+        let left = original.equivalence.unwrap().value;
+        let right = streamed.equivalence.unwrap().value;
+        assert_ne!(left, right);
+        assert_eq!(
+            prepare_numeric_comparison(&left, ComparisonScope::Root, rules).unwrap(),
+            prepare_numeric_comparison(&right, ComparisonScope::Root, rules).unwrap()
+        );
+    }
+}
+
+#[test]
 fn error_responses_and_malformed_unary_contracts_remain_distinct() {
     let (error_case, p) = case("completion_invalid_max_tokens");
     let error = json!({"error":{"message":"invalid max_tokens","type":"BadRequest","code":400}});

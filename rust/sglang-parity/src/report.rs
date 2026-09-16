@@ -568,8 +568,8 @@ impl<'a> ReportView<'a> {
             .zip(&labels)
             {
                 let rule = value
-                    .filter(|_| !side.projected())
-                    .and_then(|_| self.exception(side.case, &difference.path));
+                    .filter(|v| !v.is_null())
+                    .and_then(|_| self.comparison_reason(side, &difference.path));
                 let text = plain(&value_text(value));
                 writeln!(
                     out,
@@ -972,9 +972,13 @@ impl<'a> ReportView<'a> {
         }
     }
 
-    fn exception(&self, case: &str, pointer: &str) -> Option<&str> {
-        let (suite, case) = self.case_suite(case)?;
-        let relative = match case.comparison_scope {
+    fn comparison_reason(&self, side: Evidence<'_>, pointer: &str) -> Option<&str> {
+        let (suite, case) = self.case_suite(side.case)?;
+        let relative = match if side.projected() {
+            ComparisonScope::Root
+        } else {
+            case.comparison_scope
+        } {
             ComparisonScope::Root => pointer,
             ComparisonScope::TopLevelArrayItems => {
                 let (index, _) = pointer.strip_prefix('/')?.split_once('/')?;
@@ -982,6 +986,15 @@ impl<'a> ReportView<'a> {
                 &pointer[index.len() + 1..]
             }
         };
+        let numeric = suite
+            .comparison
+            .per_result_numeric_rules
+            .iter()
+            .find(|rule| rule.matches(relative))
+            .map(|rule| rule.reason.as_str());
+        if numeric.is_some() || side.projected() {
+            return numeric;
+        }
         suite
             .comparison
             .per_result_value_exceptions
@@ -1287,8 +1300,8 @@ impl<'a> ReportView<'a> {
                         .unwrap_or_else(|| "<missing>".into());
                     html_pre(out, &text);
                     if let Some(reason) = value
-                        .filter(|_| !side.projected())
-                        .and_then(|_| self.exception(side.case, &difference.path))
+                        .filter(|v| !v.is_null())
+                        .and_then(|_| self.comparison_reason(side, &difference.path))
                     {
                         write!(
                             out,
@@ -1720,15 +1733,18 @@ mod tests {
         }
         assert!(!html.contains("<script>"));
         assert!(!html.contains("href=\"/original/run"));
-        assert_eq!(view.exception("json", "/time"), Some("Clock value varies"));
+        assert_eq!(
+            view.comparison_reason(side, "/time"),
+            Some("Clock value varies")
+        );
         view.suite.as_mut().unwrap().cases[0].comparison_scope =
             ComparisonScope::TopLevelArrayItems;
         assert_eq!(
-            view.exception("json", "/12/time"),
+            view.comparison_reason(side, "/12/time"),
             Some("Clock value varies")
         );
-        assert_eq!(view.exception("json", "/12/nested/time"), None);
-        assert_eq!(view.exception("json", "/time"), None);
+        assert_eq!(view.comparison_reason(side, "/12/nested/time"), None);
+        assert_eq!(view.comparison_reason(side, "/time"), None);
         for mode in ["cumulative", "incremental", "custom-output"] {
             view.suite.as_mut().unwrap().output_mode = mode.into();
             view.suite.as_mut().unwrap().cases[0].capture = CaptureMode::Sse;

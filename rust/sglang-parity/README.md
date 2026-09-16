@@ -375,8 +375,9 @@ cannot override comparison rules, and there are no per-case comparison overrides
 
 Comparison is strict over the entire JSON tree: object key order is irrelevant;
 keys, array order and length, all values, and missing versus `null` matter. There
-are no tolerances, text normalization, or implicit field exclusions. The default
-specification permits only these per-result scalar values to vary:
+are no tolerances, text normalization, or implicit field exclusions. Suites may
+explicitly declare numeric precision rules below. The native specification
+permits only these per-result scalar values to vary:
 
 | Pointer | Presence | Requirement | Reason |
 | --- | --- | --- | --- |
@@ -396,6 +397,22 @@ Unknown rules or presence policies, invalid/duplicate pointers, and empty
 exception reasons are configuration errors. The supported comparison vocabulary is
 `exact_json`, `non_empty_string`, and `non_negative_number`; pointers are literal
 JSON Pointers, with no wildcards, scripts, or expressions.
+
+Optional `comparison.per_result_numeric_rules` select numeric values to round
+before exact comparison. Each rule declares `path`, `precision: "float32"`, and
+a reviewable `reason`. Unlike scalar exceptions, these pointer patterns permit
+`*` as a whole path component to select array elements or object members.
+Only the selected numbers are converted through `f32`; no epsilon is applied.
+Missing paths and `null` stay distinct and unchanged; presence and API types are
+still validated by the suite. Non-numeric selected values and numbers that
+overflow to infinity fail validation. Tokens, counts, and other unlisted fields
+remain exact. Empty rules preserve the original strict behavior.
+
+Precision rules apply to repeatability, Python/Rust parity, and semantic
+equivalence. For a semantic projection, paths are relative to its root and
+dynamic-value exceptions are not applied. `final.json` and `equivalence.json`
+retain the values before rounding; reports show the applied rule alongside
+comparison values. Saved reports retain their original verdicts.
 
 The suite's `streaming.fields` declaration assigns a lifecycle to each complete
 response field, using per-result JSON Pointers. The native suite interprets these
@@ -658,6 +675,13 @@ Allowing Completion IDs to vary does not relax JSON/SSE result equivalence:
 every declared pair still compares each indexed choice's content, finish reason
 and logprobs, along with the model and complete final usage. Independent JSON
 and SSE requests need not produce the same literal ID.
+
+The OpenAI suite specification explicitly compares log probabilities at `float32`
+precision: Chat content/refusal logprobs and their top alternatives, and
+Completion `token_logprobs` and `top_logprobs` values. This removes differences
+such as `-0.24555965` versus `-0.24555964767932892`, which map to the same `f32`.
+Different `f32` values still fail; `token_id`, offsets, usage, nulls and missing
+fields keep their exact comparisons.
 
 Reports link each comparison to its own values and event origins. Existing
 native suites and older reports continue using their original full-result

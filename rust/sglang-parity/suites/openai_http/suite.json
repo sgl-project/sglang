@@ -2,6 +2,38 @@
   "name": "openai_http",
   "comparison": {
     "base": "exact_json",
+    "per_result_numeric_rules": [
+      {
+        "path": "/choices/*/logprobs/content/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/content/*/top_logprobs/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/refusal/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/refusal/*/top_logprobs/*/logprob",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/token_logprobs/*",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      },
+      {
+        "path": "/choices/*/logprobs/top_logprobs/*/*",
+        "precision": "float32",
+        "reason": "Compare log probabilities at float32 precision to remove JSON serialization precision differences."
+      }
+    ],
     "per_result_value_exceptions": [
       {
         "path": "/id",

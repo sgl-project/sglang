@@ -1,7 +1,7 @@
 //! Strict JSON comparison with explicit, validated exceptions for scalar values.
 //!
 //! Rules never project responses into a smaller schema: the original tree stays
-//! intact, and only declared values in a copy are replaced after validation.
+//! intact, and only declared values in a copy are replaced or rounded after validation.
 
 use std::collections::BTreeSet;
 
@@ -51,12 +51,44 @@ pub struct ValueException {
     pub reason: String,
 }
 
+/// Precision used for explicitly selected numeric values, without a tolerance.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NumericPrecision {
+    Float32,
+}
+
+/// A numeric JSON Pointer pattern; `*` selects each array item or object member.
+/// Missing fields and nulls remain unchanged; other values must be numbers that
+/// stay finite after rounding. API suites own presence/type contracts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NumericRule {
+    pub path: String,
+    pub precision: NumericPrecision,
+    pub reason: String,
+}
+
+impl NumericRule {
+    /// Whether this rule applies to a concrete, escaped JSON Pointer.
+    pub fn matches(&self, pointer: &str) -> bool {
+        let mut tokens = pointer.split('/');
+        self.path.split('/').all(|pattern| {
+            tokens
+                .next()
+                .is_some_and(|token| pattern == "*" || pattern == token)
+        }) && tokens.next().is_none()
+    }
+}
+
 /// The suite's complete comparison contract, with no implicit exceptions.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ComparisonRules {
     pub base: ComparisonBase,
     pub per_result_value_exceptions: Vec<ValueException>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_result_numeric_rules: Vec<NumericRule>,
 }
 
 impl ComparisonRules {
@@ -64,7 +96,7 @@ impl ComparisonRules {
     pub fn validate(&self) -> Result<(), String> {
         let mut paths = BTreeSet::new();
         for rule in &self.per_result_value_exceptions {
-            if !valid_pointer(&rule.path) {
+            if !valid_pointer(&rule.path, false) {
                 return Err(format!(
                     "invalid exception path {:?}: expected a non-root JSON Pointer without wildcards",
                     rule.path
@@ -77,16 +109,32 @@ impl ComparisonRules {
                 return Err(format!("exception {:?} requires a reason", rule.path));
             }
         }
+        for rule in &self.per_result_numeric_rules {
+            if !valid_pointer(&rule.path, true) || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "numeric rule {:?} requires a valid non-root pointer pattern and a reason",
+                    rule.path
+                ));
+            }
+            if !paths.insert(&rule.path)
+                || self
+                    .per_result_value_exceptions
+                    .iter()
+                    .any(|exception| rule.matches(&exception.path))
+            {
+                return Err(format!("overlapping comparison rules at {:?}", rule.path));
+            }
+        }
         Ok(())
     }
 }
 
-fn valid_pointer(path: &str) -> bool {
+fn valid_pointer(path: &str, wildcards: bool) -> bool {
     if !path.starts_with('/') {
         return false;
     }
     path[1..].split('/').all(|token| {
-        if token == "*" {
+        if token == "*" && !wildcards {
             return false;
         }
         let mut chars = token.chars();
@@ -181,7 +229,113 @@ pub fn prepare_comparison(
         // another target or change the surrounding tree.
         *prepared.pointer_mut(&path).expect("validated scalar path") = replacement;
     }
+    normalize_numbers(&mut prepared, scope, &rules.per_result_numeric_rules)?;
     Ok(prepared)
+}
+
+/// Round declared numeric fields in a copy of an API's semantic projection.
+/// Dynamic-value exceptions do not apply: a projection may omit those fields.
+pub fn prepare_numeric_comparison(
+    original: &Value,
+    scope: ComparisonScope,
+    rules: &ComparisonRules,
+) -> Result<Value, Vec<Violation>> {
+    rules
+        .validate()
+        .map_err(|message| vec![Violation::new("", message)])?;
+    let mut prepared = original.clone();
+    normalize_numbers(&mut prepared, scope, &rules.per_result_numeric_rules)?;
+    Ok(prepared)
+}
+
+fn normalize_numbers(
+    value: &mut Value,
+    scope: ComparisonScope,
+    rules: &[NumericRule],
+) -> Result<(), Vec<Violation>> {
+    if scope == ComparisonScope::TopLevelArrayItems && !value.is_array() {
+        return Err(vec![Violation::new("", "expected a top-level array")]);
+    }
+    let mut violations = Vec::new();
+    for rule in rules {
+        let tokens: Vec<_> = rule.path[1..].split('/').collect();
+        match scope {
+            ComparisonScope::Root => round_at(value, "", &tokens, rule.precision, &mut violations),
+            ComparisonScope::TopLevelArrayItems => {
+                let items = value.as_array_mut().expect("validated array scope");
+                for (index, item) in items.iter_mut().enumerate() {
+                    round_at(
+                        item,
+                        &format!("/{index}"),
+                        &tokens,
+                        rule.precision,
+                        &mut violations,
+                    );
+                }
+            }
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+fn round_at(
+    value: &mut Value,
+    path: &str,
+    tokens: &[&str],
+    precision: NumericPrecision,
+    violations: &mut Vec<Violation>,
+) {
+    let Some((token, rest)) = tokens.split_first() else {
+        if value.is_null() {
+            return;
+        }
+        let rounded = match precision {
+            NumericPrecision::Float32 => value.as_f64().map(|n| n as f32),
+        };
+        if let Some(number) = rounded.filter(|n| n.is_finite()) {
+            *value = Value::from(f64::from(number));
+        } else {
+            violations.push(Violation::new(
+                path,
+                "expected a number finite at float32 precision or null",
+            ));
+        }
+        return;
+    };
+    if *token == "*" {
+        match value {
+            Value::Array(items) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    round_at(
+                        item,
+                        &format!("{path}/{index}"),
+                        rest,
+                        precision,
+                        violations,
+                    );
+                }
+            }
+            Value::Object(items) => {
+                for (key, item) in items {
+                    let key = key.replace('~', "~0").replace('/', "~1");
+                    round_at(item, &format!("{path}/{key}"), rest, precision, violations);
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(item) = value.pointer_mut(&format!("/{token}")) {
+        round_at(
+            item,
+            &format!("{path}/{token}"),
+            rest,
+            precision,
+            violations,
+        );
+    }
 }
 
 /// How a pair of JSON trees differs at a particular pointer.
@@ -292,6 +446,133 @@ mod tests {
             ]
         }))
         .unwrap()
+    }
+
+    fn numeric_rules() -> ComparisonRules {
+        serde_json::from_value(json!({
+            "base":"exact_json", "per_result_value_exceptions":[],
+            "per_result_numeric_rules":[{"path":"/items/*/score","precision":"float32","reason":"Use the source precision."}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn float32_comparison_preserves_evidence_structure_and_unlisted_numbers() {
+        let rules = numeric_rules();
+        for scope in [ComparisonScope::Root, ComparisonScope::TopLevelArrayItems] {
+            let wrap = |v| {
+                if scope == ComparisonScope::Root {
+                    v
+                } else {
+                    json!([v])
+                }
+            };
+            let prepare = |v| prepare_comparison(&wrap(v), scope, &rules).unwrap();
+            for (left, right, equal) in [
+                (-0.24555964767932892, -0.24555965, true),
+                (
+                    -0.24555964767932892,
+                    f64::from(f32::from_bits((-0.24555965_f32).to_bits() + 1)),
+                    false,
+                ),
+                (0.0, -0.0, true),
+                (1e-50, 0.0, true),
+                (f64::from(f32::from_bits(1)), 0.0, false),
+                (f64::from(f32::MAX), f64::from(f32::MAX), true),
+            ] {
+                let original = json!({"items":[{"score":left}, {"score":null}, {}],"count":16777217,"time":0.123456789});
+                let saved = original.clone();
+                let mut other = original.clone();
+                other["items"][0]["score"] = json!(right);
+                let comparison = prepare(original.clone());
+                assert_eq!(compare_json(&comparison, &prepare(other)).is_empty(), equal);
+                assert_eq!(original, saved);
+                let item = if scope == ComparisonScope::Root {
+                    &comparison
+                } else {
+                    &comparison[0]
+                };
+                assert_eq!(item["count"], 16777217);
+                assert_eq!(item["time"], 0.123456789);
+                assert_eq!(item["items"][1], json!({"score":null}));
+                assert_eq!(item["items"][2], json!({}));
+            }
+            assert!(
+                !compare_json(
+                    &prepare(json!({"items":[{}]})),
+                    &prepare(json!({"items":[{"score":null}]}))
+                )
+                .is_empty()
+            );
+            assert!(
+                !compare_json(
+                    &prepare(json!({"items":[]})),
+                    &prepare(json!({"items":[{}]}))
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_patterns_handle_escaped_members_and_reject_invalid_values() {
+        let mut rules = numeric_rules();
+        rules.per_result_numeric_rules[0].path = "/a~1b/*/~0score".into();
+        let rule = &rules.per_result_numeric_rules[0];
+        assert!(rule.matches("/a~1b/x~1y/~0score"));
+        assert!(!rule.matches("/a~1b/x/y/~0score"));
+        assert!(!rule.matches("/a~1b/x"));
+        assert!(!rule.matches("/a~1b/x/~0score/extra"));
+        for number in [
+            json!(-0.24555965),
+            json!(1e40),
+            json!("-0.1"),
+            json!(true),
+            json!([]),
+            json!({}),
+        ] {
+            let value = json!({"a/b":{"x/y":{"~score":number}}});
+            let result = prepare_comparison(&value, ComparisonScope::Root, &rules);
+            if number == json!(-0.24555965) {
+                assert_eq!(
+                    result.unwrap()["a/b"]["x/y"]["~score"],
+                    json!(f64::from(-0.24555965_f32))
+                );
+            } else {
+                assert_eq!(result.unwrap_err()[0].path, "/a~1b/x~1y/~0score");
+            }
+        }
+        rules.per_result_value_exceptions = self::rules().per_result_value_exceptions;
+        let projection = json!({"a/b":{"token":{"~score":-0.24555965}}});
+        assert!(prepare_comparison(&projection, ComparisonScope::Root, &rules).is_err());
+        assert!(prepare_numeric_comparison(&projection, ComparisonScope::Root, &rules).is_ok());
+        assert!(
+            prepare_numeric_comparison(&projection, ComparisonScope::TopLevelArrayItems, &rules)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn numeric_rules_require_valid_documented_unambiguous_paths() {
+        for path in ["", "items/*/score", "/a~", "/a~2"] {
+            let mut rules = numeric_rules();
+            rules.per_result_numeric_rules[0].path = path.into();
+            assert!(prepare_comparison(&json!({}), ComparisonScope::Root, &rules).is_err());
+        }
+        let mut rules = numeric_rules();
+        rules
+            .per_result_numeric_rules
+            .push(rules.per_result_numeric_rules[0].clone());
+        assert!(rules.validate().is_err());
+        let mut rules = numeric_rules();
+        rules.per_result_numeric_rules[0].reason.clear();
+        assert!(rules.validate().is_err());
+        let mut rules = numeric_rules();
+        rules.per_result_numeric_rules[0].path = "/meta/*".into();
+        rules.per_result_value_exceptions = self::rules().per_result_value_exceptions;
+        assert!(rules.validate().is_err());
+        let mut value = serde_json::to_value(numeric_rules()).unwrap();
+        value["per_result_numeric_rules"][0]["precision"] = json!("approximate");
+        assert!(serde_json::from_value::<ComparisonRules>(value).is_err());
     }
 
     #[test]
