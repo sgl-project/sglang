@@ -81,6 +81,31 @@ def _rocm_fp8_wo_a_supported() -> bool:
         return False
 
 
+def _apply_hip_dsa_topk_default(hf_config: Any) -> None:
+    """Prefer the cooperative HIP JIT top-k unless the user selected a path."""
+    from sglang.kernels.ops.attention.dsa.hip_cooperative_topk import (
+        hip_cooperative_topk_is_available,
+    )
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+    if not get_platform().is_hip or envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+        return
+
+    is_dsa = is_deepseek_dsa(hf_config)
+    is_dsv4 = is_deepseek_v4(hf_config)
+    if not (is_dsa or is_dsv4):
+        return
+
+    if hip_cooperative_topk_is_available():
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+        return
+
+    # Preserve the previous defaults on HIP devices that cannot run the wave64
+    # cooperative kernel.
+    model_arch = hf_config.architectures[0]
+    envs.SGLANG_OPT_USE_TOPK_V2.set(is_dsv4 or model_arch == "GlmMoeDsaForCausalLM")
+
+
 def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -109,6 +134,10 @@ def handle_model_specific_adjustments(server_args: Any):
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+
+    # The cooperative HIP JIT kernel covers the production DSA widths and both
+    # compact and page-size-1 tables. Keep the JIT v2 path user-selectable.
+    _apply_hip_dsa_topk_default(hf_config)
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
@@ -340,24 +369,6 @@ def handle_model_specific_adjustments(server_args: Any):
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
-            if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
-                # CUDA/Hopper-only path: its JIT source includes
-                # <cooperative_groups.h> and uses cg::this_cluster()
-                # (thread-block clusters), neither of which exists on ROCm,
-                # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                # here for the rest of the DSA family (DeepSeek-V3.2 /
-                # GLM-5.x) that shares the same decode top-k path.
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if model_arch == "GlmMoeDsaForCausalLM":
-                # Open the fused top-k v2 kernel for the GLM-5.x DSA
-                # family on ROCm: it shares this decode top-k path, and
-                # the kernel's ROCm build compiles the streaming levels
-                # on gfx9xx. Order is load-bearing: the blanket disable
-                # above `set`s the variable unconditionally, so this has
-                # to follow it.
-                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
@@ -408,7 +419,6 @@ def handle_model_specific_adjustments(server_args: Any):
             if not _rocm_fp8_wo_a_supported():
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-            envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
             envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
