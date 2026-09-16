@@ -940,7 +940,7 @@ class Envs:
     # gfx950 TP4 BF16 WO-A: GEMV/tiny split-K and direct output for large verify batches.
     SGLANG_OPT_HIP_WO_A_BF16_DECODE = EnvBool(True)
     # TP4 verify: quantize WO-A partial sums directly for native MXFP8 WO-B.
-    SGLANG_OPT_HIP_WO_A_MXFP8_EPILOGUE = EnvBool(True)
+    SGLANG_OPT_HIP_WO_A_MXFP8_EPILOGUE = EnvBool(False)
     # gfx950 TP4 tiny-row attention and MoE all-reduce/post fusion.
     SGLANG_OPT_HIP_ALL_REDUCE_MHC = EnvBool(True)
     # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
