@@ -53,9 +53,8 @@ def amax_topk_blocks(
 ) -> torch.Tensor:
     """Per row the ``topk_blocks`` blocks of 8 positions with the largest block
     maximum among its first ``seq_lens[b]`` positions, the newest block always
-    included: block ids in no particular order, ``-1`` past the row's count
-    (``sort_candidate_blocks`` turns them into the published table). ``nblocks``
-    is ``ceil(seq_lens / 8)`` as int32, from ``candidate_row_lens``."""
+    included: block ids in no particular order, ``-1`` past the row's count.
+    ``nblocks`` is ``ceil(seq_lens / 8)`` as int32."""
     rows = logits.shape[0]
     block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
@@ -101,9 +100,8 @@ def build_sparse_indexer_schedule(
 ) -> torch.Tensor:
     """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
     int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
-    ``request_ids`` ``[rows]``, one id per row with a request's rows consecutive
-    (verify: its draft tokens), lets DeepGEMM pair two rows of a request on one
-    KV pass; each row keeps its own block list and output layout. Paired rows
+    ``request_ids`` ``[rows]`` lets DeepGEMM pair two rows of a request on one KV
+    pass; each row keeps its own block list and output layout, and paired rows
     must share their page-table row. None: every row is its own request."""
     import deep_gemm
 
@@ -156,9 +154,7 @@ def topk_transform_sparse(
     """Top-``k`` (``k = page_indices.shape[1]``) of every row of the sparse
     ``logits`` (bf16 ``[rows, topk_blocks * 8]``) within its first ``valid_lens[b]``
     columns, written as pool slots, ``-1`` where a row has fewer than ``k`` valid
-    columns, in no particular order. Column ``j`` is slot
-    ``phys_blocks[b, j // 8] * 8 + j % 8``: the bf16 top-k kernel's page-table
-    transform at page size 8 over the physical block table."""
+    columns, in no particular order."""
     topk_transform_bf16_small(
         logits, valid_lens, table.phys_blocks, page_indices, CANDIDATE_BLOCK_SIZE
     )
@@ -177,10 +173,9 @@ class DeepGemmCandidateIndexer:
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> SparseBlockTable:
-        """Layer 20 end to end: dense logits, its own plain top-k into
-        ``page_indices`` (and ``raw_indices`` when given), the block table from
-        the same logits and DeepGEMM's schedule for it; the backend stores the
-        table on the forward metadata."""
+        """The publishing layer's own plain top-k into ``page_indices``, plus the
+        block table for the consumers; the backend stores it on the forward
+        metadata."""
         metadata = inputs.metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         logits = fp4_paged_mqa_logits(
@@ -239,8 +234,6 @@ class DeepGemmCandidateIndexer:
             )
 
     def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
-        """A consumer: bf16 logits ``[rows, topk_blocks * 8]`` of the published
-        blocks only."""
         return sparse_logits(
             inputs.q_fp4,
             inputs.q_sf,
@@ -256,10 +249,6 @@ class DeepGemmCandidateIndexer:
         page_indices: torch.Tensor,
         raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        """A consumer: top-``k`` (``k = page_indices.shape[1]``) inside the
-        published blocks, written ascending as slots through the page table with
-        ``-1`` past the valid count (and as positions into ``raw_indices`` when
-        given)."""
         assert raw_indices is None
         table = candidate_metadata
         torch.cuda.current_stream().wait_event(table.ready)

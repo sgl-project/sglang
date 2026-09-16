@@ -57,8 +57,7 @@ class CandidateIndexer(Protocol, Generic[T]):
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
 ) -> Optional[CandidateIndexer]:
-    """The paged fp4 decode path's two-level indexer; None where no layer
-    publishes candidates (``topk_blocks == 0``) or on Hopper, whose decode
+    """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
     indexer selects through masks inline."""
     if topk_blocks <= 0 or get_platform().device_sm < 100:
         return None
@@ -87,7 +86,6 @@ class CandidateMasks(CandidateMetadata):
 
 
 def published_masks(candidate) -> CandidateMasks:
-    """The forward's ``candidate_metadata`` as the masks the source published."""
     assert isinstance(candidate, CandidateMasks), "candidate masks missing"
     return candidate
 

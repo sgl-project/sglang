@@ -1138,8 +1138,7 @@ def fp4_paged_mqa_logits(
     deep_gemm_metadata,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
-    reference does not apply one."""
+    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
     from deep_gemm import fp8_fp4_paged_mqa_logits
 
     sl = seq_lens.to(torch.int32)
@@ -1163,9 +1162,8 @@ def fp32_jit_paged_topk(
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """Plain top-k of the dense paged ``logits``: pool slots into ``page_indices``
-    (``-1`` past the valid count) and, when given, positions into ``raw_indices``;
-    ``metadata`` is the ratio's ``PagedIndexerMetadata``."""
+    """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
+    positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
