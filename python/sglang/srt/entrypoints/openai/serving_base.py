@@ -14,7 +14,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -29,6 +29,20 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self.request_conversion_executor = None
+        concurrency = get_serving().request_conversion_concurrency
+        if concurrency > 0:
+            from sglang.srt.entrypoints.openai.request_conversion import (
+                RequestConversionExecutor,
+            )
+
+            if not hasattr(tokenizer_manager, "request_conversion_executor"):
+                tokenizer_manager.request_conversion_executor = (
+                    RequestConversionExecutor(concurrency)
+                )
+            self.request_conversion_executor = (
+                tokenizer_manager.request_conversion_executor
+            )
         self.allowed_custom_labels = (
             set(get_observability().tokenizer_metrics_allowed_custom_labels)
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
@@ -69,6 +83,12 @@ class OpenAIServingBase(ABC):
         # Fall back to explicit lora_path
         return explicit_lora_path
 
+    async def _run_request_conversion(self, function, *args):
+        executor = getattr(self, "request_conversion_executor", None)
+        if executor is None:
+            return function(*args)
+        return await executor.run(function, *args)
+
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
     ) -> Union[Any, StreamingResponse, ErrorResponse]:
@@ -79,7 +99,9 @@ class OpenAIServingBase(ABC):
 
         try:
             # Validate request
-            error_msg = self._validate_request(request)
+            error_msg = await self._run_request_conversion(
+                self._validate_request, request
+            )
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -89,8 +111,8 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            adapted_request, processed_request = await self._run_request_conversion(
+                self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
