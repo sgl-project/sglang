@@ -854,6 +854,10 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._abort_pending_infos = None
+        receiver._abort_retry_lock = threading.Lock()
+        receiver._abort_retry_scheduled = False
+        receiver._abort_retry_stopped = False
         receiver._connection_pool_entries = {}
         return receiver, mgr
 

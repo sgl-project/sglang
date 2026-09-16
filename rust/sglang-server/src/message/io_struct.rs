@@ -53,6 +53,7 @@ wire_struct! {
         decode_tp_size: Option<i64>,
         routed_dp_rank: Option<i64>,
         disagg_prefill_dp_rank: Option<i64>,
+        disagg_request_epoch: Option<String>,
     }
 }
 
@@ -114,6 +115,7 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             decode_tp_size: req.decode_tp_size,
             routed_dp_rank: req.routed_dp_rank,
             disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
+            disagg_request_epoch: Some(uuid::Uuid::new_v4().simple().to_string()),
         }
     }
 }
@@ -180,9 +182,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 32 (through
+        // msgspec requires >= 14 (through `stream`); we emit 33 (through
         // `disagg_prefill_dp_rank`). Trailing defaulted fields are omitted.
-        assert_eq!(arr.len(), 32, "header ends at disagg_prefill_dp_rank");
+        assert_eq!(arr.len(), 33, "header ends at disagg_prefill_dp_rank");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -212,7 +214,7 @@ mod tests {
         );
     }
 
-    /// The PD block must land on Python's wire indices 25–31, with the filler
+    /// The PD block must land on Python's wire indices 25–32, with the filler
     /// block (17–24) holding its defaults — a shift here silently routes KV
     /// transfers to the wrong host/room.
     #[test]
@@ -245,5 +247,10 @@ mod tests {
         assert_eq!(arr[29].as_i64(), Some(2), "decode_tp_size at 29");
         assert_eq!(arr[30].as_i64(), Some(3), "routed_dp_rank at 30");
         assert_eq!(arr[31].as_i64(), Some(4), "disagg_prefill_dp_rank at 31");
+        assert_eq!(
+            arr[32].as_str().map(str::len),
+            Some(32),
+            "disagg_request_epoch at 32"
+        );
     }
 }

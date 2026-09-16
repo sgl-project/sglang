@@ -9,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
+    dcp_pack_buffer_bytes_for_args,
     try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -199,6 +200,20 @@ class TestDcpPackBufferBytes(CustomTestCase):
             4 * 3 * (16 + 16),
         )
 
+    def test_for_args_excludes_draft_tail(self):
+        kv_args = SimpleNamespace(
+            kv_item_lens=[64 * 16, 64 * 16, 64 * 8],
+            num_draft_entries=1,
+            page_size=64,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.max_prefill_buffer_tokens",
+            return_value=10,
+        ):
+            size = dcp_pack_buffer_bytes_for_args(kv_args, dcp_size=4)
+
+        self.assertEqual(size, 4 * 3 * (16 + 16))
+
     def test_rejects_invalid_item_lens(self):
         with self.assertRaisesRegex(ValueError, "at least one page"):
             dcp_pack_buffer_bytes([0], page_size=64, max_tokens=8)
@@ -254,6 +269,29 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+    def test_try_pack_does_not_cross_rank_region(self):
+        pack = torch.zeros(128, dtype=torch.uint8)
+        buf = type(
+            "Buf",
+            (),
+            {
+                "buffer": pack,
+                "get_ptr": lambda self: 0x1000,
+                "get_size": lambda self: pack.numel(),
+            },
+        )()
+
+        packed = try_pack_dcp_src(
+            pack_buffer=buf,
+            kv_data_ptrs=[0x2000],
+            src_token_indices=np.arange(5, dtype=np.int64),
+            token_item_lens=[8],
+            pack_offset_bytes=32,
+            pack_limit_bytes=64,
+        )
+
+        self.assertIsNone(packed)
 
 
 if __name__ == "__main__":
