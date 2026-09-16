@@ -46,6 +46,15 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
     # resolution, aspect ratio). Disable to tokenize the prompt verbatim.
     format_prompt_as_json: bool = True
 
+    # "contract": ``action`` rows are in the embodiment's raw units and go
+    # through the checkpoint's affine normalizer; "none": rows are already in
+    # model space (e.g. imaginaire4 benchmark sidecars) and only get padded.
+    action_normalization: str = "contract"
+
+    @property
+    def actions_pre_normalized(self) -> bool:
+        return str(self.action_normalization).strip().lower() == "none"
+
     # Set during adjustment when the request left height/width unset: the image
     # stage then snaps the canvas to the trained size closest to the image aspect.
     canvas_from_image: bool = False
@@ -79,6 +88,11 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
             raise ValueError("Cosmos-Dreams accepts exactly one conditioning image.")
         if not isinstance(self.format_prompt_as_json, bool):
             raise ValueError("format_prompt_as_json must be a boolean.")
+        if str(self.action_normalization).strip().lower() not in ("contract", "none"):
+            raise ValueError(
+                "Cosmos-Dreams action_normalization must be 'contract' (raw rows) or "
+                f"'none' (pre-normalized rows), got {self.action_normalization!r}."
+            )
 
     def _adjust(self, server_args) -> None:
         # The base adjustment fills a default canvas below; remember whether the

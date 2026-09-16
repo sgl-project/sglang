@@ -48,7 +48,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 
-# ``transformer/config.json["cosmos_dreams"]`` of Cosmos3-Nano-Sim-Transfer
+# ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Transfer
 # (checkpoint causal_8b_sf_dmd_transfer_4modality_480p_ga_v2_midtrain_
 # causal_control_with_rgb_history_text_dropout_0@iter_000001750).
 TRANSFER_ARTIFACT = {
@@ -379,7 +379,7 @@ class TestTransferRegistryAndConfig(unittest.TestCase):
         self.assertFalse(config.supports_action_endpoint())
         with mock.patch(
             "sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams._transformer_config",
-            return_value={"cosmos_dreams": _artifact()},
+            return_value={"cosmos3_nano_sim_bimanual": _artifact()},
         ):
             with self.assertRaises(ValueError):
                 CosmosDreamsConfig()._validate_checkpoint("/models/transfer")

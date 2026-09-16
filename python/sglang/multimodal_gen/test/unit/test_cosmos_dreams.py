@@ -11,9 +11,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
+    ActionNormalizerContract,
+    CosmosDreamsActionContract,
+    canonical_sha256,
+    float32_value,
     load_cosmos_dreams_manifest,
     parse_cosmos_dreams_manifest,
 )
@@ -53,6 +58,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_rows,
     normalize_action_rows,
     pad_action_rows,
+    prepare_action_rows,
     resolve_geometry,
     sde_step_generator,
 )
@@ -60,7 +66,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
 )
 
-# ``transformer/config.json["cosmos_dreams"]`` of Cosmos3-Nano-Sim-Bimanual
+# ``transformer/config.json["cosmos3_nano_sim_bimanual"]`` of Cosmos3-Nano-Sim-Bimanual
 # (checkpoint causal_8b_sf_dmd_max_4step_cam_chunk4_480p_961f@iter_000002000).
 # The two SHA-256 digests are exporter-published and pin the hash
 # canonicalization, so they must not be regenerated from this code.
@@ -167,6 +173,93 @@ def _artifact() -> dict:
     return copy.deepcopy(CHECKPOINT_ARTIFACT)
 
 
+AGIBOT_LAYOUT = {
+    "id": "agibot_backward_framewise_rot6d_v1",
+    "pose_convention": "backward_framewise",
+    "rotation_representation": "rot6d_columns",
+    "delta_equation": "T_i^-1 @ T_{i+1}",
+    "fields": [
+        {"name": "head_translation", "offset": 0, "size": 3, "unit": "meter"},
+        {
+            "name": "head_rotation",
+            "offset": 3,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns",
+        },
+        {"name": "right_translation", "offset": 9, "size": 3, "unit": "meter"},
+        {
+            "name": "right_rotation",
+            "offset": 12,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns",
+        },
+        {
+            "name": "right_gripper",
+            "offset": 18,
+            "size": 1,
+            "unit": "open_fraction",
+            "closed_value": 0.0,
+            "open_value": 1.0,
+        },
+        {"name": "left_translation", "offset": 19, "size": 3, "unit": "meter"},
+        {
+            "name": "left_rotation",
+            "offset": 22,
+            "size": 6,
+            "unit": "dimensionless",
+            "representation": "rot6d_columns",
+        },
+        {
+            "name": "left_gripper",
+            "offset": 28,
+            "size": 1,
+            "unit": "open_fraction",
+            "closed_value": 0.0,
+            "open_value": 1.0,
+        },
+    ],
+}
+
+
+def _two_embodiment_artifact() -> dict:
+    """The camera fixture plus a synthetic 29-D AgiBot embodiment, hashes recomputed.
+
+    Mirrors the release export (default embodiment agibotworld, domain 15, a
+    quantile normalizer resolved to an unclamped affine transform).
+    """
+    artifact = _artifact()
+    conditioning = artifact["conditioning"]
+    conditioning["default_embodiment"] = "agibotworld"
+    conditioning["embodiments"]["agibotworld"] = {
+        "domain_id": 15,
+        "raw_action_dim": 29,
+        "layout": copy.deepcopy(AGIBOT_LAYOUT),
+        "normalizer": {
+            "schema_version": 1,
+            "method": "quantile_rot",
+            "derivation": {"low_key": "q01", "high_key": "q99", "range_floor": 1e-8},
+            "transform": {
+                "type": "affine",
+                "forward_clamp": False,
+                # The exporter publishes float32-exact values; the validator checks it.
+                "offset": [float32_value(0.001 * i) for i in range(29)],
+                "scale": [float32_value(0.01 * (i + 1)) for i in range(29)],
+            },
+            "transform_sha256": "0" * 64,
+        },
+    }
+    for embodiment in conditioning["embodiments"].values():
+        normalizer = embodiment["normalizer"]
+        parsed = msgspec.convert(normalizer, type=ActionNormalizerContract)
+        normalizer["transform_sha256"] = canonical_sha256(parsed.behavioral_payload())
+    conditioning["contract_sha256"] = "0" * 64
+    parsed = msgspec.convert(conditioning, type=CosmosDreamsActionContract)
+    conditioning["contract_sha256"] = canonical_sha256(parsed.behavioral_payload())
+    return artifact
+
+
 class TestCosmosDreamsManifest(unittest.TestCase):
     def test_checkpoint_artifact_parses_with_published_hashes(self):
         self.assertEqual(MANIFEST.chunk_size, 4)
@@ -212,6 +305,69 @@ class TestCosmosDreamsManifest(unittest.TestCase):
     def test_load_requires_artifact_block(self):
         with self.assertRaises(ValueError):
             load_cosmos_dreams_manifest({"hidden_size": 4096})
+
+    def test_load_reads_the_exporter_envelope_only(self):
+        # One envelope serves Sim-Bimanual and Sim-Transfer exports; the legacy
+        # ``cosmos_dreams`` block and unnamed blocks are rejected with a re-export hint.
+        manifest = load_cosmos_dreams_manifest(
+            {"hidden_size": 4096, "cosmos3_nano_sim_bimanual": _artifact()}
+        )
+        self.assertEqual(manifest.checkpoint_iteration, 2000)
+        with self.assertRaisesRegex(ValueError, "no longer supported"):
+            load_cosmos_dreams_manifest({"cosmos_dreams": _artifact()})
+        with self.assertRaisesRegex(ValueError, "cosmos3_nano_sim_bimanual"):
+            load_cosmos_dreams_manifest({"cosmos3_nano_sim_x": _artifact()})
+
+    def test_pre_normalized_rows_skip_the_affine_but_keep_checks(self):
+        manifest = parse_cosmos_dreams_manifest(_two_embodiment_artifact())
+        contract = manifest.conditioning.embodiments["agibotworld"]
+        rows = (torch.arange(4 * 29, dtype=torch.float32).view(4, 29) / 50.0).tolist()
+        common = dict(
+            contract=contract,
+            max_action_dim=64,
+            target_frame=2,
+            action_tokens_per_frame=4,
+        )
+        raw = prepare_action_rows(rows, pre_normalized=False, **common)
+        pre = prepare_action_rows(rows, pre_normalized=True, **common)
+        self.assertEqual(tuple(pre.shape), (4, 64))
+        torch.testing.assert_close(pre[:, :29], torch.tensor(rows))
+        self.assertTrue(torch.all(pre[:, 29:] == 0))
+        self.assertFalse(torch.allclose(raw[:, :29], pre[:, :29]))
+        with self.assertRaises(ValueError):  # width still enforced
+            prepare_action_rows([[0.0] * 9], pre_normalized=True, **common)
+        with self.assertRaises(ValueError):  # frame coverage still enforced
+            prepare_action_rows(rows[:2], pre_normalized=True, **common)
+        params = CosmosDreamsSamplingParams(action_normalization="none")
+        self.assertTrue(params.actions_pre_normalized)
+        self.assertFalse(CosmosDreamsSamplingParams().actions_pre_normalized)
+        with self.assertRaises(ValueError):
+            CosmosDreamsSamplingParams(action_normalization="quantile")
+
+    def test_two_embodiment_contract_resolves_and_normalizes(self):
+        manifest = parse_cosmos_dreams_manifest(_two_embodiment_artifact())
+        contract = manifest.conditioning
+        self.assertEqual(
+            contract.embodiment_to_domain, {"agibotworld": 15, "camera_pose": 2}
+        )
+        self.assertEqual(contract.resolve_embodiment(None, None), "agibotworld")
+        self.assertEqual(contract.resolve_embodiment(None, 15), "agibotworld")
+        self.assertEqual(contract.resolve_embodiment(None, 2), "camera_pose")
+        self.assertEqual(
+            contract.resolve_embodiment("camera_pose", None), "camera_pose"
+        )
+        with self.assertRaises(ValueError):
+            contract.resolve_embodiment("agibotworld", 2)
+        agibot = contract.embodiments["agibotworld"]
+        rows = torch.arange(2 * 29, dtype=torch.float32).view(2, 29) / 100.0
+        normalized = normalize_action_rows(rows, agibot.normalizer.transform)
+        expected = (
+            rows - torch.tensor(agibot.normalizer.transform.offset)
+        ) / torch.tensor(agibot.normalizer.transform.scale)
+        torch.testing.assert_close(normalized, expected)
+        self.assertEqual(pad_action_rows(normalized, 64).shape, (2, 64))
+        with self.assertRaises(ValueError):
+            normalize_action_rows(rows[:, :9], agibot.normalizer.transform)
 
     def test_resolve_embodiment_by_name_or_domain(self):
         contract = MANIFEST.conditioning
@@ -519,6 +675,13 @@ class TestCosmosDreamsRegistry(unittest.TestCase):
     def test_pipeline_and_transformer_are_discoverable(self):
         _discover_and_register_pipelines()
         self.assertIn("CosmosDreamsPipeline", _PIPELINE_REGISTRY)
+        # The release export declares the model-card class name.
+        self.assertTrue(
+            issubclass(
+                _PIPELINE_REGISTRY["Cosmos3NanoSimBimanualPipeline"],
+                _PIPELINE_REGISTRY["CosmosDreamsPipeline"],
+            )
+        )
         self.assertIn("CosmosDreamsTransformer", ModelRegistry.get_supported_archs())
 
     def test_release_path_resolves_to_dreams_and_nano_stays_cosmos3(self):
@@ -539,12 +702,13 @@ class TestCosmosDreamsRegistry(unittest.TestCase):
         self.assertIs(config_info.sampling_param_cls, Cosmos3SamplingParams)
 
     def test_class_name_detector_matches_dreams_checkpoints(self):
-        with mock.patch(
-            "sglang.multimodal_gen.registry.maybe_download_model_index",
-            return_value={"_class_name": "CosmosDreamsPipeline"},
-        ):
-            config_info = _get_config_info("acme/renamed-interactive-ckpt")
-        self.assertIs(config_info.pipeline_config_cls, CosmosDreamsConfig)
+        for class_name in ("CosmosDreamsPipeline", "Cosmos3NanoSimBimanualPipeline"):
+            with mock.patch(
+                "sglang.multimodal_gen.registry.maybe_download_model_index",
+                return_value={"_class_name": class_name},
+            ):
+                config_info = _get_config_info("acme/renamed-interactive-ckpt")
+            self.assertIs(config_info.pipeline_config_cls, CosmosDreamsConfig)
 
     def test_config_swaps_transformer_and_prompt_templates(self):
         config = CosmosDreamsConfig()
@@ -656,23 +820,34 @@ class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):
             closest_canvas(height=1, width=1, tier="1080p")
 
     def test_fit_image_to_canvas_pads_bottom_right_like_training(self):
+        # Smaller frames are padded at native size, never upscaled (training
+        # caps the scale at 1.0); the AgiBot clips are 640x360 in an 832x480 canvas.
         image = torch.rand(3, 360, 640)
         fitted, content = fit_image_to_canvas(
             image, target_height=480, target_width=832
         )
         self.assertEqual(tuple(fitted.shape), (3, 480, 832))
-        self.assertEqual(content, (468, 832))
+        self.assertEqual(content, (360, 640))
+        torch.testing.assert_close(fitted[:, :360, :640], image)
         # Reflection padding mirrors the rows just above the content edge.
         torch.testing.assert_close(
-            fitted[:, 468:480], torch.flip(fitted[:, 455:467], dims=[1])
+            fitted[:, 360:480, :640], torch.flip(fitted[:, 239:359, :640], dims=[1])
         )
+        # Larger frames are downscaled to fit: the camera_stone parity geometry.
+        _, content = fit_image_to_canvas(
+            torch.rand(3, 980, 1596), target_height=480, target_width=832
+        )
+        self.assertEqual(content, (480, 782))
         # A pad at least as large as the content falls back to edge replication.
         fitted, content = fit_image_to_canvas(
             torch.rand(3, 2, 2), target_height=8, target_width=20
         )
-        self.assertEqual(content, (8, 8))
+        self.assertEqual(content, (2, 2))
         torch.testing.assert_close(
-            fitted[:, :, 8:], fitted[:, :, 7:8].expand(-1, -1, 12)
+            fitted[:, :2, 2:], fitted[:, :2, 1:2].expand(-1, -1, 18)
+        )
+        torch.testing.assert_close(
+            fitted[:, 2:, :], fitted[:, 1:2, :].expand(-1, 6, -1)
         )
 
 

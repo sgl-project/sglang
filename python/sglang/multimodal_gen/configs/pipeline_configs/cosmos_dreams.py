@@ -2,7 +2,7 @@
 """Cosmos-Dreams pipeline configuration.
 
 Cosmos-Dreams checkpoints are distilled Cosmos3 Omni checkpoints with a
-``cosmos_dreams`` artifact in ``transformer/config.json``. The config reuses
+``cosmos3_nano_sim_bimanual`` artifact in ``transformer/config.json``. The config reuses
 ``Cosmos3Config`` (Wan VAE, tokenizer, distilled sigmas) and swaps in the
 causal transformer class.
 """

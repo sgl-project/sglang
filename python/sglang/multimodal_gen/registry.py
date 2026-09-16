@@ -1315,8 +1315,14 @@ def _register_configs():
         sampling_param_cls=CosmosDreamsSamplingParams,
         pipeline_config_cls=CosmosDreamsConfig,
         hf_model_paths=["nvidia/Cosmos3-Nano-Sim-Bimanual"],
-        # Matches the ``CosmosDreamsPipeline`` ``_class_name`` of the checkpoint.
-        model_detectors=[lambda hf_id: "cosmosdreamspipeline" in hf_id.lower()],
+        # Matches the release ``Cosmos3NanoSimBimanualPipeline`` ``_class_name``
+        # and the recipe-named ``CosmosDreamsPipeline`` of earlier exports.
+        model_detectors=[
+            lambda hf_id: (
+                "cosmos3nanosimbimanualpipeline" in hf_id.lower()
+                or "cosmosdreamspipeline" in hf_id.lower()
+            )
+        ],
     )
 
     # Cosmos-Dreams-Transfer: the same causal recipe conditioned on a control

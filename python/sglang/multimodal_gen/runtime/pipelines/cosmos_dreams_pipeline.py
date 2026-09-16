@@ -87,4 +87,14 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
         )
 
 
-EntryClass = [CosmosDreamsPipeline]
+class Cosmos3NanoSimBimanualPipeline(CosmosDreamsPipeline):
+    """Release ``_class_name`` of the Cosmos3-Nano-Sim-Bimanual export.
+
+    The recipe-named ``CosmosDreamsPipeline`` stays registered for earlier
+    exports; both resolve to the same native pipeline.
+    """
+
+    pipeline_name = "Cosmos3NanoSimBimanualPipeline"
+
+
+EntryClass = [CosmosDreamsPipeline, Cosmos3NanoSimBimanualPipeline]

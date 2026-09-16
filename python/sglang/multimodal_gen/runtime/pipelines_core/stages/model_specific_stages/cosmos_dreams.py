@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     TEXT_TOKENS_TRAINING_MAX,
     AffineTransform,
     CosmosDreamsManifest,
+    EmbodimentContract,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -292,6 +293,45 @@ def pad_action_rows(rows: torch.Tensor, model_action_dim: int) -> torch.Tensor:
     return torch.cat([rows, padding], dim=-1)
 
 
+def prepare_action_rows(
+    action: Any,
+    *,
+    contract: EmbodimentContract,
+    max_action_dim: int,
+    target_frame: int,
+    action_tokens_per_frame: int,
+    pre_normalized: bool,
+) -> torch.Tensor:
+    """Rows in the embodiment's raw units, or already normalized, padded for the model.
+
+    ``pre_normalized`` skips the contract's affine transform for callers that
+    hold model-space rows (the imaginaire4 benchmark sidecars, for example);
+    the width check and zero padding still apply.
+    """
+    rows = load_action_rows(action)
+    if rows.shape[-1] != contract.raw_action_dim:
+        raise ValueError(
+            "Cosmos-Dreams action rows do not match the embodiment's raw action dim "
+            f"{contract.raw_action_dim}, got {rows.shape[-1]}."
+        )
+    if pre_normalized:
+        rows = rows.to(dtype=torch.float32)
+        if not torch.isfinite(rows).all():
+            raise ValueError(
+                "Cosmos-Dreams normalized actions must contain only finite values."
+            )
+    else:
+        rows = normalize_action_rows(rows, contract.normalizer.transform)
+    rows = pad_action_rows(rows, max_action_dim)
+    required_rows = (target_frame - 1) * action_tokens_per_frame
+    if rows.shape[0] < required_rows:
+        raise ValueError(
+            f"Cosmos-Dreams action has {rows.shape[0]} rows but {target_frame} latent "
+            f"frames need {required_rows} (one row per pixel step after frame 0)."
+        )
+    return rows
+
+
 def actions_for_frames(
     rows: torch.Tensor | None,
     *,
@@ -441,15 +481,15 @@ def fit_image_to_canvas(
     ``image`` is ``[3, H, W]`` in ``[0, 1]``. The training transform resizes
     with antialiased bicubic filtering so the content fits inside the canvas,
     then reflection-pads (edge-pads when the pad would exceed the content) at
-    the bottom and right; content stays top-left. Unlike the training
-    transform, smaller inputs are upscaled so the content fills the canvas the
-    way the >= 480p training clips did. Returns the canvas tensor and the
-    ``(content_height, content_width)`` region.
+    the bottom and right; content stays top-left. Smaller inputs are never
+    upscaled (``reflection_pad_to_target`` caps the scale at 1.0), so a
+    640x360 robot frame keeps its native size inside an 832x480 canvas.
+    Returns the canvas tensor and the ``(content_height, content_width)`` region.
     """
     if image.ndim != 3 or image.shape[0] != 3:
         raise ValueError(f"Expected an RGB image [3, H, W], got {tuple(image.shape)}.")
     height, width = int(image.shape[1]), int(image.shape[2])
-    scale = min(target_width / width, target_height / height)
+    scale = min(target_width / width, target_height / height, 1.0)
     content_height = int(scale * height + 0.5)
     content_width = int(scale * width + 0.5)
     fitted = image.unsqueeze(0).to(torch.float32)
@@ -641,26 +681,23 @@ class CosmosDreamsPrepareStage(PipelineStage):
         return [ComponentUse(self._component_stage_name(stage_name), "vae")]
 
     def _prepare_action_rows(
-        self, action: Any, *, embodiment: str, target_frame: int
+        self,
+        action: Any,
+        *,
+        embodiment: str,
+        target_frame: int,
+        pre_normalized: bool = False,
     ) -> torch.Tensor | None:
         if action is None:
             return None
-        contract = self.manifest.action_contract.embodiments[embodiment]
-        rows = load_action_rows(action)
-        if rows.shape[-1] != contract.raw_action_dim:
-            raise ValueError(
-                f"Cosmos-Dreams embodiment {embodiment!r} requires raw action dimension "
-                f"{contract.raw_action_dim}, got {rows.shape[-1]}."
-            )
-        rows = normalize_action_rows(rows, contract.normalizer.transform)
-        rows = pad_action_rows(rows, self.manifest.max_action_dim)
-        required_rows = (target_frame - 1) * self.manifest.action_tokens_per_frame
-        if rows.shape[0] < required_rows:
-            raise ValueError(
-                f"Cosmos-Dreams action has {rows.shape[0]} rows but {target_frame} latent "
-                f"frames need {required_rows} (one row per pixel step after frame 0)."
-            )
-        return rows
+        return prepare_action_rows(
+            action,
+            contract=self.manifest.action_contract.embodiments[embodiment],
+            max_action_dim=self.manifest.max_action_dim,
+            target_frame=target_frame,
+            action_tokens_per_frame=self.manifest.action_tokens_per_frame,
+            pre_normalized=pre_normalized,
+        )
 
     def _encode_image_latent(
         self, image: torch.Tensor, geometry: CosmosDreamsGeometry, device: torch.device
@@ -763,6 +800,7 @@ class CosmosDreamsPrepareStage(PipelineStage):
             batch.sampling_params.action,
             embodiment=prepared.embodiment,
             target_frame=target_frame,
+            pre_normalized=batch.sampling_params.actions_pre_normalized,
         )
         if rows is None:
             self.log_warning(

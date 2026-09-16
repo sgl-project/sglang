@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos-Dreams schema-v1 causal manifest and conditioning contracts.
 
-A Cosmos-Dreams (Cosmos3-Interactive) checkpoint exports a ``cosmos_dreams``
+A Cosmos-Dreams (Cosmos3-Interactive) checkpoint exports a ``cosmos3_nano_sim_bimanual``
 block inside ``transformer/config.json``. It fixes the causal rollout
 geometry (chunk size, K/V window, mRoPE constants), the distilled fixed-step
 sampler, and one conditioning contract selected by ``conditioning.mode``:
@@ -539,7 +539,7 @@ def validate_cosmos_dreams_manifest(manifest: CosmosDreamsManifest) -> None:
 
 
 def parse_cosmos_dreams_manifest(artifact: dict[str, Any]) -> CosmosDreamsManifest:
-    """Parse and validate the ``cosmos_dreams`` transformer-config block."""
+    """Parse and validate the exporter's transformer-config artifact block."""
     try:
         manifest = msgspec.convert(artifact, type=CosmosDreamsManifest)
     except msgspec.ValidationError as exc:
@@ -548,14 +548,27 @@ def parse_cosmos_dreams_manifest(artifact: dict[str, Any]) -> CosmosDreamsManife
     return manifest
 
 
+# The imaginaire4 exporter writes one envelope for both Sim-Bimanual and
+# Sim-Transfer; the pipeline variant is selected by model_index.json's _class_name.
+COSMOS_DREAMS_ARTIFACT_KEY = "cosmos3_nano_sim_bimanual"
+_LEGACY_ARTIFACT_KEY = "cosmos_dreams"
+
+
 def load_cosmos_dreams_manifest(
     transformer_config: dict[str, Any],
 ) -> CosmosDreamsManifest:
     """Read the artifact from a diffusers transformer ``config.json`` dict."""
-    artifact = transformer_config.get("cosmos_dreams")
+    artifact = transformer_config.get(COSMOS_DREAMS_ARTIFACT_KEY)
     if not isinstance(artifact, dict) or not artifact:
+        if _LEGACY_ARTIFACT_KEY in transformer_config:
+            raise ValueError(
+                "Legacy Cosmos-Dreams exports (transformer/config.json"
+                f"[{_LEGACY_ARTIFACT_KEY!r}]) are no longer supported; re-export the "
+                "checkpoint with the imaginaire4 --cosmos3-nano-sim-bimanual flow."
+            )
         raise ValueError(
             "Cosmos-Dreams requires a schema-v1 artifact under "
-            "transformer/config.json['cosmos_dreams']; this checkpoint has none."
+            f"transformer/config.json[{COSMOS_DREAMS_ARTIFACT_KEY!r}]; this checkpoint "
+            f"has keys {sorted(transformer_config)}."
         )
     return parse_cosmos_dreams_manifest(artifact)
