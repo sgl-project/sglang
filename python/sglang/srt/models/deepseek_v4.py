@@ -2725,6 +2725,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
+            _is_gfx95_supported
+            and self.hc_pre_from_prev_sublayer
+            and self.hc_attn_fn.shape == self.hc_ffn_fn.shape == (24, 20480)
+            and getattr(self.config, "model_type", None) == "deepseek_v41"
+            and envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.get()
+            and not is_batch_invariant_mode_enabled()
+        ):
+            from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+                split_bf16_hc_weight,
+            )
+
+            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+        if (
             self.hc_pre_from_prev_sublayer
             and get_platform().is_sm100
             and self.hc_attn_fn.shape == (24, 20480)

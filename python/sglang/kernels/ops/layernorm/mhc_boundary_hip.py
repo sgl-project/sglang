@@ -1,4 +1,4 @@
-"""HIP fused mHC sublayer boundary: hc_post + collapse + mixing statistics in one launch, with the
+"""HIP mHC sublayer boundary: hc_post + collapse + mixing statistics, with the
 reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (``HcCoefficients``)."""
 
 from typing import Optional, Tuple, Union
@@ -23,6 +23,7 @@ _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
+_HC_BOUNDARY_BF16X3_MIN_M = 1024
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
 
@@ -718,6 +719,8 @@ def hc_boundary_fused_deferred(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
+    *,
+    weight_parts=None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], HcCoefficients]:
     """``hc_boundary_fused`` with the reduce + sinkhorn left pending: returns
     ``(residual_out, y, coefficients)``; see ``HcCoefficients`` for how the last launch is
@@ -747,9 +750,32 @@ def hc_boundary_fused_deferred(
         y = torch.empty((m, h), dtype=residual.dtype, device=dev)
     else:
         y = None
-    part_mix, part_sq = _hc_boundary_partials(
-        x, residual, post_in, comb_in, pre_prev, hc_fn, residual_out, y, hc_mult=hc_mult
-    )
+    if (
+        weight_parts is not None
+        and _HC_BOUNDARY_BF16X3_MIN_M <= m <= 65536
+        and h == 5120
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+        and (x is None or x.is_contiguous())
+        and _hc_boundary_prefill_available()
+    ):
+        from .mhc_prefill_hip import hc_boundary_bf16x3_partials
+
+        part_mix, part_sq = hc_boundary_bf16x3_partials(
+            x, residual, post_in, comb_in, pre_prev, residual_out, y, weight_parts
+        )
+    else:
+        part_mix, part_sq = _hc_boundary_partials(
+            x,
+            residual,
+            post_in,
+            comb_in,
+            pre_prev,
+            hc_fn,
+            residual_out,
+            y,
+            hc_mult=hc_mult,
+        )
     coefficients = HcCoefficients(
         part_mix,
         part_sq,
@@ -759,7 +785,7 @@ def hc_boundary_fused_deferred(
         rms_eps=rms_eps,
         mix=mix,
         hc_mult=hc_mult,
-        num_slices=h // _HC_BOUNDARY_BLOCK_K,
+        num_slices=part_sq.shape[0],
         sinkhorn_iters=sinkhorn_iters,
         hc_eps=hc_eps,
     )
@@ -779,6 +805,8 @@ def hc_boundary_fused(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
+    *,
+    weight_parts=None,
 ) -> Tuple[
     Optional[torch.Tensor],
     Optional[torch.Tensor],
@@ -786,7 +814,7 @@ def hc_boundary_fused(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """HIP mHC sublayer boundary in two launches: ``residual_out = hc_post(x, residual, post_in,
+    """HIP mHC sublayer boundary: ``residual_out = hc_post(x, residual, post_in,
     comb_in)`` when ``x`` is given, ``y = sum_k pre_prev[k] * copy_k`` when ``pre_prev`` is, and the
     mixing coefficients of the (new) residual. Returns ``(residual_out, y, pre, post, comb)``."""
     residual_out, y, coefficients = hc_boundary_fused_deferred(
@@ -802,5 +830,6 @@ def hc_boundary_fused(
         sinkhorn_iters,
         rms_eps,
         hc_eps,
+        weight_parts=weight_parts,
     )
     return (residual_out, y, *coefficients.tensors())
