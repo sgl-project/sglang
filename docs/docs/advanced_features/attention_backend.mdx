@@ -717,6 +717,7 @@ python3 -m sglang.launch_server \
   - Requires `moonmath-amd` from [github.com/moonmath-ai/amd-kernels](https://github.com/moonmath-ai/amd-kernels), and `--kv-cache-dtype fp8_e4m3`
   - Serves absorbed MLA with A16W8 (bf16 Q / fp8 KV) for up to 128 heads per rank: decode, plus the speculative verify pass at any draft window length. aiter's asm MLA has no verify kernel past 4 tokens. Set `SGLANG_MOONMATH_MLA_MULTIQ_VERIFY=0` to force verify back to aiter.
   - Prefill falls back to aiter, with Q zero-padded to aiter's 16-head minimum at head counts it cannot serve (Kimi-K3 has 12 per rank at TP8).
+  - Supports decode context parallelism (`--dcp-size`): each rank attends its own KV shard, decode and verify alike, and returns its LSE for the cross-rank merge.
 ```bash Command
 python3 -m sglang.launch_server \
   --tp 8 \

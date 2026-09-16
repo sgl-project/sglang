@@ -11,6 +11,10 @@ cuda-graph safe). One op, `mla_decode_a16w8`, serves both shapes for H <= 128:
 Everything else -- prefill, bf16 KV, unsupported geometry -- falls back to
 AiterAttnBackend.
 
+Under decode context parallelism each rank attends its own KV shard with the
+causal limit taken from the global lengths, and returns its partial with the LSE
+for the cross-rank merge, in aiter's natural-log base.
+
 The verify arm is what makes speculative decoding work here at all: aiter's
 asm MLA has no kernel past qseqlen 4, so a larger draft window aborts the
 process during cuda-graph capture. Q stays bf16 in both arms, so there is no
@@ -26,13 +30,16 @@ aiter's limit, so Q is zero-padded to 16 heads for them
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 try:  # pragma: no cover - AMD-only dependency, mirrors aiter_backend's guard
     from aiter.mla import mla_decode_fwd
@@ -55,6 +62,7 @@ _KERNEL_SLICE_ROWS = 96
 _KERNEL_MAX_ROW_SLICES = 304
 
 _MAX_BATCH = 8192  # size of the staged int32 seq_lens buffer
+_LN2 = math.log(2.0)
 
 
 class MoonmathMLABackend(AiterAttnBackend):
@@ -86,6 +94,17 @@ class MoonmathMLABackend(AiterAttnBackend):
         self._seq_lens_i32 = torch.zeros(
             _MAX_BATCH, dtype=torch.int32, device=model_runner.device
         )
+        # Under DCP, `_seq_lens_i32` holds rank-local lengths and these the global
+        # ones; the kv view is the shard the kernel reads for this forward.
+        self._dcp_rank = get_parallel().attn_dcp_rank if self.dcp_world_size > 1 else 0
+        self._glen_i32 = torch.zeros_like(self._seq_lens_i32)
+        self._dcp_kv_indptr: torch.Tensor | None = None
+        self._dcp_kv_indices: torch.Tensor | None = None
+        # Capture-stable shard over prefix + draft window, set by
+        # init_cuda_graph_state when DCP verify runs through the kernel.
+        self._dcp_graph_verify_kv_indptr: torch.Tensor | None = None
+        self._dcp_graph_verify_kv_indices: torch.Tensor | None = None
+        self._dcp_graph_verify_local_lens_cpu: torch.Tensor | None = None
         self._logged_decode = False
         self._logged_verify = False
         logger.info(
@@ -101,7 +120,7 @@ class MoonmathMLABackend(AiterAttnBackend):
     # the metadata hooks -- once per forward rather than once per MLA layer, and
     # out-of-graph before every replay, which is where a device buffer that a
     # captured kernel reads must be refreshed.
-    def _stage_seq_lens_i32(self, forward_batch: ForwardBatch) -> None:
+    def _stage_seq_lens_i32(self, forward_batch: ForwardBatch, in_graph: bool) -> None:
         mode = forward_batch.forward_mode
         # TARGET_VERIFY is an extend mode, not is_decode(), so it needs staging
         # of its own or the window kernel reads the previous forward's values.
@@ -111,7 +130,9 @@ class MoonmathMLABackend(AiterAttnBackend):
         bs = forward_batch.batch_size
         if bs > _MAX_BATCH:
             return
-        if is_verify:
+        if self.dcp_world_size > 1:
+            self._stage_dcp_shard(forward_batch, is_verify, in_graph)
+        elif is_verify:
             # `fb.seq_lens` at TARGET_VERIFY EXCLUDES the draft tokens, but their
             # KV is already written and the window kernel wants the TOTAL span:
             # its position t sees the first `seq_lens[b] - q_len + t + 1` slots.
@@ -124,15 +145,99 @@ class MoonmathMLABackend(AiterAttnBackend):
         else:
             self._seq_lens_i32[:bs].copy_(forward_batch.seq_lens)
 
+    def _stage_dcp_shard(
+        self, forward_batch: ForwardBatch, is_verify: bool, in_graph: bool
+    ) -> None:
+        """This rank's shard: rank-local lengths and indices, global lengths.
+
+        aiter shards only the committed prefix for verify and attends the window
+        separately; the kernel reads the window from the pool, so verify keeps a
+        shard over prefix + window of its own.
+        """
+        bs = forward_batch.batch_size
+        glen = self._glen_i32[:bs]
+        glen.copy_(forward_batch.seq_lens[:bs])
+        if is_verify:
+            glen.add_(self.num_draft_tokens)
+            kv_indptr, kv_indices = self._plan_dcp_verify_shard(
+                forward_batch, glen, in_graph
+            )
+        else:
+            kv_indptr, kv_indices = (
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+            )
+        torch.sub(kv_indptr[1 : bs + 1], kv_indptr[:bs], out=self._seq_lens_i32[:bs])
+        self._dcp_kv_indptr, self._dcp_kv_indices = kv_indptr, kv_indices
+
+    def _plan_dcp_verify_shard(
+        self, forward_batch: ForwardBatch, kv_lens: torch.Tensor, in_graph: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs = forward_batch.batch_size
+        if in_graph:
+            kv_indptr = self._dcp_graph_verify_kv_indptr[: bs + 1]
+            kv_indices = self._dcp_graph_verify_kv_indices
+            seq_lens_cpu = None
+            static_local_lens_cpu = self._dcp_graph_verify_local_lens_cpu[:bs]
+        else:
+            kv_indptr = kv_lens.new_zeros(bs + 1)
+            kv_indices = kv_lens.new_empty(
+                forward_batch.seq_lens_sum + bs * self.num_draft_tokens
+            )
+            seq_lens_cpu = forward_batch.seq_lens_cpu[:bs] + self.num_draft_tokens
+            static_local_lens_cpu = None
+        kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+        num_token_blocks = self._kv_index_blocks(bs)
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            kv_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
+        )
+        self._plan_dcp_decode_metadata(
+            kv_indptr,
+            kv_indices,
+            kv_lens.clone(),
+            seq_lens_cpu,
+            bs,
+            static_local_kv_lens_cpu=static_local_lens_cpu,
+        )
+        return kv_indptr, kv_indices
+
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: torch.Tensor | None = None,
+    ):
+        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+        if self.dcp_world_size <= 1 or not self._multiq:
+            return
+        max_kv_len = self.max_context_len + self.num_draft_tokens
+        self._dcp_graph_verify_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self._dcp_graph_verify_kv_indices = torch.zeros(
+            max_bs * max_kv_len, dtype=torch.int32, device=self.device
+        )
+        # Sizes the shard without a device sync, as aiter's own verify plan does.
+        self._dcp_graph_verify_local_lens_cpu = torch.full(
+            (max_bs,), -(-max_kv_len // self.dcp_world_size), dtype=torch.int32
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self._stage_seq_lens_i32(forward_batch)
+        self._stage_seq_lens_i32(forward_batch, in_graph=False)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         super().init_forward_metadata_out_graph(forward_batch, in_capture)
-        self._stage_seq_lens_i32(forward_batch)
+        self._stage_seq_lens_i32(forward_batch, in_graph=True)
 
     # ── shared eligibility ───────────────────────────────────────────────────
     def _shape_eligible(self, q, layer: RadixAttention, fb: ForwardBatch) -> bool:
@@ -162,13 +267,47 @@ class MoonmathMLABackend(AiterAttnBackend):
         # free: a real cast allocates a fresh tensor per layer, and a captured
         # graph holds the address it saw at capture time. The kernel takes B
         # from kv_indptr's length, so hand it exactly bs + 1 entries (a view).
-        meta = self.forward_metadata
-        return meta.kv_indices.to(torch.int32), meta.kv_indptr[: bs + 1].to(torch.int32)
+        if self.dcp_world_size > 1:
+            kv_indices, kv_indptr = self._dcp_kv_indices, self._dcp_kv_indptr
+        else:
+            kv_indices = self.forward_metadata.kv_indices
+            kv_indptr = self.forward_metadata.kv_indptr
+        return kv_indices.to(torch.int32), kv_indptr[: bs + 1].to(torch.int32)
 
     def _split_q(self, q, *shape):
         """`q` as the contiguous (latent, rope) pair the kernel ABI takes."""
         q = q.reshape(*shape, KV_CACHE_DIM)
         return q[..., :KV_LORA_RANK].contiguous(), q[..., KV_LORA_RANK:].contiguous()
+
+    def _run_kernel(self, q, layer: RadixAttention, fb: ForwardBatch, q_len: int):
+        """`B * q_len` query rows -> out, or `(out, lse)` under DCP."""
+        B, H = fb.batch_size, layer.tp_q_head_num
+        T = B * q_len
+        dcp = self.dcp_world_size > 1
+        q_lat, q_pe = self._split_q(q, T, H)
+        out = torch.empty(T, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device)
+        lse = torch.empty(T, H, dtype=torch.float32, device=q.device) if dcp else None
+        kv_indices, kv_indptr = self._kv_indices_int32(B)
+        self._mla.mla_decode_a16w8(
+            q_lat,
+            q_pe,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            out,
+            self._seq_lens_i32[:B],
+            kv_indices,
+            kv_indptr,
+            layer.scaling,
+            1.0 if layer.k_scale is None else float(layer.k_scale),
+            lse=lse,
+            glen=self._glen_i32[:B] if dcp else None,
+            cp_rank=self._dcp_rank,
+            cp_world=self.dcp_world_size,
+        )
+        out = out.reshape(T, H * KV_LORA_RANK)
+        if lse is None:
+            return out
+        # The kernel's LSE is base 2; the DCP merge reads aiter's natural log.
+        return out, lse.mul_(_LN2)
 
     # ── decode ───────────────────────────────────────────────────────────────
     def _decode_eligible(self, q, layer: RadixAttention, fb: ForwardBatch) -> bool:
@@ -202,21 +341,7 @@ class MoonmathMLABackend(AiterAttnBackend):
             self._logged_decode = True
             logger.info("moonmath_mla: decode bs=%d H=%d", B, H)
 
-        q_lat, q_pe = self._split_q(q, B, H)
-        out = torch.empty(B, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device)
-        kv_indices, kv_indptr = self._kv_indices_int32(B)
-        self._mla.mla_decode_a16w8(
-            q_lat,
-            q_pe,
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            out,
-            self._seq_lens_i32[:B],
-            kv_indices,
-            kv_indptr,
-            layer.scaling,
-            1.0 if layer.k_scale is None else float(layer.k_scale),
-        )
-        return out.reshape(B, H * KV_LORA_RANK)
+        return self._run_kernel(q, layer, fb, q_len=1)
 
     # ── TARGET_VERIFY: the multi-query draft window ──────────────────────────
     def _verify_eligible(self, q, layer: RadixAttention, fb: ForwardBatch) -> bool:
@@ -241,7 +366,10 @@ class MoonmathMLABackend(AiterAttnBackend):
         """
         B, H = fb.batch_size, layer.tp_q_head_num
         q_len = fb.spec_info.num_tokens_per_req
-        if q.shape[0] != B * q_len:
+        # The DCP shard was planned for num_draft_tokens per request.
+        if q.shape[0] != B * q_len or (
+            self.dcp_world_size > 1 and q_len != self.num_draft_tokens
+        ):
             return None
 
         if save_kv_cache and k is not None:
@@ -256,23 +384,7 @@ class MoonmathMLABackend(AiterAttnBackend):
                 H,
             )
 
-        q_lat, q_pe = self._split_q(q, B * q_len, H)
-        out = torch.empty(
-            B * q_len, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device
-        )
-        kv_indices, kv_indptr = self._kv_indices_int32(B)
-        self._mla.mla_decode_a16w8(
-            q_lat,
-            q_pe,
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            out,
-            self._seq_lens_i32[:B],
-            kv_indices,
-            kv_indptr,
-            layer.scaling,
-            1.0 if layer.k_scale is None else float(layer.k_scale),
-        )
-        return out.reshape(B * q_len, H * KV_LORA_RANK)
+        return self._run_kernel(q, layer, fb, q_len=q_len)
 
     def forward_extend(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, sinks=None

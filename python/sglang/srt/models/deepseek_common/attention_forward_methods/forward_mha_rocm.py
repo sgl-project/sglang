@@ -297,7 +297,8 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        # Under DCP only set_mla_kv_buffer resolves which rank owns a slot.
+        if _use_aiter_gfx95 or get_parallel().dcp_enabled:
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )

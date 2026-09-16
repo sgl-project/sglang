@@ -67,6 +67,7 @@ def _fake_aiter_init(self, model_runner):
     self.kv_cache_dtype = model_runner.kv_cache_dtype
     self.num_head = model_runner.num_head
     self.token_to_kv_pool = model_runner.token_to_kv_pool
+    self.dcp_world_size = 1
 
 
 def _has_moonmath():
@@ -332,6 +333,76 @@ class TestMoonmathMLAKernelCorrectness(unittest.TestCase):
 
                 relerr = (out.float() - ref).abs().max().item() / ref.abs().max().item()
                 self.assertLess(relerr, 1e-2, f"relerr={relerr:.3e}")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and _has_moonmath(),
+        "Requires ROCm GPU and moonmath_amd",
+    )
+    def test_dcp_shards_merge_to_reference(self):
+        """Rank shards merged by their natural-log LSE equal the unsharded attention.
+
+        This is the contract the DCP path relies on: rank-local lengths and pool
+        rows, global lengths for the causal limit, and base-2 LSE times ln 2.
+        """
+        import math
+
+        import moonmath_amd.mla as mla
+
+        DEV, FP8, W = "cuda", torch.float8_e4m3fnuz, 2
+        B, S, q_len, H = 2, 257, 4, 12
+        SCALE = 1.0 / math.sqrt(576)
+        T = B * q_len
+        torch.manual_seed(7)
+        q_lat = torch.randn(T, H, 512, dtype=torch.bfloat16, device=DEV)
+        q_pe = torch.randn(T, H, 64, dtype=torch.bfloat16, device=DEV)
+        kv = (torch.randn(B, S, 576, device=DEV) * 4).to(FP8)
+
+        outs, lses = [], []
+        for rank in range(W):
+            # Rank r holds global positions r, r + W, ... at pool rows 0, 1, ...
+            shard = kv[:, rank::W]
+            n = shard.shape[1]
+            pool = shard.reshape(B * n, 1, 576).contiguous()
+            seq_lens = torch.full((B,), n, dtype=torch.int32, device=DEV)
+            indptr = torch.arange(0, (B + 1) * n, n, dtype=torch.int32, device=DEV)
+            indices = torch.arange(B * n, dtype=torch.int32, device=DEV)
+            glen = torch.full((B,), S, dtype=torch.int32, device=DEV)
+            out = torch.empty(T, H, 512, dtype=torch.bfloat16, device=DEV)
+            lse = torch.empty(T, H, dtype=torch.float32, device=DEV)
+            mla.mla_decode_a16w8(
+                q_lat,
+                q_pe,
+                pool,
+                out,
+                seq_lens,
+                indices,
+                indptr,
+                SCALE,
+                1.0,
+                lse=lse,
+                glen=glen,
+                cp_rank=rank,
+                cp_world=W,
+            )
+            outs.append(out.float())
+            lses.append(lse * math.log(2.0))
+        w = torch.softmax(torch.stack(lses), dim=0).unsqueeze(-1)
+        merged = (w * torch.stack(outs)).sum(dim=0)
+
+        ref = torch.empty(T, H, 512, device=DEV)
+        c_all, k_all = kv[..., :512].float(), kv[..., 512:].float()
+        for b in range(B):
+            for t in range(q_len):
+                n = S - (q_len - 1 - t)
+                row = b * q_len + t
+                scores = (
+                    q_lat[row].float() @ c_all[b, :n].t()
+                    + q_pe[row].float() @ k_all[b, :n].t()
+                ) * SCALE
+                ref[row] = torch.softmax(scores, dim=-1) @ c_all[b, :n]
+
+        relerr = (merged - ref).abs().max().item() / ref.abs().max().item()
+        self.assertLess(relerr, 1e-2, f"relerr={relerr:.3e}")
 
 
 if __name__ == "__main__":
