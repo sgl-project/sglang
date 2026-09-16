@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _require_single_row_dsv4_swa_pages,
     _split_hicache_size,
     build_full_draft_pools,
 )
@@ -16,6 +17,23 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestDeepSeekV4SWAPageLayout(CustomTestCase):
+    def test_split_physical_rows_are_rejected_for_hicache_consumers(self):
+        with self.assertRaisesRegex(ValueError, "direct SWA KV layout"):
+            _require_single_row_dsv4_swa_pages(
+                logical_page_size=256,
+                physical_page_size=64,
+                consumer="test consumer",
+            )
+
+    def test_matching_page_geometry_is_supported(self):
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=256,
+            physical_page_size=256,
+            consumer="test consumer",
+        )
 
 
 class _Pool:

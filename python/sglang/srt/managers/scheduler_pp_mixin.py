@@ -53,6 +53,16 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _allocate_distinct_cuda_stream(device_module, avoid_streams):
+    """Allocate a CUDA stream that does not alias scheduler-owned streams."""
+    avoid_stream_ids = {stream.cuda_stream for stream in avoid_streams}
+    for _ in range(65):
+        stream = device_module.Stream(priority=0)
+        if stream.cuda_stream not in avoid_stream_ids:
+            return stream
+    raise RuntimeError("Unable to allocate a distinct PP communication stream")
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -123,7 +133,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_proxy_send_work()
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -149,9 +159,6 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
@@ -159,6 +166,10 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
+                                ready_event=self.launch_event,
+                            )
+                            self.send_proxy_requires_forward_fence = (
+                                result.can_run_cuda_graph
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -269,7 +280,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_proxy_send_work()
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
@@ -334,13 +345,14 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            ready_event=self.launch_event,
+                        )
+                        self.send_proxy_requires_forward_fence = (
+                            result.can_run_cuda_graph
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -429,7 +441,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_proxy_send_work()
 
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -522,13 +534,14 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            ready_event=self.launch_event,
+                        )
+                        self.send_proxy_requires_forward_fence = (
+                            result.can_run_cuda_graph
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -565,10 +578,31 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        self.send_proxy_requires_forward_fence = False
         self.launch_event = None
-        self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
-            defaultdict(deque)
+        self.pp_proxy_recv_event = None
+        self.pp_send_done_event = None
+        self._pp_last_recv_event = None
+        self.pp_comm_overlap = (
+            envs.SGLANG_PP_COMM_OVERLAP.get()
+            and torch.cuda.is_available()
+            and str(self.device).startswith("cuda")
         )
+        self.pp_comm_stream = None
+        self.pp_comm_stream_ctx = None
+        if self.pp_comm_overlap:
+            self.pp_comm_stream = _allocate_distinct_cuda_stream(
+                self.device_module,
+                (self.schedule_stream, self.forward_stream, self.copy_stream),
+            )
+            self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
+            logger.info(
+                "PP tensor communication overlap enabled on a dedicated CUDA stream"
+            )
+
+        self._pp_tensor_dict_inbox: Dict[
+            str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
+        ] = defaultdict(deque)
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
@@ -702,10 +736,44 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
-    def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
-        for p2p_work in work:
-            p2p_work.work.wait()
+    def _pp_commit_comm_work(
+        self: Scheduler,
+        work: List[P2PWork],
+        fence_next_forward: bool = False,
+    ) -> None:
+        def _wait_all():
+            for p2p_work in work:
+                p2p_work.work.wait()
+
+        if self.pp_comm_overlap and work:
+            with self.pp_comm_stream_ctx:
+                _wait_all()
+                if fence_next_forward:
+                    # CUDA Graph outputs are views of replay-owned static buffers.
+                    # Do not replay the next forward until NCCL has stopped reading
+                    # the previous proxy tensors. Eager prefill remains overlapped.
+                    send_done_event = self.device_module.Event()
+                    send_done_event.record(self.pp_comm_stream)
+                    self.pp_send_done_event = send_done_event
+        else:
+            _wait_all()
         work.clear()
+
+    def _pp_commit_proxy_send_work(self: Scheduler) -> None:
+        self._pp_commit_comm_work(
+            self.send_proxy_work,
+            fence_next_forward=self.send_proxy_requires_forward_fence,
+        )
+        self.send_proxy_requires_forward_fence = False
+
+    def _pp_wait_forward_dependencies(self: Scheduler) -> None:
+        self.forward_stream.wait_stream(self.schedule_stream)
+        if self.pp_send_done_event is not None:
+            self.forward_stream.wait_event(self.pp_send_done_event)
+            self.pp_send_done_event = None
+        if self.pp_proxy_recv_event is not None:
+            self.forward_stream.wait_event(self.pp_proxy_recv_event)
+            self.pp_proxy_recv_event = None
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
@@ -804,23 +872,33 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        ready_event: Optional[torch.Event] = None,
     ):
-        # Warn once if using default untyped messages
-        if msg_type == "default":
-            logger.warning_once(
-                "PP send: using default untyped message. "
-                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+        def _send():
+            if msg_type == "default":
+                logger.warning_once(
+                    "PP send: using default untyped message. "
+                    "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                )
+            tensor_dict["__msg_type__"] = msg_type
+            p2p_work = []
+            p2p_work.extend(
+                self.pp_group.send_tensor_dict(
+                    tensor_dict=tensor_dict,
+                    all_gather_group=self.attn_tp_group,
+                    async_send=async_send,
+                )
             )
-        tensor_dict["__msg_type__"] = msg_type
-        p2p_work = []
-        p2p_work.extend(
-            self.pp_group.send_tensor_dict(
-                tensor_dict=tensor_dict,
-                all_gather_group=(self.attn_tp_group),
-                async_send=async_send,
-            )
-        )
-        return p2p_work
+            return p2p_work
+
+        if self.pp_comm_overlap:
+            with self.pp_comm_stream_ctx:
+                if ready_event is not None:
+                    self.pp_comm_stream.wait_event(ready_event)
+                return _send()
+        if ready_event is not None:
+            self.device_module.current_stream().wait_event(ready_event)
+        return _send()
 
     def _pp_recv_typed_dict(
         self: Scheduler,
@@ -835,12 +913,24 @@ class SchedulerPPMixin:
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
-                return inbox_queue.popleft()
+                tensor_dict, recv_event = inbox_queue.popleft()
+                self._pp_last_recv_event = recv_event
+                return tensor_dict
 
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+            if self.pp_comm_overlap:
+                with self.pp_comm_stream_ctx:
+                    tensor_dict = self.pp_group.recv_tensor_dict(
+                        all_gather_group=all_gather_group
+                    )
+                    recv_event = self.device_module.Event()
+                    recv_event.record(self.pp_comm_stream)
+                self._pp_last_recv_event = recv_event
+            else:
+                tensor_dict = self.pp_group.recv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
+                self._pp_last_recv_event = None
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
@@ -853,7 +943,9 @@ class SchedulerPPMixin:
                 logger.debug(
                     f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
                 )
-                self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+                self._pp_tensor_dict_inbox[received_kind].append(
+                    (tensor_dict, self._pp_last_recv_event)
+                )
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
@@ -861,9 +953,10 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=self.attn_tp_group,
                 )
             )
+            self.pp_proxy_recv_event = self._pp_last_recv_event
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
@@ -997,12 +1090,12 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
-                    self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
                             async_send=True,
                             msg_type="output",
+                            ready_event=q_event,
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
@@ -1081,8 +1174,11 @@ class SchedulerPPMixin:
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                output_recv_event = self._pp_last_recv_event
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
+                if output_recv_event is not None:
+                    self.copy_stream.wait_event(output_recv_event)
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
@@ -1230,7 +1326,7 @@ class SchedulerPPMixin:
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
-                self.forward_stream.wait_stream(self.schedule_stream)
+                self._pp_wait_forward_dependencies()
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",

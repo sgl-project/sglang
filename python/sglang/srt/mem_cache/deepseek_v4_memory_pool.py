@@ -22,7 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,15 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     return sliding_window + spec_extra
 
 
+def _num_dsv4_physical_kv_pages(
+    size: int, physical_page_size: int, logical_page_size: int
+) -> int:
+    """Include the allocator's reserved logical page in physical storage."""
+    if physical_page_size <= 0 or logical_page_size <= 0:
+        raise ValueError("DeepSeek-V4 KV page sizes must be positive")
+    return ceil_div(size + logical_page_size, physical_page_size)
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -81,6 +90,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        global_page_size: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -94,6 +104,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.global_page_size = global_page_size or page_size
 
         self.scale_pad = 1
         self.quantize_block_size = 64
@@ -110,7 +121,9 @@ class DeepSeekV4SingleKVPool(KVCache):
             ):
                 self.kv_buffer = [
                     self.create_buffer(
-                        num_pages=(self.size + self.page_size + 1) // self.page_size,
+                        num_pages=_num_dsv4_physical_kv_pages(
+                            self.size, self.page_size, self.global_page_size
+                        ),
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -256,6 +269,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        global_page_size: int | None = None,
     ):
         super().__init__(
             size,
@@ -268,6 +282,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            global_page_size,
         )
 
         self.data_ptrs = torch.tensor(
@@ -774,6 +789,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.swa_size = swa_size
         self.swa_page_size = swa_page_size
+        # The allocator and compressor state keep 256-token logical pages, but
+        # FlashInfer's SM120 DSV4 kernel consumes a 64-token physical SWA page.
+        # Storing in that layout directly removes the per-layer 256 -> 64 page
+        # split while preserving the flat token indices produced by the
+        # allocator.
+        self.swa_kv_page_size = (
+            64
+            if get_platform().is_sm120 and envs.SGLANG_OPT_SM120_DIRECT_SWA_KV.get()
+            else swa_page_size
+        )
+        assert swa_page_size % self.swa_kv_page_size == 0
+        if self.swa_kv_page_size != swa_page_size:
+            logger.info(
+                "DeepSeek-V4 SM120 direct SWA KV layout enabled: "
+                "logical_page_size=%d physical_page_size=%d",
+                swa_page_size,
+                self.swa_kv_page_size,
+            )
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -815,7 +848,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv_pool_cls = DeepSeekV4UniformFP8KVPool
             self.swa_kv_pool = self._make_kv_pool(
                 size=swa_size,
-                page_size=swa_page_size,
+                page_size=self.swa_kv_page_size,
                 dtype=dtype,
                 layer_num=stage_layer_num,
                 device=device,
@@ -989,11 +1022,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         item_lens: List[int] = []
 
         if not self._unified_kv:
+            physical_pages_per_logical_page = (
+                self.swa_page_size // self.swa_kv_pool.page_size
+            )
             for buf in self.swa_kv_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+                item_lens.append(buf[0].nbytes * physical_pages_per_logical_page)
 
         for pools in [
             self.compress_state_pools,
@@ -1097,11 +1133,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cls: type = DeepSeekV4SingleKVPool,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
-        is the model-wide page_size (== ``page_size`` for the SWA pool, larger
-        for the per-ratio c4/c128 pools); the default CUDA pool ignores it.
+        is the model-wide logical page size. CUDA pools use it to reserve enough
+        physical rows for the allocator's dummy logical page.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
-        del global_page_size  # CUDA pools key only off their own page_size
         return cls(
             size,
             page_size,
@@ -1111,6 +1146,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            global_page_size=global_page_size,
         )
 
     def _make_indexer_pool(
