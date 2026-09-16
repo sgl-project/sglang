@@ -844,18 +844,28 @@ def _cgroup_dirs(mount):
     return dirs
 
 
-def _read_cgroup_memory_max():
-    # Smallest real memory cap (bytes) across this process's cgroup hierarchy,
-    # checking v2 then v1; None when uncapped or unreadable. Only a real numeric
-    # limit means the process is memory-capped and should size against the
-    # cgroup rather than the host.
+def _cgroup_memory_limit_and_used():
+    # (limit, used) in bytes from the cgroup dir with the tightest cap, so the
+    # two are the same scope: memory.current at that dir already sums its
+    # descendants, so sibling children under a capped parent are counted. Checks
+    # v2 then v1; (None, None) when uncapped or unreadable.
     limit = None
-    for mount, limit_file, _usage_file in _CGROUP_MOUNTS:
+    used = None
+    for mount, limit_file, usage_file in _CGROUP_MOUNTS:
         for cgroup_dir in _cgroup_dirs(mount):
             value = _read_cgroup_limit(os.path.join(cgroup_dir, limit_file))
-            if value is not None:
-                limit = value if limit is None else min(limit, value)
-    return limit
+            if value is None or (limit is not None and value >= limit):
+                continue
+            limit = value
+            used = _read_cgroup_int(os.path.join(cgroup_dir, usage_file))
+    return limit, used
+
+
+def _read_cgroup_memory_max():
+    # This process's binding cgroup memory limit in bytes, or None when uncapped
+    # or unreadable. Only a real numeric limit means the process is memory-capped
+    # and should size against the cgroup rather than the host.
+    return _cgroup_memory_limit_and_used()[0]
 
 
 def get_available_cpu_memory():
@@ -867,17 +877,14 @@ def get_available_cpu_memory():
 
 
 def get_used_cpu_memory():
-    # Current memory usage of this cgroup in bytes, from the most specific cgroup
-    # dir (v2 memory.current or v1 memory.usage_in_bytes). Falls back to host-wide
-    # psutil used so it pairs with the same-scoped fallback in
-    # get_available_cpu_memory(): a host-wide value here while that returns a
-    # per-container limit would make the "free memory" estimate go negative once
-    # a sibling container on the same host is resident.
-    for mount, _limit_file, usage_file in _CGROUP_MOUNTS:
-        for cgroup_dir in _cgroup_dirs(mount):
-            value = _read_cgroup_int(os.path.join(cgroup_dir, usage_file))
-            if value is not None:
-                return value
+    # Usage in bytes of the cgroup dir that supplies the binding limit, so it is
+    # the same scope as _read_cgroup_memory_max (memory.current there already
+    # includes descendants). Falls back to host-wide psutil used only when no
+    # cgroup cap applies -- pairing it with the per-cgroup limit in
+    # get_available_gpu_memory() keeps the free estimate from going negative.
+    _limit, used = _cgroup_memory_limit_and_used()
+    if used is not None:
+        return used
     return psutil.virtual_memory().used
 
 
