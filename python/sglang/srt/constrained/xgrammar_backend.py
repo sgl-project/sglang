@@ -43,6 +43,7 @@ from sglang.srt.constrained.json_schema_validation import (
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.function_call.glm4_moe_detector import glm47_thinking_grammar_prefix
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -233,6 +234,124 @@ class TokenizerNotSupportedError(Exception):
     pass
 
 
+class XGrammarThinkingGrammar(XGrammarGrammar):
+    def __init__(
+        self,
+        full: XGrammarGrammar,
+        generation: XGrammarGrammar,
+        thinking_mask: torch.Tensor,
+        safe_tokens: bytes,
+        think_end_ids: frozenset[int],
+    ):
+        super().__init__(
+            full.matcher,
+            full.vocab_size,
+            full.ctx,
+            full.override_stop_tokens,
+            full.key_string,
+            full.grammar_stats,
+            full.batch_matcher,
+        )
+        self.full_matcher = full.matcher
+        self.generation = generation
+        self.thinking_mask = thinking_mask
+        self.safe_tokens = safe_tokens
+        self.think_end_ids = think_end_ids
+        self.phase = "thinking"
+        self.accept_modes: List[str] = []
+
+    def is_terminated(self):
+        return self.phase != "thinking" and super().is_terminated()
+
+    def accept_token(self, token: int):
+        if self.is_terminated():
+            return
+        if self.phase == "thinking":
+            if token in self.think_end_ids:
+                self.matcher = self.generation.matcher
+                self.phase = "generation"
+                mode = "boundary"
+            elif 0 <= token < len(self.safe_tokens) and self.safe_tokens[token]:
+                mode = "thinking"
+            else:
+                super().accept_token(token)
+                self.phase = "fallback"
+                self.accept_modes.append("fallback")
+                return
+            self.current_token = token
+            self.accepted_tokens.append(token)
+            self.accept_modes.append(mode)
+        else:
+            super().accept_token(token)
+            self.accept_modes.append(self.phase)
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        if self.phase == "thinking":
+            vocab_mask[idx].copy_(self.thinking_mask[0])
+        else:
+            super().fill_vocab_mask(vocab_mask, idx)
+
+    def fill_vocab_mask_batched(
+        self, entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        remaining = []
+        for entry in entries:
+            grammar = entry.grammar
+            if (
+                isinstance(grammar, XGrammarThinkingGrammar)
+                and grammar.phase == "thinking"
+            ):
+                grammar.fill_vocab_mask(vocab_mask, entry.row)
+            else:
+                remaining.append(entry)
+        super().fill_vocab_mask_batched(remaining, vocab_mask)
+
+    def rollback(self, k: int):
+        if k == 0:
+            return
+        if not 0 <= k <= len(self.accept_modes):
+            raise ValueError(f"Cannot roll back {k} of {len(self.accept_modes)} tokens")
+        modes = self.accept_modes[-k:]
+        for matcher, mode in (
+            (self.full_matcher, "fallback"),
+            (self.generation.matcher, "generation"),
+        ):
+            count = modes.count(mode)
+            if count:
+                matcher.rollback(count)
+        del self.accept_modes[-k:]
+        del self.accepted_tokens[-k:]
+        last = self.accept_modes[-1] if self.accept_modes else "thinking"
+        self.phase = "generation" if last == "boundary" else last
+        self.matcher = (
+            self.generation.matcher if self.phase == "generation" else self.full_matcher
+        )
+
+    def copy(self):
+        return XGrammarThinkingGrammar(
+            super().copy(),
+            self.generation.copy(),
+            self.thinking_mask,
+            self.safe_tokens,
+            self.think_end_ids,
+        )
+
+    def try_jump_forward(self, tokenizer):
+        if self.phase == "thinking":
+            return None
+        return super().try_jump_forward(tokenizer)
+
+    def jump_and_retokenize(self, old_output_ids, new_output_ids, next_state):
+        common = 0
+        for old, new in zip(old_output_ids, new_output_ids):
+            if old != new:
+                break
+            common += 1
+        self.rollback(len(old_output_ids) - common)
+        for token in new_output_ids[common:]:
+            self.accept_token(token)
+
+
 class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
@@ -267,6 +386,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 )
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self.tokenizer_info = tokenizer_info
         # The automatic pool scales with host CPUs, even for small decode batches.
         self.batch_matcher = BatchGrammarMatcher(max_threads=XGRAMMAR_BATCH_MAX_THREADS)
         self.vocab_size = vocab_size
@@ -404,6 +524,46 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+
+    def wrap_full_assistant_grammar(
+        self, grammar: BaseGrammarObject, key_string: str
+    ) -> BaseGrammarObject:
+        if self.tokenizer_info.add_prefix_space or not key_string.startswith(
+            glm47_thinking_grammar_prefix()
+        ):
+            return grammar
+        mask = grammar.allocate_vocab_mask(self.vocab_size, 1, "cpu")
+        grammar.fill_vocab_mask(mask, 0)
+        words = mask[0].tolist()
+        safe_tokens = bytearray(self.vocab_size)
+        think_end_ids = set()
+        for token_id, value in enumerate(self.tokenizer_info.decoded_vocab):
+            if token_id >= self.vocab_size or not (
+                (words[token_id // 32] >> (token_id % 32)) & 1
+            ):
+                continue
+            if value == b"</think>":
+                think_end_ids.add(token_id)
+            if not value or b"<" in value:
+                continue
+            try:
+                value.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            # Complete UTF-8 without '<' returns this exclusion DFA to its root.
+            # Delimiter prefixes and partial codepoints retain the full matcher.
+            safe_tokens[token_id] = 1
+        if not think_end_ids:
+            return grammar
+        ctx = self.grammar_compiler.compile_grammar(
+            key_string, root_rule_name="generation"
+        )
+        generation = self._from_context(
+            ctx, key_string, GrammarStats(dispatch_type="ebnf")
+        )
+        return XGrammarThinkingGrammar(
+            grammar, generation, mask, bytes(safe_tokens), frozenset(think_end_ids)
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
