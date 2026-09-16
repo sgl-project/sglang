@@ -795,10 +795,13 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """
+        if extra_pools:
+            raise ValueError("Side-pool transfers require HybridCacheController.")
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -904,7 +907,7 @@ class HiCacheController:
         if (
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and self.mem_pool_host.can_use_write_back_jit
         ):
             return op.host_indices, op.device_indices, op.pool_transfers
         return self._move_op_indices(op)
