@@ -238,7 +238,7 @@ register_kernel(
             supported_dtypes=("bfloat16",),
             description="[m, 5120] @ [32, 5120].T for decode batches m <= 32; the DeepSeek-V4.1 indexer head-weight projection",
         ),
-        description="bf16 GEMM specialised for N = 128, K = 512 (sglang.kernels.jit, JIT-only).",
+        description="bf16 GEMM specialised for N = 32, K = 5120 (sglang.kernels.jit, JIT-only).",
     )
 )
 register_kernel(

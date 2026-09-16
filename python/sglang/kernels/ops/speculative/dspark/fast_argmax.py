@@ -1,10 +1,8 @@
 """Row-wise argmax for the tall-and-thin speculative verify logits.
 
-``torch.argmax`` dispatches ``at::native::reduce_kernel`` here, which needs
-~24 us for the [6, 129280] FP32 verify logits on GB300 -- two orders of
-magnitude off the 3 MB the reduction actually reads.  The rows are few and very
-wide, so a flat two-stage split over the vocabulary saturates the machine
-instead of leaving it to one block per row.
+``torch.argmax`` reduces each row in a single block, which leaves most of the
+machine idle for a handful of very wide rows; a flat two-stage split over the
+vocabulary saturates it instead.
 
 Ties resolve to the lowest index, matching ``ArgMaxOps``' strict ``>``.
 """

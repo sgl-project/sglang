@@ -38,4 +38,20 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="embeddings.engram_commit_history",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.engram_hash:engram_commit_history",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="embeddings.fused_engram_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.engram_gate:fused_engram_gate",
+    )
+)
+
 __all__ = []

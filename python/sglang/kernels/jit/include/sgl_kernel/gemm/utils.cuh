@@ -1,7 +1,7 @@
 /// \file utils.cuh
 /// \brief bf16 x bf16 -> fp32 dot product of two packed vectors, shared by the
-/// small-GEMM kernels (`gemm/tiny_gemm.cuh`, `gemm/small/n128k512.cuh`) so that
-/// they accumulate in the same order and agree bitwise where both apply.
+/// small-GEMM kernels so that they accumulate in the same order and agree
+/// bitwise where both apply.
 #pragma once
 
 #include <sgl_kernel/math.cuh>
