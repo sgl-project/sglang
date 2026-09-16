@@ -166,6 +166,52 @@ async fn main() -> Result<()> {
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
+    // Start the peer watch BEFORE worker discovery: a bootstrap consults the
+    // peer set the moment the first worker appears, and an empty set there
+    // means that worker's ranks skip bootstrap entirely and run cold.
+    //
+    // Only when this router maintains its own tree — with an external Indexer
+    // as the prefix source there is nothing to graft into. The CLI already
+    // rejects that combination; this keeps the invariant local to the wiring.
+    if let (Some(selector), sgl_router::config::DiscoveryBackend::K8s(k8s)) = (
+        match &cfg.discovery {
+            sgl_router::config::DiscoveryBackend::K8s(k) => k.peer_selector.as_ref(),
+            _ => None,
+        }
+        .filter(|_| kv_index.snapshot_source().is_some()),
+        &cfg.discovery,
+    ) {
+        // Peers are only usable on the family this router actually listens on
+        // — but an UNSPECIFIED address (`0.0.0.0`, `::`) names no family, it
+        // is the ordinary way to listen on both, so it must not be read as a
+        // preference. `None` keeps every slice.
+        let want_ipv6 = cfg
+            .server
+            .host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|ip| !ip.is_unspecified())
+            .map(|ip| ip.is_ipv6());
+        match sgl_router::discovery::k8s::spawn_peer_watch(
+            k8s.namespace.clone(),
+            selector.clone(),
+            kv_index.peers(),
+            want_ipv6,
+            i32::from(cfg.server.port),
+        )
+        .await
+        {
+            Ok(_handle) => {}
+            // Non-fatal: routing does not depend on peer discovery. Losing it
+            // means replicas boot cold, which is the pre-existing behaviour.
+            Err(e) => tracing::error!(
+                error = %e,
+                "kv-bootstrap: peer watch failed to start; replicas will boot with a cold \
+                 cache-aware tree (check RBAC for endpointslices on the router's own Service)",
+            ),
+        }
+    }
+
     // Spawn discovery + manager tasks.
     // The manager resolves each worker's wire protocol from its `/server_info`
     // and stamps it onto the registered worker. The proxy holds one client per
