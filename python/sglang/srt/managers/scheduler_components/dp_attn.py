@@ -357,6 +357,13 @@ def _local_prefill_cuda_graph_vote(
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
         dllm_prefill=dllm_prefill,
+        batch_max_context_len=(
+            int(local_batch.seq_lens_cpu.max().item())
+            if prefill_graph_runner.max_context_size is not None
+            and local_batch.seq_lens_cpu is not None
+            and local_batch.seq_lens_cpu.numel() > 0
+            else None
+        ),
     )
 
 

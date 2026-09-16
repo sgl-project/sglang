@@ -84,6 +84,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
     def _vote(self, *, beam, dllm_config=None, is_dllm_prefill=False):
         runner = Mock(spec=dp_attn.PrefillCudaGraphRunner)
         runner.enable_lora = False
+        runner.max_context_size = None
         runner.can_replay_locally.return_value = True
         # Kept for the dLLM case below, which asserts on the tri-state the vote
         # passes down rather than on the return value of this always-True mock.
