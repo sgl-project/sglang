@@ -1700,7 +1700,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
     topk_weights = dispatch_output.topk_weights
     psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
     is_expanded = dispatch_output.is_expanded
-    hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
     deepep_v2_use_masked = dispatch_output.use_masked_gemm
     deepep_v2_expected_m = dispatch_output.expected_m
     deepep_v2_masked_max_m = dispatch_output.masked_max_m
@@ -1796,6 +1795,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
+    # Contiguous psum already includes the 128-row expert alignment.
     expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
     ep_scatter_from_psum(
         hidden_states,

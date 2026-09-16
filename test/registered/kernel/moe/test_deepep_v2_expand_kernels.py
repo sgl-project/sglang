@@ -22,22 +22,24 @@ DEVICE = "cuda"
 
 
 def _reference_m_indices(counts, align, total_rows):
-    """Label rows [start, start+count) with the expert id, aligned per expert;
-    uncovered rows stay at the -1 sentinel (matching the kernel's allocation)."""
+    """Label each expert's whole *aligned* segment with its id, matching the
+    kernel; only rows past the last segment keep the -1 sentinel."""
     m_indices = [-1] * total_rows
     start = 0
     for e, count in enumerate(counts):
-        for r in range(start, start + count):
+        # psum is inclusive: seg_end = align(start + count), and the padding
+        # inside the segment gets the expert id too (combine ignores it).
+        seg_end = ((start + count + align - 1) // align) * align
+        for r in range(start, min(seg_end, total_rows)):
             m_indices[r] = e
-        # psum is inclusive: next expert starts at align(prev_end + count).
-        start = ((start + count + align - 1) // align) * align
+        start = seg_end
     return m_indices
 
 
 class TestFillMIndicesFromPsum(CustomTestCase):
     """m_indices must label exactly the aligned per-expert segments."""
 
-    def _run(self, counts, align):
+    def _run(self, counts, align, extra_rows=0):
         # psum[i] = align(psum[i-1]) + count_i (DeepEP's inclusive prefix sum).
         psum_vals = []
         prev_end = 0
@@ -46,14 +48,16 @@ class TestFillMIndicesFromPsum(CustomTestCase):
             prev_end = start + count
             psum_vals.append(prev_end)
         num_local_experts = len(counts)
-        # do_cpu_sync=True sizes recv_x to align(psum[-1]).
-        total_rows = ((psum_vals[-1] + align - 1) // align) * align
+        # do_cpu_sync=True sizes recv_x to align(psum[-1]); extra_rows models a
+        # capacity-sized buffer where the tail past the segments stays sentinel.
+        total_rows = ((psum_vals[-1] + align - 1) // align) * align + extra_rows
 
         psum = torch.tensor(psum_vals, dtype=torch.int32, device=DEVICE)
         m_indices = fill_m_indices_from_psum(psum, num_local_experts, total_rows, align)
 
         expected = _reference_m_indices(counts, align, total_rows)
         self.assertEqual(m_indices.tolist(), expected)
+        return m_indices
 
     def test_align_128(self):
         self._run([200, 50, 128], align=128)
@@ -66,6 +70,18 @@ class TestFillMIndicesFromPsum(CustomTestCase):
     def test_empty_expert_segment(self):
         # An expert with count == 0 (start == seg_end) must label no rows.
         self._run([128, 0, 64], align=128)
+
+    def test_segments_tile_exactly(self):
+        # do_cpu_sync=True => total_rows == align(psum[-1]), so the aligned
+        # segments tile the array and no -1 sentinel survives.
+        m_indices = self._run([200, 50, 128], align=128)
+        self.assertNotIn(-1, m_indices.tolist())
+
+    def test_sentinel_survives_capacity_tail(self):
+        # A capacity-sized buffer leaves rows past the last segment at -1 -- the
+        # defensive torch.full(-1) fill that guards the out-of-bounds weight read.
+        m_indices = self._run([200, 50, 128], align=128, extra_rows=128)
+        self.assertEqual(m_indices[-128:].tolist(), [-1] * 128)
 
 
 class TestScaleExpandedRows(CustomTestCase):

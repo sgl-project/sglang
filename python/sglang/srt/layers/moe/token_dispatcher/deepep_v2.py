@@ -60,7 +60,6 @@ class DeepEPv2DispatchOutput(NamedTuple):
     topk_weights: torch.Tensor
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
-    hidden_states_scale_tma_aligned: bool = False
     use_masked_gemm: bool = False
     expected_m: int = 0
     masked_max_m: int = 0
@@ -194,6 +193,7 @@ class DeepEPv2Buffer:
             sl_idx=0,
             prefer_overlap_with_compute=False,
         )
+        # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
         logger.info(
@@ -309,6 +309,7 @@ class _DeepEPv2Impl:
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
+            # Dummy routes need distinct expert ids; zero weights null the result.
             topk_ids = torch.arange(
                 topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
             ).unsqueeze(0)
@@ -334,6 +335,7 @@ class _DeepEPv2Impl:
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
+        # This collective argument must not depend on a rank-local batch.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
         # Masked dispatch stays asynchronous for CUDA graph capture.
         do_cpu_sync_val = True
@@ -401,7 +403,6 @@ class _DeepEPv2Impl:
             recv_topk_weights,
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
-            use_tma_aligned_col_major_sf,
             use_masked,
             expected_m,
             masked_max_m,
