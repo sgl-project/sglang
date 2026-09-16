@@ -2348,8 +2348,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2537,7 +2536,7 @@ class Scheduler(
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
-            token_capacity=self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            token_capacity=self.max_total_num_tokens,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
         )
