@@ -1145,29 +1145,6 @@ def get_cuda_driver_bindings():
     return cuda_driver
 
 
-def get_physical_device_id(pytorch_device_id: int) -> int:
-    """
-    Convert PyTorch logical device ID to physical device ID.
-
-    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
-    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
-    the device ID unchanged.
-
-    Args:
-        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
-
-    Returns:
-        The physical device ID
-    """
-    device_idx = int(pytorch_device_id)
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_list = cuda_visible_devices.split(",")
-        return int(device_list[device_idx])
-    else:
-        return device_idx
-
-
 def get_device_sm_nvidia_smi():
     try:
         # Run nvidia-smi command and capture output
@@ -1431,25 +1408,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-def calculate_time(show=False, min_cost_ms=0.0):
-    def wrapper(func):
-        def inner_func(*args, **kwargs):
-            torch.cuda.synchronize()
-            if show:
-                start_time = time.perf_counter()
-            result = func(*args, **kwargs)
-            torch.cuda.synchronize()
-            if show:
-                cost_time = (time.perf_counter() - start_time) * 1000
-                if cost_time > min_cost_ms:
-                    print(f"Function {func.__name__} took {cost_time} ms to run.")
-            return result
-
-        return inner_func
-
-    return wrapper
-
-
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1496,24 +1454,6 @@ def make_layers(
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
-
-
-def make_layers_non_pp(
-    num_hidden_layers: int,
-    layer_fn: LayerFn,
-    prefix: str = "",
-) -> torch.nn.ModuleList:
-    from sglang.srt.utils.offloader import get_offloader
-
-    layers = torch.nn.ModuleList(
-        get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(num_hidden_layers)
-            )
-        )
-    )
-    return layers
 
 
 def set_random_seed(seed: int) -> None:
@@ -2818,11 +2758,6 @@ def init_custom_process_group(
     return pg
 
 
-def crash_on_warnings():
-    # Crash on warning if we are running CI tests
-    return get_bool_env_var("SGLANG_IS_IN_CI")
-
-
 @functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
@@ -2954,26 +2889,6 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
-
-
-def permute_weight(x: torch.Tensor) -> torch.Tensor:
-    b_ = x.shape[0]
-    n_ = x.shape[1]
-    k_ = x.shape[2]
-
-    x_ = x
-    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
-    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
-    else:
-        # return x_
-        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 8), 2, 4)
-
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    return x_
 
 
 class MultiprocessingSerializer:
@@ -3139,30 +3054,6 @@ def safe_pickle_loads(data):
         # zmq.Frame and other buffer-protocol objects
         buf = bytes(memoryview(data))
     return SafeUnpickler(io.BytesIO(buf)).load()
-
-
-def debug_timing(func):
-    # todo: replace with a more organized instrumentation
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
 
 
 def nullable_str(val: str):
@@ -3703,35 +3594,6 @@ def is_no_spec_infer_or_topk_one(cfg):
         cfg.speculative_eagle_topk == 1
         and (cfg.page_size == 1 or cfg.page_size is None)
     )
-
-
-def is_fa3_default_architecture(hf_config):
-    architectures = getattr(hf_config, "architectures", None)
-    if not isinstance(architectures, list) or not architectures:
-        return False
-    default_archs = {
-        "Llama4ForConditionalGeneration",
-        "LlamaForCausalLM",
-        "Olmo2ForCausalLM",
-        "Gemma2ForCausalLM",
-        "Gemma3ForConditionalGeneration",
-        "MixtralForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-        "Qwen3MoeForCausalLM",
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Glm4MoeForCausalLM",
-        "Glm4vForConditionalGeneration",
-        "Glm4vMoeForConditionalGeneration",
-        "GlmOcrForConditionalGeneration",
-        "Step3VLForConditionalGeneration",
-        "StepVLForConditionalGeneration",
-        "Step3p7ForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    }
-    return architectures[0] in default_archs
 
 
 # Can be more general if it is used in multiple places (keep it simple and thus not general now)
