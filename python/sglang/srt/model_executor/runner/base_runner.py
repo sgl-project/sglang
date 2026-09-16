@@ -100,7 +100,12 @@ def _allocate_decode_buffers(
         out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
         positions = torch.zeros((max_num_token,), dtype=torch.int64)
         mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        # Refreshed at replay only under expert parallelism.
+        num_token_non_padded = (
+            torch.zeros((1,), dtype=torch.int32)
+            if enable_num_token_non_padded()
+            else None
+        )
         custom_mask = torch.ones(
             (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_req,
             dtype=torch.bool,
@@ -482,7 +487,8 @@ class BaseRunner(ABC):
         positions = buffers.positions[:num_tokens]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        buffers.num_token_non_padded[...] = num_tokens
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded[...] = num_tokens
 
         # Batch-axis buffer views.
         req_pool_indices = buffers.req_pool_indices[:batch_size]

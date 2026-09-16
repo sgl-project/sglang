@@ -1146,6 +1146,7 @@ class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
+    supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
@@ -2566,9 +2567,16 @@ class DeepseekV4AttnBackend(
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         if max_seq_len_override is None:
-            max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+            max_seq_len_override = forward_batch.max_seq_len_override
         if max_seq_len_override is not None:
             max_seq_len = max_seq_len_override
+            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                actual_max_seq_len = int(seq_lens_cpu.max().item())
+                if actual_max_seq_len > max_seq_len:
+                    raise ValueError(
+                        "Prefill CUDA graph max context size is smaller than the "
+                        f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+                    )
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
@@ -2659,9 +2667,10 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
@@ -2711,9 +2720,15 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        metadata_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        max_seq_len = (
+            metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        )
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            metadata_batch,
+            max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
         assert isinstance(capture_metadata, DSV4Metadata)
@@ -3948,6 +3963,39 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                )
+
+            if (
+                get_platform().is_sm100
+                and 0 < q.shape[0] <= 8
+                and layer.tp_q_head_num == 16
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 512
+                and self.head_dim_v == 512
+                and self.softmax_scale == 512**-0.5
+                and swa_k_cache.shape[-1] == 584
+                and (extra_k_cache is None or extra_k_cache.shape[-1] == 584)
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                from sglang.kernels.ops.attention.dsv4.swapab_attention import (
+                    swapab_attention,
+                )
+
+                # Put the 16 real TP4 heads in the MMA N dimension. The caller
+                # applies inverse RoPE to the BF16 result as on the FlashMLA path.
+                return swapab_attention(
+                    q[..., :16, :],
+                    swa_k_cache,
+                    swa_page_indices,
+                    swa_topk_lengths,
+                    attn_sink,
+                    extra_k_cache,
+                    extra_indices,
+                    extra_topk_lengths,
                 )
 
             if get_platform().is_sm120:

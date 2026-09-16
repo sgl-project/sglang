@@ -16,6 +16,7 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod selection;
 pub mod session_aware;
 pub mod sticky;
 

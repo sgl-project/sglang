@@ -1989,10 +1989,9 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
-        """Two calls to the same tool must be numbered 0 and 1, as the
-        streaming deltas number them; a detector's tool_index is the tool's
-        position in the request and is 0 for both."""
-        self.chat.tool_call_parser = "deepseekv41"
+        """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
+        not by the detector's tool_index (0 for both)."""
+        self.chat.tool_call_parser = "deepseekv4"
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
@@ -2009,7 +2008,7 @@ class ServingChatTestCase(unittest.TestCase):
             parser_instance.parse_non_stream.return_value = ("", calls)
 
             tool_calls, _, finish_reason = self.chat._process_tool_calls(
-                text="<｜DSML｜ calls>...",
+                text="<｜DSML｜tool_calls>...",
                 tools=tools,
                 finish_reason={"type": "stop", "matched": None},
                 history_tool_calls_cnt=0,
