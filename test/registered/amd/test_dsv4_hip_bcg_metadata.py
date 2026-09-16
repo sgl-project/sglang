@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4MultiStepBackend,
     DSV4AttnMetadata,
     DSV4Metadata,
+    DSV4RawVerifyMetadata,
     UnifiedKvMetadata,
     _match_num_queries,
 )
@@ -111,6 +112,40 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(core.unified.pf_chunk_start.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
+
+    def test_raw_verify_keeps_per_token_request_mapping(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.target_verify_num_draft_tokens = 3
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 512
+        backend.has_c4 = backend.has_c128 = False
+        backend.req_to_token = torch.zeros((10, 512), dtype=torch.int32)
+        backend.token_to_kv_pool = SimpleNamespace(unified_swa_window=128)
+        core = self._make_core_metadata(0)
+        core.positions_casual = torch.arange(6, dtype=torch.int32)
+        core.unified = None
+        repeated = torch.tensor([7, 7, 7, 9, 9, 9], dtype=torch.int32)
+        backend.expand_extend_with_same_length = mock.Mock(
+            return_value=(torch.tensor([2, 3, 4, 5, 6, 7]), repeated)
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+        backend._attach_unified_kv_decode_streams = mock.Mock()
+        backend._init_low_ratio_indexer_metadata = mock.Mock(return_value={})
+        raw = DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 5], dtype=torch.int32),
+            out_cache_loc=torch.arange(6, dtype=torch.int64),
+        )
+        with mock.patch(
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+            "is_unified_kv_triton",
+            return_value=True,
+        ):
+            metadata = backend.make_forward_metadata_from_raw_verify(raw)
+        self.assertIs(metadata.core_metadata, core)
+        self.assertEqual(core.unified.pf_state_slot.tolist(), repeated.tolist())
+        self.assertEqual(core.unified.pf_chunk_start.tolist(), [2, 2, 2, 5, 5, 5])
+        self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 0, 0, 3, 3, 3])
+        self.assertEqual(core.unified.pf_final_pos.tolist(), [4, 4, 4, 7, 7, 7])
 
     def test_eager_prefill_marks_host_proven_token_count_exact(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
