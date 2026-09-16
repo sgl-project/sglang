@@ -55,7 +55,7 @@ on:
         required: false
         default: "oci,zstd,nydus"
       private_debug_docker_target:
-        description: "Volcengine fork only: Dockerfile target stage for the debug base build (framework_final or runtime). Applies only when private_debug_base_only is set."
+        description: "Volcengine fork only: Dockerfile target stage for the debug base build (framework_final, runtime, or private_dependency_smoke). Applies only when private_debug_base_only is set."
         required: false
         default: "framework_final"
   schedule:
@@ -353,15 +353,19 @@ jobs:
       publish_default_cuda_alias: false
       image_formats: ${{ inputs.private_debug_image_formats || 'oci,zstd,nydus' }}
       image_tag_override: ${{ format('debug-{0}-{1}-{2}', inputs.tag || 'servingkit', github.run_id, github.run_attempt) }}
+      verify_image: ${{ inputs.private_debug_docker_target != 'private_dependency_smoke' }}
       use_environment: prod
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
+        --build-arg INSTALL_AI_DYNAMO=0
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
-        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,archive.ubuntu.com,security.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg no_proxy=localhost,127.0.0.1,::1,archive.ubuntu.com,security.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit

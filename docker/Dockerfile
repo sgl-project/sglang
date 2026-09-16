@@ -17,6 +17,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
+ARG INSTALL_AI_DYNAMO=1
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
@@ -32,15 +33,29 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$sources_file" ]; then \
+            sed -i -E "s#https?://(archive|security)\.ubuntu\.com#$UBUNTU_MIRROR#g" "$sources_file"; \
+        fi; \
+    done; \
 fi
 
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    retry_apt_update() { \
+        for i in 1 2 3 4 5; do \
+            rm -rf /var/lib/apt/lists/*; \
+            apt-get clean; \
+            apt-get update -o APT::Update::Error-Mode=any && return 0; \
+            echo "apt update attempt $i failed; sleeping 15s"; \
+            sleep 15; \
+        done; \
+        return 1; \
+    }; \
+    retry_apt_update \
+    && apt-get install -y --no-install-recommends wget software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
@@ -147,6 +162,34 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
+# Lightweight private-delivery dependency smoke target. This intentionally
+# stops before the full SGLang framework build so CI can validate the private
+# apt repository and EIC SDK within the runner time limit.
+FROM base AS private_dependency_smoke
+
+ARG EIC_SDK_VERSION
+ARG EIC_SDK_RELEASE_ROOT
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+
+RUN VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update -o APT::Update::Error-Mode=any \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
+        "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
+        --no-cache-dir \
+    && command -v oniond \
+    && python3 -c 'import eic; print(f"eic-module={eic.__file__}")'
+
 ########################################################
 ########## PARALLEL BUILDER STAGES ####################
 ########################################################
@@ -181,8 +224,12 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -382,9 +429,17 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN retry() { for i in 1 2 3 4 5 6 7 8; do "$@" && return 0; echo "attempt $i failed; sleeping 20s"; sleep 20; done; return 1; } \
+    && install_just() { \
+        curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            -o /tmp/just-install.sh https://just.systems/install.sh \
+        && sed -i "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" /tmp/just-install.sh \
+        && bash /tmp/just-install.sh --tag 1.42.4 --to /tools \
+        && rm -f /tmp/just-install.sh \
+        && test -x /tools/just ; \
+    } \
+    && retry install_just
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
@@ -410,7 +465,12 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -438,6 +498,7 @@ ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
 ARG EIC_SDK_VERSION
 ARG EIC_SDK_RELEASE_ROOT
+ARG INSTALL_AI_DYNAMO
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
@@ -610,7 +671,11 @@ fi
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    if [ "$INSTALL_AI_DYNAMO" = "1" ]; then \
+        python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
+    else \
+        echo "Skipping AI Dynamo installation (INSTALL_AI_DYNAMO=${INSTALL_AI_DYNAMO})"; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
