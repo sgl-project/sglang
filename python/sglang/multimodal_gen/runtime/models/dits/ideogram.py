@@ -55,7 +55,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -654,8 +653,6 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config, hf_config, **kwargs)
         cfg = self.config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
-        if get_global_server_args().original_dtype == "bfloat16":
-            use_weight_only_fp8_linears = False
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
         self.num_attention_heads = cfg.num_attention_heads

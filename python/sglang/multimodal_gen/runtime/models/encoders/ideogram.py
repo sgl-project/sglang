@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
 class IdeogramQwen3VLTextEncoder(TextEncoder):
@@ -42,8 +41,6 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
         self._uses_weight_only_fp8 = getattr(
             arch_config, "ideogram_fp8_weight_only", False
         )
-        if get_global_server_args().original_dtype == "bfloat16":
-            self._uses_weight_only_fp8 = False
         quant_config = None
         if self._uses_bitsandbytes_4bit:
             source_quant_config = getattr(arch_config, "quantization_config")
