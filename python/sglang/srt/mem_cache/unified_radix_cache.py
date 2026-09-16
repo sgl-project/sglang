@@ -2744,16 +2744,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None:
                 self.evict_host(alloc_len)
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
-                # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    hit_tokens,
-                    available_size - (available_size % self.page_size),
-                )
-                if alloc_len >= self.prefetch_threshold:
-                    host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
                 if buffer_mode:
                     # Parked ops hold no pin: release and re-take at the next
