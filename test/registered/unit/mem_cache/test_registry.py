@@ -301,25 +301,14 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         # Hybrid SWA with hierarchical cache also uses UnifiedRadixCache.
         fake_components = MagicMock()
         fake_radix = MagicMock()
-        observed_host_modes = []
-
-        def create_cache(params):
-            observed_host_modes.append(params.hicache_host_memory_mode)
-            return fake_radix.UnifiedRadixCache.return_value
-
-        fake_radix.UnifiedRadixCache.side_effect = create_cache
-        with (
-            get_context().override_server_args(hicache_host_memory_mode="buffer_only"),
-            patch.dict(
-                "sys.modules",
-                {
-                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-                },
-            ),
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
         ):
             result = default_radix_cache_factory(ctx)
-            self.assertEqual(observed_host_modes, ["buffer_only"])
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             fake_radix.UnifiedRadixCache.return_value.init_hicache.assert_called_once_with(
                 ctx.server_args, ctx.params

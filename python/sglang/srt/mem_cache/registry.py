@@ -187,15 +187,11 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
-    attach_hicache = (
+    cache = UnifiedRadixCache(params)
+    if (
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-    )
-    params.hicache_host_memory_mode = (
-        get_memory().hicache_host_memory_mode if attach_hicache else None
-    )
-    cache = UnifiedRadixCache(params)
-    if attach_hicache:
+    ):
         cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter

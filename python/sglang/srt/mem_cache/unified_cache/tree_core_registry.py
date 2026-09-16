@@ -51,11 +51,6 @@ def _rust_unsupported_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
-    if params.hicache_host_memory_mode == "buffer_only" and ComponentType.SWA in (
-        params.tree_components or ()
-    ):
-        # TODO: Port the SWA window-repair methods introduced by #39283.
-        return "buffer-mode SWA window repair requires the Python TreeCore"
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (
