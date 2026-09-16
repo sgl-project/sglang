@@ -46,6 +46,26 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
 
 
+class TestOutputMetaInfo(CustomTestCase):
+    def test_first_token_latency_requires_valid_timestamps(self):
+        for created, first, expected in (
+            (1.0, 1.5, 0.5),
+            (0.0, 1.5, None),
+            (1.0, 0.0, None),
+            (1.0, 1.0, None),
+            (1.0, 0.5, None),
+        ):
+            with self.subTest(created=created, first=first):
+                stats = rts.APIServerReqTimeStats()
+                stats.created_time = created
+                stats.first_token_time = first
+                meta_info = stats.convert_to_output_meta_info()
+                if expected is None:
+                    self.assertNotIn("first_token_latency", meta_info)
+                else:
+                    self.assertAlmostEqual(meta_info["first_token_latency"], expected)
+
+
 class TestConvertToGenAiSpanAttrs(CustomTestCase):
     def _stats_after_first_token(self) -> rts.APIServerReqTimeStats:
         stats = rts.APIServerReqTimeStats()

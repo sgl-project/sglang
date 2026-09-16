@@ -39,7 +39,41 @@
 //! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
 //! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
 //! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
+//! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
+//! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//!
+//! `sgl_router_cache_aware_decisions_total` records exactly one decision per
+//! cache-aware prefill selection that resolves a worker, so the labels sum to
+//! the cache-aware request rate less the selections that ended in a 503 (see
+//! `sgl_router_policy_selection_failures_total` for those) and ratios between
+//! them are meaningful:
+//!
+//! - `cache_hit` — a prefix owner won the selection. Note this includes a
+//!   PARTIAL gate diversion: when the gate removed the deepest owner but a
+//!   shallower one survived, an owner still won, so the request books here
+//!   and contributes nothing to `sgl_router_diverted_overlap_blocks`.
+//! - `cache_miss` — no usable prefix owner (tree miss, or every owner
+//!   rejected by hard capacity admission). A tree miss books here even on a
+//!   saturated fleet: with no prefix owner the gate never fired, so there was
+//!   no affinity to keep or trade. `all_queued` is the saturation signal for
+//!   traffic the gate ACTED on, not a fleet-wide saturation gauge — read
+//!   engine queue depth for that.
+//! - `cache_worker_queued` — the queue gate (`--worker-queue-limit`) removed
+//!   every owner while an unqueued destination still existed, so the request
+//!   was diverted off its prefix. The matched-prefix depth it gave up is in
+//!   `sgl_router_diverted_overlap_blocks` — read it against the overlap of
+//!   all selections: a diverted curve skewing high means the gate is trading
+//!   large cached prefixes for short waits.
+//! - `all_queued` — the queue gate removed every owner AND every worker in
+//!   the prefill fleet is queueing, so no diversion could dodge a wait. This
+//!   is the saturation signal for traffic the gate acted on, keyed on
+//!   saturation rather than on where the request landed: usually the request
+//!   kept its prefix, but when the re-admitted owners are also out of KV
+//!   capacity it lands off-owner and still books here. Reporting that case as `cache_miss` would hide the
+//!   saturation in the one state where it matters most. It deliberately
+//!   does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"` hit-rate query
+//!   must not absorb it, or a fully saturated fleet reads as a healthy one.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -85,6 +119,14 @@ const TTFT_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
     0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
     400.0,
+];
+
+/// Histogram bucket upper bounds (blocks) for
+/// `sgl_router_diverted_overlap_blocks`. Powers of two up to 8192 blocks;
+/// block size is engine-configured (commonly 16–64 tokens), so the ladder
+/// spans ~16 tokens to ~512K tokens of forfeited prefix.
+const OVERLAP_BLOCK_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -223,6 +265,27 @@ pub(crate) enum PolicySelectionFailureReason {
     ProposalEmpty,
 }
 
+/// Final cache-aware routing decision, one per prefill selection. See the
+/// module doc for how the labels read against each other.
+#[derive(Debug, Clone, Copy)]
+pub enum CacheAwareDecision {
+    CacheHit,
+    CacheMiss,
+    CacheWorkerQueued,
+    AllQueued,
+}
+
+impl CacheAwareDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::CacheWorkerQueued => "cache_worker_queued",
+            Self::AllQueued => "all_queued",
+        }
+    }
+}
+
 impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -280,6 +343,8 @@ pub struct MetricsRegistry {
     cache_pressure_guard_compared_total: AtomicU64,
     cache_pressure_guard_override_total: AtomicU64,
     cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
+    diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -342,6 +407,12 @@ struct ActiveLoadKey {
 struct PolicyDecisionKey {
     policy: String,
     reason: String,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct CacheAwareDecisionKey {
+    model_id: String,
+    decision: &'static str,
 }
 
 #[derive(Debug)]
@@ -619,6 +690,38 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the final cache-aware routing decision for one prefill
+    /// selection — exactly one call per cache-aware request, so the labels
+    /// sum to the cache-aware request rate.
+    pub fn record_cache_aware_decision(&self, model_id: &str, decision: CacheAwareDecision) {
+        let key = CacheAwareDecisionKey {
+            model_id: model_id.to_owned(),
+            decision: decision.as_str(),
+        };
+        let mut guard = self.cache_aware_decisions_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe the matched-prefix depth (blocks) a queue-gate diversion gave
+    /// up, for `sgl_router_diverted_overlap_blocks`. Recorded ONLY when the
+    /// gate emptied the candidate set (`cache_worker_queued`), so the
+    /// histogram measures sacrifice rather than traffic. A PARTIAL diversion
+    /// — the gate removed the deepest owner but a shallower one still won —
+    /// is therefore not represented here even though some locality was given
+    /// up; it books as `cache_hit`.
+    pub fn observe_diverted_overlap_blocks(&self, model_id: &str, blocks: u64) {
+        let mut guard = self.diverted_overlap_blocks.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(OVERLAP_BLOCK_BUCKETS));
+        hist.observe(blocks as f64);
     }
 
     /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
@@ -1024,6 +1127,47 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // cache_aware_decisions_total
+        out.push_str(
+            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit).\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
+        let guard = self.cache_aware_decisions_total.lock();
+        let mut entries: Vec<(&CacheAwareDecisionKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.decision).cmp(&(&b.0.model_id, b.0.decision)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_aware_decisions_total{{model_id=\"{}\",decision=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.decision,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // diverted_overlap_blocks histogram
+        out.push_str(
+            "# HELP sgl_router_diverted_overlap_blocks Matched-prefix depth (blocks) given up by queue-gate diversions (decision=cache_worker_queued). Read against the overlap of all selections: a curve skewing high means the gate is trading large cached prefixes for short waits.\n",
+        );
+        out.push_str("# TYPE sgl_router_diverted_overlap_blocks histogram\n");
+        let guard = self.diverted_overlap_blocks.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_diverted_overlap_blocks",
+                &label_body,
+                hist,
+            );
+        }
+        drop(guard);
+
         // ingress_tokenize_errors_total
         out.push_str(
             "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
@@ -1074,7 +1218,7 @@ fn render_histogram(out: &mut String, name: &str, label_body: &str, hist: &Histo
 /// https://prometheus.io/docs/instrumenting/exposition_formats/.
 /// We only escape `\`, `"`, and newline — the three characters the
 /// reference parser rejects unescaped.
-fn escape_label(s: &str) -> String {
+pub(crate) fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1509,6 +1653,41 @@ mod tests {
         assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
         assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
         assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
+    }
+
+    #[test]
+    fn cache_aware_decisions_and_diverted_overlap_render() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheHit);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheWorkerQueued);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::CacheWorkerQueued);
+        reg.record_cache_aware_decision("tiny", CacheAwareDecision::AllQueued);
+        reg.observe_diverted_overlap_blocks("tiny", 40);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_hit"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="cache_worker_queued"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_cache_aware_decisions_total{model_id="tiny",decision="all_queued"} 1"#
+        ));
+        // The saturation label must not be absorbed by a `cache_hit.*`
+        // hit-rate query.
+        assert!(!out.contains(r#"decision="cache_hit_all_queued""#));
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_count{model_id="tiny"} 1"#),
+            "expected one diverted observation; got:\n{out}"
+        );
+        // 40 blocks lands in the le=64 bucket, not le=32.
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_bucket{model_id="tiny",le="64"} 1"#)
+        );
+        assert!(
+            out.contains(r#"sgl_router_diverted_overlap_blocks_bucket{model_id="tiny",le="32"} 0"#)
+        );
     }
 
     #[test]

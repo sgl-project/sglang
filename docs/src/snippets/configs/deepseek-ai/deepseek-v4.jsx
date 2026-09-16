@@ -221,8 +221,8 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260911",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260911",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi30x-20260914",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260914",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -2022,7 +2022,7 @@ sgl-eval run mmmu_pro \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--prefill-decode-interval 10",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
         "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
@@ -2050,7 +2050,7 @@ sgl-eval run mmmu_pro \\
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
-        "--prefill-decode-interval 10",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
         "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
@@ -2077,7 +2077,7 @@ sgl-eval run mmmu_pro \\
         "--enable-dp-attention-local-control-broadcast",
         "--tokenizer-worker-num 8",
         "--stream-interval 20",
-        "--prefill-decode-interval 10",
+        "--prefill-decode-interval 20",
         "--attention-backend dsv4",
         "--enable-deepseek-v4-fp4-indexer",
         "--page-size 256",
