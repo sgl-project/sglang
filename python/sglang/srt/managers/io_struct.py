@@ -2113,6 +2113,8 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    terminal: bool = False
+    effective_ep_size: int = 0
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):
