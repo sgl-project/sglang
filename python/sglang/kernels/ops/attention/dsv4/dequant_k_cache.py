@@ -39,8 +39,7 @@ def dequantize_k_cache_paged(
         out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 destination.
             May be a slice of a larger workspace; the kernel uses out.stride(0)
             so contiguous-along-dim-0 slices work.
-        layout: the cache's :class:`KVLayout`; the V4.1 layouts (528-byte fp8,
-            288-byte fp4) go through :func:`dequantize_k_cache_paged_v41`.
+        layout: the cache's :class:`KVLayout`.
 
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
@@ -105,9 +104,7 @@ def dequantize_k_cache_paged_v41(
     """Dequantize a V4.1 paged cache (fp8 ``V41`` or fp4 ``V41_FP4``) for a list
     of token IDs into ``(num_tokens, 1, 512)`` bf16.
 
-    Bit-exact with the pure-torch dequantizer of the formats: the fp8 value
-    times its power-of-two ue8m0 scale, or the e2m1 value times its e4m3 scale
-    (at most 2 + 4 significant bits, so exact), rounded to bf16 once.
+    Bit-exact with the pure-torch dequantizer of these formats.
     """
     layout = KVLayout.parse(layout)
     assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
@@ -347,9 +344,8 @@ def _dequantize_k_cache_paged_kernel(
 
 @triton.jit
 def _ue8m0_to_fp32(scale_u8):
-    """The ue8m0 byte as fp32: ``2 ** (byte - 127)``, built from the exponent
-    bits so it is exact; byte 0 is the denormal ``2 ** -127`` and byte 255 NaN,
-    as ``torch.float8_e8m0fnu`` converts them."""
+    # Follows torch.float8_e8m0fnu: byte 0 is the denormal 2 ** -127, byte 255
+    # is NaN, otherwise 2 ** (byte - 127).
     normal = (scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     denormal = tl.full(scale_u8.shape, 0x00400000, tl.int32).to(
         tl.float32, bitcast=True
@@ -360,8 +356,8 @@ def _ue8m0_to_fp32(scale_u8):
 
 @triton.jit
 def _e2m1_code_to_fp32(code):
-    """The 4-bit e2m1 code (bit 3 sign, bits 0-2 index into
-    ``[0, 0.5, 1, 1.5, 2, 3, 4, 6]``) as fp32."""
+    # The 4-bit e2m1 code: bit 3 is the sign, bits 0-2 index into
+    # [0, 0.5, 1, 1.5, 2, 3, 4, 6].
     m = code & 7
     e = m >> 1
     f = (m & 1).to(tl.float32)
