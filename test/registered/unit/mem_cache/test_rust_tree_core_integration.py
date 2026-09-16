@@ -1833,17 +1833,26 @@ def test_swa_prefetch_commit_end_to_end():
     core.has_swa_host_pool = True
     anchor = core.match_prefix(MatchPrefixParams(key=_key([99]))).best_match_node
 
-    # The build wraps the host buffer with placeholder keys, trailing-pages policy.
+    # Without planned staging the SWA pool takes no part in the fetch.
+    assert (
+        core.build_hicache_transfers(
+            ComponentType.SWA, anchor, CacheTransferPhase.PREFETCH
+        )
+        is None
+    )
+
+    # The build carries the planned staging as placeholder keys, trailing-pages
+    # policy; the host buffer is attached once the hit is known.
     (xfer,) = core.build_hicache_transfers(
         ComponentType.SWA,
         anchor,
         CacheTransferPhase.PREFETCH,
-        host_indices=torch.tensor([30, 31], dtype=torch.int64),
+        staging_tokens=2,
     )
     assert xfer.name == PoolName.SWA
     assert xfer.keys == ["__placeholder__", "__placeholder__"]
     assert xfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
-    assert xfer.host_indices.tolist() == [30, 31]
+    assert xfer.host_indices is None
 
     # The prefetched suffix lands as one host node; its SWA host is a tombstone.
     insert_result = core.insert_host(
