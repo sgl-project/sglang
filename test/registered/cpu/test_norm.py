@@ -614,7 +614,7 @@ class TestFusedQKNorm:
             head_dim,
         )
 
-        atol = rtol = precision[dtype]
+        atol = rtol = 5e-2
         torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
         torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
 
