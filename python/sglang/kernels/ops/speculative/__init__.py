@@ -22,7 +22,7 @@ _TRITON_KERNELS = [
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
-    ("dspark.fast_argmax", "fast_row_argmax"),
+    ("row_argmax", "row_argmax"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
