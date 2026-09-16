@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import prometheus_client
 
@@ -37,6 +38,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     StorageMetricsCollector,
     TokenizerMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_context, reset_context
@@ -176,6 +178,29 @@ class TestDefaultBackend(unittest.TestCase):
         self.assertIsInstance(collector.eviction_num_tokens, prometheus_client.Counter)
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
+        )
+
+
+class TestRadixCacheMetricLabels(unittest.TestCase):
+    """Radix-cache series must stay distinct per scheduler rank: an unlabeled
+    family is summed across local ranks by the multiprocess registry, which
+    reported TP x the logical token count in production. The rank keys follow
+    the storage collector's DP-aware convention so L2 and L3 series line up."""
+
+    def test_labels_follow_the_storage_collector_rank_keys(self):
+        parallel = SimpleNamespace(tp_rank=3, pp_rank=1, attn_tp_rank=1, attn_dp_rank=2)
+        self.assertEqual(
+            radix_cache_metric_labels("UnifiedRadixCache", parallel, True),
+            {
+                "cache_type": "UnifiedRadixCache",
+                "tp_rank": 1,
+                "pp_rank": 1,
+                "dp_rank": 2,
+            },
+        )
+        self.assertEqual(
+            radix_cache_metric_labels("RadixCache", parallel, False),
+            {"cache_type": "RadixCache", "tp_rank": 3, "pp_rank": 1, "dp_rank": 0},
         )
 
 

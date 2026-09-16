@@ -291,7 +291,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.finish_storage_prefetch_admission.assert_called_once_with(
             req.cache_request_handle,
             fulfilled_tokens=4,
-            reason="shrunk",
+            reason="cache_admission_shortfall",
         )
         self.assertEqual(adder.log_device_hit_tokens, 8)
         self.assertEqual(adder.log_host_hit_tokens, 0)
