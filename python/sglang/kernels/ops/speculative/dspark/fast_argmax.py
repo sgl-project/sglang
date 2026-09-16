@@ -51,12 +51,11 @@ def _argmax_final_kernel(INV, INI, OUT, SPLITS: tl.constexpr, BLOCK: tl.constexp
 _SPLITS = 64
 
 
-def fast_row_argmax(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+def fast_row_argmax(x: torch.Tensor) -> torch.Tensor:
     """``x.argmax(dim=-1)`` for a 2D FP32 tensor with few rows and a wide vocab."""
     assert x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
     rows, n = x.shape
-    if out is None:
-        out = torch.empty((rows,), dtype=torch.int64, device=x.device)
+    out = torch.empty((rows,), dtype=torch.int64, device=x.device)
     pv = torch.empty((rows, _SPLITS), dtype=torch.float32, device=x.device)
     pi = torch.empty((rows, _SPLITS), dtype=torch.int32, device=x.device)
     _argmax_partial_kernel[(rows, _SPLITS)](
