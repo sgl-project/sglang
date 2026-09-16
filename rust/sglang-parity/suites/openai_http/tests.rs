@@ -199,11 +199,117 @@ fn legal_fragmentation_and_choice_interleaving_do_not_change_results() {
 }
 
 #[test]
+fn stream_id_consistency_is_chat_only_but_every_id_remains_validated() {
+    for chat in [false, true] {
+        let name = if chat {
+            "chat_greedy_stream"
+        } else {
+            "completion_greedy_stream"
+        };
+        let (c, p) = case(name);
+        for id in [
+            None,
+            Some(Value::Null),
+            Some(json!(3)),
+            Some(json!("")),
+            Some(json!("changed")),
+        ] {
+            let mut values = stream(chat);
+            if let Some(id) = &id {
+                values[1]["id"] = id.clone();
+            } else {
+                values[1].as_object_mut().unwrap().remove("id");
+            }
+            let result = p.prepare(&c, &capture(values));
+            if !chat && id == Some(json!("changed")) {
+                let response = result.unwrap();
+                assert_eq!(response.value["id"], "request");
+                assert_eq!(response.origins["/id"], vec![0]);
+            } else {
+                let errors = result.unwrap_err();
+                assert_eq!(errors[0].path, "/id");
+                assert_eq!(errors[0].event, Some(1));
+            }
+        }
+    }
+}
+
+#[test]
+fn completion_equivalence_ignores_varying_ids_but_detects_result_changes() {
+    for group in ["greedy", "multiple", "batch"] {
+        let (json_case, p) = case(&format!("completion_{group}_json"));
+        let (stream_case, _) = case(&format!("completion_{group}_stream"));
+        let count = choice_count(&stream_case.body, false).unwrap();
+        let mut json = unary(false);
+        json["id"] = json!("json-request");
+        json["choices"] = (0..count)
+            .map(|index| {
+                json!({"index":index, "text":format!("answer {index}!"),
+                "finish_reason":"length", "logprobs":null})
+            })
+            .collect();
+        let mut values = Vec::new();
+        for terminal in [false, true] {
+            for index in (0..count).rev() {
+                let mut value = chunk(
+                    false,
+                    json!({"index":index,
+                    "text":if terminal { "!".into() } else { format!("answer {index}") },
+                    "finish_reason":if terminal { json!("length") } else { Value::Null },
+                    "logprobs":null}),
+                );
+                value["id"] = json!(format!("stream-{index}-{terminal}"));
+                values.push(value);
+            }
+        }
+        let mut final_usage = usage_event(false);
+        final_usage["usage"] =
+            json!({"prompt_tokens":3,"completion_tokens":2*count,"total_tokens":3+2*count});
+        json["usage"] = final_usage["usage"].clone();
+        values.push(final_usage);
+        let streamed = p.prepare(&stream_case, &capture(values)).unwrap();
+        let semantics = streamed.equivalence.unwrap().value;
+        for (path, replacement) in [
+            ("", Value::Null),
+            ("/choices/0/text", json!("different")),
+            ("/choices/0/finish_reason", json!("stop")),
+            (
+                "/choices/0/logprobs",
+                json!({"tokens":["different"],"token_logprobs":[-0.1]}),
+            ),
+            (
+                "/usage",
+                json!({"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}),
+            ),
+        ] {
+            let mut value = json.clone();
+            if !path.is_empty() {
+                *value.pointer_mut(path).unwrap() = replacement;
+            }
+            let response = p
+                .prepare(
+                    &json_case,
+                    &HttpObservation {
+                        json: Some(value),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let differences = sglang_parity::compare::compare_json(
+                &response.equivalence.unwrap().value,
+                &semantics,
+            );
+            assert_eq!(differences.is_empty(), path.is_empty(), "{group}: {path}");
+        }
+    }
+}
+
+#[test]
 fn malformed_streams_have_event_scoped_diagnostics() {
     let (c, p) = case("completion_greedy_stream");
     for mutation in [
         "unknown",
-        "id",
+        "created",
         "early_terminal",
         "after_finish",
         "missing_usage",
@@ -216,7 +322,7 @@ fn malformed_streams_have_event_scoped_diagnostics() {
         let mut values = stream(false);
         match mutation {
             "unknown" => values[0]["extra"] = json!(1),
-            "id" => values[1]["id"] = json!("changed"),
+            "created" => values[1]["created"] = json!(2),
             "early_terminal" => values[0]["choices"][0]["matched_stop"] = json!("stop"),
             "after_finish" => values.insert(2, values[1].clone()),
             "missing_usage" => {

@@ -637,6 +637,13 @@ cumulative native output. The suite validates every event and reconstructs each
 choice by index; different legal event fragmentation is not a parity failure.
 Unknown stream semantics fail validation rather than silently disappearing.
 
+The `id: chat_constant` rule enforces a single response ID only for Chat
+Completions. For `/v1/completions`, including multiple choices and batch prompts,
+IDs may vary across events; each must still be a nonempty string. Reconstruction
+keeps the first ID and its event origin, while raw events retain every ID.
+Choices are always reconstructed by `index`, never by ID. Creation timestamps
+and the other declared constant fields retain their existing checks.
+
 There are two deliberately separate comparisons:
 
 - **Python/Rust parity and repeatability** use the complete JSON or reconstructed
@@ -646,6 +653,11 @@ There are two deliberately separate comparisons:
   finish reasons, token logprobs and final usage. IDs and wire wrappers such as
   message/delta are excluded only from this semantic view. The paired streaming
   request requires final usage. Other fields remain visible to full parity.
+
+Allowing Completion IDs to vary does not relax JSON/SSE result equivalence:
+every declared pair still compares each indexed choice's content, finish reason
+and logprobs, along with the model and complete final usage. Independent JSON
+and SSE requests need not produce the same literal ID.
 
 Reports link each comparison to its own values and event origins. Existing
 native suites and older reports continue using their original full-result

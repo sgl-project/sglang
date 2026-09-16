@@ -52,6 +52,7 @@ struct StreamingRules {
 #[serde(rename_all = "snake_case")]
 enum Rule {
     Constant,
+    ChatConstant,
     Text,
     Logprobs,
     Terminal,

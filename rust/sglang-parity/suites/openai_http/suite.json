@@ -19,7 +19,7 @@
   },
   "streaming": {
     "envelope": {
-      "id": "constant",
+      "id": "chat_constant",
       "created": "constant",
       "object": "constant",
       "model": "constant",

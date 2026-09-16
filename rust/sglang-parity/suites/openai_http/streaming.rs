@@ -94,7 +94,13 @@ pub(super) fn reconstruct(
                         origins.insert(format!("/{key}"), vec![event_index]);
                     }
                 } else {
-                    constant(&mut result, key, item, &format!("/{key}"))?;
+                    if *rule == Rule::ChatConstant && !chat {
+                        // Completion IDs may vary across chunks. Retain the first
+                        // as evidence; choice indices still identify the results.
+                        result.entry(key).or_insert_with(|| item.clone());
+                    } else {
+                        constant(&mut result, key, item, &format!("/{key}"))?;
+                    }
                     origins
                         .entry(format!("/{key}"))
                         .or_insert_with(|| vec![event_index]);
@@ -202,7 +208,7 @@ pub(super) fn reconstruct(
                                 state.origins.entry(path).or_default().push(event_index);
                             }
                         }
-                        Rule::Usage => unreachable!("validated choice rule"),
+                        Rule::Usage | Rule::ChatConstant => unreachable!("validated choice rule"),
                     }
                     state.origins.entry(path).or_default().push(event_index);
                 }
