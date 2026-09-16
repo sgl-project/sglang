@@ -6,7 +6,8 @@ Serves a single model and routes across its workers. Exposes
 `/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
 (buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
 pools come from either a static URL list or Kubernetes EndpointSlice
-discovery.
+discovery. Both edges speak cleartext HTTP/2 where the peer does — see
+[HTTP/2](#http2).
 
 ## Building
 
@@ -67,6 +68,48 @@ sgl-router \
 The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
+
+## HTTP/2
+
+There is nothing to configure. The router negotiates per connection inbound and
+resolves the protocol per worker outbound; every combination below is reached
+automatically, and HTTP/1.1 remains a supported peer on both edges.
+
+**Inbound.** The listener accepts cleartext HTTP/2 (h2c, prior knowledge) and
+HTTP/1.1 on the same `--port`, chosen per connection. A mesh sidecar or
+load balancer that prefers h2c multiplexes over one connection instead of
+opening one per request; an HTTP/1.1 client is unaffected.
+
+**Outbound.** At registration the router reads each worker's `/server_info` and
+forwards over cleartext h2c only when that worker reports `--enable-http2` (the
+engine's Granian server, which serves h2c and HTTP/1.1 together) **and** the
+worker URL is cleartext. Everything else uses the default client, which speaks
+HTTP/1.1 in cleartext and negotiates ALPN `h2, http/1.1` over TLS:
+
+| `/server_info` | worker URL | router forwards over |
+|---|---|---|
+| `enable_http2: true` | `http://` | cleartext h2c |
+| `enable_http2: true` | `https://` | HTTP/2 over TLS, by ALPN |
+| `enable_http2: false`, or absent | any | HTTP/1.1 (cleartext) or ALPN (TLS) |
+
+The choice is per worker, not fleet-wide, so a mixed fleet works and one
+worker's state never changes another's. The flag comes from the `/server_info`
+launch record, which has reported it all along, so no engine change is needed.
+A worker whose `/server_info` does not answer has no readable protocol and
+forwards over HTTP/1.1 for as long as it stays registered — a throughput cost,
+never a correctness one. Admin fan-out (`/flush_cache`) always uses the default
+client, because it addresses every worker at once rather than a selected one.
+
+Two things worth knowing when debugging. h2c is prior-knowledge only — there is
+no negotiation and no fallback — which is why the router requires the engine's
+own `enable_http2` report before using it. And a worker's protocol is fixed
+for as long as that worker stays registered: it is read once, at registration,
+and never re-read. Under the K8s backend a restarting engine flips its
+EndpointSlice to `ready=false`, which is a `Removed` → `Added` cycle and so a
+fresh reading; under `--worker-urls` the fan-out happens once at startup and
+nothing re-registers. So a worker registered over h2c that later stops serving
+it (a proxy interposed on its port, say) is not detected until it
+is re-registered; its circuit breaker will open in the meantime.
 
 ## Upgrading from `cache_aware_zmq`
 
