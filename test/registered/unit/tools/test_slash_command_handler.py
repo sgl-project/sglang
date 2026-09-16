@@ -195,5 +195,88 @@ class TestChangedTestFiles(CustomTestCase):
                 os.chdir(previous_cwd)
 
 
+class TestDetectSuiteDisabled(CustomTestCase):
+    """/rerun-test must not dispatch a `disabled=` registration: rerun-test.yml
+    runs pytest directly, so a disabled file's module-level skip exits non-zero
+    and fails the job."""
+
+    @staticmethod
+    def _write(root, relpath, body):
+        path = root / "test" / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+
+    def test_disabled_registration_is_not_dispatchable(self):
+        handler = _load_handler()
+        # Real keys, filtered on install: a runner_config rename or a rejected
+        # install script would otherwise silently retarget these assertions.
+        rc_a, rc_b = sorted(
+            name
+            for name, cfg in handler._runner_configs.load().items()
+            if handler._ALLOWED_INSTALL_SCRIPT.match(cfg["install"])
+        )[:2]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(
+                root,
+                "registered/attention/test_disabled.py",
+                "register_cuda_ci(\n"
+                "    est_time=20,\n"
+                '    stage="base-b",\n'
+                f'    runner_config="{rc_a}",\n'
+                # A `)` in the reason truncates any regex capture of the call's
+                # arg list, losing every kwarg after it.
+                '    disabled="not in the runner image (Ant-internal PyPI)",\n'
+                ")\n",
+            )
+            self._write(
+                root,
+                "registered/attention/test_enabled.py",
+                f'register_cuda_ci(est_time=20, stage="base-b", '
+                f'runner_config="{rc_a}")\n',
+            )
+            # `disabled=None` is the enabled state; only a string literal counts.
+            self._write(
+                root,
+                "registered/attention/test_disabled_none.py",
+                f'register_cuda_ci(est_time=20, stage="base-b", '
+                f'runner_config="{rc_a}", disabled=None)\n',
+            )
+            # Two pools, one disabled: the other must still dispatch.
+            self._write(
+                root,
+                "registered/attention/test_mixed.py",
+                f'register_cuda_ci(est_time=20, stage="base-b", '
+                f'runner_config="{rc_a}", disabled="broken here")\n'
+                f'register_cuda_ci(est_time=20, stage="nightly", '
+                f'runner_config="{rc_b}")\n',
+            )
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+
+                (disabled,) = handler.detect_suite(
+                    "registered/attention/test_disabled.py"
+                )
+                self.assertEqual(disabled["suite"], f"base-b-test-{rc_a}")
+                self.assertIsNone(disabled["runner_label"])
+                self.assertIn("disabled=", disabled["error"])
+                self.assertIn("Ant-internal PyPI)", disabled["error"])
+
+                for name in ("test_enabled.py", "test_disabled_none.py"):
+                    (enabled,) = handler.detect_suite(f"registered/attention/{name}")
+                    self.assertIsNone(enabled["error"], name)
+                    self.assertTrue(enabled["runner_label"], name)
+
+                first, second = handler.detect_suite(
+                    "registered/attention/test_mixed.py"
+                )
+                self.assertIn("disabled=", first["error"])
+                self.assertIsNone(second["error"])
+                self.assertEqual(second["suite"], f"nightly-test-{rc_b}")
+            finally:
+                os.chdir(previous_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()
