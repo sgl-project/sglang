@@ -25,7 +25,7 @@ namespace sglang {
 /// kernel's input is the GEMM output and its RoPE position is `positions`, not
 /// `positions - 1`. `kv_output` is the pre-RoPE latent, for the index-K
 /// branch's `wk` projection.
-struct C1Params {
+struct Compress1DecodeParams {
   const bf16_t* __restrict__ kv_input;     // [num_tokens, kHeadDim] bf16
   bf16_t* __restrict__ kv_output;          // [num_tokens, kHeadDim] bf16, pre-RoPE
   const bf16_t* __restrict__ norm_weight;  // [kHeadDim] bf16
@@ -61,8 +61,8 @@ template <
     typename LocT,
     deepseek_v4::KVLayout kLayout,
     bool kUsePDL>
-__global__
-__launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __grid_constant__ C1Params params) {
+__global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
+    const __grid_constant__ Compress1DecodeParams params) {
   using namespace device;
   using deepseek_v4::KVLayout;
   using deepseek_v4::fp8::cast_to_ue8m0;
@@ -237,7 +237,7 @@ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(const __gri
 
 /// \brief Host side of `flash_c1_decode_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
-struct FlashC1DecodeKernel {
+struct FlashCompress1Kernel {
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static constexpr uint32_t kBlockSize = kHeadDim / kC1VecSize;
@@ -300,7 +300,7 @@ struct FlashC1DecodeKernel {
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
 
-    const auto params = C1Params{
+    const auto params = Compress1DecodeParams{
         .kv_input = static_cast<const bf16_t*>(kv_input.data_ptr()),
         .kv_output = static_cast<bf16_t*>(kv_output.data_ptr()),
         .norm_weight = static_cast<const bf16_t*>(norm_weight.data_ptr()),
@@ -316,7 +316,7 @@ struct FlashC1DecodeKernel {
   }
 };
 
-// ensure that C++ wrapper can work
+// The JIT module names and wrappers spell the layouts as bare enumerators.
 using enum deepseek_v4::KVLayout;
 
 }  // namespace sglang

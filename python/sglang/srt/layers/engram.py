@@ -55,11 +55,38 @@ from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 logger = logging.getLogger(__name__)
 
 
-def _find_next_prime(start: int, seen_primes: set[int]) -> int:
-    from sympy import isprime
+_MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
+
+def _is_prime(n: int) -> bool:
+    """Deterministic Miller-Rabin: exact for every n < 3.3e24, so it agrees with
+    ``sympy.isprime`` over the whole range the layout can reach. Kept local
+    because sympy is not a declared sglang dependency -- it only happens to
+    arrive with torch, and the engram layout must not depend on that."""
+    if n < 2:
+        return False
+    for p in _MILLER_RABIN_WITNESSES:
+        if n % p == 0:
+            return n == p
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d, r = d // 2, r + 1
+    for a in _MILLER_RABIN_WITNESSES:
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _find_next_prime(start: int, seen_primes: set[int]) -> int:
     candidate = start + 1
-    while not isprime(candidate) or candidate in seen_primes:
+    while not _is_prime(candidate) or candidate in seen_primes:
         candidate += 1
     return candidate
 
