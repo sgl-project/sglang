@@ -118,6 +118,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_EARLY_FORKSERVER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Start the multiprocessing forkserver at CLI entry with the worker modules preloaded, so the scheduler, DP controller and detokenizer processes fork from an already-imported server instead of re-importing sglang and torch under `spawn`. Cuts several seconds of process startup per worker.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FORKSERVER_FILE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Address file of a long-lived forkserver daemon started with `python -m sglang.srt.entrypoints.early_forkserver`. A launcher with `SGLANG_EARLY_FORKSERVER=1` attaches to the daemon named there when it is alive, so the preload cost is paid once per machine.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`/tmp/sglang_forkserver.json`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_MP_START_METHOD`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>multiprocessing start method the launcher applies to its workers, `spawn` or `forkserver`. Set to `forkserver` by `SGLANG_EARLY_FORKSERVER=1`; not meant to be set by hand. `--enable-memory-saver` forces `spawn` because its hook is `LD_PRELOAD`ed at exec time.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`spawn`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PRESPAWN_WORKERS`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Spawn the scheduler (or DP controller) processes right after argument parsing, before the launcher imports the HTTP and tokenizer stack, so worker initialization overlaps that import. Combine with `SGLANG_EARLY_FORKSERVER=1`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
 </tbody>
 </table>
 
