@@ -43,7 +43,10 @@ from sglang.srt.utils import (
     get_current_device_stream_fast,
     next_power_of_2,
 )
-
+from cann_ops_transformer.ops.attention.flash_mla_with_kvcache import (
+    flash_mla_with_kvcache,
+    flash_mla_with_kvcache_metadata,
+)
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -108,7 +111,8 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
-
+    metadata_flash_mla = None
+    seqused_q = None
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -391,16 +395,21 @@ class AscendAttnBackend(AttentionBackend):
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
-        self.q_head_num_padding = None
-        if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
-            self.tp_q_head_num = (
+        self.tp_q_head_num = (
                 model_runner.model_config.num_attention_heads
                 // get_parallel().attn_tp_size
-            )
-            for num in self.padding_size_list:
-                if num >= self.tp_q_head_num:
-                    self.q_head_num_padding = num
-                    break
+        )
+        # self.q_head_num_padding = None
+
+        # if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
+        #     self.tp_q_head_num = (
+        #         model_runner.model_config.num_attention_heads
+        #         // get_parallel().attn_tp_size
+        #     )
+        #     for num in self.padding_size_list:
+        #         if num >= self.tp_q_head_num:
+        #             self.q_head_num_padding = num
+        #             break
 
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -694,31 +703,57 @@ class AscendAttnBackend(AttentionBackend):
             metadata.seq_lens_list_cumsum = (
                 torch.cumsum(extend_seq_lens_cpu_int, dim=0).int().tolist()
             )
-        if (
-            self.q_head_num_padding is not None
-            and self.q_head_num_padding > self.tp_q_head_num
-        ):
-            dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
-            metadata.nope_padding = torch.empty(
-                [
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.kv_lora_rank,
-                ],
-                dtype=dtype,
-                device=seq_lens.device,
-            )
-            metadata.rope_padding = torch.empty(
-                [
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.qk_rope_head_dim,
-                ],
-                dtype=dtype,
-                device=seq_lens.device,
-            )
+        # if (
+        #     self.q_head_num_padding is not None
+        #     and self.q_head_num_padding > self.tp_q_head_num
+        # ):
+        #     dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
+        #     metadata.nope_padding = torch.empty(
+        #         [
+        #             bs,
+        #             1,
+        #             self.q_head_num_padding - self.tp_q_head_num,
+        #             self.kv_lora_rank,
+        #         ],
+        #         dtype=dtype,
+        #         device=seq_lens.device,
+        #     )
+        #     metadata.rope_padding = torch.empty(
+        #         [
+        #             bs,
+        #             1,
+        #             self.q_head_num_padding - self.tp_q_head_num,
+        #             self.qk_rope_head_dim,
+        #         ],
+        #         dtype=dtype,
+        #         device=seq_lens.device,
+        #     )
+        device = seq_lens.device
+        if self.use_mla:
+            def _calculate_metadata_size(batch_size, aic_core_num, aiv_core_num):
+                """计算 metadata tensor 的对齐后大小。
+
+                MLA 硬约束 kv head num == 1（B2/D16 上界公式，禁止按 num_heads_kv>1 放大）：
+                最坏容量 = ((aic + aiv) * batch_size * 1 + 1) * 16 个 int32（每核 16 word，
+                外加 1 个 header），按 4096 个 INT32 元素对齐（与 flash_attn.py 一致）。
+                核数从硬件获取，见 _get_core_nums。
+                """
+                metadata_size = ((aic_core_num + aiv_core_num) * batch_size * 1 + 1) * 16
+                return ((metadata_size + 4095) // 4096) * 4096
+
+            def _get_core_nums():
+                """从硬件获取 AIC/AIV 核数（与 aclnn host 侧 GetCurrentPlatformInfo 同源）。"""
+                props = torch.npu.get_device_properties()
+                return props.cube_core_num, props.vector_core_num
+
+            b_size = seq_lens.size(0)
+            aic_core_num, aiv_core_num = _get_core_nums()
+            metadata_size = _calculate_metadata_size(b_size, aic_core_num, aiv_core_num)
+            metadata_flash_mla = torch.empty((metadata_size,), dtype=torch.int32, device=device)
+            metadata.metadata_flash_mla = metadata_flash_mla
+
+            metadata.seqused_q=torch.zeros(bs, dtype=torch.int32, device=device)
+            metadata.actual_seq_lengths_q = torch.cat([torch.zeros(1, dtype=torch.int32, device=device),metadata.actual_seq_lengths_q])
         self.graph_metadata[bs] = metadata
         return metadata
 
@@ -799,12 +834,36 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.block_tables[:bs, total_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
+        if self.use_mla:
+            query_seq_len = (
+                self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+                else 1
+            )
+            # Identify zero-length padding before adding the draft-token offset.
+            seqused_q = (seq_lens[:bs] > 0).to(torch.int32) * query_seq_len
+
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-
+        if self.use_mla:
+            metadata.seqused_q.copy_(seqused_q.to(torch.int32))
+            metadata_flash_mla = flash_mla_with_kvcache_metadata(
+                cache_seqlens=seq_lens.to(torch.int32),
+                num_heads_q=self.tp_q_head_num,
+                num_heads_kv=1,
+                cu_seqlens_q=None,
+                seqused_q=seqused_q,
+                max_seqlen_q=-1,
+                max_seqlen_kv=-1,
+                head_dim_qk=576,
+                head_dim_v=512,
+                mask_mode=3,
+                layout_q="BSND",
+            )
+            metadata.metadata_flash_mla.copy_(metadata_flash_mla)
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -1251,7 +1310,9 @@ class AscendAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
-        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_nope = kv_cache[..., : self.kv_lora_rank]
+        k_pe = kv_cache[..., self.kv_lora_rank :]
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -2262,21 +2323,19 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
         else:
-            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if is_fia_nz():
-                k_rope_cache = _reshape_kv_for_fia_nz(
-                    k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
-                )
-                c_kv_cache = _reshape_kv_for_fia_nz(
-                    c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
-                )
-            else:
-                k_rope_cache = k_rope.view(
-                    -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
-                )
-                c_kv_cache = c_kv.view(
-                    -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
-                )
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            # c_kv = kv_cache[..., : self.kv_lora_rank]
+            # k_rope = kv_cache[..., self.kv_lora_rank :]
+            # if is_fia_nz():
+            #     k_rope_cache = _reshape_kv_for_fia_nz(
+            #         k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
+            #     )
+            #     c_kv_cache = _reshape_kv_for_fia_nz(
+            #         c_kv, layer.tp_v_head_num, self.kv_lora_rank, self.page_size
+            #     )
+            # else:
+            #     k_rope_cache = k_rope
+            #     c_kv_cache = c_kv
 
             q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
             q_rope = q_rope.view(-1, layer.tp_q_head_num, self.qk_rope_head_dim)
@@ -2306,41 +2365,42 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 block_table = self.forward_metadata.block_tables
 
-            if (
-                self.q_head_num_padding is not None
-                and self.q_head_num_padding > self.tp_q_head_num
-            ):
-                nope_padding = torch.empty(
-                    [
-                        q_nope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.kv_lora_rank,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_nope.device,
-                )
-                rope_padding = torch.empty(
-                    [
-                        q_rope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.qk_rope_head_dim,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_rope.device,
-                )
-                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
-                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+            # if (
+            #     self.q_head_num_padding is not None
+            #     and self.q_head_num_padding > self.tp_q_head_num
+            # ):
+            #     nope_padding = torch.empty(
+            #         [
+            #             q_nope.shape[0],
+            #             self.q_head_num_padding - self.tp_q_head_num,
+            #             self.kv_lora_rank,
+            #         ],
+            #         dtype=(
+            #             self.model_dtype
+            #             if self.model_dtype is not None
+            #             else torch.bfloat16
+            #         ),
+            #         device=q_nope.device,
+            #     )
+            #     rope_padding = torch.empty(
+            #         [
+            #             q_rope.shape[0],
+            #             self.q_head_num_padding - self.tp_q_head_num,
+            #             self.qk_rope_head_dim,
+            #         ],
+            #         dtype=(
+            #             self.model_dtype
+            #             if self.model_dtype is not None
+            #             else torch.bfloat16
+            #         ),
+            #         device=q_rope.device,
+            #     )
+            #     q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+            #     q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
             num_query_heads = q_nope.shape[1]
             if self.use_fias_v2_bsnd:
+                # print(f"xxxxxxxxxxxxxxxxxx",flush=True)
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
@@ -2351,51 +2411,50 @@ class AscendAttnBackend(AttentionBackend):
                 if batch_size == 0:
                     attn_output = torch.empty_like(q_nope)
                 else:
-                    q_nope_bnsd = (
+                    q_nope_bsnd = (
                         q_nope.view(
                             batch_size,
                             query_seq_len,
                             num_query_heads,
                             self.kv_lora_rank,
-                        )
-                        .transpose(1, 2)
-                        .contiguous()
+                        ).contiguous()
                     )
-                    q_rope_bnsd = (
+                    q_rope_bsnd = (
                         q_rope.view(
                             batch_size,
                             query_seq_len,
                             num_query_heads,
                             self.qk_rope_head_dim,
-                        )
-                        .transpose(1, 2)
-                        .contiguous()
+                        ).contiguous()
                     )
-                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                        q_nope_bnsd,
-                        c_kv_cache,
-                        c_kv_cache,
-                        query_rope=q_rope_bnsd,
-                        key_rope=k_rope_cache,
-                        num_query_heads=num_query_heads,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BNSD",
-                        softmax_scale=layer.scaling,
+                    attn_output, _ = flash_mla_with_kvcache(
+                        torch.cat([q_nope_bsnd, q_rope_bsnd], dim=-1),
+                        kv_cache,
                         block_table=block_table,
-                        block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
-                        actual_seq_qlen=[query_seq_len] * batch_size,
-                        actual_seq_kvlen=actual_seq_lengths_kv,
-                        pre_tokens=FULL_ATTENTION_WINDOW,
-                        next_tokens=0,
+                        cache_seqlens=self.forward_metadata.seq_lens.to(torch.int32),
+                        cu_seqlens_q=None,
+                        seqused_q=self.forward_metadata.seqused_q.to(torch.int32),
+                        attn_mask=self.mtp_mask.to(torch.int8), # ?? todo
+                        metadata=self.forward_metadata.metadata_flash_mla,
+                        head_dim_v=512,
+                        softmax_scale=layer.scaling,
+                        mask_mode=3,
+                        max_seqlen_q = -1,
+                        max_seqlen_kv= -1,
+                        layout_q= "BSND",
+                        layout_kv= "PA_BBND",
+                        layout_out= "BSND",
+                        return_softmax_lse= False,
                     )
                     attn_output = (
-                        attn_output.transpose(1, 2)
-                        .contiguous()
+                        attn_output
                         .reshape(-1, num_query_heads, self.kv_lora_rank)
                     )
             else:
+                assert False
+                assert True
+                print(f"yyyyyyyyyyyyyyyyyyyyyyyyyyyy",flush=True)
+
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -2638,7 +2697,9 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            c_kv = kv_cache[..., : self.kv_lora_rank]
+            k_rope = kv_cache[..., self.kv_lora_rank :]
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size

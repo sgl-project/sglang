@@ -630,26 +630,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
+            # k_buffer (c_kv, kv_cache_dim) and v_buffer (k_rope, kr_cache_dim) are
+            # merged into a single contiguous kv_buffer so that get_kv_buffer returns
+            # one tensor and callers no longer need torch.cat at the call site.
+            self.kv_buffer = torch.zeros(
                 (
                     layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
                     1,
-                    self.kv_cache_dim,
+                    self.kv_cache_dim + self.kr_cache_dim,
                 ),
                 dtype=self.k_store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kr_cache_dim,
-                ),
-                dtype=self.v_store_dtype,
                 device=self.device,
             )
             self.index_k_buffer = None
@@ -688,13 +680,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
+        assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
@@ -706,10 +695,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
+        return self.kv_buffer[layer_id - self.start_layer]
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
@@ -726,17 +712,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        k_slice = buf[..., : self.kv_cache_dim]
         if self.k_store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return k_slice.view(self.dtype)
+        return k_slice
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        v_slice = buf[..., self.kv_cache_dim :]
         if self.v_store_dtype == self.store_dtype and self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return v_slice.view(self.dtype)
+        return v_slice
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -856,7 +846,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             packed_cache = self._pack_dsa_fp8_kv_cache(cache_k, cache_v, loc.numel())
             torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
+                self.kv_buffer[layer_id - self.start_layer].view(
                     -1, 1, self.kv_cache_dim
                 ),
                 loc.view(-1, 1),
@@ -881,17 +871,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
-            loc.view(-1, 1),
-            cache_k.view(-1, 1, self.kv_lora_rank),
+        kv_layer = self.kv_buffer[layer_id - self.start_layer]
+        total_dim = self.kv_cache_dim + self.kr_cache_dim
+        merged = torch.cat(
+            [cache_k.view(-1, 1, self.kv_lora_rank),
+             cache_v.view(-1, 1, self.qk_rope_head_dim)],
+            dim=-1,
         )
         torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.qk_rope_head_dim
-            ),
+            kv_layer.view(-1, 1, total_dim),
             loc.view(-1, 1),
-            cache_v.view(-1, 1, self.qk_rope_head_dim),
+            merged,
         )
 
     def _set_fia_nz_kv_buffer(
@@ -913,8 +903,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
         offset = layer_id - self.start_layer
-        scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
-        scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
+        kv_layer = self.kv_buffer[offset]
+        k_slice = kv_layer[..., : self.kv_cache_dim]
+        v_slice = kv_layer[..., self.kv_cache_dim :]
+        scatter(k_slice, cache_k, self.kv_lora_rank)
+        scatter(v_slice, cache_v, self.qk_rope_head_dim)
 
     def set_index_k_buffer(
         self,

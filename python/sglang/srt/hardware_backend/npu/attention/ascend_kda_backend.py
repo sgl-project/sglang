@@ -22,7 +22,7 @@ if _USE_TRITON_KDA:
 #     chunk_gla_fwd_o_gk_npu,
 #     recompute_w_u_fwd_npu,
 # )
-from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+# from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 # from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 # from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -54,6 +54,454 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _LOG2_E = math.log2(math.e)
 
+from typing import Optional
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _kda_target_verify_k128_fused_kernel(
+    A_log_ptr,
+    dt_bias_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    a_ptr,
+    b_ptr,
+    initial_state_ptr,
+    initial_indices_ptr,
+    snapshot_ptr,
+    snapshot_indices_ptr,
+    out_ptr,
+    scale,
+    stride_q_token: tl.constexpr,
+    stride_q_head: tl.constexpr,
+    stride_q_dim: tl.constexpr,
+    stride_k_token: tl.constexpr,
+    stride_k_head: tl.constexpr,
+    stride_k_dim: tl.constexpr,
+    stride_v_token: tl.constexpr,
+    stride_v_head: tl.constexpr,
+    stride_v_dim: tl.constexpr,
+    stride_a_token: tl.constexpr,
+    stride_a_head: tl.constexpr,
+    stride_a_dim: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_b_head: tl.constexpr,
+    initial_stride_0,
+    initial_stride_1,
+    initial_stride_2,
+    initial_stride_3,
+    snapshot_stride_0,
+    snapshot_stride_1,
+    snapshot_stride_2,
+    snapshot_stride_3,
+    snapshot_stride_4,
+    H_Q: tl.constexpr,
+    H_K: tl.constexpr,
+    H_V: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    STEPS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    GATES_ARE_PREACTIVATED: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_hv = tl.program_id(1)
+    pid_v = tl.program_id(2)
+
+    # A5's K=128 vector path operates naturally as two 64-element halves.
+    # Keep BV=128 and one program per (batch, value-head); split only K.
+    offset_k0 = tl.arange(0, 64)
+    offset_k1 = offset_k0 + 64
+    offset_v = pid_v * BV + tl.arange(0, BV)
+    mask_k0 = offset_k0 < K
+    mask_k1 = offset_k1 < K
+    mask_v = offset_v < V
+    mask_state0 = mask_v[:, None] & mask_k0[None, :]
+    mask_state1 = mask_v[:, None] & mask_k1[None, :]
+
+    q_ratio = H_V // H_Q
+    k_ratio = H_V // H_K
+    q_head = pid_hv // q_ratio
+    k_head = pid_hv // k_ratio
+    initial_idx = tl.load(initial_indices_ptr + pid_batch).to(tl.int64)
+    snapshot_idx = tl.load(snapshot_indices_ptr + pid_batch).to(tl.int64)
+
+    initial_offsets0 = (
+        initial_idx * initial_stride_0
+        + pid_hv * initial_stride_1
+        + offset_v[:, None] * initial_stride_2
+        + offset_k0[None, :] * initial_stride_3
+    )
+    initial_offsets1 = (
+        initial_idx * initial_stride_0
+        + pid_hv * initial_stride_1
+        + offset_v[:, None] * initial_stride_2
+        + offset_k1[None, :] * initial_stride_3
+    )
+    state0 = tl.load(
+        initial_state_ptr + initial_offsets0,
+        mask=(initial_idx >= 0) & mask_state0,
+        other=0.0,
+    ).to(tl.float32)
+    state1 = tl.load(
+        initial_state_ptr + initial_offsets1,
+        mask=(initial_idx >= 0) & mask_state1,
+        other=0.0,
+    ).to(tl.float32)
+
+    A_log = tl.zeros((), dtype=tl.float32)
+    dt_bias0 = tl.zeros((64,), dtype=tl.float32)
+    dt_bias1 = tl.zeros((64,), dtype=tl.float32)
+    exp_A = tl.zeros((), dtype=tl.float32)
+    neg_exp_A = tl.zeros((), dtype=tl.float32)
+    if not GATES_ARE_PREACTIVATED:
+        A_log = tl.load(A_log_ptr + k_head).to(tl.float32)
+        exp_A = tl.exp(A_log)
+        neg_exp_A = -exp_A
+        dt_bias0 = tl.load(
+            dt_bias_ptr + k_head * K + offset_k0,
+            mask=mask_k0,
+            other=0.0,
+        ).to(tl.float32)
+        dt_bias1 = tl.load(
+            dt_bias_ptr + k_head * K + offset_k1,
+            mask=mask_k1,
+            other=0.0,
+        ).to(tl.float32)
+
+    for step in range(0, STEPS):
+        token = pid_batch * STEPS + step
+
+        # Phase 1: fire all loads as early as possible — no inter-load deps.
+        q0 = tl.load(
+            q_ptr
+            + token * stride_q_token
+            + q_head * stride_q_head
+            + offset_k0 * stride_q_dim,
+            mask=mask_k0,
+            other=0.0,
+        ).to(tl.float32)
+        q1 = tl.load(
+            q_ptr
+            + token * stride_q_token
+            + q_head * stride_q_head
+            + offset_k1 * stride_q_dim,
+            mask=mask_k1,
+            other=0.0,
+        ).to(tl.float32)
+        k0 = tl.load(
+            k_ptr
+            + token * stride_k_token
+            + k_head * stride_k_head
+            + offset_k0 * stride_k_dim,
+            mask=mask_k0,
+            other=0.0,
+        ).to(tl.float32)
+        k1 = tl.load(
+            k_ptr
+            + token * stride_k_token
+            + k_head * stride_k_head
+            + offset_k1 * stride_k_dim,
+            mask=mask_k1,
+            other=0.0,
+        ).to(tl.float32)
+        a0 = tl.load(
+            a_ptr
+            + token * stride_a_token
+            + k_head * stride_a_head
+            + offset_k0 * stride_a_dim,
+            mask=mask_k0,
+            other=0.0,
+        ).to(tl.float32)
+        a1 = tl.load(
+            a_ptr
+            + token * stride_a_token
+            + k_head * stride_a_head
+            + offset_k1 * stride_a_dim,
+            mask=mask_k1,
+            other=0.0,
+        ).to(tl.float32)
+        beta_input = tl.load(
+            b_ptr + token * stride_b_token + pid_hv * stride_b_head
+        ).to(tl.float32)
+
+        # Phase 2: q/k norm and gate computation are independent — overlap.
+        q_scale = scale * tl.rsqrt(tl.sum(q0 * q0 + q1 * q1, axis=0) + 1e-12)
+        k_scale = tl.rsqrt(tl.sum(k0 * k0 + k1 * k1, axis=0) + 1e-12)
+        q0 *= q_scale
+        q1 *= q_scale
+        k0 *= k_scale
+        k1 *= k_scale
+
+        if GATES_ARE_PREACTIVATED:
+            gate0 = tl.exp(a0)
+            gate1 = tl.exp(a1)
+            beta = beta_input
+        else:
+            gate_input0 = a0 + dt_bias0
+            gate_input1 = a1 + dt_bias1
+            if USE_LOWER_BOUND:
+                gate0 = tl.exp(LOWER_BOUND * tl.sigmoid(exp_A * gate_input0))
+                gate1 = tl.exp(LOWER_BOUND * tl.sigmoid(exp_A * gate_input1))
+            else:
+                softplus0 = tl.where(
+                    gate_input0 <= 20.0,
+                    tl.log(1.0 + tl.exp(gate_input0)),
+                    gate_input0,
+                )
+                softplus1 = tl.where(
+                    gate_input1 <= 20.0,
+                    tl.log(1.0 + tl.exp(gate_input1)),
+                    gate_input1,
+                )
+                gate0 = tl.exp(neg_exp_A * softplus0)
+                gate1 = tl.exp(neg_exp_A * softplus1)
+            beta = 1.0 / (1.0 + tl.exp(-beta_input))
+
+        # Pass 1: decay state and reduce state @ k together. The addition of
+        # the two K64 products happens before a single 64-wide reduction.
+        state0 *= gate0[None, :]
+        state1 *= gate1[None, :]
+        value = tl.load(
+            v_ptr
+            + token * stride_v_token
+            + pid_hv * stride_v_head
+            + offset_v * stride_v_dim,
+            mask=mask_v,
+            other=0.0,
+        ).to(tl.float32)
+        value -= tl.sum(
+            state0 * k0[None, :] + state1 * k1[None, :], axis=1
+        )
+        value *= beta
+
+        # Pass 2: update state and reduce state @ q together.
+        state0 += value[:, None] * k0[None, :]
+        state1 += value[:, None] * k1[None, :]
+        output = tl.sum(
+            state0 * q0[None, :] + state1 * q1[None, :], axis=1
+        )
+
+        # Phase 4: stores.
+        tl.store(
+            out_ptr + (token * H_V + pid_hv) * V + offset_v,
+            output,
+            mask=mask_v,
+        )
+        snapshot_offsets0 = (
+            snapshot_idx * snapshot_stride_0
+            + step * snapshot_stride_1
+            + pid_hv * snapshot_stride_2
+            + offset_v[:, None] * snapshot_stride_3
+            + offset_k0[None, :] * snapshot_stride_4
+        )
+        snapshot_offsets1 = (
+            snapshot_idx * snapshot_stride_0
+            + step * snapshot_stride_1
+            + pid_hv * snapshot_stride_2
+            + offset_v[:, None] * snapshot_stride_3
+            + offset_k1[None, :] * snapshot_stride_4
+        )
+        tl.store(
+            snapshot_ptr + snapshot_offsets0,
+            state0,
+            mask=(snapshot_idx >= 0) & mask_state0,
+        )
+        tl.store(
+            snapshot_ptr + snapshot_offsets1,
+            state1,
+            mask=(snapshot_idx >= 0) & mask_state1,
+        )
+
+
+def kda_target_verify_npu(
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    intermediate_states_buffer: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    cache_steps: int,
+    scale: Optional[float] = None,
+    gates_are_preactivated: Optional[bool] = None,
+    lower_bound: Optional[float] = None,
+) -> torch.Tensor:
+    """KDA fixed-width target verification with per-step state snapshots.
+
+    The persistent and intermediate state layout is the Ascend KDA layout
+    ``[..., H_v, V, K]``. The persistent cache is read-only.
+
+    When ``gates_are_preactivated`` is true, ``a`` is the log-decay
+    ``-exp(A_log) * softplus(raw_a + dt_bias)`` and ``b`` is already sigmoid
+    activated. Both gate tensors may include the SGLang leading singleton.
+    When the flag is omitted, a paired leading singleton selects this mode.
+
+    When ``gates_are_preactivated`` is false, raw ``a`` and ``b`` are passed
+    directly and the gate activation (softplus or lower-bound sigmoid) and
+    beta sigmoid are computed inside the recurrent loop, eliminating the
+    separate ``fused_kda_gate_npu`` kernel launch and ``sigmoid`` op.
+    ``lower_bound`` selects the bounded gate formula
+    ``exp(lower_bound * sigmoid(exp(A_log) * (a + dt_bias)))`` when provided.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, and v must have shape [1, tokens, heads, dim]")
+    if q.shape[0] != 1 or k.shape[0] != 1 or v.shape[0] != 1:
+        raise ValueError("the leading q, k, and v dimension must be one")
+    if cache_steps <= 0 or q.shape[1] % cache_steps != 0:
+        raise ValueError("tokens must be divisible by positive cache_steps")
+    if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
+        raise ValueError("q, k, and v token dimensions must match")
+
+    batch = q.shape[1] // cache_steps
+    h_q, key_dim = q.shape[2:]
+    h_k = k.shape[2]
+    h_v, value_dim = v.shape[2:]
+    a_has_leading_singleton = a.ndim == 4
+    b_has_leading_singleton = b.ndim == 3
+    if a_has_leading_singleton != b_has_leading_singleton:
+        raise ValueError("a and b must use the leading singleton together")
+    if gates_are_preactivated is None:
+        gates_are_preactivated = a_has_leading_singleton
+    if a.ndim == 4:
+        if a.shape[0] != 1:
+            raise ValueError("4D a must have a leading singleton dimension")
+        a = a.squeeze(0)
+    if b.ndim == 3:
+        if b.shape[0] != 1:
+            raise ValueError("3D b must have a leading singleton dimension")
+        b = b.squeeze(0)
+    if k.shape[3] != key_dim:
+        raise ValueError("q and k key dimensions must match")
+    if h_v % h_q != 0 or h_v % h_k != 0:
+        raise ValueError("value heads must be divisible by q and k heads")
+    if tuple(a.shape) != (q.shape[1], h_k, key_dim):
+        raise ValueError("a must have shape [tokens, H_k, K]")
+    if tuple(b.shape) != (q.shape[1], h_v):
+        raise ValueError("b must have shape [tokens, H_v]")
+    if not gates_are_preactivated and (
+        A_log.numel() != h_k or tuple(dt_bias.shape) != (h_k, key_dim)
+    ):
+        raise ValueError("A_log and dt_bias shapes do not match KDA heads")
+    if initial_state_source.ndim != 4 or tuple(initial_state_source.shape[1:]) != (
+        h_v,
+        value_dim,
+        key_dim,
+    ):
+        raise ValueError("initial state must have shape [pool, H_v, V, K]")
+    if intermediate_states_buffer.ndim != 5 or tuple(
+        intermediate_states_buffer.shape[1:]
+    ) != (cache_steps, h_v, value_dim, key_dim):
+        raise ValueError("intermediate state must have shape [scratch, T, H_v, V, K]")
+    if initial_state_indices.ndim != 1 or initial_state_indices.numel() < batch:
+        raise ValueError("initial_state_indices must contain at least B entries")
+    if (
+        intermediate_state_indices.ndim != 1
+        or intermediate_state_indices.numel() < batch
+    ):
+        raise ValueError("intermediate_state_indices must contain at least B entries")
+
+    # SGLang produces q/k/v as views of a packed QKV tensor. The kernel consumes
+    # explicit strides so serving can avoid five per-layer materializations.
+    tensors = [
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        initial_state_source,
+        initial_state_indices,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+    ]
+    if any(t.device != q.device for t in tensors):
+        raise ValueError("all tensors must be on the same device")
+    A_log = A_log.contiguous()
+    dt_bias = dt_bias.contiguous()
+    initial_state_indices = initial_state_indices.contiguous()
+    intermediate_state_indices = intermediate_state_indices.contiguous()
+    if initial_state_source.dtype != intermediate_states_buffer.dtype:
+        raise ValueError("persistent and intermediate state dtypes must match")
+    if initial_state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("initial_state_indices must be int32 or int64")
+    if intermediate_state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("intermediate_state_indices must be int32 or int64")
+
+    if scale is None:
+        scale = key_dim**-0.5
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+
+    out = torch.empty((1, q.shape[1], h_v, value_dim), dtype=v.dtype, device=v.device)
+    if key_dim != 128:
+        raise ValueError("the k128_split_fused diagnostic supports only key_dim=128")
+    bk = 128
+    bv = 128 # min(64, triton.next_power_of_2(value_dim))
+    grid = (batch, h_v, triton.cdiv(value_dim, bv))
+    _kda_target_verify_k128_fused_kernel[grid](
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        initial_state_source,
+        initial_state_indices,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        out,
+        scale,
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        b.stride(0),
+        b.stride(1),
+        initial_state_source.stride(0),
+        initial_state_source.stride(1),
+        initial_state_source.stride(2),
+        initial_state_source.stride(3),
+        intermediate_states_buffer.stride(0),
+        intermediate_states_buffer.stride(1),
+        intermediate_states_buffer.stride(2),
+        intermediate_states_buffer.stride(3),
+        intermediate_states_buffer.stride(4),
+        H_Q=h_q,
+        H_K=h_k,
+        H_V=h_v,
+        K=key_dim,
+        V=value_dim,
+        STEPS=cache_steps,
+        BK=bk,
+        BV=bv,
+        GATES_ARE_PREACTIVATED=gates_are_preactivated,
+        USE_LOWER_BOUND=lower_bound is not None,
+        LOWER_BOUND=lower_bound if lower_bound is not None else 0.0,
+        multibuffer=True,
+    )
+    return out
 
 class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
@@ -653,6 +1101,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             intermediate_state_indices=intermediate_indices,
             cache_steps=draft_token_num,
             gates_are_preactivated=True,
+            lower_bound=layer.lower_bound,
         )
         if dense_token_indices is None:
             return out
