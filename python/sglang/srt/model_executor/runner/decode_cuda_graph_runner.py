@@ -756,29 +756,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get()
         )
 
+    def _set_profile_trace_tag(
+        self,
+        bs: int,
+        stream_idx: Optional[int],
+        variant_label: Optional[str],
+        attention_variant: Optional[str],
+    ) -> None:
+        """Name the trace for one capture. bs alone is not unique: the capture
+        loop multiplies it by the lora and attention variants (DSA captures
+        dense + sparse per bs). Absent variants are omitted so single-variant
+        runners keep the historical `bs_<n>` stem.
+        """
+        if getattr(self, "_profiler", None) is None:
+            return
+        parts = [f"bs_{bs}"]
+        if attention_variant is not None:
+            parts.append(attention_variant)
+        if variant_label is not None:
+            parts.append(variant_label)
+        if stream_idx is not None:
+            parts.append(f"stream{stream_idx}")
+        self._profile_trace_tag = "_".join(parts)
+
     def _init_profile_context_and_memory_record(self):
         if self._graph_batch_capture_active():
-            # Per-batch-size capture traces (SGLANG_GRAPH_BATCH_CAPTURE): a
-            # scheduled profiler is stepped once per batch size (see
-            # FullCudaGraphBackend.capture_one) and on_trace_ready writes one
-            # chrome trace per bs.
+            # SGLANG_GRAPH_BATCH_CAPTURE: the profiler is stepped once per
+            # captured shape (see FullCudaGraphBackend.capture_one), so
+            # on_trace_ready writes one chrome trace per shape.
             rank = get_parallel().tp_rank
             runner_name = type(self).__name__
             trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
-            # Track which BS is currently being captured for trace file naming
-            self._profile_bs_list = list(reversed(self.capture_bs))
-            self._profile_bs_idx = 0
+            self._profile_trace_tag = None
 
             def on_trace_ready(prof):
-                bs = self._profile_bs_list[self._profile_bs_idx]
+                tag = self._profile_trace_tag
                 trace_file = os.path.join(
-                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                    trace_dir, f"{runner_name}_{tag}_rank{rank}.json.gz"
                 )
                 prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for bs={bs} to {trace_file}")
-                self._profile_bs_idx += 1
+                logger.info(f"Saved trace for {tag} to {trace_file}")
 
             profile_context = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -1093,6 +1112,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
+                    # Tagged here, not in capture_one_shape: subclasses override
+                    # that but inherit this loop.
+                    self._set_profile_trace_tag(
+                        bs, stream_idx, variant_label, attention_variant
+                    )
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
