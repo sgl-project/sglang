@@ -7,6 +7,8 @@
 
 pub mod bridge;
 pub mod client;
+pub mod liveness;
+pub mod stream;
 
 pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
@@ -23,6 +25,7 @@ pub use client::{
     GrpcPrefixIndex, InvalidEndpoint, PrefixIndex, PrefixIndexConfig, PrefixIndexError,
     PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
 };
+pub use liveness::{Heartbeat, LivenessWatcher, DEFAULT_HEARTBEAT_TTL, DEFAULT_SWEEP_INTERVAL};
 pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{
     component_bit, server_builder, server_builder_with_max_concurrent_streams, BlockComponents,
@@ -31,6 +34,10 @@ pub use service::{
     MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
+pub use stream::{
+    StreamConsumer, StreamConsumerConfig, StreamSink, StreamStart, DEFAULT_CONSUMER_GROUP,
+    DEFAULT_LEASE_TTL, DEFAULT_STREAM_MAXLEN,
+};
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;
