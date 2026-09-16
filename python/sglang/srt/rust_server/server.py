@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
