@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-import sglang
+from sglang.cli.utils import (
+    _is_diffusion_model_from_hub_metadata,
+    get_is_diffusion_model,
+)
 from sglang.cli.serve import serve
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
@@ -249,26 +254,51 @@ class TestServeBackendDispatch(unittest.TestCase):
 
 
 class TestDiffusionImportIsolation(unittest.TestCase):
-    def test_multimodal_package_does_not_eagerly_import_generator_runtime(self):
+    def test_local_model_card_detects_diffusion_without_model_names(self):
+        with tempfile.TemporaryDirectory() as model_path:
+            with open(os.path.join(model_path, "README.md"), "w") as model_card:
+                model_card.write("---\npipeline_tag: text-to-image\n---\n")
+            self.assertTrue(get_is_diffusion_model(model_path))
+
+    @patch("sglang.cli.utils.HfApi")
+    def test_hub_metadata_detects_diffusion_without_model_names(self, mock_hf_api):
+        info = mock_hf_api.return_value.model_info.return_value
+        info.library_name = None
+        info.pipeline_tag = "text-to-video"
+        info.tags = []
+        self.assertTrue(_is_diffusion_model_from_hub_metadata("org/model"))
+
+        info.pipeline_tag = "text-generation"
+        self.assertFalse(_is_diffusion_model_from_hub_metadata("org/model"))
+
+    def test_llm_detection_does_not_import_multimodal_gen(self):
         script = """
-import importlib
+import os
 import sys
-import types
+from types import SimpleNamespace
+from unittest.mock import patch
 
-sglang = types.ModuleType("sglang")
-sglang.__path__ = [sys.argv[1]]
-sys.modules["sglang"] = sglang
-multimodal_gen = importlib.import_module("sglang.multimodal_gen")
-assert "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator" not in sys.modules
+os.environ.pop("SGLANG_EXTERNAL_MODEL_PACKAGE", None)
+from sglang.cli.utils import get_is_diffusion_model
 
-module_name = "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator"
-generator_module = types.ModuleType(module_name)
-generator_module.DiffGenerator = type("DiffGenerator", (), {})
-sys.modules[module_name] = generator_module
-assert multimodal_gen.DiffGenerator is generator_module.DiffGenerator
+model_info = SimpleNamespace(
+    library_name="transformers",
+    pipeline_tag="text-generation",
+    tags=["transformers"],
+)
+with patch("huggingface_hub.hf_hub_download", side_effect=FileNotFoundError), patch(
+    "sglang.cli.utils.HfApi"
+) as hf_api:
+    hf_api.return_value.model_info.return_value = model_info
+    assert not get_is_diffusion_model("org/llm")
+
+assert not any(
+    name == "sglang.multimodal_gen" or name.startswith("sglang.multimodal_gen.")
+    for name in sys.modules
+)
 """
         completed = subprocess.run(
-            [sys.executable, "-c", script, next(iter(sglang.__path__))],
+            [sys.executable, "-c", script],
             capture_output=True,
             text=True,
             timeout=30,

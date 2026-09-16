@@ -1,10 +1,12 @@
+import importlib
 import json
 import logging
 import os
 import subprocess
+import sys
 from functools import lru_cache
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, ModelCard
 
 from sglang.srt.environ import envs
 from sglang.utils import (
@@ -13,6 +15,8 @@ from sglang.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DIFFUSION_OUTPUT_MODALITIES = frozenset({"3d", "audio", "image", "video"})
 
 
 @lru_cache(maxsize=1)
@@ -24,14 +28,16 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
-def _is_diffusion_model_from_registry(model_path: str) -> bool:
-    try:
-        from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
-    except ImportError:
-        # if diffusion dependencies are not installed
+def _is_registered_diffusion_model(model_path: str) -> bool:
+    registry = sys.modules.get("sglang.multimodal_gen.registry")
+    if registry is None and os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE"):
+        try:
+            registry = importlib.import_module("sglang.multimodal_gen.registry")
+        except ImportError:
+            return False
+    if registry is None:
         return False
-
-    return is_registered_diffusion_model_path(model_path)
+    return registry.is_registered_diffusion_model_path(model_path)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -46,11 +52,33 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
     return "_diffusers_version" in config
 
 
-def _is_gated_diffusion_repo(repo_id: str) -> bool:
-    """Query HF model card metadata to check if a gated repo is a diffusers model."""
+def _metadata_marks_diffusion(metadata) -> bool:
+    library_name = (getattr(metadata, "library_name", None) or "").lower()
+    tags = {str(tag).lower() for tag in (getattr(metadata, "tags", None) or [])}
+    if library_name == "diffusers" or "diffusers" in tags:
+        return True
+
+    pipeline_tag = (getattr(metadata, "pipeline_tag", None) or "").lower()
+    output = pipeline_tag.rsplit("-to-", 1)[-1]
+    return any(
+        modality in output.split("-") for modality in _DIFFUSION_OUTPUT_MODALITIES
+    ) and ("-to-" in pipeline_tag or pipeline_tag.endswith("-generation"))
+
+
+def _is_diffusion_model_from_local_metadata(model_dir: str) -> bool:
+    readme_path = os.path.join(model_dir, "README.md")
+    if not os.path.isfile(readme_path):
+        return False
     try:
-        info = HfApi().model_info(repo_id)
-        return getattr(info, "library_name", None) == "diffusers"
+        return _metadata_marks_diffusion(ModelCard.load(readme_path).data)
+    except Exception:
+        return False
+
+
+def _is_diffusion_model_from_hub_metadata(repo_id: str) -> bool:
+    """Query model-card metadata without importing the diffusion runtime."""
+    try:
+        return _metadata_marks_diffusion(HfApi().model_info(repo_id))
     except Exception:
         return False
 
@@ -58,11 +86,10 @@ def _is_gated_diffusion_repo(repo_id: str) -> bool:
 def get_is_diffusion_model(model_path: str) -> bool:
     """Detect whether model_path points to a diffusion model.
 
-    For registered models, consults the diffusion registry first.
-    For other local directories, checks the filesystem directly.
-    For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
-    For gated repos where file download fails, falls back to HF model card
-    metadata (library_name == "diffusers").
+    Local directories are checked for Diffusers config or model-card metadata.
+    Remote models are detected from model_index.json or Hub metadata. The
+    diffusion registry is consulted only when already loaded or explicitly
+    configured, so auto-detecting an LLM does not import diffusion operators.
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
@@ -70,13 +97,15 @@ def get_is_diffusion_model(model_path: str) -> bool:
         # short-circuit, if applicable for the overlay mechanism (diffusion-only)
         return True
 
-    # the diffusion registry is authoritative for native models, including
-    # local directories without a top-level model_index.json
-    if _is_diffusion_model_from_registry(model_path):
-        return True
-
     if os.path.isdir(model_path):
-        return _is_diffusers_model_dir(model_path)
+        if _is_diffusers_model_dir(
+            model_path
+        ) or _is_diffusion_model_from_local_metadata(model_path):
+            return True
+        return _is_registered_diffusion_model(model_path)
+
+    if _is_registered_diffusion_model(model_path):
+        return True
 
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
@@ -90,10 +119,14 @@ def get_is_diffusion_model(model_path: str) -> bool:
 
             file_path = hf_hub_download(repo_id=model_path, filename="model_index.json")
 
-        return _is_diffusers_model_dir(os.path.dirname(file_path))
+        if _is_diffusers_model_dir(os.path.dirname(file_path)):
+            return True
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+
+    if envs.SGLANG_USE_MODELSCOPE.get():
         return False
+    return _is_diffusion_model_from_hub_metadata(model_path)
 
 
 def try_get_model_path(extra_argv) -> str | None:
