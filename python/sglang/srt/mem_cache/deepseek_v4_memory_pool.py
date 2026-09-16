@@ -135,10 +135,8 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     family pool, from ``SGLANG_DSV4_KV_LAYOUT`` (``v4`` | ``v41`` | ``auto``) and
     ``SGLANG_DSV4_COMPRESSED_KV_LAYOUT`` (``auto`` | ``fp8`` | ``fp4``).
 
-    The V4.1 layouts exist only in the SM100 / SM103 FlashMLA decode kernels:
-    ``v41`` raises elsewhere, ``auto`` picks them on SM100 / SM103 when the
-    installed FlashMLA advertises them and stays on ``v4`` otherwise (SM90 and
-    SM120 always keep the 584-byte V4 layout).
+    Compact layouts require SM100/SM103 FlashMLA or gfx950 AITER attention.
+    ``v41`` raises on unsupported backends; ``auto`` keeps ``v4`` there.
     """
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
@@ -150,6 +148,21 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         and torch.version.cuda is not None
         and torch.cuda.get_device_capability()[0] == 10
     )
+    if _is_hip:
+        from sglang.srt.layers.attention.hip_flash_mla import (
+            resolve_hip_flashmla_backend,
+        )
+        from sglang.srt.utils import is_gfx95_supported
+
+        supported = (
+            is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
+        )
+        if mode == "auto" and not supported:
+            return KVLayout.V4, None
+        assert supported, (
+            "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+        )
+        return KVLayout.V41, option
     supported = flashmla_supports_v41_kv_layouts()
     if mode == "auto":
         if is_sm100 and supported:

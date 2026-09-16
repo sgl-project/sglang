@@ -34,13 +34,21 @@ struct FusedKNormRopeQFlashMLAParams {
 };
 
 // copied from main_norm_rope.cuh fused_k_norm_rope_flashmla; the query-rope block is the addition
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    int32_t kPageBits,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
 K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRopeQFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(1 << kPageBits);
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -122,6 +130,28 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
   // here, not at the load, so the out_loc prefetch overlaps the norm above.
   if (out_loc < 0) return;
 
+  const auto row = Paged::row(params.kvcache, out_loc);
+  if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
+    // V4.1 layouts: every dim is quantized, with one scale per 32 (fp8) or 16 (fp4)
+    // values. The reference quantizes the bf16 tensor kv_norm produces and rotates
+    // the tail in bf16, so round the normed values to the storage dtype, rotate,
+    // round again, then quantize the whole row.
+    using Packed = packed_t<DType>;
+    PDLTriggerSecondary<kUsePDL>();
+
+    auto rounded = cast<fp32x2_t>(cast<Packed>(fp32x2_t{data[0], data[1]}));
+    if (warp_id == kRopeWarp) {
+      const auto x_real = rounded.x;
+      const auto x_imag = rounded.y;
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      rounded = cast<fp32x2_t>(
+          cast<Packed>(fp32x2_t{x_real * freq_real - x_imag * freq_imag, x_real * freq_imag + x_imag * freq_real}));
+    }
+    const float v[2] = {rounded.x, rounded.y};
+    return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
+  }
+
   const int32_t page = out_loc >> kPageBits;
   const int32_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
@@ -154,16 +184,23 @@ K_KERNEL void fused_k_norm_rope_q_flashmla(const __grid_constant__ FusedKNormRop
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kUsePDL>
 struct FusedKNormRopeQFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_norm_rope_q_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
+  static constexpr auto kernel =
+      fused_k_norm_rope_q_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
 
   /// `FusedKNormRopeFlashMLAKernel::forward`'s arguments plus `q` (B, H, kHeadDim).
   static void forward(
