@@ -2097,11 +2097,12 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report an Elastic EP operation update or runtime-health change."""
 
     success: bool
     effective_ep_size: int
     operation_id: Optional[str] = None
+    operation_update: bool = True
     scale_phase: str = "idle"
     terminal: bool = True
     joining_rank_offset: int = 0
@@ -2111,6 +2112,8 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
+    runtime_health: Optional[str] = None
+    runtime_error: Optional[str] = None
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):

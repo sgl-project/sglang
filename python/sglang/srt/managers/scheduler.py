@@ -5248,6 +5248,10 @@ class Scheduler(
             ret["pending_ep_size"] = ElasticEPStateManager.get_pending_ep_size()
             ret["scale_phase"] = ElasticEPStateManager.get_scale_phase()
             ret["elastic_ep_last_error"] = ElasticEPStateManager.get_last_error()
+            ret["elastic_ep_runtime_health"] = (
+                ElasticEPStateManager.get_runtime_health()
+            )
+            ret["elastic_ep_runtime_error"] = ElasticEPStateManager.get_runtime_error()
 
         if (
             not self.spec_algorithm.is_none()
@@ -5729,16 +5733,12 @@ class Scheduler(
                     new_ep_size=new_ep_size,
                     pending_ep_size=state.pending_ep_size,
                     scale_phase=state.scale_phase,
-                    terminal=state.pending_ep_size is None,
+                    terminal=state.operation_succeeded is not None,
                     effective_ep_size=state.effective_ep_size,
                 )
 
-            terminal = state.scale_phase in (
-                "failed",
-                "recovery_unsupported",
-                "serving_expanded",
-            )
-            success = state.scale_phase not in ("failed", "recovery_unsupported")
+            terminal = state.operation_succeeded is not None
+            success = state.operation_succeeded is not False
             return ScaleElasticEPReqOutput(
                 success=success,
                 message=(

@@ -165,8 +165,14 @@ class ElasticEPState:
     active_ranks_cpu: Optional[torch.Tensor]
     effective_ep_size: int = 0
     pending_ep_size: Optional[int] = None
+    # These fields describe the latest scale operation and stop changing once
+    # operation_succeeded becomes non-None.
     scale_phase: str = "idle"
+    operation_succeeded: Optional[bool] = None
     last_error: Optional[str] = None
+    # Runtime health is independent from the latest scale operation result.
+    runtime_health: str = "healthy"
+    runtime_error: Optional[str] = None
     pending_since: Optional[float] = None
     original_ep_size: int = 0
     has_scaled: bool = False
@@ -300,7 +306,7 @@ class ElasticEPStateManager:
             return False
         if (
             inst.pending_ep_size is not None
-            or inst.scale_phase == "recovery_unsupported"
+            or inst.runtime_health == "recovery_unsupported"
         ):
             return False
         register_scale_operation(
@@ -318,6 +324,7 @@ class ElasticEPStateManager:
             expected_joining_member_ids or []
         )
         inst.scale_phase = "waiting_for_cohort"
+        inst.operation_succeeded = None
         inst.last_error = None
         inst.pending_since = time.monotonic()
         return True
@@ -371,6 +378,7 @@ class ElasticEPStateManager:
         inst.pending_ep_size = None
         inst.has_scaled = True
         inst.scale_phase = "serving_expanded"
+        inst.operation_succeeded = True
         inst.last_error = None
         inst.pending_since = None
         inst.reset()
@@ -378,10 +386,11 @@ class ElasticEPStateManager:
     @classmethod
     def fail_scale(cls, error: str) -> None:
         inst = cls._instance
-        if inst is None:
+        if inst is None or inst.pending_ep_size is None:
             return
         inst.pending_ep_size = None
         inst.scale_phase = "failed"
+        inst.operation_succeeded = False
         inst.last_error = error
         inst.pending_since = None
         inst.reset()
@@ -391,8 +400,8 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return
-        inst.scale_phase = "recovery_unsupported"
-        inst.last_error = error
+        inst.runtime_health = "recovery_unsupported"
+        inst.runtime_error = error
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -433,6 +442,20 @@ class ElasticEPStateManager:
         return inst.last_error
 
     @classmethod
+    def get_runtime_health(cls) -> str:
+        inst = cls._instance
+        if inst is None:
+            return "disabled"
+        return inst.runtime_health
+
+    @classmethod
+    def get_runtime_error(cls) -> Optional[str]:
+        inst = cls._instance
+        if inst is None:
+            return None
+        return inst.runtime_error
+
+    @classmethod
     def get_ep_join_rank_offset(cls) -> int:
         inst = cls._instance
         if inst is None:
@@ -459,7 +482,7 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
             return False
-        if inst.scale_phase == "recovery_unsupported":
+        if inst.runtime_health == "recovery_unsupported":
             return False
         if inst.pending_ep_size is not None:
             return True

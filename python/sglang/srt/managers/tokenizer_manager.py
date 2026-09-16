@@ -494,6 +494,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        self.elastic_runtime_health = "healthy"
+        self.elastic_runtime_error = None
         self.elastic_joining_rank_offset = None
         self.elastic_joining_rank_count = 0
         self.elastic_ready_rank_count = 0
@@ -3427,6 +3429,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if not msg.operation_update:
+            if msg.runtime_health is not None:
+                self.elastic_runtime_health = msg.runtime_health
+                self.elastic_runtime_error = msg.runtime_error
+            return
+
         if (
             msg.operation_id is not None
             and msg.operation_id != self.elastic_operation_id
@@ -3438,6 +3446,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
 
+        if msg.runtime_health is not None:
+            self.elastic_runtime_health = msg.runtime_health
+            self.elastic_runtime_error = msg.runtime_error
         self.elastic_scale_phase = msg.scale_phase
         self.elastic_joining_rank_offset = msg.joining_rank_offset
         self.elastic_joining_rank_count = msg.joining_rank_count
@@ -3470,6 +3481,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "runtime_health": self.elastic_runtime_health,
+            "runtime_error": self.elastic_runtime_error,
             "joining_rank_offset": self.elastic_joining_rank_offset,
             "joining_rank_count": self.elastic_joining_rank_count,
             "ready_rank_count": self.elastic_ready_rank_count,
