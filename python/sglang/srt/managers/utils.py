@@ -24,8 +24,8 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
+    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
     from sglang.srt.speculative.spec_info import SpecInput
 
 
