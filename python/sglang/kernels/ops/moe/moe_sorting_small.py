@@ -27,8 +27,8 @@ to the original functions when the fast path does not apply:
 from __future__ import annotations
 
 import functools
-from contextvars import ContextVar
 import logging
+from contextvars import ContextVar
 
 import torch
 import triton
