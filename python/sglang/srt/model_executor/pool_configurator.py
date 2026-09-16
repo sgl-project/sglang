@@ -1090,8 +1090,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 max_speculative_num_draft_tokens() or 0
             )
 
-        from sglang.srt.runtime_context import get_exec
-
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         self.paged_draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
