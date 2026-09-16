@@ -552,6 +552,10 @@ class MoEGate(nn.Module):
                 out_dtype=torch.float32,
                 max_m=self.tiny_router_gemm_max_tokens,
             )
+        elif _is_hip and self.is_deepseek_v4 and self.weight.dtype == torch.bfloat16:
+            # Keep V4 router scores in FP32, as in the CUDA and tiny-GEMM paths.
+            # BF16 output rounding changes expert weights for identical rows.
+            logits = torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
         elif not _is_cuda:
