@@ -481,6 +481,60 @@ def hc_boundary(
     return new_residual, y, coefficients
 
 
+def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+
+    if not (
+        _is_gfx95_supported
+        and envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.get()
+        and 1 <= residual.shape[0] <= 8
+        and residual.shape[1:] == (4, 5120)
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+        and layer.config.model_type == "deepseek_v41"
+        and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        and get_parallel().attn_dp_size == 1
+        and get_parallel().tp_size == layer.self_attn.attn_tp_size == 4
+        and layer.self_attn.wo_b.reduce_results
+        and not layer.dsa_enable_prefill_cp
+        and not get_forward().sp_active
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        return None
+
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+    from sglang.srt.distributed.parallel_state import get_attn_tp_group
+    from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion
+
+    comm = get_attn_tp_group().ca_comm
+    if not (
+        isinstance(comm, CustomAllreduce)
+        and not comm.disabled
+        and comm.world_size == 4
+        and comm.enable_register_for_capturing
+    ):
+        return None
+    coefficients.materialize()
+    return MhcPostFusion(
+        residual, coefficients.post, coefficients.comb, None, pre=coefficients.pre
+    )
+
+
+def apply_attention_mhc(x, state):
+    from sglang.kernels.ops.communication.all_reduce_mhc_hip import all_reduce_mhc_post
+    from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+    state.output = all_reduce_mhc_post(
+        x, state.residual, state.post, state.comb, get_attn_tp_group().ca_comm
+    )
+
+
 def forward_hc_pre_from_prev_fused_boundary(
     layer,
     positions: torch.Tensor,
@@ -492,8 +546,8 @@ def forward_hc_pre_from_prev_fused_boundary(
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``: one fused launch per
-    boundary. ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual, post,
+    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``.
+    ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual, post,
     comb)``; with ``defer_post`` this layer's is returned the same way and ``hidden_states`` is None."""
     if pending_post is not None:
         residual, x, attn_coefficients = hc_boundary(
@@ -520,16 +574,23 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
+    from sglang.srt.layers.moe.mhc_post_fusion import use_mhc_post_fusion
+
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-        x = layer.self_attn(
-            x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
-        )
+        mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
+        with use_mhc_post_fusion(mhc):
+            x = layer.self_attn(
+                x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
+            )
+    if mhc is not None:
+        residual = mhc.output
+        x = None
     residual, x, ffn_coefficients = hc_boundary(
         layer,
         x,
         residual,
-        attn_coefficients.post,
-        attn_coefficients.comb,
+        attn_coefficients.post if mhc is None else None,
+        attn_coefficients.comb if mhc is None else None,
         attn_coefficients.pre,
         layer.hc_ffn_fn,
         layer.hc_ffn_scale,

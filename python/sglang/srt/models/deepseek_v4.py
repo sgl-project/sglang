@@ -2606,6 +2606,9 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
+        return self._project_wo_b(o)
+
+    def _project_wo_b(self, o):
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
@@ -2616,6 +2619,13 @@ class MQALayer(MqaAttentionBase):
         if mhc is not None and mhc.overlap_only:
             mhc.start_stats_before_all_reduce()
             o = attn_tp_all_reduce(o)
+        elif mhc is not None and _is_hip:
+            # The HIP fused boundary hands over post/comb directly; a lazily
+            # recorded state (main's MhcPostFusion) is materialized first.
+            mhc.materialize_stats()
+            if mhc.stats_stream is not None:
+                torch.cuda.current_stream().wait_stream(mhc.stats_stream)
+            _hip.apply_attention_mhc(o, mhc)
         elif mhc is not None:
             from sglang.kernels.ops.communication.all_reduce_mhc import (
                 all_reduce_mhc_norm,
