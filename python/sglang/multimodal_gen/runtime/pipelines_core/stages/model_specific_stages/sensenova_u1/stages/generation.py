@@ -66,12 +66,20 @@ class SenseNovaU1GenerationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         del server_args
         options = SenseNovaU1GenerationOptions.from_batch(batch)
-        if int(batch.num_outputs_per_prompt) != 1:
+
+
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+
+        generators = batch.generator
+        
+        if isinstance(generators, torch.Generator):
+            generators = [generators]
+
+        if generators is None or len(generators) != num_outputs:
             raise ValueError(
-                "SenseNova-U1 expects output expansion before generation; "
-                f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
+                f"Expected {num_outputs} generators, "
+                f"got {0 if generators is None else len(generators)}."
             )
-        seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
 
         out = self.model.t2i_generate(
             self.tokenizer,
@@ -83,11 +91,12 @@ class SenseNovaU1GenerationStage(PipelineStage):
             enable_timestep_shift=options.enable_timestep_shift,
             cfg_interval=options.cfg_interval,
             num_steps=int(batch.num_inference_steps),
-            batch_size=1,
+            batch_size=num_outputs,
             t_eps=options.t_eps,
             think_mode=options.think_mode,
-            seed=seed,
+            generators=generators,
         )
+
         think_text = None
         if options.think_mode:
             images, think_text = out
