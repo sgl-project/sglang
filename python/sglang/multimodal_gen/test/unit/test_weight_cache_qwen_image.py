@@ -2,6 +2,7 @@
 """Qwen adapter decisions without loading checkpoint tensors."""
 
 import json
+import multiprocessing as mp
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -67,6 +68,81 @@ def prepared_qwen(tmp_path):
         ),
     ):
         yield args
+
+
+def _auto_plan_in_fresh_process(model_path, free_gb, connection):
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+    from sglang.multimodal_gen.runtime.weight_cache.identity import compatibility_plan
+
+    # Inject the hardware observation, not the tuning result or residency plan.
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "is_cpu", return_value=False),
+        patch.object(
+            current_platform, "get_available_gpu_memory", return_value=free_gb
+        ) as probe,
+        patch.object(current_platform, "get_device_uuid", return_value="GPU-planned"),
+        patch.object(ServerArgs, "_adjust_network_ports"),
+        patch(
+            "sglang.multimodal_gen.runtime.weight_cache.identity.environment_identity",
+            return_value={"test_build": "fixed"},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.prepare.maybe_download_model",
+            return_value=model_path,
+        ),
+    ):
+        args = ServerArgs(
+            model_path=model_path,
+            pipeline_config=QwenImagePipelineConfig(),
+            performance_mode="auto",
+            weight_cache_mode="client",
+            weight_cache_allow_weak_checkpoint_identity=True,
+        )
+        prepared = prepare_pipeline(QwenImagePipeline, args, required=True)
+        connection.send(
+            {
+                "compatibility": compatibility_plan(prepared, args).to_dict(),
+                "execution": prepared.execution_plan,
+                "dit": args.residency_mode("transformer"),
+                "fsdp": args.should_use_fsdp_for_component("transformer"),
+                "probe_count": probe.call_count,
+            }
+        )
+    connection.close()
+
+
+def test_auto_tuning_across_bare_owner_worker_memory_states(prepared_qwen):
+    context = mp.get_context("spawn")
+    results = []
+    # These model three separate process observations before/after resident
+    # owner allocations. Actual tuner runs in every process, unchanged.
+    for free_gb in (80, 40, 30):
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_auto_plan_in_fresh_process,
+            args=(prepared_qwen.model_path, free_gb, child),
+        )
+        process.start()
+        child.close()
+        try:
+            assert parent.poll(90), "planning child timed out"
+            results.append(parent.recv())
+            process.join(10)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join(10)
+            parent.close()
+    assert all(result["probe_count"] > 0 for result in results)
+    assert all(result["dit"] == "resident" and not result["fsdp"] for result in results)
+    assert (
+        results[0]["compatibility"]
+        == results[1]["compatibility"]
+        == results[2]["compatibility"]
+    )
+    assert results[0]["execution"] != results[1]["execution"]
 
 
 def test_both_adapters_use_the_same_ordinary_and_meta_loaders():

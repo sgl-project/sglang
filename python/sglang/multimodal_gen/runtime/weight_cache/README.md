@@ -46,6 +46,31 @@ hashed across the installed `sglang` package; editing it requires restarting the
 owner. Development-only weak/unverified identity switches explicitly relax this
 contract and are not production defaults.
 
+Identity includes installed `sglang-kernel` (Python import `sgl_kernel`), selected
+FA4 provider, and native/JIT dependency versions and publication RECORD hashes.
+`SGLANG_INKLING_FA4_USE_PIP=1` must match between processes and requires the
+published `flash-attn-4` package. Dynamic external FA3 artifacts selected by
+`SGLANG_USE_SGL_FA3_KERNEL=0` are not admitted. Required providers cannot be absent;
+an installed provider without RECORD requires the explicit development-only
+unverified-build switch. This is publication identity, not binary tamper detection.
+
+Query the owner without loading checkpoint tensors or consuming a delivery:
+
+```bash
+python -m sglang.multimodal_gen.runtime.weight_cache.daemon --status \
+  --model-path /path/to/published/model
+```
+
+Use the owner's same model/variant/socket/provider settings. The final stdout
+line is JSON with generation/producer identity, active consumers, unique shared
+bytes, storage count, reserved/remaining budgets, failed deliveries and admission
+state. `fetches_remaining` is the minimum of the remaining delivery limit and
+`floor(remaining_storage_exports / storage_count)`; it is not always 128.
+Status remains available after exhaustion; new launcher admissions and fetches
+fail closed. Consumer exit never refunds budget. `admission_stopped` is distinct
+from budget exhaustion. This is a snapshot, not a reservation or allocator/VRAM
+measurement; a draining/exited owner may no longer serve the socket.
+
 ## Reuse boundary
 
 | Responsibility | Implementation |
@@ -118,6 +143,26 @@ memory or derived "headroom" as total physical GPU usage; include the owner and
 its runtime/allocator overhead when budgeting memory.
 
 ## Verification
+
+Additional focused regressions:
+
+```bash
+pytest python/sglang/multimodal_gen/test/unit/test_weight_cache_*.py -q
+pytest test/registered/e2e/model_loader/test_diffusion_weight_cache_lifecycle.py -v -s
+pytest python/sglang/multimodal_gen/test/single_test_file/test_weight_cache_startup_guard_1_gpu.py -v -s
+pytest test/registered/model_loading/test_weight_cache_daemon.py::TestWeightCacheDaemonTP1Smoke test/registered/model_loading/test_weight_cache_daemon.py::TestWeightCacheDaemonTP2 -v -s
+```
+
+The startup-guard test instruments the native safetensors/Torch tensor-read APIs
+from fresh interpreter startup, including launcher and spawned worker, with a
+positive rejection control. It allows header/stat/config and uncached-component
+reads, runs two simultaneous Wan consumers, checks output/weight parity, and
+checks real owner status through budget exhaustion and client exit. It is not a
+generic syscall/security sandbox. The lifecycle test uses a tiny CUDA adapter
+with real diffusion socket/IPC orchestration and injects generation replacement
+and producer death before fetch, during finalize, and during slow uncached load.
+The automatic-placement test injects only free-memory observations in separate
+processes and verifies stable cached identity despite uncached placement changes.
 
 The standalone GPU test uses the existing diffusion HTTP server manager and
 video validators, with five ordinary starts and five cached worker restarts for
