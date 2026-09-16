@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -139,15 +140,16 @@ def get_token_ids_logprobs_raw(
     no_copy_to_cpu: bool = False,
 ):
     vals, idxs = [], []
+    pin_memory = is_pin_memory_available(logprobs.device)
     if stage == LogprobStage.DECODE:
         for i, token_ids in enumerate(token_ids_logprobs_list):
             if token_ids is None:
                 vals.append([])
                 idxs.append([])
             else:
-                token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                    logprobs.device, non_blocking=True
-                )
+                token_ids_tensor = torch.tensor(
+                    token_ids, dtype=torch.long, pin_memory=pin_memory
+                ).to(logprobs.device, non_blocking=True)
                 row = logprobs[i, token_ids_tensor]
                 vals.append(row if no_copy_to_cpu else row.tolist())
                 idxs.append(token_ids)
@@ -166,9 +168,9 @@ def get_token_ids_logprobs_raw(
                 idxs.append([])
                 pt += pruned_len
                 continue
-            token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
-                logprobs.device, non_blocking=True
-            )
+            token_ids_tensor = torch.tensor(
+                token_ids, dtype=torch.long, pin_memory=pin_memory
+            ).to(logprobs.device, non_blocking=True)
             pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
             idxs.append([token_ids for _ in range(pruned_len)])

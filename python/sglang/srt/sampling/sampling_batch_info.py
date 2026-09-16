@@ -136,10 +136,24 @@ class SamplingBatchInfo:
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
             logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            indices, values = [], []
             for i, r in enumerate(reqs):
                 if r.sampling_params.logit_bias is not None:
-                    for key, value in r.sampling_params.logit_bias.items():
-                        logit_bias[i, int(key)] = value
+                    row_bias = {
+                        int(key): value
+                        for key, value in r.sampling_params.logit_bias.items()
+                    }
+                    for token_id, value in row_bias.items():
+                        indices.append((i, token_id))
+                        values.append(value)
+            if indices:
+                indices = torch.tensor(indices, dtype=torch.long, pin_memory=_pin).to(
+                    device, non_blocking=True
+                )
+                values = torch.tensor(
+                    values, dtype=logit_bias.dtype, pin_memory=_pin
+                ).to(device, non_blocking=True)
+                logit_bias[indices[:, 0], indices[:, 1]] = values
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -167,7 +181,7 @@ class SamplingBatchInfo:
                     # The deserialized custom logit processor object
                     CustomLogitProcessor.from_str(processor_str),
                     # The mask tensor for the requests that use this custom logit processor
-                    torch.zeros(len(reqs), dtype=torch.bool)
+                    torch.zeros(len(reqs), dtype=torch.bool, pin_memory=_pin)
                     .scatter_(0, torch.tensor(true_indices), True)
                     .to(device, non_blocking=True),
                 )
