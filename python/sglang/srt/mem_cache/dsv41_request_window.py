@@ -62,6 +62,7 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    replay: bool = False,
 ):
     n = pos.numel()
     if n == 0:
@@ -73,6 +74,8 @@ def window_layout(
     offset = torch.arange(n, device=device)
     group, group_first, group_last = _first_row_offsets(req)
     first_pos = pos - (offset - group_first)
+    if replay:
+        floor = first_pos
     history_rows = groups * window
 
     write_loc = (history_rows + offset).to(torch.int32)

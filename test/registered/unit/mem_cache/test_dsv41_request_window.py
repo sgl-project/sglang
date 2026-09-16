@@ -131,6 +131,28 @@ def test_layout_shapes_depend_only_on_batch_geometry():
     assert int(a.history_valid.sum()) == 3
 
 
+def test_replay_uses_each_requests_chunk_start_as_the_history_floor():
+    req = torch.tensor([2, 2, 2, 0, 0])
+    pos = torch.tensor([4, 5, 6, 18, 19])
+    expected = window_layout(
+        req,
+        pos,
+        window=3,
+        capacity=8,
+        num_groups=4,
+        floor=torch.tensor([4, 4, 4, 18, 18]),
+    )
+    actual = window_layout(req, pos, window=3, capacity=8, num_groups=4, replay=True)
+    for left, right in zip(astuple(actual), astuple(expected)):
+        assert (
+            torch.equal(left, right)
+            if isinstance(left, torch.Tensor)
+            else left == right
+        )
+    assert actual.lengths.tolist() == [1, 2, 3, 1, 2]
+    assert not actual.history_valid.any()
+
+
 def test_startup_dummy_history_does_not_relax_real_request_validation():
     state = RequestWindow(PackedPool, num_slots=3, layers=2, page_size=4, capacity=8)
     layout = window_layout(torch.tensor([1]), torch.tensor([20]), window=3, capacity=8)
