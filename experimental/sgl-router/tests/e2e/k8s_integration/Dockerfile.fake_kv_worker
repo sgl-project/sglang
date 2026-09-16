@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+WORKDIR /app
+# pyzmq for the real PUB socket, msgspec for the msgpack encoding the router's
+# `wire` module decodes — both are what make this a faithful publisher rather
+# than a stub.
+RUN pip install --no-cache-dir fastapi uvicorn pyzmq msgspec
+COPY fake_kv_worker.py .
+EXPOSE 8000 5557
+CMD ["python", "fake_kv_worker.py"]

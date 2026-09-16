@@ -388,13 +388,85 @@ pub enum CachePrefixProvider {
 }
 
 /// Per-model Cache-Aware configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Prefix-match source for native Cache-Aware.
     pub prefix_provider: CachePrefixProvider,
     /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
+    /// How long a freshly started replica may hold `/readyz` at 503 while it
+    /// pulls a cache-aware tree snapshot from a warm sibling.
+    ///
+    /// The deadline runs from the first worker discovery, not from process
+    /// start, so slow worker discovery does not eat the budget. On expiry the
+    /// replica serves anyway with whatever it has — a cold fleet has no warm
+    /// sibling to ask, so a gate without a deadline would never open.
+    ///
+    /// Only consulted when a peer selector is configured; see
+    /// [`K8sDiscoveryConfig::peer_selector`].
+    pub bootstrap_timeout_ms: u64,
+    /// Upper bound on a single peer-snapshot fetch. The per-fetch timeout is
+    /// derived as a quarter of `bootstrap_timeout_ms` (raised toward a 5s floor
+    /// for short budgets) so several peers can be tried within one deadline;
+    /// this caps that derivation.
+    ///
+    /// Raise it when the fleet's tree is large enough that one transfer +
+    /// decode of the snapshot body no longer fits under the derived value.
+    pub bootstrap_fetch_timeout_cap_ms: u64,
+    /// Hold `/readyz` at 503 when a sweep proved siblings were present and
+    /// their tree could not be pulled, instead of serving cache-blind.
+    ///
+    /// Off by default. A NotReady pod is absent from the Service, so with this
+    /// on a failed seed STALLS a rolling update — the previous generation keeps
+    /// serving — rather than completing it with replicas that route
+    /// cache-blind and scatter the prefixes the warm replicas were keeping
+    /// consolidated. Only a `TimedOut` sweep over a non-empty candidate set
+    /// counts; a first deploy and a cold fleet are unaffected, and the hold is
+    /// bounded at three times `bootstrap_timeout_ms` so a simultaneous
+    /// fleet-wide restart degrades to a delay rather than an outage with no
+    /// exit.
+    pub bootstrap_seed_required: bool,
 }
+
+impl Default for CacheAwareConfig {
+    fn default() -> Self {
+        Self {
+            prefix_provider: CachePrefixProvider::default(),
+            kv_indexer_endpoint: None,
+            bootstrap_timeout_ms: DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+            bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
+            bootstrap_seed_required: false,
+        }
+    }
+}
+
+/// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
+/// enough to sit inside a normal readinessProbe budget.
+pub const DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 5_000;
+
+/// 120s: comfortably past one gzipped transfer + decode of a snapshot body on
+/// a warm fleet — measured at 40 MB gzipped / 208 MB inflated / 17s on a
+/// 61-engine Kimi-K3 fleet at half its usual tree size. A hung peer is not this
+/// value's problem: separate connect and read timeouts bound "not answering"
+/// and "stopped sending", leaving this to bound only a transfer that is
+/// progressing. Must agree with
+/// [`crate::policies::kv_events::bootstrap::DEFAULT_SNAPSHOT_FETCH_TIMEOUT_CAP`];
+/// a test pins the two.
+pub const DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 120_000;
+
+/// Floor for `--kv-bootstrap-fetch-timeout-cap-ms`. Below the internal fetch
+/// floor the cap would cut every fetch short of a body transfer. Mirrors
+/// `SNAPSHOT_FETCH_TIMEOUT_FLOOR` in `policies::kv_events::index`; keep them in
+/// agreement if it moves.
+pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 5_000;
+
+/// Ceiling on `--kv-bootstrap-timeout-ms`.
+///
+/// `Instant::now() + Duration::from_millis(n)` panics on overflow, so an absurd
+/// value would abort the process at startup rather than being rejected at parse
+/// time. The ceiling is also well past any sane readinessProbe budget — this is
+/// how long `/readyz` may stay 503.
+pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 600_000;
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
 /// matches the router's other emitted/consumed metadata headers
@@ -605,6 +677,17 @@ pub struct K8sDiscoveryConfig {
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,
+    /// Label selector matching this router's OWN pods, so a booting replica can
+    /// find sibling replicas to pull a cache-aware tree snapshot from.
+    ///
+    /// `None` disables peer bootstrap and every replica starts cold — the
+    /// pre-existing behaviour. Watched in the same namespace as `namespace`,
+    /// which is why this lives here rather than on
+    /// [`crate::config::CacheAwareConfig`].
+    ///
+    /// Requires the router's ServiceAccount to have `get`/`list`/`watch` on
+    /// EndpointSlices for its own Service, in addition to the worker ones.
+    pub peer_selector: Option<String>,
 }
 
 /// Resolved discovery mode, produced by [`resolve_mode`] from the CLI

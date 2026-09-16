@@ -16,8 +16,11 @@
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
+//! - [`bootstrap`] — peer-snapshot wire format, so a booting replica can
+//!   prewarm its tree from a warm sibling instead of routing cache-blind.
 
 pub mod block_size_oracle;
+pub mod bootstrap;
 pub mod discovery;
 pub mod hash;
 pub mod index;
@@ -27,6 +30,7 @@ pub mod tree;
 pub mod wire;
 
 pub use block_size_oracle::BlockSizeOracle;
+pub use bootstrap::{BootstrapState, BootstrapTracker, PeerRegistry, WireWorker};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
@@ -34,7 +38,8 @@ pub use index::{KvEventIndex, KvIndexMetrics};
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 pub use tally::{EventKind, EventTally, TallyRow};
 pub use tree::{
-    HashTree, KvWorkerId, MatchResult, TierCounts, Tiers, ACCOUNTING_REASONS, TIER_SLOT_COUNT,
+    HashTree, KvWorkerId, MatchResult, SnapshotNode, TierCounts, Tiers, ACCOUNTING_REASONS,
+    TIER_SLOT_COUNT,
 };
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,

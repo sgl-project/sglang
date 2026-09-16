@@ -9,11 +9,13 @@
 
 use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
+use crate::policies::kv_events::bootstrap::PeerRegistry;
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
 use kube::{api::Api, runtime::watcher, Client};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Decide which [`WorkerMode`] an `EndpointSlice` should be assigned, based
@@ -330,7 +332,13 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    // `peer_selector` drives a separate watch (`spawn_peer_watch`), not the
+    // worker stream this function serves.
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        peer_selector: _,
+    } = cfg;
 
     let client = Client::try_default()
         .await
@@ -389,6 +397,293 @@ pub async fn spawn(
         process_events(stream, tx, mode).await;
     });
     Ok(handle)
+}
+
+// ---------------------------------------------------------------------------
+// Peer discovery — sibling router replicas, for KV-tree bootstrap
+// ---------------------------------------------------------------------------
+
+/// Port assumed for a sibling replica when its EndpointSlice omits one — the
+/// router's own default listen port.
+const DEFAULT_ROUTER_PORT: i32 = 30000;
+
+/// How this replica recognizes itself in an EndpointSlice, so it does not
+/// offer itself as a bootstrap source.
+///
+/// Built from the downward API. `pod_name` is the primary signal: it matches
+/// the endpoint's `target_ref` and so excludes ALL of the pod's addresses,
+/// which `ip` alone cannot do — `POD_IP` carries only the pod's primary
+/// address, so on a dual-stack Service the pod's secondary-family address
+/// would survive an IP-only filter. `ip` is kept as a fallback for endpoints
+/// whose `target_ref` is absent (manually-created slices).
+#[derive(Default, Debug)]
+struct SelfIdentity {
+    pod_name: Option<String>,
+    pod_namespace: Option<String>,
+    ip: Option<String>,
+}
+
+/// A set-but-empty env var must count as unset: the downward API never yields
+/// empty, but a hand-written manifest can, and `Some("")` would suppress the
+/// [`SelfIdentity::is_unknown`] warning while matching nothing.
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+impl SelfIdentity {
+    fn from_env() -> Self {
+        Self {
+            pod_name: env_non_empty("POD_NAME"),
+            pod_namespace: env_non_empty("POD_NAMESPACE"),
+            ip: env_non_empty("POD_IP"),
+        }
+    }
+
+    /// True when nothing usable for self-exclusion is known (`POD_NAMESPACE`
+    /// alone cannot exclude anything).
+    ///
+    /// Self then stays in the peer list, which is wasteful rather than
+    /// incorrect: an empty local tree reports `producer_ready: false` and is
+    /// skipped, and a non-empty one still has to survive vetting. The real
+    /// cost of a lingering self-candidate is that it answers splice probes
+    /// with its own cursor, which can never be past its own watermark.
+    fn is_unknown(&self) -> bool {
+        self.pod_name.is_none() && self.ip.is_none()
+    }
+
+    /// Does this endpoint belong to this replica's own pod?
+    fn matches_endpoint(&self, ep: &Endpoint) -> bool {
+        let (Some(name), Some(tref)) = (self.pod_name.as_deref(), ep.target_ref.as_ref()) else {
+            return false;
+        };
+        // Pod-backed endpoints always carry kind/name; a missing kind on a
+        // manually-written slice is treated as Pod rather than never matching.
+        if tref.kind.as_deref().unwrap_or("Pod") != "Pod" || tref.name.as_deref() != Some(name) {
+            return false;
+        }
+        // When our own namespace is known, a same-named pod elsewhere is not
+        // us. When it is unknown, a bare name match can only false-positive on
+        // an identical pod name in another watched namespace — contrived for
+        // most workloads, though deterministic for same-named StatefulSets,
+        // and impossible once POD_NAMESPACE is set. A target_ref with no
+        // namespace is treated as same-namespace: excluding beats risking a
+        // self-fetch.
+        match (self.pod_namespace.as_deref(), tref.namespace.as_deref()) {
+            (Some(want), Some(got)) => want == got,
+            _ => true,
+        }
+    }
+
+    /// Does this individual address belong to this replica?
+    fn matches_address(&self, addr: &str) -> bool {
+        self.ip.as_deref() == Some(addr)
+    }
+}
+
+/// Extract sibling replica base URLs from an EndpointSlice, excluding this pod.
+///
+/// Only `ready` endpoints are considered: an unready sibling is either starting
+/// up (cold tree, nothing worth pulling) or draining. `identity` is filtered
+/// out because a replica bootstrapping from itself would just graft its own
+/// tree back and waste the deadline.
+fn extract_peers(
+    es: &EndpointSlice,
+    identity: &SelfIdentity,
+    want_ipv6: Option<bool>,
+    self_port: i32,
+) -> Vec<String> {
+    // Skip the address family this router does not listen on. Without this, a
+    // dual-stack Service yields BOTH families per sibling, and the unusable
+    // half is permanently unreachable — retried, so it eats the bootstrap
+    // deadline.
+    //
+    // `None` means the listen address does not name a family (`0.0.0.0`, `::`,
+    // a hostname), so keep everything. An unspecified address is the ORDINARY
+    // way to get a dual-stack listener, and reading `::` as "IPv6 only" would
+    // discard every slice on a single-stack IPv4 cluster: zero candidates,
+    // `synced` with an empty set, every replica boots cold, and the only
+    // symptom is a peer count of 0 that the metric's own HELP text says means
+    // the fleet has no other ready replica.
+    let family_matches = match (want_ipv6, es.address_type.as_str()) {
+        (Some(want), "IPv6") => want,
+        (Some(want), "IPv4") => !want,
+        // FQDN, an unrecognised type, or a listener with no stated family.
+        _ => true,
+    };
+    if !family_matches {
+        return Vec::new();
+    }
+    // Siblings are this router's own pods, so they listen where this replica
+    // does. Taking `ports.first()` instead would address every sibling on
+    // whatever port the Service happens to declare first — a `metrics` or
+    // `grpc` port ahead of `http` sends every fetch somewhere that refuses it,
+    // and the sweep burns its whole deadline booking peers `Unreachable` with
+    // nothing saying the port was wrong.
+    let ports = es.ports.as_deref().unwrap_or_default();
+    let port = ports
+        .iter()
+        .filter_map(|p| p.port)
+        .find(|&p| p == self_port)
+        .or_else(|| ports.iter().find_map(|p| p.port))
+        .unwrap_or(DEFAULT_ROUTER_PORT);
+    es.endpoints
+        .iter()
+        .filter(|ep| {
+            // Per the EndpointSlice API, absent `ready` means ready.
+            ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)
+        })
+        .filter(|ep| {
+            // Exclusions are silent by default; without this line a sibling
+            // misclassified as self — or self failing to be excluded — only
+            // surfaces downstream as a misleading cold-boot verdict.
+            if identity.matches_endpoint(ep) {
+                tracing::debug!(
+                    addrs = ?ep.addresses,
+                    target_ref = ?ep.target_ref,
+                    "kv-bootstrap: excluding endpoint as self (pod identity match)",
+                );
+                return false;
+            }
+            true
+        })
+        .flat_map(|ep| ep.addresses.iter())
+        .filter(|addr| !identity.matches_address(addr))
+        .map(|addr| {
+            // A bare IPv6 literal is not a parseable authority, so on a
+            // dual-stack cluster every peer URL from the IPv6 slice would fail
+            // to connect and burn the bootstrap deadline.
+            if addr.contains(':') {
+                format!("http://[{addr}]:{port}")
+            } else {
+                format!("http://{addr}:{port}")
+            }
+        })
+        .collect()
+}
+
+/// Watch this router's own EndpointSlices and keep `peers` current.
+///
+/// Separate from [`spawn`] because it answers a different question — "which
+/// sibling replicas can I pull a cache snapshot from?" rather than "which
+/// engines can I route to" — and because it must keep working when the worker
+/// watch is in PD mode with client-side classification.
+///
+/// The task exits quietly when the watcher stream ends; peer bootstrap then
+/// degrades to whatever peers were last seen, and eventually to cold boots.
+/// That is deliberately non-fatal: routing does not depend on this watch.
+pub async fn spawn_peer_watch(
+    namespace: String,
+    label_selector: String,
+    peers: Arc<PeerRegistry>,
+    want_ipv6: Option<bool>,
+    self_port: i32,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let client = Client::try_default()
+        .await
+        .context("kube client default config for peer watch")?;
+    let api: Api<EndpointSlice> = if namespace.is_empty() {
+        Api::all(client)
+    } else {
+        Api::namespaced(client, &namespace)
+    };
+    // Downward-API pod identity, so a replica does not list itself as a peer.
+    // POD_NAME (matched against each endpoint's target_ref) is the primary
+    // signal; POD_IP is a fallback for endpoints without a target_ref.
+    let identity = SelfIdentity::from_env();
+    if identity.is_unknown() {
+        tracing::warn!(
+            "kv-bootstrap: neither POD_NAME nor POD_IP is set, so this replica cannot \
+             exclude itself from its peer list; set POD_NAME from the downward API for \
+             a cleaner peer set"
+        );
+    }
+
+    tracing::info!(
+        namespace = %if namespace.is_empty() { "<all namespaces>" } else { &namespace },
+        label_selector = %label_selector,
+        self_pod_name = %identity.pod_name.as_deref().unwrap_or("<unset>"),
+        self_ip = %identity.ip.as_deref().unwrap_or("<unset>"),
+        self_port,
+        address_family = %match want_ipv6 {
+            Some(true) => "IPv6",
+            Some(false) => "IPv4",
+            None => "both (listener names no family)",
+        },
+        "kv-bootstrap: peer watch starting",
+    );
+
+    let watcher_cfg = watcher::Config::default().labels(&label_selector);
+    let handle = tokio::spawn(async move {
+        let stream = watcher(api, watcher_cfg);
+        tokio::pin!(stream);
+        process_peer_events(stream, &peers, &identity, want_ipv6, self_port).await;
+    });
+    Ok(handle)
+}
+
+/// Drive the peer-set event loop for a stream of `watcher::Event`s.
+///
+/// Split out from [`spawn_peer_watch`] for the same reason [`process_events`]
+/// is: the relist bookkeeping is the correctness-critical part, and it is only
+/// testable without a cluster if it is a function over a stream.
+async fn process_peer_events<S>(
+    mut stream: S,
+    peers: &PeerRegistry,
+    identity: &SelfIdentity,
+    want_ipv6: Option<bool>,
+    self_port: i32,
+) where
+    S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
+{
+    // A Service's endpoints are commonly sharded across several
+    // EndpointSlices (one per AZ, one per address family), which is why this
+    // is per-slice rather than a flat list.
+    let mut by_slice: HashMap<String, Vec<String>> = HashMap::new();
+    // Relist buffer. Publishing each `InitApply` as it arrives would expose a
+    // PARTIALLY rebuilt set, and an empty partial set marks the registry
+    // synced — which makes `known_to_have_no_peers()` momentarily true and can
+    // short-circuit a bootstrap into a cold boot.
+    let mut init_buffer: HashMap<String, Vec<String>> = HashMap::new();
+    let publish = |by_slice: &HashMap<String, Vec<String>>| {
+        let mut all: Vec<String> = by_slice.values().flatten().cloned().collect();
+        all.sort_unstable();
+        all.dedup();
+        peers.replace(all);
+    };
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(watcher::Event::Init) => init_buffer.clear(),
+            Ok(watcher::Event::InitApply(es)) => {
+                init_buffer.insert(
+                    slice_key(&es),
+                    extract_peers(&es, identity, want_ipv6, self_port),
+                );
+            }
+            Ok(watcher::Event::InitDone) => {
+                // Swap atomically: the relist result fully replaces the old
+                // view, so slices deleted while the watch was down disappear
+                // here.
+                by_slice = std::mem::take(&mut init_buffer);
+                publish(&by_slice);
+            }
+            Ok(watcher::Event::Apply(es)) => {
+                by_slice.insert(
+                    slice_key(&es),
+                    extract_peers(&es, identity, want_ipv6, self_port),
+                );
+                publish(&by_slice);
+            }
+            Ok(watcher::Event::Delete(es)) => {
+                by_slice.remove(&slice_key(&es));
+                publish(&by_slice);
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "kv-bootstrap: peer watcher error; awaiting auto-restart");
+            }
+        }
+    }
+    tracing::warn!("kv-bootstrap: peer watcher stream ended; peer set is now frozen");
 }
 
 #[cfg(test)]
@@ -1214,5 +1509,618 @@ mod tests {
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(1), producer).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer discovery — the sibling-replica set cache-aware bootstrap pulls
+    // snapshots from.
+    // -----------------------------------------------------------------------
+
+    /// Multiple endpoints in one slice, each with its own ready condition, so
+    /// the per-endpoint filtering can be exercised.
+    fn peer_slice(entries: &[(&str, Option<bool>)], port: Option<i32>) -> EndpointSlice {
+        EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some("sgl-router-kv-abc".into()),
+                namespace: Some("sgl-router-test".into()),
+                ..Default::default()
+            },
+            address_type: "IPv4".into(),
+            endpoints: entries
+                .iter()
+                .map(|(addr, ready)| Endpoint {
+                    addresses: vec![(*addr).to_string()],
+                    conditions: ready.map(|r| EndpointConditions {
+                        ready: Some(r),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            ports: port.map(|p| {
+                vec![EndpointPort {
+                    port: Some(p),
+                    ..Default::default()
+                }]
+            }),
+        }
+    }
+
+    fn identity_with_ip(ip: &str) -> SelfIdentity {
+        SelfIdentity {
+            ip: Some(ip.into()),
+            ..Default::default()
+        }
+    }
+
+    fn identity_with_pod(name: &str, namespace: Option<&str>) -> SelfIdentity {
+        SelfIdentity {
+            pod_name: Some(name.into()),
+            pod_namespace: namespace.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    /// One endpoint per (addr, pod-name) entry, each pointing its `target_ref`
+    /// at the named pod in `sgl-router-test`.
+    fn pod_backed_peer_slice(entries: &[(&str, &str)], port: Option<i32>) -> EndpointSlice {
+        use k8s_openapi::api::core::v1::ObjectReference;
+        let mut es = peer_slice(
+            &entries
+                .iter()
+                .map(|(addr, _)| (*addr, Some(true)))
+                .collect::<Vec<_>>(),
+            port,
+        );
+        for (ep, (_, pod)) in es.endpoints.iter_mut().zip(entries) {
+            ep.target_ref = Some(ObjectReference {
+                kind: Some("Pod".into()),
+                name: Some((*pod).into()),
+                namespace: Some("sgl-router-test".into()),
+                ..Default::default()
+            });
+        }
+        es
+    }
+
+    #[test]
+    fn extract_peers_excludes_self() {
+        let es = peer_slice(
+            &[("10.0.0.1", Some(true)), ("10.0.0.2", Some(true))],
+            Some(8090),
+        );
+        assert_eq!(
+            extract_peers(&es, &identity_with_ip("10.0.0.1"), Some(false), 8090),
+            vec!["http://10.0.0.2:8090"],
+            "a replica must not offer itself as a bootstrap source",
+        );
+    }
+
+    /// POD_NAME matches the endpoint's `target_ref` and excludes the whole
+    /// pod, even when the endpoint's address is not POD_IP — which is what a
+    /// dual-stack Service's secondary family looks like.
+    #[test]
+    fn extract_peers_excludes_self_by_pod_name() {
+        let es = pod_backed_peer_slice(
+            &[
+                ("10.0.0.1", "sgl-router-kv-0"),
+                ("10.0.0.2", "sgl-router-kv-1"),
+            ],
+            Some(8090),
+        );
+        let identity = SelfIdentity {
+            ip: Some("192.168.1.5".into()), // primary addr, NOT in this slice
+            ..identity_with_pod("sgl-router-kv-0", Some("sgl-router-test"))
+        };
+        assert_eq!(
+            extract_peers(&es, &identity, Some(false), 8090),
+            vec!["http://10.0.0.2:8090"],
+            "target_ref matching must exclude the pod even at an unknown address",
+        );
+    }
+
+    /// With POD_NAMESPACE known, a same-named pod in another namespace is a
+    /// different pod and must be kept.
+    #[test]
+    fn extract_peers_keeps_same_named_pod_in_another_namespace() {
+        let mut es = pod_backed_peer_slice(&[("10.0.0.2", "sgl-router-kv-0")], Some(8090));
+        es.endpoints[0].target_ref.as_mut().unwrap().namespace = Some("other-ns".into());
+        assert_eq!(
+            extract_peers(
+                &es,
+                &identity_with_pod("sgl-router-kv-0", Some("sgl-router-test")),
+                Some(false),
+                8090
+            ),
+            vec!["http://10.0.0.2:8090"],
+        );
+    }
+
+    /// Without POD_NAMESPACE a bare name match still excludes — EndpointSlices
+    /// are namespaced, so a collision needs the same Deployment name twice.
+    #[test]
+    fn extract_peers_excludes_by_name_when_own_namespace_unknown() {
+        let es = pod_backed_peer_slice(&[("10.0.0.1", "sgl-router-kv-0")], Some(8090));
+        assert!(extract_peers(
+            &es,
+            &identity_with_pod("sgl-router-kv-0", None),
+            Some(false),
+            8090
+        )
+        .is_empty());
+    }
+
+    /// Endpoints with no `target_ref` (manually-written slices) still fall
+    /// back to POD_IP matching.
+    #[test]
+    fn extract_peers_falls_back_to_ip_without_target_ref() {
+        let es = peer_slice(&[("10.0.0.1", Some(true))], Some(8090));
+        let identity = SelfIdentity {
+            ip: Some("10.0.0.1".into()),
+            ..identity_with_pod("sgl-router-kv-0", Some("sgl-router-test"))
+        };
+        assert!(extract_peers(&es, &identity, Some(false), 8090).is_empty());
+    }
+
+    /// The IP fallback filters per ADDRESS, not per endpoint: a multi-address
+    /// endpoint without `target_ref` keeps its non-self addresses.
+    #[test]
+    fn extract_peers_ip_fallback_filters_per_address() {
+        let mut es = peer_slice(&[("10.0.0.1", Some(true))], Some(8090));
+        es.endpoints[0].addresses = vec!["10.0.0.1".into(), "10.0.0.9".into()];
+        assert_eq!(
+            extract_peers(&es, &identity_with_ip("10.0.0.1"), Some(false), 8090),
+            vec!["http://10.0.0.9:8090"],
+            "IP fallback must drop only the self address, not the whole endpoint",
+        );
+    }
+
+    /// A `target_ref` pointing at a non-Pod object (a hand-written slice
+    /// naming a Service, say) must not be mistaken for this replica.
+    #[test]
+    fn extract_peers_ignores_target_ref_of_non_pod_kind() {
+        let mut es = pod_backed_peer_slice(&[("10.0.0.2", "sgl-router-kv-0")], Some(8090));
+        es.endpoints[0].target_ref.as_mut().unwrap().kind = Some("Service".into());
+        assert_eq!(
+            extract_peers(
+                &es,
+                &identity_with_pod("sgl-router-kv-0", Some("sgl-router-test")),
+                Some(false),
+                8090
+            ),
+            vec!["http://10.0.0.2:8090"],
+        );
+    }
+
+    /// A `target_ref` with no kind (hand-written slice) is treated as a Pod:
+    /// excluding beats risking a self-fetch.
+    #[test]
+    fn extract_peers_treats_absent_target_ref_kind_as_pod() {
+        let mut es = pod_backed_peer_slice(&[("10.0.0.1", "sgl-router-kv-0")], Some(8090));
+        es.endpoints[0].target_ref.as_mut().unwrap().kind = None;
+        assert!(extract_peers(
+            &es,
+            &identity_with_pod("sgl-router-kv-0", Some("sgl-router-test")),
+            Some(false),
+            8090
+        )
+        .is_empty());
+    }
+
+    /// A set-but-empty env var must behave as unset; otherwise it would
+    /// suppress the `is_unknown` warning while matching nothing.
+    #[test]
+    fn env_non_empty_treats_empty_strings_as_unset() {
+        // Unique names so parallel tests cannot race on these vars.
+        std::env::set_var("SGL_ROUTER_TEST_ENV_EMPTY", "");
+        std::env::set_var("SGL_ROUTER_TEST_ENV_SET", "x");
+        assert_eq!(env_non_empty("SGL_ROUTER_TEST_ENV_EMPTY"), None);
+        assert_eq!(
+            env_non_empty("SGL_ROUTER_TEST_ENV_SET"),
+            Some("x".to_string())
+        );
+        assert_eq!(env_non_empty("SGL_ROUTER_TEST_ENV_MISSING"), None);
+    }
+
+    /// With neither POD_NAME nor POD_IP there is nothing to exclude. A
+    /// self-fetch is wasteful but harmless — an empty local tree reports
+    /// `producer_ready: false`.
+    #[test]
+    fn extract_peers_keeps_self_when_identity_is_unknown() {
+        let es = peer_slice(&[("10.0.0.1", Some(true))], Some(8090));
+        assert_eq!(
+            extract_peers(&es, &SelfIdentity::default(), Some(false), 8090),
+            vec!["http://10.0.0.1:8090"],
+        );
+        assert!(SelfIdentity::default().is_unknown());
+    }
+
+    /// Per the EndpointSlice API an ABSENT ready condition means ready.
+    /// Treating it as not-ready would empty the peer set on clusters that omit
+    /// it.
+    #[test]
+    fn extract_peers_treats_absent_ready_as_ready() {
+        let es = peer_slice(&[("10.0.0.2", None)], Some(8090));
+        assert_eq!(
+            extract_peers(&es, &identity_with_ip("10.0.0.1"), Some(false), 8090),
+            vec!["http://10.0.0.2:8090"],
+        );
+    }
+
+    /// An unready sibling is either still bootstrapping (nothing worth
+    /// copying) or draining. This is the primary defence against a new replica
+    /// in a rolling update bootstrapping from another new replica.
+    #[test]
+    fn extract_peers_skips_unready_endpoints() {
+        let es = peer_slice(
+            &[("10.0.0.2", Some(false)), ("10.0.0.3", Some(true))],
+            Some(8090),
+        );
+        assert_eq!(
+            extract_peers(&es, &identity_with_ip("10.0.0.1"), Some(false), 8090),
+            vec!["http://10.0.0.3:8090"],
+        );
+    }
+
+    /// A bare IPv6 literal is not a parseable authority, so on a dual-stack
+    /// cluster every peer URL from the IPv6 slice would fail to connect and
+    /// burn the bootstrap deadline.
+    #[test]
+    fn extract_peers_brackets_ipv6_addresses() {
+        let mut es = peer_slice(&[("fd00::2", Some(true))], Some(8090));
+        es.address_type = "IPv6".into();
+        assert_eq!(
+            extract_peers(&es, &identity_with_ip("fd00::1"), Some(true), 8090),
+            vec!["http://[fd00::2]:8090"],
+        );
+    }
+
+    /// A dual-stack Service yields one slice per family. Keeping the family
+    /// the router does not listen on gives permanently-unreachable candidates
+    /// that burn the bootstrap deadline — and an entry for THIS replica that
+    /// IP matching cannot exclude.
+    #[test]
+    fn extract_peers_skips_the_other_address_family() {
+        let mut v6 = peer_slice(&[("fd00::2", Some(true))], Some(8090));
+        v6.address_type = "IPv6".into();
+        assert!(
+            extract_peers(&v6, &identity_with_ip("10.0.0.1"), Some(false), 8090).is_empty(),
+            "an IPv4 router must ignore the IPv6 slice",
+        );
+
+        let v4 = peer_slice(&[("10.0.0.2", Some(true))], Some(8090));
+        assert!(
+            extract_peers(&v4, &identity_with_ip("fd00::1"), Some(true), 8090).is_empty(),
+            "an IPv6 router must ignore the IPv4 slice",
+        );
+    }
+
+    /// A listener that names no family — `0.0.0.0` or `::`, the ordinary way
+    /// to listen on both — must not be read as a preference for one. Reading
+    /// `::` as IPv6-only discards every slice on a single-stack IPv4 cluster,
+    /// and the only symptom is a peer count of 0 that the metric's own HELP
+    /// text says means the fleet has no other ready replica.
+    #[test]
+    fn an_unspecified_listener_keeps_both_address_families() {
+        let v4 = peer_slice(&[("10.0.0.2", Some(true))], Some(8090));
+        let mut v6 = peer_slice(&[("fd00::2", Some(true))], Some(8090));
+        v6.address_type = "IPv6".into();
+
+        assert_eq!(
+            extract_peers(&v4, &SelfIdentity::default(), None, 8090),
+            vec!["http://10.0.0.2:8090"],
+        );
+        assert_eq!(
+            extract_peers(&v6, &SelfIdentity::default(), None, 8090),
+            vec!["http://[fd00::2]:8090"],
+        );
+    }
+
+    /// A multi-port Service lists its ports in spec order, and nothing says
+    /// the one this router serves on sorts first. Siblings are this router's
+    /// own pods, so its own listen port is the reliable signal — taking index
+    /// 0 would address every sibling on, say, a `metrics` port, and the sweep
+    /// would burn its deadline booking them all `Unreachable`.
+    #[test]
+    fn peer_port_prefers_this_replicas_own_listen_port() {
+        use k8s_openapi::api::discovery::v1::EndpointPort;
+        let mut es = peer_slice(&[("10.0.0.2", Some(true))], None);
+        es.ports = Some(vec![
+            EndpointPort {
+                name: Some("metrics".into()),
+                port: Some(9090),
+                ..Default::default()
+            },
+            EndpointPort {
+                name: Some("http".into()),
+                port: Some(8090),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            extract_peers(&es, &SelfIdentity::default(), None, 8090),
+            vec!["http://10.0.0.2:8090"],
+            "the router's own port wins over whatever the Service lists first",
+        );
+    }
+
+    /// When no advertised port matches — a Service fronting the router on a
+    /// different port than it listens on — fall back to the first rather than
+    /// to the hard-coded default, which would be wrong more often.
+    #[test]
+    fn peer_port_falls_back_to_the_first_advertised_port() {
+        let es = peer_slice(&[("10.0.0.2", Some(true))], Some(8080));
+        assert_eq!(
+            extract_peers(&es, &SelfIdentity::default(), None, 8090),
+            vec!["http://10.0.0.2:8080"],
+        );
+    }
+
+    /// An FQDN slice cannot be classified by family, so it is kept.
+    #[test]
+    fn extract_peers_keeps_fqdn_slices_for_either_family() {
+        let mut es = peer_slice(&[("router-1.svc", Some(true))], Some(8090));
+        es.address_type = "FQDN".into();
+        assert_eq!(
+            extract_peers(&es, &SelfIdentity::default(), Some(false), 8090),
+            vec!["http://router-1.svc:8090"],
+        );
+    }
+
+    #[test]
+    fn extract_peers_falls_back_to_default_port() {
+        let es = peer_slice(&[("10.0.0.2", Some(true))], None);
+        assert_eq!(
+            extract_peers(&es, &SelfIdentity::default(), Some(false), 8090),
+            vec![format!("http://10.0.0.2:{DEFAULT_ROUTER_PORT}")],
+        );
+    }
+
+    #[test]
+    fn extract_peers_on_empty_slice_is_empty() {
+        assert!(extract_peers(
+            &peer_slice(&[], Some(8090)),
+            &SelfIdentity::default(),
+            Some(false),
+            8090
+        )
+        .is_empty());
+    }
+
+    /// Same slice shape, but with a caller-chosen name so `slice_key` yields
+    /// distinct keys — needed to model a multi-slice Service.
+    fn named_peer_slice(
+        name: &str,
+        entries: &[(&str, Option<bool>)],
+        port: Option<i32>,
+    ) -> EndpointSlice {
+        let mut es = peer_slice(entries, port);
+        es.metadata.name = Some(name.into());
+        es
+    }
+
+    async fn run_peer_events(
+        events: Vec<Result<watcher::Event<EndpointSlice>, watcher::Error>>,
+        peers: &PeerRegistry,
+        identity: &SelfIdentity,
+    ) {
+        let stream = futures::stream::iter(events);
+        tokio::pin!(stream);
+        process_peer_events(stream, peers, identity, Some(false), 8090).await;
+    }
+
+    /// THE regression this loop exists for: a relist must not publish a
+    /// partial set. If it does, an empty partial marks the registry synced and
+    /// `known_to_have_no_peers()` goes true, short-circuiting a bootstrap into
+    /// a cold boot even though siblings exist.
+    ///
+    /// Asserted MID-relist, deliberately. Checking only the settled state
+    /// after `InitDone` passes even with the bug present, because the damage
+    /// is a transient a retry loop can sample and act on permanently.
+    #[tokio::test]
+    async fn peer_relist_does_not_publish_a_partial_set() {
+        let peers = PeerRegistry::new();
+        // Init plus one self-only slice, and NO InitDone: nothing may be
+        // published yet, so the registry must not even be marked synced.
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.1", Some(true))], // self — yields zero peers
+                    Some(8090),
+                ))),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+
+        assert!(
+            !peers.synced(),
+            "an incomplete relist must not mark the peer set synced",
+        );
+        assert!(
+            !peers.known_to_have_no_peers(),
+            "a partial relist must never read as 'this replica is alone'",
+        );
+    }
+
+    /// And the completed relist publishes the full set.
+    #[tokio::test]
+    async fn peer_relist_publishes_once_complete() {
+        let peers = PeerRegistry::new();
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.1", Some(true))], // self
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-b",
+                    &[("10.0.0.2", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+
+        assert_eq!(peers.candidates(), vec!["http://10.0.0.2:8090"]);
+        assert!(!peers.known_to_have_no_peers());
+    }
+
+    /// A relist drops slices that disappeared while the watch was down.
+    #[tokio::test]
+    async fn peer_relist_replaces_rather_than_merges() {
+        let peers = PeerRegistry::new();
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.2", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+                // Watch restarts; slice-a is gone, slice-b appears.
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-b",
+                    &[("10.0.0.3", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+        assert_eq!(
+            peers.candidates(),
+            vec!["http://10.0.0.3:8090"],
+            "a relist must replace the view, not merge into it",
+        );
+    }
+
+    /// Steady-state add and remove of one slice out of several.
+    #[tokio::test]
+    async fn peer_apply_and_delete_update_incrementally() {
+        let peers = PeerRegistry::new();
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.2", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+                Ok(watcher::Event::Apply(named_peer_slice(
+                    "slice-b",
+                    &[("10.0.0.3", Some(true))],
+                    Some(8090),
+                ))),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+        let mut got = peers.candidates();
+        got.sort();
+        assert_eq!(got, vec!["http://10.0.0.2:8090", "http://10.0.0.3:8090"]);
+
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.2", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-b",
+                    &[("10.0.0.3", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+                Ok(watcher::Event::Delete(named_peer_slice(
+                    "slice-b",
+                    &[("10.0.0.3", Some(true))],
+                    Some(8090),
+                ))),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+        assert_eq!(
+            peers.candidates(),
+            vec!["http://10.0.0.2:8090"],
+            "deleting a slice drops only its own endpoints",
+        );
+    }
+
+    /// A transient watcher error must preserve the peer set, not clear or
+    /// republish it.
+    ///
+    /// Publishing an empty set on a transient error would mark the registry
+    /// synced with zero peers, making `known_to_have_no_peers()` true and
+    /// short-circuiting a bootstrap into a cold boot.
+    #[tokio::test]
+    async fn peer_watcher_error_preserves_the_peer_set() {
+        let peers = PeerRegistry::new();
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.2", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+                Err(watcher::Error::NoResourceVersion),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+
+        assert_eq!(
+            peers.candidates(),
+            vec!["http://10.0.0.2:8090"],
+            "a transient error must not disturb the peer set",
+        );
+        assert!(!peers.known_to_have_no_peers());
+    }
+
+    /// A genuinely single-replica deployment must be recognised as alone, so a
+    /// bootstrap abandons immediately instead of burning the whole deadline.
+    #[tokio::test]
+    async fn peer_relist_with_only_self_is_conclusively_alone() {
+        let peers = PeerRegistry::new();
+        run_peer_events(
+            vec![
+                Ok(watcher::Event::Init),
+                Ok(watcher::Event::InitApply(named_peer_slice(
+                    "slice-a",
+                    &[("10.0.0.1", Some(true))],
+                    Some(8090),
+                ))),
+                Ok(watcher::Event::InitDone),
+            ],
+            &peers,
+            &identity_with_ip("10.0.0.1"),
+        )
+        .await;
+        assert!(peers.is_empty());
+        assert!(
+            peers.known_to_have_no_peers(),
+            "synced with only self ⇒ genuinely alone",
+        );
     }
 }

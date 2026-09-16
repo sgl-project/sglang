@@ -75,6 +75,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
 bytes = "1"
+# Inflates a gzipped peer snapshot on the bootstrap fetch path. Deliberately
+# used directly instead of reqwest's `gzip` feature: that feature is crate-wide,
+# so enabling it would make every client in the process advertise gzip and
+# auto-decode — including the proxy client carrying SSE.
+flate2 = "1"
 rand = "0.8"
 tokio-stream = { version = "0.1", features = ["net"] }
 dashmap = "6"

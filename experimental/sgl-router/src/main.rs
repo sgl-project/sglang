@@ -125,15 +125,34 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .expect("default http client builds");
+    // Peer bootstrap is enabled only when a peer selector is configured.
+    // Without one there is nobody to pull a snapshot from, so the tracker is
+    // pre-settled and `/readyz` behaves exactly as it did before this feature
+    // existed.
+    let kv_peer_selector = match &cfg.discovery {
+        sgl_router::config::DiscoveryBackend::K8s(k) => k.peer_selector.clone(),
+        _ => None,
+    };
     let kv_index = if prefix_index.is_some() {
         sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
             kv_event_http,
             Arc::clone(&block_size_oracle),
         )
     } else {
-        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+        let bootstrap = Arc::new(match (&cfg.model.cache_aware, &kv_peer_selector) {
+            (Some(ca), Some(_)) => {
+                sgl_router::policies::kv_events::BootstrapTracker::new_with_opts(
+                    std::time::Duration::from_millis(ca.bootstrap_timeout_ms),
+                    std::time::Duration::from_millis(ca.bootstrap_fetch_timeout_cap_ms),
+                    ca.bootstrap_seed_required,
+                )
+            }
+            _ => sgl_router::policies::kv_events::BootstrapTracker::disabled(),
+        });
+        sgl_router::policies::kv_events::KvEventIndex::new_with_bootstrap(
             kv_event_http,
             Arc::clone(&block_size_oracle),
+            bootstrap,
         )
     };
     let policies = Arc::new(
@@ -165,6 +184,50 @@ async fn main() -> Result<()> {
     );
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
+
+    // Start the peer watch BEFORE worker discovery: a bootstrap consults the
+    // peer set the moment the first worker appears, and an empty set there
+    // means that worker's ranks skip bootstrap entirely and run cold.
+    //
+    // Only when this router maintains its own tree — with an external Indexer
+    // as the prefix source there is nothing to graft into. The CLI already
+    // rejects that combination; this keeps the invariant local to the wiring.
+    if let (Some(selector), sgl_router::config::DiscoveryBackend::K8s(k8s)) = (
+        kv_peer_selector
+            .as_ref()
+            .filter(|_| kv_index.snapshot_source().is_some()),
+        &cfg.discovery,
+    ) {
+        // Peers are only usable on the family this router actually listens on
+        // — but an UNSPECIFIED address (`0.0.0.0`, `::`) names no family, it
+        // is the ordinary way to listen on both, so it must not be read as a
+        // preference. `None` keeps every slice.
+        let want_ipv6 = cfg
+            .server
+            .host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|ip| !ip.is_unspecified())
+            .map(|ip| ip.is_ipv6());
+        match sgl_router::discovery::k8s::spawn_peer_watch(
+            k8s.namespace.clone(),
+            selector.clone(),
+            kv_index.peers(),
+            want_ipv6,
+            i32::from(cfg.server.port),
+        )
+        .await
+        {
+            Ok(_handle) => {}
+            // Non-fatal: routing does not depend on peer discovery. Losing it
+            // means replicas boot cold, which is the pre-existing behaviour.
+            Err(e) => tracing::error!(
+                error = %e,
+                "kv-bootstrap: peer watch failed to start; replicas will boot with a cold \
+                 cache-aware tree (check RBAC for endpointslices on the router's own Service)",
+            ),
+        }
+    }
 
     // Spawn discovery + manager tasks.
     // The manager resolves each worker's wire protocol from its `/server_info`
@@ -215,6 +278,7 @@ async fn main() -> Result<()> {
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.engine_load = kv_index.engine_load();
     app_ctx.kv_metrics = kv_index.metrics_source();
+    app_ctx.kv_index = kv_index.snapshot_source();
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 

@@ -118,6 +118,25 @@ impl BlockSizeOracle {
         self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
     }
 
+    /// The block size and hashing mode together, or `None` while either is
+    /// still unreported.
+    ///
+    /// Both or neither, deliberately. [`Self::get`] and [`Self::is_bigram`]
+    /// are two independent reads, and `add_worker` publishes them one after
+    /// the other, so there is a window in which the size is visible and the
+    /// mode is not — during which `is_bigram()` answers its `false` default.
+    /// Anything that stamps a hashing identity onto state other processes will
+    /// compare against must not act inside that window: a peer snapshot
+    /// exported there claims unigram hashing on a bigram fleet, and every
+    /// block in it is one the recipient can never match.
+    pub fn hash_config(&self) -> Option<(u32, bool)> {
+        let size = self.get()?;
+        match self.bigram.load(Ordering::Relaxed) {
+            BIGRAM_UNKNOWN => None,
+            mode => Some((size, mode == BIGRAM_BIGRAM)),
+        }
+    }
+
     /// Publish a candidate block size. Returns the established value on
     /// success (idempotent: same candidate as already set is `Ok`);
     /// returns `Err(BlockSizeMismatch)` when the candidate disagrees.
@@ -153,6 +172,35 @@ mod tests {
     fn fresh_oracle_returns_none() {
         let oracle = BlockSizeOracle::new();
         assert_eq!(oracle.get(), None);
+        assert_eq!(oracle.hash_config(), None);
+    }
+
+    /// The window this exists to close: `add_worker` publishes the size and
+    /// the mode as two separate stores, and between them `is_bigram()` answers
+    /// its `false` default. A caller stamping a hashing identity onto shared
+    /// state must see `None` there, not "64, unigram".
+    #[test]
+    fn hash_config_requires_both_worker_properties() {
+        let oracle = BlockSizeOracle::new();
+        assert_eq!(oracle.hash_config(), None);
+        oracle.try_set(64).unwrap();
+        assert_eq!(
+            oracle.hash_config(),
+            None,
+            "a block size alone must not transiently imply unigram hashing",
+        );
+        oracle.set_bigram(true);
+        assert_eq!(oracle.hash_config(), Some((64, true)));
+    }
+
+    /// An established `false` is a reported mode, not an absent one.
+    #[test]
+    fn hash_config_reports_an_established_unigram_fleet() {
+        let oracle = BlockSizeOracle::new();
+        oracle.set_bigram(false);
+        assert_eq!(oracle.hash_config(), None, "no block size yet");
+        oracle.try_set(32).unwrap();
+        assert_eq!(oracle.hash_config(), Some((32, false)));
     }
 
     #[test]
