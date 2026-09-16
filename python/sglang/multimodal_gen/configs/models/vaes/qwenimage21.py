@@ -162,5 +162,6 @@ class QwenImage21VAEConfig(VAEConfig):
     arch_config: QwenImage21VAEArchConfig = field(
         default_factory=QwenImage21VAEArchConfig
     )
+    use_tiling: bool = False
     parallel_decode_mode: str = "tiled"
     use_temporal_tiling: bool = False

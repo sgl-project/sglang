@@ -109,9 +109,8 @@ def test_native_vae_roundtrip_shapes_and_checkpoint_names(channels):
         in_channels=channels,
         out_channels=channels,
     )
-    model = AutoencoderKLQwenImage21(
-        QwenImage21VAEConfig(arch_config=ac, use_tiling=False)
-    ).eval()
+    model = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac)).eval()
+    assert not model.use_tiling
     with torch.no_grad():
         moments = model._encode(torch.randn(1, channels, 1, 32, 64))
         assert moments.shape == (1, 8, 1, 2, 4)
