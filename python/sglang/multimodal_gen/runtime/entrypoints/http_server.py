@@ -264,7 +264,9 @@ async def stats_endpoint(request: Request):
     Returns queue depth, request counts, latency, throughput, etc.
     Sends a GetDisaggStatsReq to the scheduler via ZMQ and returns the result.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        GetDisaggStatsReq,
+    )
 
     server_args: ServerArgs = request.app.state.server_args
     response: dict = {

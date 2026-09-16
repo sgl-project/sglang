@@ -69,11 +69,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -395,6 +397,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if _is_xpu:
+            if error:
+                raise RuntimeError(
+                    f"Quantization scheme requiring compute capability "
+                    f"{min_capability} is not supported on XPU."
+                )
+            return False
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -600,6 +610,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         # checkpoints carry a weight zero-point.
         return is_channel_group and input_quant_none and is_static
 
+    def _is_wna16_triton_moe_supported(self, weight_quant: BaseModel) -> bool:
+        return (
+            weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size in (32, 128)
+            and weight_quant.symmetric
+            and not weight_quant.actorder
+        )
+
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
         is_symmetric = weight_quant.symmetric
@@ -700,9 +720,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
-                is_fp8_w8a8_supported = self._check_scheme_supported(
-                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
-                )
+                if _is_xpu:
+                    is_fp8_w8a8_supported = True
+                else:
+                    is_fp8_w8a8_supported = self._check_scheme_supported(
+                        CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                    )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
@@ -813,10 +836,26 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
                 else:
                     moe_backend = get_moe_runner_backend()
-                    if moe_backend.is_triton():
+                    triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
+                    use_blackwell_triton = (
+                        moe_backend.is_auto()
+                        and get_platform().is_sm100
+                        and triton_supported
+                    )
+                    if moe_backend.is_triton() and not triton_supported:
+                        raise ValueError(
+                            "The Triton WNA16 MoE backend only supports symmetric "
+                            "INT4 group quantization with group_size=32 or 128 and no "
+                            "actorder."
+                        )
+                    if moe_backend.is_triton() or use_blackwell_triton:
+                        reason = (
+                            "SM100/SM103 auto default"
+                            if use_blackwell_triton
+                            else "moe_runner_backend=triton"
+                        )
                         logger.info_once(
-                            "Using CompressedTensorsWNA16TritonMoE "
-                            "(moe_runner_backend=triton)"
+                            f"Using CompressedTensorsWNA16TritonMoE ({reason})"
                         )
                         return CompressedTensorsWNA16TritonMoE(
                             self, weight_quant=weight_quant
@@ -842,7 +881,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
             else:
                 raise NotImplementedError(
-                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         elif self._is_wint4afp8(weight_quant, input_quant):
             # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.
@@ -857,7 +896,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
             else:
                 raise NotImplementedError(
-                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
         else:
             raise RuntimeError(
@@ -939,7 +978,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if not _is_npu:
+        if _is_xpu:
+            if not isinstance(scheme, CompressedTensorsW8A8Fp8):
+                raise RuntimeError(
+                    f"{scheme.__class__.__name__} is not supported on XPU "
+                    "(no XPU kernel implementation)."
+                )
+        elif not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
@@ -1138,7 +1183,6 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config
@@ -1192,7 +1236,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
 
 class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
         self.quant_config = quantization_config

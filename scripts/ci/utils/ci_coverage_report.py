@@ -34,9 +34,9 @@ from ci_register import CIRegistry, HWBackend, ut_parse_one_file
 # (highest test volume historically), then accelerators that have been
 # wired into the registry more recently (XPU, MUSA, MLX).
 BACKEND_DISPLAY_ORDER = ("CUDA", "AMD", "NPU", "CPU", "XPU", "MUSA", "MLX")
-assert set(BACKEND_DISPLAY_ORDER) == {
-    b.name for b in HWBackend
-}, "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+assert set(BACKEND_DISPLAY_ORDER) == {b.name for b in HWBackend}, (
+    "BACKEND_DISPLAY_ORDER is out of sync with HWBackend"
+)
 
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage

@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
@@ -59,7 +59,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
-            can_run_dp_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
         )
 
         fb.init_mlp_sync_metadata(batch, torch.device("cpu"))
@@ -71,7 +71,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         torch.testing.assert_close(
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
-        self.assertTrue(fb.can_run_dp_cuda_graph)
+        self.assertTrue(fb.can_run_decode_cuda_graph)
 
     def test_draft_input_without_hidden_states_can_be_padded(self):
         spec_info = SimpleNamespace(

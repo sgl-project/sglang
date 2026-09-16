@@ -32,6 +32,7 @@ MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 _LAYER_WEIGHT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
 _PARAM_NAMES_MAPPING = {
     r"^model\.(embed_tokens|layers|norm|rotary_emb)\.": r"model.language_model.\1.",
+    r"^language_model\.": r"model.language_model.",
     r"^visual\.": r"model.visual.",
     r"^(model\.visual\.blocks\.\d+\.attn\.)qkv\.": r"\1qkv_proj.",
 }
@@ -207,6 +208,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     supports_dp_encode = True
     param_names_mapping = _PARAM_NAMES_MAPPING
+    # Comfy packs the vision tower across whole tensors rather than rows. Keep
+    # its language/vocabulary matrices packed and restore this smaller tower.
+    gguf_dequantize_prefixes = ("visual.", "model.visual.")
 
     @classmethod
     def configure_component_paths(

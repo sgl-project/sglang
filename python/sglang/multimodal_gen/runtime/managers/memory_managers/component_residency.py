@@ -18,11 +18,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
 
 RESIDENT = "resident"
 COMPONENT_OFFLOAD = "component-offload"
+SNAPSHOT_OFFLOAD = "snapshot-offload"
 LAYERWISE_OFFLOAD = "layerwise-offload"
 COMPONENT_RESIDENCY_MODES = frozenset(
     (
         RESIDENT,
         COMPONENT_OFFLOAD,
+        SNAPSHOT_OFFLOAD,
         LAYERWISE_OFFLOAD,
     )
 )
@@ -82,8 +84,7 @@ def normalize_component_residency(
     for raw_selector, raw_mode in entries:
         if not isinstance(raw_selector, str) or not isinstance(raw_mode, str):
             raise ComponentResidencyError(
-                "Invalid component residency assignment: "
-                f"{raw_selector!r}={raw_mode!r}"
+                f"Invalid component residency assignment: {raw_selector!r}={raw_mode!r}"
             )
         selector = raw_selector.strip().replace("-", "_").lower()
         mode = raw_mode.strip().replace("_", "-").lower()
@@ -149,10 +150,13 @@ def resolve_diffusers_pipeline_offload(
         return None
     if LAYERWISE_OFFLOAD in assignments.values():
         raise ComponentResidencyError(
-            "--component-residency layerwise-offload requires the native SGLang "
-            "backend"
+            "--component-residency layerwise-offload requires the native SGLang backend"
         )
 
+    if SNAPSHOT_OFFLOAD in assignments.values():
+        raise ComponentResidencyError(
+            "--component-residency snapshot-offload requires the native SGLang backend"
+        )
     pipeline_mode = assignments.get(LAYERWISE_OFFLOAD_ALL_COMPONENTS)
     if len(assignments) == 1 and pipeline_mode is not None:
         return pipeline_mode == COMPONENT_OFFLOAD

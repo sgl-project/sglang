@@ -24,6 +24,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
@@ -32,8 +33,10 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-from sglang.srt.runtime_context import configured_pp_size, get_parallel
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.runtime_context import (
+    get_parallel,
+)
+from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +106,18 @@ def _get_bundle_node_ip(placement_group: PlacementGroup, bundle_idx: int) -> str
     )
 
 
-def _compute_world_size(server_args: ServerArgs) -> int:
+def _compute_world_size() -> int:
     """Compute world_size (total number of scheduler actors/GPUs needed).
 
-    Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
+    Reads the published parallel leaves: the driver is sizing the actors that
+    will hold the process groups, so there is nothing live to ask.
     """
-    if get_parallel().enable_dp_attention:
-        return server_args.tp_size * configured_pp_size()
-    return get_parallel().dp_size * server_args.tp_size * configured_pp_size()
+    return compute_world_size(
+        enable_dp_attention=get_parallel().enable_dp_attention,
+        dp_size=get_parallel().dp_size,
+        tp_size=get_parallel().tp_size,
+        pp_size=get_parallel().pp_size,
+    )
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:
@@ -197,9 +204,7 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
-    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-        server_args, tp_rank
-    )
+    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(tp_rank)
 
     return SchedulerActor.options(
         num_cpus=0,
@@ -236,6 +241,12 @@ class RayEngine(Engine):
         self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
+        # Schedulers are separate Ray actors; default to the Ray-backed
+        # collectors so enable_metrics reaches Ray's Prometheus endpoint.
+        if kwargs.get("enable_metrics") and kwargs.get("stat_loggers") is None:
+            from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
+
+            kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
@@ -268,14 +279,13 @@ class RayEngine(Engine):
                 placement_group as create_placement_group,
             )
 
-            if get_parallel().enable_dp_attention:
-                total_gpus = server_args.tp_size * configured_pp_size()
+            parallel = get_parallel()
+            if parallel.enable_dp_attention:
+                total_gpus = parallel.tp_size * parallel.pp_size
             else:
-                total_gpus = (
-                    get_parallel().dp_size * server_args.tp_size * configured_pp_size()
-                )
+                total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
 
-            nnodes = server_args.nnodes
+            nnodes = parallel.nnodes
             gpus_per_node = total_gpus // nnodes
             strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
 
@@ -292,8 +302,8 @@ class RayEngine(Engine):
             ray.get(pg.ready())
 
         is_custom_pg = placement_group is not None
-        nnodes = server_args.nnodes
-        world_size = _compute_world_size(server_args)
+        nnodes = get_parallel().nnodes
+        world_size = _compute_world_size()
 
         if not is_custom_pg:
             engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
@@ -332,8 +342,8 @@ class RayEngine(Engine):
                     pp_range, tp_range, pp_per_node, tp_per_node = (
                         _calculate_rank_ranges(
                             nnodes,
-                            configured_pp_size(),
-                            server_args.tp_size,
+                            get_parallel().pp_size,
+                            get_parallel().tp_size,
                             node_rank=node_idx,
                         )
                     )
@@ -369,9 +379,10 @@ class RayEngine(Engine):
                     f"bundle_indices={bundle_indices}"
                 )
 
+                tp_size = get_parallel().tp_size
                 for rank in range(world_size):
-                    pp_rank = rank // server_args.tp_size
-                    tp_rank = rank % server_args.tp_size
+                    pp_rank = rank // tp_size
+                    tp_rank = rank % tp_size
                     bundle_idx = bundle_indices[rank]
 
                     actor = _create_scheduler_actor(
@@ -447,27 +458,30 @@ class RayEngine(Engine):
             RayDataParallelController,
         )
 
-        if get_parallel().enable_dp_attention:
+        parallel = get_parallel()
+        if parallel.enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
-            total_gpus = server_args.tp_size * configured_pp_size()
+            total_gpus = parallel.tp_size * parallel.pp_size
         else:
-            total_gpus = (
-                get_parallel().dp_size * server_args.tp_size * configured_pp_size()
-            )
-        gpus_per_node = total_gpus // server_args.nnodes
+            total_gpus = parallel.dp_size * parallel.tp_size * parallel.pp_size
+        gpus_per_node = total_gpus // parallel.nnodes
         logger.info(
-            f"Ray DP cluster: {server_args.nnodes} nodes, "
-            f"{gpus_per_node} GPUs/node, dp_size={get_parallel().dp_size}, "
-            f"tp_size={server_args.tp_size}, pp_size={configured_pp_size()}, "
-            f"enable_dp_attention={get_parallel().enable_dp_attention}"
+            f"Ray DP cluster: {parallel.nnodes} nodes, "
+            f"{gpus_per_node} GPUs/node, dp_size={parallel.dp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"enable_dp_attention={parallel.enable_dp_attention}"
         )
 
-        # Set dist_init_addr on server_args so PortArgs.init_new() can compute
-        # TCP addresses correctly (required for DP attention path).
-        dp_server_args = server_args.replace_resolved(
+        # Declared on the record itself so `PortArgs.init_new()` can compute
+        # TCP addresses (required for the DP attention path). No copy: this
+        # process does not publish here, and every other reader of the field
+        # goes through the bags its own process projects.
+        declare_resolution(
+            server_args,
             "ray.dp_controller",
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
+        dp_server_args = server_args
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(

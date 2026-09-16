@@ -145,15 +145,19 @@ def _run_node(**node_kwargs):
         )
 
     node = SGLDiffusionGenerateH3()
-    with mock.patch(
-        f"{PKG}.core.server_api.requests.post",
-        side_effect=fake_post,
-    ), mock.patch(
-        f"{PKG}.core.server_api.requests.get",
-        side_effect=fake_get,
-    ), mock.patch(
-        f"{PKG}.nodes.get_image_path",
-        side_effect=lambda image: "/tmp/frame.png",
+    with (
+        mock.patch(
+            f"{PKG}.core.server_api.requests.post",
+            side_effect=fake_post,
+        ),
+        mock.patch(
+            f"{PKG}.core.server_api.requests.get",
+            side_effect=fake_get,
+        ),
+        mock.patch(
+            f"{PKG}.nodes.get_image_path",
+            side_effect=lambda image: "/tmp/frame.png",
+        ),
     ):
         result = node.generate(sgld_client=client, **node_kwargs)
     return captured, result
@@ -243,13 +247,16 @@ def test_extra_fields_win_over_generic_defaults():
         captured.update(json)
         return _Response({"id": "job-1"})
 
-    with mock.patch(
-        f"{PKG}.core.server_api.requests.post",
-        side_effect=fake_post,
-    ), mock.patch(
-        f"{PKG}.core.server_api.requests.get",
-        side_effect=lambda *a, **k: _Response(
-            {"id": "job-1", "status": "completed", "size": RESOLVED_SIZE}
+    with (
+        mock.patch(
+            f"{PKG}.core.server_api.requests.post",
+            side_effect=fake_post,
+        ),
+        mock.patch(
+            f"{PKG}.core.server_api.requests.get",
+            side_effect=lambda *a, **k: _Response(
+                {"id": "job-1", "status": "completed", "size": RESOLVED_SIZE}
+            ),
         ),
     ):
         client.generate_video(

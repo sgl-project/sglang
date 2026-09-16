@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -14,7 +17,6 @@ logger = init_logger(__name__)
 
 @dataclass
 class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
-
     is_causal: bool = True
     task_type: ModelTaskType = ModelTaskType.TI2V
     vae_precision: str = "bf16"
@@ -28,8 +30,17 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
 
     dit_config: DiTConfig = field(default_factory=LongLive2VideoConfig)
 
-    def adjust_num_frames(self, num_frames: int) -> int:
-        num_frames = super().adjust_num_frames(num_frames)
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "text_encoder", "vae"),
+        )
+
+    def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
+        num_frames = super().adjust_num_frames(
+            num_frames, log_adjustment=log_adjustment
+        )
         vae_scale_factor_temporal = self.vae_config.arch_config.scale_factor_temporal
         latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
         block_size = self.dit_config.arch_config.num_frames_per_block
@@ -42,13 +53,14 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         adjusted_num_frames = (
             adjusted_latent_frames - 1
         ) * vae_scale_factor_temporal + 1
-        logger.warning(
-            "`num_frames` must map to latent frames divisible by %s for "
-            "LongLive2 causal denoising. Rounding from %s to %s.",
-            block_size,
-            num_frames,
-            adjusted_num_frames,
-        )
+        if log_adjustment:
+            logger.warning(
+                "`num_frames` must map to latent frames divisible by %s for "
+                "LongLive2 causal denoising. Rounding from %s to %s.",
+                block_size,
+                num_frames,
+                adjusted_num_frames,
+            )
         return adjusted_num_frames
 
     def postprocess_image_latent(self, latent_condition, batch):

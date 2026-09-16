@@ -170,6 +170,64 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
+# SM107 (Rubin, VR)
+@cache
+def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    mc_blocks = {4: 128, 5: 128, 6: 128, 7: 128, 8: 96, 16: 32}
+
+    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+        return AllReduceConfig(
+            graph=_pack_heuristic(*graph),
+            eager=_pack_heuristic(*eager),
+            num_push_blocks=num_sm,
+            num_pull_blocks=min(192, num_sm),
+            num_mc_blocks=mc_blocks.get(world_size),
+        )
+
+    return {
+        2: config(
+            2,
+            graph=(128.0 * MB, 128.0 * MB, 128.0 * MB),
+            eager=(128.0 * MB, 128.0 * MB, 128.0 * MB),
+        ),
+        3: config(
+            3,
+            graph=(19.625 * MB, 19.625 * MB, 128.0 * MB),
+            eager=(39.188 * MB, 39.188 * MB, 128.0 * MB),
+        ),
+        4: config(
+            4,
+            graph=(6.938 * MB, 6.938 * MB, 128.0 * MB),
+            eager=(9.812 * MB, 9.812 * MB, 128.0 * MB, Range(9.812 * MB, 128 * MB)),
+        ),
+        5: config(
+            5,
+            graph=(6.938 * MB, 6.938 * MB, 128.0 * MB, Range(6.938 * MB, 128 * MB)),
+            eager=(6.938 * MB, 6.938 * MB, 128.0 * MB, Range(6.938 * MB, 128 * MB)),
+        ),
+        6: config(
+            6,
+            graph=(4.875 * MB, 4.875 * MB, 128.0 * MB, Range(4.875 * MB, 128 * MB)),
+            eager=(4.875 * MB, 4.875 * MB, 128.0 * MB, Range(4.875 * MB, 128 * MB)),
+        ),
+        7: config(
+            7,
+            graph=(3.438 * MB, 3.438 * MB, 128.0 * MB, Range(3.438 * MB, 128 * MB)),
+            eager=(3.438 * MB, 3.438 * MB, 128.0 * MB, Range(3.438 * MB, 128 * MB)),
+        ),
+        8: config(
+            8,
+            graph=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            eager=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+        ),
+        16: config(
+            16,
+            graph=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            eager=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+        ),
+    }
+
+
 # SM90 (Hopper, H100/H200). Tuned on H200.
 @cache
 def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
@@ -223,11 +281,13 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 
 @cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
-    cuda_major, _ = torch.cuda.get_device_capability()
+    cuda_major, cuda_minor = torch.cuda.get_device_capability()
     num_sm = torch.cuda.get_device_properties().multi_processor_count
     if cuda_major == 9:
         return _sm90_configs(num_sm)
     if cuda_major == 10:
+        if cuda_minor >= 7:
+            return _sm107_configs(num_sm)
         return _sm100_configs(num_sm)
 
     default = AllReduceConfig(
@@ -249,7 +309,7 @@ def get_supported_world_sizes() -> tuple[int, ...]:
 def get_all_reduce_config(world_size: int) -> AllReduceConfig:
     """Tuned thresholds and block counts for the current arch / world size.
 
-    Only SM90 and SM100 are benchmarked so far; other archs get a
+    Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
     conservative default (1 MB one-shot crossovers, no multicast).
     """
     return _get_all_reduce_configs()[world_size]

@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
+    VDNHybridAttentionArchConfig,
+)
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
@@ -13,6 +16,8 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     # H3 fuses Q/K/V, so split projections are stacked for the fused LoRA layer
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^model\.diffusion_model\.(.*)$": r"\1",
+            r"^(.*)\.weight_scale$": r"\1.weight_scale_inv",
             r"^(.*\.lora_[AB])\.[^.]+$": r"\1",
             r"^base_model\.model\.(.*\.lora_[AB])$": r"\1",
             r"^transformer\.(.*\.lora_[AB])$": r"\1",
@@ -21,11 +26,14 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
             r"^context_embedder\.(.*)$": r"condition_proj.\1",
             r"^time_embedder\.linear_1\.(.*)$": r"time_embedder.proj_in.\1",
             r"^time_embedder\.linear_2\.(.*)$": r"time_embedder.proj_out.\1",
+            r"^time_embedder\.table$": r"adaln_t_table",
             r"^norm_out\.norm\.(.*)$": r"final_layer.norm.\1",
+            r"^norm_out\.folded_bias$": r"final_layer.adaln_proj.linear.bias",
             r"^norm_out\.linear\.(.*)$": r"final_layer.adaln_proj.linear.\1",
             r"^proj_out\.(.*)$": r"final_layer.video_out.\1",
             r"^audio_proj_out\.(.*)$": r"final_layer.audio_out.\1",
             r"^transformer_blocks\.(\d+)\.adaln_proj\.linear\.(.*)$": r"blocks.\1.adaln_proj.linear.\2",
+            r"^transformer_blocks\.(\d+)\.adaln_proj\.folded_bias$": r"blocks.\1.adaln_proj.linear.bias",
             r"^transformer_blocks\.(\d+)\.attn\.to_q\.(.*)$": (
                 r"blocks.\1.attn.qkv_proj.\2",
                 0,
@@ -42,6 +50,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
                 3,
             ),
             r"^transformer_blocks\.(\d+)\.attn\.to_out\.0\.(.*)$": r"blocks.\1.attn.out_proj.\2",
+            r"^transformer_blocks\.(\d+)\.attn\.to_gate_compress\.(.*)$": r"blocks.\1.attn.to_gate_compress.\2",
+            # VDN-H3 hybrid attention module (see minimax_h3_vdn_attention)
+            r"^transformer_blocks\.(\d+)\.attn\.(linear_attention|softmax_gate|to_out_linear)\.(.*)$": r"blocks.\1.attn.hybrid.\2.\3",
             r"^transformer_blocks\.(\d+)\.attn\.norm_q\.(.*)$": r"blocks.\1.attn.q_norm.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_k\.(.*)$": r"blocks.\1.attn.k_norm.\2",
             r"^transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.(.*)$": r"blocks.\1.mlp.fc1.\2",
@@ -94,6 +105,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
     checkpoint_uses_diffusers_layout: bool = False
+    adaln_affine_input_dim: int | None = None
+    has_gate_compress: bool = False
+    # VDN-H3: None for the dense model; set from transformer/config.json
+    hybrid_attention: VDNHybridAttentionArchConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -102,6 +117,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         if len(self.patch_size) != 3:
             raise ValueError(f"patch_size must have 3 values, got {self.patch_size}.")
         self.num_channels_latents = self.latents_dim
+        if isinstance(self.hybrid_attention, dict):
+            self.hybrid_attention = VDNHybridAttentionArchConfig.from_transform_config(
+                self.hybrid_attention
+            )
 
 
 @dataclass
@@ -118,9 +137,19 @@ class MiniMaxH3DiTConfig(DiTConfig):
             "time_embed_hidden_dim": "time_embed_hidden_size",
             "rope_freq_dim": "rope_inv_freq_len",
         }
-        super().update_model_arch(
-            {aliases.get(key, key): value for key, value in source_model_dict.items()}
-        )
+        model_dict = {
+            aliases.get(key, key): value for key, value in source_model_dict.items()
+        }
+        if source_model_dict.get("_class_name") == "MiniMaxH3PrunedTransformer3DModel":
+            model_dict["adaln_affine_input_dim"] = source_model_dict["time_embed_dim"]
+            model_dict["time_embed_dim"] = source_model_dict["adaln_rank"]
+            model_dict["adaln_curve_grid"] = source_model_dict["time_table_size"]
+        hybrid = model_dict.get("hybrid_attention")
+        if isinstance(hybrid, dict):
+            model_dict["hybrid_attention"] = (
+                VDNHybridAttentionArchConfig.from_transform_config(hybrid)
+            )
+        super().update_model_arch(model_dict)
 
 
 __all__ = [
