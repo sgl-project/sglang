@@ -228,9 +228,20 @@ async fn precise_differences_invalid_responses_and_instability_remain_distinct()
     let summary = ReportView::new(&report, &report.directory)
         .terminal(None, false)
         .unwrap();
-    assert!(summary.contains("Python is missing fields present in Rust"));
-    assert!(summary.contains("Field types differ"));
-    assert!(summary.contains("response policy rejected the response without diagnostics"));
+    assert!(summary.contains("missing in Python"));
+    assert!(summary.contains("type mismatches"));
+    assert!(summary.contains("a required response failed validation"));
+    for case in &report.cases {
+        let block = summary
+            .split("\n\n")
+            .find(|block| block.starts_with(&format!("{} · ", case.name)))
+            .unwrap();
+        assert_eq!(block.lines().count(), 5, "{block}");
+    }
+    let detail = ReportView::new(&report, &report.directory)
+        .terminal(Some(&report.cases[3].name), false)
+        .unwrap();
+    assert!(detail.contains("response policy rejected the response without diagnostics"));
     // Reuse the captured results to check each exit category without masking by others.
     let cases = std::mem::take(&mut report.cases);
     for (case, expected) in cases.iter().zip([1, 1, 2, 1]) {
