@@ -73,6 +73,11 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import (
+    get_local_dp_buffer_len,
+    set_local_dp_buffer_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -816,10 +821,6 @@ class DeepseekV4HipRadixBackend(
                 raise NotImplementedError(
                     "decoder SWA bounded replay is not wired for unified_kv_triton"
                 )
-            if get_parallel().attn_cp_size != 1:
-                raise NotImplementedError(
-                    "decoder SWA bounded replay on HIP does not support attention CP"
-                )
         # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         self.encoder_replay = False
@@ -968,6 +969,14 @@ class DeepseekV4HipRadixBackend(
         if cp_metadata is not None:
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
             out_cache_loc = out_cache_loc[:num_tokens]
+            if (
+                swa_replay_start is not None
+                and swa_replay_start.shape[0] < padded_num_tokens
+            ):
+                swa_replay_start = torch.nn.functional.pad(
+                    swa_replay_start,
+                    (0, padded_num_tokens - swa_replay_start.shape[0]),
+                )
 
         # extend_start_loc and the CPU mirrors below only feed the torch
         # fallback; the triton kernel cumsums extend_seq_lens on device, so
@@ -1871,8 +1880,6 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> DSV4Metadata:
-        from sglang.srt.layers.cp.utils import is_cp_active
-
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_seq_lens = forward_batch.extend_seq_lens
         assert (
@@ -1900,6 +1907,8 @@ class DeepseekV4HipRadixBackend(
         )
 
     # ---- decoder SWA bounded replay ---------------------------------------
+
+    _late_layer_tail_cp_layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout
 
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch
@@ -1932,6 +1941,11 @@ class DeepseekV4HipRadixBackend(
         )
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         num_tokens = sum(tail_lens_cpu)
+        cp_tail = (
+            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            if is_cp_active(forward_batch)
+            else None
+        )
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=int(seq_lens_cpu.max().item()),
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1943,6 +1957,7 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens_cpu=tail_lens_cpu,
             extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
             swa_replay_start=swa_replay_start,
+            cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
         window_layout = metadata.core_attn_metadata.request_window_layout
         swa_out_cache_loc = (
@@ -1964,14 +1979,28 @@ class DeepseekV4HipRadixBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-        metadata.late_layer_tail = LateLayerTail(
-            token_indices=token_indices,
-            positions=positions,
-            extend_seq_lens=tail_lens,
-            extend_seq_lens_cpu=tail_lens_cpu,
-            swa_out_cache_loc=swa_out_cache_loc,
-            contiguous_start=contiguous_start,
-        )
+        if cp_tail is None:
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=token_indices,
+                positions=positions,
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                contiguous_start=contiguous_start,
+            )
+        else:
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=cp_tail["local_token_indices"],
+                positions=cp_tail["local_positions"],
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                pad_rows=cp_tail["pad_rows"],
+                cp_metadata=cp_tail["cp_metadata"],
+                local_lens_cpu=cp_tail["local_lens_cpu"],
+                req_global=metadata.low_ratio_req_indices,
+                pos_global=metadata.low_ratio_pos_i64,
+            )
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
 
@@ -1980,12 +2009,22 @@ class DeepseekV4HipRadixBackend(
         return value. Each request's candidate mask is cut to its tail rows."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
-        saved = (self.forward_metadata, self.candidate_masks)
+        saved = (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            get_local_dp_buffer_len(),
+        )
         tail = tail_metadata.late_layer_tail
+        tail_lens_cpu = (
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
+        )
         if isinstance(self.candidate_masks, list) and self.candidate_masks:
             self.candidate_masks = [
                 _candidate_tail_rows(mask, t)
-                for mask, t in zip(self.candidate_masks, tail.extend_seq_lens_cpu)
+                for mask, t in zip(self.candidate_masks, tail_lens_cpu)
             ]
         # the consumers after the switch read the tail buffers, so carry the last source's rows over
         full_core = saved[0].core_attn_metadata
@@ -2007,15 +2046,27 @@ class DeepseekV4HipRadixBackend(
             ):
                 if full_buf is None or tail_buf is None:
                     continue
-                tail_buf.copy_(tail.real_rows(full_buf))
+                rows = tail.real_rows(full_buf)
+                tail_buf[: rows.shape[0]].copy_(rows)
+                if tail.pad_rows:
+                    tail_buf[rows.shape[0] :].fill_(0 if tail_buf.ndim == 1 else -1)
         self.forward_metadata = tail_metadata
         window = getattr(self.token_to_kv_pool, "request_window", None)
         if window is not None:
             window.activate(tail_core.request_window_layout)
+        if tail.cp_metadata is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+            set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
-        self.forward_metadata, self.candidate_masks = saved
+        (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.attn_cp_metadata,
+            local_dp_buffer_len,
+        ) = saved
+        set_local_dp_buffer_len(local_dp_buffer_len)
         window = getattr(self.token_to_kv_pool, "request_window", None)
         if window is not None:
             window.activate(
