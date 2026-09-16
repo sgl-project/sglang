@@ -633,6 +633,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     ngram_history: Optional[torch.Tensor] = None
 
+    # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
+    # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
+    ngram_history: Optional[torch.Tensor] = None
+
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
