@@ -236,7 +236,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIsNone(converted.bootstrap_port)
         self.assertIsNone(converted.bootstrap_room)
 
-
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
             [
