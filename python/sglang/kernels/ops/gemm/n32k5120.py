@@ -1,10 +1,7 @@
 """Decode-batch bf16 GEMM for ``x[m, 5120] @ w[32, 5120].T``.
 
-Each CTA prefetches one weight row before the PDL wait. Row groups map to
-blockIdx.y, keeping per-CTA work independent of batch size.
-The thread-to-K mapping and shared dot_product reduction match tiny_gemm_bf16,
-so results agree bitwise where both apply and are invariant to batch composition.
-cuBLAS uses a different reduction order. See ``gemm/small/n32k5120.cuh``.
+Shares dot_product_vec's reduction order with tiny_gemm_bf16 for bitwise parity;
+a row's result does not depend on the batch composition.
 """
 
 from __future__ import annotations
