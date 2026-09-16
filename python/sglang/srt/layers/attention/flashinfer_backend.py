@@ -1069,6 +1069,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device="cuda",
             )
+            self.cuda_graph_swa_custom_mask = None
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -1104,17 +1105,33 @@ class FlashInferAttnBackend(AttentionBackend):
             wrappers = self.decode_cuda_graph_metadata[bs]
         return wrappers
 
-    def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
+    def _create_prefill_wrappers(
+        self,
+        bs: int,
+        use_custom_mask: bool = False,
+        use_eagle_swa_mask: bool = False,
+    ) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
         # `custom_mask_buf` is initialized (not whether a custom mask is provided).
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
         # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
         # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+        separate_swa_mask = use_custom_mask and use_eagle_swa_mask
+        if separate_swa_mask and self.cuda_graph_swa_custom_mask is None:
+            # Allocate only when a SWA custom-mask wrapper is actually captured.
+            # Its packed mask must survive planning the full-attention wrapper.
+            self.cuda_graph_swa_custom_mask = torch.empty_like(
+                self.cuda_graph_custom_mask
+            )
         wrappers = []
         for i in range(self.num_wrappers):
             extra = (
                 {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "custom_mask_buf": (
+                        self.cuda_graph_swa_custom_mask
+                        if separate_swa_mask and i == 0
+                        else self.cuda_graph_custom_mask
+                    ),
                     "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
                 }
                 if use_custom_mask
@@ -1262,7 +1279,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+            prefill_wrappers = self._create_prefill_wrappers(
+                bs,
+                use_custom_mask,
+                use_eagle_swa_mask=(
+                    self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                    and spec_info is not None
+                    and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+                ),
+            )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
@@ -2172,7 +2197,14 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+            # The SWA updater binds wrapper 0 to this indptr buffer; offsets
+            # alone cannot identify it (cross-attention also has offsets).
+            eagle_swa = (
+                self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                and kv_indptr is self.kv_indptr[0]
+                and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            )
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY or eagle_swa:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
                         req_pool_indices,

@@ -12,6 +12,44 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 logger = logging.getLogger(__name__)
 
 
+@torch.compile(dynamic=True)
+def apply_eagle_swa_mask(
+    mask: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    positions: torch.Tensor,
+    window: int,
+):
+    """Apply tree-position window bounds to an already compact tree mask.
+
+    Only the first draft-token-count prefix columns can leave the window.
+    A window smaller than the tree also needs the draft columns checked.
+    This touches O(batch * draft_tokens**2) cells, independent of context length.
+    """
+    _, draft_tokens = positions.shape
+    prefix = prefix_lens.clamp(max=window)
+    width = prefix + draft_tokens
+    starts = (width.cumsum(0) - width) * draft_tokens
+    q = torch.arange(draft_tokens, device=mask.device)
+    span = draft_tokens if window >= draft_tokens else window + draft_tokens
+    columns = torch.minimum(
+        torch.arange(span, device=mask.device)[None, :], width[:, None] - 1
+    )
+    tree_columns = (columns - prefix[:, None]).clamp(0, draft_tokens - 1)
+    key_positions = torch.where(
+        columns < prefix[:, None],
+        prefix_lens[:, None] - prefix[:, None] + columns,
+        positions.gather(1, tree_columns.long()),
+    )
+    indices = (
+        starts[:, None, None]
+        + q[None, :, None] * width[:, None, None]
+        + columns[:, None, :]
+    )
+    mask[indices] = mask[indices] & (
+        key_positions[:, None, :] >= positions[:, :, None] - window
+    )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -33,6 +71,10 @@ class EagleVerifyInput(SpecInput):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+
+    # Compact tree mask with logical-position bounds for SWA verify layers.
+    swa_custom_mask: Optional[torch.Tensor] = None
+    swa_mask_window: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -85,6 +127,7 @@ class EagleVerifyInput(SpecInput):
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
     ):
         device = req_pool_indices.device
         batch_size = len(req_pool_indices)
@@ -112,7 +155,7 @@ class EagleVerifyInput(SpecInput):
             req_pool_indices,
             paged_kernel_lens,
             cum_kv_seq_len,
-            None,
+            kv_start_idx,
             kv_indices,
             req_to_token.size(1),
         )
@@ -120,13 +163,15 @@ class EagleVerifyInput(SpecInput):
             paged_kernel_lens_sum * self.draft_token_num
             + (self.draft_token_num**2) * batch_size
         )
-        if self.custom_mask.numel() < mask_numel:
+        use_swa_mask = kv_start_idx is not None and self.swa_custom_mask is not None
+        custom_mask = self.swa_custom_mask if use_swa_mask else self.custom_mask
+        if custom_mask.numel() < mask_numel:
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
-            self.custom_mask = torch.cat(
+            custom_mask = torch.cat(
                 [
-                    self.custom_mask,
+                    custom_mask,
                     torch.full(
-                        (mask_numel - self.custom_mask.numel(),),
+                        (mask_numel - custom_mask.numel(),),
                         True,
                         dtype=torch.bool,
                         device=device,
@@ -135,6 +180,10 @@ class EagleVerifyInput(SpecInput):
                 dim=0,
             )
 
+        if use_swa_mask:
+            return kv_indices, cum_kv_seq_len, qo_indptr, custom_mask[:mask_numel]
+        # Preserve the original full-mask padding and return contract.
+        self.custom_mask = custom_mask
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
 
