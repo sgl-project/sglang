@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -131,6 +132,72 @@ class TestEngramPrefetch(unittest.TestCase):
                         other_output, engram.project(other_ids), rtol=0, atol=0
                     )
                 torch.cuda.synchronize()
+
+    @torch.inference_mode()
+    def test_vision_model_prefetch_preserves_image_rows_on_replay(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import deepseek_v4
+
+        engram = self._make_engram(Fp8GemmRunnerBackend.AUTO)
+        hidden = torch.randn(1, 4, 128, device="cuda", dtype=torch.bfloat16)
+        ids = torch.randint(0, 128, (1, 1, 8), device="cuda")
+        input_ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+        positions = torch.zeros_like(input_ids)
+        layer = SimpleNamespace(
+            engram=engram,
+            hc_boundary_fused=False,
+            forward_hc_pre_from_prev=lambda **kw: (kw["hidden_states"], None),
+        )
+        model = SimpleNamespace(
+            pp_group=SimpleNamespace(world_size=1),
+            config=SimpleNamespace(
+                model_type="deepseek_v41", vision_n_layers=32, image_token_id=42
+            ),
+            engram_hasher=lambda *_: ids,
+            engram_prefetch_stream=torch.cuda.Stream(),
+            late_layer_start=None,
+            start_layer=14,
+            end_layer=15,
+            layers=[None] * 14 + [layer],
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
+
+        def forward():
+            return deepseek_v4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
+                model, positions, hidden, batch, input_ids, input_ids, False, []
+            )[0]
+
+        with (
+            patch.object(deepseek_v4, "is_cp_active", return_value=False),
+            patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                deepseek_v4,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            for fused in (False, True):
+                with (
+                    self.subTest(fused=fused),
+                    envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.override(fused),
+                ):
+                    for _ in range(3):
+                        forward()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        output = forward()
+                    for token in (7, 42, 13, 42):
+                        hidden.normal_()
+                        ids.random_(0, 128)
+                        input_ids.fill_(token)
+                        graph.replay()
+                        expected = hidden if token == 42 else engram(hidden, ids[:, 0])
+                        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
