@@ -16,6 +16,7 @@ mod test_kv;
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sgl_kv_indexer::pb::{
@@ -126,8 +127,40 @@ macro_rules! require_valkey {
 
 // ---- the pair harness ---------------------------------------------------------
 
+/// The in-memory backend's placements fed through the trait's default prefix
+/// path (no fast path), to tell a fast-path drift from a placement drift.
+struct DefaultViaMemory(Arc<InMemoryKvIndexerBackend>);
+
+#[tonic::async_trait]
+impl KvIndexerBackend for DefaultViaMemory {
+    async fn apply_external_kv_batch(
+        &self,
+        request: ApplyExternalKvBatchRequest,
+    ) -> Result<sgl_kv_indexer::pb::ApplyExternalKvBatchResponse, tonic::Status> {
+        self.0.apply_external_kv_batch(request).await
+    }
+    async fn match_external_kv(
+        &self,
+        request: MatchExternalKvRequest,
+    ) -> Result<MatchExternalKvResponse, tonic::Status> {
+        self.0.match_external_kv(request).await
+    }
+    async fn collect_worker_prefix_inputs(
+        &self,
+        hashes: &[i64],
+    ) -> Result<Vec<sgl_kv_indexer::WorkerPrefixInput>, tonic::Status> {
+        self.0.collect_worker_prefix_inputs(hashes).await
+    }
+    async fn get_external_kv_hit_counts(
+        &self,
+        request: GetExternalKvHitCountsRequest,
+    ) -> Result<sgl_kv_indexer::pb::GetExternalKvHitCountsResponse, tonic::Status> {
+        self.0.get_external_kv_hit_counts(request).await
+    }
+}
+
 struct Pair {
-    memory: InMemoryKvIndexerBackend,
+    memory: Arc<InMemoryKvIndexerBackend>,
     valkey: ValkeyKvIndexerBackend,
 }
 
@@ -182,7 +215,7 @@ fn normalize_prefix(resp: &MatchExternalKvPrefixResponse) -> (u32, Vec<(String, 
 impl Pair {
     async fn new(server: &ValkeyServer) -> Self {
         Self {
-            memory: InMemoryKvIndexerBackend::new(),
+            memory: Arc::new(InMemoryKvIndexerBackend::new()),
             valkey: server.backend(&fresh_prefix()).await,
         }
     }
@@ -226,11 +259,29 @@ impl Pair {
             .await
             .unwrap();
         let actual = self.valkey.match_external_kv_prefix(req).await.unwrap();
-        assert_eq!(
-            normalize_prefix(&expected),
-            normalize_prefix(&actual),
-            "prefix differs for {hashes:?}"
-        );
+        if normalize_prefix(&expected) != normalize_prefix(&actual) {
+            let probe = MatchExternalKvRequest {
+                hashes: hashes.to_vec(),
+                count_as_hit: false,
+            };
+            let mem = self.memory.match_external_kv(probe.clone()).await.unwrap();
+            let val = self.valkey.match_external_kv(probe).await.unwrap();
+            let default_path = DefaultViaMemory(Arc::clone(&self.memory))
+                .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                    hashes: hashes.to_vec(),
+                    max_blocks,
+                })
+                .await
+                .unwrap();
+            panic!(
+                "prefix differs for {hashes:?} (max_blocks={max_blocks})\n memory fast path: {:?}\n memory default path: {:?}\n valkey: {:?}\n memory placements: {:?}\n valkey placements: {:?}",
+                normalize_prefix(&expected),
+                normalize_prefix(&default_path),
+                normalize_prefix(&actual),
+                normalize_match(&mem),
+                normalize_match(&val)
+            );
+        }
     }
 
     async fn assert_hits(&self, hashes: &[i64]) {
@@ -699,7 +750,7 @@ async fn hit_counts_follow_placements() {
 async fn valkey_state_survives_server_restart_and_is_shared() {
     let server = require_valkey!();
     let prefix = fresh_prefix();
-    let memory = InMemoryKvIndexerBackend::new();
+    let memory = Arc::new(InMemoryKvIndexerBackend::new());
     let chain: Vec<i64> = (300..308).collect();
 
     let first = server.backend(&prefix).await;
@@ -759,6 +810,78 @@ async fn valkey_blocks_read_matches_reference_on_first_miss_and_cap() {
         .unwrap();
     assert_eq!(capped.blocks_read, 2);
     assert_eq!(capped.best_prefix_blocks, 2);
+}
+
+/// Block and children records must disappear once every placement is revoked,
+/// including a block reported and revoked in the same batch (its parent edge is
+/// written by that batch, so the prune must remove it from the parent's set).
+/// Otherwise the keyspace leaks one record per prefix ever seen.
+#[tokio::test]
+async fn valkey_prunes_every_block_record_after_full_revoke() {
+    let server = require_valkey!();
+    let prefix = fresh_prefix();
+    let backend = server.backend(&prefix).await;
+    let chain: Vec<i64> = (400..410).collect();
+
+    backend
+        .apply_external_kv_batch(report_with_parent(
+            "a",
+            "http://a",
+            hbm(),
+            None,
+            &chain[..5],
+        ))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(apply_request(
+            "a",
+            "http://a",
+            2,
+            vec![
+                action_with_parent(
+                    ExternalKvActionType::ActionReport,
+                    hbm(),
+                    Some(chain[4]),
+                    &chain[5..],
+                ),
+                action(ExternalKvActionType::ActionRevoke, hbm(), &chain[5..]),
+            ],
+        ))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(report_with_parent(
+            "b",
+            "http://b",
+            dram(),
+            None,
+            &chain[..2],
+        ))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(clear("a", "http://a", hbm()))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(revoke("b", "http://b", dram(), &chain[..2]))
+        .await
+        .unwrap();
+
+    let client = redis::Client::open(server.url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{prefix}*"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![format!("{prefix}w:a"), format!("{prefix}w:b")],
+        "only worker records may remain"
+    );
 }
 
 // ---- randomized parity ----------------------------------------------------------
