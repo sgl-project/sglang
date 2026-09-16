@@ -11,16 +11,14 @@ fusing silu+mul into the quant, not from the GEMM).
 The names and the threshold are aiter-tuned, so they live with the model rather
 than in quark.
 
-A note on why the format matters more than the layer list here. Measured on gsm8k
-against a 0.936 bf16 base, MXFP4 on these same four projections scored 0.851 with
-8.9% of outputs unparseable, and a per-projection ablation put nearly all of that
-on ``qkv_proj``: -3.0 points alone, -5.3 marginal on top of the other three, and
-the sole cause of the invalid-output spike. Its doubled Q block is half attention
-output gate under ``attn_output_gate``, so the error lands on a gate rather than a
-plain projection -- while the GDN ``z`` gate inside ``in_proj_qkvz`` turned out
-almost free. MXFP6's ~4% relative error against MXFP4's ~16% is what makes all
-four safe (0.937, i.e. no regression), which is why ``--dense-mx-format`` defaults
-to mxfp6 and mxfp4 is kept only so the trade stays measurable.
+``qkv_proj`` is in the list only because the format is MXFP6. At MXFP4's ~16%
+relative error a per-projection gsm8k ablation put almost all of the damage on
+that one layer -- -3.0 points alone, -5.3 marginal on top of the other three, and
+the sole cause of an 8.9% invalid-output rate -- because its doubled Q block is
+half attention output gate under ``attn_output_gate``, so the error lands on a
+gate rather than a plain projection. (The GDN ``z`` gate inside ``in_proj_qkvz``
+turned out almost free, so this is specific to the attention output gate.) At
+MXFP6's ~4% all four convert with no measurable cost.
 
 :func:`register` is a no-op off aiter or on a non-quark checkpoint, and the policy
 it hands over does nothing unless ``--enable-dense-mx`` is set, which is not the

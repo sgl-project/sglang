@@ -1,4 +1,4 @@
-"""Opt-in microscaling (MXFP6/MXFP4) for dense BF16 projections on gfx950.
+"""Opt-in MXFP6 for dense BF16 projections on gfx950.
 
 An MX checkpoint that quantizes only its routed experts leaves the rest of the
 body BF16, and aiter's tuned BF16 dispatch already serves those shapes with the
@@ -6,25 +6,16 @@ best BF16 kernel it has -- on Qwen3.5-397B's widest projections it reaches rough
 60% of the device's BF16 peak. Going faster therefore means narrower inputs rather
 than a different BF16 kernel.
 
-Which narrower format to use is an accuracy question, and on this model it is not
-close. Measured on the four widest projections at prefill token counts:
+MXFP6 rather than MXFP4 because CDNA4's matrix core runs both at the same rate
+(10.1 PFLOPS, against 5 for MXFP8), so MXFP6's two extra mantissa bits are free
+in peak terms. On these projections that is ~1.9x over tuned BF16 at ~4% relative
+error, where MXFP4 is ~2.6x at ~16% -- and ~16% cost 8.5 points of gsm8k with
+one output in eleven unparseable, while MXFP6 is accuracy-neutral.
 
-    format   speedup over tuned BF16   relative error   gsm8k
-    MXFP4    ~2.6x                     ~16%             -8.5 points, 8.9% invalid
-    MXFP6    ~1.9x                     ~4%              (see tests/campaign)
-    FP8      ~1.4x                     ~3.7%            n/a -- too slow to matter
-
-MXFP6 is the default because it reaches FP8's error at appreciably more speed
-than FP8 can manage here. CDNA4 is what makes that possible: the matrix core
-runs MXFP6 at the MXFP4 rate (10.1 PFLOPS each) while MXFP8 gets half (5), so
-the two extra mantissa bits over MXFP4 cost nothing in peak terms. MXFP4 stays
-selectable for measurement, but it is not a sensible production choice on this
-model.
-
-The BF16 weight stays live next to the packed copy, because these formats only
-win above roughly a thousand tokens: below that the GEMM is not compute-bound,
-the extra activation quantization dominates, and decode -- where a precision
-loss would compound across every step -- keeps running exactly as before.
+The BF16 weight stays live next to the packed copy, because MXFP6 only wins above
+roughly a thousand tokens: below that the GEMM is not compute-bound, the extra
+activation quantization dominates, and decode -- where a precision loss would
+compound across every step -- keeps running exactly as before.
 
 Nothing here decides *which* layers to convert. A model registers its own policy
 (which projections, minimum width, token threshold) and quark routes matching
@@ -40,53 +31,34 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.gemm import mxfp6_dense_aiter_hip as mxfp6
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 logger = logging.getLogger(__name__)
 
-# Formats this method can install, cheapest-error-first. Both adapters expose the
-# same supported/packable/pack/run surface so the method body is format-agnostic.
-MX_DENSE_FORMATS = ("mxfp6", "mxfp4")
-MX_DENSE_DEFAULT_FORMAT = "mxfp6"
-
-# One line per process, so a server log shows whether the path is live, in which
-# format, and the threshold it uses. Which projections were chosen is the
-# caller's to report.
+# One line per process, so a server log shows whether the path is live and the
+# threshold it uses. Which projections were chosen is the caller's to report.
 _announced = False
 
 
-def _adapter(fmt: str):
-    if fmt == "mxfp6":
-        from sglang.kernels.ops.gemm import mxfp6_dense_aiter_hip as mod
-    elif fmt == "mxfp4":
-        from sglang.kernels.ops.gemm import mxfp4_dense_aiter_hip as mod
-    else:
-        raise ValueError(
-            f"unknown dense MX format {fmt!r}; pick from {list(MX_DENSE_FORMATS)}"
-        )
-    return mod
-
-
-def mx_dense_supported(fmt: str) -> bool:
-    """Whether this device has the kernels for ``fmt``; raises on an unknown name."""
-    return _adapter(fmt).supported()
+def mx_dense_supported() -> bool:
+    """Whether this device has the MXFP6 kernels at all."""
+    return mxfp6.supported()
 
 
 class MxDenseLinearMethod(UnquantizedLinearMethod):
-    """BF16 linear that switches to a microscaling format once tokens make it pay.
+    """BF16 linear that switches to MXFP6 once the token count makes it pay.
 
     Weight creation and loading are the base method's, so the checkpoint still
     loads as BF16 and every consumer that reads ``layer.weight`` keeps working.
     ``apply_into`` is deliberately not overridden: it writes into caller-owned
-    storage, which these GEMMs cannot do without an extra copy that would eat
-    the win.
+    storage, which this GEMM cannot do without an extra copy that would eat the
+    win.
     """
 
-    def __init__(self, fmt: str, min_tokens: int):
+    def __init__(self, min_tokens: int):
         super().__init__()
-        self.fmt = fmt
         self.min_tokens = min_tokens
-        self._mx = _adapter(fmt)
         self._packed: Optional[torch.Tensor] = None
         self._scale: Optional[torch.Tensor] = None
         self._out_features: Optional[int] = None
@@ -94,9 +66,8 @@ class MxDenseLinearMethod(UnquantizedLinearMethod):
         if not _announced:
             _announced = True
             logger.info(
-                "Dense %s is enabled for forward passes of at least %d tokens; "
+                "Dense MXFP6 is enabled for forward passes of at least %d tokens; "
                 "the BF16 weights stay live for everything below that.",
-                fmt.upper(),
                 min_tokens,
             )
 
@@ -105,11 +76,11 @@ class MxDenseLinearMethod(UnquantizedLinearMethod):
         if self._packed is not None:
             return
         weight = getattr(layer, "weight", None)
-        if weight is None or not self._mx.packable(weight.data):
+        if weight is None or not mxfp6.packable(weight.data):
             # Leaving the packed buffers unset keeps this layer on BF16 forever.
             return
         self._out_features = weight.shape[0]
-        self._packed, self._scale = self._mx.pack(weight.data)
+        self._packed, self._scale = mxfp6.pack(weight.data)
 
     def _use_mx(self, x: torch.Tensor) -> bool:
         return (
@@ -129,5 +100,5 @@ class MxDenseLinearMethod(UnquantizedLinearMethod):
     ) -> torch.Tensor:
         if not self._use_mx(x):
             return super().apply(layer, x, bias)
-        out = self._mx.run(x, self._packed, self._scale, self._out_features)
+        out = mxfp6.run(x, self._packed, self._scale, self._out_features)
         return out if bias is None else out.add_(bias)
