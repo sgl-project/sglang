@@ -1271,6 +1271,26 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
+# Matched per dotted component, so `final_layernorm` and friends stay clear.
+IMAGE_GENERATION_HEAD_RE = re.compile(r"(?:x_embedder|t_embedder|final_layer)\d*")
+
+
+# HiDream-O1-Image ships a stock qwen3_vl config and declares this architecture, but
+# bolts a flow-matching pixel head onto the backbone. load_weights drops names it has
+# no parameter for, so without this the server starts clean and then answers empty.
+def check_not_image_generation_head(name: str) -> None:
+    if not any(IMAGE_GENERATION_HEAD_RE.fullmatch(part) for part in name.split(".")):
+        return
+    raise ValueError(
+        f"Weight '{name}' belongs to a pixel-level image-generation head. This "
+        "checkpoint (e.g. HiDream-ai/HiDream-O1-Image) only borrows the Qwen3-VL "
+        "architecture string and generates images rather than text, so it cannot be "
+        "loaded as Qwen3-VL. Serve it with the diffusion runtime instead, e.g. "
+        "`sglang serve --model-path HiDream-ai/HiDream-O1-Image`; that dispatch keys "
+        "off the model path, so keep the checkpoint's original directory name."
+    )
+
+
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -1676,6 +1696,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            check_not_image_generation_head(name)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "language_model" in name:

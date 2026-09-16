@@ -114,6 +114,12 @@ export const DiffusionModelCatalog = ({ category }) => {
       note: "Resolved by the GLM-Image family detector.",
     },
     {
+      name: "HiDream-O1-Image",
+      modelIds: ["HiDream-ai/HiDream-O1-Image"],
+      cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+      note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
+    },
+    {
       name: "Hunyuan3D 2",
       modelIds: ["tencent/Hunyuan3D-2"],
     },
