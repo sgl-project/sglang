@@ -1164,7 +1164,8 @@ class KVCacheConfigurator:
             # case above: None => the pool skips SpeculativeState).
             speculative_num_draft_tokens=(
                 None
-                if get_disagg().disaggregation_mode == "prefill" and not _is_npu
+                if get_disagg().disaggregation_mode == "prefill"
+                and not (_is_npu and kimi_linear_config(self.model_config) is not None)
                 else max_speculative_num_draft_tokens()
             ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
