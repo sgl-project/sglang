@@ -398,10 +398,11 @@ class TokenizerControlMixin:
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
-        result = (await self.profile_communicator(req))[0]
-        if not result.success:
-            raise RuntimeError(result.message)
-        return result
+        results = await self.profile_communicator(req)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise RuntimeError(message)
+        return results[0]
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
