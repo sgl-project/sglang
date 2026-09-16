@@ -185,6 +185,55 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
 
         self.assertEqual((normal, calls), ("", []))
 
+    def test_stray_prose_inside_invoke_is_ignored(self):
+        """Prose around the parameter tags cannot hide a lost argument, so the
+        call is still emitted, matching the one-shot parser and the previous
+        streaming behavior."""
+        text = _wrapped(
+            _invoke(
+                "get_weather",
+                "thinking aloud\n" + _param("city", "true", "SF") + "\nnote to self",
+            )
+        )
+
+        for width in (4, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                self.assertEqual(normal, "")
+                self.assertEqual(
+                    [(call.name, call.parameters) for call in calls],
+                    [("get_weather", '{"city": "SF"}')],
+                )
+
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [(call.name, call.parameters) for call in result.calls],
+            [("get_weather", '{"city": "SF"}')],
+        )
+
+    def test_closed_invoke_rejects_unmatched_parameter_tag(self):
+        """Leftover text containing a DSML fragment is a parameter that failed
+        to match; the call is dropped rather than emitted without it."""
+        bodies = {
+            "missing string attr": f'<{DSML}parameter name="city">SF</{DSML}parameter>',
+            "self-closing": f'<{DSML}parameter name="city" string="true"/>',
+            "unclosed after valid": _param("city", "true", "SF")
+            + f'<{DSML}parameter name="units" string="true">C',
+        }
+        for label, body in bodies.items():
+            with self.subTest(label=label):
+                normal, calls = self._feed([_wrapped(_invoke("get_weather", body))])
+                self.assertEqual((normal, calls), ("", []))
+
+    def test_closed_invoke_rejects_body_without_parameters(self):
+        text = _wrapped(_invoke("get_weather", "just prose, no parameters"))
+
+        normal, calls = self._feed([text])
+
+        self.assertEqual((normal, calls), ("", []))
+
     def test_closed_invoke_rejects_malformed_direct_json(self):
         text = _wrapped(_invoke("get_weather", '{"city": }'))
 
