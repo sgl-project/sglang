@@ -330,7 +330,7 @@ class TestFusedInplaceQKNorm:
         [(1, 1), (17, 1), (17, 2)],
         ids=["decode-tp1", "prefill-tp1", "prefill-tp2"],
     )
-    def test_fused_inplace_qknorm_muse_glimmer(
+    def test_fused_inplace_qknorm(
         self, batch_size: int, tp_size: int, dtype: torch.dtype
     ):
         """Muse-Glimmer QKNorm must not write outside its in-place Q/K views."""
