@@ -1030,6 +1030,11 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer
             # can apply separate B projections for each.
