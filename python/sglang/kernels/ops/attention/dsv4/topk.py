@@ -137,13 +137,13 @@ def amax8_varlen(
 
 
 @cache_once
-def _jit_sort_idx_module():
+def _jit_candidate_block_table_module():
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        make_name("sort_idx"),
+        make_name("candidate_block_table"),
         *args,
-        cuda_files=["deepseek_v4/sort_idx.cuh"],
-        cuda_wrappers=[("transform", f"SortIdxKernel<{args}>::transform")],
+        cuda_files=["deepseek_v4/candidate_block_table.cuh"],
+        cuda_wrappers=[("transform", f"CandidateBlockTableKernel<{args}>::transform")],
     )
 
 
@@ -165,7 +165,9 @@ def sort_candidate_blocks(
     """
     if out_pages is None:
         out_pages = torch.empty_like(blocks)
-    _jit_sort_idx_module().transform(blocks, seq_lens, page_table, out_pages, page_size)
+    _jit_candidate_block_table_module().transform(
+        blocks, seq_lens, page_table, out_pages, page_size
+    )
     return out_pages
 
 
