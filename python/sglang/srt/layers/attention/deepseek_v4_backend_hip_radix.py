@@ -713,6 +713,7 @@ class DeepseekV4HipRadixBackend(
     # both children and leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
     # TboAttnBackend reads this to skip children in the *_graph paths only.
     tbo_supports_cuda_graph = False
+    supports_prefill_cuda_graph_max_context_size = True
     supports_ragged_verify_graph: bool = True
     # each bucket keeps one metadata object; the captured segments read the SWA store target by address
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
@@ -2004,13 +2005,29 @@ class DeepseekV4HipRadixBackend(
             )
         assert forward_batch.forward_mode.is_extend(), forward_batch.forward_mode
 
-    def _prefill_metadata_for_batch(self, forward_batch: ForwardBatch) -> DSV4Metadata:
+    def _prefill_metadata_for_batch(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        max_seq_len_override: Optional[int] = None,
+    ) -> DSV4Metadata:
         """The eager prefill build, for a capture batch or a live replay batch."""
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
+        actual_max_seq_len = int(seq_lens_cpu.max().item())
+        if max_seq_len_override is None:
+            max_seq_len_override = forward_batch.max_seq_len_override
+        max_seq_len = (
+            actual_max_seq_len if max_seq_len_override is None else max_seq_len_override
+        )
+        if actual_max_seq_len > max_seq_len:
+            raise ValueError(
+                "Prefill CUDA graph max context size is smaller than the "
+                f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+            )
         return self._init_forward_metadata_prefill_from_batch(
             forward_batch,
-            max_seq_len=int(seq_lens_cpu.max().item()),
+            max_seq_len=max_seq_len,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
@@ -2038,7 +2055,10 @@ class DeepseekV4HipRadixBackend(
         if static_forward_batch is None:
             static_forward_batch = forward_batch
         # break-time consumers read the live batch's eager build; the padded loc feeds only the target
-        live = self._prefill_metadata_for_batch(forward_batch)
+        live = self._prefill_metadata_for_batch(
+            forward_batch,
+            max_seq_len_override=static_forward_batch.max_seq_len_override,
+        )
         self.forward_metadata = live
         self.init_forward_metadata_in_graph(static_forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
