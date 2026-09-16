@@ -17,6 +17,38 @@ from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_lo
 
 logger = logging.getLogger(__name__)
 
+# Keys the model sometimes emits as a spurious wrapper around the real
+# parameter object, e.g. {"arguments": {...}} or {"input": "..."} instead of
+# the tool's declared properties. See sgl-project/sglang#38924.
+_WRAPPER_ARG_KEYS = ("arguments", "input")
+
+
+def _tool_property_names(tool: Tool | None) -> set[str]:
+    """Declared property names of a tool, or an empty set when unknown."""
+    params = tool.function.parameters if tool is not None else None
+    if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+        return set(params["properties"].keys())
+    return set()
+
+
+def _sole_tool_property(tool: Tool | None) -> str | None:
+    """The single property to remap a bare scalar onto: the only declared
+    property, else the only required one. None when the target is ambiguous."""
+    params = tool.function.parameters if tool is not None else None
+    if not isinstance(params, dict):
+        return None
+    props = params.get("properties")
+    if isinstance(props, dict) and len(props) == 1:
+        return next(iter(props))
+    required = params.get("required")
+    if (
+        isinstance(required, list)
+        and len(required) == 1
+        and isinstance(required[0], str)
+    ):
+        return required[0]
+    return None
+
 
 class DeepSeekV32Detector(BaseFormatDetector):
     """
@@ -185,6 +217,64 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return json.dumps(parameters, ensure_ascii=False)
 
+    def _unwrap_wrapped_arguments(self, params: dict, tool: Tool | None) -> dict:
+        """Undo a spurious ``{"arguments"/"input": ...}`` wrapper the model emits
+        around the real parameters (sgl-project/sglang#38924).
+
+        No-op unless the object is exactly one wrapper key that is not itself a
+        declared property. A dict value is unwrapped directly, a JSON-object
+        string is decoded first (the XML ``string="true"`` sub-case), and a bare
+        scalar is remapped onto the tool's sole property when unambiguous.
+        """
+        if not isinstance(params, dict) or len(params) != 1:
+            return params
+        ((key, value),) = params.items()
+        if key not in _WRAPPER_ARG_KEYS or key in _tool_property_names(tool):
+            return params
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                decoded = json.loads(value.strip())
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict):
+                return decoded
+        target = _sole_tool_property(tool)
+        if target is not None:
+            return {target: value}
+        return params
+
+    def _looks_like_wrapped_arguments(
+        self, invoke_content: str, tool: Tool | None
+    ) -> bool:
+        """Cheap pre-check on raw (possibly partial) invoke content, mirroring
+        ``_unwrap_wrapped_arguments``. Lets streaming hold a wrapped call back
+        until it is complete rather than emit the wrapped shape then rewrite it.
+        """
+        declared = _tool_property_names(tool)
+        content = invoke_content.strip()
+        if content.startswith("{"):
+            # First key as emitted so far; group(2) is the closing quote once
+            # the key name is complete. While it is still being written, hold
+            # back if it is a live prefix of a wrapper key -- streaming cannot
+            # yet tell "arguments" from a real "argument_list".
+            m = re.match(r'\{\s*"([^"]*)("?)', content)
+            if m is None:
+                return True
+            key, closed = m.group(1), m.group(2)
+            if closed:
+                return key in _WRAPPER_ARG_KEYS and key not in declared
+            return any(
+                w.startswith(key) and w not in declared for w in _WRAPPER_ARG_KEYS
+            )
+        names = re.findall(r'name="([^"]+)"\s+string=', content)
+        return (
+            len(names) == 1
+            and names[0] in _WRAPPER_ARG_KEYS
+            and names[0] not in declared
+        )
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -204,6 +294,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if not sections:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
+            tools_by_name = {t.function.name: t for t in tools if t.function.name}
+
             # Find all invoke blocks
             for function_calls_content in sections:
                 for invoke_match in re.finditer(
@@ -216,7 +308,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
-                        "parameters": json.loads(func_args),
+                        "parameters": self._unwrap_wrapped_arguments(
+                            json.loads(func_args), tools_by_name.get(func_name)
+                        ),
                     }
                     calls.extend(self.parse_base_json(match_result, tools))
 
@@ -262,6 +356,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Only recovered for the first call: the DSML guard above never releases a
         # buffer that still holds a marker, so later prose stays buffered.
         preamble = ""
+        tools_by_name = {t.function.name: t for t in tools if t.function.name}
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -312,6 +407,26 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_content, allow_partial=not is_tool_end
                 )
 
+                # A spurious {"arguments"/"input": ...} wrapper (#38924) is only
+                # rewritten once the invoke is complete; until then hold the
+                # call's arguments back rather than stream a wrapped prefix we
+                # would have to rewrite. Clients act on arguments only at
+                # finish_reason: tool_calls, so a single late chunk is safe.
+                wrapped = self._looks_like_wrapped_arguments(
+                    invoke_content, tools_by_name.get(func_name)
+                )
+                if wrapped and is_tool_end:
+                    try:
+                        current_params = json.dumps(
+                            self._unwrap_wrapped_arguments(
+                                json.loads(current_params),
+                                tools_by_name.get(func_name),
+                            ),
+                            ensure_ascii=False,
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
                 # 3. Calculate and send incremental arguments
                 sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
                 prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
@@ -320,7 +435,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 argument_diff = None
 
-                if is_tool_end:
+                if wrapped and not is_tool_end:
+                    argument_diff = None  # hold back until the wrapper resolves
+                elif is_tool_end:
                     # If complete, send everything remaining
                     argument_diff = current_params[sent_len:]
                 elif prev_params is not None:
