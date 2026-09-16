@@ -495,6 +495,7 @@ class WanTransformerBlock(nn.Module):
         self.hidden_dim = dim
         self.num_attention_heads = num_heads
         self.dim_head = dim // num_heads
+        self.use_offline_qk_rotation = False
 
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
