@@ -140,7 +140,7 @@ def _compare(got, expected, rows, ctx):
     )
 
 
-def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
+def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], out=None, **kw):
     """One `c2_decode_norm` call against the reference, returning the two pair states so
     callers can add their own assertions."""
     kv_input, kv_state, positions, req, raw_out_loc = _inputs(
@@ -161,9 +161,8 @@ def _run(n, dim, seed, *, ring_size=RING_SIZES[-1], **kw):
         raw_out_loc,
         EPS,
         ring_size=ring_size,
+        out=out,
     )
-    # A padded row still computes and still publishes its latent -- the caller
-    # discards that row -- so the tolerance gate covers the live ones.
     live = odd & (raw_out_loc != 0)
     _compare(got, expected, live, f"{n=} {dim=} {seed=}")
     return got, expected, odd, got_state, ref_state
@@ -232,8 +231,7 @@ def test_pair_state_carried_across_two_steps():
 
 
 def test_padded_rows_publish_nothing():
-    """Padding rows with `raw_out_loc == 0` write neither cache nor state, even when
-    their `req_pool_idx` aliases a live request."""
+    """Padded rows preserve output and pair state even when request slots alias live rows."""
     n = 8
     num_state_rows = 5
     req = torch.tensor([0, 1, 2, 3, 4, 0, 0, 0], device="cuda", dtype=torch.int64)
@@ -251,8 +249,10 @@ def test_padded_rows_publish_nothing():
         req=req,
         raw_out_loc=raw_out_loc,
         num_state_rows=num_state_rows,
+        out=torch.full((n, HEAD_DIM), 42, device="cuda", dtype=torch.bfloat16),
     )
     assert torch.equal(got_state, ref_state), "a padded row wrote the pair state"
+    assert torch.all(got[raw_out_loc == 0] == 42), "a padded row published a latent"
     live = odd & (raw_out_loc != 0)
     assert live.any(), "test needs a live completing row"
     _compare(got, expected, live, "padded")
