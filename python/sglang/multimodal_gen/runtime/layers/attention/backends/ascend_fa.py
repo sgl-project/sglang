@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from itertools import pairwise
+from typing import Any, ClassVar
 
 import torch
 
@@ -19,39 +20,37 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_is_npu = current_platform.is_npu()
-if _is_npu:
-    import torch_npu
-
 
 def resolve_mx_fa_scheme(quant_config) -> str | None:
     """Resolve the opt-in MXFP8 attention scheme for an NPU quant config."""
     if (
         quant_config is None
-        or not _is_npu
+        or not current_platform.is_npu()
         or not envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
     ):
         return None
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
         return None
 
-    is_a5 = torch_npu.npu.get_soc_version() >= 260
-    if not is_a5:
+    if torch.npu.get_soc_version() < 260:
         logger.warning_once(
             "MXFP8 attention is disabled because MXFP8 quantization is only "
             "supported on Ascend 950 (A5) devices."
         )
         return None
 
-    required_apis = (
+    required_ops = (
         "npu_dynamic_mx_quant",
         "npu_fused_infer_attention_score_v2",
     )
-    missing_apis = [name for name in required_apis if not hasattr(torch_npu, name)]
-    if missing_apis:
+    missing_ops = [name for name in required_ops if not hasattr(torch.ops.npu, name)]
+    required_dtypes = ("float8_e4m3fn", "float8_e8m0fnu")
+    missing_dtypes = [name for name in required_dtypes if not hasattr(torch, name)]
+    if missing_ops or missing_dtypes:
+        missing_features = missing_ops + missing_dtypes
         logger.warning_once(
             "MXFP8 attention is disabled because the installed torch_npu does not "
-            f"provide the required APIs: {', '.join(missing_apis)}. "
+            f"provide the required APIs: {', '.join(missing_features)}. "
             "Please install torch==2.10.0, torch_npu>=2.10.0.post4, and CANN>=9.1.1."
         )
         return None
@@ -87,7 +86,7 @@ def _packed_boundaries(
             f"{name} must end at the packed token count {total_tokens}, "
             f"got {boundaries[-1]}"
         )
-    if any(stop < start for start, stop in zip(boundaries[:-1], boundaries[1:])):
+    if any(stop < start for start, stop in pairwise(boundaries)):
         raise ValueError(f"{name} must be non-decreasing")
     return boundaries
 
@@ -141,12 +140,8 @@ def fused_infer_attention_varlen(
     if len(q_boundaries) != len(k_boundaries):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must describe the same batch")
 
-    q_nonempty = [
-        stop > start for start, stop in zip(q_boundaries[:-1], q_boundaries[1:])
-    ]
-    k_nonempty = [
-        stop > start for start, stop in zip(k_boundaries[:-1], k_boundaries[1:])
-    ]
+    q_nonempty = [stop > start for start, stop in pairwise(q_boundaries)]
+    k_nonempty = [stop > start for start, stop in pairwise(k_boundaries)]
     if q_nonempty != k_nonempty:
         raise NotImplementedError(
             "NPU packed attention does not support a sequence that is empty only "
@@ -239,23 +234,20 @@ class AscendFABackend(AttentionBackend):
 
 
 class AscendFAImpl(AttentionImpl):
-    # npu_fused_infer_attention_score_v2 requires per-token-group
-    # quantization (mode 6) for Q/K and per-channel-group quantization (mode 8) for V.
-    # Only TND input layout is available for MXFP8 scenario.
-    _MXFP8_FA_PARAMS = {
-        "q_quant_mode": 6,
-        "k_quant_mode": 6,
-        "v_quant_mode": 8,
-        "qk_quant_axis": -1,
-        "v_quant_axis": 0,
-        "layout": "TND",
-    }
+    # FA v2 uses per-token-group quantization (mode 6) for Q/K and
+    # per-channel-group quantization (mode 8) for V in the packed TND path.
+    _MXFP8_LAYOUT = "TND"
+    _MXFP8_QK_QUANT_AXIS = -1
+    _MXFP8_V_QUANT_AXIS = 0
+    _MXFP8_QK_QUANT_MODE = 6
+    _MXFP8_V_QUANT_MODE = 8
+
     # Online Q/K rotations are deterministic CPU FP32 tensors shared
     # by all backend instances and keyed by head size. Applying the same
-    # orthogonal matrix R preserves scores because R @ R.T = I.
-    # (Q @ R) @ (K @ R).T = Q @ R @ R.T @ K = Q @ R.
-    # Offline ModelSlim checkpoint rotations are supplied by the model now.
-    _rot_matrices: dict[int, torch.Tensor] = {}
+    # orthogonal matrix R preserves scores:
+    # (Q @ R) @ (K @ R).T = Q @ R @ R.T @ K.T = Q @ K.T.
+    # Offline checkpoint rotations do not use this generated-matrix cache.
+    _rot_matrices: ClassVar[dict[int, torch.Tensor]] = {}
 
     def __init__(
         self,
@@ -282,9 +274,9 @@ class AscendFAImpl(AttentionImpl):
         if self._quant_scheme is not None:
             self._head_size = head_size
             self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
+            self._rot_device: torch.Tensor | None = None
             if not self.use_offline_qk_rotation:
                 self._ensure_rot_matrix(head_size)
-                self._rot_device: torch.Tensor | None = None
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -332,20 +324,12 @@ class AscendFAImpl(AttentionImpl):
         ):
             batch_size, query_length, num_heads, head_size = query.shape
             key_length = key.shape[1]
-            actual_seq_qlen = torch.arange(
-                query_length,
-                query_length * (batch_size + 1),
-                query_length,
-                dtype=torch.int64,
-                device=query.device,
-            )
-            actual_seq_kvlen = torch.arange(
-                key_length,
-                key_length * (batch_size + 1),
-                key_length,
-                dtype=torch.int64,
-                device=key.device,
-            )
+            actual_seq_qlen = [
+                query_length * batch_index for batch_index in range(1, batch_size + 1)
+            ]
+            actual_seq_kvlen = [
+                key_length * batch_index for batch_index in range(1, batch_size + 1)
+            ]
             output = self._forward_mxfp8_tnd(
                 query.reshape(-1, num_heads, head_size),
                 key.reshape(-1, key.shape[2], head_size),
@@ -406,23 +390,16 @@ class AscendFAImpl(AttentionImpl):
                 cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
             )
             actual_seq_lengths = [
-                stop
-                for start, stop in zip(boundaries[:-1], boundaries[1:])
-                if stop > start
+                stop for start, stop in pairwise(boundaries) if stop > start
             ]
             if not actual_seq_lengths:
                 return torch.empty_like(query)
-            actual_seq_lengths_tensor = torch.tensor(
-                actual_seq_lengths,
-                dtype=torch.int64,
-                device=query.device,
-            )
             return self._forward_mxfp8_tnd(
                 query,
                 key,
                 value,
-                actual_seq_qlen=actual_seq_lengths_tensor,
-                actual_seq_kvlen=actual_seq_lengths_tensor,
+                actual_seq_qlen=actual_seq_lengths,
+                actual_seq_kvlen=actual_seq_lengths,
             )
 
         if self.causal:
@@ -432,7 +409,7 @@ class AscendFAImpl(AttentionImpl):
                 else tuple(int(item) for item in cu_seqlens.tolist())
             )
             output = torch.empty_like(query)
-            for start, stop in zip(bounds[:-1], bounds[1:]):
+            for start, stop in pairwise(bounds):
                 if start == stop:
                     continue
                 segment = self.forward(
@@ -461,8 +438,8 @@ class AscendFAImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         *,
-        actual_seq_qlen: torch.Tensor,
-        actual_seq_kvlen: torch.Tensor,
+        actual_seq_qlen: Sequence[int],
+        actual_seq_kvlen: Sequence[int],
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         if return_softmax_lse:
@@ -517,29 +494,28 @@ class AscendFAImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         *,
-        actual_seq_qlen: torch.Tensor,
-        actual_seq_kvlen: torch.Tensor,
+        actual_seq_qlen: Sequence[int],
+        actual_seq_kvlen: Sequence[int],
     ) -> torch.Tensor:
-        params = self._MXFP8_FA_PARAMS
         quant_dtype = torch.float8_e4m3fn
-        scale_dtype = torch_npu.float8_e8m0fnu
+        scale_dtype = torch.float8_e8m0fnu
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
-        query_fp8, query_scale = torch_npu.npu_dynamic_mx_quant(
-            query, dst_type=quant_dtype, axis=params["qk_quant_axis"]
+        query_fp8, query_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            query, dst_type=quant_dtype, axis=self._MXFP8_QK_QUANT_AXIS
         )
-        key_fp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-            key, dst_type=quant_dtype, axis=params["qk_quant_axis"]
+        key_fp8, key_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            key, dst_type=quant_dtype, axis=self._MXFP8_QK_QUANT_AXIS
         )
-        value_fp8, value_scale = torch_npu.npu_dynamic_mx_quant(
-            value, dst_type=quant_dtype, axis=params["v_quant_axis"]
+        value_fp8, value_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            value, dst_type=quant_dtype, axis=self._MXFP8_V_QUANT_AXIS
         )
-        return torch_npu.npu_fused_infer_attention_score_v2(
+        return torch.ops.npu.npu_fused_infer_attention_score_v2(
             query_fp8,
             key_fp8,
             value_fp8,
-            input_layout=params["layout"],
+            input_layout=self._MXFP8_LAYOUT,
             num_query_heads=query.shape[1],
             num_key_value_heads=key.shape[1],
             softmax_scale=self.softmax_scale,
@@ -549,9 +525,9 @@ class AscendFAImpl(AttentionImpl):
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_kvlen=actual_seq_kvlen,
             sparse_mode=0,
-            query_quant_mode=params["q_quant_mode"],
-            key_quant_mode=params["k_quant_mode"],
-            value_quant_mode=params["v_quant_mode"],
+            query_quant_mode=self._MXFP8_QK_QUANT_MODE,
+            key_quant_mode=self._MXFP8_QK_QUANT_MODE,
+            value_quant_mode=self._MXFP8_V_QUANT_MODE,
             query_dtype=quant_dtype,
             key_dtype=quant_dtype,
             value_dtype=quant_dtype,
