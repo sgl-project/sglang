@@ -5,25 +5,23 @@
 //! `msgspec.msgpack`. Two struct families are involved:
 //!
 //! * `EventBatch` (the outer payload) — declared with
-//!   `array_like=True, gc=False` (no tag).
-//! * `KVCacheEvent` (each inner event variant) — additionally declared
-//!   with `tag=True`.
+//!   `array_like=True, gc=False` (no tag), so it is a msgpack **array**
+//!   `[ts, events, attn_dp_rank]`.
+//! * `KVCacheEvent` (each inner event variant) — declared with
+//!   `omit_defaults=True, tag=True` and no `array_like`, so each event is a
+//!   msgpack **map** whose `type` key carries the class name and whose other
+//!   keys are field names. Optional fields left at `None` are omitted. This
+//!   is the same encoding vLLM uses for its KV events.
 //!
-//! The combined effect on the wire:
-//!
-//! * Each struct is a msgpack **array** of its fields in declaration
-//!   order, not a map.
-//! * `tag=True` on `KVCacheEvent` prepends a class-name string at index 0
-//!   of each inner event array, so an event is
-//!   `[class_name_str, field1, field2, ...]`. The outer `EventBatch`
-//!   array does **not** carry a tag prefix.
+//! Older publishers emitted each event as a tagged **array**
+//! `[class_name_str, field1, ...]`; that shape is rejected.
 //!
 //! This module deserializes those bytes into Rust types and exposes a single
 //! [`decode_event_batch`] entry point.
 
 use std::fmt;
 
-use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
 /// Top-level batch payload published by SGLang.
@@ -46,16 +44,16 @@ pub struct KvEventBatch {
 }
 
 /// A single KV cache event. The Python base class `KVCacheEvent` uses
-/// `tag=True`, so each event on the wire is an array whose first element
-/// is the class-name discriminator.
+/// `tag=True`, so each event carries its class name under the `type` key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KvCacheEvent {
-    /// `["BlockStored", block_hashes, parent_block_hash, token_ids,
-    /// block_size, lora_id, medium?]`.
+    /// `{"type": "BlockStored", "block_hashes", "parent_block_hash",
+    /// "token_ids", "block_size", "lora_id", "medium"?, ...}`. Keys the
+    /// gateway does not route on (`cache_salt`, `session_id`) are ignored.
     BlockStored(BlockStored),
-    /// `["BlockRemoved", block_hashes, medium?]`.
+    /// `{"type": "BlockRemoved", "block_hashes", "medium"?}`.
     BlockRemoved(BlockRemoved),
-    /// `["AllBlocksCleared"]`.
+    /// `{"type": "AllBlocksCleared"}`.
     AllBlocksCleared,
 }
 
@@ -329,9 +327,8 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
 }
 
 // ---------------------------------------------------------------------------
-// Custom Deserialize impls — msgspec encodes these structs as msgpack arrays
-// (not maps). The visitors also accept absent trailing optional fields for
-// compatibility.
+// Custom Deserialize impls — the batch is a msgpack array; each event is a
+// tagged map. Optional fields may be absent or nil.
 // ---------------------------------------------------------------------------
 
 impl<'de> Deserialize<'de> for KvEventBatch {
@@ -381,65 +378,104 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
     where
         D: Deserializer<'de>,
     {
+        /// Map keys of a `KVCacheEvent` the gateway reads. Every other key
+        /// (`cache_salt`, `session_id`, future additions) is skipped.
+        enum EventField {
+            Type,
+            BlockHashes,
+            ParentBlockHash,
+            TokenIds,
+            BlockSize,
+            LoraId,
+            Medium,
+            Other,
+        }
+
+        impl<'de> Deserialize<'de> for EventField {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct FieldVisitor;
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = EventField;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("a KV event field name")
+                    }
+                    fn visit_str<E: de::Error>(self, v: &str) -> Result<EventField, E> {
+                        Ok(match v {
+                            "type" => EventField::Type,
+                            "block_hashes" => EventField::BlockHashes,
+                            "parent_block_hash" => EventField::ParentBlockHash,
+                            "token_ids" => EventField::TokenIds,
+                            "block_size" => EventField::BlockSize,
+                            "lora_id" => EventField::LoraId,
+                            "medium" => EventField::Medium,
+                            _ => EventField::Other,
+                        })
+                    }
+                }
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
         struct EventVisitor;
 
         impl<'de> Visitor<'de> for EventVisitor {
             type Value = KvCacheEvent;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a tagged msgpack array [class_name, ...fields]")
+                f.write_str("a tagged msgpack map {\"type\": class_name, ...fields}")
             }
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<KvCacheEvent, A::Error>
+            fn visit_map<A>(self, mut map: A) -> Result<KvCacheEvent, A::Error>
             where
-                A: SeqAccess<'de>,
+                A: MapAccess<'de>,
             {
-                let tag: String = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::missing_field("event tag"))?;
-
+                let mut tag: Option<String> = None;
+                let mut block_hashes: Option<BoundedI64Vec> = None;
+                let mut parent_block_hash: Option<i64> = None;
+                let mut token_ids: Option<BoundedU32Vec> = None;
+                let mut block_size: Option<u32> = None;
+                let mut lora_id: Option<i64> = None;
+                let mut medium: Option<String> = None;
+                while let Some(field) = map.next_key::<EventField>()? {
+                    match field {
+                        EventField::Type => tag = Some(map.next_value()?),
+                        EventField::BlockHashes => block_hashes = Some(map.next_value()?),
+                        // Optional fields may be present as nil or omitted entirely.
+                        EventField::ParentBlockHash => parent_block_hash = map.next_value()?,
+                        EventField::TokenIds => token_ids = Some(map.next_value()?),
+                        EventField::BlockSize => block_size = Some(map.next_value()?),
+                        EventField::LoraId => lora_id = map.next_value()?,
+                        EventField::Medium => medium = map.next_value()?,
+                        EventField::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                let tag = tag.ok_or_else(|| de::Error::missing_field("type"))?;
                 match tag.as_str() {
-                    "BlockStored" => {
-                        let block_hashes: BoundedI64Vec = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
-                        let parent_block_hash: Option<i64> = seq.next_element()?.unwrap_or(None);
-                        let token_ids: BoundedU32Vec = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::missing_field("token_ids"))?;
-                        let block_size: u32 = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::missing_field("block_size"))?;
-                        // `lora_id` is `Optional[int]` with no default — it's
-                        // always emitted, but as nil when absent.
-                        let lora_id: Option<i64> = seq.next_element()?.unwrap_or(None);
-                        // `medium` defaults to None and may be omitted.
-                        let medium: Option<String> = seq.next_element()?.unwrap_or(None);
-                        while seq.next_element::<IgnoredAny>()?.is_some() {}
-                        Ok(KvCacheEvent::BlockStored(BlockStored {
-                            block_hashes: block_hashes.0,
-                            parent_block_hash,
-                            token_ids: token_ids.0,
-                            block_size,
-                            lora_id,
-                            medium,
-                        }))
-                    }
-                    "BlockRemoved" => {
-                        let block_hashes: BoundedI64Vec = seq
-                            .next_element()?
-                            .ok_or_else(|| de::Error::missing_field("block_hashes"))?;
-                        let medium: Option<String> = seq.next_element()?.unwrap_or(None);
-                        while seq.next_element::<IgnoredAny>()?.is_some() {}
-                        Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
-                            block_hashes: block_hashes.0,
-                            medium,
-                        }))
-                    }
-                    "AllBlocksCleared" => {
-                        while seq.next_element::<IgnoredAny>()?.is_some() {}
-                        Ok(KvCacheEvent::AllBlocksCleared)
-                    }
+                    "BlockStored" => Ok(KvCacheEvent::BlockStored(BlockStored {
+                        block_hashes: block_hashes
+                            .ok_or_else(|| de::Error::missing_field("block_hashes"))?
+                            .0,
+                        parent_block_hash,
+                        token_ids: token_ids
+                            .ok_or_else(|| de::Error::missing_field("token_ids"))?
+                            .0,
+                        block_size: block_size
+                            .ok_or_else(|| de::Error::missing_field("block_size"))?,
+                        lora_id,
+                        medium,
+                    })),
+                    "BlockRemoved" => Ok(KvCacheEvent::BlockRemoved(BlockRemoved {
+                        block_hashes: block_hashes
+                            .ok_or_else(|| de::Error::missing_field("block_hashes"))?
+                            .0,
+                        medium,
+                    })),
+                    "AllBlocksCleared" => Ok(KvCacheEvent::AllBlocksCleared),
                     other => Err(de::Error::unknown_variant(
                         other,
                         &["BlockStored", "BlockRemoved", "AllBlocksCleared"],
@@ -448,13 +484,13 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
             }
         }
 
-        deserializer.deserialize_seq(EventVisitor)
+        deserializer.deserialize_map(EventVisitor)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests — golden bytes are constructed via the `rmp` low-level encoder so
-// they exercise the exact msgpack array layout SGLang emits, independent of
+// they exercise the exact msgpack map layout SGLang emits, independent of
 // any Rust-side serializer.
 // ---------------------------------------------------------------------------
 
@@ -464,11 +500,17 @@ mod tests {
 
     use rmp::encode as mp;
 
-    /// Encode a tagged event header `[tag, ...]` array of `total_len`
-    /// elements (tag included).
-    fn write_event_array(buf: &mut Vec<u8>, tag: &str, total_len: u32) {
-        mp::write_array_len(buf, total_len).unwrap();
-        mp::write_str(buf, tag).unwrap();
+    fn write_key(buf: &mut Vec<u8>, key: &str) {
+        mp::write_str(buf, key).unwrap();
+    }
+
+    fn write_opt_sint(buf: &mut Vec<u8>, value: Option<i64>) {
+        match value {
+            Some(v) => {
+                mp::write_sint(buf, v).unwrap();
+            }
+            None => mp::write_nil(buf).unwrap(),
+        }
     }
 
     fn write_i64_array(buf: &mut Vec<u8>, values: &[i64]) {
@@ -497,6 +539,101 @@ mod tests {
         }
     }
 
+    /// Start a tagged event map with `field_count` fields after `type`.
+    fn write_event_map(buf: &mut Vec<u8>, tag: &str, field_count: u32) {
+        mp::write_map_len(buf, field_count + 1).unwrap();
+        write_key(buf, "type");
+        mp::write_str(buf, tag).unwrap();
+    }
+
+    fn block_stored_field_count(medium: Option<&str>, extra: &[(&str, &str)]) -> u32 {
+        5 + u32::from(medium.is_some()) + extra.len() as u32
+    }
+
+    /// Write the `BlockStored` fields that follow `type`. `parent_block_hash`
+    /// and `lora_id` have no default in the Python schema, so msgspec always
+    /// emits them (nil when unset); `medium` is omitted when `None`; `extra`
+    /// adds string-valued keys the gateway must ignore.
+    #[allow(clippy::too_many_arguments)]
+    fn write_block_stored_fields(
+        buf: &mut Vec<u8>,
+        block_hashes: &[i64],
+        parent: Option<i64>,
+        write_tokens: impl FnOnce(&mut Vec<u8>),
+        block_size: u32,
+        lora_id: Option<i64>,
+        medium: Option<&str>,
+        extra: &[(&str, &str)],
+    ) {
+        write_key(buf, "block_hashes");
+        write_i64_array(buf, block_hashes);
+        write_key(buf, "parent_block_hash");
+        write_opt_sint(buf, parent);
+        write_key(buf, "token_ids");
+        write_tokens(buf);
+        write_key(buf, "block_size");
+        mp::write_uint(buf, block_size as u64).unwrap();
+        write_key(buf, "lora_id");
+        write_opt_sint(buf, lora_id);
+        if let Some(m) = medium {
+            write_key(buf, "medium");
+            mp::write_str(buf, m).unwrap();
+        }
+        for (key, value) in extra {
+            write_key(buf, key);
+            mp::write_str(buf, value).unwrap();
+        }
+    }
+
+    /// Build a `BlockStored` map as msgspec emits it, plus `extra` keys.
+    #[allow(clippy::too_many_arguments)]
+    fn build_block_stored_bytes_with_extra(
+        block_hashes: &[i64],
+        parent: Option<i64>,
+        token_ids: &[u32],
+        block_size: u32,
+        lora_id: Option<i64>,
+        medium: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_event_map(
+            &mut buf,
+            "BlockStored",
+            block_stored_field_count(medium, extra),
+        );
+        write_block_stored_fields(
+            &mut buf,
+            block_hashes,
+            parent,
+            |b| write_u32_array(b, token_ids),
+            block_size,
+            lora_id,
+            medium,
+            extra,
+        );
+        buf
+    }
+
+    fn build_block_stored_bytes(
+        block_hashes: &[i64],
+        parent: Option<i64>,
+        token_ids: &[u32],
+        block_size: u32,
+        lora_id: Option<i64>,
+        medium: Option<&str>,
+    ) -> Vec<u8> {
+        build_block_stored_bytes_with_extra(
+            block_hashes,
+            parent,
+            token_ids,
+            block_size,
+            lora_id,
+            medium,
+            &[],
+        )
+    }
+
     /// Like `build_block_stored_bytes`, but `token_ids` is the bigram
     /// list-of-pairs shape that DeepSeek-V4-class models emit.
     fn build_block_stored_bigram_bytes(
@@ -508,109 +645,39 @@ mod tests {
         medium: Option<&str>,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_event_array(&mut buf, "BlockStored", 7);
-        write_i64_array(&mut buf, block_hashes);
-        match parent {
-            Some(v) => {
-                mp::write_sint(&mut buf, v).unwrap();
-            }
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
-        write_bigram_token_array(&mut buf, token_pairs);
-        mp::write_uint(&mut buf, block_size as u64).unwrap();
-        match lora_id {
-            Some(v) => {
-                mp::write_sint(&mut buf, v).unwrap();
-            }
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
-        match medium {
-            Some(s) => mp::write_str(&mut buf, s).unwrap(),
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
-        buf
-    }
-
-    /// Regression: bigram models (e.g. DeepSeek-V4-Flash) emit `token_ids` as
-    /// `[[t_i, t_{i+1}], ...]`. The decoder previously read `token_ids` as a
-    /// flat `u32` array and failed the entire batch with
-    /// "wrong msgpack marker FixArray(2)", silently disabling cache-aware
-    /// routing. It must instead accept the bigram shape (flattening the ints).
-    #[test]
-    fn decodes_block_stored_with_bigram_token_ids() {
-        let event = build_block_stored_bigram_bytes(
-            &[111_i64],
-            None,
-            &[(10, 20), (20, 30)],
-            2,
-            None,
-            Some("GPU"),
+        write_event_map(
+            &mut buf,
+            "BlockStored",
+            block_stored_field_count(medium, &[]),
         );
-        let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
-
-        let batch = decode_event_batch(&bytes).expect("decode bigram token_ids");
-        assert_eq!(batch.events.len(), 1);
-        match &batch.events[0] {
-            KvCacheEvent::BlockStored(b) => {
-                // routing-relevant fields decode unchanged
-                assert_eq!(b.block_hashes, vec![111]);
-                assert_eq!(b.parent_block_hash, None);
-                assert_eq!(b.block_size, 2);
-                // bigram pairs are flattened into the (informational) token vec
-                assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
-            }
-            other => panic!("expected BlockStored, got {other:?}"),
-        }
-    }
-
-    /// Build a full BlockStored event as msgspec would emit it (all 7
-    /// elements: tag + 6 fields). `medium` may be Some/None.
-    fn build_block_stored_bytes(
-        block_hashes: &[i64],
-        parent: Option<i64>,
-        token_ids: &[u32],
-        block_size: u32,
-        lora_id: Option<i64>,
-        medium: Option<&str>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        write_event_array(&mut buf, "BlockStored", 7);
-        write_i64_array(&mut buf, block_hashes);
-        match parent {
-            Some(v) => {
-                mp::write_sint(&mut buf, v).unwrap();
-            }
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
-        write_u32_array(&mut buf, token_ids);
-        mp::write_uint(&mut buf, block_size as u64).unwrap();
-        match lora_id {
-            Some(v) => {
-                mp::write_sint(&mut buf, v).unwrap();
-            }
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
-        match medium {
-            Some(s) => mp::write_str(&mut buf, s).unwrap(),
-            None => mp::write_nil(&mut buf).unwrap(),
-        }
+        write_block_stored_fields(
+            &mut buf,
+            block_hashes,
+            parent,
+            |b| write_bigram_token_array(b, token_pairs),
+            block_size,
+            lora_id,
+            medium,
+            &[],
+        );
         buf
     }
 
     fn build_block_removed_bytes(block_hashes: &[i64], medium: Option<&str>) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_event_array(&mut buf, "BlockRemoved", 3);
+        write_event_map(&mut buf, "BlockRemoved", 1 + u32::from(medium.is_some()));
+        write_key(&mut buf, "block_hashes");
         write_i64_array(&mut buf, block_hashes);
-        match medium {
-            Some(s) => mp::write_str(&mut buf, s).unwrap(),
-            None => mp::write_nil(&mut buf).unwrap(),
+        if let Some(m) = medium {
+            write_key(&mut buf, "medium");
+            mp::write_str(&mut buf, m).unwrap();
         }
         buf
     }
 
     fn build_all_blocks_cleared_bytes() -> Vec<u8> {
         let mut buf = Vec::new();
-        write_event_array(&mut buf, "AllBlocksCleared", 1);
+        write_event_map(&mut buf, "AllBlocksCleared", 0);
         buf
     }
 
@@ -641,6 +708,36 @@ mod tests {
         buf
     }
 
+    /// Regression: bigram models (e.g. DeepSeek-V4-Flash) emit `token_ids` as
+    /// `[[t_i, t_{i+1}], ...]`. The decoder previously read `token_ids` as a
+    /// flat `u32` array and failed the entire batch with
+    /// "wrong msgpack marker FixArray(2)", silently disabling cache-aware
+    /// routing. It must instead accept the bigram shape (flattening the ints).
+    #[test]
+    fn decodes_block_stored_with_bigram_token_ids() {
+        let event = build_block_stored_bigram_bytes(
+            &[111_i64],
+            None,
+            &[(10, 20), (20, 30)],
+            2,
+            None,
+            Some("GPU"),
+        );
+        let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
+
+        let batch = decode_event_batch(&bytes).expect("decode bigram token_ids");
+        assert_eq!(batch.events.len(), 1);
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![111]);
+                assert_eq!(b.parent_block_hash, None);
+                assert_eq!(b.block_size, 2);
+                assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
+
     #[test]
     fn decodes_block_stored_with_all_fields() {
         let event = build_block_stored_bytes(
@@ -666,12 +763,14 @@ mod tests {
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
             }
-            other => panic!("expected BlockStored, got {:?}", other),
+            other => panic!("expected BlockStored, got {other:?}"),
         }
     }
 
+    /// `parent_block_hash` and `lora_id` present as nil, `medium` key omitted
+    /// (msgspec `omit_defaults`).
     #[test]
-    fn decodes_block_stored_with_nil_optionals() {
+    fn decodes_block_stored_with_nil_and_omitted_optionals() {
         let event = build_block_stored_bytes(&[1, 2, 3], None, &[5, 6], 16, None, None);
         let bytes = build_batch_bytes(0.0, &[event], None, true);
 
@@ -683,7 +782,37 @@ mod tests {
                 assert_eq!(b.medium, None);
                 assert_eq!(b.block_size, 16);
             }
-            other => panic!("unexpected variant: {:?}", other),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Attribution keys (`cache_salt`, `session_id`) and any future key the
+    /// gateway does not route on are skipped, not rejected.
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let event = build_block_stored_bytes_with_extra(
+            &[10],
+            Some(1),
+            &[1, 2],
+            2,
+            None,
+            Some("GPU"),
+            &[
+                ("cache_salt", "tenant-a"),
+                ("session_id", "session-a"),
+                ("future_key", "x"),
+            ],
+        );
+        let bytes = build_batch_bytes(0.0, &[event], None, true);
+
+        let batch = decode_event_batch(&bytes).expect("decode");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![10]);
+                assert_eq!(b.parent_block_hash, Some(1));
+                assert_eq!(b.medium.as_deref(), Some("GPU"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 
@@ -698,7 +827,22 @@ mod tests {
                 assert_eq!(r.block_hashes, vec![100, 200]);
                 assert_eq!(r.medium.as_deref(), Some("DISK"));
             }
-            other => panic!("unexpected variant: {:?}", other),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn medium_omitted_in_block_removed_decodes_as_none() {
+        let event = build_block_removed_bytes(&[42], None);
+        let bytes = build_batch_bytes(0.0, &[event], None, true);
+
+        let batch = decode_event_batch(&bytes).expect("decode");
+        match &batch.events[0] {
+            KvCacheEvent::BlockRemoved(r) => {
+                assert_eq!(r.block_hashes, vec![42]);
+                assert_eq!(r.medium, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 
@@ -739,47 +883,9 @@ mod tests {
     }
 
     #[test]
-    fn medium_omitted_in_block_stored_decodes_as_none() {
-        // BlockStored with `medium` omitted entirely (omit_defaults can drop
-        // the trailing default-None field). 6 elements instead of 7.
-        let mut buf = Vec::new();
-        write_event_array(&mut buf, "BlockStored", 6);
-        write_i64_array(&mut buf, &[1]);
-        mp::write_nil(&mut buf).unwrap(); // parent_block_hash
-        write_u32_array(&mut buf, &[1, 2]);
-        mp::write_uint(&mut buf, 2).unwrap(); // block_size
-        mp::write_nil(&mut buf).unwrap(); // lora_id
-        let bytes = build_batch_bytes(0.0, &[buf], None, true);
-
-        let batch = decode_event_batch(&bytes).expect("decode");
-        match &batch.events[0] {
-            KvCacheEvent::BlockStored(b) => assert_eq!(b.medium, None),
-            other => panic!("unexpected variant: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn medium_omitted_in_block_removed_decodes_as_none() {
-        // BlockRemoved with only [tag, block_hashes] (medium omitted).
-        let mut buf = Vec::new();
-        write_event_array(&mut buf, "BlockRemoved", 2);
-        write_i64_array(&mut buf, &[42]);
-        let bytes = build_batch_bytes(0.0, &[buf], None, true);
-
-        let batch = decode_event_batch(&bytes).expect("decode");
-        match &batch.events[0] {
-            KvCacheEvent::BlockRemoved(r) => {
-                assert_eq!(r.block_hashes, vec![42]);
-                assert_eq!(r.medium, None);
-            }
-            other => panic!("unexpected variant: {:?}", other),
-        }
-    }
-
-    #[test]
     fn unknown_event_tag_is_rejected() {
         let mut buf = Vec::new();
-        write_event_array(&mut buf, "MysteryEvent", 1);
+        write_event_map(&mut buf, "MysteryEvent", 0);
         let bytes = build_batch_bytes(0.0, &[buf], None, true);
 
         let err = decode_event_batch(&bytes).expect_err("should reject unknown variant");
@@ -790,12 +896,60 @@ mod tests {
         );
     }
 
-    /// Golden bytes captured from the actual SGLang Python publisher
-    /// (`msgspec.msgpack.Encoder().encode(KVEventBatch(...))`). These
-    /// hex strings are produced by msgspec 0.21.1 against the schema in
-    /// `python/sglang/srt/disaggregation/kv_events.py` and lock down the
-    /// exact wire format the decoder is expected to consume. Regenerated
-    /// with `python -c '...msgspec.msgpack.Encoder().encode(...)'`.
+    #[test]
+    fn event_without_type_is_rejected() {
+        let mut buf = Vec::new();
+        mp::write_map_len(&mut buf, 1).unwrap();
+        write_key(&mut buf, "block_hashes");
+        write_i64_array(&mut buf, &[1]);
+        let bytes = build_batch_bytes(0.0, &[buf], None, true);
+
+        let err = decode_event_batch(&bytes).expect_err("missing type must fail");
+        assert!(format!("{err}").contains("type"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn block_stored_without_block_hashes_is_rejected() {
+        let mut buf = Vec::new();
+        write_event_map(&mut buf, "BlockStored", 2);
+        write_key(&mut buf, "token_ids");
+        write_u32_array(&mut buf, &[1]);
+        write_key(&mut buf, "block_size");
+        mp::write_uint(&mut buf, 1).unwrap();
+        let bytes = build_batch_bytes(0.0, &[buf], None, true);
+
+        let err = decode_event_batch(&bytes).expect_err("missing block_hashes must fail");
+        assert!(
+            format!("{err}").contains("block_hashes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The pre-map publishers encoded events as tagged arrays; that shape is
+    /// no longer produced and is rejected rather than half-decoded.
+    #[test]
+    fn legacy_array_event_is_rejected() {
+        let mut buf = Vec::new();
+        mp::write_array_len(&mut buf, 7).unwrap();
+        mp::write_str(&mut buf, "BlockStored").unwrap();
+        write_i64_array(&mut buf, &[1]);
+        mp::write_nil(&mut buf).unwrap();
+        write_u32_array(&mut buf, &[1, 2]);
+        mp::write_uint(&mut buf, 2).unwrap();
+        mp::write_nil(&mut buf).unwrap();
+        mp::write_str(&mut buf, "GPU").unwrap();
+        let bytes = build_batch_bytes(0.0, &[buf], None, true);
+
+        assert!(matches!(
+            decode_event_batch(&bytes),
+            Err(DecodeError::Msgpack(_))
+        ));
+    }
+
+    /// Golden bytes captured from the SGLang Python publisher
+    /// (`msgspec.msgpack.Encoder().encode(KVEventBatch(...))`), msgspec 0.21.1,
+    /// against the schema in `python/sglang/srt/disaggregation/kv_events.py`.
+    /// They lock down the exact wire format the decoder consumes.
     mod msgspec_golden {
         use super::super::*;
 
@@ -811,9 +965,7 @@ mod tests {
             // EventBatch(ts=123.456, events=[BlockStored([1234567890123, -987654321],
             //   parent=42, tokens=[10,20,30,40], block_size=4, lora=7, medium="GPU")],
             //   attn_dp_rank=2)
-            let bytes = hex_to_bytes(
-                "93cb405edd2f1a9fbe779197ab426c6f636b53746f72656492cf0000011f71fb04cbd2c521974f2a940a141e280407a347505502",
-            );
+            let bytes = hex_to_bytes("93cb405edd2f1a9fbe779187a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657392cf0000011f71fb04cbd2c521974fb1706172656e745f626c6f636b5f686173682aa9746f6b656e5f696473940a141e28aa626c6f636b5f73697a6504a76c6f72615f696407a66d656469756da347505502");
             let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
             assert_eq!(batch.ts, 123.456);
             assert_eq!(batch.attn_dp_rank, Some(2));
@@ -827,17 +979,15 @@ mod tests {
                     assert_eq!(b.lora_id, Some(7));
                     assert_eq!(b.medium.as_deref(), Some("GPU"));
                 }
-                other => panic!("expected BlockStored, got {:?}", other),
+                other => panic!("expected BlockStored, got {other:?}"),
             }
         }
 
         #[test]
         fn block_stored_with_nil_optionals() {
             // ts=0.0, BlockStored([1,2,3], parent=None, tokens=[5,6], block_size=16,
-            //   lora=None, medium=None), attn_dp_rank=None
-            let bytes = hex_to_bytes(
-                "93cb00000000000000009197ab426c6f636b53746f72656493010203c092050610c0c0c0",
-            );
+            //   lora=None, medium=None -> key omitted), attn_dp_rank=None
+            let bytes = hex_to_bytes("93cb00000000000000009186a474797065ab426c6f636b53746f726564ac626c6f636b5f68617368657393010203b1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920506aa626c6f636b5f73697a6510a76c6f72615f6964c0c0");
             let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
             assert_eq!(batch.attn_dp_rank, None);
             match &batch.events[0] {
@@ -849,16 +999,14 @@ mod tests {
                     assert_eq!(b.lora_id, None);
                     assert_eq!(b.medium, None);
                 }
-                other => panic!("unexpected: {:?}", other),
+                other => panic!("unexpected: {other:?}"),
             }
         }
 
         #[test]
         fn block_removed_with_medium() {
             // ts=1.0, [BlockRemoved([100, 200], medium="DISK")], attn_dp_rank=0
-            let bytes = hex_to_bytes(
-                "93cb3ff00000000000009193ac426c6f636b52656d6f7665649264ccc8a44449534b00",
-            );
+            let bytes = hex_to_bytes("93cb3ff00000000000009183a474797065ac426c6f636b52656d6f766564ac626c6f636b5f6861736865739264ccc8a66d656469756da44449534b00");
             let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
             assert_eq!(batch.ts, 1.0);
             assert_eq!(batch.attn_dp_rank, Some(0));
@@ -867,15 +1015,16 @@ mod tests {
                     assert_eq!(r.block_hashes, vec![100, 200]);
                     assert_eq!(r.medium.as_deref(), Some("DISK"));
                 }
-                other => panic!("unexpected: {:?}", other),
+                other => panic!("unexpected: {other:?}"),
             }
         }
 
         #[test]
         fn all_blocks_cleared() {
             // ts=2.0, [AllBlocksCleared()], attn_dp_rank=None
-            let bytes =
-                hex_to_bytes("93cb40000000000000009191b0416c6c426c6f636b73436c6561726564c0");
+            let bytes = hex_to_bytes(
+                "93cb40000000000000009181a474797065b0416c6c426c6f636b73436c6561726564c0",
+            );
             let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
             assert_eq!(batch.ts, 2.0);
             assert_eq!(batch.attn_dp_rank, None);
@@ -886,9 +1035,7 @@ mod tests {
         #[test]
         fn mixed_batch() {
             // ts=99.0, [BlockStored, BlockRemoved, AllBlocksCleared], attn_dp_rank=3
-            let bytes = hex_to_bytes(
-                "93cb4058c000000000009397ab426c6f636b53746f726564910a0192010202c0a347505593ac426c6f636b52656d6f7665649114c091b0416c6c426c6f636b73436c656172656403",
-            );
+            let bytes = hex_to_bytes("93cb4058c000000000009387a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573910ab1706172656e745f626c6f636b5f6861736801a9746f6b656e5f696473920102aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505582a474797065ac426c6f636b52656d6f766564ac626c6f636b5f686173686573911481a474797065b0416c6c426c6f636b73436c656172656403");
             let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
             assert_eq!(batch.ts, 99.0);
             assert_eq!(batch.attn_dp_rank, Some(3));
@@ -902,16 +1049,57 @@ mod tests {
                     assert_eq!(b.lora_id, None);
                     assert_eq!(b.medium.as_deref(), Some("GPU"));
                 }
-                other => panic!("unexpected: {:?}", other),
+                other => panic!("unexpected: {other:?}"),
             }
             match &batch.events[1] {
                 KvCacheEvent::BlockRemoved(r) => {
                     assert_eq!(r.block_hashes, vec![20]);
                     assert_eq!(r.medium, None);
                 }
-                other => panic!("unexpected: {:?}", other),
+                other => panic!("unexpected: {other:?}"),
             }
             assert!(matches!(batch.events[2], KvCacheEvent::AllBlocksCleared));
+        }
+
+        #[test]
+        fn mixed_batch_with_attribution_keys() {
+            // ts=1.0, attn_dp_rank=0: three BlockStored (the second carries
+            // cache_salt and session_id, the third session_id only), one
+            // BlockRemoved, one AllBlocksCleared.
+            let bytes = hex_to_bytes("93cb3ff00000000000009587a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573920b0cb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f6964739401020304aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da347505589a474797065ab426c6f636b53746f726564ac626c6f636b5f6861736865739115b1706172656e745f626c6f636b5f686173680ca9746f6b656e5f696473920506aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da3475055aa63616368655f73616c74a874656e616e742d61aa73657373696f6e5f6964a6736573732d3188a474797065ab426c6f636b53746f726564ac626c6f636b5f686173686573911fb1706172656e745f626c6f636b5f68617368c0a9746f6b656e5f696473920708aa626c6f636b5f73697a6502a76c6f72615f6964c0a66d656469756da3475055aa73657373696f6e5f6964a6736573732d3283a474797065ac426c6f636b52656d6f766564ac626c6f636b5f686173686573910ba66d656469756da347505581a474797065b0416c6c426c6f636b73436c656172656400");
+            let batch = decode_event_batch(&bytes).expect("decode msgspec golden");
+            assert_eq!(batch.ts, 1.0);
+            assert_eq!(batch.attn_dp_rank, Some(0));
+            assert_eq!(batch.events.len(), 5);
+            match &batch.events[0] {
+                KvCacheEvent::BlockStored(b) => {
+                    assert_eq!(b.block_hashes, vec![11, 12]);
+                    assert_eq!(b.parent_block_hash, None);
+                    assert_eq!(b.token_ids, vec![1, 2, 3, 4]);
+                    assert_eq!(b.block_size, 2);
+                    assert_eq!(b.medium.as_deref(), Some("GPU"));
+                }
+                other => panic!("expected BlockStored, got {other:?}"),
+            }
+            match &batch.events[1] {
+                KvCacheEvent::BlockStored(b) => {
+                    assert_eq!(b.block_hashes, vec![21]);
+                    assert_eq!(b.parent_block_hash, Some(12));
+                }
+                other => panic!("expected BlockStored, got {other:?}"),
+            }
+            match &batch.events[2] {
+                KvCacheEvent::BlockStored(b) => assert_eq!(b.block_hashes, vec![31]),
+                other => panic!("expected BlockStored, got {other:?}"),
+            }
+            match &batch.events[3] {
+                KvCacheEvent::BlockRemoved(r) => {
+                    assert_eq!(r.block_hashes, vec![11]);
+                    assert_eq!(r.medium.as_deref(), Some("GPU"));
+                }
+                other => panic!("expected BlockRemoved, got {other:?}"),
+            }
+            assert!(matches!(batch.events[4], KvCacheEvent::AllBlocksCleared));
         }
     }
 
@@ -930,17 +1118,15 @@ mod tests {
     #[test]
     fn block_stored_with_too_many_hashes_rejected() {
         let claimed = (MAX_HASHES_PER_EVENT + 1) as u32;
-
         let mut event = Vec::new();
-        write_event_array(&mut event, "BlockStored", 7);
+        write_event_map(&mut event, "BlockStored", 1);
+        write_key(&mut event, "block_hashes");
         // Oversize block_hashes prefix; only one real element. The
         // visitor's size_hint check fires before reading anything.
         mp::write_array_len(&mut event, claimed).unwrap();
         mp::write_sint(&mut event, 0).unwrap();
         // Trailing bytes are ignored — decoder errors out earlier.
-
         let bytes = build_batch_bytes(0.0, &[event], None, true);
-
         let err = decode_event_batch(&bytes).expect_err("oversize hashes should fail");
         match err {
             DecodeError::PayloadTooLarge { field, len, cap } => {
@@ -960,21 +1146,16 @@ mod tests {
     #[test]
     fn block_stored_oversize_token_ids_prefix_rejected() {
         let claimed = (MAX_TOKENS_PER_EVENT + 1) as u32;
-
         let mut event = Vec::new();
-        write_event_array(&mut event, "BlockStored", 7);
-        write_i64_array(&mut event, &[42_i64]); // block_hashes (small)
-        mp::write_nil(&mut event).unwrap(); // parent_block_hash
-                                            // Oversize token_ids: announce huge length but only write a
-                                            // single element. The visitor's size_hint check fires
-                                            // immediately and we never reach the truncated payload.
+        write_event_map(&mut event, "BlockStored", 2);
+        write_key(&mut event, "block_hashes");
+        write_i64_array(&mut event, &[42_i64]);
+        write_key(&mut event, "token_ids");
+        // Oversize token_ids: announce huge length but only write a single
+        // element. The visitor's size_hint check fires immediately.
         mp::write_array_len(&mut event, claimed).unwrap();
         mp::write_uint(&mut event, 0).unwrap();
-        // Trailing bytes after the truncated array are ignored — the
-        // decoder errors out on the size_hint check before reading them.
-
         let bytes = build_batch_bytes(0.0, &[event], None, true);
-
         let err = decode_event_batch(&bytes).expect_err("oversize token prefix should fail");
         match err {
             DecodeError::PayloadTooLarge { field, len, cap } => {
@@ -990,15 +1171,13 @@ mod tests {
     #[test]
     fn block_removed_with_too_many_hashes_rejected() {
         let claimed = (MAX_HASHES_PER_EVENT + 1) as u32;
-
         let mut event = Vec::new();
-        write_event_array(&mut event, "BlockRemoved", 3);
+        write_event_map(&mut event, "BlockRemoved", 1);
+        write_key(&mut event, "block_hashes");
         mp::write_array_len(&mut event, claimed).unwrap();
         mp::write_sint(&mut event, 0).unwrap();
         // Trailing bytes ignored — decoder errors on the size hint.
-
         let bytes = build_batch_bytes(0.0, &[event], None, true);
-
         let err = decode_event_batch(&bytes).expect_err("oversize hashes should fail");
         match err {
             DecodeError::PayloadTooLarge { field, cap, .. } => {
