@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     IndexerInputs,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
-    fp4_paged_mqa_logits,
+    deep_gemm_fp4_paged_mqa_logits,
 )
 
 CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
@@ -70,47 +70,21 @@ def amax_topk_blocks(
     return blocks
 
 
-_ROW_IDS: dict = {}
-_ROW_IDS_RETIRED: list = []  # captured graphs keep reading the buffers they saw
-
-
-def _row_ids(rows: int, device: torch.device) -> torch.Tensor:
-    """``arange(rows)`` int32 from a cached buffer (grown in steps of 8192), so the
-    every-row-its-own-request case costs no launch."""
-    buf = _ROW_IDS.get(device)
-    if buf is None or buf.numel() < rows:
-        assert not torch.cuda.is_current_stream_capturing(), (
-            f"row-id buffer grows to {rows} rows inside a CUDA graph capture; "
-            "warm up with the largest row count first"
-        )
-        if buf is not None:
-            _ROW_IDS_RETIRED.append(buf)
-        size = max(8192, -(-rows // 8192) * 8192)
-        buf = _ROW_IDS[device] = torch.arange(size, dtype=torch.int32, device=device)
-    return buf[:rows]
-
-
 def build_sparse_indexer_schedule(
     blocks: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     page_size: int,
     q_dtype: torch.dtype,
-    request_ids: Optional[torch.Tensor] = None,
+    request_ids: torch.Tensor,
 ) -> torch.Tensor:
     """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
     int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
-    ``request_ids`` ``[rows]`` lets DeepGEMM pair two rows of a request on one KV
-    pass; each row keeps its own block list and output layout, and paired rows
-    must share their page-table row. None: every row is its own request."""
+    ``request_ids`` ``[rows]`` int32 lets DeepGEMM pair two rows of a request on
+    one KV pass; each row keeps its own block list and output layout, and paired
+    rows must share their page-table row."""
     import deep_gemm
 
-    rows = blocks.shape[0]
-    if request_ids is None:
-        request_ids = _row_ids(rows, blocks.device)  # cached, no launch
-    else:
-        # the scheduler keeps request indices as int64; one small cast per publish
-        request_ids = request_ids[:rows].to(torch.int32).contiguous()
     return deep_gemm.get_paged_sparse_mqa_logits_metadata(
         seq_lens.contiguous(),
         page_table,
@@ -160,12 +134,36 @@ def topk_transform_sparse(
     )
 
 
+# TODO(dark): support publish prefill/select prefill
+# TODO(dark): support fusion of publish + topk of publish layer
 class DeepGemmCandidateIndexer:
     def __init__(self, topk_blocks: int, block_size: int):
         assert block_size == CANDIDATE_BLOCK_SIZE, block_size
         self.topk_blocks = topk_blocks
         self.block_size = block_size
         self.alt_stream = torch.cuda.Stream()
+        self._row_ids: Optional[torch.Tensor] = None
+        self._retired_row_ids: list = []  # captured graphs keep reading the buffers they saw
+
+    def _request_ids(
+        self, request_ids: Optional[torch.Tensor], rows: int, device: torch.device
+    ) -> torch.Tensor:
+        """int32 ``[rows]``; None means every row is its own request, served from a
+        cached ``arange`` (grown in steps of 8192) so that case costs no launch."""
+        if request_ids is not None:
+            # the scheduler keeps request indices as int64; one small cast per publish
+            return request_ids[:rows].to(torch.int32).contiguous()
+        buf = self._row_ids
+        if buf is None or buf.numel() < rows:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"row-id buffer grows to {rows} rows inside a CUDA graph capture; "
+                "warm up with the largest row count first"
+            )
+            if buf is not None:
+                self._retired_row_ids.append(buf)
+            size = max(8192, -(-rows // 8192) * 8192)
+            buf = self._row_ids = torch.arange(size, dtype=torch.int32, device=device)
+        return buf[:rows]
 
     def publish_decode(
         self,
@@ -178,7 +176,7 @@ class DeepGemmCandidateIndexer:
         metadata."""
         metadata = inputs.metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
-        logits = fp4_paged_mqa_logits(
+        logits = deep_gemm_fp4_paged_mqa_logits(
             (inputs.q_fp4, inputs.q_sf),
             inputs.k_cache,
             inputs.weights,
@@ -218,7 +216,7 @@ class DeepGemmCandidateIndexer:
                 metadata.page_table,
                 metadata.compressed_page_size,
                 inputs.q_fp4.dtype,
-                inputs.request_ids,
+                self._request_ids(inputs.request_ids, inputs.num_rows, blocks.device),
             )
             # select_decode reads these on the main stream
             for t in (blocks, schedule, phys_blocks, row_valid_lens):
@@ -233,7 +231,7 @@ class DeepGemmCandidateIndexer:
                 ready=ready,
             )
 
-    def scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
+    def _scores(self, table: SparseBlockTable, inputs: IndexerInputs) -> torch.Tensor:
         return sparse_logits(
             inputs.q_fp4,
             inputs.q_sf,
@@ -252,6 +250,6 @@ class DeepGemmCandidateIndexer:
         assert raw_indices is None
         table = candidate_metadata
         torch.cuda.current_stream().wait_event(table.ready)
-        logits = self.scores(table, inputs)
+        logits = self._scores(table, inputs)
         # decode carries no raw_indices; the kernel writes slots only
         topk_transform_sparse(logits, table.valid_lens, table, page_indices)

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.runtime_context import get_platform
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+        DeepGemmCandidateIndexer,
+    )
 
 
 class CandidateMetadata:
@@ -33,44 +39,23 @@ class IndexerInputs:
         return self.q_fp4.shape[0]
 
 
-T = TypeVar("T", bound=CandidateMetadata)
-
-
-# TODO(dark): support publish prefill/select prefill
-# TODO(dark): support fusion of publish + topk of publish layer
-class CandidateIndexer(Protocol, Generic[T]):
-    def publish_decode(
-        self,
-        inputs: IndexerInputs,
-        page_indices: torch.Tensor,
-        raw_indices: Optional[torch.Tensor] = None,
-    ) -> T: ...
-    def select_decode(
-        self,
-        candidate_metadata: T,
-        inputs: IndexerInputs,
-        page_indices: torch.Tensor,
-        raw_indices: Optional[torch.Tensor] = None,
-    ) -> None: ...
-
-
 def make_candidate_indexer(
     topk_blocks: int, block_size: int
-) -> Optional[CandidateIndexer]:
+) -> Optional[DeepGemmCandidateIndexer]:
     """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
     indexer selects through masks inline."""
     if topk_blocks <= 0 or get_platform().device_sm < 100:
         return None
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-        DEEPGEMM_SPARSE_INDEXER,
+        DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
     )
 
-    if not DEEPGEMM_SPARSE_INDEXER:
+    if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
             "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
         )
-    from sglang.srt.layers.attention.dsv4.candidate_deep_gemm import (
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
         DeepGemmCandidateIndexer,
     )
 
@@ -104,3 +89,30 @@ def mask_topk_scores(
         (columns >= 0) & (columns < scores.shape[1]) & (selected_scores > -torch.inf)
     )
     return indices.masked_fill(~valid, -1)
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level one of the two-level top-k: a bool mask over positions keeping the
+    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
+    in logits, so an all -inf block means not reachable yet; the block holding the
+    query's newest position is always kept."""
+    width = logits.size(-1)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    num_blocks = scores.size(-1)
+
+    last = (compress_lens - 1) // block_size
+    scores = scores.masked_fill(
+        torch.arange(num_blocks, device=logits.device) == last, torch.inf
+    )
+
+    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        -1, top.indices, top.values > -torch.inf
+    )
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
