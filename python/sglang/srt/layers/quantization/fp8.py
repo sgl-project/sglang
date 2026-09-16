@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    torch_w8a8_block_fp8_linear,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
 )
@@ -798,6 +799,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 # instead of silently reading a permuted weight.
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
+
+        if (
+            is_xpu()
+            and self.w8a8_block_fp8_linear is torch_w8a8_block_fp8_linear
+            and self.weight_block_size in ([1, 128], [128, 128])
+            and layer.weight_scale_inv.ndim == 2
+        ):
+            # Keep the checkpoint's logical [N-blocks, K-blocks] shape, but use
+            # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+            # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+            # This avoids a per-forward contiguous/copy in either path.
+            scale = layer.weight_scale_inv.data
+            scale_b_is_contiguous = scale.t().is_contiguous()
+            if not scale_b_is_contiguous:
+                scale_reordered = torch.empty_strided(
+                    scale.shape,
+                    (1, scale.shape[0]),
+                    dtype=scale.dtype,
+                    device=scale.device,
+                )
+                scale_reordered.copy_(scale)
+                with torch.no_grad():
+                    layer.weight_scale_inv.set_(scale_reordered)
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:

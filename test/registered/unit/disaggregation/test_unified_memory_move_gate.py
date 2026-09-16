@@ -11,13 +11,17 @@ corruption with no crash.
 """
 
 import unittest
+from types import SimpleNamespace
 from typing import List, Optional, Set
+
+import torch
 
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -187,58 +191,41 @@ class TestMoveGateRejectsNonPdNode(CustomTestCase):
 
 
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
-    """Every unified composite allocator must OVERRIDE the two PD hooks.
+    """Unified composites must translate virtual IDs before PD transfer.
 
-    `BaseTokenToKVPoolAllocator.translate_kv_indices_for_transfer` is the
-    IDENTITY, and `set_disagg_move_gate` exists only where a composite defines
-    it. Inheriting either is silent, not loud: identity puts VIRTUAL ids on the
-    wire (they address real bytes, so the peer gets plausible garbage), and a
-    missing gate lets lazy compaction relocate pages under in-flight RDMA.
-    An AST-level check because instantiating these composites needs a GPU.
+    The implementation may be inherited from a shared unified allocator base,
+    but inheriting the static allocator's identity would put virtual IDs on the
+    wire and silently corrupt KV. Gate installation must reach every member.
     """
 
-    # Composites that own the full-side virtual ids and so must define the
-    # transfer translate themselves.
-    _COMPOSITES = (
-        "UnifiedMambaTokenToKVPoolAllocator",
-        "UnifiedSWATokenToKVPoolAllocator",
-    )
-    # Every composite must define the gate setter, including the tri-pool,
-    # which inherits the SWA translates (same full side) but has a THIRD
-    # member the 2-pool setter does not reach.
-    _GATE_COMPOSITES = _COMPOSITES + ("UnifiedMambaSWATokenToKVPoolAllocator",)
-
     @staticmethod
-    def _own_methods(cls_name: str) -> Set[str]:
-        """Names this class defines ITSELF, inheritance excluded.
-
-        Resolved off the class object rather than by parsing a named module:
-        these composites have already been moved once (out of
-        `multi_ended_allocator` into `allocator/unified_*`), and a hardcoded
-        module path turns that kind of move into a test failure that says
-        nothing about the contract. `__dict__` needs no GPU -- it is the class
-        body, not an instance.
-        """
-        from sglang.srt.mem_cache.allocator import (
-            unified_hybrid_swa,
-            unified_mamba,
+    def _allocator_class(name):
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedMambaSWATokenToKVPoolAllocator,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
+            UnifiedMambaTokenToKVPoolAllocator,
         )
 
-        for mod in (unified_mamba, unified_hybrid_swa):
-            cls = getattr(mod, cls_name, None)
-            if cls is not None:
-                return set(vars(cls))
-        raise AssertionError(f"class {cls_name} not found in the unified allocators")
+        classes = (
+            UnifiedMambaTokenToKVPoolAllocator,
+            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedMambaSWATokenToKVPoolAllocator,
+        )
+        return {cls.__name__: cls for cls in classes}[name]
 
     def test_transfer_translate_is_not_inherited_identity(self):
-        for name in self._COMPOSITES:
-            with self.subTest(composite=name):
-                self.assertIn(
-                    "translate_kv_indices_for_transfer",
-                    self._own_methods(name),
-                    f"{name} inherits the identity transfer translate; PD would "
-                    "ship VIRTUAL ids and corrupt KV without any error",
+        virtual = torch.tensor([1, 3], dtype=torch.int32)
+        for name in self._EXPECTED_COVERAGE:
+            with self.subTest(composite=name), get_parallel().override(attn_dcp_size=1):
+                alloc = object.__new__(self._allocator_class(name))
+                alloc.full_attn_allocator = SimpleNamespace(
+                    translate_kv_loc=lambda ids: ids + 16
                 )
+                physical = alloc.translate_kv_indices_for_transfer(virtual)
+                self.assertEqual(physical.dtype, torch.int64)
+                self.assertEqual(physical.tolist(), [17, 19])
 
     # Every sub-allocator attribute a composite can hold. The stub carries all
     # of them regardless of composite, so the assertion is on what installation
@@ -270,11 +257,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         `object.__new__` skips `__init__` (which needs a GPU); the setter reads
         only `lazy_compaction` and the member attributes.
         """
-        from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
-
-        cls = getattr(unified_mamba, cls_name, None) or getattr(
-            unified_hybrid_swa, cls_name
-        )
+        cls = self._allocator_class(cls_name)
         alloc = object.__new__(cls)
         alloc.lazy_compaction = True
         for attr in self._MEMBER_ATTRS:
@@ -313,14 +296,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
-
         for name in self._EXPECTED_COVERAGE:
-            cls = getattr(unified_mamba, name, None) or getattr(
-                unified_hybrid_swa, name
-            )
-            if "set_disagg_move_gate" not in vars(cls):
-                continue  # inherited, and the inherited one is checked above
+            cls = self._allocator_class(name)
             with self.subTest(composite=name):
                 body = inspect.getsource(cls.set_disagg_move_gate)
                 self.assertIn("install_move_gate", body)
@@ -331,10 +308,23 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         does not name the SWA page holding the same virtual token. The read-path
         `translate_loc_from_full_to_swa` cannot stand in either: it returns
         kernel-facing ids, and the transfer addresses raw page envelopes."""
-        self.assertIn(
-            "translate_swa_indices_for_transfer",
-            self._own_methods("UnifiedSWATokenToKVPoolAllocator"),
-        )
+        virtual = torch.tensor([1, 3], dtype=torch.int32)
+        for name in (
+            "UnifiedSWATokenToKVPoolAllocator",
+            "UnifiedMambaSWATokenToKVPoolAllocator",
+        ):
+            with self.subTest(composite=name), get_parallel().override(attn_dcp_size=1):
+                alloc = object.__new__(self._allocator_class(name))
+                alloc.full_attn_allocator = SimpleNamespace(
+                    translate_kv_loc=lambda ids: ids + 16
+                )
+                alloc.swa_attn_allocator = SimpleNamespace(
+                    translate_kv_loc=lambda ids: ids + 32,
+                    translate_kv_loc_for_kernel=lambda ids: ids + 64,
+                )
+                physical = alloc.translate_swa_indices_for_transfer(virtual)
+                self.assertEqual(physical.dtype, torch.int64)
+                self.assertEqual(physical.tolist(), [33, 35])
 
 
 class TestEverySwaAllocatorAnswersTheTransferTranslate(CustomTestCase):

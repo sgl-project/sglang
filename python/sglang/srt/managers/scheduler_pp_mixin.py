@@ -248,6 +248,7 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
+                self._process_hicache_events()
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
