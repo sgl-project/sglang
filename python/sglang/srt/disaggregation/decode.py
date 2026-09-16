@@ -55,10 +55,9 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
-    get_dsv4_c128_state_indices,
+    get_dsv4_request_state_indices,
     get_kv_class,
     get_qsa_pending_state_indices,
-    is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
@@ -82,6 +81,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
+    dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
@@ -649,6 +649,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if is_retracted and dsv41_dspark_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
+            if req.output_ids:
+                req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+            req.pd_rebootstrap_in_progress = True
+            req.time_stats.set_retract_time()
+            is_retracted = False
+            is_rebootstrap = True
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -1472,13 +1482,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
+                return get_dsv4_request_state_indices(
+                    self.token_to_kv_pool,
                     int(decode_req.req.kv.req_pool_idx),
                     seq_len,
-                    online=online,
-                    ring_size=ring_size,
                 )
 
             state_types = self.kv_manager.kv_args.state_types
@@ -2747,6 +2754,11 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
+        # The prebuilt batch never reaches the forward loop's prepare call, and
+        # its requests skip EXTEND here, so seed their engram history now.
+        self.ngram_embedding_manager.prepare_for_forward(
+            new_batch, chunked_req=self.chunked_req
+        )
         new_batch.process_prebuilt(self.future_map)
 
         return new_batch

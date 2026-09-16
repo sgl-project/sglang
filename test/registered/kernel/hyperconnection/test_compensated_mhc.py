@@ -1,4 +1,6 @@
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -7,6 +9,8 @@ from sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm import (
     hc_mix_stats_sinkhorn_deepgemm,
     split_tf32_hc_weight,
 )
+from sglang.srt.environ import envs
+from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -86,6 +90,42 @@ def test_original_sinkhorn_path_without_residual_matches_fp64(m):
         torch.testing.assert_close(actual.double(), ref, rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.parametrize(
+    "m,invariant,use_fast",
+    [
+        (6, False, False),
+        (64, False, False),
+        (127, False, False),
+        (128, False, True),
+        (384, True, False),
+        (384, False, True),
+        (2049, True, False),
+        (2049, False, True),
+    ],
+)
+def test_model_dispatch_preserves_invariant_and_small_rows(m, invariant, use_fast):
+    x, w, scale, base = inputs(m, 1)
+    layer = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.hc_attn_fn = torch.nn.Parameter(w)
+    layer.hc_ffn_fn = torch.nn.Parameter(w.clone())
+    layer._hc_attn_tf32_parts = split_tf32_hc_weight(w)
+    layer.hc_mult, layer.hc_sinkhorn_iters = 4, 20
+    layer.rms_norm_eps = layer.hc_eps = EPS
+    target = "sglang.kernels.ops.layernorm.hc_mix_stats_deepgemm.hc_mix_stats_sinkhorn_deepgemm"
+    with (
+        patch(
+            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+            return_value=invariant,
+        ),
+        patch(target, wraps=hc_mix_stats_sinkhorn_deepgemm) as fast,
+    ):
+        layer._hc_mix_and_combine(
+            x.view(m, 4, 5120), layer.hc_attn_fn, scale, base, None, lambda v: v
+        )
+    assert fast.called == use_fast
+
+
 @pytest.mark.parametrize("m", [128, 384, 4096])
 def test_fused_compensation_preserves_epilogue_bits(m):
     from sglang.kernels.ops.layernorm.mhc import _hc_mix_reduce_sinkhorn_kernel
@@ -151,6 +191,106 @@ def test_bf16x3_matches_compensated_and_fp64(m, seed):
         assert torch.isfinite(a).all()
         torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
         torch.testing.assert_close(a[indices].double(), ref, rtol=2e-5, atol=2e-6)
+
+
+def make_layer():
+    _, w, _, _ = inputs(0, 17)
+    layer = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = SimpleNamespace(model_type="deepseek_v41")
+    layer.hc_pre_from_prev_sublayer = True
+    layer.hc_attn_fn = torch.nn.Parameter(w)
+    layer.hc_ffn_fn = torch.nn.Parameter(w.clone())
+    layer.hc_mult, layer.hc_sinkhorn_iters = 4, 20
+    layer.rms_norm_eps = layer.hc_eps = EPS
+    layer.input_layernorm = torch.nn.LayerNorm(5120, device="cuda")
+    layer.post_attention_layernorm = torch.nn.LayerNorm(5120, device="cuda")
+    return layer
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_automatic_cache_and_capability_fallback(supported):
+    layer = make_layer()
+    with patch(
+        "sglang.srt.layers.deep_gemm_wrapper.configurer.ENABLE_JIT_DEEPGEMM", supported
+    ):
+        layer.refresh_mhc_norm_weight_cache()
+    if supported:
+        assert torch.equal(sum(layer._hc_attn_tf32_parts), layer.hc_attn_fn)
+        assert torch.equal(sum(layer._hc_ffn_tf32_parts), layer.hc_ffn_fn)
+        previous = layer._hc_attn_bf16_parts
+        with torch.no_grad():
+            layer.hc_attn_fn.add_(0.1)
+        layer.refresh_mhc_norm_weight_cache()
+        assert not torch.equal(previous[0], layer._hc_attn_bf16_parts[0])
+        torch.testing.assert_close(
+            sum(p.float() for p in layer._hc_attn_bf16_parts),
+            layer.hc_attn_fn,
+            rtol=2e-7,
+            atol=0,
+        )
+    else:
+        assert layer._hc_attn_tf32_parts is layer._hc_attn_bf16_parts is None
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
+        layer.refresh_mhc_norm_weight_cache()
+    assert layer._hc_attn_tf32_parts is layer._hc_ffn_tf32_parts is None
+    assert layer._hc_attn_bf16_parts is layer._hc_ffn_bf16_parts is None
+
+
+@pytest.mark.parametrize("fallback", ["api", "model", "invariant", "platform"])
+def test_automatic_cache_preserves_unsupported_modes(fallback):
+    layer = make_layer()
+    target, value = {
+        "api": ("deep_gemm.tf32_hc_prenorm_gemm", None),
+        "model": (None, None),
+        "invariant": (
+            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+            True,
+        ),
+        "platform": (
+            "sglang.srt.models.deepseek_v4.get_platform",
+            SimpleNamespace(is_sm100=False),
+        ),
+    }[fallback]
+    if fallback == "model":
+        layer.config.model_type = "deepseek_v4"
+        layer.refresh_mhc_norm_weight_cache()
+    elif fallback == "platform":
+        with patch(target, return_value=value):
+            layer.refresh_mhc_norm_weight_cache()
+    else:
+        kwargs = {"return_value": value} if fallback == "invariant" else {"new": value}
+        with patch(target, **kwargs):
+            layer.refresh_mhc_norm_weight_cache()
+    assert layer._hc_attn_tf32_parts is layer._hc_attn_bf16_parts is None
+
+
+@pytest.mark.parametrize(
+    "m,invariant,expected",
+    [(384, False, False), (4096, True, False), (4096, False, True)],
+)
+def test_bf16x3_model_dispatch(m, invariant, expected):
+    from sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3 import (
+        hc_mix_stats_sinkhorn_bf16x3,
+    )
+
+    layer = make_layer()
+    layer.refresh_mhc_norm_weight_cache()
+    x, _, scale, base = inputs(m, 17)
+    with (
+        patch(
+            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+            return_value=invariant,
+        ),
+        patch(
+            "sglang.kernels.ops.layernorm.hc_mix_stats_bf16x3.hc_mix_stats_sinkhorn_bf16x3",
+            wraps=hc_mix_stats_sinkhorn_bf16x3,
+        ) as fast,
+    ):
+        layer._hc_mix_and_combine(
+            x.view(m, 4, 5120), layer.hc_attn_fn, scale, base, None, lambda v: v
+        )
+    assert fast.called == expected
 
 
 def test_bf16x3_graph_replay():

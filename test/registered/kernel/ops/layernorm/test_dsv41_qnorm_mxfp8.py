@@ -1,6 +1,8 @@
 """Q normalization/quantization parity, including strided and replayed inputs."""
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import flashinfer
 import pytest
@@ -49,6 +51,50 @@ def test_dynamic_graph(m, stride):
         w.copy_(torch.randn_like(w))
         graph.replay()
         check(x, w, got)
+
+
+@pytest.mark.parametrize(
+    "batch_invariant,deterministic", [(True, False), (False, True)]
+)
+def test_deterministic_modes_keep_original_norm(batch_invariant, deterministic):
+    from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+    from sglang.srt.models.deepseek_v4 import MQALayer
+
+    class Norm:
+        weight = torch.ones(1280, device="cuda", dtype=torch.bfloat16)
+        variance_epsilon = 1e-6
+
+        def __call__(self, x):
+            return flashinfer.norm.rmsnorm(x, self.weight, self.variance_epsilon)
+
+    layer = SimpleNamespace(
+        is_dsv41=True,
+        q_norm=Norm(),
+        wq_b=SimpleNamespace(
+            quant_method=SimpleNamespace(
+                mxfp8_dense_backend=Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
+                use_mxfp8=True,
+            )
+        ),
+    )
+    x = torch.randn(6, 1280, device="cuda", dtype=torch.bfloat16)
+    runtime = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
+    )
+    with (
+        patch(
+            "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+            return_value=batch_invariant,
+        ),
+        patch("sglang.srt.runtime_context.get_exec", return_value=runtime),
+        patch(
+            "sglang.kernels.ops.layernorm.mxfp8_epilogue.rmsnorm_mxfp8",
+            side_effect=AssertionError("deterministic norm changed"),
+        ),
+    ):
+        y, q = MQALayer._normalize_q_lora(layer, x)
+    assert q is y
+    assert torch.equal(y, layer.q_norm(x))
 
 
 if __name__ == "__main__":

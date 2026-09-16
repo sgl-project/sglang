@@ -72,6 +72,14 @@ def get_capture_attention_variant() -> Optional[str]:
     return _capture_attention_variant
 
 
+def skip_low_ratio_indexer(compress_ratio: int) -> bool:
+    """Whether the captured DeepSeek-V4.1 candidate variant selects every
+    position for this ratio (decode_cuda_graph_runner's candidate graphs)."""
+    return _capture_attention_variant == "candidate_all" or (
+        _capture_attention_variant == "candidate_c2_all" and compress_ratio == 2
+    )
+
+
 def _set_capture_attention_variant(variant: Optional[str]) -> None:
     global _capture_attention_variant
     _capture_attention_variant = variant
