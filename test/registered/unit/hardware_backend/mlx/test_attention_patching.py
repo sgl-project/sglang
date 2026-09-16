@@ -14,6 +14,7 @@ register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
+_HAS_MPS = False
 
 if _HAS_MLX:
     import mlx.core as mx
@@ -56,6 +57,8 @@ if _HAS_MLX:
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    _HAS_MPS = torch.backends.mps.is_available()
 
 
 def _set_runner_cache_layout(
@@ -407,15 +410,21 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(calls, [(1, [[7]], ["r0"])])
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
 
-    def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
+    @staticmethod
+    def _init_overlap_mlx_scheduler(device: str):
+        """Run ``Scheduler.init_overlap`` on a bare MLX-style scheduler.
+
+        ``device`` is the scheduler's accelerator device; the MLX backend keeps
+        ``req_to_token_pool`` (and hence every ScheduleBatch tensor) on CPU
+        regardless.
+        """
         from sglang.srt.managers import scheduler as scheduler_module
-        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         scheduler = object.__new__(Scheduler)
-        scheduler.device = "cpu"
+        scheduler.device = device
         scheduler.draft_worker = None
         scheduler.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=None)
@@ -440,6 +449,36 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             Scheduler.init_overlap(scheduler)
         finally:
             scheduler_module.use_mlx = original_use_mlx
+        return scheduler
+
+    @unittest.skipUnless(_HAS_MPS, "requires the mps device")
+    def test_mlx_scheduler_future_map_follows_req_pool_device(self):
+        """``--disable-overlap-schedule`` relays ``next_token_ids`` through
+        ``FutureMap.stash`` with the batch's CPU ``req_pool_indices`` and the
+        MLX worker's CPU tokens. A FutureMap built on the scheduler's "mps"
+        device only survived that by PyTorch's one-element CPU-scalar
+        exception: the first batch with two requests raised
+        "Expected all tensors to be on the same device". The relay must live
+        on the req_to_token_pool's device.
+        """
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
+        scheduler = self._init_overlap_mlx_scheduler(device="mps")
+
+        indices = torch.tensor([1, 2], dtype=torch.int64)
+        scheduler.future_map.stash(
+            indices,
+            RelayPayload(bonus_tokens=torch.tensor([7, 9], dtype=torch.int64)),
+        )
+        self.assertEqual(
+            scheduler.future_map.output_tokens_buf[indices].tolist(), [7, 9]
+        )
+        self.assertEqual(scheduler.future_map.output_tokens_buf.device.type, "cpu")
+
+    def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
+        from sglang.srt.managers.overlap_utils import RelayPayload
+
+        scheduler = self._init_overlap_mlx_scheduler(device="cpu")
 
         self.assertIsNotNone(scheduler.future_map)
         indices = torch.tensor([1], dtype=torch.int64)
