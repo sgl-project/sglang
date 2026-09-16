@@ -3,10 +3,21 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+try:
+    from sgl_kernel.speculative import (
+        reconstruct_indices_from_tree_mask as _reconstruct_indices_kernel,
+    )
+except ImportError:
+    # Stale / CPU-only sgl_kernel wheels may not ship this op. Fall back to the
+    # pure-torch implementation below.
+    _reconstruct_indices_kernel = None
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+)
+from sglang.kernels.ops.speculative.reconstruct_tree import (
+    reconstruct_indices_from_tree_mask_triton,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -70,6 +81,46 @@ def _derive_tree_links(
                 next_sibling[b, i] = earliest_child_of.get(parent, -1)
                 earliest_child_of[parent] = i
     return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
+
+
+def reconstruct_indices_from_tree_mask(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    # XPU has no compiled reconstruct op; use the fused Triton kernel there.
+    # Every other device (CPU / CUDA) goes through the compiled sgl_kernel op.
+    if tree_mask.is_xpu:
+        reconstruct_indices_from_tree_mask_triton(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
+        return
+
+    assert (
+        _reconstruct_indices_kernel is not None
+    ), "sgl_kernel.speculative.reconstruct_indices_from_tree_mask is unavailable"
+    _reconstruct_indices_kernel(
+        tree_mask,
+        verified_seq_len,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        batch_size,
+        draft_token_num,
+    )
 
 
 class NGRAMWorker(BaseSpecWorker):
