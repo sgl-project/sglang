@@ -58,6 +58,3 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
-
-    # None when no HiCache host pool will be attached.
-    hicache_host_memory_mode: Optional[str] = None

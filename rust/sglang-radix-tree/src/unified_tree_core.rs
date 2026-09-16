@@ -4078,6 +4078,172 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
+    /// Snapshot matched nodes and their spans without splitting or refreshing them.
+    fn walk_span_(
+        &self,
+        key: &K,
+        namespace: KeyNamespaceRef<'_>,
+        end: usize,
+    ) -> Vec<(NodeIdx_, usize, usize)> {
+        let mut spans = Vec::new();
+        let mut node_id = self.arena.root();
+        let mut pos = 0;
+        while pos < end && key.atom_len() - pos >= self.page_size {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id,
+                namespace,
+                key.page_at(pos, self.page_size),
+            ) else {
+                break;
+            };
+            let child = self.arena.node(child_id);
+            if !child.has_device_value(FULL) && !child.has_host_value(FULL) {
+                break;
+            }
+            let prefix_len = key.match_len(pos, &child.key, self.page_size);
+            if prefix_len == 0 {
+                break;
+            }
+            spans.push((child_id, pos, prefix_len));
+            if prefix_len < child.key.atom_len() {
+                break;
+            }
+            node_id = child_id;
+            pos += prefix_len;
+        }
+        spans
+    }
+
+    fn validate_swa_span_(&self, key: &K, start: usize, end: usize) -> Result<(), String> {
+        if self.components_by_type[SWA.idx()].is_none() {
+            return Err("SWA component is not enabled".into());
+        }
+        if start > end || end > key.atom_len() {
+            return Err(format!(
+                "invalid SWA span [{start}, {end}) for key length {}",
+                key.atom_len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maximal SWA-device-tombstoned ranges within the requested key span.
+    /// Host-backed FULL nodes remain traversable; an absent FULL copy stops the walk.
+    pub fn swa_tombstone_ranges(
+        &self,
+        key: &K,
+        namespace: KeyNamespaceRef<'_>,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<(usize, usize)>, String> {
+        self.validate_swa_span_(key, start, end)?;
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        if start == end {
+            return Ok(ranges);
+        }
+        for (child_id, pos, prefix_len) in self.walk_span_(key, namespace, end) {
+            let seg_end = pos + prefix_len;
+            if seg_end <= start || self.arena.has_device_value(child_id, SWA) {
+                continue;
+            }
+            let lo = start.max(pos);
+            let hi = end.min(seg_end);
+            if let Some(last) = ranges.last_mut()
+                && last.1 == lo
+            {
+                last.1 = hi;
+            } else {
+                ranges.push((lo, hi));
+            }
+            if hi >= end {
+                break;
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Publish loaded SWA slots into an existing tombstoned span.
+    /// Validate the entire operation before splitting or publishing any values.
+    pub fn attach_swa_window(
+        &mut self,
+        key: &K,
+        namespace: KeyNamespaceRef<'_>,
+        window_start: usize,
+        window_end: usize,
+        swa_values: &Tensor,
+    ) -> Result<Vec<CacheAction>, String> {
+        self.validate_swa_span_(key, window_start, window_end)?;
+        if swa_values.kind() != Kind::Int64 || swa_values.device() != self.device {
+            return Err(format!(
+                "attach_swa_window requires int64 values on {:?}",
+                self.device
+            ));
+        }
+        if swa_values.size() != [((window_end - window_start) as i64)] {
+            return Err(format!(
+                "attach_swa_window size mismatch: got {:?} for [{window_start}, {window_end})",
+                swa_values.size()
+            ));
+        }
+        if window_start == window_end {
+            return Ok(Vec::new());
+        }
+        if !window_start.is_multiple_of(self.page_size)
+            || !window_end.is_multiple_of(self.page_size)
+        {
+            return Err("attach_swa_window boundaries must be page aligned".into());
+        }
+        let spans = self.walk_span_(key, namespace, window_end);
+        let mut covered = window_start;
+        for &(child_id, pos, prefix_len) in &spans {
+            if pos + prefix_len <= window_start {
+                continue;
+            }
+            if self.arena.has_device_value(child_id, SWA) {
+                return Err(format!(
+                    "attach_swa_window over live SWA at [{}, {})",
+                    window_start.max(pos),
+                    window_end.min(pos + prefix_len)
+                ));
+            }
+            covered = window_end.min(pos + prefix_len);
+        }
+        if covered != window_end {
+            return Err(format!(
+                "attach_swa_window covered {covered} of [{window_start}, {window_end})"
+            ));
+        }
+
+        let mut actions = Vec::new();
+        for (child_id, pos, prefix_len) in spans {
+            let seg_end = window_end.min(pos + prefix_len);
+            if seg_end <= window_start {
+                continue;
+            }
+            let seg_start = window_start.max(pos);
+            let mut target = child_id;
+            if seg_start > pos {
+                // The original handle remains on the suffix, our target.
+                let (_, action) = self.split_node_(target, seg_start - pos);
+                actions.extend(action);
+            }
+            if seg_start + self.arena.node(target).key.atom_len() > seg_end {
+                let (fragment, action) = self.split_node_(target, seg_end - seg_start);
+                actions.extend(action);
+                target = fragment;
+            }
+            let values = swa_values
+                .narrow(
+                    0,
+                    (seg_start - window_start) as i64,
+                    (seg_end - seg_start) as i64,
+                )
+                .copy();
+            self.set_component_device_value_(target, SWA, values);
+        }
+        Ok(actions)
+    }
+
     /// Store an auxiliary component's device value onto a node and restamp
     /// its LRU.
     pub fn set_component_device_value(

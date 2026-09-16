@@ -627,6 +627,24 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return maximal missing SWA ranges within the matched [start, end) span."""
+        ...
+
+    @abstractmethod
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA window to tombstoned spans, returning split actions."""
+        ...
+
+    @abstractmethod
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
     ) -> None:

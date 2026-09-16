@@ -4501,7 +4501,6 @@ class UnifiedRadixCacheSuite:
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
         """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         storage_dir = tempfile.mkdtemp()
@@ -4642,7 +4641,6 @@ class UnifiedRadixCacheSuite:
     def test_buffer_only_load_back_reuses_partial_masked_full(self):
         """FULL-only rematch reuses a resident head and fetches only its tail."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
         page_size = self.cfg.page_size
@@ -4855,7 +4853,6 @@ class UnifiedRadixCacheSuite:
         A window-sized fetch still passes the global threshold, but after
         sibling growth its FULL splice is shorter than its SWA transfer."""
         self._skip_unsupported_hicache_test()
-        self._skip_swa_window_repair_on_rust()
         # Buffer-mode plan/commit logic is layout-independent, and each
         # hicache fixture retains its pools for the whole file run. Pin to
         # one config so the matrix does not exhaust a small CI GPU.
@@ -5439,13 +5436,6 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
-
-    def _skip_swa_window_repair_on_rust(self):
-        # Buffer-mode consumption repairs SWA tombstones under the loaded
-        # window through swa_tombstone_ranges/attach_swa_window, which the
-        # Rust tree core does not implement yet.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("buffer-mode SWA window repair is Python-core only")
 
     def _simulate_backup(self, cache, node):
         """Simulate D->H backup over the whole root->node path (parent-first)."""
