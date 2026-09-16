@@ -50,6 +50,15 @@
 //! When a batch attaches an existing subtree under a new parent, the subtree's
 //! `r` fields are rewritten by a breadth-first pass over `c:` sets.
 //!
+//! # Pruning
+//!
+//! A block that lost its last placement and has no children is deleted by a
+//! server-side script (loaded once, invoked by `EVALSHA`) so a concurrent
+//! re-report of the same block cannot be lost between the check and the
+//! delete. Every key the script touches is declared in `KEYS`; it returns the
+//! deleted block's grandparent link so the walk up the chain stays declared
+//! one level at a time.
+//!
 //! # Cluster mode
 //!
 //! Pipelines are routed per slot, so in cluster mode every key must live in one
@@ -58,17 +67,21 @@
 //! slot is a capacity fit and cluster mode buys failover rather than sharding.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::cluster::ClusterClientBuilder;
 use redis::cluster_async::ClusterConnection;
-use redis::{FromRedisValue, Pipeline, RedisError, Value};
+use redis::{FromRedisValue, Pipeline, RedisError, Script, Value};
 use tonic::Status;
 
 use crate::pb::{
-    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
-    ExternalKvNodeMatch, GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse,
-    HitCountEntry, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierHashes, WorkerCacheSpec,
+    ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
+    ExternalKvActionType, ExternalKvNodeMatch, GetExternalKvHitCountsRequest,
+    GetExternalKvHitCountsResponse, HitCountEntry, MatchExternalKvPrefixRequest,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
+    WorkerCacheSpec,
 };
 use crate::service::{compute_prefix_response, prefix_limit};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
@@ -77,18 +90,24 @@ use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 /// one slot and pipelines stay legal in cluster mode.
 pub const DEFAULT_KEY_PREFIX: &str = "{sgl-kv-indexer}:";
 
+/// Per-command response deadline. Well above a healthy round trip and below
+/// the Router's default 100 ms query deadline times its retry-free fallback, so
+/// a stalled Valkey surfaces as `Unavailable` instead of a hung apply.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Deadline for establishing a connection at startup or after a drop.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Commands per pipeline. Bounds the memory one apply or query holds in flight
 /// while keeping round trips low: a 16,384-hash batch is a handful of pipelines.
 const PIPELINE_CHUNK: usize = 4096;
 
-/// Lua that deletes a block record only if it is still empty: no placements and
-/// no children. Runs server-side so a concurrent REPORT of the same block cannot
-/// be lost between the check and the delete. Returns the parent hash to continue
-/// pruning upward, or an empty string.
-///
-/// KEYS[1] = block hash key, KEYS[2] = children set key, KEYS[3] = hit count key,
-/// ARGV[1] = hash, ARGV[2] = children key prefix (for the parent's set).
-const PRUNE_SCRIPT: &str = r#"
+/// KEYS[1] block, KEYS[2] its children set, KEYS[3] hit counts; when the block
+/// has a known parent also KEYS[4] the parent's children set and KEYS[5] the
+/// parent's block. ARGV[1] is the block hash. Returns nil when nothing was
+/// deleted or the block had no parent, else the parent's own parent link
+/// (`R`, a hash, or `U` for unknown) so the caller can continue upward.
+const PRUNE_LUA: &str = r#"
 local fields = redis.call('HKEYS', KEYS[1])
 local placements = 0
 for _, f in ipairs(fields) do
@@ -98,15 +117,14 @@ if placements == 0 then
   redis.call('HDEL', KEYS[3], ARGV[1])
 end
 if placements > 0 or redis.call('SCARD', KEYS[2]) > 0 then
-  return ''
+  return false
 end
-local parent = redis.call('HGET', KEYS[1], 'p')
 redis.call('DEL', KEYS[1], KEYS[2])
-if parent and parent ~= 'R' then
-  redis.call('SREM', ARGV[2] .. parent, ARGV[1])
-  return parent
+if #KEYS < 5 then
+  return false
 end
-return ''
+redis.call('SREM', KEYS[4], ARGV[1])
+return redis.call('HGET', KEYS[5], 'p') or 'U'
 "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +136,8 @@ pub struct ValkeyConfig {
     /// Prepended to every key. Must contain a `{hash tag}` in cluster mode.
     pub key_prefix: String,
     pub cluster: bool,
+    pub request_timeout: Duration,
+    pub connect_timeout: Duration,
 }
 
 impl ValkeyConfig {
@@ -126,6 +146,8 @@ impl ValkeyConfig {
             url: url.into(),
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
             cluster: false,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
@@ -136,6 +158,16 @@ impl ValkeyConfig {
 
     pub fn with_cluster(mut self, cluster: bool) -> Self {
         self.cluster = cluster;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }
@@ -164,12 +196,29 @@ impl Conn {
     }
 }
 
+/// Transport failures are `Unavailable`, which the Router treats as "index
+/// unreachable" and falls back on. Anything else is a server-side fault.
 fn valkey_error(error: RedisError) -> Status {
-    Status::unavailable(format!("valkey backend: {error}"))
+    let transport = error.is_io_error()
+        || error.is_timeout()
+        || error.is_connection_dropped()
+        || error.is_connection_refusal()
+        || error.is_cluster_error();
+    if transport {
+        Status::unavailable(format!("valkey backend: {error}"))
+    } else {
+        Status::internal(format!("valkey backend: {error}"))
+    }
 }
 
 fn parse_error(what: &str, raw: &str) -> Status {
     Status::internal(format!("valkey backend: malformed {what}: {raw:?}"))
+}
+
+fn missing(what: &str, hash: i64) -> Status {
+    Status::internal(format!(
+        "valkey backend: {what} for block {hash} missing from snapshot"
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +231,7 @@ enum ParentLink {
 impl ParentLink {
     fn decode(raw: Option<&str>) -> Result<Self, Status> {
         match raw {
-            None => Ok(ParentLink::Unknown),
+            None | Some("U") => Ok(ParentLink::Unknown),
             Some("R") => Ok(ParentLink::Root),
             Some(hash) => hash
                 .parse::<i64>()
@@ -206,7 +255,7 @@ struct BlockRead {
     parent: ParentLink,
     root: Option<i64>,
     token_count: u32,
-    /// `(worker, tier) -> component mask`, in field order.
+    /// `(worker, tier) -> component mask`, sorted.
     placements: Vec<((String, i32), u32)>,
 }
 
@@ -249,8 +298,8 @@ impl BlockRead {
                 }
             }
         }
-        // Field order from HGETALL is hash-table order; sort so responses are
-        // deterministic and match the in-memory backend's per-worker grouping.
+        // HGETALL field order is hash-table order; sort so responses are
+        // deterministic and grouped like the in-memory backend's.
         read.placements.sort();
         Ok(read)
     }
@@ -325,11 +374,396 @@ fn convert<T: FromRedisValue>(value: Value, what: &str) -> Result<T, Status> {
         .map_err(|error| Status::internal(format!("valkey backend: unexpected {what}: {error}")))
 }
 
+/// The chain edges one batch introduces, validated for internal consistency
+/// before any read: a hash may appear in several REPORT actions only with the
+/// same parent, and never as its own parent.
+#[derive(Debug)]
+struct BatchPlan {
+    parents: HashMap<i64, ParentLink>,
+    /// Planned hashes in first-appearance order.
+    order: Vec<i64>,
+    clear_tiers: Vec<i32>,
+}
+
+fn plan_batch(actions: &[ExternalKvAction]) -> Result<BatchPlan, Status> {
+    let mut plan = BatchPlan {
+        parents: HashMap::new(),
+        order: Vec::new(),
+        clear_tiers: Vec::new(),
+    };
+    for action in actions {
+        match ExternalKvActionType::try_from(action.r#type) {
+            Ok(ExternalKvActionType::ActionReport) => {
+                let mut parent = action
+                    .parent_block_hash
+                    .map_or(ParentLink::Root, ParentLink::Hash);
+                for hash in &action.hashes {
+                    if parent == ParentLink::Hash(*hash) {
+                        return Err(Status::invalid_argument(
+                            "block hash cannot be its own parent",
+                        ));
+                    }
+                    match plan.parents.get(hash) {
+                        Some(existing) if *existing != parent => {
+                            return Err(Status::invalid_argument(format!(
+                                "block hash {hash} was reported with conflicting parents"
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            plan.parents.insert(*hash, parent);
+                            plan.order.push(*hash);
+                        }
+                    }
+                    parent = ParentLink::Hash(*hash);
+                }
+            }
+            Ok(ExternalKvActionType::ActionRevoke) => {}
+            Ok(ExternalKvActionType::ActionClearAllAtTier) => plan.clear_tiers.push(action.tier),
+            Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {
+                return Err(Status::invalid_argument("unsupported action type"));
+            }
+        }
+    }
+    plan.clear_tiers.sort_unstable();
+    plan.clear_tiers.dedup();
+    Ok(plan)
+}
+
+/// What the keyspace held, for every block a batch touches, before the batch
+/// wrote anything.
+struct Snapshot {
+    blocks: HashMap<i64, BlockRead>,
+    /// Holdings of the reporting worker at each tier a CLEAR_ALL_AT_TIER names.
+    holdings: HashMap<i32, HashSet<i64>>,
+}
+
+impl Snapshot {
+    fn block(&self, hash: i64) -> Result<&BlockRead, Status> {
+        self.blocks
+            .get(&hash)
+            .ok_or_else(|| missing("record", hash))
+    }
+
+    fn exists(&self, hash: i64) -> bool {
+        self.blocks.get(&hash).is_some_and(BlockRead::exists)
+    }
+
+    /// Root of an existing block's chain; a block with no record is its own root.
+    fn root_of_existing(&self, hash: i64) -> i64 {
+        self.blocks
+            .get(&hash)
+            .and_then(|block| block.root)
+            .unwrap_or(hash)
+    }
+}
+
+/// Rejects a batch whose edges conflict with stored parents or would close a
+/// cycle. Runs before any write, so a rejection leaves the keyspace untouched.
+fn validate_plan(plan: &BatchPlan, snapshot: &Snapshot) -> Result<(), Status> {
+    for hash in &plan.order {
+        let planned = plan.parents[hash];
+        let existing = snapshot.block(*hash)?.parent;
+        if existing != ParentLink::Unknown && existing != planned {
+            return Err(Status::invalid_argument(format!(
+                "block hash {hash} was reported with conflicting parents"
+            )));
+        }
+    }
+    // Follow planned edges through the batch; on leaving it into existing
+    // state, jump to that subtree's root, the only node that can lead back.
+    for start in &plan.order {
+        let mut on_path = HashSet::new();
+        let mut current = *start;
+        loop {
+            if !on_path.insert(current) {
+                return Err(Status::invalid_argument(
+                    "report would create a parent cycle",
+                ));
+            }
+            let Some(parent) = plan.parents.get(&current) else {
+                break;
+            };
+            let ParentLink::Hash(parent) = *parent else {
+                break;
+            };
+            if plan.parents.contains_key(&parent) {
+                current = parent;
+                continue;
+            }
+            let root = snapshot.root_of_existing(parent);
+            if plan.parents.contains_key(&root) {
+                current = root;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Chain root of every planned block after the batch: a block attached
+/// outside the batch inherits that parent's root; inside, its parent's new root.
+/// `validate_plan` has ruled out cycles, so the recursion terminates.
+fn roots_after(plan: &BatchPlan, snapshot: &Snapshot) -> HashMap<i64, i64> {
+    fn root_of(
+        hash: i64,
+        plan: &BatchPlan,
+        snapshot: &Snapshot,
+        roots: &mut HashMap<i64, i64>,
+    ) -> i64 {
+        if let Some(root) = roots.get(&hash) {
+            return *root;
+        }
+        let root = match plan.parents.get(&hash) {
+            Some(ParentLink::Hash(parent)) => root_of(*parent, plan, snapshot, roots),
+            Some(ParentLink::Root) | Some(ParentLink::Unknown) => hash,
+            None => snapshot.root_of_existing(hash),
+        };
+        roots.insert(hash, root);
+        root
+    }
+    let mut roots = HashMap::with_capacity(plan.order.len());
+    for hash in &plan.order {
+        root_of(*hash, plan, snapshot, &mut roots);
+    }
+    roots
+}
+
+/// Turns a validated batch into ordered write commands, tracking the in-batch
+/// state the reference semantics depend on: holdings as seen by a later
+/// CLEAR_ALL_AT_TIER, and each block's live placement set so a hit count is
+/// dropped at the revoke that empties it even if a later action re-reports it.
+struct WriteBuilder<'a> {
+    backend: &'a ValkeyKvIndexerBackend,
+    worker_id: &'a str,
+    plan: &'a BatchPlan,
+    snapshot: &'a Snapshot,
+    roots: &'a HashMap<i64, i64>,
+    commands: Vec<redis::Cmd>,
+    /// Existing blocks that gain a parent edge; their subtrees need `r` rewritten.
+    relink: Vec<(i64, i64)>,
+    written_parent: HashSet<i64>,
+    /// Revoked hashes with the parent link they will have after this batch.
+    revoked: Vec<(i64, ParentLink)>,
+    holdings_delta: HashMap<i32, (HashSet<i64>, HashSet<i64>)>,
+    live: HashMap<i64, HashSet<(String, i32)>>,
+}
+
+impl<'a> WriteBuilder<'a> {
+    fn new(
+        backend: &'a ValkeyKvIndexerBackend,
+        worker_id: &'a str,
+        plan: &'a BatchPlan,
+        snapshot: &'a Snapshot,
+        roots: &'a HashMap<i64, i64>,
+    ) -> Self {
+        Self {
+            backend,
+            worker_id,
+            plan,
+            snapshot,
+            roots,
+            commands: Vec::new(),
+            relink: Vec::new(),
+            written_parent: HashSet::new(),
+            revoked: Vec::new(),
+            holdings_delta: HashMap::new(),
+            live: HashMap::new(),
+        }
+    }
+
+    /// Address and spec are snapshots carried on every batch; an empty address
+    /// makes the worker unroutable and an absent spec returns it to legacy.
+    fn worker_meta(&mut self, address: &str, spec: Option<&WorkerCacheSpec>) {
+        let key = self.backend.worker_key(self.worker_id);
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(&key).arg("addr").arg(address);
+        self.commands.push(cmd);
+        let cmd = match spec {
+            Some(spec) => {
+                let mut cmd = redis::cmd("HSET");
+                cmd.arg(&key).arg("spec").arg(encode_spec(spec));
+                cmd
+            }
+            None => {
+                let mut cmd = redis::cmd("HDEL");
+                cmd.arg(&key).arg("spec");
+                cmd
+            }
+        };
+        self.commands.push(cmd);
+    }
+
+    fn action(&mut self, action: &ExternalKvAction) -> Result<(), Status> {
+        match ExternalKvActionType::try_from(action.r#type) {
+            Ok(ExternalKvActionType::ActionReport) => self.report(action),
+            Ok(ExternalKvActionType::ActionRevoke) => {
+                for hash in action.hashes.iter().copied() {
+                    self.revoke(hash, action.tier)?;
+                    let (added, removed) = self.holdings_delta.entry(action.tier).or_default();
+                    added.remove(&hash);
+                    removed.insert(hash);
+                }
+                Ok(())
+            }
+            Ok(ExternalKvActionType::ActionClearAllAtTier) => self.clear(action.tier),
+            Ok(ExternalKvActionType::ActionUnknown) | Err(_) => Err(Status::internal(
+                "unsupported action type reached the write path",
+            )),
+        }
+    }
+
+    fn report(&mut self, action: &ExternalKvAction) -> Result<(), Status> {
+        let mut parent = action
+            .parent_block_hash
+            .map_or(ParentLink::Root, ParentLink::Hash);
+        for (index, hash) in action.hashes.iter().copied().enumerate() {
+            if self.written_parent.insert(hash) {
+                self.link(hash, parent)?;
+            }
+            let mask = action.component_masks.get(index).copied().unwrap_or(0);
+            let token_count = action.block_sizes.get(index).copied().unwrap_or(0);
+            let mut cmd = redis::cmd("HSET");
+            cmd.arg(self.backend.block_key(hash))
+                .arg(ValkeyKvIndexerBackend::placement_field(
+                    self.worker_id,
+                    action.tier,
+                ))
+                .arg(mask);
+            // A legacy report carries no size; 0 must not erase a known count.
+            if token_count > 0 {
+                cmd.arg("t").arg(token_count);
+            }
+            self.commands.push(cmd);
+            let mut cmd = redis::cmd("SADD");
+            cmd.arg(self.backend.holdings_key(self.worker_id, action.tier))
+                .arg(hash);
+            self.commands.push(cmd);
+            let (added, removed) = self.holdings_delta.entry(action.tier).or_default();
+            added.insert(hash);
+            removed.remove(&hash);
+            let placement = (self.worker_id.to_string(), action.tier);
+            self.live_placements(hash).insert(placement);
+            parent = ParentLink::Hash(hash);
+        }
+        Ok(())
+    }
+
+    /// Writes the chain edge of a planned block: its parent link and root, the
+    /// parent's child entry, and a bare record for a parent only referenced.
+    fn link(&mut self, hash: i64, parent: ParentLink) -> Result<(), Status> {
+        let root = *self.roots.get(&hash).ok_or_else(|| missing("root", hash))?;
+        let stored = self.snapshot.block(hash)?;
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(self.backend.block_key(hash)).arg("r").arg(root);
+        if let Some(encoded) = parent.encode() {
+            cmd.arg("p").arg(encoded);
+        }
+        self.commands.push(cmd);
+        if let ParentLink::Hash(parent_hash) = parent {
+            let mut cmd = redis::cmd("SADD");
+            cmd.arg(self.backend.children_key(parent_hash)).arg(hash);
+            self.commands.push(cmd);
+            if !self.plan.parents.contains_key(&parent_hash)
+                && !self.snapshot.exists(parent_hash)
+                && self.written_parent.insert(parent_hash)
+            {
+                let mut cmd = redis::cmd("HSET");
+                cmd.arg(self.backend.block_key(parent_hash))
+                    .arg("r")
+                    .arg(parent_hash);
+                self.commands.push(cmd);
+            }
+        }
+        if stored.exists()
+            && stored.parent == ParentLink::Unknown
+            && parent != ParentLink::Unknown
+            && root != hash
+        {
+            self.relink.push((hash, root));
+        }
+        Ok(())
+    }
+
+    fn revoke(&mut self, hash: i64, tier: i32) -> Result<(), Status> {
+        let mut cmd = redis::cmd("HDEL");
+        cmd.arg(self.backend.block_key(hash))
+            .arg(ValkeyKvIndexerBackend::placement_field(
+                self.worker_id,
+                tier,
+            ));
+        self.commands.push(cmd);
+        let mut cmd = redis::cmd("SREM");
+        cmd.arg(self.backend.holdings_key(self.worker_id, tier))
+            .arg(hash);
+        self.commands.push(cmd);
+        let worker_id = self.worker_id.to_string();
+        let set = self.live_placements(hash);
+        set.remove(&(worker_id, tier));
+        let emptied = set.is_empty();
+        if emptied && self.snapshot.exists(hash) {
+            let mut cmd = redis::cmd("HDEL");
+            cmd.arg(self.backend.hits_key()).arg(hash);
+            self.commands.push(cmd);
+        }
+        // The parent this block will have once the batch is applied.
+        let parent = match self.plan.parents.get(&hash) {
+            Some(parent) => *parent,
+            None => self
+                .snapshot
+                .blocks
+                .get(&hash)
+                .map_or(ParentLink::Unknown, |block| block.parent),
+        };
+        self.revoked.push((hash, parent));
+        Ok(())
+    }
+
+    fn clear(&mut self, tier: i32) -> Result<(), Status> {
+        let mut hashes: Vec<i64> = self
+            .snapshot
+            .holdings
+            .get(&tier)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        if let Some((added, removed)) = self.holdings_delta.get(&tier) {
+            hashes.retain(|hash| !removed.contains(hash));
+            hashes.extend(added.iter().copied());
+        }
+        for hash in dedup_preserve_order(&hashes) {
+            self.revoke(hash, tier)?;
+        }
+        // Everything at this tier is gone now, including earlier in-batch adds.
+        self.holdings_delta
+            .insert(tier, (HashSet::new(), hashes.into_iter().collect()));
+        Ok(())
+    }
+
+    fn live_placements(&mut self, hash: i64) -> &mut HashSet<(String, i32)> {
+        let snapshot = self.snapshot;
+        self.live.entry(hash).or_insert_with(|| {
+            snapshot
+                .blocks
+                .get(&hash)
+                .map(|block| {
+                    block
+                        .placements
+                        .iter()
+                        .map(|(key, _)| key.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+}
+
 /// Shared-keyspace KV placement index over Valkey.
 #[derive(Clone)]
 pub struct ValkeyKvIndexerBackend {
     conn: Conn,
     prefix: String,
+    prune: Arc<Script>,
 }
 
 impl std::fmt::Debug for ValkeyKvIndexerBackend {
@@ -348,8 +782,9 @@ impl std::fmt::Debug for ValkeyKvIndexerBackend {
 }
 
 impl ValkeyKvIndexerBackend {
-    /// Connects and returns the backend. The first connection is awaited so a
-    /// misconfigured URL fails at startup rather than on the first query.
+    /// Connects, loads the prune script, and returns the backend. Both are
+    /// awaited so a misconfigured URL fails at startup rather than on the first
+    /// query.
     pub async fn connect(config: ValkeyConfig) -> Result<Self, Status> {
         if config.cluster && !(config.key_prefix.contains('{') && config.key_prefix.contains('}')) {
             return Err(Status::invalid_argument(
@@ -363,21 +798,43 @@ impl ValkeyKvIndexerBackend {
                 .map(|node| node.trim().to_string())
                 .filter(|node| !node.is_empty())
                 .collect();
-            let client = redis::cluster::ClusterClient::new(nodes).map_err(valkey_error)?;
+            let client = ClusterClientBuilder::new(nodes)
+                .connection_timeout(config.connect_timeout)
+                .response_timeout(config.request_timeout)
+                .build()
+                .map_err(valkey_error)?;
             Conn::Cluster(client.get_async_connection().await.map_err(valkey_error)?)
         } else {
             let client = redis::Client::open(config.url.as_str()).map_err(valkey_error)?;
+            // Three reconnect attempts, then commands fail as `Unavailable` and
+            // the next command starts a fresh attempt; the Router falls back meanwhile.
+            let manager = ConnectionManagerConfig::new()
+                .set_connection_timeout(Some(config.connect_timeout))
+                .set_response_timeout(Some(config.request_timeout))
+                .set_number_of_retries(3)
+                .set_max_delay(Duration::from_secs(1));
             Conn::Standalone(
                 client
-                    .get_connection_manager()
+                    .get_connection_manager_with_config(manager)
                     .await
                     .map_err(valkey_error)?,
             )
         };
-        Ok(Self {
+        let backend = Self {
             conn,
             prefix: config.key_prefix,
-        })
+            prune: Arc::new(Script::new(PRUNE_LUA)),
+        };
+        backend.load_prune_script().await?;
+        Ok(backend)
+    }
+
+    /// `SCRIPT LOAD` is idempotent and routed to every primary in cluster mode.
+    async fn load_prune_script(&self) -> Result<(), Status> {
+        let mut pipe = redis::pipe();
+        pipe.cmd("SCRIPT").arg("LOAD").arg(PRUNE_LUA);
+        let _: Vec<String> = self.conn.clone().run(&pipe).await?;
+        Ok(())
     }
 
     fn block_key(&self, hash: i64) -> String {
@@ -386,10 +843,6 @@ impl ValkeyKvIndexerBackend {
 
     fn children_key(&self, hash: i64) -> String {
         format!("{}c:{hash}", self.prefix)
-    }
-
-    fn children_prefix(&self) -> String {
-        format!("{}c:", self.prefix)
     }
 
     fn worker_key(&self, worker: &str) -> String {
@@ -447,47 +900,6 @@ impl ValkeyKvIndexerBackend {
             .collect()
     }
 
-    /// One pipeline: full records for `hashes` and the holdings of `worker` at
-    /// each of `clear_tiers`.
-    async fn read_touched(
-        &self,
-        worker: &str,
-        hashes: &[i64],
-        clear_tiers: &[i32],
-    ) -> Result<(HashMap<i64, BlockRead>, HashMap<i32, HashSet<i64>>), Status> {
-        let commands = hashes.len() + clear_tiers.len();
-        let replies = self
-            .run_chunked(
-                |pipe, range| {
-                    for index in range {
-                        if index < hashes.len() {
-                            pipe.cmd("HGETALL").arg(self.block_key(hashes[index]));
-                        } else {
-                            let tier = clear_tiers[index - hashes.len()];
-                            pipe.cmd("SMEMBERS").arg(self.holdings_key(worker, tier));
-                        }
-                    }
-                },
-                commands,
-            )
-            .await?;
-        let mut blocks = HashMap::with_capacity(hashes.len());
-        let mut holdings = HashMap::with_capacity(clear_tiers.len());
-        for (index, value) in replies.into_iter().enumerate() {
-            if index < hashes.len() {
-                let read = BlockRead::from_fields(convert(value, "block record")?)?;
-                blocks.insert(hashes[index], read);
-            } else {
-                let members: Vec<i64> = convert(value, "holdings set")?;
-                holdings.insert(
-                    clear_tiers[index - hashes.len()],
-                    members.into_iter().collect(),
-                );
-            }
-        }
-        Ok((blocks, holdings))
-    }
-
     async fn read_workers(&self, workers: &[String]) -> Result<Vec<WorkerMeta>, Status> {
         let replies = self
             .run_chunked(
@@ -506,12 +918,13 @@ impl ValkeyKvIndexerBackend {
     }
 
     /// Issues write commands in [`PIPELINE_CHUNK`] slices, preserving order.
-    async fn write_all(&self, commands: Vec<redis::Cmd>) -> Result<(), Status> {
+    async fn write_all(&self, mut commands: Vec<redis::Cmd>) -> Result<(), Status> {
         let mut conn = self.conn.clone();
-        for chunk in commands.chunks(PIPELINE_CHUNK) {
+        while !commands.is_empty() {
+            let take = commands.len().min(PIPELINE_CHUNK);
             let mut pipe = redis::pipe();
-            for cmd in chunk {
-                pipe.add_command(cmd.clone()).ignore();
+            for cmd in commands.drain(..take) {
+                pipe.add_command(cmd).ignore();
             }
             conn.exec(&pipe).await?;
         }
@@ -524,57 +937,47 @@ impl ValkeyKvIndexerBackend {
         &self,
         req: ApplyExternalKvBatchRequest,
     ) -> Result<ApplyExternalKvBatchResponse, Status> {
-        let worker_id = req.worker_id;
+        let plan = plan_batch(&req.actions)?;
+        let snapshot = self.snapshot(&req.worker_id, &plan, &req.actions).await?;
+        validate_plan(&plan, &snapshot)?;
+        let roots = roots_after(&plan, &snapshot);
 
-        // Phase 1: plan the chain edges this batch introduces, purely in memory.
-        // A hash may appear in several REPORT actions only with the same parent.
-        let mut planned_parents: HashMap<i64, ParentLink> = HashMap::new();
-        let mut planned_order: Vec<i64> = Vec::new();
-        let mut clear_tiers: Vec<i32> = Vec::new();
+        let mut writes = WriteBuilder::new(self, &req.worker_id, &plan, &snapshot, &roots);
+        writes.worker_meta(&req.worker_address, req.cache_spec.as_ref());
         for action in &req.actions {
-            match ExternalKvActionType::try_from(action.r#type) {
-                Ok(ExternalKvActionType::ActionReport) => {
-                    let mut parent = action
-                        .parent_block_hash
-                        .map_or(ParentLink::Root, ParentLink::Hash);
-                    for hash in &action.hashes {
-                        if parent == ParentLink::Hash(*hash) {
-                            return Err(Status::invalid_argument(
-                                "block hash cannot be its own parent",
-                            ));
-                        }
-                        match planned_parents.get(hash) {
-                            Some(existing) if *existing != parent => {
-                                return Err(Status::invalid_argument(format!(
-                                    "block hash {hash} was reported with conflicting parents"
-                                )));
-                            }
-                            Some(_) => {}
-                            None => {
-                                planned_parents.insert(*hash, parent);
-                                planned_order.push(*hash);
-                            }
-                        }
-                        parent = ParentLink::Hash(*hash);
-                    }
-                }
-                Ok(ExternalKvActionType::ActionRevoke) => {}
-                Ok(ExternalKvActionType::ActionClearAllAtTier) => clear_tiers.push(action.tier),
-                Ok(ExternalKvActionType::ActionUnknown) | Err(_) => {
-                    return Err(Status::invalid_argument("unsupported action type"));
-                }
-            }
+            writes.action(action)?;
         }
+        let WriteBuilder {
+            commands,
+            relink,
+            revoked,
+            ..
+        } = writes;
+        self.write_all(commands).await?;
 
-        // Phase 2: one read snapshot of every block the batch touches (parent
-        // link, root, placements) plus the holdings each CLEAR_ALL_AT_TIER drains.
-        let mut touched: Vec<i64> = planned_order.clone();
-        for parent in planned_parents.values() {
+        for (hash, root) in relink {
+            self.rewrite_subtree_root(hash, root).await?;
+        }
+        self.prune(revoked).await?;
+        Ok(ApplyExternalKvBatchResponse {})
+    }
+
+    /// One read of every block the batch touches (planned hashes, the parents
+    /// they attach to, revoked hashes) plus the holdings each CLEAR drains, and
+    /// then the blocks those holdings name that nothing else did.
+    async fn snapshot(
+        &self,
+        worker_id: &str,
+        plan: &BatchPlan,
+        actions: &[ExternalKvAction],
+    ) -> Result<Snapshot, Status> {
+        let mut touched: Vec<i64> = plan.order.clone();
+        for parent in plan.parents.values() {
             if let ParentLink::Hash(parent) = parent {
                 touched.push(*parent);
             }
         }
-        for action in &req.actions {
+        for action in actions {
             if ExternalKvActionType::try_from(action.r#type)
                 == Ok(ExternalKvActionType::ActionRevoke)
             {
@@ -582,286 +985,52 @@ impl ValkeyKvIndexerBackend {
             }
         }
         let touched = dedup_preserve_order(&touched);
-        clear_tiers.sort_unstable();
-        clear_tiers.dedup();
-        let (mut blocks, mut holdings) = self
-            .read_touched(&worker_id, &touched, &clear_tiers)
+        let commands = touched.len() + plan.clear_tiers.len();
+        let replies = self
+            .run_chunked(
+                |pipe, range| {
+                    for index in range {
+                        if index < touched.len() {
+                            pipe.cmd("HGETALL").arg(self.block_key(touched[index]));
+                        } else {
+                            let tier = plan.clear_tiers[index - touched.len()];
+                            pipe.cmd("SMEMBERS").arg(self.holdings_key(worker_id, tier));
+                        }
+                    }
+                },
+                commands,
+            )
             .await?;
-        // Blocks a CLEAR will revoke that no other action named.
-        let extra: Vec<i64> = holdings
+        let mut snapshot = Snapshot {
+            blocks: HashMap::with_capacity(touched.len()),
+            holdings: HashMap::with_capacity(plan.clear_tiers.len()),
+        };
+        for (index, value) in replies.into_iter().enumerate() {
+            if index < touched.len() {
+                let read = BlockRead::from_fields(convert(value, "block record")?)?;
+                snapshot.blocks.insert(touched[index], read);
+            } else {
+                let members: Vec<i64> = convert(value, "holdings set")?;
+                snapshot.holdings.insert(
+                    plan.clear_tiers[index - touched.len()],
+                    members.into_iter().collect(),
+                );
+            }
+        }
+        let extra: Vec<i64> = snapshot
+            .holdings
             .values()
             .flatten()
             .copied()
-            .filter(|hash| !blocks.contains_key(hash))
+            .filter(|hash| !snapshot.blocks.contains_key(hash))
             .collect();
         let extra = dedup_preserve_order(&extra);
         if !extra.is_empty() {
             for (hash, read) in extra.iter().zip(self.read_blocks(&extra).await?) {
-                blocks.insert(*hash, read);
+                snapshot.blocks.insert(*hash, read);
             }
         }
-        let root_of_existing = |hash: i64| {
-            blocks
-                .get(&hash)
-                .and_then(|block| block.root)
-                .unwrap_or(hash)
-        };
-
-        // Phase 3: validate against the snapshot. Nothing has been written yet,
-        // so a rejection leaves the keyspace exactly as it was.
-        for hash in &planned_order {
-            let planned = planned_parents[hash];
-            let existing = blocks[hash].parent;
-            if existing != ParentLink::Unknown && existing != planned {
-                return Err(Status::invalid_argument(format!(
-                    "block hash {hash} was reported with conflicting parents"
-                )));
-            }
-        }
-        // Cycle check: follow planned edges through the batch; on leaving it into
-        // existing state, jump to that subtree's root, the only node that can lead back.
-        for start in &planned_order {
-            let mut on_path = HashSet::new();
-            let mut current = *start;
-            loop {
-                if !on_path.insert(current) {
-                    return Err(Status::invalid_argument(
-                        "report would create a parent cycle",
-                    ));
-                }
-                let parent = match planned_parents.get(&current) {
-                    Some(parent) => *parent,
-                    None => break,
-                };
-                match parent {
-                    ParentLink::Unknown | ParentLink::Root => break,
-                    ParentLink::Hash(parent) => {
-                        if planned_parents.contains_key(&parent) {
-                            current = parent;
-                        } else {
-                            let root = root_of_existing(parent);
-                            if planned_parents.contains_key(&root) {
-                                current = root;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Roots after this batch. A planned block whose parent is outside the
-        // batch inherits that parent's root; inside the batch, its parent's new root.
-        let mut roots: HashMap<i64, i64> = HashMap::new();
-        fn root_of(
-            hash: i64,
-            planned: &HashMap<i64, ParentLink>,
-            existing: &dyn Fn(i64) -> i64,
-            roots: &mut HashMap<i64, i64>,
-        ) -> i64 {
-            if let Some(root) = roots.get(&hash) {
-                return *root;
-            }
-            let root = match planned.get(&hash) {
-                Some(ParentLink::Hash(parent)) => root_of(*parent, planned, existing, roots),
-                Some(ParentLink::Root) | Some(ParentLink::Unknown) => hash,
-                None => existing(hash),
-            };
-            roots.insert(hash, root);
-            root
-        }
-        // Acyclicity was verified above, so this recursion terminates.
-        for hash in &planned_order {
-            root_of(*hash, &planned_parents, &root_of_existing, &mut roots);
-        }
-
-        // Phase 4: writes, in action order.
-        let mut commands: Vec<redis::Cmd> = Vec::new();
-        // Address and spec are snapshots carried on every batch; an empty address
-        // makes the worker unroutable and an absent spec returns it to legacy.
-        let mut cmd = redis::cmd("HSET");
-        cmd.arg(self.worker_key(&worker_id))
-            .arg("addr")
-            .arg(&req.worker_address);
-        commands.push(cmd);
-        commands.push(match &req.cache_spec {
-            Some(spec) => {
-                let mut cmd = redis::cmd("HSET");
-                cmd.arg(self.worker_key(&worker_id))
-                    .arg("spec")
-                    .arg(encode_spec(spec));
-                cmd
-            }
-            None => {
-                let mut cmd = redis::cmd("HDEL");
-                cmd.arg(self.worker_key(&worker_id)).arg("spec");
-                cmd
-            }
-        });
-        // Existing blocks that gain a parent edge here; their subtrees need `r`
-        // rewritten after the pipeline.
-        let mut relink: Vec<(i64, i64)> = Vec::new();
-        let mut written_parent: HashSet<i64> = HashSet::new();
-        let mut revoked: Vec<i64> = Vec::new();
-        // In-batch view of holdings so CLEAR_ALL_AT_TIER sees earlier actions.
-        let mut holdings_delta: HashMap<i32, (HashSet<i64>, HashSet<i64>)> = HashMap::new();
-        // In-batch view of each block's placements; the reference drops a hit
-        // count at the revoke that empties the block, before later actions run.
-        let mut live: HashMap<i64, HashSet<(String, i32)>> = HashMap::new();
-        fn live_placements<'a>(
-            live: &'a mut HashMap<i64, HashSet<(String, i32)>>,
-            blocks: &HashMap<i64, BlockRead>,
-            hash: i64,
-        ) -> &'a mut HashSet<(String, i32)> {
-            live.entry(hash).or_insert_with(|| {
-                blocks
-                    .get(&hash)
-                    .map(|block| {
-                        block
-                            .placements
-                            .iter()
-                            .map(|(key, _)| key.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-        }
-
-        for action in &req.actions {
-            match ExternalKvActionType::try_from(action.r#type) {
-                Ok(ExternalKvActionType::ActionReport) => {
-                    let has_masks = !action.component_masks.is_empty();
-                    let has_sizes = !action.block_sizes.is_empty();
-                    let mut parent = action
-                        .parent_block_hash
-                        .map_or(ParentLink::Root, ParentLink::Hash);
-                    for (index, hash) in action.hashes.iter().copied().enumerate() {
-                        let snap = &blocks[&hash];
-                        let root = roots[&hash];
-                        if written_parent.insert(hash) {
-                            let mut cmd = redis::cmd("HSET");
-                            cmd.arg(self.block_key(hash)).arg("r").arg(root);
-                            if let Some(encoded) = parent.encode() {
-                                cmd.arg("p").arg(encoded);
-                            }
-                            commands.push(cmd);
-                            if let ParentLink::Hash(parent_hash) = parent {
-                                let mut cmd = redis::cmd("SADD");
-                                cmd.arg(self.children_key(parent_hash)).arg(hash);
-                                commands.push(cmd);
-                                // A parent only ever referenced gets a record so
-                                // the chain is walkable and prunable.
-                                if !planned_parents.contains_key(&parent_hash)
-                                    && !blocks.get(&parent_hash).is_some_and(BlockRead::exists)
-                                    && written_parent.insert(parent_hash)
-                                {
-                                    let mut cmd = redis::cmd("HSET");
-                                    cmd.arg(self.block_key(parent_hash))
-                                        .arg("r")
-                                        .arg(parent_hash);
-                                    commands.push(cmd);
-                                }
-                            }
-                            if snap.exists()
-                                && snap.parent == ParentLink::Unknown
-                                && parent != ParentLink::Unknown
-                                && root != hash
-                            {
-                                relink.push((hash, root));
-                            }
-                        }
-                        let mask = if has_masks {
-                            action.component_masks[index]
-                        } else {
-                            0
-                        };
-                        let token_count = if has_sizes {
-                            action.block_sizes[index]
-                        } else {
-                            0
-                        };
-                        let mut cmd = redis::cmd("HSET");
-                        cmd.arg(self.block_key(hash))
-                            .arg(Self::placement_field(&worker_id, action.tier))
-                            .arg(mask);
-                        if token_count > 0 {
-                            cmd.arg("t").arg(token_count);
-                        }
-                        commands.push(cmd);
-                        let mut cmd = redis::cmd("SADD");
-                        cmd.arg(self.holdings_key(&worker_id, action.tier))
-                            .arg(hash);
-                        commands.push(cmd);
-                        let (added, removed) = holdings_delta.entry(action.tier).or_default();
-                        added.insert(hash);
-                        removed.remove(&hash);
-                        live_placements(&mut live, &blocks, hash)
-                            .insert((worker_id.clone(), action.tier));
-                        parent = ParentLink::Hash(hash);
-                    }
-                }
-                Ok(ExternalKvActionType::ActionRevoke) => {
-                    for hash in action.hashes.iter().copied() {
-                        self.push_revoke(&mut commands, &worker_id, hash, action.tier);
-                        let set = live_placements(&mut live, &blocks, hash);
-                        set.remove(&(worker_id.clone(), action.tier));
-                        if set.is_empty() && blocks.get(&hash).is_some_and(BlockRead::exists) {
-                            let mut cmd = redis::cmd("HDEL");
-                            cmd.arg(self.hits_key()).arg(hash);
-                            commands.push(cmd);
-                        }
-                        revoked.push(hash);
-                        let (added, removed) = holdings_delta.entry(action.tier).or_default();
-                        added.remove(&hash);
-                        removed.insert(hash);
-                    }
-                }
-                Ok(ExternalKvActionType::ActionClearAllAtTier) => {
-                    let mut hashes: Vec<i64> = holdings
-                        .get(&action.tier)
-                        .map(|set| set.iter().copied().collect())
-                        .unwrap_or_default();
-                    if let Some((added, removed)) = holdings_delta.get(&action.tier) {
-                        hashes.retain(|hash| !removed.contains(hash));
-                        hashes.extend(added.iter().copied());
-                    }
-                    for hash in dedup_preserve_order(&hashes) {
-                        self.push_revoke(&mut commands, &worker_id, hash, action.tier);
-                        let set = live_placements(&mut live, &blocks, hash);
-                        set.remove(&(worker_id.clone(), action.tier));
-                        if set.is_empty() && blocks.get(&hash).is_some_and(BlockRead::exists) {
-                            let mut cmd = redis::cmd("HDEL");
-                            cmd.arg(self.hits_key()).arg(hash);
-                            commands.push(cmd);
-                        }
-                        revoked.push(hash);
-                    }
-                    holdings_delta.remove(&action.tier);
-                    holdings.remove(&action.tier);
-                }
-                Ok(ExternalKvActionType::ActionUnknown) | Err(_) => unreachable!("validated above"),
-            }
-        }
-        self.write_all(commands).await?;
-
-        // Phase 5: subtree root rewrites, then prune blocks left empty.
-        for (hash, root) in relink {
-            self.rewrite_subtree_root(hash, root).await?;
-        }
-        self.prune(dedup_preserve_order(&revoked)).await?;
-
-        Ok(ApplyExternalKvBatchResponse {})
-    }
-
-    fn push_revoke(&self, commands: &mut Vec<redis::Cmd>, worker_id: &str, hash: i64, tier: i32) {
-        let mut cmd = redis::cmd("HDEL");
-        cmd.arg(self.block_key(hash))
-            .arg(Self::placement_field(worker_id, tier));
-        commands.push(cmd);
-        let mut cmd = redis::cmd("SREM");
-        cmd.arg(self.holdings_key(worker_id, tier)).arg(hash);
-        commands.push(cmd);
+        Ok(snapshot)
     }
 
     /// Sets `r = root` on every descendant of `hash`, one pipelined BFS level at
@@ -908,43 +1077,60 @@ impl ValkeyKvIndexerBackend {
     }
 
     /// Deletes block records that lost their last placement and have no
-    /// children, walking up parents that become empty in turn. Each step is a
-    /// server-side check-and-delete, so a concurrent re-report survives.
-    async fn prune(&self, mut candidates: Vec<i64>) -> Result<(), Status> {
-        // A parent re-enters as a candidate each time a child is deleted, so a
-        // block judged non-empty early in a round is re-checked; every round deletes.
+    /// children, walking up parents that become empty in turn. A parent
+    /// re-enters as a candidate each time a child is deleted, so a block judged
+    /// non-empty early in a round is re-checked; every round deletes.
+    async fn prune(&self, mut candidates: Vec<(i64, ParentLink)>) -> Result<(), Status> {
         while !candidates.is_empty() {
-            let replies = self
-                .run_chunked(
-                    |pipe, range| {
-                        for hash in &candidates[range] {
-                            pipe.cmd("EVAL")
-                                .arg(PRUNE_SCRIPT)
-                                .arg(3)
-                                .arg(self.block_key(*hash))
-                                .arg(self.children_key(*hash))
-                                .arg(self.hits_key())
-                                .arg(*hash)
-                                .arg(self.children_prefix());
-                        }
-                    },
-                    candidates.len(),
-                )
-                .await?;
+            let mut seen = HashSet::new();
+            candidates.retain(|(hash, _)| seen.insert(*hash));
+            let replies = match self.prune_round(&candidates).await {
+                Ok(replies) => replies,
+                // A flushed or restarted Valkey forgets scripts; load and retry once.
+                Err(status) if status.message().contains("NOSCRIPT") => {
+                    self.load_prune_script().await?;
+                    self.prune_round(&candidates).await?
+                }
+                Err(status) => return Err(status),
+            };
             let mut next = Vec::new();
-            for value in replies {
-                let parent: String = convert(value, "prune result")?;
-                if !parent.is_empty() {
-                    next.push(
-                        parent
-                            .parse::<i64>()
-                            .map_err(|_| parse_error("pruned parent", &parent))?,
-                    );
+            for (value, (_, parent)) in replies.into_iter().zip(&candidates) {
+                let token: Option<String> = convert(value, "prune result")?;
+                if let (Some(token), ParentLink::Hash(parent)) = (token, parent) {
+                    next.push((*parent, ParentLink::decode(Some(&token))?));
                 }
             }
-            candidates = dedup_preserve_order(&next);
+            candidates = next;
         }
         Ok(())
+    }
+
+    async fn prune_round(&self, candidates: &[(i64, ParentLink)]) -> Result<Vec<Value>, Status> {
+        let sha = self.prune.get_hash();
+        self.run_chunked(
+            |pipe, range| {
+                for (hash, parent) in &candidates[range] {
+                    let cmd = pipe.cmd("EVALSHA").arg(sha);
+                    match parent {
+                        ParentLink::Hash(parent) => cmd
+                            .arg(5)
+                            .arg(self.block_key(*hash))
+                            .arg(self.children_key(*hash))
+                            .arg(self.hits_key())
+                            .arg(self.children_key(*parent))
+                            .arg(self.block_key(*parent)),
+                        ParentLink::Root | ParentLink::Unknown => cmd
+                            .arg(3)
+                            .arg(self.block_key(*hash))
+                            .arg(self.children_key(*hash))
+                            .arg(self.hits_key()),
+                    };
+                    cmd.arg(*hash);
+                }
+            },
+            candidates.len(),
+        )
+        .await
     }
 
     // ---- queries -------------------------------------------------------------
@@ -1055,7 +1241,9 @@ impl ValkeyKvIndexerBackend {
             .collect();
         for (position, block) in blocks.iter().enumerate() {
             for ((worker, tier), mask) in &block.placements {
-                let index = index_of[worker.as_str()];
+                let Some(&index) = index_of.get(worker.as_str()) else {
+                    continue;
+                };
                 let components =
                     inputs[index].blocks[position].get_or_insert_with(|| BlockComponents {
                         token_count: block.token_count,
@@ -1180,6 +1368,8 @@ mod tests {
             assert_eq!(ParentLink::decode(encoded.as_deref()).unwrap(), link);
         }
         assert_eq!(ParentLink::decode(None).unwrap(), ParentLink::Unknown);
+        // The prune script spells an absent parent link `U`.
+        assert_eq!(ParentLink::decode(Some("U")).unwrap(), ParentLink::Unknown);
         assert!(ParentLink::decode(Some("nope")).is_err());
     }
 
@@ -1205,12 +1395,45 @@ mod tests {
     }
 
     #[test]
+    fn plan_rejects_self_parent_and_in_batch_conflicts() {
+        let report = |parent: Option<i64>, hashes: &[i64]| ExternalKvAction {
+            r#type: ExternalKvActionType::ActionReport as i32,
+            tier: 1,
+            hashes: hashes.to_vec(),
+            component_masks: Vec::new(),
+            block_sizes: Vec::new(),
+            parent_block_hash: parent,
+        };
+        assert_eq!(
+            plan_batch(&[report(Some(5), &[5])]).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            plan_batch(&[report(None, &[1, 2]), report(Some(9), &[2])])
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let plan = plan_batch(&[report(None, &[1, 2]), report(Some(2), &[3])]).unwrap();
+        assert_eq!(plan.order, vec![1, 2, 3]);
+        assert_eq!(plan.parents[&3], ParentLink::Hash(2));
+    }
+
+    #[test]
     fn cluster_mode_requires_hash_tag() {
         let config = ValkeyConfig::new("valkey://127.0.0.1:1")
             .with_cluster(true)
             .with_key_prefix("plain:");
         let error = futures_block(ValkeyKvIndexerBackend::connect(config)).unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn unreachable_server_is_unavailable() {
+        let config = ValkeyConfig::new("valkey://127.0.0.1:1")
+            .with_connect_timeout(Duration::from_millis(200));
+        let error = futures_block(ValkeyKvIndexerBackend::connect(config)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
     }
 
     fn futures_block<F: std::future::Future>(future: F) -> F::Output {
