@@ -306,11 +306,9 @@ fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
-    let input_ids = ids
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PromptSpec::TokenIds(input_ids))
+    Ok(PromptSpec::TokenIds(
+        ids.iter().map(|&id| i64::from(id)).collect(),
+    ))
 }
 
 fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {

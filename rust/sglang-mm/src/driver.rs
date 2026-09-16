@@ -28,7 +28,7 @@ pub struct MmInput {
     /// The tokenized prompt with its placeholders still unexpanded — the
     /// client's own ids or the tokenizer pool's. Tokenization is not this
     /// pipeline's job: the layout step only needs ids.
-    pub input_ids: Vec<i32>,
+    pub input_ids: Vec<i64>,
     pub images: Vec<ImageSource>,
 }
 
@@ -45,7 +45,7 @@ pub struct OutputItem {
 
 /// The per-request result parked for the scheduler drain.
 pub struct Output {
-    pub input_ids: Vec<i32>,
+    pub input_ids: Vec<i64>,
     /// In prompt order; `offsets[i]` is `items[i]`'s inclusive token range.
     pub items: Vec<OutputItem>,
     pub offsets: Vec<(u32, u32)>,

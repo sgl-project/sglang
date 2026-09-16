@@ -76,6 +76,16 @@ impl Drop for ShmSegment {
     }
 }
 
+/// Unique segment names: the pid separates server restarts (a crash can leak
+/// segments under the old pid), the counter separates segments within one.
+/// `tag` says who made it, for anyone listing `/dev/shm`.
+pub fn unique_name(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sgl-{tag}-{}-{n}", std::process::id())
+}
+
 /// Test helper: where Linux exposes the segment as a file.
 #[cfg(test)]
 pub fn shm_path(name: &str) -> std::path::PathBuf {
@@ -87,10 +97,7 @@ mod tests {
     use super::*;
 
     fn test_name() -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("sglshm-test-{}-{n}", std::process::id())
+        unique_name("test")
     }
 
     /// The segment holds exactly the written bytes and dropping it unlinks —

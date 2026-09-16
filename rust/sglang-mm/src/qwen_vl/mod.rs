@@ -26,7 +26,7 @@ pub struct MropeItem {
 /// (unknown fields like `family` are ignored here).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct QwenVlSpec {
-    pub image_token_id: i32,
+    pub image_token_id: i64,
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,
@@ -201,7 +201,7 @@ impl MmFamilyProcessor for QwenVlProcessor {
         })
     }
 
-    fn layout(&self, input_ids: &[i32], items: &[Geometry]) -> Result<TokenLayout, String> {
+    fn layout(&self, input_ids: &[i64], items: &[Geometry]) -> Result<TokenLayout, String> {
         let counts = items
             .iter()
             .map(|Geometry::Grid(grid)| self.tokens_per_image(grid))
@@ -348,10 +348,12 @@ pub fn mrope_image_only(
 /// replace with a generic named-tensor handoff once a second family needs a
 /// different shape.
 pub struct QwenPackedOutput {
-    pub input_ids: Vec<i32>,
-    /// All items' `pixel_values`, concatenated in prompt order; flattened
-    /// `[Σ t·h·w, 3·temporal_patch_size·patch_size²]`.
-    pub features: Vec<f32>,
+    pub input_ids: Vec<i64>,
+    /// Per item `pixel_values` in prompt order, each flattened
+    /// `[t·h·w, 3·temporal_patch_size·patch_size²]` — moved straight out of
+    /// the driver output, never concatenated, so each item can be placed
+    /// (inline or in its own shm segment) without a copy.
+    pub features: Vec<Vec<f32>>,
     /// Per item `[t, h, w]` patch grid.
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -368,14 +370,14 @@ pub fn pack_output(output: crate::driver::Output) -> Result<QwenPackedOutput, St
     let PositionOutput::MRope { positions, delta } = output.positions else {
         return Err("qwen_vl pack: expected M-RoPE positions".into());
     };
-    let mut features = Vec::new();
+    let mut features = Vec::with_capacity(output.items.len());
     let mut grids = Vec::with_capacity(output.items.len());
     let mut hashes = Vec::with_capacity(output.items.len());
     for item in output.items {
         let TensorData::F32(pixel_values) = item.feature.data else {
             return Err("qwen_vl pack: expected f32 feature".into());
         };
-        features.extend(pixel_values);
+        features.push(pixel_values);
         let grid = item
             .aux
             .into_iter()
@@ -414,7 +416,7 @@ mod python {
     /// Full Rust pipeline output at the scheduler boundary:
     /// `(input_ids, features, grids, hashes, offsets, mrope, mrope_delta)`.
     type PyNativeOutput<'py> = (
-        Vec<i32>,
+        Vec<i64>,
         Bound<'py, PyArray1<f32>>,
         Vec<(u32, u32, u32)>,
         Vec<u64>,
@@ -493,7 +495,7 @@ mod python {
     #[pyo3(signature = (input_ids, images, spec_json))]
     fn process_mm<'py>(
         py: Python<'py>,
-        input_ids: Option<Vec<i32>>,
+        input_ids: Option<Vec<i64>>,
         images: Vec<PyImageSource>,
         spec_json: String,
     ) -> PyResult<PyNativeOutput<'py>> {
@@ -516,7 +518,7 @@ mod python {
             .map_err(PyValueError::new_err)?;
         Ok((
             packed.input_ids,
-            packed.features.into_pyarray(py),
+            packed.features.concat().into_pyarray(py),
             packed
                 .grids
                 .into_iter()

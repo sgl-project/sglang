@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
-
+use crate::message::buffers::Buffer;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
@@ -89,9 +88,11 @@ impl Runnable for Intake {
                 Some(Lane::Event(TmEvent::Intake(req) | TmEvent::Tokenized(req))) => {
                     self.drive(req)
                 }
-                Some(Lane::Event(TmEvent::MmEncoded { rid, input_ids })) => {
-                    self.on_mm_encoded(rid, input_ids)
-                }
+                Some(Lane::Event(TmEvent::MmEncoded {
+                    rid,
+                    input_ids,
+                    buffers,
+                })) => self.on_mm_encoded(rid, input_ids, buffers),
                 Some(Lane::Event(TmEvent::MmFailed { rid, message })) => {
                     self.on_mm_failed(rid, message)
                 }
@@ -124,9 +125,6 @@ impl Intake {
         if err.http_status() == 500 {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
         }
-        // A rejected request never reaches the scheduler drain, so purge any
-        // parked MM result (no-op for the common non-mm request).
-        self.mm.results.purge(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(ResponseItem::Error(err)); // client may be gone
         if registered {
@@ -401,25 +399,26 @@ impl Intake {
         // Control requests carry no tensor cell — empty `ids`.
         if !self.to_scheduler_tx.try_push(SchedulerRequest {
             header,
-            ids: Bytes::new(),
+            buffers: Vec::new(),
         }) {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
     }
 
     /// An MM worker finished a parked request: fill in the final expanded
-    /// `input_ids`, advance `Encoding → PreSendValidating`, and resume driving
-    /// (pre-send checks → ring). No pending entry means the request was already
-    /// rejected or aborted, so the result is dropped.
-    fn on_mm_encoded(&mut self, rid: Rid, input_ids: Vec<i32>) {
+    /// `input_ids`, keep its buffers for the ring push, advance `Encoding →
+    /// PreSendValidating`, and resume driving (pre-send checks → ring). No
+    /// pending entry means the request was already rejected or aborted, so the
+    /// result is dropped — and with it any shm segment it parked.
+    fn on_mm_encoded(&mut self, rid: Rid, input_ids: Vec<i64>, buffers: Vec<Buffer>) {
         let Some(mut req) = self.pending_mm.remove(&rid) else {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
-            // It will never reach the scheduler drain, so purge or leak.
-            self.mm.results.purge(rid.as_str());
+            drop(buffers);
             return;
         };
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(input_ids);
+            g.mm_buffers = buffers;
         }
         let _ = req.state.apply(Event::EncodeDone); // Encoding → PreSendValidating
         self.drive(req);
@@ -463,7 +462,7 @@ impl Intake {
             Ok(header) => {
                 if !self.to_scheduler_tx.try_push(SchedulerRequest {
                     header,
-                    ids: Bytes::new(),
+                    buffers: Vec::new(),
                 }) {
                     tracing::error!(
                         rid = %rid,
@@ -480,18 +479,19 @@ impl Intake {
     /// push it onto the to_scheduler channel for the scheduler. On backpressure, fail it.
     fn push_to_ring(&self, mut req: Request) {
         // Only generate requests reach here (control uses `push_control_to_ring`).
-        // Validate + serialize while borrowing `g` immutably; the resulting `Bytes`
-        // own their data, so the borrow ends before any `fail(&mut req)`.
-        let serialized = match &req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => g
-                .encode_header()
-                .map(|header| (header, g.encode_data_buf())),
+        // Validate + serialize the header first (borrowing `g`), then move the
+        // buffers out; the resulting values own their data, so no borrow
+        // outlives a `fail(&mut req)`.
+        let serialized = match &mut req.kind {
+            RequestKind::Generate(g) if g.already_tokenized() => {
+                g.encode_header().map(|header| (header, g.take_buffers()))
+            }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_ring".into(),
             )),
         };
-        let (header, ids) = match serialized {
+        let (header, buffers) = match serialized {
             Ok(v) => v,
             Err(e) => {
                 self.fail(&mut req, e, true); // on the push path: registered
@@ -501,7 +501,7 @@ impl Intake {
 
         if !self
             .to_scheduler_tx
-            .try_push(SchedulerRequest { header, ids })
+            .try_push(SchedulerRequest { header, buffers })
         {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }

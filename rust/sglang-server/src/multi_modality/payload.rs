@@ -11,6 +11,7 @@ use sglang_mm::driver::{ImageSource, MmInput};
 
 use crate::message::multimodal::MmItem;
 use crate::message::request::{MmWorkItem, ProcessorExtensions};
+use crate::message::types::TokenIds;
 
 /// Fully resolved media for a multimodal processor. I/O sources were
 /// prefetched on the async API layer; data URLs and bare base64 are decoded on
@@ -18,7 +19,7 @@ use crate::message::request::{MmWorkItem, ProcessorExtensions};
 pub struct ResolvedMediaWork {
     /// The prompt ids with placeholders unexpanded — always present, the
     /// tokenizer pool having run first for a text prompt.
-    pub input_ids: Vec<i32>,
+    pub input_ids: TokenIds,
     pub images: Vec<Bytes>,
     pub videos: Vec<Bytes>,
     pub audios: Vec<Bytes>,

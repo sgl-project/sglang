@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// A flat token-id buffer — one request's `array("q")` cell on the Python side.
 /// Wrapped in [`OneOrMany`] on the wire, where a bare list is one prompt's ids
 /// (or a broadcast) and a list of lists is per-prompt.
-pub type TokenIds = Vec<i32>;
+pub type TokenIds = Vec<i64>;
 
 /// A field taking a bare `T` **or** `[T,…]` (`text: "hi"` or `text: ["a","b"]`).
 /// `untagged` takes the first variant that matches, so a `T` that itself accepts

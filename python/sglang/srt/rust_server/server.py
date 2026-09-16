@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmEncodedResult, MmSpec, Server
+    from sglang.srt.rust_extensions._server import MmSpec, Server
 
 logger = logging.getLogger(__name__)
 
@@ -189,9 +189,13 @@ class RustServer:
 
         return instance
 
-    def _wrap_mm_result(self, entry: MmEncodedResult) -> MultimodalProcessorOutput:
+    def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
+        """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
+        ShmBuffer}``) into the scheduler's ``MultimodalProcessorOutput``. Model
+        packages with an external processor override this for their own
+        item layout; the buffer names are the contract (see ``wrap_encoded``)."""
         assert self.mm_spec is not None
-        return RustMmProcessor.wrap_encoded(self.mm_spec, entry)
+        return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -204,32 +208,27 @@ class RustServer:
         request objects. The scheduler's request receiver calls this instead of
         polling the zmq socket when `rust_server_mode` is set.
 
-        The transfer is **columnar**: `recv_requests` returns an `IngressBatch`
-        of scalar msgpack `headers` (with `input_ids` omitted) plus one
-        concatenated raw int64 `data` buffer and per-request `lengths`, so the
-        large `input_ids` lists never go through msgpack. Each header is `msgpack_decode`d (yielding
-        the same `TokenizedGenerateReqInput` / control objects the zmq path
-        produces, so the IPC schema is tracked automatically) and its `input_ids`
-        slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
-        never waits: the ring drain is `try_recv` (returns the instant the ring
-        is dry, capped at `max_recv`) and the rest is one memcpy per header
-        plus one for the concatenated ids — same contract as `zmq.NOBLOCK`.
-        Parking for work is :meth:`wait_request`, which does release the GIL.
+        Each request arrives as a scalar msgpack `header` (with `input_ids`
+        and `token_ids_logprob` left nil) plus its named **buffers** — the one
+        data plane every non-scalar payload uses. An inline buffer is a shaped
+        numpy array that owns the Rust vector (nothing was copied to get here);
+        a shm buffer is a `ShmBuffer` naming the segment to map after the TP
+        broadcast. The header is `msgpack_decode`d (yielding the same
+        `TokenizedGenerateReqInput` / control objects the zmq path produces, so
+        the IPC schema is tracked automatically) and each buffer is attached
+        under its name: `input_ids` as the `array("q")` the scheduler expects
+        (the one copy left, forced by that type), `token_ids_logprob` as a
+        list, and the `mm.*` set through :meth:`_wrap_mm_result`.
+        `recv_requests` never waits: the ring drain is `try_recv` (returns the
+        instant the ring is dry, capped at `max_recv`) — same contract as
+        `zmq.NOBLOCK`. Parking for work is :meth:`wait_request`, which does
+        release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        batch = self.server.recv_requests(limit)
-        # Bind once: each attribute access converts the rust vec to a fresh list.
-        headers, data, lengths = batch.headers, batch.data, batch.lengths
-        if not headers:
-            return []
-
-        ids_view = memoryview(data)
         out = []
-        pos = 0  # byte offset into ids_buf
-        for header, n in zip(headers, lengths):
-            nbytes = n * 8
+        for req in self.server.recv_requests(limit):
             try:
-                obj = msgpack_decode_explained(header)
+                obj = msgpack_decode_explained(req.header)
             except MsgpackDecodeError as e:
                 # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
                 logger.warning(
@@ -237,21 +236,20 @@ class RustServer:
                 )
                 if e.rid is not None:
                     self.server.push_error(e.rid, f"invalid request: {e.reason}")
-                pos += nbytes
                 continue
-            if n:  # generate request: attach its int64 ids slice as array("q")
-                ids = array("q")
-                ids.frombytes(ids_view[pos : pos + nbytes])
-                obj.input_ids = ids
-                pos += nbytes
-            if self._multimodal_enabled and isinstance(obj, TokenizedGenerateReqInput):
-                # The buffers were parked in the Rust result store before the
-                # ring push; wrapping them into tensors is the only Python step
-                # of the Rust path. `None` for a text-only request on a
-                # multimodal model.
-                mm_result = self.server.take_mm_result(obj.rid)
-                if mm_result is not None:
-                    obj.mm_inputs = self._wrap_mm_result(mm_result)
+            buffers = dict(req.buffers)
+            ids = buffers.get("input_ids")
+            if ids is not None:  # generate request
+                obj.input_ids = array("q")
+                obj.input_ids.frombytes(memoryview(ids).cast("B"))
+            token_ids_logprob = buffers.get("token_ids_logprob")
+            if token_ids_logprob is not None:
+                obj.token_ids_logprob = token_ids_logprob.tolist()
+            if self._multimodal_enabled and "mm.meta" in buffers:
+                # Wrapping the worker's buffers into tensors is the only Python
+                # step of the Rust path; a text-only request on a multimodal
+                # model carries no `mm.*` buffers.
+                obj.mm_inputs = self._wrap_mm_result(buffers)
             out.append(obj)
         return out
 

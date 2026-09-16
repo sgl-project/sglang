@@ -1,11 +1,13 @@
 //! Tests for scheduler intake.
 
 use super::*;
+use crate::message::buffers::{Buffer, BufferData, find};
 use crate::message::request::GenerateRequest;
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
+use crate::utils::shm::{shm_path, unique_name};
 use tokio::sync::mpsc;
 
 /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —
@@ -84,13 +86,16 @@ fn make_intake_inner(
     (intake, detok_rx, consumer, tm_tx, mm_rx)
 }
 
-/// An [`MmDispatch`] over `tx` with a fresh result store.
+/// An [`MmDispatch`] over `tx`.
 fn test_mm(tx: flume::Sender<MmRequest>, enabled: bool) -> MmDispatch {
-    MmDispatch {
-        enabled,
-        tx,
-        results: Default::default(),
-    }
+    MmDispatch { enabled, tx }
+}
+
+/// Token count of a pushed request's `input_ids` buffer.
+fn ids_len(req: &SchedulerRequest) -> usize {
+    find(&req.buffers, "input_ids")
+        .expect("input_ids buffer")
+        .shape[0]
 }
 
 /// Both abort sources do the same two things: drop the detok entry so no
@@ -134,7 +139,7 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
             "{source:?} must drop the detok entry",
         );
         assert_eq!(
-            consumer.drain(8).headers.len(),
+            consumer.drain(8).len(),
             1,
             "{source:?} must push an AbortReq so the scheduler stops",
         );
@@ -397,7 +402,7 @@ fn over_context_request_deregisters_and_never_reaches_the_ring() {
         "must deregister on reject",
     );
     assert!(
-        consumer.drain(16).headers.is_empty(),
+        consumer.drain(16).is_empty(),
         "must not reach the scheduler"
     );
 }
@@ -433,7 +438,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_ring() {
         "the decode job follows, ids intact",
     );
     assert!(
-        consumer.drain(16).headers.is_empty(),
+        consumer.drain(16).is_empty(),
         "must never reach the scheduler"
     );
     assert!(
@@ -464,7 +469,7 @@ fn detokenize_negative_ids_reject_before_registration() {
     assert_eq!(err.http_status(), 400);
     assert!(err.to_string().contains("out of range"), "{err}");
     assert!(detok_rx.try_recv().is_err(), "shard never hears of it");
-    assert!(consumer.drain(16).headers.is_empty());
+    assert!(consumer.drain(16).is_empty());
 }
 
 /// A dropped ring push is survivable, and this pins WHY. The ring is bounded,
@@ -841,30 +846,28 @@ fn abort_cancels_parked_mm_request() {
     intake.drive(mm_pretokenized_req("mm-gone"));
     mm_rx.try_recv().expect("parked to mm pool");
 
-    // The worker parks its result, as it always does before MmEncoded.
-    intake.mm.results.park(
-        "mm-gone".into(),
-        crate::multi_modality::result_store::MmEncodedEntry::Qwen(
-            crate::multi_modality::result_store::QwenMmEncodedEntry {
-                features: crate::multi_modality::result_store::FeatureStore::Inline(vec![]),
-                grids: vec![],
-                hashes: vec![],
-                offsets: vec![],
-                mrope: vec![],
-                mrope_delta: 0,
-            },
-        ),
-    );
+    // The worker's late result carries a shm segment, as it would under TP;
+    // nobody is left to take it, so dropping the result must unlink it.
+    let segment = unique_name("test");
+    let buffers = vec![
+        Buffer::shm(
+            "mm.feature.0",
+            segment.clone(),
+            vec![1],
+            &BufferData::F32(vec![1.0]),
+        )
+        .unwrap(),
+    ];
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
-    assert_eq!(consumer.drain(16).headers.len(), 1, "only the AbortReq");
+    assert_eq!(consumer.drain(16).len(), 1, "only the AbortReq");
 
-    // The late result must be dropped, not queued, and the parked result purged.
-    intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6]);
+    // The late result must be dropped, not queued, and its segment released.
+    intake.on_mm_encoded("mm-gone".to_string().into(), vec![5, 6], buffers);
+    assert!(consumer.drain(16).is_empty(), "cancelled, not queued");
     assert!(
-        consumer.drain(16).headers.is_empty(),
-        "cancelled, not queued"
+        !shm_path(&segment).exists(),
+        "late result's segment unlinked"
     );
-    assert!(intake.mm.results.take("mm-gone").is_none(), "entry purged");
 }
 
 /// A pre-tokenized multimodal request parks in `Encoding` (submitted to the
@@ -887,16 +890,16 @@ fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
         sub.work.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
-    assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
+    assert!(consumer.drain(16).is_empty(), "parked, not queued");
 
     // The worker returns the final expanded ids → pushed to the ring.
-    intake.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8]);
+    intake.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8], Vec::new());
     let batch = consumer.drain(16);
-    assert_eq!(batch.headers.len(), 1);
+    assert_eq!(batch.len(), 1);
     assert_eq!(
-        batch.lengths,
-        vec![4],
-        "expanded ids ride the columnar cell"
+        ids_len(&batch[0]),
+        4,
+        "expanded ids ride the input_ids buffer"
     );
 }
 
@@ -926,7 +929,7 @@ fn mm_text_prompt_tokenizes_then_encodes() {
         mm_rx.try_recv().is_err(),
         "nothing submitted to the mm pool yet"
     );
-    assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
 
     // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
     if let RequestKind::Generate(g) = &mut req.kind {
@@ -945,15 +948,19 @@ fn mm_text_prompt_tokenizes_then_encodes() {
         vec![7, 1, 8],
         "the pool's ids, unexpanded"
     );
-    assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
+    assert!(consumer.drain(16).is_empty(), "parked, not queued");
 
-    intake.on_mm_encoded("mm-t".to_string().into(), vec![7, 1, 1, 1, 1, 8]);
+    intake.on_mm_encoded(
+        "mm-t".to_string().into(),
+        vec![7, 1, 1, 1, 1, 8],
+        Vec::new(),
+    );
     let batch = consumer.drain(16);
-    assert_eq!(batch.headers.len(), 1);
+    assert_eq!(batch.len(), 1);
     assert_eq!(
-        batch.lengths,
-        vec![6],
-        "expanded ids ride the columnar cell"
+        ids_len(&batch[0]),
+        6,
+        "expanded ids ride the input_ids buffer"
     );
 }
 
@@ -973,7 +980,7 @@ fn mm_failure_rejects_parked_request() {
                 if rid.as_str() == "mm-2"),
         "mm failure must deregister",
     );
-    assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
 }
 
 /// On a non-multimodal model (`MmDispatch::enabled == false`), image_data is silently
@@ -1007,7 +1014,7 @@ fn mm_fields_ignored_when_disabled() {
 #[test]
 fn late_mm_result_is_dropped() {
     let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
-    intake.on_mm_encoded("ghost".to_string().into(), vec![1]);
+    intake.on_mm_encoded("ghost".to_string().into(), vec![1], Vec::new());
     intake.on_mm_failed("ghost".to_string().into(), "boom".into());
-    assert!(consumer.drain(16).headers.is_empty());
+    assert!(consumer.drain(16).is_empty());
 }

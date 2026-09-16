@@ -461,7 +461,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i32,
+        image_token_id: i64,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,

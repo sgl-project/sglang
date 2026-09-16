@@ -8,6 +8,7 @@ use bytes::Bytes;
 use itertools::izip;
 use serde::{Deserialize, de::DeserializeOwned};
 
+use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::multimodal::{self, MmDataInput, MmItem};
 use super::response::ResponseSink;
@@ -467,6 +468,7 @@ impl GenerateBody {
                 routed_dp_rank,
                 disagg_prefill_dp_rank,
                 mm: pack_mm(image_data, video_data, audio_data, processor_extensions),
+                mm_buffers: Vec::new(),
             },
         )
         .collect();
@@ -566,7 +568,7 @@ pub struct MmWorkItem {
     /// The prompt ids with placeholders unexpanded. Always present by the
     /// time a request reaches `Encoding`: the client's own, or the tokenizer
     /// pool's (`Tokenizing { then: Encode }` runs first for a text prompt).
-    pub input_ids: Vec<i32>,
+    pub input_ids: TokenIds,
     pub image_data: Vec<MmItem>,
     pub video_data: Vec<MmItem>,
     pub audio_data: Vec<MmItem>,
@@ -591,12 +593,14 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
-/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
-/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+/// One to_scheduler channel entry: the scalar `header` (msgpack; `input_ids`
+/// and `token_ids_logprob` left nil) plus every non-scalar payload as a named
+/// [`Buffer`], so nothing big goes through msgpack and nothing is copied on
+/// the way to the drain. Empty for control requests.
 #[derive(Debug)]
 pub struct SchedulerRequest {
     pub header: Bytes,
-    pub ids: Bytes,
+    pub buffers: Vec<Buffer>,
 }
 
 /// Request variant — selects the request branch, scheduler wire message, and
@@ -665,6 +669,7 @@ pub struct GenerateRequest {
     pub top_logprobs_num: i64,
     /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
     /// collapsed to `None` when empty (the scheduler branches on `is not None`).
+    /// Rides the ring as the `token_ids_logprob` buffer, nil in the header.
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
     pub return_hidden_states: bool,
@@ -691,6 +696,10 @@ pub struct GenerateRequest {
     /// scheduler header. Boxed so the common text-only request doesn't grow
     /// every `Request` moved between stages.
     pub mm: Option<Box<MmData>>,
+    /// What the MM worker produced (`MmEncoded`): the feature tensors and their
+    /// per-item metadata, already placed inline or in shm. Pushed to the ring
+    /// with the request by [`take_buffers`](Self::take_buffers).
+    pub mm_buffers: Vec<Buffer>,
 }
 
 /// The multimodal fields of one request (see [`GenerateRequest::mm`]), each
@@ -756,16 +765,22 @@ impl GenerateRequest {
         TokenizedGenerateReqInput::from(self).encode()
     }
 
-    /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the to-scheduler channel outside
-    /// msgpack). Empty when not tokenized.
-    pub fn encode_data_buf(&self) -> Bytes {
-        let ids = self.input_ids.as_deref().unwrap_or(&[]);
-        let mut buf = Vec::with_capacity(ids.len() * 8);
-        for &id in ids {
-            buf.extend_from_slice(&(id as i64).to_le_bytes());
+    /// Every non-scalar payload as a named buffer, in the shape the Python
+    /// drain attaches: `input_ids` (already the scheduler's int64),
+    /// `token_ids_logprob` when present, then whatever the MM worker left in
+    /// `mm_buffers`. Pure moves — no id is read here, and the header, the last
+    /// thing built from this request, never carries them.
+    pub fn take_buffers(&mut self) -> Vec<Buffer> {
+        let mut buffers = Vec::with_capacity(2 + self.mm_buffers.len());
+        buffers.push(Buffer::inline(
+            "input_ids",
+            self.input_ids.take().unwrap_or_default(),
+        ));
+        if let Some(ids) = self.token_ids_logprob.take() {
+            buffers.push(Buffer::inline("token_ids_logprob", ids));
         }
-        Bytes::from(buf)
+        buffers.append(&mut self.mm_buffers);
+        buffers
     }
 }
 
@@ -793,7 +808,7 @@ impl HeapBytes for String {
 }
 impl HeapBytes for TokenIds {
     fn heap_bytes(&self) -> usize {
-        self.len() * std::mem::size_of::<i32>()
+        self.len() * std::mem::size_of::<i64>()
     }
 }
 impl<T: HeapBytes> HeapBytes for Option<T> {

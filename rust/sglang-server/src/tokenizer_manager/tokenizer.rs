@@ -28,7 +28,7 @@ pub trait TextTokenizer: Send + Sync {
     /// The special tokens this tokenizer auto-prepends on every `encode` —
     /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
     /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
-    fn auto_specials(&self) -> Vec<i32> {
+    fn auto_specials(&self) -> Vec<i64> {
         Vec::new()
     }
 }
@@ -127,16 +127,27 @@ impl TextTokenizer for DynamoTokenizer {
             .inner
             .encode(text)
             .map_err(|e| Error::Tokenize(e.to_string()))?;
-        // Vocab ids are non-negative and fit in i32.
-        Ok(encoding.token_ids().iter().map(|&id| id as i32).collect())
+        // Widened once here, in the parallel pool: the scheduler's `array("q")`
+        // is int64, and the ids move into their ring buffer untouched from here.
+        Ok(encoding
+            .token_ids()
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect())
     }
 
     /// The post-processor prepends exactly what `encode("")` returns, so the
     /// probe is the same prefix [`strip_auto_specials`] removes.
-    fn auto_specials(&self) -> Vec<i32> {
+    fn auto_specials(&self) -> Vec<i64> {
         self.inner
             .encode("")
-            .map(|encoding| encoding.token_ids().iter().map(|&id| id as i32).collect())
+            .map(|encoding| {
+                encoding
+                    .token_ids()
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -145,7 +156,7 @@ impl TextTokenizer for DynamoTokenizer {
 /// `add_special_tokens=false` encode would have produced, without a second
 /// tokenizer instance (the post-processor always prepends the same prefix, so
 /// a template-rendered copy of those tokens is preserved).
-fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
+fn strip_auto_specials(mut ids: Vec<i64>, auto_specials: &[i64]) -> Vec<i64> {
     if ids.starts_with(auto_specials) {
         ids.drain(..auto_specials.len());
     }
@@ -163,7 +174,7 @@ pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
     tokenizer: Arc<dyn TextTokenizer>,
-    auto_specials: Vec<i32>,
+    auto_specials: Vec<i64>,
 }
 
 impl TokenizerWorker {
@@ -242,7 +253,7 @@ mod tests {
     struct WordTokenizer;
     impl TextTokenizer for WordTokenizer {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(text.split_whitespace().map(|_| 1i32).collect())
+            Ok(text.split_whitespace().map(|_| 1i64).collect())
         }
     }
 
@@ -312,9 +323,9 @@ mod tests {
     struct MarkedTokenizer;
     impl TextTokenizer for MarkedTokenizer {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(vec![0, text.len() as i32])
+            Ok(vec![0, text.len() as i64])
         }
-        fn auto_specials(&self) -> Vec<i32> {
+        fn auto_specials(&self) -> Vec<i64> {
             vec![0]
         }
     }
