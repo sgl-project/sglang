@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import List, Optional, Tuple
 
 import torch
@@ -1479,6 +1479,124 @@ class ZayaModel(nn.Module):
         return hidden_states
 
 
+# --------------- native (transformers >= v5.13) checkpoint keys ---------------
+#
+# Native checkpoints fold each attention + MoE pair into one hybrid layer
+# ``model.layers.k`` and fuse expert weights into 3D tensors, while the module
+# tree above mirrors the legacy layout: 2L interleaved internal layers (even =
+# attention, odd = MoE) with per-expert tensors. Native layer ``k`` maps onto
+# internal layers ``(2k, 2k + 1)``.
+#
+# Residual-scaling blocks associate exit-style in native checkpoints
+# (``post_attention_*`` / ``post_mlp_*`` on the layer they follow) but
+# entry-style internally (``res_scale`` on the layer they precede), which
+# shifts every block one position later: the model-input scale lands on
+# internal layer 0, layer ``k``'s post-attention scale on internal layer
+# ``2k + 1``, layer ``k``'s post-MLP scale on internal layer ``2k + 2``, and
+# the last layer's post-MLP scale on the model-level ``res_scale``.
+
+_NATIVE_TOP_LEVEL_KEYS = {
+    "model.embed_tokens.weight": "model.embed_tokens.weight",
+    "model.norm.weight": "model.final_norm.weight",
+    "model.input_hidden_states_scale": "model.layers.0.res_scale.hidden_states_scale",
+    "model.input_hidden_states_bias": "model.layers.0.res_scale.hidden_states_bias",
+}
+
+# Attention-side suffixes: native layer k -> internal layer 2k.
+_NATIVE_ATTN_SUFFIXES = {
+    "input_layernorm.weight": "input_norm.weight",
+    "self_attn.qkv_proj.q_proj.weight": "self_attn.qkv.linear_q.weight",
+    "self_attn.qkv_proj.k_proj.weight": "self_attn.qkv.linear_k.weight",
+    "self_attn.qkv_proj.v_proj_current.weight": "self_attn.qkv.val_proj1.weight",
+    "self_attn.qkv_proj.v_proj_delayed.weight": "self_attn.qkv.val_proj2.weight",
+    "self_attn.qkv_proj.conv_qk_depthwise.weight": "self_attn.qkv.conv_qk.0.weight",
+    "self_attn.qkv_proj.conv_qk_depthwise.bias": "self_attn.qkv.conv_qk.0.bias",
+    "self_attn.qkv_proj.conv_qk_grouped.weight": "self_attn.qkv.conv_qk.1.weight",
+    "self_attn.qkv_proj.conv_qk_grouped.bias": "self_attn.qkv.conv_qk.1.bias",
+    "self_attn.qk_norm.temp": "self_attn.qkv.temp",
+    "self_attn.o_proj.weight": "self_attn.o_proj.weight",
+}
+
+# MoE-side suffixes: native layer k -> internal layer 2k + 1. The fused
+# ``mlp.experts.{gate_up_proj,down_proj}`` tensors are handled separately in
+# ``_native_weights_to_legacy`` because they expand into per-expert entries.
+_NATIVE_MOE_SUFFIXES = {
+    "post_attention_layernorm.weight": "input_norm.weight",
+    "mlp.gate.down_proj.weight": "zaya_block.router.down_proj.weight",
+    "mlp.gate.down_proj.bias": "zaya_block.router.down_proj.bias",
+    "mlp.gate.router_states_scale": "zaya_block.router.router_states_scale",
+    "mlp.gate.router_mlp.norm.weight": "zaya_block.router.rmsnorm_eda.weight",
+    "mlp.gate.router_mlp.fc1.weight": "zaya_block.router.router_mlp.0.weight",
+    "mlp.gate.router_mlp.fc1.bias": "zaya_block.router.router_mlp.0.bias",
+    "mlp.gate.router_mlp.fc2.weight": "zaya_block.router.router_mlp.2.weight",
+    "mlp.gate.router_mlp.fc2.bias": "zaya_block.router.router_mlp.2.bias",
+    "mlp.gate.router_mlp.out_proj.weight": "zaya_block.router.router_mlp.4.weight",
+    "mlp.gate.balancing_biases": "zaya_block.router.balancing_biases",
+}
+
+_NATIVE_LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
+_NATIVE_FUSED_EXPERT_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$"
+)
+
+
+def _native_to_legacy_key(name: str, num_native_layers: int) -> str:
+    """Translate one native checkpoint key to its internal (legacy-shaped)
+    parameter name. Keys that match no known native pattern are returned
+    unchanged so the caller's regular unknown-key handling applies."""
+    if name in _NATIVE_TOP_LEVEL_KEYS:
+        return _NATIVE_TOP_LEVEL_KEYS[name]
+    match = _NATIVE_LAYER_RE.match(name)
+    if match is None:
+        return name
+    k = int(match.group(1))
+    suffix = match.group(2)
+    if suffix in _NATIVE_ATTN_SUFFIXES:
+        return f"model.layers.{2 * k}.{_NATIVE_ATTN_SUFFIXES[suffix]}"
+    if suffix in _NATIVE_MOE_SUFFIXES:
+        return f"model.layers.{2 * k + 1}.{_NATIVE_MOE_SUFFIXES[suffix]}"
+    for native_block, internal_layer in (
+        ("post_attention_residual_scale", 2 * k + 1),
+        ("post_mlp_residual_scale", 2 * k + 2),
+    ):
+        prefix = f"{native_block}."
+        if suffix.startswith(prefix):
+            field = suffix[len(prefix) :]
+            if internal_layer == 2 * num_native_layers:
+                # The last layer's post-MLP scale precedes the final norm and
+                # lives on the model itself.
+                return f"model.res_scale.{field}"
+            return f"model.layers.{internal_layer}.res_scale.{field}"
+    return name
+
+
+def _native_weights_to_legacy(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    num_native_layers: int,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Rewrite a native checkpoint stream into the legacy key space consumed
+    by ``ZayaForCausalLM.load_weights``.
+
+    Fused expert tensors are expanded per expert: ``gate_up_proj`` has shape
+    ``[num_experts, 2 * I, hidden]`` with the gate rows first, matching the
+    legacy ``linear_fc1`` half-split order, and ``down_proj`` has shape
+    ``[num_experts, hidden, I]``, matching ``linear_fc2``.
+    """
+    for name, tensor in weights:
+        match = _NATIVE_FUSED_EXPERT_RE.match(name)
+        if match is not None:
+            k = int(match.group(1))
+            kind = "linear_fc1" if match.group(2) == "gate_up_proj" else "linear_fc2"
+            prefix = f"model.layers.{2 * k + 1}.zaya_block.experts"
+            for expert_id in range(tensor.shape[0]):
+                yield (
+                    f"{prefix}.local_experts.{expert_id}.{kind}.weight",
+                    tensor[expert_id],
+                )
+            continue
+        yield _native_to_legacy_key(name, num_native_layers), tensor
+
+
 class ZayaForCausalLM(nn.Module):
     def __init__(
         self,
@@ -1490,6 +1608,17 @@ class ZayaForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+
+        if config.zaya_layer_types is not None:
+            unsupported = sorted({t for t in config.zaya_layer_types if t != "hybrid"})
+            if unsupported:
+                # ZAYA1-74B-preview mixes "hybrid_sliding" layers in; serving
+                # them without the sliding window would be silently wrong.
+                raise NotImplementedError(
+                    f"ZAYA1 native layer_types {unsupported} are not supported "
+                    'yet; only all-"hybrid" native checkpoints (e.g. '
+                    "Zyphra/ZAYA1-8B) can be served."
+                )
 
         self.model = ZayaModel(
             config=config,
@@ -1554,7 +1683,17 @@ class ZayaForCausalLM(nn.Module):
            and up projections concatenated along dim 0) is split and routed
            to FusedMoE shards ``w1`` (first half) and ``w3`` (second half);
            ``linear_fc2.weight`` becomes the FusedMoE ``w2`` shard.
+
+        Native-format checkpoints (``config.checkpoint_format == "native"``)
+        are first rewritten into this legacy key space by
+        ``_native_weights_to_legacy``; see the mapping tables above.
         """
+        if self.config.checkpoint_format == "native":
+            weights = _native_weights_to_legacy(
+                weights,
+                num_native_layers=self.config.num_hidden_layers // 2,
+            )
+
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         # ``balancing_biases`` is a persistent buffer; FusedMoE may also expose
