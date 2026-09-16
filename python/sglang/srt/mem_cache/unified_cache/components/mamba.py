@@ -688,10 +688,6 @@ class MambaComponent(TreeComponent):
             req.kv.mamba_pool_idx = None
 
     # ---- Buffer-mode load-back handoff ----
-    #
-    # Buffer mode publishes a fetched span with a plain insert at prefill
-    # admission, so the state reaches the consuming request through its own
-    # H2D rather than through the match path's deferred copy.
 
     def ensure_request_state_slot(self, req: Req) -> bool:
         """Give the request a device Mamba slot to receive the staged state.

@@ -408,9 +408,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # FULL, SWA and MAMBA are the component set the staging pipeline
-            # knows how to move; anything else (e.g. the DSv4 compressed
-            # regions) has no per-pool staging path.
+            # Anything outside this set (e.g. the DSv4 compressed regions)
+            # has no per-pool staging path.
             supported = {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(

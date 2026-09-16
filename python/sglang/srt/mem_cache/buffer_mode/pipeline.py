@@ -134,13 +134,9 @@ class _OngoingBufferLoadBack(msgspec.Struct):
 
 
 class _MambaHandoff(msgspec.Struct):
-    """The two destinations one staged recurrent state has to reach.
-
-    Both copies read the same host bounce: ``node_copy`` carries the tree
-    node's slot (cc.load allocates it, and it becomes the published node's
-    value), ``request_copy`` carries the consuming request's own slot.
-    ``slot_allocated`` records that this load-back is the owner of that
-    request slot, so a called-off load-back returns it.
+    """The two device destinations one staged recurrent state has to reach,
+    both reading the same host bounce. ``slot_allocated`` records that this
+    load-back owns the request slot, so a called-off load-back returns it.
     """
 
     node_copy: PoolTransfer
@@ -230,26 +226,18 @@ def validate_buffer_only_stack(
             )
     mamba = mamba_component
     if mamba is not None:
-        if mamba._mamba_pool_host is None:
+        host = mamba._mamba_pool_host
+        # Below two slots _backup_oversize rejects every checkpoint-carrying
+        # intent, so the whole node -- KV included -- silently never reaches
+        # storage.
+        if host is None or host.size < 2:
             raise ValueError(
                 "--hicache-host-memory-mode buffer_only on Mamba models "
-                "requires a Mamba host staging pool: the recurrent state "
-                "can neither stage for writes nor fetch for load-backs "
-                "without one."
-            )
-        if mamba._mamba_pool_host.size < 2:
-            # Same two-slot argument as the SWA window above: one slot
-            # stages a write while one stays in the loads-priority reserve.
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only requires a Mamba "
-                f"host pool of at least two state slots (got "
-                f"{mamba._mamba_pool_host.size}): one staging a write "
-                "while one stays reserved for prefetch state allocs."
+                "requires a Mamba host staging pool of at least two state "
+                f"slots (got {0 if host is None else host.size}): one "
+                "staging a write while one stays in the loads reserve."
             )
         if mamba.int8_ckpt_pool is not None:
-            # The tree's Mamba value would be an int8 checkpoint slot, but a
-            # load-back restores into a raw Mamba pool slot; the two pools
-            # are not interchangeable.
             raise ValueError(
                 "--hicache-host-memory-mode buffer_only does not support "
                 "int8 Mamba checkpoints: the load-back restores into a raw "
@@ -991,8 +979,7 @@ class BufferModePipeline:
             for t in f.aux_xfers
             if t.name == PoolName.SWA and t.host_indices is not None
         )
-        # The recurrent state consumption binds to the request's own device
-        # slot; charge it here so the adder's Mamba gate reserves that slot.
+        # Charged so the adder's Mamba gate reserves the slot consumption binds.
         mamba_slots = sum(
             len(t.host_indices)
             for t in f.aux_xfers
@@ -1269,17 +1256,14 @@ class BufferModePipeline:
         if mamba is not None:
             handoff = self._prepare_mamba_handoff(f, req)
             if handoff is None:
-                # No state to publish the tail node with: the hold can never
-                # splice, so drop it outright and let the request recompute.
                 self.release_staged_hold(request, reason="no_mamba_state")
                 req.staged_prefetch_plan = None
                 req.host_hit_length = 0
                 req.swa_host_hit_length = 0
                 req.mamba_host_hit_length = 0
                 return unchanged
-            # The request's own copy rides the same layer-gated H2D; it is not
-            # staging (its host slots are the node copy's) so it stays out of
-            # the aux_xfers the ack frees.
+            # Not staging (its host slots are the node copy's), so it stays
+            # out of the aux_xfers the ack frees.
             load_xfers.append(handoff.request_copy)
         device_indices = cc.load(
             host_indices=f.host_indices[trim_tokens:],
