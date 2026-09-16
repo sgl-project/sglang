@@ -141,6 +141,14 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Logical-page KV sharding: rotation base of the chain this node's Full
+        # KV pages belong to — the owner rank of position-page P along the chain
+        # is (rotation_base + P) % shard_size. A host-side mirror of the
+        # loc-derived owners (the Full value is a device tensor; reading it
+        # would put a D2H sync on the alloc path): set at insert from the
+        # inserting request's host base, copied on split, read through
+        # req.last_node at alloc time. None when sharding is off.
+        self.rotation_base: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -230,6 +238,12 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node(node)
+
+    def insert_after(self, prev_node: UnifiedTreeNode, node: UnifiedTreeNode):
+        assert prev_node.id in self.cache
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(prev_node, node)
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -401,6 +415,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
         self.write_through_threshold = 256
@@ -514,6 +529,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         return self.node_by_id(node_id) is self.root_node
+
+    supports_rotation_base = True
+
+    def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+        """Logical-page KV sharding: the node's chain rotation base, or None
+        when sharding is off (and on the root, which starts no chain)."""
+        return self.node_by_id(node_id).rotation_base
 
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -687,6 +709,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
+    def inc_full_pin(self, node_id: NodeId) -> None:
+        """Pin only the FULL device slots on the node's root path; the SWA segment
+        lock is left alone since its receipt does not survive a window re-attach."""
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].acquire_component_lock(
+            node=node, result=IncLockRefResult()
+        )
+        self._update_evictable_leaf_sets(node)
+
+    def dec_full_pin(self, node_id: NodeId) -> None:
+        node = self.node_by_id(node_id)
+        self.components_by_type[BASE_COMPONENT_TYPE].release_component_lock(
+            node=node, params=None
+        )
+        self._update_evictable_leaf_sets(node)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -850,6 +888,32 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
+    def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
+        """Read-only FULL-device match, independent of auxiliary components; the
+        third result counts the whole deepest node (a partial match pins it all)."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched_len = 0
+        pinned_len = 0
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            value = child.component_data[BASE_COMPONENT_TYPE].value
+            if value is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
+            matched_len += prefix_len
+            node = child
+            pinned_len += len(child.key)
+            if prefix_len < len(child.key):
+                break
+            key = key[prefix_len:]
+        return matched_len, node.id, pinned_len
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -999,6 +1063,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
             )
 
+        if params.rotation_base is not None:
+            conflict = self._rotation_conflict(key, params.rotation_base)
+            if conflict is not None:
+                total_prefix_length, node = conflict
+                return InsertStepResult(
+                    actions=[],
+                    result=InsertResult(
+                        prefix_len=total_prefix_length,
+                        last_device_node=node.id,
+                        rotation_tail_declined=True,
+                        adopted_ranges={} if params.track_adopted_ranges else None,
+                    ),
+                )
+
         self._ongoing_insert_walk_state = _InsertWalkState(
             phase=_InsertPhase.WALK,
             node=self.root_node,
@@ -1012,6 +1090,52 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
         )
         return self._advance_insert()
+
+    def _rotation_conflict(
+        self, key: RadixKey, rotation_base: int
+    ) -> Optional[tuple[int, UnifiedTreeNode]]:
+        """Logical-page KV sharding: refuse an insert that would splice two
+        rotation runs into one cached path.
+
+        Read-only mirror of ``_insert_walk_step``'s matching. Returns
+        ``(matched_len, deepest_matched_node)`` when the chain this key lands on
+        was allocated under a different rotation base than the inserting
+        request's pages, else None.
+
+        Grafting across a base discontinuity would create a cached path whose
+        page owners are not one cyclic run — the padded-allgather / ``k // N``
+        translation contract — so later readers would crash on a negative pad or
+        silently read the wrong rank's scratch rows. Such a discontinuity means
+        two requests sharing a prefix were planned in pipelined batches before
+        either's insert landed, or the match was capped below the cached prefix.
+
+        Unlike the flat radix tree, the unified insert transfers page ownership
+        at three points, not just the tail graft: the tail leaf
+        (``_add_new_node``), an evicted node restored from the request's fresh
+        pages (``_unevict_node_on_insert``), and a component re-pointing a
+        matched node's Full value at the request's pages
+        (``update_component_on_insert_overlap``). All three are downstream of
+        this same predicate, so it is evaluated once, up front, and declines the
+        whole insert — which also keeps the walk's duplicate frees from running,
+        as the declined request stays on its own pages.
+        """
+        node = self.root_node
+        total_prefix_length = 0
+        while len(key) > 0:
+            child_key = key.child_key(self.page_size)
+            if child_key not in node.children:
+                break
+            child = node.children[child_key]
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            node = child
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            if prefix_len < len(child.key):
+                # The walk would split here; the fragment inherits this base.
+                break
+        if node is self.root_node or node.rotation_base == rotation_base:
+            return None
+        return total_prefix_length, node
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
@@ -1079,7 +1203,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node.priority = max(node.priority, state.priority)
 
         if node.evicted:
-            self._unevict_node_on_insert(node, state.value[:prefix_len])
+            self._unevict_node_on_insert(
+                node,
+                state.value[:prefix_len],
+                session_id=state.params.session_id,
+            )
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
                 state.total_prefix_length,
@@ -1149,7 +1277,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 state.total_prefix_length + len(state.key),
             )
             state.target_node = self._add_new_node(
-                state.node, state.key, state.value, priority=state.priority
+                state.node,
+                state.key,
+                state.value,
+                priority=state.priority,
+                session_id=state.params.session_id,
+                rotation_base=state.params.rotation_base,
             )
             state.is_new_leaf = True
         else:
@@ -1224,8 +1357,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.creation_time = child.creation_time
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
-
-        self._for_each_component_lru(child, UnifiedLRUList.remove_node)
+        # The rotation base is constant along a chain (position-page P keeps
+        # owner (b + P) % N on both sides of the split).
+        new_node.rotation_base = child.rotation_base
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1252,11 +1386,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 new_child_node_id=child.id,
             )
 
+        # Splitting does not access the suffix; retain its recency and place
+        # the inherited prefix beside it, in the same session partition.
         self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
+            new_node,
+            lambda lru, node: lru.insert_after(child, node),
+            skip_existing=True,
         )
         child.last_access_time = get_and_increase_time_counter()
 
@@ -1272,10 +1407,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         value: torch.Tensor,
         priority: int = 0,
+        session_id: Optional[str] = None,
+        rotation_base: Optional[int] = None,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
+        # Chain-constant under sharding: the pre-flight decline in
+        # begin_insert() guarantees this tail continues the matched prefix's
+        # rotation, so stamping the inserting request's base keeps every node
+        # on a root path carrying the same base.
+        new_node.rotation_base = rotation_base
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1284,11 +1426,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
-        self.kv_events.record_store(new_node)
+        self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
 
     def _unevict_node_on_insert(
-        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+        self,
+        node: UnifiedTreeNode,
+        fresh_value: torch.Tensor,
+        session_id: Optional[str] = None,
     ) -> None:
         """Restore an evicted node's Full device value from fresh KV indices
         during insert."""
@@ -1306,7 +1451,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
-        self.kv_events.record_store(node, medium=StorageMedium.GPU)
+        self.kv_events.record_store(
+            node,
+            medium=StorageMedium.GPU,
+            session_id=session_id,
+        )
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
@@ -1952,6 +2101,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
 
+    def set_host_memory_buffer_only(self) -> None:
+        self.is_host_memory_buffer_only = True
+
     def insert_host(
         self,
         node_id: NodeId,
@@ -2019,6 +2171,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
+        self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
         return result
 
     def build_backup_spec(self, node_id: NodeId):
@@ -2080,6 +2233,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Route a build_hicache_transfers call to the component for the given type."""
@@ -2089,6 +2243,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             host_indices=host_indices,
             token_ids=token_ids,
             prefetch_tokens=prefetch_tokens,
+            staging_tokens=staging_tokens,
             last_hash=last_hash,
         )
 
@@ -2363,6 +2518,106 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # The backed-up copy becomes a tracked duplicate only now.
                 self._update_duplicate_tracking(node)
             self.kv_events.record_store(node, medium=StorageMedium.CPU)
+
+    def _walk_span(self, key: RadixKey, end: int):
+        """Yield nodes and their matched spans along ``key`` through ``end``."""
+        node = self.root_node
+        pos = 0
+        remaining = key
+        while pos < end and len(remaining) > 0:
+            child = node.children.get(remaining.child_key(self.page_size))
+            if child is None or (child.evicted and not child.backuped):
+                return
+            prefix_len = child.key.match(remaining, page_size=self.page_size)
+            if prefix_len == 0:
+                return
+            yield child, pos, prefix_len
+            if prefix_len < len(child.key):
+                return
+            node = child
+            pos += prefix_len
+            remaining = remaining[prefix_len:]
+
+    def swa_tombstone_ranges(
+        self, key: RadixKey, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
+        ranges: list[tuple[int, int]] = []
+        for child, pos, prefix_len in self._walk_span(key, end):
+            seg_end = pos + prefix_len
+            if seg_end <= start:
+                continue
+            if child.component_data[ComponentType.SWA].value is not None:
+                continue
+            lo, hi = max(start, pos), min(end, seg_end)
+            if ranges and ranges[-1][1] == lo:
+                ranges[-1] = (ranges[-1][0], hi)
+            else:
+                ranges.append((lo, hi))
+            if hi >= end:
+                break
+        return ranges
+
+    def attach_swa_window(
+        self,
+        key: RadixKey,
+        window_start: int,
+        window_end: int,
+        swa_values: torch.Tensor,
+    ) -> list[CacheAction | ComponentAction]:
+        """Attach a loaded SWA slice to an existing tombstoned tree span."""
+        assert len(swa_values) == window_end - window_start, (
+            f"attach_swa_window size mismatch: got {len(swa_values)} "
+            f"for [{window_start}, {window_end})"
+        )
+        actions: list[CacheAction | ComponentAction] = []
+        covered = window_start
+        for child, pos, prefix_len in list(self._walk_span(key, window_end)):
+            seg_end = pos + prefix_len
+            if seg_end <= window_start:
+                continue
+            seg_start = max(pos, window_start)
+            assign_end = min(seg_end, window_end)
+            assert child.component_data[ComponentType.SWA].value is None, (
+                f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
+                f"of [{window_start}, {window_end})"
+            )
+            self._attach_swa_segment(
+                child,
+                pos,
+                seg_start,
+                assign_end,
+                swa_values[seg_start - window_start : assign_end - window_start],
+                actions,
+            )
+            covered = assign_end
+            if covered >= window_end:
+                break
+        assert covered == window_end, (
+            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
+        )
+        return actions
+
+    def _attach_swa_segment(
+        self,
+        node: UnifiedTreeNode,
+        node_start: int,
+        seg_start: int,
+        seg_end: int,
+        values: torch.Tensor,
+        actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        target = node
+        if seg_start > node_start:
+            _, action = self._split_node(target.key, target, seg_start - node_start)
+            if action is not None:
+                actions.append(action)
+        if seg_start + len(target.key) > seg_end:
+            fragment, action = self._split_node(target.key, target, seg_end - seg_start)
+            if action is not None:
+                actions.append(action)
+            target = fragment
+        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

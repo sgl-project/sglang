@@ -579,8 +579,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
-        forward_batch = SimpleNamespace(name="live")
-        static_forward_batch = SimpleNamespace(name="static")
+        forward_batch = SimpleNamespace(name="live", max_seq_len_override=None)
+        static_forward_batch = SimpleNamespace(name="static", max_seq_len_override=None)
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
@@ -604,11 +604,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
-        schedule = SimpleNamespace(
-            max_prefill_tokens=16384,
-            chunked_prefill_size=4096,
-            max_running_requests=256,
-        )
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
         spec = SimpleNamespace(
             speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
         )

@@ -161,6 +161,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     original_temperature: Optional[float] = None
     original_top_k: Optional[int] = None
     is_normalized: bool = False  # set by normalize()
+    ebnf_full_assistant: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers

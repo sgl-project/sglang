@@ -235,9 +235,6 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             use_fsdp = server_args.should_use_fsdp_for_component("transformer")
-            component_starts_on_cpu = server_args.should_start_component_on_cpu(
-                "transformer"
-            )
             if current_platform.is_mps():
                 use_fsdp = False
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
