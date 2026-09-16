@@ -40,9 +40,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-)
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -326,7 +324,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
             self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
-        graph_key = self._make_graph_key(self.bs)
+        graph_key = self._replay_graph_key
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
