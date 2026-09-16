@@ -72,6 +72,8 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar_encoder import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_lidar_outputs import (
     lidar_output_payload,
     lidar_payload_for_response,
+    pool_lidar_azimuth,
+    render_lidar_bev_frames,
     render_lidar_range_frames,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_multiview import (
@@ -1705,6 +1707,28 @@ class TestLidarDecoder(unittest.TestCase):
         """Per-camera captions live in multiview.views[].prompt, so the multipart video
         endpoint must not reject the empty top-level prompt schema-2 requests send."""
         self.assertTrue(Cosmos3MultiviewSamplingParams.video_prompt_optional())
+
+    def test_bev_places_rays_by_azimuth_and_range(self):
+        """Column 0 of the range image is azimuth +180 (rear), the middle column is
+        forward; a forward return at half the radius lands above the ego center and a
+        rear one below it, and azimuth pooling keeps the nearest return of a group."""
+        clip = torch.zeros(3, 1, 4, 8)
+        clip[2] = 1.0
+        clip[0, 0, :, 4] = 40.0  # forward (0 deg)
+        clip[0, 0, :, 0] = 20.0  # rear (+180 deg)
+        frames = render_lidar_bev_frames(
+            clip, min_range_m=5.0, max_range_m=100.0, size_px=64, radius_m=80.0
+        )
+        self.assertEqual(frames.shape, (1, 64, 64, 3))
+        center = 32
+        self.assertTrue(frames[0, center - 16, center].any())  # forward, 40 of 80 m
+        self.assertTrue(frames[0, center + 8, center].any())  # rear, 20 m
+        self.assertFalse(frames[0, center, center].any())
+        pooled = pool_lidar_azimuth(clip, 2)
+        self.assertEqual(tuple(pooled.shape), (3, 1, 4, 4))
+        self.assertEqual(pooled[0, 0, 0, 0].item(), 20.0)  # columns 0,1: nearest kept
+        self.assertEqual(pooled[0, 0, 0, 2].item(), 40.0)  # columns 4,5
+        self.assertEqual(pooled[0, 0, 0, 1].item(), 0.0)  # columns 2,3: no return
 
     def test_lidar_request_decode_flag(self):
         params = validate_lidar_request({"control_path": "/x/hdmap.safetensors"})
