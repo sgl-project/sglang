@@ -677,9 +677,10 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # TODO(Jialin): This Rust default is for testing the rollout in CI; finalize
-    # it after parity coverage passes. Known capability gaps fall back to Python
-    # through the tree-core registry, including when Rust is explicitly selected.
+    # The tree-core registry falls back to Python for session-aware caching,
+    # C128/custom components, non-Linux platforms, unsupported PyTorch versions
+    # or devices, and installs with neither the Rust extension nor its sources.
+    # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
