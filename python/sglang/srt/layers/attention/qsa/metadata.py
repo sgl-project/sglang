@@ -122,8 +122,13 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         self,
         layer_id: int,
         positions: torch.Tensor,
+        query_sequence_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather packed compressed K and ragged ranges for prefill MQA."""
+        """Gather packed compressed K and ragged ranges for prefill MQA.
+
+        ``query_sequence_ids`` overrides ``token_to_batch_idx`` for callers that
+        score a subset of the batch's rows (prefill CP: this rank's zigzag rows);
+        ``positions`` must then be those rows' logical positions."""
 
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
@@ -151,7 +156,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
                 (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
             )
         )
-        num_valid_tokens = self.token_to_batch_idx.numel()
+        if query_sequence_ids is None:
+            query_sequence_ids = self.token_to_batch_idx
+        num_valid_tokens = query_sequence_ids.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(
                 "QSA prefill positions are shorter than the request mapping: "
@@ -161,7 +168,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         row_starts, row_ends, _ = build_qsa_row_ranges(
             sequence_lengths,
             positions.to(sequence_lengths.device),
-            self.token_to_batch_idx.to(sequence_lengths.device),
+            query_sequence_ids.to(sequence_lengths.device),
             self.compress_ratio,
         )
         return compressed_keys, row_starts, row_ends, sequence_lengths
