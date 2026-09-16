@@ -4,6 +4,10 @@ from functools import lru_cache
 
 import torch
 
+from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -354,23 +358,75 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
+            # --- attn-tp batch split for indexer ---
+            # Each rank handles a contiguous slice of requests, runs the
+            # lightning indexer on its local Q slice against the shared full
+            # KV cache, then all-gathers the top-k indices.
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            q_view = q.view(-1, self.n_heads, self.head_dim)
+            total_tokens = q_view.shape[0]
+            num_requests = actual_seq_lengths_q.shape[0]
+            if attn_tp_size > 1 and num_requests % attn_tp_size == 0:
+                attn_tp_rank = get_attn_tensor_model_parallel_rank()
+                # num_requests = actual_seq_lengths_q.shape[0]
+                assert (
+                    num_requests % attn_tp_size == 0
+                ), f"batch {num_requests} not divisible by attn_tp_size {attn_tp_size}"
+                local_bs = num_requests // attn_tp_size
+                req_start = attn_tp_rank * local_bs
+                req_end = req_start + local_bs
+
+                if total_tokens % num_requests == 0:
+                    # Uniform Q tokens per request (decode / target_verify).
+                    # All offsets are Python ints — graph-safe, no .item().
+                    tokens_per_req = total_tokens // num_requests
+                    token_start = req_start * tokens_per_req
+                    token_end = req_end * tokens_per_req
+                    q_cumsum_offset = req_start * tokens_per_req
+                else:
+                    # Variable-length Q (prefill without CP) — never graph-captured,
+                    # so .item() synchronization is safe here.
+                    token_start = (
+                        int(actual_seq_lengths_q[req_start - 1].item())
+                        if attn_tp_rank > 0
+                        else 0
+                    )
+                    token_end = int(actual_seq_lengths_q[req_end - 1].item())
+                    q_cumsum_offset = token_start
+
+                q_local = q_view[token_start:token_end]
+                weights_local = weights[token_start:token_end]
+                actual_seq_lengths_q_local = (
+                    actual_seq_lengths_q[req_start:req_end] - q_cumsum_offset
+                ).to(torch.int32)
+                actual_seq_lengths_kv_local = actual_seq_lengths_kv[
+                    req_start:req_end
+                ]
+                block_table_local = block_table[req_start:req_end]
+            else:
+                q_local = q_view
+                weights_local = weights
+                actual_seq_lengths_q_local = actual_seq_lengths_q.to(torch.int32)
+                actual_seq_lengths_kv_local = actual_seq_lengths_kv
+                block_table_local = block_table
+
             if use_quant_indexer:
-                query, query_scale = _quantize_npu_indexer_activation(
-                    q.view(-1, self.n_heads, self.head_dim),
+                query_local, query_scale_local = _quantize_npu_indexer_activation(
+                    q_local,
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
+                    query=query_local,
                     key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
+                    weights=weights_local,
+                    query_dequant_scale=query_scale_local,
                     key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                    actual_seq_lengths_query=actual_seq_lengths_q_local,
+                    actual_seq_lengths_key=actual_seq_lengths_kv_local.to(
                         device=k.device, dtype=torch.int32
                     ),
-                    block_table=block_table,
+                    block_table=block_table_local,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
@@ -378,24 +434,37 @@ class DSANPUIndexerMixin:
                     query_quant_mode=0,
                     key_quant_mode=0,
                 )
-                return topk_indices.squeeze(1)
+                topk_indices = topk_indices.squeeze(1)
+            else:
+                topk_indices = torch_npu.npu_lightning_indexer(
+                    query=q_local,
+                    key=past_key_states,
+                    weights=weights_local,
+                    actual_seq_lengths_query=actual_seq_lengths_q_local,
+                    actual_seq_lengths_key=actual_seq_lengths_kv_local.to(
+                        k.device
+                    ).to(torch.int32),
+                    block_table=block_table_local,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                )
+                # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+                topk_indices = topk_indices[0].squeeze(1)
 
-            topk_indices = torch_npu.npu_lightning_indexer(
-                query=q.view(-1, self.n_heads, self.head_dim),
-                key=past_key_states,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
-                ),
-                block_table=block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )
-            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices[0].squeeze(1)
+            if attn_tp_size > 1 and num_requests % attn_tp_size == 0:
+                topk_full = torch.empty(
+                    (total_tokens, topk_indices.shape[-1]),
+                    dtype=topk_indices.dtype,
+                    device=topk_indices.device,
+                )
+                attn_tp_all_gather_into_tensor(
+                    topk_full, topk_indices.contiguous()
+                )
+                return topk_full
+
+            return topk_indices
 
     def do_npu_cp_balance_indexer(
         self,
