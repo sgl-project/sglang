@@ -2,9 +2,7 @@
 
 Every implementation takes this rank's ``[rows, local_width]`` slice and returns
 ``[rows, world_size * local_width]`` with the ranks' slices side by side, the
-layout ``GroupCoordinator.all_gather(dim=-1)`` produces. Callers pick one with
-``make_vocab_gather`` at init and call it unconditionally afterwards; which
-transport runs is the implementation's business, including any fallback.
+layout ``GroupCoordinator.all_gather(dim=-1)`` produces.
 """
 
 from __future__ import annotations
@@ -53,12 +51,11 @@ class NcclVocabGather(VocabGather):
         return self.group.all_gather(local, dim=0)
 
 
+# Collective: every rank of the group must call this, in the same order, outside
+# CUDA-graph capture. The returned multicast alias is 0 when the group has none.
 def _alloc_symm(
     group, shape: Tuple[int, int], dtype: torch.dtype
 ) -> Tuple[torch.Tensor, int]:
-    """A symmetric-memory tensor on ``group`` and its multicast alias (0 when
-    the group has none). Collective: every rank of the group must call it, in
-    the same order, outside CUDA-graph capture."""
     from torch._C._distributed_c10d import _SymmetricMemory
 
     # a GroupCoordinator names the allocation by its cpu_group, as
@@ -78,16 +75,13 @@ def _alloc_symm(
 class NVLinkVocabGather(VocabGather):
     """The NVLink collectives on CustomAllReduceV2's multicast plane.
 
-    Both kernels gather along the row axis, so the ranks come back stacked and
-    are transposed into place. A slice that fits one slot of the push plane
-    takes the push kernel into a fresh tensor; a larger one that fits
-    ``pull_out`` takes the pull kernel into that symmetric-memory output, which
-    is reused every call, so the result is copied out of it; anything else goes
-    to ``fallback``, the NCCL ring.
-
-    ``pull_out`` (``[world_size * symm_rows, local_width]``) is allocated here:
-    the allocation is collective and captured graphs keep its address, and with
-    CUDA graphs on the capture warm-up reaches it at the largest batch anyway.
+    A slice that fits one slot of the push plane takes the push kernel into a
+    fresh tensor; a larger one that fits ``pull_out`` takes the pull kernel into
+    that symmetric-memory output, which is reused every call; anything else goes
+    to ``fallback``, the NCCL ring. Both kernels gather along the row axis, so
+    the ranks come back stacked and are transposed into place. ``pull_out`` is
+    allocated here: the allocation is collective and captured graphs keep its
+    address.
     """
 
     def __init__(
@@ -130,8 +124,7 @@ class NVLinkVocabGather(VocabGather):
         return self.fallback(local)
 
     def gather_stacked(self, local: torch.Tensor) -> torch.Tensor:
-        # Compact argmax partials need rank-major output and no symmetric pull
-        # buffer. Unaligned rows and payloads past the push slot use NCCL.
+        # Compact argmax partials need rank-major output, no symmetric pull buffer.
         if (
             local.is_contiguous()
             and local.shape[1] * local.element_size() % 16 == 0
@@ -163,7 +156,6 @@ class NVLinkVocabGather(VocabGather):
         return full.clone() if full.data_ptr() == out.data_ptr() else full
 
     def _unstack(self, gathered: torch.Tensor) -> torch.Tensor:
-        """``[world_size * rows, width]`` stacked by rank -> ``[rows, world_size * width]``."""
         rows = gathered.shape[0] // self.world_size
         width = gathered.shape[1]
         if rows == 1:
@@ -176,8 +168,6 @@ class NVLinkVocabGather(VocabGather):
 
 
 def _nvlink_ca_comm(group, *, local_width: int, dtype: torch.dtype):
-    """The group's CustomAllReduceV2 when it can carry this gather on its
-    multicast plane, else None."""
     ca_comm = getattr(group, "ca_comm", None)
     if ca_comm is None or getattr(ca_comm, "disabled", True):
         return None
@@ -193,9 +183,6 @@ def _nvlink_ca_comm(group, *, local_width: int, dtype: torch.dtype):
 
 
 def _default_symm_rows() -> int:
-    """One row per request in the largest batch the server runs (the
-    scheduler's max running requests, else the decode graph's max batch); 0
-    when the server config is not published (offline use)."""
     try:
         from sglang.srt.runtime_context import get_exec, get_schedule
 
