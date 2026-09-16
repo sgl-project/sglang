@@ -979,6 +979,13 @@ class TestPrefillAdder(CustomTestCase):
         return req
 
     def test_successful_load_back_commits_the_selected_shape_once(self):
+        block_dllm_config = DllmConfig(
+            algorithm="test",
+            algorithm_config={},
+            block_size=4,
+            mask_id=0,
+            max_running_requests=2,
+        )
         cases = (
             ("full", 0, 24, None, None, 8, 8),
             ("full_unaligned", 0, 24, None, None, 7, 8),
@@ -993,7 +1000,7 @@ class TestPrefillAdder(CustomTestCase):
                 0,
                 24,
                 None,
-                SimpleNamespace(block_size=4, max_running_requests=2),
+                block_dllm_config,
                 4,
                 0,
             ),
@@ -1002,7 +1009,7 @@ class TestPrefillAdder(CustomTestCase):
                 0,
                 24,
                 None,
-                SimpleNamespace(block_size=4, max_running_requests=2),
+                block_dllm_config,
                 4,
                 0,
             ),
