@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -49,6 +50,44 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
 
+def pp_sync_polls(
+    polls: Optional[List[int]],
+    pp_group,
+    pp_rank: int,
+    pp_size: int,
+    sync_work_list: List,
+) -> List[int]:
+    """Synchronize poll states from PP0 through the PP pipeline.
+
+    PP0 provides the data. Each later PP rank receives it from the previous
+    rank and asynchronously forwards it to the next rank.
+    """
+    if pp_size <= 1:
+        assert polls is not None
+        return polls
+
+    for p2p_work in sync_work_list:
+        p2p_work.work.wait()
+    sync_work_list.clear()
+
+    data = polls
+    if pp_rank > 0:
+        data = pp_group.recv_object(
+            src=pp_rank - 1,
+            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+        )
+    if pp_rank + 1 < pp_size:
+        sync_work_list.extend(
+            pp_group.send_object(
+                data,
+                dst=pp_rank + 1,
+                async_send=True,
+                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            )
+        )
+    return data
+
+
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,
@@ -65,6 +104,25 @@ def poll_and_all_reduce_pp(
         KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
         for rid in rids
     ]
+
+
+def poll_and_all_reduce_pp2(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: dist.ProcessGroup,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_sync_work_list: List[torch.distributed.Work],
+) -> List[int]:
+    polls: List[int] = []
+    if pp_rank == 0:
+        polls = _poll_with_failure_injection_pp(pollers)
+        polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+        polls = _all_reduce_polls(polls, attn_cp_cpu_group)
+    # Propagate PP0's data to other ranks
+    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    return polls
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -200,6 +258,17 @@ def _poll_with_failure_injection(pollers) -> List[int]:
             for poller in pollers
         ]
     return [int(poller.poll()) for poller in pollers]
+
+
+def _poll_with_failure_injection_pp(pollers) -> List[int]:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
+        return [
+            int(KVPoll.Failed)
+            if random.random() < failure_prob
+            else int(poller.poll_pp_consensus())
+            for poller in pollers
+        ]
+    return [int(poller.poll_pp_consensus()) for poller in pollers]
 
 
 def _is_fake_transfer(req: Req) -> bool:
