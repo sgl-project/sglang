@@ -20,11 +20,9 @@ namespace sglang {
 
 /// \brief Ratio-1 decode compressor: RMSNorm and the whole main-KV write.
 ///
-/// The ratio-1 compressor pools nothing -- `project` is a single bf16 `wkv`
-/// GEMM and the latent it produces stands for the token itself -- so the
-/// kernel's input is the GEMM output and its RoPE position is `positions`, not
-/// `positions - 1`. `kv_output` is the pre-RoPE latent, for the index-K
-/// branch's `wk` projection.
+/// At ratio 1 the latent stands for the token itself, so the kernel's input is the
+/// `wkv` GEMM output and its RoPE position is `positions`, not `positions - 1`.
+/// `kv_output` is the pre-RoPE latent, for the index-K branch's `wk` projection.
 struct Compress1DecodeParams {
   const bf16_t* __restrict__ kv_input;     // [num_tokens, kHeadDim] bf16
   bf16_t* __restrict__ kv_output;          // [num_tokens, kHeadDim] bf16, pre-RoPE
@@ -36,23 +34,19 @@ struct Compress1DecodeParams {
   float eps;
 };
 
-/// Elements per thread; 256 threads per token was measured fastest on B200 decode batches.
-/// At head_dim 512, (512 - 64) / 2 = 224 threads keeps the nope/rope split warp-aligned;
-/// the fp8 amax reduction requires every lane in its full-warp mask to participate.
+/// Elements per thread; 256 threads per token measured fastest on B200 decode batches.
+/// At (512, 64) it also keeps the nope/rope split warp-aligned, as the fp8 amax reduction requires.
 constexpr uint32_t kC1VecSize = 2;
 
 /// \brief RMSNorm + RoPE tail + fp4 fake-quant + the FlashMLA store.
 ///
 /// One CTA per token, `kHeadDim / kC1VecSize` threads over the row.
 ///
-/// The three reductions have three different widths and are not
-/// interchangeable: the RMSNorm statistic spans the row, an fp8 store scale
-/// spans 64 elements, an fp4 block spans 16. All asserted below.
+/// The three reductions have different widths and are not interchangeable: the RMSNorm
+/// statistic spans the row, an fp8 store scale 64 elements, an fp4 block 16.
 ///
-/// kLayout is the cache's page format. V4 (584 B/token) and V41 (528 B/token,
-/// fp8 with per-32 scales) store the fake-quantized value; V41_FP4 (288 B/token)
-/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding
-/// happens once and no fp8 rounding follows it.
+/// kLayout is the cache's page format: V4 and V41 store the fake-quantized value; V41_FP4
+/// stores the e2m1 codes and their e4m3 scales directly, so the fp4 rounding happens once.
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -69,8 +63,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   using deepseek_v4::fp8::inv_scale_ue8m0;
   using deepseek_v4::fp8::pack_fp8;
 
-  /// Threads over one token, and the leading ones of those that carry the fp8
-  /// nope part; the rest carry the bf16 RoPE tail.
+  /// Threads over one token; the leading kNopeLanes carry the fp8 nope part, the rest the bf16 RoPE tail.
   constexpr uint32_t kVecSize = kC1VecSize;
   constexpr uint32_t kRowLanes = kHeadDim / kVecSize;
   constexpr uint32_t kNopeLanes = (kHeadDim - kRopeDim) / kVecSize;
@@ -151,8 +144,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   }
 
   if (tx >= kNopeLanes) {
-    // `rope_tail` ends in `.to(x.dtype)`, so the rotated value is rounded back
-    // to bf16 before the fake-quant widens it again.
+    // Match rope_tail()'s bf16 rounding: it ends in `.to(x.dtype)` before the fake-quant.
     freq_vec_t freq;
     freq.load(params.freqs_cis + position * kRopeDim, tx - kNopeLanes);
 #pragma unroll
@@ -171,8 +163,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   }
 
   if constexpr (kLayout == KVLayout::V41_FP4) {
-    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the
-    // fake quantization, minus the dequantization.
+    // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
     if (out_loc <= 0) return;
     const auto kv_row = Paged::row(params.kvcache, out_loc);
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
@@ -195,9 +186,8 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     }
   }
 
-  // A padded CUDA-graph row carries `out_loc == 0`, the reserved dummy slot,
-  // and must publish nothing: at ratio 1 the compressed slot *is* the FULL
-  // slot, so there is nothing to divide and no other marker to read.
+  // A padded CUDA-graph row carries `out_loc == 0`, the reserved dummy slot, and must publish
+  // nothing: at ratio 1 the compressed slot is the FULL slot, so there is no other marker to read.
   if (out_loc <= 0) return;
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
