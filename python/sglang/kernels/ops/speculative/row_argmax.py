@@ -51,7 +51,7 @@ def _argmax_final_kernel(INV, INI, OUT, SPLITS: tl.constexpr, BLOCK: tl.constexp
 _SPLITS = 64
 
 
-def fast_row_argmax(x: torch.Tensor) -> torch.Tensor:
+def row_argmax(x: torch.Tensor) -> torch.Tensor:
     """``x.argmax(dim=-1)`` for a 2D FP32 tensor with few rows and a wide vocab."""
     assert x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
     rows, n = x.shape
