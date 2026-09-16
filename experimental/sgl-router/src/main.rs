@@ -31,10 +31,8 @@ use tokio::{
 };
 
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// Below this the heartbeat stays at INFO: a pod finishing a long streaming
-/// response during a routine rollout is normal, and warning on every rollout
-/// would train operators to filter router WARNs. Past it the pod risks being
-/// SIGKILLed with work still open, so the heartbeat escalates to WARN.
+/// Heartbeat escalates INFO -> WARN here: earlier is a routine rollout draining
+/// a long response; later the pod risks SIGKILL with work still open.
 const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 
 // Main components started by this binary:
@@ -296,9 +294,8 @@ fn build_app_context(
     Ok(Arc::new(app_context))
 }
 
-/// How serving ended: the server's exit status and, when a termination signal
-/// started the in-flight drain, how long that drain ran (`None` means the
-/// server stopped without ever reaching the drain).
+/// How serving ended; `inflight_drain_secs` is `None` when the server stopped
+/// without ever reaching the in-flight drain.
 struct ServeOutcome {
     result: Result<()>,
     inflight_drain_secs: Option<u64>,
@@ -442,10 +439,9 @@ fn handle_further_signal(
     expedite_tx: &mut Option<oneshot::Sender<()>>,
     sigterm_first: bool,
 ) -> FurtherSignal {
-    // A failed `send` means the pause already elapsed and dropped its receiver.
-    // That is the same "nothing to cut short" state as a spent sender and must
-    // fall through to the notice below; discarding the `Err` once swallowed the
-    // first post-pause signal (see the regression test).
+    // A failed `send` means the pause already elapsed; it must fall through to
+    // the notice below. Discarding the `Err` once swallowed the first
+    // post-pause signal (see the regression test).
     if let Some(tx) = expedite_tx.take() {
         if tx.send(()).is_ok() {
             return FurtherSignal::Expedited;
