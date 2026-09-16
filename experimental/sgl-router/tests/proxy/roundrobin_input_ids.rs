@@ -207,27 +207,24 @@ async fn forwarding_opt_out_keeps_ingress_tokens_for_routing() {
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
-/// Dynamo wraps strings into arrays; the engine leaves them unchanged.
+/// Array-only templates remain usable for routing, without forwarding generated IDs.
 #[tokio::test]
-async fn array_only_template_fixture_preserves_engine_processing_with_opt_out() {
-    let fixture: Value =
-        serde_json::from_str(include_str!("../fixtures/array_content_rendering.json")).unwrap();
-    let (_dir, cfg) = template_config(json!({"chat_template": fixture["chat_template"]}));
-    for policy in [PolicyKind::RoundRobin, PolicyKind::CacheAware] {
-        let mock = MockWorker::start(vec![]).await;
-        let ctx = build_ctx_with_config(mock.url.clone(), without_forwarding(cfg.clone(), policy));
-        for case in fixture["cases"].as_array().unwrap() {
-            let request =
-                json!({"model": MODEL, "messages": [{"role": "user", "content": case["content"]}]});
-            let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
-            assert_eq!(
-                json!(ids) == case["engine_token_ids"],
-                case["content"].is_array(),
-                "{case}"
-            );
-            assert_forwarded_unchanged(&ctx, &mock, &request).await;
-        }
-    }
+async fn array_only_template_blocks_forwarding() {
+    let (_dir, mut cfg) = template_config(json!({
+        "chat_template": "{% for m in messages %}{% for part in m.content %}{{ part.text }}{% endfor %}{% endfor %}"
+    }));
+    cfg.model.policy = PolicyKind::CacheAware;
+    cfg.model.cache_aware = Some(Default::default());
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    assert!(!ctx.tokenizers.can_forward_chat(MODEL));
+    assert!(!ctx
+        .tokenizers
+        .encode_chat(MODEL, &request)
+        .unwrap()
+        .is_empty());
+    assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
 #[tokio::test]

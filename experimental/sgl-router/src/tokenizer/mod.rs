@@ -79,7 +79,11 @@ impl TokenizerRegistry {
             tracing::info!(model = %m.id,
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
-        } else if me.has_chat_formatter(&m.id) {
+        } else if me.has_chat_formatter(&m.id) && !me.can_forward_chat(&m.id) {
+            tracing::info!(model = %m.id,
+                "input_ids forwarding withheld: template did not pass the string-content probe; \
+                 chat rendering remains available for routing");
+        } else if me.can_forward_chat(&m.id) {
             tracing::warn!(model = %m.id,
                 "router-generated input_ids forwarding enabled: requires matching worker model \
                  files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
@@ -99,6 +103,13 @@ impl TokenizerRegistry {
     /// tokenization path is available for it).
     pub fn has_chat_formatter(&self, model_id: &str) -> bool {
         self.formatters.contains_key(model_id)
+    }
+
+    /// Request and deployment guards still apply after this template-level check.
+    pub fn can_forward_chat(&self, model_id: &str) -> bool {
+        self.formatters
+            .get(model_id)
+            .is_some_and(|entry| entry.formatter.supports_string_content())
     }
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.

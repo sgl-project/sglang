@@ -199,11 +199,14 @@ Forwarding logs its assumptions at startup. In particular, disable it for
 `SGLANG_DEFAULT_THINKING=true`, a non-default `SGLANG_DSV4_REASONING_EFFORT`,
 worker parser overrides such as `--tool-call-parser deepseekv32` that select a
 native encoder over a shipped template, or conversation templates with stop
-strings (the engine's `input_ids` path skips those template stops). Also disable
-it for array-only VLM templates: dynamo-render can wrap string content into an
-array where the engine leaves the string unchanged. These worker settings are
-not inferred from the router's environment. Disabling forwarding preserves
+strings (the engine's `input_ids` path skips those template stops). These worker
+settings are not inferred from the router's environment. Disabling forwarding preserves
 engine behavior but does not establish parity for local routing hashes.
+
+Forwarding is automatically withheld for templates that fail a direct string-content
+probe, including array-only VLM templates. The probe is conservative: templates
+requiring additional rendering helpers may also be withheld. Routing can still use
+Dynamo's rendering; detailed content-format parity coverage follows in #39133.
 
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
