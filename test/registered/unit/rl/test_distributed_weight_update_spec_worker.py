@@ -37,6 +37,7 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
+        scheduler=Mock(spec=["record_weight_version_change"]),
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._weight_update_in_progress = True
@@ -77,7 +78,7 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
     # selector="target": the target still receives once, but the draft worker is
     # never enumerated and no draft runner is loaded.
-    weights = object()
+    weights = [("model.layers.0.weight", object())]
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
     draft_worker = Mock()
