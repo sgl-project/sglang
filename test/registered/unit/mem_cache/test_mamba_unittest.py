@@ -1,5 +1,7 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -26,10 +28,15 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
 def _event_hashes(events):
@@ -74,6 +81,26 @@ class TestMamba(unittest.TestCase):
         self.assertIn(
             "layer_id=1 not in full attention layers:", str(context.exception)
         )
+
+    def test_hybrid_linear_kv_pool_npu_layer_ids_match_buffer_groups(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        pool.use_mla = True
+
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", False):
+            self.assertEqual(pool.get_kv_layer_ids(), [3, 7])
+
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            for group_count in (2, 3):
+                with self.subTest(group_count=group_count):
+                    pool.full_kv_pool = SimpleNamespace(
+                        get_contiguous_buf_infos=lambda: (
+                            list(range(2 * group_count)),
+                            [],
+                            [],
+                        )
+                    )
+                    self.assertEqual(pool.get_kv_layer_ids(), [3, 7] * group_count)
 
     def test_mamba_pool(self):
         max_num_reqs = 10
@@ -168,6 +195,8 @@ class TestMamba(unittest.TestCase):
         conv_dim = 5
 
         pool = object.__new__(WindowFirstMambaPool)
+        # Bypasses __init__, so set the device the allocator reads directly.
+        pool.device = get_device()
         physical, view = pool._allocate_deduplicated_conv_window(
             conv_shape=(window_size, conv_dim),
             num_mamba_layers=num_mamba_layers,

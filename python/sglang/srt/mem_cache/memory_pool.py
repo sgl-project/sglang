@@ -52,6 +52,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -489,7 +490,7 @@ class MambaPool:
                 *physical_conv_shape,
             ),
             dtype=conv_dtype,
-            device="cuda",
+            device=self.device,
         )
         physical_conv_strides = phys.stride()[2:]
         window_stride = physical_conv_strides[window_axis]
@@ -771,7 +772,7 @@ class MambaPool:
                             temporal_state_shape[2],
                         ),
                         dtype=ssm_dtype,
-                        device="cuda",
+                        device=device,
                     )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
@@ -839,7 +840,7 @@ class MambaPool:
                                 conv_shape[1],
                             ),
                             dtype=conv_dtype,
-                            device="cuda",
+                            device=device,
                         )
                         for conv_shape in dense_conv_shapes
                     ]
@@ -1113,8 +1114,8 @@ class MambaPool:
         }
     )
 
-    def _iter_transfer_state_tensors(self):
-        """Yield transferable state tensors with their per-slot slice axis."""
+    def _iter_transfer_state_entries(self):
+        """Yield ``[slot, ...]`` state entries and their transfer metadata."""
         for field, value in vars(self.mamba_cache).items():
             if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
                 continue
@@ -1125,20 +1126,20 @@ class MambaPool:
                 # empty. Advertising it fails the whole batch registration.
                 if state_tensor.numel() == 0:
                     continue
-                yield field, state_tensor, slice_axis
+                for layer_index, layer_id in enumerate(self.mamba_layer_ids):
+                    yield field, state_tensor[layer_index], slice_axis, layer_id
+
+        for sibling in self._slot_siblings:
+            yield from sibling.iter_transfer_state_entries()
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor, _ in self._iter_transfer_state_tensors():
-            data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
-            ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
-            item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
-            ]
+        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            data_ptrs.append(state_tensor.data_ptr())
+            data_lens.append(state_tensor.nbytes)
+            item_lens.append(state_tensor[0].nbytes)
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
@@ -1148,13 +1149,17 @@ class MambaPool:
         while Kimi conv state uses the second per-slot axis.
         """
         dim_per_tensor = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
-            axis = 2 + slice_axis
-            sliceable_dim = state_tensor.shape[axis]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            # Zero is a protocol marker for request state replicated across the
+            # attention-TP group. Heterogeneous PD copies the whole item from one
+            # elected source rank instead of slicing it as a TP-sharded tensor.
+            if slice_axis is None:
+                dim_per_tensor.append(0)
+                continue
+            # state_tensor shape: [size+1, sliceable_dim, ...]. Kimi conv state
+            # transposes the two per-slot axes to [K-1, dim].
+            axis = 1 + slice_axis
+            dim_per_tensor.append(state_tensor.shape[axis])
         return dim_per_tensor
 
     def get_state_layer_ids(self):
@@ -1164,15 +1169,18 @@ class MambaPool:
         the state list tensor-major x layer. Lets PD transfer match entries
         by layer id when prefill (PP stage) holds a subset of the mamba layers.
         """
-        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
-        return list(self.mamba_layer_ids) * state_tensor_count
+        return [layer_id for _, _, _, layer_id in self._iter_transfer_state_entries()]
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
         outer_counts = []
-        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
-            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
-            outer_counts += [outer_count] * self.num_mamba_layers
+        for _, state_tensor, slice_axis, _ in self._iter_transfer_state_entries():
+            outer_count = (
+                1
+                if slice_axis is None
+                else math.prod(state_tensor.shape[1 : 1 + slice_axis])
+            )
+            outer_counts.append(outer_count)
         return outer_counts
 
     def get_state_conv_shard_groups(self):
@@ -1187,14 +1195,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field, _, _ in self._iter_transfer_state_tensors():
+        for field, _, _, _ in self._iter_transfer_state_entries():
             # Only conv_state carries a q/k/v decomposition.
             subdims = (
                 list(self.conv_shard_groups)
                 if field == "conv" and self.conv_shard_groups is not None
                 else None
             )
-            subdims_per_tensor += [subdims] * self.num_mamba_layers
+            subdims_per_tensor.append(subdims)
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
@@ -3973,6 +3981,9 @@ class HybridLinearKVPool(KVCache):
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
+        if self.use_mla and _is_npu and layer_ids:
+            data_ptrs, _, _ = self.get_contiguous_buf_infos()
+            return layer_ids * (len(data_ptrs) // len(layer_ids))
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4603,6 +4614,9 @@ class MLATokenToKVPool(KVCache):
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4622,6 +4636,9 @@ class MLATokenToKVPool(KVCache):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        indices = maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):

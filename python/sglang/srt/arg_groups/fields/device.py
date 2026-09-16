@@ -9,18 +9,18 @@ how config is shaped at runtime.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import (
     Callable,
     List,
     Optional,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import A
 
 
-@dataclasses.dataclass
-class Device:
+class Device(msgspec.Struct):
     """Namespace ``device``."""
 
     _NS_PATH = "device"

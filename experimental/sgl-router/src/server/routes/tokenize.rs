@@ -126,6 +126,7 @@ mod tests {
                 affinity: None,
                 fused: None,
                 eligibility: None,
+                sampling_overrides: Default::default(),
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {

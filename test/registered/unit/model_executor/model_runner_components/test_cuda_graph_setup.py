@@ -48,6 +48,25 @@ def test_pipeline_attention_metadata_is_indexed_by_global_layer_id():
     assert companions[24] is companion24
 
 
+def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
+    looped = SimpleNamespace(layer_id=1)
+    companion = object()
+    attention_in = [SimpleNamespace(layer_id=0), looped, looped]
+    companions_in = [None, companion, companion]
+
+    attention, companions = index_attention_layers_by_global_id(
+        attention_in, companions_in
+    )
+
+    assert attention is attention_in
+    assert companions is companions_in
+
+    with pytest.raises(ValueError, match="duplicate attention layer_id: 2"):
+        index_attention_layers_by_global_id(
+            [SimpleNamespace(layer_id=2), SimpleNamespace(layer_id=2)], [None, None]
+        )
+
+
 def test_model_runner_can_override_decode_graph_runner(monkeypatch):
     from sglang.srt.runtime_context import get_context
 
