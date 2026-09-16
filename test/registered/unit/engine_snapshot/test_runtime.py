@@ -248,12 +248,14 @@ class TestSnapshotRuntime(SnapshotArtifacts, CustomTestCase):
     def test_pin_restored_tree_verifies_identity(self):
         startup = ("python", "-m", "sglang.srt.engine_snapshot.startup")
         base = dict(
+            artifact=str(self.artifact_path),
             root_pid=100,
             pids=[100, 101],
             state=(1, 100, 100, 5),
             command=startup,
             session=[100, 101],
             pidfds=[11, 12],
+            owns=True,
         )
 
         def pin_once(**patched):
@@ -268,12 +270,15 @@ class TestSnapshotRuntime(SnapshotArtifacts, CustomTestCase):
                     self.runtime, "_session_pids", return_value=patched["session"]
                 ),
                 patch.object(self.runtime, "_pidfd_exited", return_value=False),
+                patch.object(self.runtime, "_owns", return_value=patched["owns"]),
                 patch.object(
                     runtime_module.os, "pidfd_open", side_effect=patched["pidfds"]
                 ),
                 patch.object(runtime_module.os, "close"),
             ):
-                self.runtime.pin_restored_tree(patched["root_pid"], patched["pids"])
+                self.runtime.pin_restored_tree(
+                    patched["artifact"], patched["root_pid"], patched["pids"]
+                )
 
         pin_once(**base)
         self.assertIn(100, self.runtime._restored)
@@ -281,6 +286,7 @@ class TestSnapshotRuntime(SnapshotArtifacts, CustomTestCase):
         for name, overrides, expected in (
             ("not the leader", {"state": (1, 99, 100, 5)}, "process-group"),
             ("foreign command", {"command": ("python", "other.py")}, "command"),
+            ("other artifact", {"owns": False}, "does not belong"),
             ("extra process", {"session": [100, 101, 102]}, "session"),
         ):
             with self.subTest(case=name):

@@ -67,7 +67,7 @@ def artifact_manifest(artifact_path, **overrides):
         stdio=["pipe:[99999991]", "pipe:[99999992]"],
         files=[],
         dev_shm=[],
-        canary=SnapshotCanary(CANARY_PROMPT, 42),
+        canary=SnapshotCanary(CANARY_PROMPT, 42, -0.5),
     )
     fields.update(overrides)
     return SnapshotManifest(**fields)

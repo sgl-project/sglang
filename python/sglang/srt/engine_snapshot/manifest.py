@@ -16,6 +16,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import platform
 import stat
@@ -77,11 +78,28 @@ class SnapshotEnvironmentEntry(msgspec.Struct, forbid_unknown_fields=True, froze
     digest: str
 
 
+# The canary log-probability is compared with a tolerance: create and restore
+# run the same forward from the same weights, so a different token means the
+# reloaded weights differ, while a drift this small is floating-point noise.
+CANARY_LOGPROB_TOLERANCE = 1e-3
+
+
 class SnapshotCanary(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
-    """One greedy token sampled at the initialization boundary."""
+    """One greedy token sampled at the initialization boundary.
+
+    The log-probability of that token is recorded as well: a reload that shifts
+    the logits without flipping the argmax is invisible to the token id alone.
+    """
 
     prompt: str
     token_id: int
+    logprob: float
+
+    def matches(self, token_id, logprob):
+        """Whether a re-run of the same forward reproduced this canary."""
+        return self.token_id == token_id and math.isclose(
+            self.logprob, logprob, rel_tol=0.0, abs_tol=CANARY_LOGPROB_TOLERANCE
+        )
 
 
 class SnapshotIdentity(msgspec.Struct, forbid_unknown_fields=True, frozen=True):
@@ -415,7 +433,9 @@ def load_manifest(artifact_path, identity=None):
         raise SnapshotCompatibilityError("Invalid snapshot process list")
     if any(pid not in manifest.pids for pid in manifest.cuda_pids):
         raise SnapshotCompatibilityError("Invalid snapshot CUDA process list")
-    if manifest.canary.token_id < 0:
+    if len(manifest.stdio) != 2 or any(not resource for resource in manifest.stdio):
+        raise SnapshotCompatibilityError("Invalid snapshot stdio")
+    if manifest.canary.token_id < 0 or not math.isfinite(manifest.canary.logprob):
         raise SnapshotCompatibilityError("Invalid snapshot canary")
     if identity is not None:
         validate_identity(manifest.identity, identity)

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import msgspec
 from snapshot_fixtures import SnapshotArtifacts, artifact_manifest, identity
 
 import sglang.srt.engine_snapshot.controller as controller
@@ -12,6 +13,7 @@ from sglang.srt.engine_snapshot.errors import (
 )
 from sglang.srt.engine_snapshot.manifest import (
     publish_manifest,
+    write_json_atomic,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -121,6 +123,39 @@ class TestSnapshotController(SnapshotArtifacts, CustomTestCase):
         with self.assertRaisesRegex(SnapshotUsageError, "pid taken"):
             controller.restore_snapshot(str(artifact), runtime=runtime)
         runtime.stop_restored_tree.assert_not_called()
+
+    def test_restore_judges_the_engines_canary_report(self):
+        artifact = self.publish()
+        resumed = artifact / "control" / control.RESUMED
+
+        def report(token_id=42, logprob=-0.5):
+            write_json_atomic(
+                resumed,
+                msgspec.to_builtins(
+                    control.ResumedInfo(token_id=token_id, logprob=logprob)
+                ),
+                overwrite=True,
+            )
+
+        runtime = self.mock_runtime()
+        runtime.restore.return_value = 99999991
+        runtime.wait_listener.side_effect = lambda *arguments, **kwargs: report()
+
+        outcome = controller.restore_snapshot(str(artifact), runtime=runtime)
+        self.assertEqual(
+            (outcome.root_pid, outcome.host, outcome.port),
+            (99999991, "127.0.0.1", 30184),
+        )
+        runtime.complete_restore.assert_called_once_with(99999991)
+
+        # A reload that shifted the logits is rejected here even though the
+        # token id still matches, and the half-restored tree is torn down.
+        runtime.wait_listener.side_effect = lambda *arguments, **kwargs: report(
+            logprob=-2.0
+        )
+        with self.assertRaisesRegex(SnapshotRuntimeFailure, "canary mismatch"):
+            controller.restore_snapshot(str(artifact), runtime=runtime)
+        runtime.stop_restored_tree.assert_called()
 
     # ------------------------------------------------------------------ #
     # inspect and CLI
