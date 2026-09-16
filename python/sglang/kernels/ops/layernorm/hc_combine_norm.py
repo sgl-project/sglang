@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.layernorm.mxfp8_epilogue import mxfp8_epilogue
+
 
 @triton.jit
 def _hc_combine_norm(X, P, W, Y, SX: tl.constexpr, SP: tl.constexpr, EPS: tl.constexpr):
@@ -62,3 +64,83 @@ def hc_combine_norm(
         x, pre, weight, y, x.stride(0), pre.stride(0), eps, num_warps=8
     )
     return y
+
+
+@triton.jit
+def _hc_combine_norm_mxfp8_kernel(
+    X,
+    P,
+    W,
+    Y,
+    Q,
+    S,
+    SX: tl.constexpr,
+    SP: tl.constexpr,
+    EPS: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUPS: tl.constexpr,
+    SLICE: tl.constexpr,
+):
+    row, part = tl.program_id(0), tl.program_id(1)
+    h = tl.arange(0, BLOCK)
+    m = h < K
+    value = tl.full((BLOCK,), 0, tl.float32)
+    for c in tl.static_range(4):
+        pre = tl.load(P + row * SP + c).to(tl.float32)
+        x = tl.load(X + row * SX + c * K + h, m, 0).to(tl.float32)
+        value += x * pre
+    # The unfused combine stores BF16 before RMSNorm reads it.
+    value = value.to(tl.bfloat16).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(value * value, 0) / K + EPS)
+    weight = tl.load(W + h, m, 0).to(tl.float32)
+    y = (value * inv_rms * weight).to(tl.bfloat16)
+    tl.store(Y + row * K + h, y, m & (h >= part * SLICE) & (h < (part + 1) * SLICE))
+    mxfp8_epilogue(
+        y, row, Q, S, K, BLOCK, GROUPS, part * (SLICE // 32), (part + 1) * (SLICE // 32)
+    )
+
+
+def _parts_for(k: int) -> int:
+    # Row splits: recomputing the statistic beats running 6 CTAs on 148 SMs.
+    parts = 4
+    while parts > 1 and (k % (parts * 32)):
+        parts //= 2
+    return parts
+
+
+def _alloc(m, k, device):
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
+    s = torch.zeros(
+        (k // 32) * (triton.cdiv(m, 128) * 128), dtype=torch.uint8, device=device
+    )
+    return q, s
+
+
+def hc_combine_norm_mxfp8(
+    x: torch.Tensor, pre: torch.Tensor, weight: torch.Tensor, eps: float
+):
+    """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
+    m = x.shape[0]
+    assert 0 < m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
+    k = x.shape[1] // 4
+    y = torch.empty((m, k), dtype=x.dtype, device=x.device)
+    q, s = _alloc(m, k, x.device)
+    parts = _parts_for(k)
+    _hc_combine_norm_mxfp8_kernel[(m, parts)](
+        x,
+        pre,
+        weight,
+        y,
+        q,
+        s,
+        SX=x.stride(0),
+        SP=pre.stride(0),
+        EPS=eps,
+        K=k,
+        BLOCK=triton.next_power_of_2(k),
+        GROUPS=k // 32,
+        SLICE=k // parts,
+        num_warps=8,
+    )
+    return y, q, s
