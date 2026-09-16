@@ -224,17 +224,20 @@ def validate_outlines_json_schema(schema: Any) -> None:
             )
 
         if "properties" in subschema:
-            ignored_object_constraints = sorted(
-                {"additionalProperties", "maxProperties", "minProperties"}.intersection(
-                    subschema
-                )
-            )
+            ignored_object_constraints = {
+                "additionalProperties",
+                "maxProperties",
+                "minProperties",
+            }.intersection(subschema)
+            if subschema.get("additionalProperties") is False:
+                # The properties regex already excludes undeclared keys.
+                ignored_object_constraints.discard("additionalProperties")
             if ignored_object_constraints:
                 _raise_unsupported(
                     "outlines",
                     pointer,
                     "properties cannot be combined with "
-                    + ", ".join(ignored_object_constraints),
+                    + ", ".join(sorted(ignored_object_constraints)),
                 )
 
         if "prefixItems" in subschema:
