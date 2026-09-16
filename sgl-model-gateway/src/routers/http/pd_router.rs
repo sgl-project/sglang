@@ -1730,7 +1730,8 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, body, context, None)
+            .await
     }
 
     async fn route_rerank(
