@@ -73,6 +73,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",

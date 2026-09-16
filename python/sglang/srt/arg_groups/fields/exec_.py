@@ -148,6 +148,21 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_kv_cache_dequant_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Online dequantization dtype used by prefill attention when "
+                "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache directly "
+                "without additional dequantization; 'fp8_e4m3' dequantizes it "
+                "into a temporary FP8 workspace. This does not change the stored "
+                "KV-cache dtype. 'auto' selects NVFP4 without additional "
+                "dequantization on SM100 and FP8 E4M3 otherwise."
+            ),
+            choices=["auto", "nvfp4", "fp8_e4m3"],
+            resolvable=True,
+        ),
+    ] = "auto"
     sampling_backend: A[
         Optional[str],
         Arg(
