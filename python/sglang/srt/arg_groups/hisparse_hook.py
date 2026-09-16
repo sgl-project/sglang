@@ -19,7 +19,7 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "bfloat16": {"flashmla_sparse"},
     "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
-HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
+HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
@@ -96,9 +96,9 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        cfg.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert cfg.disable_radix_cache, (
+        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

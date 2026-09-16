@@ -330,7 +330,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -779,9 +778,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
                 ]
         elif pool_name == PoolName.DRAFT_SWA:
-            from sglang.srt.mem_cache.memory_pool_host import (
-                DeepSeekV4PagedHostPool,
-            )
+            from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
             from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
             if isinstance(
@@ -799,6 +796,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             PoolName.DRAFT_INDEXER,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
             PoolName.DEEPSEEK_V4_C128,
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,

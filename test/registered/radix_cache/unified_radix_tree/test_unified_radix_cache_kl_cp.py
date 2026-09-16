@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=950, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=346, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -50,7 +50,7 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 str(cls.max_running_requests),
                 "--max-total-tokens",
                 "14000",  # loadback trigger
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 "--enable-hierarchical-cache",
@@ -63,7 +63,10 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-mem-layout",
                 cls.hicache_mem_layout,
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

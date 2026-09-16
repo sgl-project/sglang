@@ -119,8 +119,6 @@ jobs:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
-          source scripts/ci/utils/sgl_eval_ref.sh
-          uv pip install "$SGL_EVAL_SPEC" --index-strategy unsafe-best-match
 
       # Hosted runners are ephemeral, so models are re-fetched every run and the
       # Hub occasionally returns 429s. Persist the HF cache in GitHub's cache
@@ -158,7 +156,7 @@ jobs:
           SGLANG_SKIP_RUST_TESTS: ${{ fromJson(inputs.check_changes).rust_workspace == 'true' && 'false' || 'true' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite ${{ inputs.self_name }} --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} --partition-model-file /tmp/partition-model.json --fork-worker-batch-size 20 $CONTINUE_ON_ERROR_FLAG
 
       # PRs save only what the base lacks; the implicit if: success() keeps a
       # half-downloaded cache unpublished.

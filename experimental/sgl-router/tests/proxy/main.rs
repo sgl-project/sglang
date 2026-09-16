@@ -10,15 +10,21 @@
 
 mod common;
 
+mod bucket_routing;
 mod cache_aware_input_ids;
 mod chat_routing;
 mod external_indexer_routing;
 mod failover;
 mod graceful_shutdown;
+mod h2c_forward;
 mod header_forwarding;
+mod inbound_h2c;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
+mod pd_protocol_binding;
+mod radix_tree_routing;
 mod roundrobin_input_ids;
+mod shared_prefill_admission;
 mod sticky_input_ids;
 mod sticky_routing;
 mod timeout;

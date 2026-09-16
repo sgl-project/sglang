@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
@@ -129,9 +129,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     elif cfg.disaggregation_mode == "prefill":
-        assert (
-            cfg.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
+        assert cfg.disaggregation_transfer_backend != "fake", (
+            "Prefill server does not support 'fake' as the transfer backend"
+        )
 
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)
@@ -158,7 +158,7 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     default_port = next(
         f.default
-        for f in dataclasses.fields(server_args)
+        for f in record_fields(type(server_args))
         if f.name == "disaggregation_bootstrap_port"
     )
     if cfg.disaggregation_bootstrap_port not in (
@@ -256,9 +256,10 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
+        "Glm5NextForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
         )
