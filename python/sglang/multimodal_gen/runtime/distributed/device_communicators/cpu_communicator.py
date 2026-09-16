@@ -4,19 +4,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/cpu_communicator.py
 
-import os
-
-import torch
-from torch.distributed import ProcessGroup
-
-from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
-
-from .base_device_communicator import DeviceCommunicatorBase
-
-
-class CpuCommunicator(DeviceCommunicatorBase):
-    import os
-
 import torch
 from torch.distributed import ProcessGroup
 
@@ -35,9 +22,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
 
-        self._group_shm_backends: dict[
-            tuple[int, ...], _GroupSHMDistributed
-        ] = {}
+        self._group_shm_backends: dict[tuple[int, ...], _GroupSHMDistributed] = {}
         self._group_shm_available = self._load_group_shm_ops()
 
     def _load_group_shm_ops(self) -> bool:
@@ -58,6 +43,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             and hasattr(torch.ops.sgl_kernel, "shm_group_alltoall")
             and hasattr(torch.ops.sgl_kernel, "shm_group_allreduce")
         )
+
     @staticmethod
     def _sanitize_shm_name(name: str) -> str:
         return "".join(c if c.isalnum() or c in ("_", "-", ".") else "_" for c in name)
@@ -224,9 +210,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
-            input_size[:dim]
-            + (world_size * input_size[dim],)
-            + input_size[dim + 1 :]
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
 
         return output_tensor
@@ -265,6 +249,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 group=group,
             )
 
+
 class _GroupSHMDistributed:
     def __init__(
         self,
@@ -276,30 +261,21 @@ class _GroupSHMDistributed:
         self.handle = self._init_group_shm()
 
     def _init_group_shm(self) -> int:
-        group_ranks = tuple(
-            torch.distributed.get_process_group_ranks(self.group)
-        )
+        group_ranks = tuple(torch.distributed.get_process_group_ranks(self.group))
         group_size = torch.distributed.get_world_size(self.group)
         group_rank = torch.distributed.get_rank(self.group)
 
         addr = self.communicator._sanitize_shm_name(
             os.environ.get("MASTER_ADDR", "localhost")
         )
-        port = self.communicator._sanitize_shm_name(
-            os.environ.get("MASTER_PORT", "0")
-        )
+        port = self.communicator._sanitize_shm_name(os.environ.get("MASTER_PORT", "0"))
         unique_name = self.communicator._sanitize_shm_name(
             self.communicator.unique_name
         )
         ranks_name = "_".join(str(rank) for rank in group_ranks)
 
         group_name = (
-            f"sglang_group_"
-            f"{os.getuid()}_"
-            f"{addr}_"
-            f"{port}_"
-            f"{unique_name}_"
-            f"{ranks_name}"
+            f"sglang_group_{os.getuid()}_{addr}_{port}_{unique_name}_{ranks_name}"
         )
 
         return int(

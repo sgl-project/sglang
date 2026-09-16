@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
-from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -448,9 +447,7 @@ class GroupCoordinator:
 
         if dim != 0:
             input_size[0] //= world_size
-            output_tensor = output_tensor.reshape(
-                [world_size] + input_size
-            )
+            output_tensor = output_tensor.reshape([world_size] + input_size)
             output_tensor = output_tensor.movedim(0, dim)
 
         if separate_tensors:

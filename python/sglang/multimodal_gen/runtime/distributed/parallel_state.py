@@ -42,7 +42,6 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
