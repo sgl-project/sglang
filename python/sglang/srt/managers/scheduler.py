@@ -5619,16 +5619,12 @@ class Scheduler(
                     new_ep_size=new_ep_size,
                     pending_ep_size=state.pending_ep_size,
                     scale_phase=state.scale_phase,
-                    terminal=state.pending_ep_size is None,
+                    terminal=state.operation_succeeded is not None,
                     effective_ep_size=state.effective_ep_size,
                 )
 
-            terminal = state.scale_phase in (
-                "failed",
-                "recovery_unsupported",
-                "serving_expanded",
-            )
-            success = state.scale_phase not in ("failed", "recovery_unsupported")
+            terminal = state.operation_succeeded is not None
+            success = state.operation_succeeded is not False
             return ScaleElasticEPReqOutput(
                 success=success,
                 message=(
