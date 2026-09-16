@@ -28,6 +28,18 @@ DEQUANT = {
 ONE_CODE_RTOL = {KVLayout.V41: 0.13, KVLayout.V41_FP4: 0.51}
 
 
+def rope_tail(
+    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
+) -> torch.Tensor:
+    """Rotate the last rope_dim features of x [T, ..., D] with complex freqs [T, rope_dim // 2]."""
+    head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
+    tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
+    f = freqs.conj() if inverse else freqs
+    f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
+    rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
+    return torch.cat([head, rotated], dim=-1)
+
+
 def _sm100():
     return (
         torch.cuda.is_available()
@@ -144,7 +156,6 @@ class TestV41KVStore(CustomTestCase):
         """The in-kernel RoPE tail equals rope_tail (bf16-rounded) before quantizing,
         so the fp4 cache holds exactly fake_quant_compressed_kv(rope_tail(x))."""
         from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
         g = torch.Generator(device="cuda").manual_seed(1)
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
@@ -234,7 +245,6 @@ class TestV41KVStore(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.elementwise import (
             fused_k_norm_rope_flashmla,
         )
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
         g = torch.Generator(device="cuda").manual_seed(2)
         page_size, num_pages, n = 256, 3, 300
@@ -329,7 +339,6 @@ class TestV41KVStore(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.c2 import (
             c2_decode_or_verify_norm_rope_store,
         )
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
         g = torch.Generator(device="cuda").manual_seed(4)
         eps = 1e-6
@@ -495,7 +504,6 @@ class TestV41KVStore(CustomTestCase):
             CompressorDecodePlan,
             compress_norm_rope_store,
         )
-        from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
         g = torch.Generator(device="cuda").manual_seed(5)
         ratio = 4
