@@ -1,12 +1,31 @@
-// Top-k(2048) + page transform, adapted from aiter's coop_topk.cuh (MIT).
-// aiter runs one block per row; this splits a row across G blocks that agree
-// without communicating, via the histogram the logits kernel already built.
+/// Top-k(2048) + page transform for the gfx950 DSA indexer, adapted from aiter's
+/// coop_topk.cuh (MIT).  aiter runs one block per row; this splits a row across
+/// G blocks that agree without communicating, via paged_mqa_logits.cuh's
+/// histogram.  Also exports hist_stride: the ghist row stride is a compile-time
+/// property of this kernel and the workspace must be sized on it.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
-#include <torch/extension.h>
+#pragma once
 
-namespace dsa_topk {
+#ifndef USE_ROCM
+#error "topk_transform.cuh targets gfx950; it is wave64 DPP and HIP occupancy"
+#endif
+
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <tvm/ffi/container/tensor.h>
+
+#include <cstdint>
+
+namespace sglang {
+
+namespace dsa_gfx950::topk {
 
 constexpr uint32_t TOPK = 2048u;
 // Coarse bin width, in bits of the fp16 ordered key: trades candidate-set size
@@ -19,10 +38,9 @@ constexpr uint32_t HIST_BINS = 1u << HIST_BITS;
 constexpr uint32_t LOW_BITS = 16u - HIST_BITS;
 // Hierarchical (two-level) threshold.
 constexpr uint32_t CBITS = 6u;
-constexpr uint32_t CBINS = 1u << CBITS;               // 64, one wave wide
-constexpr uint32_t FINE_PER_CRS = HIST_BINS >> CBITS; // 64 at HIST_BITS=12
-static_assert(HIST_BITS >= CBITS,
-              "coarse must be no wider than the fine histogram");
+constexpr uint32_t CBINS = 1u << CBITS;                // 64, one wave wide
+constexpr uint32_t FINE_PER_CRS = HIST_BINS >> CBITS;  // 64 at HIST_BITS=12
+static_assert(HIST_BITS >= CBITS, "coarse must be no wider than the fine histogram");
 static_assert(FINE_PER_CRS <= 64u, "the fine group must fit in one wave");
 // Row stride of the ghist workspace: the fine histogram followed by the coarse
 // summary.  Both halves are zeroed by whoever owns the reset.
@@ -31,8 +49,8 @@ constexpr uint32_t GH_CRS_OFF = HIST_BINS;
 #ifndef DSA_TOPK_BS
 #define DSA_TOPK_BS 256
 #endif
-constexpr uint32_t BS = (uint32_t)DSA_TOPK_BS; // threads per block
-constexpr uint32_t RADIX = 256u;               // refinement radix
+constexpr uint32_t BS = (uint32_t)DSA_TOPK_BS;  // threads per block
+constexpr uint32_t RADIX = 256u;                // refinement radix
 static_assert(BS % 64u == 0u, "BS must be a whole number of wave64 waves");
 static_assert(BS >= 64u && BS <= 1024u, "HIP workgroup bound");
 #ifndef DSA_TOPK_STAGE
@@ -55,9 +73,9 @@ constexpr uint32_t PRANK_CAP = RANK_CAP < BS ? RANK_CAP : BS;
 // block updates live in one 8-byte word, so a block reserves output space with
 // ONE returning global atomic instead of two and rows do not false-share.
 constexpr uint32_t RC_STRIDE = 32u;
-constexpr uint32_t RC_WIN = 0u;  // winners emitted so far
-constexpr uint32_t RC_CAND = 1u; // candidates appended so far
-constexpr uint32_t RC_ARR = 4u;  // arrival counter (own dword)
+constexpr uint32_t RC_WIN = 0u;   // winners emitted so far
+constexpr uint32_t RC_CAND = 1u;  // candidates appended so far
+constexpr uint32_t RC_ARR = 4u;   // arrival counter (own dword)
 // Departure half of the two-phase row barrier.  The arrival counter alone is
 // not a barrier more than one block may pass: whoever reset it would race the
 // blocks still spinning on it.
@@ -78,17 +96,15 @@ __device__ __forceinline__ uint32_t order_key32(float x) {
 __device__ __forceinline__ uint32_t order_key16(float x) {
   __half h = __float2half_rn(x);
   unsigned short bits = __half_as_ushort(h);
-  unsigned short key = (bits & 0x8000) ? (unsigned short)(~bits)
-                                       : (unsigned short)(bits | 0x8000);
+  unsigned short key = (bits & 0x8000) ? (unsigned short)(~bits) : (unsigned short)(bits | 0x8000);
   return (uint32_t)key;
 }
 
 // Physical KV slot of a row-relative position: pt64[row][p >> 6] * 64 + (p &
 // 63) for page_size 64, which is the definition of page_table_1.  PB/PM carry
 // the shift and mask so page_size 1 collapses to the identity.
-__device__ __forceinline__ int32_t slot_of(const int32_t *__restrict__ pt,
-                                           uint32_t pos, uint32_t page_bits,
-                                           uint32_t page_mask) {
+__device__ __forceinline__ int32_t
+slot_of(const int32_t* __restrict__ pt, uint32_t pos, uint32_t page_bits, uint32_t page_mask) {
   return (pt[pos >> page_bits] << page_bits) | (int32_t)(pos & page_mask);
 }
 
@@ -97,8 +113,7 @@ struct Slice {
 };
 
 // This block's slice, cut on float4 boundaries so every load stays 16B aligned.
-__device__ __forceinline__ Slice slice_of(uint32_t row_len, uint32_t g,
-                                          uint32_t G) {
+__device__ __forceinline__ Slice slice_of(uint32_t row_len, uint32_t g, uint32_t G) {
   const uint32_t units = (row_len + 3u) / 4u;
   const uint32_t base = units / G;
   const uint32_t extra = units % G;
@@ -111,11 +126,10 @@ __device__ __forceinline__ Slice slice_of(uint32_t row_len, uint32_t g,
 }
 
 template <typename Op>
-__device__ __forceinline__ void scan_slice(const float *__restrict__ in,
-                                           Slice sl, Op op) {
+__device__ __forceinline__ void scan_slice(const float* __restrict__ in, Slice sl, Op op) {
   const uint32_t tx = threadIdx.x;
   const uint32_t vec_len = sl.len & ~3u;
-  const float4 *in4 = reinterpret_cast<const float4 *>(in + sl.start);
+  const float4* in4 = reinterpret_cast<const float4*>(in + sl.start);
   const uint32_t n4 = vec_len >> 2;
 
   uint32_t i = tx;
@@ -150,10 +164,10 @@ __device__ __forceinline__ void scan_slice(const float *__restrict__ in,
   }
 }
 
-constexpr uint32_t WAVE = 64u; // gfx950
+constexpr uint32_t WAVE = 64u;  // gfx950
 constexpr uint32_t NWAVE = BS / WAVE;
 
-__device__ __forceinline__ void hist_add_agg(uint32_t *hist, uint32_t bin) {
+__device__ __forceinline__ void hist_add_agg(uint32_t* hist, uint32_t bin) {
   const uint64_t active = __ballot(1);
   const int leader = __ffsll((unsigned long long)active) - 1;
   const uint32_t lead_bin = __shfl(bin, leader, WAVE);
@@ -167,9 +181,12 @@ __device__ __forceinline__ void hist_add_agg(uint32_t *hist, uint32_t bin) {
 }
 
 template <uint32_t NB>
-__device__ __forceinline__ void
-find_thr(const uint32_t *__restrict__ hist, uint32_t *__restrict__ wtot,
-         uint32_t want, uint32_t *out_thr, uint32_t *out_above) {
+__device__ __forceinline__ void find_thr(
+    const uint32_t* __restrict__ hist,
+    uint32_t* __restrict__ wtot,
+    uint32_t want,
+    uint32_t* out_thr,
+    uint32_t* out_above) {
   // NB < BS is legal: PER is then 1, threads past NB hold a zero count, and a
   // zero bin cannot satisfy the bracket predicate below.
   constexpr uint32_t PER = (NB >= BS) ? (NB / BS) : 1u;
@@ -212,7 +229,7 @@ find_thr(const uint32_t *__restrict__ hist, uint32_t *__restrict__ wtot,
     }
     total += t;
   }
-  uint32_t acc = total - (base + incl); // strictly above this thread's group
+  uint32_t acc = total - (base + incl);  // strictly above this thread's group
 
 #pragma unroll
   for (int j = (int)PER - 1; j >= 0; --j) {
@@ -223,7 +240,7 @@ find_thr(const uint32_t *__restrict__ hist, uint32_t *__restrict__ wtot,
     }
     acc += c;
   }
-  __syncthreads(); // wtot[] is scratch and out_thr/out_above must be visible
+  __syncthreads();  // wtot[] is scratch and out_thr/out_above must be visible
 }
 
 __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v) {
@@ -242,8 +259,7 @@ __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v) {
 constexpr uint32_t HIER_BAD = 0xFFFFFFFFu;
 
 __device__ __forceinline__ uint32_t
-find_thr_hier_impl(const uint32_t *__restrict__ gh, uint32_t want, uint32_t crs,
-                   uint32_t total_must_be) {
+find_thr_hier_impl(const uint32_t* __restrict__ gh, uint32_t want, uint32_t crs, uint32_t total_must_be) {
   const uint32_t lane = threadIdx.x & (WAVE - 1u);
 
   const uint32_t c = crs;
@@ -280,21 +296,28 @@ find_thr_hier_impl(const uint32_t *__restrict__ gh, uint32_t want, uint32_t crs,
 
 // Exact refinement of the threshold bin + padding.
 
-__device__ __forceinline__ float ld_val(const float *p) {
+__device__ __forceinline__ float ld_val(const float* p) {
   return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
-__device__ __forceinline__ int32_t ld_idx(const int32_t *p) {
+__device__ __forceinline__ int32_t ld_idx(const int32_t* p) {
   return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 template <bool IN_LDS>
-__device__ __forceinline__ void
-refine_core(uint32_t n, uint32_t above, uint32_t remain,
-            const uint32_t *__restrict__ s_key,
-            const int32_t *__restrict__ s_slot, const float *__restrict__ cv,
-            const int32_t *__restrict__ ci, int32_t *__restrict__ o,
-            uint32_t *__restrict__ s_hist, uint32_t *__restrict__ s_grp,
-            uint32_t *s_thr, uint32_t *s_above, uint32_t *s_emit) {
+__device__ __forceinline__ void refine_core(
+    uint32_t n,
+    uint32_t above,
+    uint32_t remain,
+    const uint32_t* __restrict__ s_key,
+    const int32_t* __restrict__ s_slot,
+    const float* __restrict__ cv,
+    const int32_t* __restrict__ ci,
+    int32_t* __restrict__ o,
+    uint32_t* __restrict__ s_hist,
+    uint32_t* __restrict__ s_grp,
+    uint32_t* s_thr,
+    uint32_t* s_above,
+    uint32_t* s_emit) {
   const uint32_t tx = threadIdx.x;
 
   if (remain == 0 || n <= remain) {
@@ -328,8 +351,7 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
 
     for (uint32_t i = tx; i < n; i += BS) {
       const uint32_t key = IN_LDS ? s_key[i] : order_key32(ld_val(&cv[i]));
-      const bool in_play =
-          (r == 0) || (((key >> (sh + 8u)) << (sh + 8u)) == prefix);
+      const bool in_play = (r == 0) || (((key >> (sh + 8u)) << (sh + 8u)) == prefix);
       if (in_play) {
         hist_add_agg(s_hist, (key >> sh) & 0xFFu);
       }
@@ -357,8 +379,7 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
 
     for (uint32_t i = tx; i < n; i += BS) {
       const uint32_t key = IN_LDS ? s_key[i] : order_key32(ld_val(&cv[i]));
-      const bool in_play =
-          (r == 0) || (((key >> (sh + 8u)) << (sh + 8u)) == prefix);
+      const bool in_play = (r == 0) || (((key >> (sh + 8u)) << (sh + 8u)) == prefix);
       if (!in_play) {
         continue;
       }
@@ -395,18 +416,29 @@ refine_core(uint32_t n, uint32_t above, uint32_t remain,
 // Only the i axis is partitioned -- rank_i sums over ALL j in EVERY block --
 // so a candidate on a partition boundary is still ranked against the full set.
 template <bool PRANK = false>
-__device__ __forceinline__ void
-refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
-           const int32_t *__restrict__ cand_idx,
-           const float *__restrict__ cand_val, int32_t *__restrict__ o,
-           uint32_t *__restrict__ s_hist, uint32_t *__restrict__ s_grp,
-           uint32_t *__restrict__ s_key, int32_t *__restrict__ s_slot,
-           uint32_t *s_thr, uint32_t *s_above, uint32_t *s_emit,
-           bool have_pre = false, int32_t pre_slot = 0, float pre_val = 0.f,
-           uint32_t pb = 0u, uint32_t PB = 1u) {
+__device__ __forceinline__ void refine_row(
+    uint32_t row,
+    uint32_t above,
+    uint32_t n_raw,
+    uint32_t cap,
+    const int32_t* __restrict__ cand_idx,
+    const float* __restrict__ cand_val,
+    int32_t* __restrict__ o,
+    uint32_t* __restrict__ s_hist,
+    uint32_t* __restrict__ s_grp,
+    uint32_t* __restrict__ s_key,
+    int32_t* __restrict__ s_slot,
+    uint32_t* s_thr,
+    uint32_t* s_above,
+    uint32_t* s_emit,
+    bool have_pre = false,
+    int32_t pre_slot = 0,
+    float pre_val = 0.f,
+    uint32_t pb = 0u,
+    uint32_t PB = 1u) {
   const uint32_t tx = threadIdx.x;
-  const int32_t *__restrict__ ci = cand_idx + (size_t)row * cap;
-  const float *__restrict__ cv = cand_val + (size_t)row * cap;
+  const int32_t* __restrict__ ci = cand_idx + (size_t)row * cap;
+  const float* __restrict__ cv = cand_val + (size_t)row * cap;
 
   const uint32_t n = n_raw > cap ? cap : n_raw;
   const uint32_t remain = above < TOPK ? TOPK - above : 0u;
@@ -427,7 +459,7 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
     }
     for (uint32_t i = i0; i < n; i += BS) {
       s_key[i] = order_key32(ld_val(&cv[i]));
-      s_slot[i] = ld_idx(&ci[i]); // k_scatter already translated it
+      s_slot[i] = ld_idx(&ci[i]);  // k_scatter already translated it
     }
   }
   __syncthreads();
@@ -439,7 +471,7 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
         const uint32_t wv = tx / WAVE;
         const uint32_t kj = (tx < n) ? s_key[tx] : 0u;
         for (uint32_t i = pb; i < n; i += PB) {
-          const uint32_t ki = s_key[i]; // block-uniform read
+          const uint32_t ki = s_key[i];  // block-uniform read
           const bool p = (tx < n) && ((kj > ki) || (kj == ki && tx < i));
           const uint64_t m = __ballot(p);
           if (lane == 0) {
@@ -454,7 +486,7 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
           if (tx == 0 && rank < remain) {
             o[above + rank] = s_slot[i];
           }
-          __syncthreads(); // s_grp is reused by the next i
+          __syncthreads();  // s_grp is reused by the next i
         }
         return;
       }
@@ -496,11 +528,9 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
     // The radix fallback emits through a shared cursor and pads o[..TOPK):
     // one block's work by construction, so the rest of the row returns here.
   } else if (in_lds) {
-    refine_core<true>(n, above, remain, s_key, s_slot, cv, ci, o, s_hist, s_grp,
-                      s_thr, s_above, s_emit);
+    refine_core<true>(n, above, remain, s_key, s_slot, cv, ci, o, s_hist, s_grp, s_thr, s_above, s_emit);
   } else {
-    refine_core<false>(n, above, remain, s_key, s_slot, cv, ci, o, s_hist,
-                       s_grp, s_thr, s_above, s_emit);
+    refine_core<false>(n, above, remain, s_key, s_slot, cv, ci, o, s_hist, s_grp, s_thr, s_above, s_emit);
   }
 }
 
@@ -508,11 +538,9 @@ refine_row(uint32_t row, uint32_t above, uint32_t n_raw, uint32_t cap,
 
 // Stage this block's span of the row's page table into LDS (PTMODE 2 only).
 // A block's slice is contiguous, so the window is [pt_base, pt_base + npt).
-__device__ __forceinline__ void
-stage_pt_window(int32_t *__restrict__ s_pt, const int32_t *__restrict__ pt_row,
-                Slice sl, uint32_t pt_base, uint32_t page_bits) {
-  const uint32_t want =
-      sl.len ? (((sl.start + sl.len - 1u) >> page_bits) - pt_base + 1u) : 0u;
+__device__ __forceinline__ void stage_pt_window(
+    int32_t* __restrict__ s_pt, const int32_t* __restrict__ pt_row, Slice sl, uint32_t pt_base, uint32_t page_bits) {
+  const uint32_t want = sl.len ? (((sl.start + sl.len - 1u) >> page_bits) - pt_base + 1u) : 0u;
   const uint32_t npt = want < PT_WIN ? want : PT_WIN;
   for (uint32_t i = threadIdx.x; i < npt; i += BS) {
     s_pt[i] = pt_row[pt_base + i];
@@ -521,12 +549,20 @@ stage_pt_window(int32_t *__restrict__ s_pt, const int32_t *__restrict__ pt_row,
 
 template <int PTMODE, bool PRANK = false, int PBLK = 0>
 __global__ __launch_bounds__(BS) void k_scatter(
-    const float *__restrict__ logits, const int32_t *__restrict__ row_ends,
-    const int32_t *__restrict__ page_table, int32_t *__restrict__ out,
-    uint32_t *__restrict__ ghist, int32_t *__restrict__ cursor,
-    int32_t *__restrict__ cand_idx, float *__restrict__ cand_val,
-    int64_t lg_stride, int64_t pt_stride, uint32_t page_bits,
-    uint32_t page_mask, uint32_t cap, uint32_t G) {
+    const float* __restrict__ logits,
+    const int32_t* __restrict__ row_ends,
+    const int32_t* __restrict__ page_table,
+    int32_t* __restrict__ out,
+    uint32_t* __restrict__ ghist,
+    int32_t* __restrict__ cursor,
+    int32_t* __restrict__ cand_idx,
+    float* __restrict__ cand_val,
+    int64_t lg_stride,
+    int64_t pt_stride,
+    uint32_t page_bits,
+    uint32_t page_mask,
+    uint32_t cap,
+    uint32_t G) {
   // Three working sets with disjoint lifetimes share one 16 KB block: the flat
   // histogram, then the staging buffers, then the refinement's keys and slots.
   // s_radix stays separate -- it is live at the same time as the keys.
@@ -542,10 +578,9 @@ __global__ __launch_bounds__(BS) void k_scatter(
       int32_t slot[REF_CAP];
     } ref;
   } s_pool;
-  static_assert(sizeof(s_pool) == HIST_BINS * 4u,
-                "the flat histogram is the widest phase");
+  static_assert(sizeof(s_pool) == HIST_BINS * 4u, "the flat histogram is the widest phase");
   __shared__ uint32_t s_radix[RADIX];
-  __shared__ uint32_t s_grp[NWAVE]; // cross-wave scan fixup (see find_thr)
+  __shared__ uint32_t s_grp[NWAVE];  // cross-wave scan fixup (see find_thr)
   __shared__ uint32_t s_thr, s_above;
   // Per-block staging.  Without it every emitted element would need its own
   // returning atomic on the row's single cursor.
@@ -556,12 +591,12 @@ __global__ __launch_bounds__(BS) void k_scatter(
   __shared__ int32_t s_pt[PTMODE == 2 ? PT_WIN : 1];
   __shared__ uint32_t s_emit;
   __shared__ uint32_t s_last;
-  uint32_t *const s_hist = s_pool.hist;
-  int32_t *const s_wbuf = s_pool.stage.wbuf;
-  int32_t *const s_cidx = s_pool.stage.cidx;
-  float *const s_cval = s_pool.stage.cval;
-  uint32_t *const s_key = s_pool.ref.key;
-  int32_t *const s_slot = s_pool.ref.slot;
+  uint32_t* const s_hist = s_pool.hist;
+  int32_t* const s_wbuf = s_pool.stage.wbuf;
+  int32_t* const s_cidx = s_pool.stage.cidx;
+  float* const s_cval = s_pool.stage.cval;
+  uint32_t* const s_key = s_pool.ref.key;
+  int32_t* const s_slot = s_pool.ref.slot;
 
   const uint32_t row = blockIdx.y;
   const uint32_t g = blockIdx.x;
@@ -571,8 +606,7 @@ __global__ __launch_bounds__(BS) void k_scatter(
   // Issued before row_ends comes back: the address depends only on blockIdx.
   // Later would serialise row_ends -> coarse bins -> fine group.
   uint32_t pre_crs = 0u;
-  pre_crs = ((const uint32_t *)ghist)[(size_t)row * GH_STRIDE + GH_CRS_OFF +
-                                      (threadIdx.x & (WAVE - 1u))];
+  pre_crs = ((const uint32_t*)ghist)[(size_t)row * GH_STRIDE + GH_CRS_OFF + (threadIdx.x & (WAVE - 1u))];
   // row_ends is device data, so no host check can bound it.  Unclamped, an
   // oversized row reads past its page table, and under PTMODE 2 past s_pt --
   // which stays inside LDS and so returns garbage rather than faulting.
@@ -587,15 +621,15 @@ __global__ __launch_bounds__(BS) void k_scatter(
   if (row_len <= TOPK) {
     // Rows short enough to need no selection: this kernel is their only
     // writer, so it emits the whole row here.
-    const int32_t *__restrict__ pt0 = page_table + (int64_t)row * pt_stride;
-    int32_t *__restrict__ o0 = out + (size_t)row * TOPK;
+    const int32_t* __restrict__ pt0 = page_table + (int64_t)row * pt_stride;
+    int32_t* __restrict__ o0 = out + (size_t)row * TOPK;
     for (uint32_t i = g * BS + tx; i < TOPK; i += G * BS) {
       o0[i] = i < row_len ? slot_of(pt0, i, page_bits, page_mask) : -1;
     }
     return;
   }
 
-  int32_t *__restrict__ rc = cursor + (size_t)row * RC_STRIDE;
+  int32_t* __restrict__ rc = cursor + (size_t)row * RC_STRIDE;
 
   // Issued first: independent of everything else, so the page-table staging
   // rides along under the barrier below.
@@ -604,18 +638,16 @@ __global__ __launch_bounds__(BS) void k_scatter(
   // emits is inside its own slice, so the window is [pt_base, pt_base+npt).
   const uint32_t pt_base = (PTMODE == 2) ? (sl.start >> page_bits) : 0u;
   if constexpr (PTMODE == 2) {
-    stage_pt_window(s_pt, page_table + (int64_t)row * pt_stride, sl, pt_base,
-                    page_bits);
+    stage_pt_window(s_pt, page_table + (int64_t)row * pt_stride, sl, pt_base, page_bits);
   }
 
-  const uint32_t *__restrict__ gh =
-      (const uint32_t *)ghist + (size_t)row * GH_STRIDE;
+  const uint32_t* __restrict__ gh = (const uint32_t*)ghist + (size_t)row * GH_STRIDE;
   uint32_t thr_h = 0u;
-  bool need_flat = false; // HIER: the flat histogram is the fallback only
+  bool need_flat = false;  // HIER: the flat histogram is the fallback only
   // Issued before the barrier so its two dependent loads overlap the
   // page-table window staging above.  Needs neither LDS nor a barrier.
   thr_h = find_thr_hier_impl(gh, TOPK, pre_crs, row_len);
-  need_flat = (thr_h == HIER_BAD); // block-uniform
+  need_flat = (thr_h == HIER_BAD);  // block-uniform
 
   if (need_flat) {
     for (uint32_t i = tx; i < HIST_BINS; i += BS) {
@@ -637,18 +669,17 @@ __global__ __launch_bounds__(BS) void k_scatter(
 
   const uint32_t thr = need_flat ? s_thr : thr_h;
 
-  const float *__restrict__ in = logits + (int64_t)row * lg_stride;
-  const int32_t *__restrict__ pt = page_table + (int64_t)row * pt_stride;
-  int32_t *__restrict__ o = out + (size_t)row * TOPK;
-  int32_t *__restrict__ ci = cand_idx + (size_t)row * cap;
-  float *__restrict__ cv = cand_val + (size_t)row * cap;
+  const float* __restrict__ in = logits + (int64_t)row * lg_stride;
+  const int32_t* __restrict__ pt = page_table + (int64_t)row * pt_stride;
+  int32_t* __restrict__ o = out + (size_t)row * TOPK;
+  int32_t* __restrict__ ci = cand_idx + (size_t)row * cap;
+  float* __restrict__ cv = cand_val + (size_t)row * cap;
 
   // The page-table lookup.  `if constexpr` so exactly one form is
   // emitted (see the s_pt declaration).
   auto SLOT = [&](uint32_t p) -> int32_t {
     if constexpr (PTMODE == 2) {
-      return (s_pt[(p >> page_bits) - pt_base] << page_bits) |
-             (int32_t)(p & page_mask);
+      return (s_pt[(p >> page_bits) - pt_base] << page_bits) | (int32_t)(p & page_mask);
     } else {
       return slot_of(pt, p, page_bits, page_mask);
     }
@@ -663,8 +694,7 @@ __global__ __launch_bounds__(BS) void k_scatter(
       if (p < STAGE) {
         s_wbuf[p] = (int32_t)gi;
       } else {
-        const unsigned long long old =
-            atomicAdd((unsigned long long *)rc, 1ull);
+        const unsigned long long old = atomicAdd((unsigned long long*)rc, 1ull);
         const uint32_t q = (uint32_t)old;
         // The threshold guarantees q < TopK; the bound is belt-and-braces
         // so that no reachable state can scribble past the output row.
@@ -678,14 +708,11 @@ __global__ __launch_bounds__(BS) void k_scatter(
         s_cidx[p] = (int32_t)gi;
         s_cval[p] = v;
       } else {
-        const unsigned long long old =
-            atomicAdd((unsigned long long *)rc, 1ull << 32);
+        const unsigned long long old = atomicAdd((unsigned long long*)rc, 1ull << 32);
         const uint32_t q = (uint32_t)(old >> 32);
         if (q < cap) {
-          __hip_atomic_store(&ci[q], SLOT(gi), __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
-          __hip_atomic_store(&cv[q], v, __ATOMIC_RELAXED,
-                             __HIP_MEMORY_SCOPE_AGENT);
+          __hip_atomic_store(&ci[q], SLOT(gi), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          __hip_atomic_store(&cv[q], v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
       }
     }
@@ -716,9 +743,8 @@ __global__ __launch_bounds__(BS) void k_scatter(
   // One thread reserves this block's span in both output streams with a single
   // packed atomic, so the two counters cannot be observed out of step.
   if (tx == 0) {
-    const unsigned long long pack =
-        ((unsigned long long)cn << 32) | (unsigned long long)wn;
-    const unsigned long long old = atomicAdd((unsigned long long *)rc, pack);
+    const unsigned long long pack = ((unsigned long long)cn << 32) | (unsigned long long)wn;
+    const unsigned long long old = atomicAdd((unsigned long long*)rc, pack);
     s_wbase = (int32_t)(uint32_t)old;
     s_cbase = (int32_t)(uint32_t)(old >> 32);
   }
@@ -738,10 +764,8 @@ __global__ __launch_bounds__(BS) void k_scatter(
       if (q < cap) {
         // The only bytes another block reads inside this kernel, which is why
         // just these stores are agent-scope.
-        __hip_atomic_store(&ci[q], cslot[u], __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-        __hip_atomic_store(&cv[q], cvalr[u], __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(&ci[q], cslot[u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(&cv[q], cvalr[u], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       }
     }
   }
@@ -752,9 +776,7 @@ __global__ __launch_bounds__(BS) void k_scatter(
   __builtin_amdgcn_s_waitcnt(/*vmcnt(0)*/ 0x0f70);
   __syncthreads();
   if (tx == 0) {
-    const uint32_t old =
-        __hip_atomic_fetch_add((uint32_t *)&rc[RC_ARR], 1u, __ATOMIC_RELAXED,
-                               __HIP_MEMORY_SCOPE_AGENT);
+    const uint32_t old = __hip_atomic_fetch_add((uint32_t*)&rc[RC_ARR], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     // PRANK needs this block's arrival rank, the non-PRANK form only the
     // is-last flag, and no form needs both, so they share s_last.
     s_last = PRANK ? old : ((old + 1u == G) ? 1u : 0u);
@@ -762,7 +784,7 @@ __global__ __launch_bounds__(BS) void k_scatter(
   __syncthreads();
   const uint32_t PB_N = (PBLK == 0 || (uint32_t)PBLK > G) ? G : (uint32_t)PBLK;
   const uint32_t pfirst = G - PB_N;
-  const uint32_t pidx = s_last - pfirst; // valid only if s_last>=pfirst
+  const uint32_t pidx = s_last - pfirst;  // valid only if s_last>=pfirst
   // Under PRANK the arrival counter stops being an election (one block
   // continues, G-1 return) and becomes the arrival half of a row barrier.
   if constexpr (PRANK) {
@@ -770,12 +792,10 @@ __global__ __launch_bounds__(BS) void k_scatter(
       return;
     }
     if (tx == 0) {
-      uint32_t v = __hip_atomic_load((uint32_t *)&rc[RC_ARR], __ATOMIC_RELAXED,
-                                     __HIP_MEMORY_SCOPE_AGENT);
+      uint32_t v = __hip_atomic_load((uint32_t*)&rc[RC_ARR], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       while (v < G) {
         __builtin_amdgcn_s_sleep(2);
-        v = __hip_atomic_load((uint32_t *)&rc[RC_ARR], __ATOMIC_RELAXED,
-                              __HIP_MEMORY_SCOPE_AGENT);
+        v = __hip_atomic_load((uint32_t*)&rc[RC_ARR], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       }
     }
     __syncthreads();
@@ -789,40 +809,52 @@ __global__ __launch_bounds__(BS) void k_scatter(
   static_assert(GH_STRIDE % 4u == 0u, "vectorised reset needs 4 | stride");
   // Under PRANK the reset is spread over the row's blocks instead; the
   // barrier above guarantees every block has finished reading it.
-  uint4 *__restrict__ ghw4 = (uint4 *)(ghist + (size_t)row * GH_STRIDE);
+  uint4* __restrict__ ghw4 = (uint4*)(ghist + (size_t)row * GH_STRIDE);
   const uint4 z4 = make_uint4(0u, 0u, 0u, 0u);
-  for (uint32_t i = PRANK ? pidx * BS + tx : tx; i < GH_STRIDE / 4u;
-       i += PRANK ? PB_N * BS : BS) {
+  for (uint32_t i = PRANK ? pidx * BS + tx : tx; i < GH_STRIDE / 4u; i += PRANK ? PB_N * BS : BS) {
     ghw4[i] = z4;
   }
 
-  const uint32_t above = (uint32_t)__hip_atomic_load(
-      &rc[RC_WIN], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  const uint32_t nraw = (uint32_t)__hip_atomic_load(
-      &rc[RC_CAND], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  const uint32_t above = (uint32_t)__hip_atomic_load(&rc[RC_WIN], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  const uint32_t nraw = (uint32_t)__hip_atomic_load(&rc[RC_CAND], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   // The candidate prefetch is issued alongside the two cursor reads rather
   // than behind them.  Unconditionally in bounds (cap >= TOPK >= BS);
   // entries at or past n are discarded.
   const int32_t pre_slot = ld_idx(&cand_idx[(size_t)row * cap + tx]);
   const float pre_val = ld_val(&cand_val[(size_t)row * cap + tx]);
-  __syncthreads(); // every thread has read them before they are cleared
+  __syncthreads();  // every thread has read them before they are cleared
   if (!PRANK && tx == 0) {
     rc[RC_WIN] = 0;
     rc[RC_CAND] = 0;
     rc[RC_ARR] = 0;
   }
-  refine_row<PRANK>(row, above, nraw, cap, cand_idx, cand_val, o, s_radix,
-                    s_grp, s_key, s_slot, &s_thr, &s_above, &s_emit, true,
-                    pre_slot, pre_val, pidx, PB_N);
+  refine_row<PRANK>(
+      row,
+      above,
+      nraw,
+      cap,
+      cand_idx,
+      cand_val,
+      o,
+      s_radix,
+      s_grp,
+      s_key,
+      s_slot,
+      &s_thr,
+      &s_above,
+      &s_emit,
+      true,
+      pre_slot,
+      pre_val,
+      pidx,
+      PB_N);
   // Departure half of the row barrier: the block that finishes first cannot
   // reset the counters while the other G-1 are still reading them, so the
   // last one out does it.
   if constexpr (PRANK) {
     __syncthreads();
     if (tx == 0) {
-      const uint32_t d =
-          __hip_atomic_fetch_add((uint32_t *)&rc[RC_DEP], 1u, __ATOMIC_RELAXED,
-                                 __HIP_MEMORY_SCOPE_AGENT);
+      const uint32_t d = __hip_atomic_fetch_add((uint32_t*)&rc[RC_DEP], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       if (d + 1u == PB_N) {
         rc[RC_WIN] = 0;
         rc[RC_CAND] = 0;
@@ -833,10 +865,8 @@ __global__ __launch_bounds__(BS) void k_scatter(
   }
 }
 
-} // namespace dsa_topk
-
 // PRANK liveness guard.
-static bool prank_resident_ok(const void *fn, int blocks_per_row, int rows) {
+inline bool prank_resident_ok(const void* fn, int blocks_per_row, int rows) {
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess) {
     return false;
@@ -857,8 +887,7 @@ static bool prank_resident_ok(const void *fn, int blocks_per_row, int rows) {
     s_cu[dev] = prop.multiProcessorCount;
   }
   int per_cu = 0;
-  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
-          &per_cu, fn, (int)dsa_topk::BS, 0) != hipSuccess) {
+  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, fn, (int)BS, 0) != hipSuccess) {
     return false;
   }
   if (per_cu <= 0) {
@@ -872,117 +901,143 @@ static bool prank_resident_ok(const void *fn, int blocks_per_row, int rows) {
   const long long slots = (long long)per_cu * (long long)s_cu[dev];
   return (long long)blocks_per_row * (long long)rows <= slots;
 }
+}  // namespace dsa_gfx950::topk
 
-// host entry
+struct TopKTransformKernel {
+  /// PTMODE 2 stages a per-block page-table window in LDS.  Page-table strides
+  /// too wide for that fixed window use the numerically identical PTMODE 0
+  /// global-gather specialization instead.
+  static void
+  run(const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView row_ends,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView ghist,
+      const tvm::ffi::TensorView cursor,
+      const tvm::ffi::TensorView cand_idx,
+      const tvm::ffi::TensorView cand_val,
+      int64_t g_per_row,
+      int64_t page_size) {
+    using namespace host;
+    namespace impl = dsa_gfx950::topk;
 
-// PTMODE 2 stages a per-block page-table window in LDS.  Page-table strides
-// too wide for that fixed window use the numerically identical PTMODE 0
-// global-gather specialization instead.
-void topk_transform(torch::Tensor logits, torch::Tensor row_ends,
-                    torch::Tensor page_table, torch::Tensor out,
-                    torch::Tensor ghist, torch::Tensor cursor,
-                    torch::Tensor cand_idx, torch::Tensor cand_val,
-                    int64_t g_per_row, int64_t page_size) {
-  const int64_t R = logits.size(0);
-  const int64_t L = logits.stride(0);
-  const int64_t PTS = page_table.stride(0);
-  const int64_t cap = cand_idx.size(1);
-  const uint32_t G = (uint32_t)g_per_row;
-  // page_size must be 1 or a power of two; both give the identical mapping.
-  uint32_t PB = 0, PM = 0;
-  for (int64_t ps = page_size; ps > 1; ps >>= 1) {
-    ++PB;
+    const int64_t R = logits.size(0);
+    const int64_t L = logits.stride(0);
+    const int64_t PTS = page_table.stride(0);
+    RuntimeCheck(cand_idx.dim() == 2, "cand_idx must be [>=rows, cap]");
+    const int64_t cap = cand_idx.size(1);
+    const uint32_t G = static_cast<uint32_t>(g_per_row);
+    // page_size must be 1 or a power of two; both give the identical mapping.
+    uint32_t PB = 0, PM = 0;
+    for (int64_t ps = page_size; ps > 1; ps >>= 1) {
+      ++PB;
+    }
+    PM = (page_size > 1) ? static_cast<uint32_t>(page_size - 1) : 0u;
+    RuntimeCheck(
+        (page_size & (page_size - 1)) == 0 && page_size >= 1, "page_size must be a power of two, got ", page_size);
+
+    // The histogram width is a compile-time property of the kernel.  Getting
+    // it wrong on the host silently walks off the end of ghist and corrupts
+    // the buffers next to it, which is exactly what happened once already.
+    RuntimeCheck(
+        ghist.numel() == R * static_cast<int64_t>(impl::GH_STRIDE),
+        "ghist must be [rows, ",
+        impl::GH_STRIDE,
+        "], got ",
+        ghist.numel());
+    // TOPK is compiled in and every row write is `out + row * TOPK`, so a
+    // narrower or shorter `out` overruns each row in turn.  The rest of these
+    // bound the tensors the kernel indexes by blockIdx.y or by `cap`; each one
+    // holds today only because fused_decode.py happens to allocate it that way.
+    RuntimeCheck(
+        out.dim() == 2 && out.size(0) >= R && out.size(1) == static_cast<int64_t>(impl::TOPK),
+        "out must be [>=rows, ",
+        impl::TOPK,
+        "], got a ",
+        out.dim(),
+        "-D tensor");
+    RuntimeCheck(
+        is_type<int32_t>(row_ends.dtype()) && row_ends.is_contiguous() && row_ends.numel() >= R,
+        "row_ends must be a contiguous int32 tensor with one entry per row");
+    RuntimeCheck(page_table.dim() == 2 && page_table.size(0) >= R, "page_table must be [>=rows, width]");
+    RuntimeCheck(
+        cand_val.dim() == 2 && cand_val.size(0) >= R && cand_val.size(1) >= cap,
+        "cand_val must be at least as wide as cand_idx (",
+        cap,
+        ")");
+    RuntimeCheck(cand_idx.size(0) >= R, "cand_idx must have one row per row");
+    // scan_slice reads the row base as float4, so the row stride has to keep
+    // that base 16B-aligned; the slice starts are multiples of 4 by construction.
+    RuntimeCheck(
+        logits.stride(1) == 1 && L % 4 == 0,
+        "logits rows must be unit-stride with a stride(0) divisible by 4, got ",
+        L);
+    // The cursor carries the same zero-in/zero-out invariant as ghist, and the
+    // consequence of getting it wrong is worse: under PRANK a stale arrival
+    // counter hangs the row barrier rather than returning a wrong answer.
+    RuntimeCheck(
+        cursor.numel() == R * static_cast<int64_t>(impl::RC_STRIDE),
+        "cursor must be [rows, ",
+        impl::RC_STRIDE,
+        "], got ",
+        cursor.numel(),
+        " elements for ",
+        R,
+        " rows");
+    RuntimeCheck(cap >= static_cast<int64_t>(impl::TOPK), "candidate capacity must be >= TopK");
+    // Every pointer below is a static_cast, which validates nothing -- unlike
+    // the data_ptr<T>() these replaced. page_table is the one a caller supplies.
+    RuntimeCheck(
+        is_type<fp32_t>(logits.dtype()) && is_type<int32_t>(out.dtype()) && is_type<int32_t>(page_table.dtype()) &&
+            is_type<int32_t>(ghist.dtype()) && is_type<int32_t>(cursor.dtype()) && is_type<int32_t>(cand_idx.dtype()) &&
+            is_type<fp32_t>(cand_val.dtype()),
+        "logits/cand_val must be fp32 and out/page_table/ghist/cursor/cand_idx int32");
+
+    // PTMODE 2 is faster when its per-block page-table slice fits in LDS.  PTS
+    // is a static graph property while row_ends is replay-time data, so use PTS
+    // as the conservative upper bound.  PTMODE 0 has no page-table-width limit.
+    const bool use_pt_window =
+        (PTS + static_cast<int64_t>(G) - 1) / static_cast<int64_t>(G) + 2 <= static_cast<int64_t>(impl::PT_WIN);
+
+    const auto stream = LaunchKernel::resolve_device(logits.device());
+    dim3 grid(static_cast<unsigned>(G), static_cast<unsigned>(R), 1);
+    dim3 blk(impl::BS, 1, 1);
+#define SGL_DSA_SCATTER_ARGS                                                                                 \
+  grid, blk, 0, stream, static_cast<fp32_t*>(logits.data_ptr()), static_cast<int32_t*>(row_ends.data_ptr()), \
+      static_cast<int32_t*>(page_table.data_ptr()), static_cast<int32_t*>(out.data_ptr()),                   \
+      static_cast<uint32_t*>(ghist.data_ptr()), static_cast<int32_t*>(cursor.data_ptr()),                    \
+      static_cast<int32_t*>(cand_idx.data_ptr()), static_cast<fp32_t*>(cand_val.data_ptr()), L, PTS, PB, PM, \
+      static_cast<uint32_t>(cap), G
+
+    // The persistent-rank tail finishes the exact rank behind a row barrier, so
+    // its blocks must be co-resident.  When they would not be, the ordinary
+    // kernel-boundary form is launched instead and the selector cannot hang.
+    if (use_pt_window &&
+        impl::prank_resident_ok(
+            reinterpret_cast<const void*>(impl::k_scatter<2, true, 16>), static_cast<int>(G), static_cast<int>(R))) {
+      hipLaunchKernelGGL((impl::k_scatter<2, true, 16>), SGL_DSA_SCATTER_ARGS);
+    } else if (use_pt_window) {
+      hipLaunchKernelGGL((impl::k_scatter<2>), SGL_DSA_SCATTER_ARGS);
+    } else if (impl::prank_resident_ok(
+                   reinterpret_cast<const void*>(impl::k_scatter<0, true, 16>),
+                   static_cast<int>(G),
+                   static_cast<int>(R))) {
+      hipLaunchKernelGGL((impl::k_scatter<0, true, 16>), SGL_DSA_SCATTER_ARGS);
+    } else {
+      hipLaunchKernelGGL((impl::k_scatter<0>), SGL_DSA_SCATTER_ARGS);
+    }
+    RuntimeDeviceCheck();
+#undef SGL_DSA_SCATTER_ARGS
   }
-  PM = (page_size > 1) ? (uint32_t)(page_size - 1) : 0u;
-  TORCH_CHECK((page_size & (page_size - 1)) == 0 && page_size >= 1,
-              "page_size must be a power of two, got ", page_size);
+};
 
-  // The histogram width is a compile-time property of the kernel.  Getting it
-  // wrong on the host silently walks off the end of ghist and corrupts the
-  // buffers next to it, which is exactly what happened once already.
-  TORCH_CHECK(ghist.numel() == R * (int64_t)dsa_topk::GH_STRIDE,
-              "ghist must be [rows, ", dsa_topk::GH_STRIDE, "], got ",
-              ghist.numel());
-  // TOPK is compiled in and every row write is `out + row * TOPK`, so a
-  // narrower or shorter `out` overruns each row in turn.  The rest of these
-  // bound the tensors the kernel indexes by blockIdx.y or by `cap`; each one
-  // holds today only because fused_decode.py happens to allocate it that way.
-  TORCH_CHECK(out.dim() == 2 && out.size(0) >= R &&
-                  out.size(1) == (int64_t)dsa_topk::TOPK,
-              "out must be [>=rows, ", dsa_topk::TOPK, "], got ", out.sizes());
-  TORCH_CHECK(
-      row_ends.scalar_type() == at::kInt && row_ends.is_contiguous() &&
-          row_ends.numel() >= R,
-      "row_ends must be a contiguous int32 tensor with one entry per row");
-  TORCH_CHECK(page_table.dim() == 2 && page_table.size(0) >= R,
-              "page_table must be [>=rows, width], got ", page_table.sizes());
-  TORCH_CHECK(cand_val.dim() == 2 && cand_val.size(0) >= R &&
-                  cand_val.size(1) >= cap,
-              "cand_val must be at least as wide as cand_idx (", cap, ")");
-  TORCH_CHECK(cand_idx.size(0) >= R, "cand_idx must have one row per row");
-  // scan_slice reads the row base as float4, so the row stride has to keep
-  // that base 16B-aligned; the slice starts are multiples of 4 by construction.
-  TORCH_CHECK(
-      logits.stride(1) == 1 && L % 4 == 0,
-      "logits rows must be unit-stride with a stride(0) divisible by 4, got ",
-      L);
-  // The cursor carries the same zero-in/zero-out invariant as ghist, and the
-  // consequence of getting it wrong is worse: under PRANK a stale arrival
-  // counter hangs the row barrier rather than returning a wrong answer.
-  TORCH_CHECK(cursor.numel() == R * (int64_t)dsa_topk::RC_STRIDE,
-              "cursor must be [rows, ", dsa_topk::RC_STRIDE, "], got ",
-              cursor.numel(), " elements for ", R, " rows");
-  TORCH_CHECK(cap >= (int64_t)dsa_topk::TOPK,
-              "candidate capacity must be >= TopK");
-  TORCH_CHECK(logits.scalar_type() == at::kFloat &&
-                  out.scalar_type() == at::kInt,
-              "dtype");
-  // PTMODE 2 is faster when its per-block page-table slice fits in LDS.  PTS is
-  // a static graph property while row_ends is replay-time data, so use PTS as
-  // the conservative upper bound.  PTMODE 0 has no page-table-width limit.
-  const bool use_pt_window =
-      (PTS + (int64_t)G - 1) / (int64_t)G + 2 <= (int64_t)dsa_topk::PT_WIN;
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-  dim3 grid((unsigned)G, (unsigned)R, 1);
-  dim3 blk(dsa_topk::BS, 1, 1);
-#define SCATTER_ARGS                                                           \
-  grid, blk, 0, stream, logits.data_ptr<float>(),                              \
-      row_ends.data_ptr<int32_t>(), page_table.data_ptr<int32_t>(),            \
-      out.data_ptr<int32_t>(), (uint32_t *)ghist.data_ptr<int32_t>(),          \
-      cursor.data_ptr<int32_t>(), cand_idx.data_ptr<int32_t>(),                \
-      cand_val.data_ptr<float>(), L, PTS, PB, PM, (uint32_t)cap, G
-
-  // The persistent-rank tail finishes the exact rank behind a row barrier, so
-  // its blocks must be co-resident.  When they would not be, the ordinary
-  // kernel-boundary form is launched instead and the selector cannot hang.
-  if (use_pt_window &&
-      prank_resident_ok((const void *)dsa_topk::k_scatter<2, true, 16>, (int)G,
-                        (int)R)) {
-    hipLaunchKernelGGL((dsa_topk::k_scatter<2, true, 16>), SCATTER_ARGS);
-  } else if (use_pt_window) {
-    hipLaunchKernelGGL((dsa_topk::k_scatter<2>), SCATTER_ARGS);
-  } else if (prank_resident_ok((const void *)dsa_topk::k_scatter<0, true, 16>,
-                               (int)G, (int)R)) {
-    hipLaunchKernelGGL((dsa_topk::k_scatter<0, true, 16>), SCATTER_ARGS);
-  } else {
-    hipLaunchKernelGGL((dsa_topk::k_scatter<0>), SCATTER_ARGS);
+struct TopKHistStride {
+  /// Row stride of the ghist workspace = fine bins + the coarse summary.
+  /// The workspace MUST be sized on this, not on the fine bin count: getting it
+  /// wrong walks off the end of ghist into whatever is allocated next.
+  static auto run() -> int64_t {
+    return static_cast<int64_t>(dsa_gfx950::topk::GH_STRIDE);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-#undef SCATTER_ARGS
-}
+};
 
-// Row stride of the ghist workspace = fine bins + the coarse summary.
-// The workspace MUST be sized on this, not on hist_bins(): getting it wrong
-// walks off the end of ghist into whatever is allocated next.
-int64_t hist_stride() { return (int64_t)dsa_topk::GH_STRIDE; }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("topk_transform", &topk_transform, "phase D top-k + page transform",
-        py::arg("logits"), py::arg("row_ends"), py::arg("page_table"),
-        py::arg("out"), py::arg("ghist"), py::arg("cursor"),
-        py::arg("cand_idx"), py::arg("cand_val"), py::arg("g_per_row"),
-        py::arg("page_size"));
-  m.def("hist_stride", &hist_stride,
-        "ghist row stride (fine bins + coarse summary)");
-}
+}  // namespace sglang

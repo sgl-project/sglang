@@ -1,4 +1,5 @@
-"""Numerical checks for kernels 1 and 4 against torch.mm and aiter respectively.
+"""Numerical checks for kernels 1 and 4 against torch.mm and the standard
+top-k path respectively.
 
 Kernel 3 runs here only as the fixture that produces kernel 4's inputs; nothing
 asserts on its logits. Kernel 2 is NOT covered -- it is the kernel that *writes*
@@ -147,11 +148,20 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
         torch.cuda.synchronize()
         return logits, ghist, (q_fp8, kv, gate, seqlens, page_table_64, ctx)
 
-    def _assert_matches_aiter(self, rows, ctx, pt_width=0):
-        """Node 4 against aiter on identical logits.  The fused kernel derives the slot
-        from the compact table as pt64[row, p >> 6] * 64 + (p & 63), so the reference
-        gets the equivalent wide table.  Compared as sets: neither fixes the order."""
-        import aiter
+    def _assert_matches_standard_path(self, rows, ctx, pt_width=0):
+        """Node 4 against the path it replaces, on identical logits.
+
+        The reference is sglang's own v2 paged transform -- the one
+        ``_topk_transform_v2_paged`` routes to -- rather than
+        ``aiter.dsa_topk_transform``: both emit physical page_size=1 slots from
+        the same compact table, but aiter only grew that op recently, so a
+        container with an older aiter skipped this check instead of running it.
+        Compared as sets: neither side fixes the order.
+        """
+        from sglang.kernels.ops.attention.dsv4.topk import (
+            plan_topk_v2,
+            topk_transform_paged_v2,
+        )
 
         logits, ghist, (_, _, _, seqlens, page_table_64, _) = self._fused_logits(
             rows, ctx, pt_width=pt_width
@@ -173,16 +183,9 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             self.loader.TOPK_G,
             PAGE_SIZE,
         )
-        page_table_1 = (
-            page_table_64.to(torch.int64).repeat_interleave(PAGE_SIZE, dim=1)
-            * PAGE_SIZE
-            + torch.arange(PAGE_SIZE, device=self.dev)
-            .repeat(page_table_64.shape[1])
-            .unsqueeze(0)
-        ).to(torch.int32)
         ref = logits.new_full((rows, TOPK), -1, dtype=torch.int32)
-        aiter.dsa_topk_transform(
-            logits, None, seqlens, page_table_1, ref, 1, TOPK, ptRowMap=None
+        topk_transform_paged_v2(
+            logits, seqlens, page_table_64, ref, PAGE_SIZE, plan_topk_v2(seqlens)
         )
         torch.cuda.synchronize()
 
@@ -192,15 +195,15 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             self.assertEqual(
                 len(got_r), min(TOPK, ctx), f"row {r}: {len(got_r)} distinct slots"
             )
-            self.assertEqual(got_r, ref_r, f"row {r}: different slots from aiter")
+            self.assertEqual(got_r, ref_r, f"row {r}: different slots from the v2 path")
 
-    def test_topk_transform_matches_aiter(self):
-        self._assert_matches_aiter(rows=8, ctx=8192)
+    def test_topk_transform_matches_standard_path(self):
+        self._assert_matches_standard_path(rows=8, ctx=8192)
 
     def test_topk_transform_at_graph_width(self):
         """k_scatter is selected on the page-table width, and GLM-5.2 captures wider
         than the LDS window, so this is the form serving traffic."""
-        self._assert_matches_aiter(rows=8, ctx=8192, pt_width=16384)
+        self._assert_matches_standard_path(rows=8, ctx=8192, pt_width=16384)
 
     def test_topk_transform_restores_its_histogram(self):
         """The zero-in/zero-out invariant: one ghist serves all 79 layers back to back,
